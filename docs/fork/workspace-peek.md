@@ -1,0 +1,222 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
+# Workspace peek — the thumbnail strip on the live desktop
+
+**Divergence, deliberate.** gnome-shell reaches the workspace thumbnail strip only through the
+overview. This makes the same strip available on the plain desktop, on a *hold* of the overlay key,
+and gives an interactive window move a drop target while it is down. There is no reference to port;
+this document is the specification.
+
+## The gesture
+
+Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past **300 ms** slides
+the workspace thumbnail strip down from the top of the work area, semi-transparent, over the live
+desktop. Nothing else changes: no window spread, no dash, no search entry, no dimming. Releasing the
+key slides it back up.
+
+The hold and the tap partition the overlay key, so nothing that works today changes unless the user
+holds:
+
+| what happens | result |
+| --- | --- |
+| release **before** 300 ms | the overview toggles, exactly as now |
+| release **after** 300 ms | the strip dismisses; the overview does **not** open |
+| any other key while held | the strip dismisses (if up) and the chord fires |
+| **while the overview is open** | the overlay key behaves exactly as it does today, hold or not — no peek, and a release still closes the overview |
+
+A client holding a keyboard-shortcuts inhibit prevents the peek from arming, for the same reason and
+at the same point it prevents the overview tap from arming (`src/input/mod.rs:944`).
+
+The strip comes down on every output at once, as the overview's does. It is a pointer affordance:
+touch has no Super, and no touch path arms it.
+
+## What the strip does while it is down
+
+- **click a thumbnail** — switch to that workspace. The strip stays up and scrolls to follow the new
+  active workspace. Clicking the *active* thumbnail does nothing.
+- **drag a thumbnail** — reorder the workspaces.
+- **drag a window onto a thumbnail** — move it to that workspace. This is the existing interactive
+  move; what is new is that the strip is a drop target for it outside the overview, and that as the
+  pointer climbs toward the band the dragged window scales down toward thumbnail size. That
+  feedback lives in the interactive-move render path, lerping the carried window's render scale by
+  the pointer's proximity to the band; it is the one piece of this with no existing home.
+- **drop into a gap** — open a new workspace there, as on the overview strip.
+
+## The shape of the change
+
+Every consumer of the strip — render, hit test, close button, reorder grab, drop target — funnels
+through `Monitor::thumbnail_strip()` (`src/layout/monitor.rs:2293`), gated by `thumbnails_visible()`
+→ `expose_progress()`. So the peek is **a second visibility source and a second band**:
+
+- `Monitor::peek_progress()` — a `0 → 1` animation of its own, and `thumbnails_visible()` becomes
+  "the overview exposes the strip, or the peek does". `expose_progress()` itself is untouched: it
+  drives the window spread, which the peek must never do. It is gnome-mode-only
+  (`monitor.rs:2266-2268`) and the peek inherits that gate.
+- the band: the overview's is `controls_layout().workspace_row`, at the floating search entry's
+  midline, well down the canvas. The peek's is full width, pinned just below the top of the work
+  area, at the same `small_workspace_height` — computed from the same `start_y`, the work area's
+  top, as the overview's — so a thumbnail is the same size in both and the strip does not resize if
+  the overview opens over a peek. `lay_strip` (`:2317`) chooses between the two.
+
+Two things are already built and already right. The entrance is `thumbnail_slide_offset` (`:2671`),
+`-extent * (1 - progress)` — a slide from off the top edge. The transparency is
+`push_group_at_alpha` (`src/synoik.rs:11427`), where the overview passes its search cross-fade and
+the peek passes a constant below 1.
+
+Most of the interaction plumbing genuinely does come along from the visibility gate alone: hover
+tracking, the reorder grab, phantom slots, `via_strip` insert hints, gap-drops-create-workspace, and
+the close button on an empty workspace are none of them overview-gated.
+
+## What does not come for free
+
+### 1. Two accessors that shape the strip also shape the live desktop
+
+They must be **split**, not repointed. Feeding peek progress into either one deforms the desktop
+behind the strip:
+
+- `workspace_background_radius()` (`:1557`) is read by the strip *and* by the live workspace bake
+  (`ws.update_render_elements(is_active, background_radius)`, `:1623`). At peek, `overview_zoom()` is
+  1, so the clamp lands on the full constant and the desktop wallpaper would grow ~30 px rounded
+  corners.
+- `workspace_inactive_ramp()` (`:2014`) feeds `workspaces_render_geo()` (`:2797`) — the geometry of
+  the **real desktop**, not just of thumbnails. With the ramp above zero and a fractional scroll
+  position — exactly the click-a-thumbnail-while-peeked case — the live desktop would visibly shrink
+  mid-switch, overview-style.
+
+Only `render_thumbnails`' own progress read (`:3165`) is strip-local. The strip needs its own radius
+and its own shrink ramp, derived from the peek progress, with the desktop's left reading
+`expose_progress()`.
+
+### 2. Inactive workspaces are culled from render updates when the overview is closed
+
+`update_render_elements` iterates `workspaces_with_render_geo_mut(true)` (`:1623`) and the cull drops
+every workspace whose geometry does not intersect the output — overview closed, that is all but the
+active one. Their thumbnails would draw stale. The cull must admit every workspace while the peek is
+up; the cost is bounded to the peek and is work the overview already does continuously. Frame
+callbacks are a second question with the same shape: whether a window visible *only* in a thumbnail
+gets callbacks and queues damage (`src/synoik.rs:12278`), or animating clients freeze in the strip.
+
+### 3. A window dropped on the strip would edge-tile
+
+`edge_tiling`, `keep_position` and `allow_to_activate_workspace` all key off `self.overview_open`
+(`src/layout/mod.rs:3210`, `:4845-4853`). The overview never has strip drops and edge tiling live at
+once; the peek is the first context that does. A strip drop computes
+`pos_within_workspace = (pointer - thumb.loc).downscale(zoom)` with `zoom` 1 at peek (`:4877`), so
+thumbnail-local coordinates near the top of the screen reach `edge_tile_target` and the window
+maximizes instead of moving.
+
+The fix is to key those three off *the drop being a strip drop* rather than off the overview being
+open — which `insert_position` already knows, since it returns from its strip branch. That also
+settles where a strip-dropped window lands: `keep_position`, i.e. it keeps its geometry and only
+changes workspace, in the peek exactly as in the overview.
+
+### 4. The trigger cannot ride `overlay_key_armed`
+
+That flag is cleared by **any pointer button, scroll, or touch** (`event_cancels_overlay_key`,
+`src/input/mod.rs:9745`, applied at `:488`) and overwritten by any other key press (`:950`). The
+first click of any peek interaction disarms it, so it cannot be the record that Super is down.
+
+The peek gets **its own state**, holding the keycode that armed it, and is dismissed on that
+keycode's release — which the keyboard path sees whatever the pointer did in between.
+
+**Pointer activity does not cancel the peek.** It cancels the *tap*, and must: mutter will not let
+Super+click open the overview. The peek has the opposite relationship to the pointer — it is a
+pointer affordance, and pointer activity is evidence the user wants it. Cancelling on button press
+would break the headline gesture outright: grabbing a window within 300 ms of pressing Super is how
+anyone will actually perform "carry it to the strip", and it would mean the strip never comes down.
+So the peek timer is cancelled only by a chord and by the key's own release, while `:488` keeps
+cancelling the tap alone. The consequence is deliberate: any Super+drag held past 300 ms brings the
+strip down mid-drag, which is exactly when the drop target becomes useful.
+
+Also to implement deliberately: arming is idempotent, so a virtual-keyboard client's key repeat
+cannot stack timers; the peek release is checked *before* the `overlay_key_armed` tap path, so a
+release past the threshold never reaches `ToggleOverview`; and it does not touch
+`overlay_key_last_fired`, which belongs to the app-grid escalation (`:960-975`).
+
+### 5. Clicking a thumbnail would open the overview
+
+`ThumbGrab`'s non-drag release calls `activate_overview_workspace_at` → `activate_overview_workspace`
+(`src/input/mod.rs:5493`), which sends the **active** workspace down `toggle_overview_to_workspace` —
+opening the overview from a closed one. The peek needs its own click action: switch to another
+workspace, do nothing on the active one.
+
+### 6. During a peek every click is a Super+click
+
+The strip's press handling (`src/input/mod.rs:7327`) is gated on `is_overview_open` and sits *after*
+the modifier-drag gestures. In the overview that ordering was free, because Super is not held there.
+**Rule: a press inside the strip's band belongs to the strip, before any modifier gesture is
+considered.** Outside the band, Super+drag keeps its meaning — which is what makes "grab a window,
+carry it up to the strip" work.
+
+### 7. Z-order and the top edge
+
+The thumbnails group is pushed *after* the `Top` and `Overlay` layers (`src/synoik.rs:11318`,
+`:11424`), and earlier push means higher z — so layer-shell surfaces draw over the strip today, and
+the peek band sits exactly where client bars live. **The peek group is pushed above `Top` and
+`Overlay`**: it is a transient affordance the user is actively holding, and one that a client bar can
+hide is not one that can be aimed at. The hit test must agree — `is_layout_obscured_under`
+(`src/synoik.rs:8969`) must not refuse a strip hit under a layer surface while the peek is up.
+
+Same reasoning for the **hot corner**: pressure into the top-left toggles the overview
+(`src/input/mod.rs:5055`), and a pointer travelling to the strip's left end would trip it. The hot
+corner is suppressed while the peek is up.
+
+### 8. A fullscreen window takes a render branch that has no strip
+
+When `render_above_top_layer()` (`:3088`) is true, `src/synoik.rs:11323` takes a branch that never
+calls `render_thumbnails`, has no close-button chrome, and no alpha group. **The peek draws over
+fullscreen** — that is where switching workspaces is most wanted — so that branch grows the same
+group. Note that clicking a thumbnail flips `render_above_top_layer()` false the moment the switch
+starts (`:3089`), swapping render branches mid-animation; the strip must be continuous across that
+swap.
+
+### 9. Teardown
+
+Lock, VT switch, suspend, and the session dialogs dismiss the peek and cancel a pending timer. Today
+nothing clears `overlay_key_armed` on those paths either (`src/input/mod.rs:2568`), which is a
+pre-existing hole the same fix closes.
+
+### 10. Releasing Super mid-drag
+
+If the key comes up while a `ThumbGrab` or a strip-targeted move is in flight, dismissal waits for
+the button release that ends the grab, then slides up. This is not a latch — the strip is never
+*usable* after the key is up; it is only not torn down while a grab holds its geometry.
+
+## Open — needs a call
+
+- **Dock icon dragged onto the strip.** `drop_workspace_at` (`src/layout/mod.rs:5934`) routes through
+  `insert_position`'s strip branch, so with the dash-as-dock on the live desktop a dock drag while
+  peeked acquires the strip as a launch target for free. Coherent (it launches on that workspace) but
+  nobody asked for it. Allow, or refuse strip drops from app drags?
+
+## Conformance corpus
+
+In `src/tests/gnome.rs`, driving real input against the `Fixture`. Peek state is observable through
+the inspectable model, and the threshold is measured on the compositor clock, so the harness drives
+the hold rather than sleeping:
+
+- hold past the threshold → the strip is visible, the overview is closed, no window has moved
+- release past the threshold → the strip is gone, the overview did not open
+- release before the threshold → the overview opens (existing behavior, pinned against regression)
+- a chord while held → the strip is gone and the chord's action fired
+- hold while the overview is open → no peek, and the release closes the overview as today
+- hold with a shortcuts-inhibiting client focused → no peek
+- click a thumbnail → the active workspace changed, the strip is still up
+- click the active thumbnail → nothing changed, the overview did not open
+- drag a window to a thumbnail → the window is on that workspace, keeps its geometry, is not tiled,
+  and the active workspace did not change
+- drag a thumbnail → the workspaces reordered
+- drag a window into a gap → a workspace was created there
+- Super held past the threshold *while already dragging a window* → the strip comes down
+- release the key mid-drag → the strip stays until the button releases, then goes
+- the top-left hot corner while peeked → the overview did not open
+- lock while peeked → the strip is gone
+
+Plus render tests for two things state assertions cannot see: that peek thumbnails show their
+workspaces' live contents (the cull), and that the desktop behind the strip has neither rounded
+corners nor a shrink (the split accessors).
+
+## Reverting
+
+The peek is a visibility source, a band, and the ten items above. The interactions it exposes are the
+strip's own, and no overview behavior is rewritten to make room for it.
