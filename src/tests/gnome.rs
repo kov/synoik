@@ -1500,10 +1500,11 @@ impl WarmTarget {
 /// tracker calls damaged, exactly as the backend does — and, when `read` is set, hand back the
 /// whole target's pixels.
 ///
-/// Reading is opt-in because the readback is not free of consequence: the copy leaves the texture
-/// in a layout the next incremental pass does not load from, and the tiles that pass touches come
-/// back as garbage. Frames that only need to advance the tracker must not copy, and a frame that
-/// does copy has to be healed (see [`probe_frame`]) before the next incremental one.
+/// Reading is opt-in because the readback is not free of consequence: after a copy, the tiles the
+/// next incremental pass touches come back as garbage — measured, and not a spec violation the
+/// validation layer sees. Frames that only need to advance the tracker must not copy, and a frame
+/// that does copy has to be healed (see [`probe_frame`]) before the next incremental one, or the
+/// probe reports its own contamination as a missing repaint.
 fn draw_into(
     renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
     target: &mut WarmTarget,
