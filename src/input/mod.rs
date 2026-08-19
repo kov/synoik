@@ -119,7 +119,14 @@ const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 /// There is no reference constant: gnome-shell spends the overlay key on the tap alone and does
 /// nothing with a hold. Long enough that a chord on the way to Super+Tab does not flash the strip,
 /// short enough that a deliberate hold does not feel ignored.
-pub const PEEK_HOLD_THRESHOLD: Duration = Duration::from_millis(300);
+///
+/// Not the same job as the switcher's
+/// [`WORKSPACE_PREVIEW_DELAY`](crate::ui::switcher::WORKSPACE_PREVIEW_DELAY), which happens to
+/// share a value at 300 ms: that one times a pause *inside* a gesture already underway, where the
+/// key is down either way and the delay only decides whether the view follows. This one is the
+/// gesture's entry, competing with every chord that starts with Super — so it is the longer of the
+/// two, and tuned on the seat.
+pub const PEEK_HOLD_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// Touchpad pixels per scroll step — mutter's `DISCRETE_SCROLL_STEP`
 /// (`src/backends/native/meta-seat-impl.c:62,1139`), which is the factor it divides libinput's

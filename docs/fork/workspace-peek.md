@@ -9,8 +9,9 @@ this document is the specification.
 
 ## The gesture
 
-Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past **300 ms** brings
-out the overview's two pieces of furniture over the live desktop: the workspace thumbnail strip
+Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past
+**`PEEK_HOLD_THRESHOLD`** (500 ms, tuned on the seat) brings out the overview's two pieces of
+furniture over the live desktop: the workspace thumbnail strip
 slides down from the top of the work area, semi-transparent, and the dock slides up from the bottom.
 Nothing else changes — no window spread, no search entry, no dimming, and the windows do not move.
 Releasing the key puts both away.
@@ -20,8 +21,8 @@ holds:
 
 | what happens | result |
 | --- | --- |
-| release **before** 300 ms | the overview toggles, exactly as now |
-| release **after** 300 ms | the strip dismisses; the overview does **not** open |
+| release **before** the threshold | the overview toggles, exactly as now |
+| release **after** the threshold | the strip dismisses; the overview does **not** open |
 | any other key while held | the strip dismisses (if up) and the chord fires |
 | an action fires, by any route | the strip dismisses — see below |
 | **while the overview is open** | the overlay key behaves exactly as it does today, hold or not — no peek, and a release still closes the overview |
@@ -137,10 +138,10 @@ keycode's release — which the keyboard path sees whatever the pointer did in b
 **Pointer activity does not cancel the peek.** It cancels the *tap*, and must: mutter will not let
 Super+click open the overview. The peek has the opposite relationship to the pointer — it is a
 pointer affordance, and pointer activity is evidence the user wants it. Cancelling on button press
-would break the headline gesture outright: grabbing a window within 300 ms of pressing Super is how
+would break the headline gesture outright: grabbing a window within the threshold of pressing Super is how
 anyone will actually perform "carry it to the strip", and it would mean the strip never comes down.
 So the peek timer is cancelled only by a chord and by the key's own release, while `:488` keeps
-cancelling the tap alone. The consequence is deliberate: any Super+drag held past 300 ms brings the
+cancelling the tap alone. The consequence is deliberate: any Super+drag held past the threshold brings the
 strip down mid-drag, which is exactly when the drop target becomes useful.
 
 **An action stands the peek down, however it arrived.** A chord's own key press already does it,
@@ -206,15 +207,19 @@ corner is suppressed while the peek is up.
 When `render_above_top_layer()` is true the render takes a branch that never calls
 `render_thumbnails`, has no close-button chrome and no alpha group.
 
-**Until that branch grows the strip, the peek presents nothing there** — not the strip, and not the
-dash either. Half a gesture is worse than none: the dock coming out over a fullscreen window with no
-strip above it is furniture for a thing that is not happening. The refusal lives in
-`Monitor::strip_progress`, the strip's one funnel, so nothing is drawn, nothing is hit and no drop
-lands; `Synoik::peek_is_over_fullscreen` holds the dock back to match. The peek's *state* still
-stands, so the release dismisses rather than falling through to the tap and opening the overview.
+**A fullscreen window is left alone: the peek does not engage over one.** `Layout::set_peek`
+refuses there as it does in the overview, so the overlay key keeps exactly the meaning it had before
+the peek existed — hold as long as you like, the release opens the overview. That is deliberately a
+question the seat can answer rather than a design: whether the strip is *wanted* over fullscreen is
+unknown, and an affordance that is half-there teaches nothing. Half-there is the specific risk,
+because only the strip is missing from that render branch: the dock would come out on its own, which
+is furniture for a gesture that is not happening.
 
-Whether the peek should instead **draw** over fullscreen — that is arguably where switching
-workspaces is most wanted — is open. If it does, note that clicking a thumbnail flips
+Two guards keep it whole if a window goes fullscreen *during* a peek: `Monitor::strip_progress`
+refuses at the strip's one funnel, so nothing draws, nothing is hit and no drop lands; and
+`Synoik::peek_is_over_fullscreen` releases the dock's hold.
+
+If the peek is later given a strip over fullscreen, note that clicking a thumbnail flips
 `render_above_top_layer()` false the moment the switch starts, swapping render branches
 mid-animation; the strip must be continuous across that swap.
 
@@ -284,7 +289,8 @@ the hold rather than sleeping:
 - Super held past the threshold *while already dragging a window* → the strip comes down
 - the top-left hot corner while peeked → the overview did not open
 - Super+MMB while peeked → the strip is gone, and the release that follows opens nothing
-- hold over a fullscreen window → neither strip nor dash, and the release opens no overview
+- hold over a fullscreen window → no peek, no strip, no dash, and the release opens the overview
+  as a tap would
 - the pointer over a peeked thumbnail → the window under it holds neither surface nor activation,
   and takes both back when the peek goes
 - lock while peeked → the strip is gone

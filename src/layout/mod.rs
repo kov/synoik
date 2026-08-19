@@ -5519,7 +5519,15 @@ impl<W: LayoutElement> Layout<W> {
     /// The overview outranks it: while the overview is open the strip is already on screen in
     /// its own band, and a peek would be a second claim on the same row.
     pub fn set_peek(&mut self, open: bool) {
-        let open = open && !self.overview_open;
+        // Two states outrank the peek. The overview already has the strip on screen in its own
+        // band. A fullscreen window is left alone entirely — the peek does not engage there, so
+        // the overlay key behaves exactly as it did before the peek existed, which is what makes
+        // "do I reach for it while fullscreen?" a question the seat can answer.
+        let outranked = self.overview_open
+            || self
+                .active_monitor_ref()
+                .is_some_and(|mon| mon.render_above_top_layer());
+        let open = open && !outranked;
         if self.peek_open == open {
             return;
         }

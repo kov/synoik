@@ -877,14 +877,11 @@ fn holding_super_in_the_overview_does_not_peek() {
     );
 }
 
-/// Over a fullscreen window the peek presents nothing. The strip has no render branch to draw
-/// in there (`docs/fork/workspace-peek.md` §8), and half a gesture — the dash out, the strip
-/// missing — is worse than none, so the dock is held back to match.
-///
-/// The peek's *state* still stands, so the release dismisses instead of falling through to the
-/// tap and opening the overview over the fullscreen window.
+/// A fullscreen window is left alone: the peek does not engage over one, so the overlay key
+/// behaves exactly as it did before the peek existed — a hold and release opens the overview,
+/// as a tap does (`docs/fork/workspace-peek.md` §8).
 #[test]
-fn a_peek_over_a_fullscreen_window_shows_neither_strip_nor_dock() {
+fn the_peek_does_not_engage_over_a_fullscreen_window() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let output = f.synoik_output(1);
@@ -949,11 +946,16 @@ fn a_peek_over_a_fullscreen_window_shows_neither_strip_nor_dock() {
         "and no dash either — the peek presents nothing, not half of itself"
     );
 
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "and the peek does not engage at all"
+    );
+
     f.key_release(KEY_LEFTMETA);
     f.settle();
     assert!(
-        !f.synoik().layout.is_overview_open(),
-        "the release still dismisses rather than falling through to the tap"
+        f.synoik().layout.is_overview_open(),
+        "the overlay key keeps its pre-peek meaning here: the release opens the overview"
     );
 }
 
