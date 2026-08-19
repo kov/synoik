@@ -20,12 +20,13 @@ use std::time::{Duration, Instant};
 use insta::assert_snapshot;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
+use smithay::backend::renderer::element::Element as _;
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
@@ -1964,6 +1965,312 @@ fn filing_windows_away_one_after_another_repaints_the_strip() {
             check(&mut f, &mut warm, &format!("window {n}: after the drop"));
         }
     }
+}
+
+/// Drag each window in turn onto the strip's trailing thumbnail — the workspace that does not
+/// exist yet — so every drop grows the row and re-lays out everything after it, and call `tick` to
+/// run the frames in between.
+///
+/// One window moved is not the case that shows the artifact: the second and third are carried into
+/// a strip that is re-laying out under them.
+fn file_windows_onto_new_workspaces(
+    f: &mut Fixture,
+    out: &Output,
+    tick: &mut dyn FnMut(&mut Fixture, usize),
+) {
+    for _ in 0..3 {
+        // Take whichever window is on top: floating windows overlap, and a press lands on the
+        // topmost one whatever rect it was aimed at.
+        let win = f
+            .synoik()
+            .layout
+            .focus()
+            .expect("a window is focused")
+            .window
+            .clone();
+        let last = f.synoik().layout.workspaces().count() - 1;
+        let rect = f
+            .synoik()
+            .layout
+            .window_render_rect(&win, out)
+            .expect("the focused window is on screen");
+        pointer_motion_to(
+            f,
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        );
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(f, 1536., 1400.);
+        tick(f, 2);
+
+        let (tx, ty) = thumbnail_center(f, last);
+        pointer_motion_to(f, tx, ty);
+        tick(f, 2);
+
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        // Long enough for the drop's move-back, the row's re-layout and the slot slides to land.
+        tick(f, 40);
+    }
+}
+
+/// The scene may not drop one instance of an element while another stays put.
+///
+/// The damage tracker allows an `Id` to appear many times in a frame, and we lean on it: one
+/// cached texture draws a window in the workspace and again in every thumbnail showing it. It
+/// decides per instance, and an instance that *moves* heals the rect it left — but an instance
+/// that simply goes away while a sibling stays unchanged is asked for by nobody, in that frame or
+/// any after it (`tests::damage_instances`). The pixels then live in whichever screen buffer
+/// missed the repaint and resurface every time it comes round.
+///
+/// So the scene owes the tracker this: no `Id` may shrink its instance count in a frame where a
+/// surviving instance is pixel-identical to the last one. Asserted over the drop gesture, where
+/// miniatures come and go as the row re-lays out.
+#[test]
+fn no_element_drops_an_instance_while_another_stays_put() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!("skipping no_element_drops_an_instance_while_another_stays_put: no Vulkan ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.synoik().wallpaper = crate::wallpaper::checker(3840, 2160, 120);
+    f.settle();
+
+    let id = f.add_client();
+    for size in [(896, 650), (896, 650), (1172, 1069)] {
+        let surface = map_window_sized(&mut f, id, size, None);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+        window.commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let scale = Scale::from(out.current_scale().fractional_scale());
+    summon_peek(&mut f);
+
+    // Every instance of every Id in the frame, by geometry.
+    let snapshot = |f: &mut Fixture| -> HashMap<String, Vec<Rectangle<i32, Physical>>> {
+        let state = f.synoik_state();
+        state.synoik.update_render_elements(Some(&out));
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let ctx = crate::render_helpers::RenderCtx {
+                    renderer: vk,
+                    target: crate::render_helpers::RenderTarget::Output,
+                    xray: None,
+                    appearance: Some(state.synoik.appearance()),
+                };
+                let mut by_id: HashMap<String, Vec<_>> = HashMap::new();
+                for elem in state.synoik.render_to_vec(ctx, &out, true) {
+                    by_id
+                        .entry(format!("{:?}", elem.id()))
+                        .or_default()
+                        .push(elem.geometry(scale));
+                }
+                by_id
+            })
+            .expect("the probe fixture has a renderer")
+    };
+
+    let mut previous = snapshot(&mut f);
+    let mut offenders: Vec<String> = Vec::new();
+    let mut tick = |f: &mut Fixture, frames: usize| {
+        for _ in 0..frames {
+            f.run_frames_for(Duration::from_millis(16));
+            let now = snapshot(f);
+            for (id, was) in &previous {
+                let Some(is) = now.get(id) else {
+                    // The Id left the frame entirely; `elements_gone` damages all of it.
+                    continue;
+                };
+                if is.len() >= was.len() {
+                    continue;
+                }
+                if was.iter().any(|geo| is.contains(geo)) {
+                    let gone: Vec<_> = was.iter().filter(|geo| !is.contains(geo)).collect();
+                    offenders.push(format!(
+                        "{id}: {} instances down to {}, vacating {gone:?}",
+                        was.len(),
+                        is.len()
+                    ));
+                }
+            }
+            previous = now;
+        }
+    };
+
+    file_windows_onto_new_workspaces(&mut f, &out, &mut tick);
+
+    assert_eq!(
+        offenders,
+        Vec::<String>::new(),
+        "an element dropped an instance while a sibling stayed put, so the rect it vacated is \
+         damaged by nobody"
+    );
+}
+
+/// Read back every buffer of `warm` as it stands, without healing it.
+///
+/// [`probe_frame`] repaints its target whole after a read, so the next incremental frame measures
+/// its own delta and not the readback's leavings. That makes it blind to the one thing a screen
+/// can do: carry content in the buffer it is *not* currently showing. Here the scene is at rest,
+/// so each frame reports no damage and draws nothing — what comes back is what each buffer has
+/// been holding.
+fn read_buffers(f: &mut Fixture, out: &Output, warm: &mut WarmTarget) -> Vec<Vec<u8>> {
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+    let state = f.synoik_state();
+    state.synoik.update_render_elements(Some(out));
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let ctx = crate::render_helpers::RenderCtx {
+                renderer: vk,
+                target: crate::render_helpers::RenderTarget::Output,
+                xray: None,
+                appearance: Some(state.synoik.appearance()),
+            };
+            let elements = state.synoik.render_to_vec(ctx, out, true);
+            (0..warm.buffers)
+                .map(|_| draw_into(vk, warm, size, &elements, true).expect("the buffer was read"))
+                .collect()
+        })
+        .expect("the probe fixture has a renderer")
+}
+
+/// The scene drawn from scratch, which is right by construction.
+fn cold_frame(f: &mut Fixture, out: &Output) -> Vec<u8> {
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+    let state = f.synoik_state();
+    state.synoik.update_render_elements(Some(out));
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            // The strip lives in a cached texture; rendering the same list again would composite
+            // that cache, staleness and all.
+            state.synoik.reset_thumbnails_offscreen();
+            let ctx = crate::render_helpers::RenderCtx {
+                renderer: vk,
+                target: crate::render_helpers::RenderTarget::Output,
+                xray: None,
+                appearance: Some(state.synoik.appearance()),
+            };
+            let fresh = state.synoik.render_to_vec(ctx, out, true);
+            let mut cold = WarmTarget::new(out, 1);
+            draw_into(vk, &mut cold, size, &fresh, true).expect("the cold target was read")
+        })
+        .expect("the probe fixture has a renderer")
+}
+
+/// A screen shows the buffer it last flipped to, and the *other* one is where a missed repaint
+/// hides: nothing on screen looks wrong until that buffer comes round again, and then the region
+/// flips back and forth once per frame for as long as anything keeps drawing.
+///
+/// That is the shape the seat produced on 2026-08-19 — a miniature alternating between two
+/// coherent positions at frame parity, in a region the frame's own damage never named — and it is
+/// invisible to a probe that repairs its target between frames. So: run the whole gesture without
+/// touching the target, let it come to rest, and only then ask each buffer what it is holding.
+/// Every one of them has to match the scene.
+#[test]
+fn no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved: no Vulkan ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.synoik().wallpaper = crate::wallpaper::checker(3840, 2160, 120);
+    f.settle();
+
+    let id = f.add_client();
+    let sizes = [(896, 650), (896, 650), (1172, 1069)];
+    let colors = [
+        (0, u32::MAX, 0, u32::MAX),
+        (u32::MAX, 0, 0, u32::MAX),
+        (0, 0, u32::MAX, u32::MAX),
+    ];
+    for (size, color) in sizes.into_iter().zip(colors) {
+        let surface = map_window_sized(&mut f, id, size, None);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(color.0, color.1, color.2, color.3);
+        window.commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+
+    summon_peek(&mut f);
+
+    // Two regions of interest. The buffers are compared to each other over the whole band plus
+    // the shadow margins around it; against the *scene* only below the panel, because the panel
+    // is a framebuffer effect — it samples the frame beneath it, so a from-scratch render blurs
+    // over a complete frame and an incremental one over whatever was already there. That is a
+    // real difference and not a stale pixel, and it is the same reason the older probes confine
+    // themselves to the band.
+    let (band, below_panel) = {
+        let mon = f.synoik().layout.monitor_for_output(&out).unwrap();
+        let band = mon.thumbnail_strip().expect("the strip is up").band;
+        let scale = out.current_scale().fractional_scale();
+        (
+            Rectangle::new(
+                band.loc - Point::from((0., 60.)),
+                band.size + Size::from((0., 120.)),
+            )
+            .to_physical_precise_round(scale),
+            Rectangle::new(band.loc, band.size + Size::from((0., 60.)))
+                .to_physical_precise_round(scale),
+        )
+    };
+
+    // One frame per tick, into a target nothing repairs — the way an output accumulates.
+    let mut warm = WarmTarget::new(&out, SCREEN_BUFFERS);
+    let advance = |f: &mut Fixture, warm: &mut WarmTarget, frames: usize| {
+        for _ in 0..frames {
+            probe_frame(f, &out, warm, None);
+            f.run_frames_for(Duration::from_millis(16));
+        }
+    };
+    advance(&mut f, &mut warm, 4);
+
+    file_windows_onto_new_workspaces(&mut f, &out, &mut |f, frames| advance(f, &mut warm, frames));
+
+    let held = read_buffers(&mut f, &out, &mut warm);
+    let cold = cold_frame(&mut f, &out);
+    // Every buffer against the scene, and the buffers against each other. A difference only one
+    // of them carries is a fossil; one they all share is the probe measuring itself.
+    let stale: Vec<_> = held
+        .iter()
+        .map(|buffer| stale_bounds(buffer, &cold, size, below_panel))
+        .collect();
+    let between = stale_bounds(&held[0], &held[held.len() - 1], size, band);
+    assert_eq!(
+        (stale.as_slice(), between),
+        (vec![None; held.len()].as_slice(), None),
+        "a buffer is holding strip pixels the scene no longer draws"
+    );
 }
 
 /// Mark or clear a rect in a full-output bitmap.

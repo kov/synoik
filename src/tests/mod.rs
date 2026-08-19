@@ -46,6 +46,7 @@ mod server;
 
 mod animations;
 mod background_effect;
+mod damage_instances;
 mod floating;
 mod fullscreen;
 mod gnome;
