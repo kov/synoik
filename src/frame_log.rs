@@ -1342,19 +1342,31 @@ where
 /// again in every thumbnail showing it. So the answer is not to stop sharing ids, and this says
 /// which element to look at when a stale rectangle appears.
 pub fn log_instance_shrinks(
-    output: &str,
+    name: &str,
+    geometry: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
     before: &std::collections::HashMap<String, Vec<Instance>>,
     after: &std::collections::HashMap<String, Vec<Instance>>,
 ) {
-    for line in instance_shrinks(before, after) {
-        tracing::info!("instances {output} {line}");
+    for line in instance_shrinks(before, after, geometry) {
+        tracing::info!("instances {name} {line}");
     }
 }
 
 /// The offenders themselves, one line each, so the same rule serves the log and the corpus.
+///
+/// Three conditions, all of them the tracker's own:
+///
+/// - the count shrank, so an instance left;
+/// - **every** surviving instance matches a remembered one. One that does not takes the branch that
+///   damages this id's whole remembered instance list — which heals the departed rects too, so a
+///   frame where anything of this id moved is a frame that repairs itself. Measured on the seat:
+///   without this, four fifths of the report is elements mid-relayout that are fine;
+/// - at least one vacated rect lands on the output, since the tracker clips its damage there and an
+///   instance that left from off-screen never owed any.
 pub fn instance_shrinks(
     before: &std::collections::HashMap<String, Vec<Instance>>,
     after: &std::collections::HashMap<String, Vec<Instance>>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for (id, was) in before {
@@ -1362,24 +1374,23 @@ pub fn instance_shrinks(
             // The id left the frame entirely, which `elements_gone` damages in full.
             continue;
         };
-        if is.len() >= was.len() || !was.iter().any(|i| is.contains(i)) {
+        if is.len() >= was.len() || !is.iter().all(|i| was.contains(i)) {
             continue;
         }
         let vacated = was
             .iter()
             .filter(|i| !is.contains(i))
-            .map(|i| {
-                format!(
-                    "{}x{}+{}+{}",
-                    i.geometry.size.w, i.geometry.size.h, i.geometry.loc.x, i.geometry.loc.y
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+            .filter_map(|i| i.geometry.intersection(output))
+            .map(|geo| format!("{}x{}+{}+{}", geo.size.w, geo.size.h, geo.loc.x, geo.loc.y))
+            .collect::<Vec<_>>();
+        if vacated.is_empty() {
+            continue;
+        }
         lines.push(format!(
-            "{id} {} -> {} vacated=[{vacated}]",
+            "{id} {} -> {} vacated=[{}]",
             was.len(),
-            is.len()
+            is.len(),
+            vacated.join(" ")
         ));
     }
     lines.sort();
@@ -3010,28 +3021,38 @@ mod tests {
         let id = String::from("thumbnail");
         let one = |v: Vec<Instance>| HashMap::from([(id.clone(), v)]);
 
+        let screen = Rectangle::new(Point::from((0, 0)), Size::from((800, 600)));
+        let shrinks = |was: Vec<Instance>, is: HashMap<String, Vec<Instance>>| {
+            super::instance_shrinks(&one(was), &is, screen)
+        };
+
         // A departure past a sibling that stayed: the tracker heals nothing.
-        let shrinks =
-            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &one(vec![at(0, 0)]));
-        assert_eq!(shrinks, ["thumbnail 2 -> 1 vacated=[100x100+400+0]"]);
+        assert_eq!(
+            shrinks(vec![at(0, 0), at(400, 0)], one(vec![at(0, 0)])),
+            ["thumbnail 2 -> 1 vacated=[100x100+400+0]"]
+        );
 
         // A move: the arriving instance matches nothing, so it damages every remembered one.
-        assert!(super::instance_shrinks(
-            &one(vec![at(0, 0), at(400, 0)]),
-            &one(vec![at(0, 0), at(430, 0)])
+        assert!(shrinks(vec![at(0, 0), at(400, 0)], one(vec![at(0, 0), at(430, 0)])).is_empty());
+
+        // A departure where the survivor also moved: same branch, same healing.
+        assert!(shrinks(vec![at(0, 0), at(400, 0)], one(vec![at(30, 0)])).is_empty());
+
+        // A departure in a frame where *another* instance of the id moved. That one instance is
+        // enough: its branch damages the whole remembered list, departed rects included. Four
+        // fifths of the seat's first report was this, which is why the rule asks that *every*
+        // survivor matched.
+        assert!(shrinks(
+            vec![at(0, 0), at(200, 0), at(400, 0)],
+            one(vec![at(0, 0), at(230, 0)])
         )
         .is_empty());
 
-        // A departure where the survivor also moved: same branch, same healing.
-        assert!(
-            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &one(vec![at(30, 0)]))
-                .is_empty()
-        );
+        // A departure from off the output, which the tracker clips away and never owed.
+        assert!(shrinks(vec![at(0, 0), at(900, 0)], one(vec![at(0, 0)])).is_empty());
 
         // The id gone altogether, which `elements_gone` damages in full.
-        assert!(
-            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &HashMap::new()).is_empty()
-        );
+        assert!(shrinks(vec![at(0, 0), at(400, 0)], HashMap::new()).is_empty());
     }
 
     /// The damage log is read by eye out of a journal, so its shape is part of it: an empty age

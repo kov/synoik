@@ -3369,13 +3369,18 @@ fn render_surface_with(
             output.current_scale().fractional_scale().into(),
         );
         let name = output.name();
+        let geometry = Rectangle::from_size(
+            output
+                .current_mode()
+                .map_or_else(Default::default, |m| m.size),
+        );
         if let Some(state) = synoik.output_state.get_mut(output) {
             if let Some(before) = state.last_frame_instances.replace(now) {
                 let after = state
                     .last_frame_instances
                     .as_ref()
                     .expect("the frame's instances were just stored");
-                crate::frame_log::log_instance_shrinks(&name, &before, after);
+                crate::frame_log::log_instance_shrinks(&name, geometry, &before, after);
             }
         }
     }

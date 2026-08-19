@@ -2054,6 +2054,7 @@ fn no_element_drops_an_instance_while_another_stays_put() {
 
     let out = f.synoik().global_space.outputs().next().unwrap().clone();
     let scale = Scale::from(out.current_scale().fractional_scale());
+    let screen = Rectangle::from_size(out.current_mode().unwrap().size);
     summon_peek(&mut f);
 
     // Every instance of every Id in the frame, exactly as the log on a seat records them
@@ -2082,7 +2083,7 @@ fn no_element_drops_an_instance_while_another_stays_put() {
         for _ in 0..frames {
             f.run_frames_for(Duration::from_millis(16));
             let now = snapshot(f);
-            offenders.extend(crate::frame_log::instance_shrinks(&previous, &now));
+            offenders.extend(crate::frame_log::instance_shrinks(&previous, &now, screen));
             previous = now;
         }
     };
