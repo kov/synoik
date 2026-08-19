@@ -2157,9 +2157,25 @@ impl<W: LayoutElement> Workspace<W> {
             }
         }
 
-        let rects: Vec<_> = tiles.iter().map(|(_, _, settled)| *settled).collect();
+        // Lay out in a stable order, not the front-to-back one this vec is in.
+        // `compute_slots` sorts stably and breaks no ties, so windows whose centres tie
+        // exactly — which centred placement makes ordinary — are ordered by nothing but the
+        // input, and the stacking order changes on every raise. gnome-shell lays out
+        // `_sortedWindows`, held in `get_stable_sequence()` order (`workspace.js:811-817`),
+        // for exactly this reason: there, a restack recomputes to the identical assignment.
+        let mut order: Vec<usize> = (0..tiles.len()).collect();
+        order.sort_by_key(|&i| tiles[i].0.window().stable_sequence());
+
+        let rects: Vec<_> = order.iter().map(|&i| tiles[i].2).collect();
         let area = self.expose_area();
-        let slots = expose::compute_slots(self.view_size.h, area, &rects);
+        let packed = expose::compute_slots(self.view_size.h, area, &rects);
+
+        // Scatter the slots back onto the render order the caller expects.
+        let mut slots = vec![Rectangle::default(); tiles.len()];
+        for (&i, slot) in order.iter().zip(packed) {
+            slots[i] = slot;
+        }
+
         tiles
             .into_iter()
             .zip(slots)

@@ -29452,6 +29452,55 @@ fn a_settled_position_does_not_move_while_the_window_animates() {
     }
 }
 
+/// Raising a window does not move any preview in the picker.
+///
+/// gnome-shell lays out `_sortedWindows`, held in `get_stable_sequence()` order
+/// (`workspace.js:811-817`, consumed at `:541`); `syncStacking` sorts a local array for
+/// z-order and never touches it, so a restack there recomputes to the identical assignment.
+/// Ours laid out the floating stack, which `raise_window` reorders on every activation —
+/// and `compute_slots` sorts stably, so windows whose centres tie exactly are ordered by
+/// nothing but that stack. Activating one swapped it with its twin.
+#[test]
+fn raising_a_window_does_not_move_the_previews() {
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    let (win_a, win_b, _) = tied_previews_in_the_overview(&mut f, id, (801, 601));
+
+    let slots = |f: &mut Fixture| {
+        [&win_a, &win_b].map(|w| f.synoik().layout.expose_slot_local(w).expect("a slot"))
+    };
+    let settled = |f: &mut Fixture| {
+        [&win_a, &win_b].map(|w| f.synoik().layout.expose_settled_pos(w).expect("a position"))
+    };
+
+    // Precondition: the two must tie *exactly*, or the sort never consults the stack and the
+    // test is decorative — untied windows sort the same whatever the order.
+    let [pa, pb] = settled(&mut f);
+    assert_eq!(
+        (pa.x, pa.y),
+        (pb.x, pb.y),
+        "precondition: the two previews must sit at the same place for their centres to tie",
+    );
+
+    let before = slots(&mut f);
+    assert_ne!(
+        before[0], before[1],
+        "precondition: tied windows must still land in different slots, or nothing can swap",
+    );
+
+    f.synoik().layout.activate_window(&win_a);
+    f.settle();
+
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "raising a window re-sorted the picker: the slots the previews had are not the slots \
+         they have now, and only the stacking order changed",
+    );
+}
+
 /// A preview settling into the picker moves toward its new slot and does not double back.
 ///
 /// The picker recomputes its whole layout every frame (`Workspace::expose_layout`, called

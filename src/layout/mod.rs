@@ -155,6 +155,14 @@ pub trait LayoutElement {
     /// Unique ID of this element.
     fn id(&self) -> &Self::Id;
 
+    /// A number that orders elements by when they appeared and never changes afterwards —
+    /// our `MetaWindow::get_stable_sequence`.
+    ///
+    /// The overview picker lays out in this order rather than in stacking order. Its sort
+    /// is stable and has no tie-break, so windows whose centres tie exactly are ordered by
+    /// nothing but the input, and the stacking order changes on every raise.
+    fn stable_sequence(&self) -> u64;
+
     /// Updates the config for the element.
     fn update_config(&mut self, blur_config: synoik_config::Blur) {
         let _ = blur_config;

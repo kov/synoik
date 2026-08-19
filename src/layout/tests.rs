@@ -158,6 +158,10 @@ impl LayoutElement for TestWindow {
         &self.0.id
     }
 
+    fn stable_sequence(&self) -> u64 {
+        self.0.id as u64
+    }
+
     fn size(&self) -> Size<i32, Logical> {
         self.0.bbox.get().size
     }

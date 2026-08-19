@@ -730,6 +730,10 @@ impl LayoutElement for Mapped {
         &self.window
     }
 
+    fn stable_sequence(&self) -> u64 {
+        self.id.get()
+    }
+
     fn update_config(&mut self, blur_config: synoik_config::Blur) {
         self.blur_config = blur_config;
     }
