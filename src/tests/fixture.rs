@@ -352,11 +352,15 @@ impl Fixture {
     /// `settle` returns after a frame or two and the threshold never passes. Nor by teleporting
     /// the clock: the deadline has to be crossed by frames, since the frame is what notices it.
     ///
-    /// Leaves the clock frozen only if it found it frozen, for the reason in `run_until_settled`.
+    /// **Leaves the clock frozen**, unlike [`run_until_settled`](Self::run_until_settled), which
+    /// restores it. That helper can: by the time it returns nothing is animating, so the rewind
+    /// that unfreezing performs — back from the pinned time to real monotonic time — lands on
+    /// animations that are already done. A hold ends with transitions *in flight*, and rewinding
+    /// under them puts their start time in the future: an animation mid-slide reads as 0 again and
+    /// the thing under test flicks back to where it started.
     pub fn run_frames_for(&mut self, duration: Duration) {
         const FRAME: Duration = Duration::from_micros(16_667);
 
-        let was_frozen = self.synoik().clock.is_frozen();
         self.freeze_clock();
         let mut elapsed = Duration::ZERO;
         while elapsed < duration {
@@ -364,9 +368,6 @@ impl Fixture {
             self.dispatch();
             self.refresh();
             elapsed += FRAME;
-        }
-        if !was_frozen {
-            self.synoik().clock.unfreeze();
         }
     }
 

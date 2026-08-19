@@ -876,6 +876,10 @@ pub struct Synoik {
     /// loop wakes to notice, so a headless test can drive the hold by advancing the clock rather
     /// than by sleeping.
     pub peek_arm_at: Option<Duration>,
+    /// The key came up while a grab still held the strip's geometry, so the dismissal is waiting
+    /// for that grab to end (`docs/fork/workspace-peek.md`). Not a latch: the peek is no longer
+    /// *usable*, it is only not torn down under something aiming at it.
+    pub peek_dismiss_pending: bool,
     /// The loop wake-up for [`Self::peek_arm_at`], and the deadline it was scheduled for.
     pub peek_timer: Option<RegistrationToken>,
     pub peek_timer_at: Option<Duration>,
@@ -2235,6 +2239,12 @@ impl State {
         if self.synoik.peek_up && (self.synoik.is_locked() || self.synoik.screen_shield.is_active())
         {
             self.synoik.end_peek();
+        }
+
+        // A dismissal that waited for a grab, now that the grab is done. Level-triggered for the
+        // same reason as the dock's holds: no path that ends a drag has to remember.
+        if self.synoik.peek_dismiss_pending && !self.synoik.layout.strip_grab_in_flight() {
+            self.synoik.finish_peek();
         }
 
         // Before the focus update, so a panel menu this dismisses (the overview opening over it)
@@ -7759,6 +7769,7 @@ impl Synoik {
             peek_key_held: None,
             peek_up: false,
             peek_arm_at: None,
+            peek_dismiss_pending: false,
             peek_timer: None,
             peek_timer_at: None,
             suppressed_buttons: HashSet::new(),
@@ -15539,10 +15550,24 @@ impl Synoik {
         if !self.peek_up {
             return false;
         }
+
+        // A thumbnail being carried, or a window being dragged at the strip, still needs the row
+        // it is aiming at. The strip goes when the grab does.
+        if self.layout.strip_grab_in_flight() {
+            self.peek_dismiss_pending = true;
+            return true;
+        }
+
+        self.finish_peek();
+        true
+    }
+
+    /// Put the strip away for real.
+    fn finish_peek(&mut self) {
         self.peek_up = false;
+        self.peek_dismiss_pending = false;
         self.layout.set_peek(false);
         self.queue_redraw_all();
-        true
     }
 
     /// Bring the peek down once the hold's deadline passes. Driven from the frame rather than

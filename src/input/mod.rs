@@ -5537,6 +5537,50 @@ impl State {
     /// delayed move. `FolderView` is a `BaseAppView` like the app display, so it inherits
     /// the same `_maybeMoveItem` — including the [`DELAYED_MOVE_MS`] wait, which is what
     /// keeps a drag that merely sweeps across the folder from shuffling it.
+    /// A left press on the thumbnail strip: the close button of an empty workspace, or a
+    /// [`ThumbGrab`] that resolves on release into a reorder or a plain click.
+    ///
+    /// Returns whether the press was the strip's. The close button sits *inside* its thumbnail's
+    /// body, so it has to be tested before the grab or the reorder drag swallows every press
+    /// aimed at it.
+    fn press_on_thumbnail_strip(
+        &mut self,
+        button_code: u32,
+        serial: smithay::utils::Serial,
+    ) -> bool {
+        let pointer = self.synoik.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+
+        if let Some(ws_id) = self.synoik.thumbnail_close_under(location) {
+            if self.synoik.layout.close_workspace(ws_id) {
+                // The strip re-lays around the gap; nothing is under the pointer where the button
+                // was, so drop both hovers rather than leaving a button lit over a workspace that
+                // is gone.
+                self.synoik.thumbnail_hovered = None;
+                self.synoik.thumbnail_close_hovered = None;
+                self.synoik.queue_redraw_all();
+            }
+            return true;
+        }
+
+        let hit = self
+            .synoik
+            .thumbnail_under(location)
+            .map(|(output, _, idx)| (output, idx));
+        let Some((output, idx)) = hit else {
+            return false;
+        };
+
+        let start_data = PointerGrabStartData {
+            focus: None,
+            button: button_code,
+            location,
+        };
+        let grab = ThumbGrab::new(start_data, output, idx);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+        true
+    }
+
     /// Activating a workspace by clicking it in the overview (gnome-shell's `Workspace`
     /// click rules): clicking the *active* workspace's empty area leaves the overview,
     /// clicking another one switches to it and stays.
@@ -5556,6 +5600,11 @@ impl State {
             .is_some_and(|active| active.id() == ws_id);
         if gnome_mode && !is_active {
             self.synoik.layout.switch_workspace(ws_idx);
+        } else if self.synoik.peek_up {
+            // A peek's click on the *active* thumbnail does nothing. In the overview this is the
+            // gesture that leaves it, landing on the workspace you clicked; here there is no
+            // overview to leave, and opening one would be the opposite of what the user asked for
+            // by holding rather than tapping (`docs/fork/workspace-peek.md`).
         } else {
             self.synoik.layout.toggle_overview_to_workspace(ws_idx);
         }
@@ -7314,6 +7363,20 @@ impl State {
                 }
             }
 
+            // **A press inside a peeked strip belongs to the strip, before any modifier gesture
+            // is considered** (`docs/fork/workspace-peek.md`). During a peek the overlay key is by
+            // definition held, so every click is a Super+click and the mouse-bind lookup below
+            // would swallow presses aimed at a thumbnail — an ordering that never mattered in the
+            // overview, where Super is not held. Outside the band Super+drag keeps its meaning,
+            // which is what lets a window be carried up to the strip in the first place.
+            if self.synoik.peek_up
+                && button == Some(MouseButton::Left)
+                && !self.synoik.seat.get_pointer().unwrap().is_grabbed()
+                && self.press_on_thumbnail_strip(button_code, serial)
+            {
+                return;
+            }
+
             if is_switcher_open || self.synoik.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = match button {
                     Some(MouseButton::Left) => Some(Trigger::MouseLeft),
@@ -7373,38 +7436,12 @@ impl State {
             // workspace reorder from a plain click (divergence, see `ThumbGrab`). It comes
             // before the window check because a thumbnail is drawn over the picker, and
             // after the modifier gestures above, which stay in charge of their buttons.
-            // The close button sits *inside* its thumbnail's body, so it has to be tested
-            // before the grab or the reorder drag swallows every press aimed at it.
-            if button == Some(MouseButton::Left) && !pointer.is_grabbed() && is_overview_open {
-                if let Some(ws_id) = self
-                    .synoik
-                    .thumbnail_close_under(pointer.current_location())
-                {
-                    if self.synoik.layout.close_workspace(ws_id) {
-                        // The strip re-lays around the gap; nothing is under the pointer
-                        // where the button was, so drop both hovers rather than leaving a
-                        // button lit over a workspace that is gone.
-                        self.synoik.thumbnail_hovered = None;
-                        self.synoik.thumbnail_close_hovered = None;
-                        self.synoik.queue_redraw_all();
-                    }
-                    return;
-                }
-
-                let hit = self
-                    .synoik
-                    .thumbnail_under(pointer.current_location())
-                    .map(|(output, _, idx)| (output, idx));
-                if let Some((output, idx)) = hit {
-                    let start_data = PointerGrabStartData {
-                        focus: None,
-                        button: button_code,
-                        location: pointer.current_location(),
-                    };
-                    let grab = ThumbGrab::new(start_data, output, idx);
-                    pointer.set_grab(self, grab, serial, Focus::Clear);
-                    return;
-                }
+            if button == Some(MouseButton::Left)
+                && !pointer.is_grabbed()
+                && is_overview_open
+                && self.press_on_thumbnail_strip(button_code, serial)
+            {
+                return;
             }
 
             if let Some(mapped) = self.synoik.window_under_cursor() {

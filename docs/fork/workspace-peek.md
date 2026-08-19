@@ -229,12 +229,14 @@ the hold rather than sleeping:
 - drag a window to a thumbnail → the window is on that workspace, keeps its geometry, is not tiled,
   and the active workspace did not change
 - drag a thumbnail → the workspaces reordered
+- click the active thumbnail → nothing changed and the overview did not open
+- carry a window toward the strip → it shrinks, and grows again on the way back down
+- release the key mid-drag → the strip stays until the button releases, then goes
 - drag a window into a gap → a workspace was created there
 - hold past the threshold → the dock is out on the active output
 - release → the dock's hide deadline is re-armed, and it goes
 - drag a dock icon onto a thumbnail → the app launched on that workspace
 - Super held past the threshold *while already dragging a window* → the strip comes down
-- release the key mid-drag → the strip stays until the button releases, then goes
 - the top-left hot corner while peeked → the overview did not open
 - lock while peeked → the strip is gone
 

@@ -80,10 +80,10 @@ const KEY_K: u32 = 37;
 const KEY_V: u32 = 47;
 const KEY_LEFTMETA: u32 = 125;
 
-/// Comfortably past the workspace peek's hold threshold, so a test that means "held" does not
-/// depend on where the frame boundaries happen to land.
+/// Long enough that the workspace peek's hold has fired *and* the strip has finished sliding in,
+/// so a test that means "held" neither races the threshold nor measures a half-arrived strip.
 const HELD_PAST_THRESHOLD: Duration =
-    Duration::from_millis(crate::input::PEEK_HOLD_THRESHOLD.as_millis() as u64 + 100);
+    Duration::from_millis(crate::input::PEEK_HOLD_THRESHOLD.as_millis() as u64 + 400);
 const KEY_RIGHTMETA: u32 = 126;
 pub(super) const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -896,6 +896,246 @@ fn locking_dismisses_the_peek() {
     assert!(
         !f.synoik().layout.is_peeking(),
         "the lock must put the strip away"
+    );
+}
+
+/// A peek that puts the strip on screen but does not let you press it is a picture, not a control.
+/// Clicking a thumbnail switches to that workspace, and the strip stays up — Super is still held.
+#[test]
+fn clicking_a_peeked_thumbnail_switches_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "precondition: back on the desktop"
+    );
+    let active_before = f.synoik().layout.active_workspace().unwrap().id();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    let target = f
+        .synoik()
+        .layout
+        .workspaces()
+        .position(|(_, _, ws)| ws.id() != active_before)
+        .expect("a workspace other than the active one");
+
+    let (x, y) = thumbnail_center(&mut f, target);
+    pointer_motion_to(&mut f, x, y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert_ne!(
+        f.synoik().layout.active_workspace().unwrap().id(),
+        active_before,
+        "clicking a peeked thumbnail must switch to it"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and must not open the overview"
+    );
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "the strip stays up — Super is still held"
+    );
+}
+
+/// Clicking the *active* thumbnail does nothing. In the overview that press is the gesture that
+/// leaves it, landing on the workspace clicked; a peek has no overview to leave, and opening one
+/// would be the opposite of what holding rather than tapping asked for.
+#[test]
+fn clicking_the_active_peeked_thumbnail_does_nothing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    let active_before = f.synoik().layout.active_workspace().unwrap().id();
+    let active_idx = f
+        .synoik()
+        .layout
+        .workspaces()
+        .position(|(_, _, ws)| ws.id() == active_before)
+        .unwrap();
+
+    let (x, y) = thumbnail_center(&mut f, active_idx);
+    pointer_motion_to(&mut f, x, y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "the active thumbnail must not open the overview"
+    );
+    assert_eq!(
+        f.synoik().layout.active_workspace().unwrap().id(),
+        active_before,
+        "and must not switch anywhere"
+    );
+}
+
+/// Dragging a peeked thumbnail reorders the workspaces, exactly as it does on the overview's strip
+/// — it is the same strip and the same grab.
+#[test]
+fn dragging_a_peeked_thumbnail_reorders_the_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, _)| idx)
+            .expect("the window must be on a workspace")
+    };
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (0, 1),
+        "precondition"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, t0x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t1x + 1., t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (1, 0),
+        "dragging a peeked thumbnail past its neighbour must reorder the workspaces"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and must not open the overview on the way"
+    );
+}
+
+/// Carrying a window toward a peeked strip shrinks it toward thumbnail size, so what you are
+/// aiming with is the size of what you are aiming at. Derived from the pointer's distance to the
+/// band rather than animated, so carrying it back down grows it again on the way.
+#[test]
+fn carrying_a_window_toward_the_peeked_strip_shrinks_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    // Grab the focused window low on the screen and read its drawn size there.
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let rect = f.synoik().layout.window_render_rect(&win, &out).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, 960., 900.);
+    f.run_frames_for(Duration::from_millis(50));
+    let far = f
+        .synoik()
+        .layout
+        .interactive_move_drawn_size()
+        .expect("the drag must be in flight");
+
+    // Now carry it up into the strip.
+    let (tx, ty) = thumbnail_center(&mut f, 0);
+    pointer_motion_to(&mut f, tx, ty);
+    f.run_frames_for(Duration::from_millis(50));
+    let near = f
+        .synoik()
+        .layout
+        .interactive_move_drawn_size()
+        .expect("still dragging");
+
+    assert!(
+        near.w < far.w && near.h < far.h,
+        "the window must shrink as it is carried into the strip: {far:?} -> {near:?}"
+    );
+
+    // And back down again: the pull is the pointer's position, not a one-way animation.
+    pointer_motion_to(&mut f, 960., 900.);
+    f.run_frames_for(Duration::from_millis(50));
+    let back = f
+        .synoik()
+        .layout
+        .interactive_move_drawn_size()
+        .expect("still dragging");
+    assert!(
+        back.w > near.w,
+        "carrying it back down must grow it again: {near:?} -> {back:?}"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+}
+
+/// Releasing the overlay key mid-drag must not yank the strip out from under the grab: the drag is
+/// still aiming at it. Not a latch — the strip is no longer *usable*, it is only not torn down
+/// while something holds its geometry.
+#[test]
+fn releasing_super_mid_drag_keeps_the_strip_until_the_drop() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, t0x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t1x + 1., t0y);
+
+    // The key comes up in the middle of the reorder.
+    f.key_release(KEY_LEFTMETA);
+    f.run_frames_for(Duration::from_millis(50));
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "the strip must survive the key while the grab still needs it"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "and go as soon as the drop lands"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "without falling through to the overlay-key tap"
     );
 }
 

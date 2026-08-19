@@ -2759,6 +2759,11 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// Drops the drag without reordering (the overview closing under it, a
     /// cancelled grab).
+    /// Whether a thumbnail is currently being carried along the strip.
+    pub fn is_thumb_dragging(&self) -> bool {
+        self.thumb_drag.is_some()
+    }
+
     pub fn cancel_thumb_drag(&mut self) {
         let was = self.thumb_xs();
         if self.thumb_drag.take().is_some() {

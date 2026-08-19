@@ -566,6 +566,14 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// `SCALE_ANIMATION_TIME` (`dnd.js:261-288`), so a drag across the row
     /// carries something small enough to see the target under.
     pub(self) expose_dnd_shrink: Option<Animation>,
+    /// How far the dragged tile has shrunk toward the workspace peek's thumbnail size as the
+    /// pointer climbs toward the strip (`docs/fork/workspace-peek.md`): 1 is untouched, and the
+    /// floor is the strip's own scale, at which the tile is exactly thumbnail-sized.
+    ///
+    /// Restated every frame by [`Layout::update_render_elements`] from the pointer's distance to
+    /// the band, so it needs no animation of its own — it rides the pointer, and nothing has to
+    /// remember to reset it when the drag leaves the strip.
+    pub(self) peek_shrink: f64,
 }
 
 #[derive(Debug)]
@@ -756,14 +764,16 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
     /// `WINDOW_DND_SIZE` as the drag gets going.
     fn expose_extra_scale(&self, zoom: f64) -> f64 {
         let Some(pickup) = self.expose_pickup_size else {
-            return 1.;
+            // A plain desktop drag has no picker preview to fit — but it can still be carried
+            // toward a peeked strip, which is the only shrink it ever takes.
+            return self.peek_shrink;
         };
         let size = self.tile.tile_size();
         if size.w <= 0. || size.h <= 0. {
             return 1.;
         }
         let fit = f64::min(pickup.w / (size.w * zoom), pickup.h / (size.h * zoom));
-        fit * self.expose_dnd_shrink_factor(pickup)
+        fit * self.expose_dnd_shrink_factor(pickup) * self.peek_shrink
     }
 
     /// How far the drag actor has shrunk toward [`WINDOW_DND_SIZE`]: 1 at the
@@ -3219,6 +3229,48 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// How far a dragged window has shrunk toward the peeked strip, restated from the pointer's
+    /// distance to the band (`docs/fork/workspace-peek.md`).
+    ///
+    /// Derived rather than animated: the pointer *is* the progress, so carrying the window back
+    /// down grows it again on the way, and no path that ends a drag or a peek has to remember to
+    /// undo it.
+    ///
+    /// Driven from the drag and from [`Self::refresh`] alongside [`Self::sync_thumb_phantom`], and
+    /// **never** from `update_render_elements`, for the reason written there: state armed in the
+    /// render path is a cycle late and invisible to anything that does not draw.
+    fn update_peek_shrink(&mut self) {
+        let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move else {
+            return;
+        };
+
+        // Only a peek pulls: in the overview the drag already carries a picker preview, which has
+        // its own footprint rules.
+        let target = self
+            .monitors()
+            .find(|mon| mon.output == move_.output)
+            .filter(|mon| mon.strip_is_peek())
+            .and_then(|mon| mon.thumbnail_strip())
+            .map(|strip| (strip.band, strip.scale));
+
+        let shrink = match target {
+            Some((band, scale)) => {
+                // 1 at `PEEK_PULL_DISTANCE` below the band and further, the strip's own scale once
+                // the pointer is inside it. Clamped rather than extrapolated, so a pointer above
+                // the band does not invert the window.
+                let below = move_.pointer_pos_within_output.y - (band.loc.y + band.size.h);
+                let away = (below / PEEK_PULL_DISTANCE).clamp(0., 1.);
+                scale + (1. - scale) * away
+            }
+            None => 1.,
+        };
+
+        let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move else {
+            return;
+        };
+        move_.peek_shrink = shrink;
+    }
+
     fn update_insert_hint(&mut self, output: Option<&Output>) {
         let _span = tracy_client::span!("Layout::update_insert_hint");
 
@@ -4694,6 +4746,7 @@ impl<W: LayoutElement> Layout<W> {
                             },
                         )
                     }),
+                    peek_shrink: 1.,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4761,6 +4814,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.sync_thumb_phantom();
+        self.update_peek_shrink();
 
         true
     }
@@ -5428,6 +5482,14 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Whether something is holding on to the strip's geometry: a thumbnail being carried along
+    /// it, or a window being dragged toward it. Either one outlives the overlay key's release, and
+    /// tearing the strip down under it would leave the grab aiming at nothing.
+    pub fn strip_grab_in_flight(&self) -> bool {
+        matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_)))
+            || self.monitors().any(|mon| mon.is_thumb_dragging())
+    }
+
     /// Whether the workspace peek is up — what input goes by, as `overview_open` is for the
     /// overview. True the moment the hold fires, not when the slide lands.
     pub fn is_peeking(&self) -> bool {
@@ -5828,6 +5890,7 @@ impl<W: LayoutElement> Layout<W> {
         // the overview shut — leaves a slot open with nothing driving it. Reconciling
         // here eases it back rather than leaving the row a workspace too wide.
         self.sync_thumb_phantom();
+        self.update_peek_shrink();
 
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 
@@ -6157,6 +6220,13 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
 /// The strip's own transition, not the overview's: the peek is the row arriving, and it reads as
 /// the same movement whether a hold brought it or a drop re-laid it. It obeys the overview's
 /// animations-off switch, since that is the switch that turns off the thing it is part of.
+/// How far below the peeked strip a dragged window starts shrinking toward it
+/// (`docs/fork/workspace-peek.md`).
+///
+/// The pull has to begin well before the band, or the window snaps to thumbnail size at the last
+/// moment instead of reading as being carried into the strip.
+const PEEK_PULL_DISTANCE: f64 = 260.;
+
 fn peek_transition_config(options: &Options) -> synoik_config::Animation {
     synoik_config::Animation {
         off: options.animations.overview_open_close.0.off,
