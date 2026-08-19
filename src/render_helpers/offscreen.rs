@@ -275,12 +275,24 @@ impl Element for OffscreenRenderElement {
         Rectangle::from_size(self.src_size).to_f64()
     }
 
+    /// The group's own damage, in the output's coordinates.
+    ///
+    /// `src` is the part of the texture this element actually samples, and it draws it at
+    /// [`logical_size`](Self::logical_size) — which is `src` at `self.scale`, one buffer pixel to
+    /// one texture pixel. So the only conversion damage needs is that scale.
+    ///
+    /// It used to also scale by `texture_size / src.size`, as if the element stretched `src` across
+    /// the whole texture. That ratio is 1 exactly while the texture fits its contents, and the
+    /// texture is only ever reallocated to *grow* (`render` keeps an oversized one deliberately) —
+    /// so the moment a group shrank, every damage rect it reported was pushed outward by the
+    /// leftover slack. A 1% ratio put the ask 8 physical pixels to the right of what had actually
+    /// changed, leaving an unrepainted sliver every frame of any animation that shrinks the group.
+    /// Pinned by `what_the_screen_was_shown_is_the_scene_when_the_strip_stops`.
     fn damage_since(
         &self,
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        let texture_size = self.texture.size().to_f64();
         let src = self.src();
 
         self.damage_since(commit)
@@ -289,7 +301,6 @@ impl Element for OffscreenRenderElement {
                 let mut region = region.to_f64().intersection(src)?;
 
                 region.loc -= src.loc;
-                region = region.upscale(texture_size / src.size);
 
                 let logical = region.to_logical(self.scale, Transform::Normal, &src.size);
                 Some(logical.to_physical_precise_up(scale))

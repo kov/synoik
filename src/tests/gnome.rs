@@ -2298,10 +2298,6 @@ fn no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved() {
 /// swapchain buffer and x=1876 in the other, while a from-scratch render put it at x=1909. Two
 /// buffers holding two different frames of an ease whose end reached neither.
 #[test]
-#[ignore = "reproduces a real, unfixed bug: dropping a window onto an already-occupied thumbnail \
-            leaves that thumbnail's miniatures showing what the ease passed through rather than \
-            where it ended. The one-buffer target is wrong too, so the frame's damage simply does \
-            not cover what the frame changed. Un-ignore with the fix"]
 fn what_the_screen_was_shown_is_the_scene_when_the_strip_stops() {
     if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
         eprintln!(
@@ -29116,4 +29112,211 @@ fn a_key_during_a_switch_goes_to_the_window_being_left() {
         vec![(KEY_Z, WlKeyState::Pressed), (KEY_Z, WlKeyState::Released)],
         "the window being left still has the keyboard until the switch settles",
     );
+}
+
+/// Every frame's damage has to cover everything that frame changed.
+///
+/// This is the invariant underneath every stale-pixel bug we have chased: what the compositor asks
+/// to repaint must be a superset of what actually became different. Checked directly, per frame,
+/// rather than inferred from what a screen ends up holding — the same run composites each frame
+/// twice, once incrementally through a damage tracker (which reports the ask) and once from
+/// scratch (which is the truth), and compares this frame's truth against the last one's.
+///
+/// Per *pixel*, deliberately: subtracting the ask from the bounding box of the change reports every
+/// unchanged pixel that box happened to enclose, which is a false positive generator — it claimed
+/// four offending frames before this was fixed, all of them wallpaper inside a box.
+#[test]
+fn every_frames_damage_covers_what_that_frame_changed() {
+    use smithay::backend::renderer::element::Element as _;
+
+    if crate::render_helpers::vulkan::VulkanRenderer::new().is_err() {
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.synoik().wallpaper = crate::wallpaper::checker(3840, 2160, 120);
+    f.settle();
+
+    let id = f.add_client();
+    for (size, color) in [(896, 650), (896, 650), (1172, 1069)].into_iter().zip([
+        (0, u32::MAX, 0, u32::MAX),
+        (u32::MAX, 0, 0, u32::MAX),
+        (0, 0, u32::MAX, u32::MAX),
+    ]) {
+        let surface = map_window_sized(&mut f, id, size, None);
+        let w = f.client(id).window(&surface);
+        w.attach_solid_buffer(color.0, color.1, color.2, color.3);
+        w.commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+    let scale = Scale::from(out.current_scale().fractional_scale());
+    summon_peek(&mut f);
+    f.synoik().clock.unfreeze();
+
+    let band: Rectangle<i32, Physical> =
+        Rectangle::new(Point::from((0, 0)), Size::from((size.w, 460)));
+
+    let state = std::rc::Rc::new(std::cell::RefCell::new((
+        WarmTarget::new(&out, 1), // incremental, like a screen
+        WarmTarget::new(&out, 1), // cold, tracker reset every frame
+        Vec::<u8>::new(),         // previous cold band
+        0usize,                   // frame index
+        Vec::<String>::new(),     // findings
+    )));
+    {
+        let out2 = out.clone();
+        let state = state.clone();
+        f.synoik_state().backend.headless().frame_sink = Some(Box::new(move |vk, _o, elements| {
+            let mut st = state.borrow_mut();
+            let (ref mut warm, ref mut cold, ref mut prev, ref mut n, ref mut found) = *st;
+            *n += 1;
+
+            let asked = draw_reporting(vk, warm, size, elements);
+            cold.tracker =
+                smithay::backend::renderer::damage::OutputDamageTracker::from_output(&out2);
+            let now = draw_into(vk, cold, size, elements, true).expect("read");
+
+            if !prev.is_empty() {
+                // The bounding box of the change is not the change: subtracting the ask from a box
+                // reports every unchanged pixel the box happened to enclose. Ask the question per
+                // pixel — did this pixel change, and was it in any rect the frame asked for.
+                let mut bb: Option<(i32, i32, i32, i32)> = None;
+                let mut missed = 0u32;
+                for y in band.loc.y..band.size.h {
+                    for x in 0..size.w {
+                        let i = ((y * size.w + x) * 4) as usize;
+                        if now[i..i + 4] == prev[i..i + 4] {
+                            continue;
+                        }
+                        let p = Point::from((x, y));
+                        if asked.iter().any(|r| r.contains(p)) {
+                            continue;
+                        }
+                        missed += 1;
+                        bb = Some(match bb {
+                            None => (x, y, x, y),
+                            Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x), d.max(y)),
+                        });
+                    }
+                }
+                if let Some((x0, y0, x1, y1)) = bb {
+                    let changed = Rectangle::new(
+                        Point::from((x0, y0)),
+                        Size::from((x1 - x0 + 1, y1 - y0 + 1)),
+                    );
+                    let left = missed;
+                    if found.len() < 3 {
+                        let mut who = String::new();
+                        for e in elements {
+                            let g = e.geometry(scale);
+                            if g.intersection(changed).is_some() {
+                                let d = format!("{e:?}");
+                                who.push_str(&format!(
+                                    "\n      {}x{}+{}+{}  {}",
+                                    g.size.w,
+                                    g.size.h,
+                                    g.loc.x,
+                                    g.loc.y,
+                                    &d[..d.len().min(150)]
+                                ));
+                            }
+                        }
+                        found.push(format!(
+                            "frame {n}: {left} pixels changed that nothing asked for, within {}x{}+{}+{}\n    asked={asked:?}\n    elements over it:{who}",
+                            changed.size.w, changed.size.h, changed.loc.x, changed.loc.y
+                        ));
+                    }
+                }
+            }
+            *prev = now;
+        }));
+    }
+
+    let settle = |f: &mut Fixture| {
+        let t = out.clone();
+        f.dispatch_until(Duration::from_millis(1500), move |s| {
+            s.synoik
+                .anim_causes(&t)
+                .difference(crate::frame_log::AnimCauses::ONGOING)
+                .is_empty()
+        });
+        f.dispatch_until(Duration::from_millis(200), |_| false);
+    };
+    settle(&mut f);
+
+    let mut occupied: Option<usize> = None;
+    for _ in 0..3 {
+        let win = f.synoik().layout.focus().unwrap().window.clone();
+        let target = occupied.unwrap_or(f.synoik().layout.workspaces().count() - 1);
+        let rect = f.synoik().layout.window_render_rect(&win, &out).unwrap();
+        pointer_motion_to(
+            &mut f,
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        );
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(&mut f, 1536., 1400.);
+        settle(&mut f);
+        let (tx, ty) = thumbnail_center(&mut f, target);
+        pointer_motion_to(&mut f, tx, ty);
+        settle(&mut f);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        settle(&mut f);
+        occupied.get_or_insert(target);
+    }
+    settle(&mut f);
+    f.synoik_state().backend.headless().frame_sink = None;
+
+    let st = state.borrow();
+    assert!(
+        st.3 >= 20,
+        "precondition: the gesture must have made the compositor draw — it drew {} frames",
+        st.3
+    );
+    assert!(
+        st.4.is_empty(),
+        "over {} frames, a frame changed pixels it never asked to repaint:\n{}",
+        st.3,
+        st.4.join("\n")
+    );
+}
+
+/// `draw_into`, reporting the damage the tracker asked for.
+fn draw_reporting(
+    renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    target: &mut WarmTarget,
+    size: Size<i32, Physical>,
+    elements: &[OutputRenderElements],
+) -> Vec<Rectangle<i32, Physical>> {
+    use smithay::backend::renderer::Offscreen as _;
+
+    while target.textures.len() < target.buffers {
+        let tex = renderer
+            .create_buffer(
+                crate::render_helpers::NATIVE_FOURCC,
+                size.to_logical(1).to_buffer(1, Transform::Normal),
+            )
+            .expect("create");
+        target.textures.push(tex);
+    }
+    let age = target.age();
+    let slot = target.frame % target.buffers;
+    target.frame += 1;
+    let texture = &mut target.textures[slot];
+    let mut fb = renderer.bind_preserving(texture).expect("bind");
+    let res = target
+        .tracker
+        .render_output(renderer, &mut fb, age, elements, Color32F::BLACK)
+        .expect("composite");
+    res.damage.cloned().unwrap_or_default()
 }
