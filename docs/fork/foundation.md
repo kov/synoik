@@ -522,6 +522,14 @@ Slottable any time:
   without buying it with idle wakeups. We already have the whole cross-context toolkit and it is
   proven in production — importing a client's dmabuf *is* sampling another context's render, and the
   worker would be a client we own. Images must be dmabuf-backed with modifiers to cross the boundary.
+- **Make the damage overlay usable as an instrument.** `msg action debug-toggle-damage` already
+  tints repainted regions, but it answers a *different* question from the one it looks like it
+  answers: it runs its own `OutputDamageTracker` at age 1 over the element list, so it reports what
+  a one-frame-old buffer would need, never what the screen was actually told to repaint (planes
+  included) — that is `SYNOIK_DEBUG_DAMAGE`, §4. It is also self-feeding: the tint elements are
+  themselves damage, so the overlay perturbs what it measures. Wanted: pick the reported age over
+  IPC, take the rects from the composed frame's result rather than a private tracker, and keep the
+  tint out of its own input. Until then, read the log and treat the overlay as a locator only.
 - **An arena for reconstructible caches**, without which the `madvise` options in §3 cannot be
   expressed at all.
 - **Read `heapBudget` from `VK_EXT_memory_budget`.** The extension is available under
