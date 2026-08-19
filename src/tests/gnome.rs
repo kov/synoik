@@ -2284,6 +2284,199 @@ fn no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved() {
     );
 }
 
+/// Everything the screen was shown, once the strip has stopped moving, must be the scene.
+///
+/// The difference from [`no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved`] is *when*
+/// frames happen. That probe composites one frame per 16 ms tick, unconditionally — so a frame the
+/// compositor never rendered gets drawn by the probe anyway, and an artifact whose whole nature is
+/// a missing repaint is invisible to it. Here the backend hands over each frame it actually
+/// renders ([`Headless::frame_sink`]), on the turns its own redraw machinery chose, at its own
+/// clock; the test composites on no schedule of its own. The clock is left running for the same
+/// reason — the frame timer is a real one, and freezing it would decide the sampling.
+///
+/// Measured on kov's seat 2026-08-19: after a drop, a miniature's left edge sat at x=1866 in one
+/// swapchain buffer and x=1876 in the other, while a from-scratch render put it at x=1909. Two
+/// buffers holding two different frames of an ease whose end reached neither.
+#[test]
+#[ignore = "reproduces a real, unfixed bug: dropping a window onto an already-occupied thumbnail \
+            leaves that thumbnail's miniatures showing what the ease passed through rather than \
+            where it ended. The one-buffer target is wrong too, so the frame's damage simply does \
+            not cover what the frame changed. Un-ignore with the fix"]
+fn what_the_screen_was_shown_is_the_scene_when_the_strip_stops() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping what_the_screen_was_shown_is_the_scene_when_the_strip_stops: no Vulkan ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.synoik().wallpaper = crate::wallpaper::checker(3840, 2160, 120);
+    f.settle();
+
+    let id = f.add_client();
+    let sizes = [(896, 650), (896, 650), (1172, 1069)];
+    let colors = [
+        (0, u32::MAX, 0, u32::MAX),
+        (u32::MAX, 0, 0, u32::MAX),
+        (0, 0, u32::MAX, u32::MAX),
+    ];
+    for (size, color) in sizes.into_iter().zip(colors) {
+        let surface = map_window_sized(&mut f, id, size, None);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(color.0, color.1, color.2, color.3);
+        window.commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+
+    summon_peek(&mut f);
+    // `summon_peek` runs frames, which freezes the clock. From here the compositor's own timer
+    // decides when to draw, so the clock has to follow real time again.
+    f.synoik().clock.unfreeze();
+
+    let (band, below_panel) = {
+        let mon = f.synoik().layout.monitor_for_output(&out).unwrap();
+        let band = mon.thumbnail_strip().expect("the strip is up").band;
+        let scale = out.current_scale().fractional_scale();
+        (
+            Rectangle::new(
+                band.loc - Point::from((0., 60.)),
+                band.size + Size::from((0., 120.)),
+            )
+            .to_physical_precise_round(scale),
+            Rectangle::new(band.loc, band.size + Size::from((0., 60.)))
+                .to_physical_precise_round(scale),
+        )
+    };
+
+    // The target the backend composites into, and a count of the frames it was given. The count is
+    // the precondition: a run that rendered almost nothing would agree with the scene trivially.
+    let warm = std::rc::Rc::new(std::cell::RefCell::new(WarmTarget::new(
+        &out,
+        SCREEN_BUFFERS,
+    )));
+    let drawn = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let single = std::rc::Rc::new(std::cell::RefCell::new(WarmTarget::new(&out, 1)));
+    {
+        let warm = warm.clone();
+        let single = single.clone();
+        let drawn = drawn.clone();
+        f.synoik_state().backend.headless().frame_sink =
+            Some(Box::new(move |vk, _out, elements| {
+                drawn.set(drawn.get() + 1);
+                draw_into(vk, &mut warm.borrow_mut(), size, elements, false);
+                draw_into(vk, &mut single.borrow_mut(), size, elements, false);
+            }));
+    }
+
+    // Let the compositor draw on its own schedule, in real time, until it has nothing left to
+    // animate — then a little longer, because the frame that lands an animation's final value is
+    // the one this whole probe exists to catch.
+    let settle = |f: &mut Fixture| {
+        let target = out.clone();
+        f.dispatch_until(Duration::from_millis(1500), move |state| {
+            state
+                .synoik
+                .anim_causes(&target)
+                .difference(crate::frame_log::AnimCauses::ONGOING)
+                .is_empty()
+        });
+        f.dispatch_until(Duration::from_millis(200), |_| false);
+    };
+
+    settle(&mut f);
+    let before = drawn.get();
+
+    // Drop onto a thumbnail that is **already occupied**, which the row-growing gesture never
+    // does. A workspace gaining a second window re-lays out the picker inside its miniature, and
+    // every preview already there eases from where it was to where the new layout puts it
+    // (`slide_expose_slots_from`). That ease, inside a thumbnail, is the one the seat caught
+    // drifting: rects `250x200+1879+114` down to `232x200+1922+114`, and then silence.
+    let mut occupied: Option<usize> = None;
+    for _ in 0..3 {
+        let win = f
+            .synoik()
+            .layout
+            .focus()
+            .expect("a window is focused")
+            .window
+            .clone();
+        let target = occupied.unwrap_or(f.synoik().layout.workspaces().count() - 1);
+        let rect = f
+            .synoik()
+            .layout
+            .window_render_rect(&win, &out)
+            .expect("the focused window is on screen");
+        pointer_motion_to(
+            &mut f,
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        );
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(&mut f, 1536., 1400.);
+        settle(&mut f);
+
+        let (tx, ty) = thumbnail_center(&mut f, target);
+        pointer_motion_to(&mut f, tx, ty);
+        settle(&mut f);
+
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        settle(&mut f);
+        // From here on, aim at the workspace the first window landed on, so the next drop arrives
+        // where there is already something to re-lay out around.
+        occupied.get_or_insert(target);
+    }
+
+    settle(&mut f);
+    let rendered = drawn.get() - before;
+
+    // Stop taking frames before reading: the readback is only sound on a target nothing else is
+    // writing, and from here the test is the only one looking.
+    f.synoik_state().backend.headless().frame_sink = None;
+    assert!(
+        rendered >= 20,
+        "precondition: the gesture must have made the compositor draw — it drew {rendered} frames, \
+         which is too few to have animated anything"
+    );
+
+    let held = {
+        let mut warm = warm.borrow_mut();
+        read_buffers(&mut f, &out, &mut warm)
+    };
+    let one = {
+        let mut single = single.borrow_mut();
+        read_buffers(&mut f, &out, &mut single)
+    };
+    let cold = cold_frame(&mut f, &out);
+    // A screen with a single buffer only ever needs the last frame's damage. If even that one
+    // disagrees with the scene, nothing about buffer age is involved: the frame's damage did not
+    // cover what the frame changed, and a screen of any depth would show it. Reported alongside
+    // the assertion because it is the first thing worth knowing when this fails.
+    let age_one = stale_bounds(&one[0], &cold, size, below_panel);
+    let stale: Vec<_> = held
+        .iter()
+        .map(|buffer| stale_bounds(buffer, &cold, size, below_panel))
+        .collect();
+    let between = stale_bounds(&held[0], &held[held.len() - 1], size, band);
+    assert_eq!(
+        (stale.as_slice(), between),
+        (vec![None; held.len()].as_slice(), None),
+        "after {rendered} rendered frames, a buffer the screen was shown is not the scene \
+         (a one-buffer screen is wrong too: {age_one:?} — so this is not about buffer age)"
+    );
+}
+
 /// Mark or clear a rect in a full-output bitmap.
 fn paint(bits: &mut [bool], w: usize, h: usize, rect: &Rectangle<i32, Physical>, on: bool) {
     let x0 = rect.loc.x.max(0) as usize;

@@ -80,7 +80,29 @@ pub struct Headless {
     /// The `zwp_linux_dmabuf_v1` global, once [`add_dmabuf_global`](Self::add_dmabuf_global) has
     /// found a render node to advertise. `None` means clients only ever see shm.
     dmabuf_global: Option<DmabufGlobal>,
+    /// Where a test may composite the frames this backend renders, and only those.
+    ///
+    /// Headless paints nothing persistent: it runs the element pass to learn what the output
+    /// presents and throws the pixels away. A test that wants to know what a *screen* would be
+    /// holding has to accumulate them itself — and the one thing it must not do is composite on
+    /// its own schedule, because then it draws frames the compositor never asked for. That is not
+    /// a hypothetical: a probe that composited every 16 ms tick could not see an artifact whose
+    /// whole nature is a frame that was never rendered. This hands over the real element list, at
+    /// the real clock, on exactly the turns the redraw machinery decided to render.
+    #[cfg(test)]
+    pub(crate) frame_sink: Option<FrameSink>,
 }
+
+/// A test's hook into [`Headless::render`]: the renderer, the output, and the element list of a
+/// frame the compositor actually decided to draw.
+#[cfg(test)]
+pub(crate) type FrameSink = Box<
+    dyn FnMut(
+        &mut crate::render_helpers::vulkan::VulkanRenderer,
+        &Output,
+        &[crate::synoik::OutputRenderElements],
+    ),
+>;
 
 impl Headless {
     pub fn new() -> Self {
@@ -91,6 +113,8 @@ impl Headless {
             #[cfg(feature = "xdp-gnome-screencast")]
             gbm: None,
             dmabuf_global: None,
+            #[cfg(test)]
+            frame_sink: None,
         }
     }
 
@@ -318,6 +342,12 @@ impl Headless {
             appearance: Some(synoik.appearance()),
         };
         let elements = synoik.render_to_vec(ctx, output, true);
+
+        #[cfg(test)]
+        if let Some(sink) = &mut self.frame_sink {
+            let renderer = self.renderer.as_mut().expect("checked just above");
+            sink(renderer, output, &elements);
+        }
 
         let mut damage_tracker = OutputDamageTracker::from_output(output);
         match damage_tracker.damage_output(1, &elements) {
