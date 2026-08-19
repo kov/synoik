@@ -3338,7 +3338,7 @@ checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/kov/smithay.git?branch=synoik#51fbdbeec3a920ced20242c5c9764485782af896"
+source = "git+https://github.com/kov/smithay.git?branch=synoik#189c57fde0b955977015a28c6ee0659df32daa3a"
 dependencies = [
  "appendlist",
  "atomic_float",
@@ -3380,7 +3380,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/kov/smithay.git?branch=synoik#51fbdbeec3a920ced20242c5c9764485782af896"
+source = "git+https://github.com/kov/smithay.git?branch=synoik#189c57fde0b955977015a28c6ee0659df32daa3a"
 dependencies = [
  "drm",
  "libdisplay-info",

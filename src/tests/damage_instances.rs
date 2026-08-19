@@ -90,19 +90,21 @@ fn covered(damage: &[Vec<Rectangle<i32, Physical>>], rect: Rectangle<i32, Physic
     left.is_empty()
 }
 
-/// A vacated instance leaves no damage when the count shrinks, and nothing later heals it.
+/// A vacated instance is damaged when the count shrinks, even though a sibling stayed put.
 ///
-/// The tracker matches an instance against *any* remembered one (`instance_matches` is an `.any()`)
-/// and `elements_gone` is keyed on an Id being absent altogether. So when one of an Id's instances
-/// goes away while another stays put, the survivor takes the cheap branch and the Id is still
-/// present: the rect the departed instance covered is asked for by nobody, in that frame or any
-/// after it. On a screen that cycles buffers the pixels sit in the buffer that missed the repaint
-/// and surface every time it comes round — which is what a workspace thumbnail alternating between
-/// two positions at frame parity looks like.
+/// This is a **fork fix**. The tracker matches an instance against *any* remembered one
+/// (`instance_matches` is an `.any()`) and `elements_gone` is keyed on an Id being absent
+/// altogether, so when one of an Id's instances went away while another stayed put, the survivor
+/// took the cheap branch and the Id was still present — the rect the departed instance covered was
+/// asked for by nobody, in that frame or any after it. The fork now damages an Id's whole
+/// remembered instance list when its count shrinks.
+///
+/// The case is reachable — a live seat's log named window surfaces going two instances to one with
+/// on-screen rects vacated. It was **not** the cause of the workspace-peek thumbnail artifact,
+/// though it fits that description well enough that it was fixed on suspicion: the artifact
+/// survived this, and the instrument logged zero events during a reproduction of it. That one was
+/// `OffscreenRenderElement::damage_since` scaling its rects by texture-versus-contents slack.
 #[test]
-#[ignore = "the gap is real and unfixed: the vacated rect is asked for by nobody, ever. The fix is \
-            in the smithay fork (damage every remembered instance when the count shrinks) and \
-            shipping it means pushing the fork, so it waits for that. Un-ignore with the fix"]
 fn a_departed_instance_leaves_its_rect_behind() {
     let id = Id::new();
     let other = Id::new();
