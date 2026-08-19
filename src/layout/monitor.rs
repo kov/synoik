@@ -2365,6 +2365,14 @@ impl<W: LayoutElement> Monitor<W> {
         if self.options.layout.windowing_mode != WindowingMode::Floating {
             return None;
         }
+        // A fullscreen window takes a render branch with no thumbnails group in it
+        // (`docs/fork/workspace-peek.md` §8), so a peek has nowhere to draw here. Refusing it at
+        // the strip's one funnel is what keeps that honest: nothing is drawn, nothing is hit, and
+        // no drop lands. The dock is held back to match, so a peek over a fullscreen window
+        // presents nothing at all rather than the dash on its own.
+        if self.render_above_top_layer() {
+            return None;
+        }
         (self.peek_progress > 0.).then_some(self.peek_progress)
     }
 
@@ -2372,7 +2380,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// picks its band, since the overview's row is allocated among the overview's chrome and the
     /// peek's is not.
     pub fn strip_is_peek(&self) -> bool {
-        self.expose_progress().is_none() && self.peek_progress > 0.
+        self.expose_progress().is_none() && self.strip_progress().is_some()
     }
 
     /// The peek's band: full width, pinned at the top of the work area, a thumbnail's height.
@@ -3117,13 +3125,6 @@ impl<W: LayoutElement> Monitor<W> {
     /// swallows the pointer and what accepts a drop are the same rectangle.
     pub fn peek_takes_pointer(&self, pos_within_output: Point<f64, Logical>) -> bool {
         if !self.strip_is_peek() {
-            return false;
-        }
-        // Over a fullscreen window the strip is not drawn at all — that render branch has no
-        // thumbnails group yet (`docs/fork/workspace-peek.md` §8). Taking the pointer where
-        // nothing is painted would be an invisible dead zone; drop this when the branch grows
-        // the strip.
-        if self.render_above_top_layer() {
             return false;
         }
         let Some(strip) = self.thumbnail_strip() else {

@@ -877,6 +877,119 @@ fn holding_super_in_the_overview_does_not_peek() {
     );
 }
 
+/// Over a fullscreen window the peek presents nothing. The strip has no render branch to draw
+/// in there (`docs/fork/workspace-peek.md` §8), and half a gesture — the dash out, the strip
+/// missing — is worse than none, so the dock is held back to match.
+///
+/// The peek's *state* still stands, so the release dismisses instead of falling through to the
+/// tap and opening the overview over the fullscreen window.
+#[test]
+fn a_peek_over_a_fullscreen_window_shows_neither_strip_nor_dock() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+
+    // The control: windowed, the hold brings out both halves.
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .thumbnails_visible(),
+        "the control: windowed, the hold brings the strip down"
+    );
+    assert!(
+        f.synoik().dock.area(&output).is_some(),
+        "the control: and the dock out with it"
+    );
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    pointer_motion_to(&mut f, 960., 400.);
+    f.advance_clock(Duration::from_millis(600));
+    f.settle();
+
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+    assert!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .render_above_top_layer(),
+        "precondition: the window renders above the top layer"
+    );
+    assert!(
+        f.synoik().dock.area(&output).is_none(),
+        "precondition: the dock is away"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(
+        !f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .thumbnails_visible(),
+        "no strip over a fullscreen window"
+    );
+    assert!(
+        f.synoik().dock.area(&output).is_none(),
+        "and no dash either — the peek presents nothing, not half of itself"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "the release still dismisses rather than falling through to the tap"
+    );
+}
+
+/// Super+MMB is the resize chord, and a chord stands the peek down and then does its work.
+#[test]
+fn the_resize_chord_dismisses_the_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = map_window_sized(&mut f, id, (800, 600), None);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "precondition: the strip is down"
+    );
+
+    // Onto the window, well clear of the strip's band at the top.
+    pointer_motion_to(&mut f, 960., 700.);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the resize chord must put the strip away"
+    );
+
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and the key release that follows a chord opens nothing"
+    );
+}
+
 /// A peek cannot outlive the session locking: the shield swallows the overlay key's release, so
 /// nothing else would ever put the strip away.
 #[test]

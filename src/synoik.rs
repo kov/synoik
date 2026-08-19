@@ -10298,7 +10298,11 @@ impl Synoik {
         // hold shows the dock at all: dragging an icon onto a thumbnail needs a dock to drag it
         // from, and the dock's own reveal is a push into the bottom edge nobody can perform while
         // the pointer is travelling to the top of the screen (`docs/fork/workspace-peek.md`).
-        self.dock.set_peeked(self.peek_up);
+        // The dock is the peek's other half, so it comes out only where the strip does: over a
+        // fullscreen window the strip has no render branch to draw in, and the dash alone would
+        // be half a gesture. Re-stated every frame like every other dock hold.
+        self.dock
+            .set_peeked(self.peek_up && !self.peek_is_over_fullscreen());
         // The hold's deadline, checked here rather than in its timer callback so the clock alone
         // decides when the strip comes down.
         self.advance_peek();
@@ -15579,9 +15583,24 @@ impl Synoik {
         }
 
         if let Some(output) = self.layout.active_output().cloned() {
-            self.dock.show(&output);
+            // Same gate as the hold in `advance_animations`: nothing of the peek's furniture
+            // comes out where the strip cannot draw.
+            if !self.peek_is_over_fullscreen() {
+                self.dock.show(&output);
+            }
         }
         self.queue_redraw_all();
+    }
+
+    /// Whether the output the peek would come down on is showing a fullscreen window, where the
+    /// strip refuses to draw (`Monitor::strip_progress`). The peek's *state* still stands there —
+    /// a release must not fall through to the tap and open the overview — it simply presents
+    /// nothing.
+    fn peek_is_over_fullscreen(&self) -> bool {
+        self.layout
+            .active_output()
+            .and_then(|output| self.layout.monitor_for_output(output))
+            .is_some_and(|mon| mon.render_above_top_layer())
     }
 
     /// Disarm the hold and put the strip away. Returns whether it had come down — which is what

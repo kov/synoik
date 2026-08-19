@@ -176,6 +176,11 @@ the modifier-drag gestures. In the overview that ordering was free, because Supe
 considered.** Outside the band, Super+drag keeps its meaning — which is what makes "grab a window,
 carry it up to the strip" work.
 
+Outside the band the pointer chords split. **Super+MMB, the resize chord, stands the peek down and
+then resizes**, exactly as a keyboard chord does. **Super+LMB does not**: carrying a window up to
+the strip is the peek's headline gesture, and dismissing on its press would take the target
+away.
+
 ### 7. Z-order and the top edge
 
 The thumbnails group is pushed *after* the `Top` and `Overlay` layers (`src/synoik.rs:11318`,
@@ -191,12 +196,20 @@ corner is suppressed while the peek is up.
 
 ### 8. A fullscreen window takes a render branch that has no strip
 
-When `render_above_top_layer()` (`:3088`) is true, `src/synoik.rs:11323` takes a branch that never
-calls `render_thumbnails`, has no close-button chrome, and no alpha group. **The peek draws over
-fullscreen** — that is where switching workspaces is most wanted — so that branch grows the same
-group. Note that clicking a thumbnail flips `render_above_top_layer()` false the moment the switch
-starts (`:3089`), swapping render branches mid-animation; the strip must be continuous across that
-swap.
+When `render_above_top_layer()` is true the render takes a branch that never calls
+`render_thumbnails`, has no close-button chrome and no alpha group.
+
+**Until that branch grows the strip, the peek presents nothing there** — not the strip, and not the
+dash either. Half a gesture is worse than none: the dock coming out over a fullscreen window with no
+strip above it is furniture for a thing that is not happening. The refusal lives in
+`Monitor::strip_progress`, the strip's one funnel, so nothing is drawn, nothing is hit and no drop
+lands; `Synoik::peek_is_over_fullscreen` holds the dock back to match. The peek's *state* still
+stands, so the release dismisses rather than falling through to the tap and opening the overview.
+
+Whether the peek should instead **draw** over fullscreen — that is arguably where switching
+workspaces is most wanted — is open. If it does, note that clicking a thumbnail flips
+`render_above_top_layer()` false the moment the switch starts, swapping render branches
+mid-animation; the strip must be continuous across that swap.
 
 ### 9. Teardown
 
@@ -263,6 +276,8 @@ the hold rather than sleeping:
 - drag a dock icon onto a thumbnail → the app launched on that workspace
 - Super held past the threshold *while already dragging a window* → the strip comes down
 - the top-left hot corner while peeked → the overview did not open
+- Super+MMB while peeked → the strip is gone, and the release that follows opens nothing
+- hold over a fullscreen window → neither strip nor dash, and the release opens no overview
 - the pointer over a peeked thumbnail → the window under it holds neither surface nor activation,
   and takes both back when the peek goes
 - lock while peeked → the strip is gone

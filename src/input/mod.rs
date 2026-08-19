@@ -7461,6 +7461,17 @@ impl State {
                 return;
             }
 
+            // Super+MMB — the resize chord — stands the peek down and then does its work, the
+            // same rule the keyboard chords follow (`docs/fork/workspace-peek.md`). Taken here
+            // rather than at the resize itself so it holds whether or not a window is under the
+            // pointer: the chord was pressed either way. Super+LMB is deliberately not in here —
+            // carrying a window up to the strip is the peek's headline gesture, and dismissing on
+            // its press would take the target away. A press *on* the strip never reaches this
+            // far: it was handled above.
+            if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
+                self.synoik.end_peek();
+            }
+
             if let Some(mapped) = self.synoik.window_under_cursor() {
                 let window = mapped.window.clone();
 
