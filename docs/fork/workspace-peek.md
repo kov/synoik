@@ -9,12 +9,15 @@ is the specification.
 
 ## The gesture
 
-**Hold the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) and press Shift.** Out
+**Hold the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) and hit Shift.** Out
 come the overview's two pieces of furniture over the live desktop: the workspace thumbnail strip
 slides down from the top of the work area, semi-transparent, and the dock slides up from the bottom.
 Nothing else changes — no window spread, no search entry, no dimming, and the windows do not move.
 **The overlay key is the hold**: releasing it puts both away, whatever Shift is doing. Shift is only
-the trigger, and letting go of it changes nothing.
+the trigger, and letting go of it changes nothing — but hitting it again **toggles**, so the key
+that summoned the strip also dismisses it without letting go of Super. Either Shift triggers: the
+gesture is "the hand already on Super, the other thumb on Shift", and which one that is depends on
+the hand.
 
 The trigger is a *key*, not a *duration*. A hold cannot be one, because Super held down already
 means something: it is the modifier half of Super+drag, of Super+click, and of every Super chord.
@@ -24,6 +27,7 @@ window to the top edge to maximize it takes longer than any threshold worth havi
 | what happens | result |
 | --- | --- |
 | Shift, with the overlay key held | the strip comes down |
+| Shift again, still held | the strip goes away; the next hit brings it back |
 | release the overlay key | the strip dismisses; the overview does **not** open |
 | release Shift, keep holding | nothing — the strip stays |
 | any other key while held | the strip dismisses (if up) and the chord fires |
@@ -35,6 +39,11 @@ window to the top edge to maximize it takes longer than any threshold worth havi
 Shift spends the overlay key's tap on the way in, exactly as any key pressed under Super always
 has, so the release that ends a peek was never going to open the overview anyway. The peek claims it
 regardless, because it must **forward** that release where the tap swallows it (§4).
+
+A toggle acts on the trigger's **edge**, so a repeat of a Shift already down flips nothing. A
+physical keyboard never repeats a press without a release — repeat is generated client-side from the
+keymap — but a `zwp_virtual_keyboard` client can send anything, and the old arm was idempotent where
+a toggle is not.
 
 The order is part of the gesture: Super, *then* Shift. An overlay key pressed while any other
 modifier is already down never arms — mutter's rule for the tap, which the peek inherits by riding
@@ -293,6 +302,7 @@ the inspectable model, and the tap limit is measured on the compositor clock, so
 the hold rather than sleeping:
 
 - Shift under a held overlay key → the strip is visible, the overview is closed, no window has moved
+- Shift again → the strip goes; again → it comes back; a repeat with no release in between → nothing
 - release the overlay key → the strip is gone, the overview did not open
 - release Shift and keep holding → the strip stays; the overlay key is the hold
 - an overlay key pressed *under* Shift → never a hold, and a later Shift summons nothing

@@ -927,6 +927,66 @@ fn a_long_super_hold_is_not_a_tap() {
     );
 }
 
+/// Each hit of the trigger flips the strip, so the key that summoned the peek dismisses it
+/// without letting go of the overlay key.
+#[test]
+fn a_second_shift_hit_puts_the_peek_away() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    summon_peek(&mut f);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "a second hit puts it away, with Super still held"
+    );
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "and a third brings it back — it is a toggle, not a one-shot"
+    );
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the overlay key is still the hold"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and none of that opened the overview"
+    );
+}
+
+/// A toggle acts on the trigger's *edge*. A physical keyboard never repeats a press without a
+/// release, but a virtual-keyboard client can send anything, and a repeat that flipped the strip
+/// would make the gesture flicker on someone else's timing.
+#[test]
+fn a_repeated_shift_press_does_not_flip_the_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    summon_peek(&mut f);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    for _ in 0..3 {
+        f.key_press(KEY_LEFTSHIFT);
+    }
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "a repeat is not an edge — the strip must not flip under it"
+    );
+}
+
 /// The peek outlives the Shift that summoned it: the *hold* is what keeps it up.
 #[test]
 fn releasing_shift_keeps_the_peek_up() {

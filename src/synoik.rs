@@ -877,6 +877,11 @@ pub struct Synoik {
     /// desync waiting for a path that clears only one, and a stale instant reads every later tap
     /// as a long hold — which would make the overview unreachable by tap.
     pub overlay_key_hold: Option<(Keycode, Duration)>,
+    /// The peek's trigger key while it is down, so a key-repeat of it cannot toggle the strip
+    /// twice. A physical keyboard never repeats — repeat is generated client-side from the keymap
+    /// — but a `zwp_virtual_keyboard` client can send anything, and a toggle is not idempotent
+    /// the way the old arm was.
+    pub peek_trigger_held: Option<Keycode>,
     /// Whether the peek fired and the strip is up. Separate from [`Self::overlay_key_hold`]
     /// because the key can come up while a grab still holds the strip's geometry.
     pub peek_up: bool,
@@ -7770,6 +7775,7 @@ impl Synoik {
             overlay_key_armed: None,
             overlay_key_last_fired: None,
             overlay_key_hold: None,
+            peek_trigger_held: None,
             peek_up: false,
             peek_dismiss_pending: false,
             suppressed_buttons: HashSet::new(),
@@ -15577,13 +15583,35 @@ impl Synoik {
         Some(self.clock.now_unadjusted().saturating_sub(since))
     }
 
-    /// Shift went down while the overlay key was held: the strip comes down over the live desktop
-    /// and the dock comes out. Does nothing if no overlay key is held.
-    pub fn trigger_peek(&mut self) {
-        if self.overlay_key_hold.is_none() || self.peek_up {
+    /// Shift went down while the overlay key was held: **toggle** the strip. Each hit of the
+    /// trigger flips it, so the same key that summoned the peek dismisses it without letting go
+    /// of the overlay key. Does nothing if no overlay key is held.
+    ///
+    /// Ignores a repeat of the trigger key that is already down: a toggle acts on the *edge*, and
+    /// a repeat is not one.
+    pub fn toggle_peek(&mut self, trigger: Keycode) {
+        if self.overlay_key_hold.is_none() || self.peek_trigger_held == Some(trigger) {
             return;
         }
-        self.start_peek();
+        self.peek_trigger_held = Some(trigger);
+
+        if !self.peek_up {
+            self.start_peek();
+        } else if self.peek_dismiss_pending {
+            // Already on its way out, waiting on a grab that is still aiming at the strip. The
+            // strip is on screen, so the toggle that "brings it back" is cancelling that.
+            self.peek_dismiss_pending = false;
+        } else {
+            self.dismiss_peek();
+        }
+    }
+
+    /// The trigger key came up. Nothing toggles — the overlay key is the hold — but the next
+    /// press of it is an edge again.
+    pub fn release_peek_trigger(&mut self, trigger: Keycode) {
+        if self.peek_trigger_held == Some(trigger) {
+            self.peek_trigger_held = None;
+        }
     }
 
     /// The peek fires: the strip comes down over the live desktop and the dock comes out.
@@ -15625,7 +15653,12 @@ impl Synoik {
     /// behind is not self-healing: every path that can swallow the key's release must reach here.
     pub fn end_peek(&mut self) -> bool {
         self.overlay_key_hold = None;
+        self.peek_trigger_held = None;
+        self.dismiss_peek()
+    }
 
+    /// Put the strip away without letting go of the overlay key — what a toggle does.
+    fn dismiss_peek(&mut self) -> bool {
         if !self.peek_up {
             return false;
         }

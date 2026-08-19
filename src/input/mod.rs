@@ -124,6 +124,13 @@ const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 /// this elapses and no timer is armed for it. It is read once, at the release.
 pub const OVERLAY_KEY_TAP_LIMIT: Duration = Duration::from_millis(500);
 
+/// Whether a keysym is the workspace peek's trigger (`docs/fork/workspace-peek.md`). Either Shift:
+/// the gesture is "the hand already on Super, the other thumb on Shift", and which one that is
+/// depends on the hand.
+fn is_peek_trigger_key(raw: Option<Keysym>) -> bool {
+    raw.is_some_and(|raw| matches!(raw, Keysym::Shift_L | Keysym::Shift_R))
+}
+
 /// Touchpad pixels per scroll step — mutter's `DISCRETE_SCROLL_STEP`
 /// (`src/backends/native/meta-seat-impl.c:62,1139`), which is the factor it divides libinput's
 /// pixel deltas by before handing Clutter a `dy`. GNOME's scroll consumers then read that `dy` as
@@ -964,11 +971,10 @@ impl State {
                         && !mods.iso_level3_shift
                         && !mods.iso_level5_shift;
                     // Shift is the peek's trigger, and the only key that does not end a held
-                    // overlay key's business: it summons the strip instead. It still clears the
+                    // overlay key's business: it toggles the strip instead. It still clears the
                     // tap like any other key, and it is still forwarded — a modifier the client
                     // does not see is a modifier it thinks is up.
-                    let is_peek_trigger = !is_overlay_key
-                        && raw.is_some_and(|raw| matches!(raw, Keysym::Shift_L | Keysym::Shift_R));
+                    let is_peek_trigger = !is_overlay_key && is_peek_trigger_key(raw);
 
                     this.synoik.overlay_key_armed = is_overlay_key.then_some(key_code);
                     if is_overlay_key {
@@ -976,12 +982,16 @@ impl State {
                     } else if is_peek_trigger {
                         // Does nothing unless an overlay key is actually held — Shift on its own,
                         // and Shift pressed *before* Super (which never arms, since arming
-                        // requires no other modifier), summon nothing.
-                        this.synoik.trigger_peek();
+                        // requires no other modifier), toggle nothing.
+                        this.synoik.toggle_peek(key_code);
                     } else {
                         // Another key: the chord takes over, and the strip goes with the tap.
                         this.synoik.end_peek();
                     }
+                } else if is_peek_trigger_key(raw) {
+                    // The trigger coming up toggles nothing — the overlay key is the hold — but
+                    // it makes the next press of it an edge again.
+                    this.synoik.release_peek_trigger(key_code);
                 } else if this
                     .synoik
                     .overlay_key_hold
