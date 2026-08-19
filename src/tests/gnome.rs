@@ -1481,17 +1481,41 @@ fn dropping_a_window_on_a_peeked_thumbnail_does_not_switch_to_it() {
     );
 }
 
+/// How many buffers a screen cycles through. Two is the least a real one ever has.
+const SCREEN_BUFFERS: usize = 2;
+
 /// A render target that persists across frames, the way a real output's does.
 struct WarmTarget {
     tracker: smithay::backend::renderer::damage::OutputDamageTracker,
-    texture: Option<crate::render_helpers::vulkan::VkTexture>,
+    /// One texture per buffer in the swapchain, drawn round-robin.
+    ///
+    /// A screen is not one surface repainted in place: a frame lands in whichever buffer came
+    /// free, and that buffer last held the frame *`buffers` ago*, so the tracker has to
+    /// repaint everything damaged since then. One buffer at age 1 asks a strictly easier
+    /// question — it only ever needs the last frame's damage — and that is not the question a
+    /// screen asks.
+    textures: Vec<crate::render_helpers::vulkan::VkTexture>,
+    buffers: usize,
+    frame: usize,
 }
 
 impl WarmTarget {
-    fn new(out: &Output) -> Self {
+    fn new(out: &Output, buffers: usize) -> Self {
         WarmTarget {
             tracker: smithay::backend::renderer::damage::OutputDamageTracker::from_output(out),
-            texture: None,
+            textures: Vec::new(),
+            buffers,
+            frame: 0,
+        }
+    }
+
+    /// The age of the buffer about to be drawn into: how many frames ago its contents were
+    /// current. Zero until every buffer has been drawn once — nothing is known about them yet.
+    fn age(&self) -> usize {
+        if self.frame < self.buffers {
+            0
+        } else {
+            self.buffers
         }
     }
 }
@@ -1514,24 +1538,27 @@ fn draw_into(
 ) -> Option<Vec<u8>> {
     use smithay::backend::renderer::{ExportMem as _, Offscreen as _};
 
-    let texture = match &mut target.texture {
-        Some(tex) => tex,
-        none => none.insert(
-            renderer
-                .create_buffer(
-                    crate::render_helpers::NATIVE_FOURCC,
-                    size.to_logical(1).to_buffer(1, Transform::Normal),
-                )
-                .expect("create the probe's render target"),
-        ),
-    };
+    while target.textures.len() < target.buffers {
+        let tex = renderer
+            .create_buffer(
+                crate::render_helpers::NATIVE_FOURCC,
+                size.to_logical(1).to_buffer(1, Transform::Normal),
+            )
+            .expect("create the probe's render target");
+        target.textures.push(tex);
+    }
+
+    let age = target.age();
+    let slot = target.frame % target.buffers;
+    target.frame += 1;
+    let texture = &mut target.textures[slot];
 
     let mut fb = renderer
         .bind_preserving(texture)
         .expect("bind the probe's render target");
     target
         .tracker
-        .render_output(renderer, &mut fb, 1, elements, Color32F::BLACK)
+        .render_output(renderer, &mut fb, age, elements, Color32F::BLACK)
         .expect("composite the scene");
     if !read {
         return None;
@@ -1753,7 +1780,7 @@ fn moving_a_window_between_workspaces_repaints_the_strip() {
 
     // Accumulate a few frames so the warm target is carrying real history: the first frame of any
     // tracker is full damage, which would repaint the strip no matter what the tracker knows.
-    let mut warm = WarmTarget::new(&out);
+    let mut warm = WarmTarget::new(&out, SCREEN_BUFFERS);
     for _ in 0..4 {
         probe_frame(&mut f, &out, &mut warm, None);
         f.run_frames_for(Duration::from_millis(16));
@@ -1762,7 +1789,7 @@ fn moving_a_window_between_workspaces_repaints_the_strip() {
     // Control: with nothing happening, warm and cold must already agree. A difference here would
     // be the instrument, not the scene.
     {
-        let mut cold = WarmTarget::new(&out);
+        let mut cold = WarmTarget::new(&out, 1);
         let (w, c) = probe_frame(&mut f, &out, &mut warm, Some(&mut cold));
         assert_eq!(
             stale_bounds(&w.unwrap(), &c.unwrap(), size, band),
@@ -1772,7 +1799,7 @@ fn moving_a_window_between_workspaces_repaints_the_strip() {
     }
 
     let check = |f: &mut Fixture, warm: &mut WarmTarget, stage: &str| {
-        let mut cold = WarmTarget::new(&out);
+        let mut cold = WarmTarget::new(&out, 1);
         let (warm_px, cold_px) = probe_frame(f, &out, warm, Some(&mut cold));
         let stale = stale_bounds(&warm_px.unwrap(), &cold_px.unwrap(), size, band);
         assert_eq!(
@@ -1877,14 +1904,14 @@ fn filing_windows_away_one_after_another_repaints_the_strip() {
         .to_physical_precise_round(scale)
     };
 
-    let mut warm = WarmTarget::new(&out);
+    let mut warm = WarmTarget::new(&out, SCREEN_BUFFERS);
     for _ in 0..4 {
         probe_frame(&mut f, &out, &mut warm, None);
         f.run_frames_for(Duration::from_millis(16));
     }
 
     let check = |f: &mut Fixture, warm: &mut WarmTarget, stage: &str| {
-        let mut cold = WarmTarget::new(&out);
+        let mut cold = WarmTarget::new(&out, 1);
         let (warm_px, cold_px) = probe_frame(f, &out, warm, Some(&mut cold));
         let stale = stale_bounds(&warm_px.unwrap(), &cold_px.unwrap(), size, band);
         assert_eq!(
@@ -1936,6 +1963,179 @@ fn filing_windows_away_one_after_another_repaints_the_strip() {
             f.run_frames_for(Duration::from_millis(16));
             check(&mut f, &mut warm, &format!("window {n}: after the drop"));
         }
+    }
+}
+
+/// Mark or clear a rect in a full-output bitmap.
+fn paint(bits: &mut [bool], w: usize, h: usize, rect: &Rectangle<i32, Physical>, on: bool) {
+    let x0 = rect.loc.x.max(0) as usize;
+    let y0 = rect.loc.y.max(0) as usize;
+    let x1 = ((rect.loc.x + rect.size.w).max(0) as usize).min(w);
+    let y1 = ((rect.loc.y + rect.size.h).max(0) as usize).min(h);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            bits[y * w + x] = on;
+        }
+    }
+}
+
+/// The damage a screen asks for is not the damage one buffer asks for.
+///
+/// A frame lands in whichever buffer came free, and that buffer last held the frame `age` ago, so
+/// the compositor has to repaint everything that changed since then — not just since the last
+/// frame. What the screen shows is that older buffer, which is why a stale trace can sit there
+/// while a full re-render (a one-shot screencopy) comes back clean: the scene is right, the
+/// repaint of that buffer was not.
+///
+/// Pinned as an accumulation invariant over two trackers fed the same frames: the damage reported
+/// for a buffer `n` frames old must cover every rect reported for the `n` frames in between.
+/// Deliberately pixel-free — no target, no readback, so nothing the copy does can colour it.
+#[test]
+#[ignore = "fails on a shaping seam, not on the gesture: the strip's slide-out reports the panel \
+            row as 1920x33 in one frame, and the two-frame union comes back as 480-wide shapes \
+            32 tall in the outer columns — 960 pixels of row y=32 that nothing repaints. The \
+            drag, the drop and the forty frames after it are clean. Un-ignore with the fix"]
+fn a_screens_older_buffer_is_told_about_every_frame_it_missed() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping a_screens_older_buffer_is_told_about_every_frame_it_missed: no Vulkan ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    f.synoik().wallpaper = crate::wallpaper::checker(1920, 1080, 60);
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let target_idx = {
+        let active = f.synoik().layout.active_workspace().unwrap().id();
+        f.synoik()
+            .layout
+            .workspaces()
+            .position(|(_, _, ws)| ws.id() != active)
+            .expect("a workspace other than the active one")
+    };
+
+    summon_peek(&mut f);
+
+    // One tracker per age: they see the same frames, and differ only in which buffer they are
+    // answering for.
+    let mut fresh = smithay::backend::renderer::damage::OutputDamageTracker::from_output(&out);
+    let mut older = smithay::backend::renderer::damage::OutputDamageTracker::from_output(&out);
+    let mut previous: Vec<Rectangle<i32, Physical>> = Vec::new();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+
+    let mut step = |f: &mut Fixture, stage: &str, previous: &mut Vec<_>| {
+        let state = f.synoik_state();
+        state.synoik.update_render_elements(Some(&out));
+        let (this_frame, for_older) = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let ctx = crate::render_helpers::RenderCtx {
+                    renderer: vk,
+                    target: crate::render_helpers::RenderTarget::Output,
+                    xray: None,
+                    appearance: Some(state.synoik.appearance()),
+                };
+                let elements = state.synoik.render_to_vec(ctx, &out, true);
+                assert!(
+                    !elements.is_empty(),
+                    "the probe must see a real element list"
+                );
+                let this_frame = fresh
+                    .damage_output(1, &elements)
+                    .map(|(d, _)| d.cloned().unwrap_or_default())
+                    .expect("the output has a mode");
+                let for_older = older
+                    .damage_output(2, &elements)
+                    .map(|(d, _)| d.cloned().unwrap_or_default())
+                    .expect("the output has a mode");
+                (this_frame, for_older)
+            })
+            .expect("the probe fixture has a renderer");
+
+        // Every pixel the last two frames damaged has to be inside what the two-frame-old buffer
+        // is told to repaint. Rasterised rather than sampled: the two rect sets are shaped
+        // independently, so corner-sampling one against the other reads merges as misses.
+        let (w, h) = (size.w as usize, size.h as usize);
+        let mut want = vec![false; w * h];
+        for rect in previous.iter().chain(this_frame.iter()) {
+            paint(&mut want, w, h, rect, true);
+        }
+        for rect in for_older.iter() {
+            paint(&mut want, w, h, rect, false);
+        }
+        let missed: Vec<usize> = want
+            .iter()
+            .enumerate()
+            .filter_map(|(i, on)| on.then_some(i))
+            .collect();
+        if !missed.is_empty() {
+            let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+            for i in &missed {
+                let (x, y) = (i % w, i / w);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+            panic!(
+                "{stage}: {} pixels damaged within the last two frames are not repainted in a \
+                 two-frame-old buffer — they still show what was there before. Bounding box \
+                 {}x{}+{}+{}",
+                missed.len(),
+                x1 - x0 + 1,
+                y1 - y0 + 1,
+                x0,
+                y0,
+            );
+        }
+        *previous = this_frame;
+    };
+
+    for _ in 0..4 {
+        f.run_frames_for(Duration::from_millis(16));
+        step(&mut f, "settled", &mut previous);
+    }
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f.synoik().layout.window_render_rect(&win, &out).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, 960., 900.);
+    step(&mut f, "picking the window up", &mut previous);
+
+    let (tx, ty) = thumbnail_center(&mut f, target_idx);
+    pointer_motion_to(&mut f, tx, ty);
+    step(&mut f, "carrying it over the thumbnail", &mut previous);
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    step(&mut f, "the drop", &mut previous);
+    for _ in 0..40 {
+        f.run_frames_for(Duration::from_millis(16));
+        step(&mut f, "after the drop", &mut previous);
+    }
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    for _ in 0..30 {
+        f.run_frames_for(Duration::from_millis(16));
+        step(&mut f, "the strip leaving", &mut previous);
     }
 }
 
