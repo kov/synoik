@@ -183,12 +183,19 @@ away.
 
 ### 7. Z-order and the top edge
 
-The thumbnails group is pushed *after* the `Top` and `Overlay` layers (`src/synoik.rs:11318`,
-`:11424`), and earlier push means higher z — so layer-shell surfaces draw over the strip today, and
-the peek band sits exactly where client bars live. **The peek group is pushed above `Top` and
-`Overlay`**: it is a transient affordance the user is actively holding, and one that a client bar can
-hide is not one that can be aimed at. The hit test must agree — `is_layout_obscured_under`
-(`src/synoik.rs:8969`) must not refuse a strip hit under a layer surface while the peek is up.
+The thumbnails group is pushed *after* the `Top` and `Overlay` layers, and earlier push means higher
+z — so layer-shell surfaces draw over the strip, and the peek band sits exactly where client bars
+live. A top-anchored `Top` bar therefore covers the peeked strip.
+
+**Deferred, pending a case to ground it against.** The argument for raising the peek above those
+layers is that it is a transient affordance the user is actively holding, and one a client bar can
+hide is not one that can be aimed at — but nothing on our seats puts a bar there (our own panel is
+not layer-shell), so the rule would be written against an imagined client rather than an observed
+one. Raise it when a real surface is being covered, and let that surface decide the rule.
+
+Whatever is decided, render and hit test move together: `contents_under` requires its order to match
+the render's, and `is_layout_obscured_under` is the half that would have to stop refusing a strip hit
+under a layer surface. Raising input alone gives a strip you can click but cannot see.
 
 Same reasoning for the **hot corner**: pressure into the top-left toggles the overview
 (`src/input/mod.rs:5055`), and a pointer travelling to the strip's left end would trip it. The hot
