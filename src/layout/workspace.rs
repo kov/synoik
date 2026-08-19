@@ -1982,6 +1982,25 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Each tile with the position the picker lays its slots out over: where it sits with
+    /// nothing animating, **unrounded**. Same order as
+    /// [`Self::tiles_with_render_positions`].
+    ///
+    /// The scrolling layer's view position rides in here and animates on its own account,
+    /// but the picker is GNOME-mode-only and GNOME mode keeps every window in the floating
+    /// layout, so there is nothing in that layer to lay out.
+    fn tiles_with_settled_positions(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> {
+        let scrolling = self.scrolling.tiles_with_settled_positions();
+        let floating = self.floating.tiles_with_offsets();
+        if self.scrolling_renders_on_top() {
+            Box::new(scrolling.chain(floating)) as Box<dyn Iterator<Item = _>>
+        } else {
+            Box::new(floating.chain(scrolling))
+        }
+    }
+
     /// GNOME windowing: the focused window is effectively topmost (mutter
     /// raises on click and on activation), so when the active window lives
     /// in the scrolling layer (a maximized or fullscreen window), that layer
@@ -2062,6 +2081,23 @@ impl<W: LayoutElement> Workspace<W> {
     /// Slots come from gnome-shell's layout strategy (see [`expose`]), over
     /// the working area, front-to-back like
     /// [`Self::tiles_with_render_positions`].
+    /// The settled position the picker lays out over, aligned to physical pixels.
+    ///
+    /// Rounded exactly once, from a value that does not move while an animation runs.
+    /// Shared with [`Self::expose_settled_pos`] so the value a test can observe cannot
+    /// drift from the value the layout consumes.
+    fn settled_pos(scale: f64, settled: Point<f64, Logical>) -> Point<f64, Logical> {
+        settled.to_physical_precise_round(scale).to_logical(scale)
+    }
+
+    /// [`Self::settled_pos`] for one window, if it is here.
+    pub(super) fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
+        let scale = self.scale().fractional_scale();
+        self.tiles_with_settled_positions()
+            .find(|(tile, _)| tile.window().id() == window)
+            .map(|(_, settled)| Self::settled_pos(scale, settled))
+    }
+
     fn expose_layout(&self) -> ExposeLayout<'_, W> {
         let scale = self.scale().fractional_scale();
         // Two rects per tile: the *render* rect, which the overview
@@ -2078,18 +2114,18 @@ impl<W: LayoutElement> Workspace<W> {
         // when it lands. A drop's move-back animation did exactly that to
         // every other preview.
         //
-        // Only the tile's own offset is subtracted. The scrolling layer's
-        // view/column animations ride in `pos` too, but the picker is
-        // GNOME-mode-only (`Monitor::expose_progress`) and GNOME mode keeps
-        // every window — maximized and fullscreen included — in the floating
-        // layout, so there is nothing in the scrolling layer to lay out.
+        // The settled position is read from its own source rather than
+        // recovered from `pos` by subtracting the offset back off. `pos` is
+        // already rounded to physical pixels, and at a fractional scale
+        // `round(round(X + R) - R) != X` — so recovering it that way moved it
+        // by a physical pixel for the life of `R`, which is all a sort with no
+        // tie-break needs to swap two previews and swap them back.
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
-            .map(|(tile, pos, _)| {
+            .zip(self.tiles_with_settled_positions())
+            .map(|((tile, pos, _), (_, settled))| {
                 let size = tile.tile_size();
-                let settled = (pos - tile.render_offset())
-                    .to_physical_precise_round(scale)
-                    .to_logical(scale);
+                let settled = Self::settled_pos(scale, settled);
                 (
                     tile,
                     Rectangle::new(pos, size),

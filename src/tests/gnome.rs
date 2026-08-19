@@ -29320,3 +29320,209 @@ fn draw_reporting(
         .expect("composite");
     res.damage.cloned().unwrap_or_default()
 }
+
+/// Three same-sized windows, each mapped onto an *empty* workspace and only then brought
+/// together, with the overview open and the third still on its own workspace.
+///
+/// Placement centres the first window on an empty workspace, so every window gets the very
+/// same position and their centres tie **exactly** — which is how the seat produces ties,
+/// and what a sort with no tie-break resolves by stacking order alone.
+///
+/// `size` is deliberately the caller's: at a fractional scale a window whose centred
+/// position lands on the physical-pixel grid rounds `round(round(X + R) - R)` back to `X`
+/// for every `R`, which hides the very wobble some of these tests exist to catch.
+fn tied_previews_in_the_overview(
+    f: &mut Fixture,
+    id: ClientId,
+    size: (u16, u16),
+) -> (
+    smithay::desktop::Window,
+    smithay::desktop::Window,
+    smithay::desktop::Window,
+) {
+    let park = |f: &mut Fixture| {
+        let win = f.synoik().layout.focus().unwrap().window.clone();
+        f.synoik_state()
+            .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+        f.settle();
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+        f.settle();
+        win
+    };
+
+    map_window_sized(f, id, size, None);
+    let win_a = park(f);
+    map_window_sized(f, id, size, None);
+    let win_b = park(f);
+
+    // The third stays where the drag will start from, so the drop lands on a thumbnail that
+    // already has something to re-lay out around. A drop onto an empty one re-sorts nothing.
+    map_window_sized(f, id, size, None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+
+    tap(f, KEY_LEFTMETA);
+    f.settle();
+
+    (win_a, win_b, win_c)
+}
+
+/// Drag `win`'s preview out of the main view and drop it on the thumbnail at `idx`.
+fn drop_preview_on_thumbnail(f: &mut Fixture, win: &smithay::desktop::Window, idx: usize) {
+    let rect = f.synoik().layout.expose_target_rect(win).unwrap();
+    pointer_motion_to(
+        f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(f, rect.loc.x + rect.size.w / 2., rect.loc.y + 10.);
+    let (tx, ty) = thumbnail_center(f, idx);
+    pointer_motion_to(f, tx, ty);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+}
+
+/// An output whose scale makes a logical pixel land between physical ones.
+fn fractional_output(f: &mut Fixture) {
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.settle();
+}
+
+/// The picker lays its slots out over where a window sits with no animation running, so
+/// that position must not move while one runs.
+///
+/// It moved. `tiles_with_render_positions` rounds `logical_pos + render_offset` to physical
+/// pixels and the picker rounds again after subtracting `render_offset` back off, and
+/// `round(round(X + R) - R) != X` at a fractional scale. So a decaying move spring wobbled a
+/// rect that is by construction animation-free, by a physical pixel, for the life of the
+/// spring — and `compute_slots` breaks ties by input order, so a pixel is a swapped slot.
+#[test]
+fn a_settled_position_does_not_move_while_the_window_animates() {
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    // 801x601 centres at x = (3072 - 801) / 2 = 1135.5, which is 1419.375 physical: off the
+    // grid, where the double rounding actually oscillates.
+    let (_, _, win_c) = tied_previews_in_the_overview(&mut f, id, (801, 601));
+    drop_preview_on_thumbnail(&mut f, &win_c, 1);
+
+    // The drop arms a move spring whose tail runs well past the 200ms slot slide. Sample the
+    // window's drawn position alongside, since "it did not move" is only a claim about a
+    // settled position if something was moving at the time.
+    let out = f.synoik_output(1);
+    let track = f.sample_animation(Duration::from_millis(900), 180, |f| {
+        (
+            f.synoik().layout.expose_settled_pos(&win_c),
+            f.synoik().layout.window_render_rect(&win_c, &out),
+        )
+    });
+    let seen: Vec<_> = track.iter().filter_map(|(s, _)| *s).collect();
+    assert!(
+        seen.len() > 100,
+        "too few samples to judge a settled position"
+    );
+
+    let drawn: Vec<_> = track.iter().filter_map(|(_, r)| *r).collect();
+    let swept = drawn
+        .iter()
+        .map(|r| r.loc.x)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - drawn.iter().map(|r| r.loc.x).fold(f64::INFINITY, f64::min);
+    assert!(
+        swept > 100.,
+        "precondition: the window must have been animating across the samples — it swept \
+         {swept:.1}px, which is too little for a move spring to have been running",
+    );
+
+    let settled = seen[0];
+
+    for (n, pos) in seen.iter().enumerate() {
+        assert_eq!(
+            (pos.x, pos.y),
+            (settled.x, settled.y),
+            "the picker's idea of where the window sits moved at sample {n}: \
+             {:.3},{:.3} -> {:.3},{:.3}, while only an animation was running",
+            settled.x,
+            settled.y,
+            pos.x,
+            pos.y,
+        );
+    }
+}
+
+/// A preview settling into the picker moves toward its new slot and does not double back.
+///
+/// The picker recomputes its whole layout every frame (`Workspace::expose_layout`, called
+/// from `render_expose`) and eases each preview toward whatever that computation just
+/// produced, so any input that wobbles re-sorts the grid under a running animation.
+/// `compute_slots` assigns rows by `center().y` and columns by `center().x` with no
+/// tie-break, and centred auto-placement makes exact ties ordinary, so a perturbation of a
+/// single physical pixel is enough to swap two windows' slots outright. They then charge at
+/// each other's positions until it swaps back.
+///
+/// **A net, not a pin.** It asserts the class — nothing mid-settle reverses — and it passed
+/// before the settled position was fixed, so it never witnessed the defect it describes;
+/// `a_settled_position_does_not_move_while_the_window_animates` is the test that did. Kept
+/// because the class outlives its first instance: the same reversal reaches the picker
+/// through a restack changing the order an exact tie resolves in, and through anything else
+/// that disturbs a layout input mid-animation.
+#[test]
+fn a_preview_settling_into_the_picker_never_doubles_back() {
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    let (win_a, win_b, win_c) = tied_previews_in_the_overview(&mut f, id, (800, 600));
+
+    let before: Vec<_> = [&win_a, &win_b]
+        .iter()
+        .map(|w| f.synoik().layout.expose_slot_local(w).expect("a slot"))
+        .collect();
+
+    drop_preview_on_thumbnail(&mut f, &win_c, 1);
+
+    // Sample across the settle. The slide is 200ms and the arriving tile's move is a spring,
+    // whose tail runs well past it — and the tail is where a wobble lives, so the span has to
+    // cover it.
+    let series = f.sample_animation(Duration::from_millis(900), 90, |f| {
+        [&win_a, &win_b]
+            .iter()
+            .map(|w| f.synoik().layout.expose_slot_local(w))
+            .collect::<Vec<_>>()
+    });
+
+    let mut travelled = 0f64;
+    for (i, name) in ["a", "b"].into_iter().enumerate() {
+        let track: Vec<_> = series
+            .iter()
+            .filter_map(|s| s[i])
+            .map(|r| (r.loc.x, r.loc.y))
+            .collect();
+        assert!(track.len() > 40, "{name}: too few samples to judge motion");
+        let (fx, fy) = *track.last().unwrap();
+        travelled = travelled.max((before[i].loc.x - fx).abs() + (before[i].loc.y - fy).abs());
+
+        // The whole claim: the distance still to travel never grows.
+        for (n, pair) in track.windows(2).enumerate() {
+            let (px, py) = pair[0];
+            let (cx, cy) = pair[1];
+            let was = (fx - px).abs() + (fy - py).abs();
+            let now = (fx - cx).abs() + (fy - cy).abs();
+            assert!(
+                now <= was + 1.,
+                "preview {name} doubled back at sample {n}: it was {was:.1}px from where it \
+                 settles and moved to {now:.1}px away, {px:.1},{py:.1} -> {cx:.1},{cy:.1}",
+            );
+        }
+    }
+
+    // Precondition: "nothing doubled back" is trivially true of a picker that never re-laid out.
+    // Only one resident need move — a three-window grid can leave the other where it was.
+    assert!(
+        travelled > 20.,
+        "precondition: the drop must have re-laid the picker out — the furthest a resident \
+         preview moved was {travelled:.1}px, too little for a reversal to have anywhere to happen",
+    );
+}

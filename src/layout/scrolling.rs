@@ -2387,6 +2387,24 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             })
     }
 
+    /// Each tile with the position it sits at when nothing is animating, **unrounded**.
+    ///
+    /// Not the drawn position with the animation subtracted back off: at a fractional
+    /// scale `round(round(X + R) - R) != X`, so deriving it that way moves it for the life
+    /// of `R`. The picker lays its slots out over these, and a settled position that moves
+    /// re-sorts the grid under a running animation.
+    pub fn tiles_with_settled_positions(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> {
+        let view_off = Point::from((-self.view_pos(), 0.));
+        self.columns_in_render_order()
+            .flat_map(move |(col, col_x)| {
+                let col_off = Point::from((col_x, 0.));
+                col.tiles_in_render_order()
+                    .map(move |(tile, tile_off, _)| (tile, view_off + col_off + tile_off))
+            })
+    }
+
     pub fn tiles_with_render_positions_mut(
         &mut self,
         round: bool,

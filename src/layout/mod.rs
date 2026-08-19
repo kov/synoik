@@ -6212,6 +6212,21 @@ impl<W: LayoutElement> Layout<W> {
         })
     }
 
+    /// Where the picker believes `window` sits with no animation running.
+    ///
+    /// The slots are laid out over these, so a settled position that moves while an
+    /// animation runs re-sorts the grid under it — and `compute_slots` breaks ties by
+    /// input order, so a single pixel is enough to swap two previews. Exposed because
+    /// that is the defect, and a slot only witnesses it once a tie actually flips.
+    pub fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
+        self.monitors().find_map(|mon| {
+            let (ws, _) = mon
+                .workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(window))?;
+            ws.expose_settled_pos(window)
+        })
+    }
+
     pub fn expose_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         self.monitors().find_map(|mon| {
             mon.expose_progress()?;
