@@ -1671,6 +1671,25 @@ fn probe_frame(
         .expect("the probe fixture has a renderer")
 }
 
+/// Whether two pixels hold different *content*, as opposed to the same colour quantised
+/// differently.
+///
+/// One step in one channel is not a stale pixel, it is 8-bit rounding: the warm frame reaches a
+/// blended colour by compositing onto what was already there, the cold one by drawing the whole
+/// scene into an empty target, and the two orders round the same value apart on some drivers.
+/// Measured 2026-08-20: llvmpipe differs on 2 and 20 pixels of these two tests' bands, every one
+/// of them `delta=[1,0,0,0]` or `[1,1,0,0]` and every one on a blended edge; Venus is bit-exact
+/// and shows none. CI runs llvmpipe, so a bit-exact comparison is red there and green here.
+///
+/// The tolerance costs the instrument nothing it was built for. Stale content is *a different
+/// part of the scene* — a thumbnail's old position, a workspace that has moved on — and differs
+/// by far more than one step. What it would mask is a sub-pixel *placement* shift over a smooth
+/// gradient, which is why these tests draw over a checkerboard wallpaper rather than a flat
+/// colour: misplacement there is a large difference, not a small one.
+fn pixel_content_differs(warm: &[u8], cold: &[u8]) -> bool {
+    std::iter::zip(warm, cold).any(|(a, b)| a.abs_diff(*b) > 1)
+}
+
 /// Pixels the incrementally-repainted frame got wrong, as a bounding box in physical coordinates.
 fn stale_bounds(
     warm: &[u8],
@@ -1683,7 +1702,7 @@ fn stale_bounds(
     for y in roi.loc.y.max(0)..(roi.loc.y + roi.size.h).min(size.h) {
         for x in roi.loc.x.max(0)..(roi.loc.x + roi.size.w).min(size.w) {
             let i = ((y * size.w + x) * 4) as usize;
-            if warm[i..i + 4] != cold[i..i + 4] {
+            if pixel_content_differs(&warm[i..i + 4], &cold[i..i + 4]) {
                 differing += 1;
                 bounds = Some(match bounds {
                     None => (x, y, x, y),
@@ -1694,6 +1713,26 @@ fn stale_bounds(
     }
     bounds.map(|(x0, y0, x1, y1)| {
         eprintln!("{differing} pixels of the band differ; a map of where, 32x16 per cell:");
+        // The values, not just where. A bounding box around a handful of scattered pixels reads
+        // like a stale *region* and sends the reader looking for a missing damage rect; the
+        // deltas say in one line whether the frame kept old content or merely rounded.
+        let mut shown = 0;
+        for y in roi.loc.y.max(0)..(roi.loc.y + roi.size.h).min(size.h) {
+            for x in roi.loc.x.max(0)..(roi.loc.x + roi.size.w).min(size.w) {
+                let i = ((y * size.w + x) * 4) as usize;
+                if shown < 16 && pixel_content_differs(&warm[i..i + 4], &cold[i..i + 4]) {
+                    shown += 1;
+                    let delta: Vec<i32> = std::iter::zip(&warm[i..i + 4], &cold[i..i + 4])
+                        .map(|(a, b)| i32::from(*a) - i32::from(*b))
+                        .collect();
+                    eprintln!(
+                        "  ({x},{y}) warm={:?} cold={:?} delta={delta:?}",
+                        &warm[i..i + 4],
+                        &cold[i..i + 4],
+                    );
+                }
+            }
+        }
         let (ry0, ry1) = (roi.loc.y.max(0), (roi.loc.y + roi.size.h).min(size.h));
         for gy in (ry0..ry1).step_by(16) {
             let mut row = String::new();
@@ -1702,7 +1741,7 @@ fn stale_bounds(
                 for y in gy..(gy + 16).min(ry1) {
                     for x in gx..(gx + 32).min(size.w) {
                         let i = ((y * size.w + x) * 4) as usize;
-                        if warm[i..i + 4] != cold[i..i + 4] {
+                        if pixel_content_differs(&warm[i..i + 4], &cold[i..i + 4]) {
                             n += 1;
                         }
                     }
