@@ -2262,6 +2262,14 @@ impl<W: LayoutElement> Workspace<W> {
         monitor_height: f64,
         area: Rectangle<f64, Logical>,
     ) -> Vec<Rectangle<f64, Logical>> {
+        // An empty workspace has no layout to decide, and the overview draws several of
+        // them: every workspace in the strip is rendered, and dynamic workspaces keep a
+        // trailing empty one. Deciding nothing must not read as a decision.
+        if inputs.is_empty() {
+            *self.expose_retained.borrow_mut() = None;
+            return Vec::new();
+        }
+
         let mut retained = self.expose_retained.borrow_mut();
 
         let hit = retained.as_ref().is_some_and(|r| {
@@ -2281,10 +2289,8 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.expose_recomputes.set(self.expose_recomputes.get() + 1);
-        let Some(mut grid) = expose::compute_grid(monitor_height, area, &rects) else {
-            *retained = None;
-            return Vec::new();
-        };
+        let mut grid = expose::compute_grid(monitor_height, area, &rects)
+            .expect("a non-empty workspace always has a grid");
         let slots = expose::pack_grid(&mut grid, area, &rects);
         *retained = Some(RetainedExpose {
             inputs,

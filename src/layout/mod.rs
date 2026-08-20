@@ -6220,6 +6220,19 @@ impl<W: LayoutElement> Layout<W> {
         })
     }
 
+    /// Ask every workspace for its picker slots, the way rendering the overview does —
+    /// which includes the workspaces holding no windows at all.
+    ///
+    /// Exists because [`Layout::expose_recompute_count`] is only worth reading against a
+    /// query that reaches everything the render path reaches.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn expose_slots_everywhere(&self) -> usize {
+        self.monitors()
+            .flat_map(|mon| mon.workspaces.iter())
+            .map(|ws| ws.expose_slots_now().len())
+            .sum()
+    }
+
     /// How many times the picker has decided a layout, over every workspace.
     ///
     /// Retention's claim is about *when* work happens: a held layout and a freshly derived

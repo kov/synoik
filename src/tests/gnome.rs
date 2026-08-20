@@ -29519,7 +29519,9 @@ fn the_picker_decides_its_layout_once_and_holds_it() {
     f.settle();
 
     // Every query goes through `expose_layout`, which is what the render path calls twice a
-    // frame per workspace — the main row and the thumbnail strip.
+    // frame per workspace — the main row and the thumbnail strip. Asking every workspace,
+    // not just the ones holding these windows: the strip draws the empty trailing workspace
+    // too, and a workspace with nothing to lay out must not read as a decision either.
     let query = |f: &mut Fixture| {
         for win in [&win_a, &win_b, &win_c] {
             f.synoik()
@@ -29527,6 +29529,11 @@ fn the_picker_decides_its_layout_once_and_holds_it() {
                 .expose_slot_local(win)
                 .expect("every window in the overview has a slot");
         }
+        assert_eq!(
+            f.synoik().layout.expose_slots_everywhere(),
+            3,
+            "three windows, three slots, however many workspaces they are spread over",
+        );
     };
 
     query(&mut f);
