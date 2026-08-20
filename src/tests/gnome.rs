@@ -4304,9 +4304,8 @@ fn overlay_key_setting_rebinds() {
     );
 }
 
-/// Map a window of the given size, optionally as a transient child of
-/// `parent`, and return its surface.
-/// Map a window of a given size, leaving the frame loop alone.
+/// Map a window of a given size, optionally as a transient child of `parent`, and return
+/// its surface — leaving the frame loop alone.
 ///
 /// For mapping one while something that never settles is in flight — an interactive move,
 /// say, where [`map_window_sized`]'s settle would run out its frame budget and panic.
@@ -27928,6 +27927,89 @@ fn a_drop_eases_the_previews_it_displaces() {
         assert!(
             *sample != b_before && *sample != b_after,
             "sample {} sits on an endpoint — B snapped rather than eased: {samples:?}",
+            i + 1,
+        );
+    }
+}
+
+/// A window closing while the picker is up eases the survivors into their new slots
+/// rather than snapping them there. Membership is a layout input, so a removal re-decides
+/// the grid; gnome-shell eases every child from its current allocation on that same event
+/// (`_syncWindowPositions` / `animateAllocation`, `workspace.js:759-766`, `:389-399`).
+///
+/// It does **not** port `_doRemoveWindow`'s freeze (`workspace.js:1140-1183`), which holds
+/// the layout until the pointer has been still for 750ms so a close button stays under the
+/// cursor for a second click.
+#[test]
+fn a_window_closing_in_the_picker_eases_the_survivors() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Two rows: the big one alone on top, the small pair sharing the bottom. Taking one of
+    // the pair away lets the survivors spread into a single row, so both of them travel
+    // hundreds of pixels and a snap would be unmistakable.
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let c = map_window_sized(&mut f, id, (740, 480), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    // Frame by frame, not `settle_animations`: that jumps the clock a second into the
+    // future, and the roundtrip below puts it back, which would leave the ease armed at a
+    // time no sample ever reaches.
+    f.settle();
+
+    // Workspace-local: the workspace's own placement animates too, and a rect that folded
+    // it in would be two motions at once.
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    // C's own client takes it away, which is the path a close button ends in too.
+    let window = f.client(id).window(&c);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    let samples = f.sample_animation(Duration::from_millis(200), 4, slots);
+    f.settle_animations();
+    let after = slots(&mut f);
+    assert_ne!(
+        after, before,
+        "the close must have moved a survivor at all, or there is nothing to ease",
+    );
+
+    // It starts where it was and arrives where it is going, having been in between.
+    //
+    // The start is a near-miss rather than an equality: the destroy has to round-trip to
+    // the compositor, and the clock ticks a fraction of a millisecond doing it, which an
+    // ease that is steepest at t=0 turns into about a pixel of travel. A snap would be
+    // hundreds — the two survivors cross 498px and 818px respectively.
+    use smithay::utils::{Logical, Rectangle};
+    type Pair = (Rectangle<f64, Logical>, Rectangle<f64, Logical>);
+    let apart = |a: Pair, b: Pair| {
+        [(a.0, b.0), (a.1, b.1)]
+            .iter()
+            .map(|(x, y)| (x.loc.x - y.loc.x).abs().max((x.loc.y - y.loc.y).abs()))
+            .fold(0f64, f64::max)
+    };
+    assert!(
+        apart(samples[0], before) < 5.,
+        "the survivors jumped on the close frame: {:?} vs {before:?}",
+        samples[0],
+    );
+    assert_eq!(samples[4], after);
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            *sample != before && *sample != after,
+            "sample {} sits on an endpoint \u{2014} the survivors snapped rather than eased: {samples:?}",
             i + 1,
         );
     }

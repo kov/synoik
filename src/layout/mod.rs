@@ -1396,15 +1396,38 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        // A window leaving is a layout input changing, so the picker re-decides and the
+        // survivors would jump to their new slots. Ease them there instead, the way GNOME
+        // does on the same event (`workspace.js:759-766`, 200ms EASE_OUT_QUAD). Only worth
+        // the redraws while something is actually showing the spread — the overview, or the
+        // workspace peek's thumbnail strip.
+        let picker_showing = self.overview_open || self.peek_open;
+
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     for ws in mon.workspaces.iter_mut() {
                         if ws.has_window(window) {
+                            // A drag pickup removes the window too, but reserves its place
+                            // first (`freeze_expose`): nothing reflows, so there is nothing
+                            // to ease and no reason to pay for the snapshot.
+                            let ease = picker_showing && !ws.expose_is_reserved(window);
+                            let before = if ease {
+                                ws.expose_slots_now()
+                            } else {
+                                Vec::new()
+                            };
+
                             // Emptying a workspace no longer reaps it: it stays put and
                             // grows a close button in the overview instead (see
                             // `Monitor::clean_up_workspaces`).
-                            return Some(ws.remove_tile(window, transaction));
+                            let removed = ws.remove_tile(window, transaction);
+
+                            if ease {
+                                ws.slide_expose_slots_from(before, None);
+                            }
+
+                            return Some(removed);
                         }
                     }
                 }
@@ -4927,7 +4950,8 @@ impl<W: LayoutElement> Layout<W> {
             mon.dnd_scroll_gesture_end();
         }
 
-        // Where every preview is *right now*, taken while the layouts are still frozen —
+        // Where every preview is *right now*, taken while the dragged window's place is
+        // still reserved —
         // i.e. exactly what is on screen. The drop below re-packs them; these are the
         // rects they ease out of.
         let slots_before: Vec<_> = self

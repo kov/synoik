@@ -134,10 +134,38 @@ settling drop stopped the picker dead mid-flight for the length of the drag. And
 capture cannot answer for a window that arrives mid-drag, which is why one used to collapse
 the reserved gap and reflow everything.
 
-**Left open:** a *bystander* closing mid-drag re-decides and snaps the survivors, where GNOME
-freezes for 750 ms of pointer stillness and then eases (`workspace.js:1152-1183`). That is a
-pre-existing class — a window closing in the picker with no drag in flight already snaps —
-and the fix is to arm a slide on the removal reflow.
+A pickup reserves the input *before* the removal takes the tile away, so for that stretch the
+window is both a live tile and the reservation. The splice drops the reservation while that
+lasts: laying it out twice would decide a grid over a window that does not exist, and poison
+the held inputs with it.
+
+## The close
+
+A window leaving re-decides the layout — membership is an input — so the survivors would jump.
+They ease instead, over the same 200 ms `EaseOutQuad` a drop uses, which is what gnome-shell
+runs on the same event (`animateAllocation` off `layoutChanged`, `workspace.js:759-766`,
+`:389-399`).
+
+Armed in `Layout::remove_window`, the one site every close funnels through — a client
+destroying its toplevel, `Action::CloseWindow`, the preview's own close button. Two conditions
+on it:
+
+- **Only while something shows the spread**, `overview_open || peek_open` — the workspace peek
+  renders the picker with the overview shut. Arming a slide nobody can see costs 200 ms of
+  redraws per close, because `are_animations_ongoing` counts `expose_slides`.
+- **Not on a drag pickup**, which removes the window too but reserves its place first, so
+  nothing reflows.
+
+It does **not** port `_doRemoveWindow`'s freeze (`workspace.js:1140-1183`): GNOME holds the
+layout until the pointer has been still for 750 ms, so a close button stays under the cursor
+for a second click. That needs a repeating timer, pointer-stillness sampling and hit-testing,
+and a hold that several removals can share — where the reservation here is a single `Option`
+the drag owns. It is a separate mechanism, not a parameter of this one.
+
+**Left open:** a window *arriving* in the picker outside a drop — a fresh map, or a
+move-to-workspace keybinding, which bypasses `Layout::remove_window` entirely
+(`mod.rs:3827`, `monitor.rs:1215`) — still snaps the previews it displaces. Same class, same
+fix, different plumbing.
 
 ## Tests
 
@@ -172,6 +200,12 @@ about the picker's *output* can witness retention directly.
   `a_drag_begun_mid_settle_leaves_the_other_previews_travelling` — the two things a captured
   slot could not do. The first reads how many windows the decision was made over, because a
   reserved slot reaches no caller and is otherwise unobservable.
+- `a_window_closing_in_the_picker_eases_the_survivors` — the close ease, sampled across the
+  200 ms. Its start is a near-miss rather than an equality: the destroy has to round-trip to
+  the compositor and the clock ticks a fraction of a millisecond doing it, which an ease that
+  is steepest at t=0 turns into about a pixel. It must settle **frame by frame** beforehand,
+  not with `settle_animations` — that jumps the clock a second ahead and the roundtrip puts it
+  back, arming the ease at a time no sample reaches, which reads exactly like a snap.
 - `the_picker_decides_its_layout_once_and_holds_it` — forward-only, and says so. The count it
   asserts on did not exist before the decision was held, so it cannot have been red. It
   queries *every* workspace, which is what the render path does and the only way an empty

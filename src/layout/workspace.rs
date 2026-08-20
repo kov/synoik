@@ -2241,11 +2241,19 @@ impl<W: LayoutElement> Workspace<W> {
         // gnome-shell's mechanism exactly — a preview drag reparents the actor and freezes
         // nothing, the window staying in `_sortedWindows` for the whole drag
         // (`windowPreview.js:643-670`), which is what keeps a slot reserved for it.
-        let reserved_at = self.expose_reserved.map(|reserved| {
-            let at = inputs.partition_point(|(seq, _)| *seq < reserved.0);
-            inputs.insert(at, reserved);
-            at
-        });
+        //
+        // A pickup reserves the input *before* the removal takes the tile away, so for that
+        // stretch the window is both. The reservation is dropped while that lasts: laying it
+        // out twice would decide a grid over a window that does not exist, and poison the
+        // held inputs with it.
+        let reserved_at = self
+            .expose_reserved
+            .filter(|reserved| !inputs.iter().any(|(seq, _)| *seq == reserved.0))
+            .map(|reserved| {
+                let at = inputs.partition_point(|(seq, _)| *seq < reserved.0);
+                inputs.insert(at, reserved);
+                at
+            });
 
         let packed = self.retained_expose_slots(inputs, self.view_size, self.expose_area());
 
@@ -2555,6 +2563,13 @@ impl<W: LayoutElement> Workspace<W> {
     /// the drag.
     pub(super) fn freeze_expose(&mut self, window: &W::Id) {
         self.expose_reserved = self.expose_input(window);
+    }
+
+    /// Whether a drag has already reserved this window's place in the picker, i.e. whether
+    /// the removal about to happen is a pickup rather than a departure.
+    pub(super) fn expose_is_reserved(&self, window: &W::Id) -> bool {
+        let reserved = self.expose_reserved.map(|(seq, _)| seq);
+        reserved.is_some() && reserved == self.expose_input(window).map(|(seq, _)| seq)
     }
 
     /// Forget the held picker layout, so the next one is decided afresh.
