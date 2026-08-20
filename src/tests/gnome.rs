@@ -10075,6 +10075,27 @@ fn a_window_mapping_mid_drag_keeps_the_dragged_preview_a_place() {
         "the dragged window still has no slot of its own: its place is reserved, not filled",
     );
 
+    // And the reservation sits *in* the order rather than at the end of it: B's stable
+    // sequence is between A's and C's, so the hole comes before C and pushes it to the right.
+    // A splice that appended would count three all the same, and put C where the hole is.
+    let win_c = f
+        .synoik()
+        .layout
+        .windows()
+        .map(|(_, m)| crate::layout::LayoutElement::id(m).clone())
+        .find(|w| *w != win_a && *w != win_b)
+        .expect("the window that arrived mid-drag");
+    let a = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let c = f.synoik().layout.expose_target_rect(&win_c).unwrap();
+    // A is alone in its row, so its centre is the picker's — the line C has to be right of.
+    let middle = a.loc.x + a.size.w / 2.;
+    assert!(
+        c.loc.x > middle,
+        "the arriving preview took the reserved place instead of following it: it starts at \
+         {:.1} with the picker's middle at {middle:.1}",
+        c.loc.x,
+    );
+
     pointer_motion_to(&mut f, 1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle();
@@ -10114,10 +10135,17 @@ fn a_drag_begun_mid_settle_leaves_the_other_previews_travelling() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     pointer_motion_to(&mut f, 1800., 540.);
+    // Frozen from here to the sampling below. The slide it starts is 200ms long, and
+    // `run_until_settled` hands the clock back to real time when it returns (it only
+    // unfreezes what it froze), so any stall in the pointer plumbing would run the slide out
+    // before the first sample — which reads as exactly the defect this pins.
+    f.freeze_clock();
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     // One frame in, mid-slide, pick B up.
-    f.run_until_settled(1);
+    f.advance_clock(Duration::from_micros(16_667));
+    f.dispatch();
+    f.refresh();
     let mid = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
     pointer_motion_to(
@@ -10143,6 +10171,18 @@ fn a_drag_begun_mid_settle_leaves_the_other_previews_travelling() {
         "the drag pinned a preview part-way to its slot: it moved {travelled:.2}px over the \
          rest of the slide it was in the middle of",
     );
+
+    // Travelling, not teleporting: a pickup that re-decided and jumped A straight to its
+    // final slot would move it just as far. The early samples must sit on neither endpoint.
+    let end = *moved.last().unwrap();
+    for (i, sample) in moved[1..6].iter().enumerate() {
+        assert!(
+            *sample != mid && *sample != end,
+            "sample {} sits on an endpoint — the pickup snapped A rather than letting its \
+             slide run: {sample:?}",
+            i + 1,
+        );
+    }
 
     pointer_motion_to(&mut f, 900., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -27958,8 +27998,10 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
     tap(&mut f, KEY_LEFTMETA);
     // Frame by frame, not `settle_animations`: that jumps the clock a second into the
     // future, and the roundtrip below puts it back, which would leave the ease armed at a
-    // time no sample ever reaches.
+    // time no sample ever reaches. Then frozen, so the destroy's roundtrip cannot spend any
+    // of the 200ms the ease is sampled over.
     f.settle();
+    f.freeze_clock();
 
     // Workspace-local: the workspace's own placement animates too, and a rect that folded
     // it in would be two motions at once.
@@ -27988,10 +28030,10 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
 
     // It starts where it was and arrives where it is going, having been in between.
     //
-    // The start is a near-miss rather than an equality: the destroy has to round-trip to
-    // the compositor, and the clock ticks a fraction of a millisecond doing it, which an
-    // ease that is steepest at t=0 turns into about a pixel of travel. A snap would be
-    // hundreds — the two survivors cross 498px and 818px respectively.
+    // The start is a near-miss rather than an equality: the destroy has to round-trip to the
+    // compositor, and a fraction of a millisecond still gets through the frozen clock doing
+    // it, which an ease steepest at t=0 turns into a fraction of a pixel. A snap would be
+    // hundreds — the two survivors cross 498px and 818px.
     use smithay::utils::{Logical, Rectangle};
     type Pair = (Rectangle<f64, Logical>, Rectangle<f64, Logical>);
     let apart = |a: Pair, b: Pair| {

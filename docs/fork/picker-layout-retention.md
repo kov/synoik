@@ -199,7 +199,17 @@ about the picker's *output* can witness retention directly.
 - `a_window_mapping_mid_drag_keeps_the_dragged_preview_a_place` and
   `a_drag_begun_mid_settle_leaves_the_other_previews_travelling` — the two things a captured
   slot could not do. The first reads how many windows the decision was made over, because a
-  reserved slot reaches no caller and is otherwise unobservable.
+  reserved slot reaches no caller and is otherwise unobservable; a count alone would pass on
+  a reservation spliced at the wrong index, so it also pins the arriving preview to the right
+  of the picker's middle, which is where the hole in front of it puts it. The second must
+  distinguish *travelling* from *teleporting*: a pickup that re-decided and jumped the
+  bystander to its final slot moves it just as far as the slide does, so intermediate samples
+  are pinned off both endpoints.
+
+  Both sample across a live animation and so must **freeze the clock** over it.
+  `run_until_settled` unfreezes on the way out when it froze on the way in, and a slide left
+  running on the wall clock finishes during whatever the test does next — reading as a snap
+  that never happened.
 - `a_window_closing_in_the_picker_eases_the_survivors` — the close ease, sampled across the
   200 ms. Its start is a near-miss rather than an equality: the destroy has to round-trip to
   the compositor and the clock ticks a fraction of a millisecond doing it, which an ease that
