@@ -4306,7 +4306,11 @@ fn overlay_key_setting_rebinds() {
 
 /// Map a window of the given size, optionally as a transient child of
 /// `parent`, and return its surface.
-fn map_window_sized(
+/// Map a window of a given size, leaving the frame loop alone.
+///
+/// For mapping one while something that never settles is in flight — an interactive move,
+/// say, where [`map_window_sized`]'s settle would run out its frame budget and panic.
+fn map_window_unsettled(
     f: &mut Fixture,
     id: ClientId,
     size: (u16, u16),
@@ -4325,8 +4329,19 @@ fn map_window_sized(
     window.set_size(size.0, size.1);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.settle();
 
+    surface
+}
+
+/// [`map_window_unsettled`] and then settle, which is what almost every caller wants.
+fn map_window_sized(
+    f: &mut Fixture,
+    id: ClientId,
+    size: (u16, u16),
+    parent: Option<&WlSurface>,
+) -> WlSurface {
+    let surface = map_window_unsettled(f, id, size, parent);
+    f.settle();
     surface
 }
 
@@ -10000,6 +10015,139 @@ fn overview_drag_freezes_the_other_previews() {
         Some(slot_a),
         "the drop must let the source desktop's picker layout recompute"
     );
+}
+
+/// A window mapping mid-drag does not close the gap the dragged preview left.
+///
+/// Membership is a layout input, so a window picked up is a window removed unless the picker
+/// keeps laying out for it. It did — by replaying the slots it captured at pickup — but a
+/// window it had no slot for made that replay impossible and the whole picker fell through
+/// to a fresh layout, over a membership the dragged window had already left. The gap
+/// collapsed and every preview reflowed into it.
+///
+/// gnome-shell has nothing to fall through to: a preview drag reparents the actor and leaves
+/// the window in `_sortedWindows` (`windowPreview.js:643-670`), and `addWindow` reflows
+/// immediately around it (`workspace.js:824`).
+#[test]
+fn a_window_mapping_mid_drag_keeps_the_dragged_preview_a_place() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
+
+    assert_eq!(
+        f.synoik().layout.expose_decided_over(&win_a),
+        Some(2),
+        "the dragged window must still be laid out for, though it has left the workspace",
+    );
+
+    map_window_unsettled(&mut f, id, (500, 400), None);
+    // Not `settle`: the drag is in flight, and an interactive move never settles.
+    f.run_until_settled(20);
+    // The decision is taken lazily, at the next query.
+    let _ = f.synoik().layout.expose_target_rect(&win_a);
+
+    assert_eq!(
+        f.synoik().layout.expose_decided_over(&win_a),
+        Some(3),
+        "a window arriving mid-drag must be laid out alongside the reserved place, not \
+         instead of it",
+    );
+    assert_eq!(
+        f.synoik().layout.expose_target_rect(&win_b),
+        None,
+        "the dragged window still has no slot of its own: its place is reserved, not filled",
+    );
+
+    pointer_motion_to(&mut f, 1800., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+}
+
+/// A drag begun while a drop is still settling leaves the other previews travelling.
+///
+/// Picking a preview up captured the slots the picker had *at that instant* and replayed
+/// them for the length of the drag. Those come through the slide post-pass, so a preview
+/// part-way to a new slot was pinned exactly where it had got to — the picker stopped dead
+/// mid-flight and stayed there until the drop. Reserving the dragged window's layout input
+/// instead leaves the slides running over the targets they were easing toward.
+#[test]
+fn a_drag_begun_mid_settle_leaves_the_other_previews_travelling() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let _c = map_window_sized(&mut f, id, (520, 420), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    // Drop C on the trailing workspace. A and B are displaced and start easing toward the
+    // slots a two-window picker gives them.
+    let rect = f.synoik().layout.expose_target_rect(&win_c).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, 1800., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    // One frame in, mid-slide, pick B up.
+    f.run_until_settled(1);
+    let mid = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
+
+    // A was not the window picked up and nothing about its layout changed, so its slide must
+    // still be running: the drag reserves B's place and suppresses nothing.
+    let moved = f.sample_animation(Duration::from_millis(200), 20, |f| {
+        f.synoik().layout.expose_target_rect(&win_a).unwrap()
+    });
+    let travelled = moved
+        .iter()
+        .map(|r| (r.loc.x - mid.loc.x).abs() + (r.loc.y - mid.loc.y).abs())
+        .fold(0., f64::max);
+    assert!(
+        travelled > 1.,
+        "the drag pinned a preview part-way to its slot: it moved {travelled:.2}px over the \
+         rest of the slide it was in the middle of",
+    );
+
+    pointer_motion_to(&mut f, 900., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
 }
 
 /// Picking a preview up must not re-flow the picker. The tile is still in the

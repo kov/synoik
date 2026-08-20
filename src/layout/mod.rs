@@ -4690,13 +4690,12 @@ impl<W: LayoutElement> Layout<W> {
                     .find(|ws| ws.has_window(&window_id))
                     .unwrap();
                 if in_expose {
-                    // gnome-shell's WindowPreview drag never touches the real
-                    // window: no unmaximize/untile until the drop (the tile
-                    // carries its state and restore rects along), and the
-                    // source desktop's picker layout stays frozen so the
-                    // remaining previews hold their slots (workspace.js
-                    // layout_frozen).
-                    ws.freeze_expose();
+                    // gnome-shell's WindowPreview drag never touches the real window: no
+                    // unmaximize/untile until the drop, the tile carrying its state and
+                    // restore rects along. Read the window's layout input before the removal
+                    // below takes it away, so the picker keeps a slot reserved for it and
+                    // the remaining previews do not close the gap.
+                    ws.freeze_expose(&window_id);
                 } else {
                     // Unset fullscreen before removing the tile. This will restore its size
                     // properly, and move it to floating if needed, so we don't have to deal with
@@ -6235,6 +6234,16 @@ impl<W: LayoutElement> Layout<W> {
                 .workspaces_with_render_geo()
                 .find(|(ws, _)| ws.has_window(window))?;
             ws.expose_slot(window)
+        })
+    }
+
+    /// How many windows the picker's decision on `window`'s workspace was made over.
+    pub fn expose_decided_over(&self, window: &W::Id) -> Option<usize> {
+        self.monitors().find_map(|mon| {
+            let (ws, _) = mon
+                .workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(window))?;
+            Some(ws.expose_decided_over())
         })
     }
 

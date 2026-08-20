@@ -12,23 +12,21 @@ input re-seats previews — and centred auto-placement makes exact ties ordinary
 same-sized windows each mapped alone on an empty workspace and then brought together have
 *identical* centres, resolved by nothing but input order.
 
-Two inputs were unstable, and both are fixed:
+Two rules keep the inputs still, and neither is retention:
 
-- **The settled rect was rounded twice.** `tiles_with_render_positions` rounds
-  `logical_pos + render_offset` to physical pixels, and the picker rounded again after
-  subtracting `render_offset` back off. At fractional scale `round(round(X + R) − R) != X`,
-  so a rect that is by construction animation-free wobbled by a physical pixel for the life
-  of a decaying move spring. It is now read from its own source (`tiles_with_offsets`),
-  unrounded and frame-stable.
-- **The sort input was reordered by stacking.** GNOME lays out `_sortedWindows`, held in
-  `get_stable_sequence()` order (`workspace.js:811-817`, consumed at `:541`); `syncStacking`
-  sorts a *local* array for z-order (`:862-872`), so a restack recomputes to the identical
-  assignment. Ours sorted the floating stack, which `raise_window` reorders on every
-  activation. It now sorts by `stable_sequence`.
+- **A settled rect is read, never recovered.** It comes from `tiles_with_offsets`, unrounded
+  and frame-stable, not from the rounded render position with the animation subtracted back
+  off — at fractional scale `round(round(X + R) − R) != X`, so recovering it that way moves a
+  rect that is by construction animation-free by a physical pixel for the life of `R`.
+- **The layout order is creation order.** `stable_sequence`, our
+  `MetaWindow::get_stable_sequence`, never the floating stack, which `raise_window` reorders
+  on every activation. GNOME lays out `_sortedWindows` in that order for exactly this reason
+  (`workspace.js:811-817`, consumed at `:541`), while `syncStacking` sorts only a *local*
+  array for z-order (`:862-872`), so a restack recomputes to the identical assignment.
 
-Retention is not what fixed those. It is GNOME fidelity, and insurance: a tie-break-free
-sort stays fragile against every *genuine* sub-pixel input change, and holding the decision
-makes those non-events rather than lucky ones.
+Retention is GNOME fidelity, and insurance: a tie-break-free sort stays fragile against every
+*genuine* sub-pixel input change, and holding the decision makes those non-events rather than
+lucky ones.
 
 ## The split
 
@@ -86,6 +84,13 @@ it is GNOME's: `workareas-changed` calls `layout_changed()` without ever setting
 `_needsLayout` (`workspace.js:594-597`). A strut appearing mid-overview shifts and re-scales
 the previews together rather than re-seating them.
 
+Narrower in practice than it sounds, and knowingly so: a free-floating window's position is
+stored as a fraction of the working area (`floating.rs:192-227`, mutter's rule), so a real
+strut *moves* most windows, which changes an input and re-decides anyway. The re-fit is what
+happens to the windows a strut leaves where they are. We therefore re-decide on more events
+than GNOME, which never dirties on a bare position change — the safe direction, and not
+worth diverging from mutter's placement to narrow.
+
 ### What bounds the staleness
 
 Only one thing goes stale: the area a decision was searched for. Since `additional_scale`
@@ -109,10 +114,30 @@ makes a re-layout animate rather than jump. The interpolated slot must never rea
 `compute_grid`. The hover growth in `expose_tile_render`. And the `rect` half of
 `ExposeLayout`, the tile's live render rect; only the `slot` half is held.
 
-`expose_frozen` sits beside the held decision rather than being it: while an overview drag is
-in flight the remaining tiles keep their captured slots and the dragged window's slot stays
-vacant. A window the freeze does not know about falls through to the held decision, which is
-stable for the duration of a drag.
+## The drag
+
+A window picked up in the picker leaves its workspace to ride along with the move, and
+membership is a layout input — so without help, picking one up is removing one, and the
+previews around it close the gap. The drag therefore **reserves its layout input**: the
+`(stable_sequence, settled rect)` it had at pickup stays in the list, keeps its place in the
+order, and resolves to a slot that no tile asks for.
+
+That is GNOME's mechanism, which has nothing to suppress: a preview drag reparents the actor
+and leaves the window in `_sortedWindows` (`windowPreview.js:643-670`), so the layout keeps
+computing a slot with no actor in it, and `addWindow` reflows around it (`workspace.js:824`).
+`_layoutFrozen` exists for something else entirely — a removal settling under a still pointer
+(`:1152-1183`) and overview exit (`:1300`).
+
+It reserves the *input*, not the slot it resolved to. A captured slot comes through the slide
+post-pass, so replaying one pins a preview wherever it had got to: a drag begun during a
+settling drop stopped the picker dead mid-flight for the length of the drag. And a slot
+capture cannot answer for a window that arrives mid-drag, which is why one used to collapse
+the reserved gap and reflow everything.
+
+**Left open:** a *bystander* closing mid-drag re-decides and snaps the survivors, where GNOME
+freezes for 750 ms of pointer stillness and then eases (`workspace.js:1152-1183`). That is a
+pre-existing class — a window closing in the picker with no drag in flight already snaps —
+and the fix is to arm a slide on the removal reflow.
 
 ## Tests
 
@@ -138,7 +163,15 @@ about the picker's *output* can witness retention directly.
   area differs from the re-fitted one — without that, re-fitting and re-deciding would be
   indistinguishable and the test would prove nothing.
 - `the_picker_decides_again_when_its_inputs_change` — a window arriving, moving, resizing
-  under a client commit, and the view rescaling.
+  under a client commit, and the view rescaling. The rescale leg is confounded and known to
+  be: it moves the working area too, so it would pass even with the view size out of the
+  compared set. The reason both view *dimensions* are compared — a 1920x1080 to 3440x1080
+  mode change leaves the height bit-identical — is unwitnessable headless, where mode changes
+  no-op.
+- `a_window_mapping_mid_drag_keeps_the_dragged_preview_a_place` and
+  `a_drag_begun_mid_settle_leaves_the_other_previews_travelling` — the two things a captured
+  slot could not do. The first reads how many windows the decision was made over, because a
+  reserved slot reaches no caller and is otherwise unobservable.
 - `the_picker_decides_its_layout_once_and_holds_it` — forward-only, and says so. The count it
   asserts on did not exist before the decision was held, so it cannot have been red. It
   queries *every* workspace, which is what the render path does and the only way an empty
@@ -157,14 +190,30 @@ physical-pixel grid. Kept as a class net.
 
 **Must keep passing unchanged.** `overview_drag_does_not_reflow_the_picker_on_pickup`,
 `overview_drop_does_not_reflow_the_picker_while_the_window_settles`,
-`dropped_preview_flies_back_into_its_slot`, and `leaving_the_overview_drops_the_picker_overlay`.
+`dropped_preview_flies_back_into_its_slot`, `overview_drag_freezes_the_other_previews`, and
+`leaving_the_overview_drops_the_picker_overlay`.
+
+**What the corpus cannot see.** `Fixture::run_until_settled` dispatches and refreshes but
+never renders, so anything that only `render_expose` does — its hover restack, say — is
+invisible here. Tests reach the picker through `expose_slot` and `expose_slots_now`, the same
+entry the render path uses, which is why they see the layout at all.
 
 ## Known gap
 
-A held grid packed into a pathologically shrunken area can drive
-`additional_vertical_scale` negative, where a fresh decision would have scored its way to a
-single row and avoided it. It needs an area shorter than `(rows − 1) × spacing()`, which a
-view-size change would have re-decided, so only an extreme mid-visit strut reaches it.
-GNOME divides the same way at every one of these sites (`workspace.js:284-285`, `:320`,
-`:329`) and has the same hole. Do not clamp — the geometry is pinned, but whether a
-negative-size slot survives the render path is unverified.
+A held grid packed into a much smaller area drives `additional_vertical_scale` negative,
+where a fresh decision would have scored its way to a single row and avoided it. It needs an
+area shorter than `(rows − 1) × spacing()` — `spacing()` is about 30px, so a held two-row
+grid needs roughly 30 logical pixels of height left, which on a 1080-logical view means a
+mid-visit layer surface reserving over 500px. A view-size change would have re-decided, so
+only a strut appearing during a visit reaches it.
+
+What happens: negative slot sizes reach `expose_tile_render` as a negative tile scale, and
+`RescaleRenderElement` builds its geometry from corners, so damage intersection treats the
+result as empty. The previews go invisible and stop hit-testing until the next input change
+or overview entry. No panic — `verify_invariants` is test-only — and self-healing.
+
+Left alone deliberately. GNOME divides the same way at every one of these sites
+(`workspace.js:284-285`, `:320`, `:329`) and has the same hole, and clamping here would put
+a fudge factor in a ported formula to paper over a state reached only by an OSK-sized strut
+opening over an already-shrunken picker. If it is ever worth closing, close it by
+re-deciding when a re-fit would come out negative — not by clamping the scale.

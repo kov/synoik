@@ -120,9 +120,9 @@ pub struct Workspace<W: LayoutElement> {
     /// Layout config overrides for this workspace.
     layout_config: Option<synoik_config::LayoutPart>,
 
-    /// Picker slots held in place while an overview drag is in flight
-    /// (gnome-shell's frozen workspace layout), keyed by window.
-    expose_frozen: Option<FrozenExposeSlots<W>>,
+    /// The window being dragged out of this workspace's picker, kept as a layout input for
+    /// as long as the drag lasts — see [`Workspace::freeze_expose`].
+    expose_reserved: Option<ExposeInput>,
 
     /// The picker's held layout — see [`RetainedExpose`]. `RefCell` because
     /// [`Workspace::expose_layout`] is a read: the layout is a value the workspace
@@ -184,9 +184,6 @@ type ExposeLayout<'a, W> = Vec<(
     Rectangle<f64, Logical>,
     Rectangle<f64, Logical>,
 )>;
-
-/// Frozen picker slots, keyed by window.
-type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>;
 
 /// One input to the picker's layout: a window's stable sequence, and the rect it is laid
 /// out over.
@@ -512,7 +509,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
-            expose_frozen: None,
+            expose_reserved: None,
             expose_retained: RefCell::new(None),
             expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
@@ -581,7 +578,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
-            expose_frozen: None,
+            expose_reserved: None,
             expose_retained: RefCell::new(None),
             expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
@@ -2172,12 +2169,20 @@ impl<W: LayoutElement> Workspace<W> {
         settled.to_physical_precise_round(scale).to_logical(scale)
     }
 
-    /// [`Self::settled_pos`] for one window, if it is here.
-    pub(super) fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
+    /// The layout input one window contributes, if it is here.
+    fn expose_input(&self, window: &W::Id) -> Option<ExposeInput> {
         let scale = self.scale().fractional_scale();
         self.tiles_with_settled_positions()
             .find(|(tile, _)| tile.window().id() == window)
-            .map(|(_, settled)| Self::settled_pos(scale, settled))
+            .map(|(tile, settled)| {
+                let rect = Rectangle::new(Self::settled_pos(scale, settled), tile.tile_size());
+                (tile.window().stable_sequence(), rect)
+            })
+    }
+
+    /// [`Self::settled_pos`] for one window, if it is here.
+    pub(super) fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
+        self.expose_input(window).map(|(_, rect)| rect.loc)
     }
 
     fn expose_layout(&self) -> ExposeLayout<'_, W> {
@@ -2216,29 +2221,6 @@ impl<W: LayoutElement> Workspace<W> {
             })
             .collect();
 
-        // While frozen (an overview drag is in flight), the remaining tiles
-        // keep their captured slots and the dragged window's slot stays
-        // vacant. A window the freeze doesn't know about falls back to a
-        // fresh layout, like gnome-shell unfreezing on window-added.
-        if let Some(frozen) = &self.expose_frozen {
-            let slots: Option<Vec<_>> = tiles
-                .iter()
-                .map(|(tile, _, _)| {
-                    frozen
-                        .iter()
-                        .find(|(id, _)| id == tile.window().id())
-                        .map(|(_, slot)| *slot)
-                })
-                .collect();
-            if let Some(slots) = slots {
-                return tiles
-                    .into_iter()
-                    .zip(slots)
-                    .map(|((tile, rect, _), slot)| (tile, rect, slot))
-                    .collect();
-            }
-        }
-
         // Lay out in a stable order, not the front-to-back one this vec is in.
         // `compute_grid` sorts stably and breaks no ties, so windows whose centres tie
         // exactly — which centred placement makes ordinary — are ordered by nothing but the
@@ -2248,16 +2230,35 @@ impl<W: LayoutElement> Workspace<W> {
         let mut order: Vec<usize> = (0..tiles.len()).collect();
         order.sort_by_key(|&i| tiles[i].0.window().stable_sequence());
 
-        let inputs: Vec<ExposeInput> = order
+        let mut inputs: Vec<ExposeInput> = order
             .iter()
             .map(|&i| (tiles[i].0.window().stable_sequence(), tiles[i].2))
             .collect();
+
+        // A window being dragged out of the picker has left the workspace, but it is still
+        // laid out for: it keeps its place in the order and its slot stays vacant, so the
+        // previews around it hold still instead of closing the gap it left. That is
+        // gnome-shell's mechanism exactly — a preview drag reparents the actor and freezes
+        // nothing, the window staying in `_sortedWindows` for the whole drag
+        // (`windowPreview.js:643-670`), which is what keeps a slot reserved for it.
+        let reserved_at = self.expose_reserved.map(|reserved| {
+            let at = inputs.partition_point(|(seq, _)| *seq < reserved.0);
+            inputs.insert(at, reserved);
+            at
+        });
+
         let packed = self.retained_expose_slots(inputs, self.view_size, self.expose_area());
 
-        // Scatter the slots back onto the render order the caller expects.
+        // Scatter the slots back onto the render order the caller expects, dropping the
+        // reserved one — no tile is asking for it.
         let mut slots = vec![Rectangle::default(); tiles.len()];
-        for (&i, slot) in order.iter().zip(packed) {
-            slots[i] = slot;
+        let mut next = 0;
+        for (i, slot) in packed.into_iter().enumerate() {
+            if Some(i) == reserved_at {
+                continue;
+            }
+            slots[order[next]] = slot;
+            next += 1;
         }
 
         tiles
@@ -2317,6 +2318,19 @@ impl<W: LayoutElement> Workspace<W> {
             grid,
         });
         slots
+    }
+
+    /// How many windows the picker's standing decision was made over.
+    ///
+    /// Larger than the tile count while a drag reserves a place for the window it carries,
+    /// which is the only way to see that the reservation is still in force: a reserved slot
+    /// has no tile asking for it and so never reaches a caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn expose_decided_over(&self) -> usize {
+        self.expose_retained
+            .borrow()
+            .as_ref()
+            .map_or(0, |r| r.inputs.len())
     }
 
     /// How many times this workspace has decided a picker layout — see
@@ -2525,17 +2539,22 @@ impl<W: LayoutElement> Workspace<W> {
             .map_or(0., |(_, anim)| anim.clamped_value().clamp(0., 1.))
     }
 
-    /// Holds the current picker slots in place until [`Self::unfreeze_expose`].
+    /// Keeps laying out for `window` until [`Self::unfreeze_expose`], though it has left
+    /// this workspace to ride along with the drag.
     ///
-    /// gnome-shell freezes the workspace layout while a preview drag is in
-    /// flight so the other previews don't shuffle into the gap.
-    pub(super) fn freeze_expose(&mut self) {
-        let frozen = self
-            .expose_layout()
-            .into_iter()
-            .map(|(tile, _, slot)| (tile.window().id().clone(), slot))
-            .collect();
-        self.expose_frozen = Some(frozen);
+    /// Membership is a layout input, so a window picked up would otherwise be a window
+    /// removed, and the previews around it would close the gap it left. gnome-shell has
+    /// nothing to suppress here: a preview drag reparents the actor and leaves the window in
+    /// `_sortedWindows` (`windowPreview.js:643-670`), so the layout keeps computing a slot
+    /// that simply has no actor in it. Holding the input back is that, in a layout that owns
+    /// its tiles.
+    ///
+    /// It reserves the *input*, not the slot it resolved to. A slot captured at pickup would
+    /// be captured through the slide post-pass and pinned mid-flight, so a drag begun during
+    /// a settling drop froze every preview part-way to where it was going, for the length of
+    /// the drag.
+    pub(super) fn freeze_expose(&mut self, window: &W::Id) {
+        self.expose_reserved = self.expose_input(window);
     }
 
     /// Forget the held picker layout, so the next one is decided afresh.
@@ -2552,7 +2571,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub(super) fn unfreeze_expose(&mut self) {
-        self.expose_frozen = None;
+        self.expose_reserved = None;
     }
 
     /// The picker slot of one window, in workspace coordinates.
