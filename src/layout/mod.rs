@@ -4247,8 +4247,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn overview_gesture_begin(&mut self) {
+        // A gesture that begins while the overview is already open is on its way *out* of
+        // it, and is not an entry: re-deciding there would re-seat previews at the moment
+        // the user starts swiping away, and again if the swipe is cancelled.
+        let entering = !self.overview_open;
         self.overview_open = true;
-        self.forget_expose_layouts();
+        if entering {
+            self.forget_expose_layouts();
+        }
 
         let value = self.overview_progress.take().map_or(0., |p| p.value());
         let gesture = OverviewGesture {
