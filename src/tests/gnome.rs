@@ -29555,6 +29555,124 @@ fn the_picker_decides_its_layout_once_and_holds_it() {
     }
 }
 
+/// A strut appearing re-fits the picker's previews and never re-seats them.
+///
+/// The tier split: deciding which window goes where reads positions and *orders*, packing
+/// that decision into rects reads sizes and cannot. So a change to the area the slots are
+/// packed into re-packs the standing decision — the previews shift and re-scale together —
+/// where re-deciding could hand them different cells outright, over an area change that
+/// says nothing about which window belongs beside which.
+///
+/// gnome-shell's `vfunc_allocate` splits the same way: `_layout` is guarded by
+/// `_needsLayout`, `_windowSlots` additionally recomputes on `containerAllocationChanged`
+/// (`workspace.js:668-681`), and a `workareas-changed` calls `layout_changed()` without
+/// ever setting `_needsLayout` (`:594-597`).
+#[test]
+fn a_strut_refits_the_previews_and_does_not_reseat_them() {
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
+    use crate::tests::client::LayerConfigureProps;
+
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    let (win_a, win_b, win_c) = tied_previews_in_the_overview(&mut f, id, (801, 601));
+    f.settle();
+
+    let slots = |f: &mut Fixture| {
+        [&win_a, &win_b, &win_c].map(|w| f.synoik().layout.expose_slot_local(w).expect("a slot"))
+    };
+    let settled = |f: &mut Fixture| {
+        [&win_a, &win_b, &win_c].map(|w| f.synoik().layout.expose_settled_pos(w).expect("a pos"))
+    };
+
+    // Parked at the working area's origin. A free-floating window's position is stored as a
+    // fraction of the working area (mutter's rule, `recompute_logical_pos`), so a strut
+    // re-derives it and *moves* the window — which changes a layout input and would entitle
+    // the picker to decide again for a reason that has nothing to do with the split. The
+    // origin is the one point a bottom strut leaves alone: it shortens the working area
+    // without moving where it starts.
+    for win in [&win_a, &win_b, &win_c] {
+        let win = win.clone();
+        f.synoik().layout.move_floating_window(
+            Some(&win),
+            synoik_ipc::PositionChange::SetFixed(0.),
+            synoik_ipc::PositionChange::SetFixed(0.),
+            false,
+        );
+    }
+    f.settle();
+
+    let before = slots(&mut f);
+    let placed = settled(&mut f);
+    let decided = f.synoik().layout.expose_recompute_count();
+
+    // A bottom dock, deeper than the top panel's strut so it is the one `expose_area`
+    // symmetrizes on — a shallower one would be swallowed by the larger opposite strut and
+    // the area would not move at all.
+    let layer = f.client(id).create_layer(None, Layer::Top, "");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        size: Some((0, 200)),
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Bottom),
+        exclusive_zone: Some(200),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(3072, 200);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    // The lever has to be the area alone. A strut that also nudged a window would change a
+    // layout *input*, and re-deciding would then be right — the count below would be
+    // measuring the fixture rather than the split.
+    assert_eq!(
+        settled(&mut f),
+        placed,
+        "precondition: the strut must not have moved any window, or the picker is entitled \
+         to decide again and this test cannot tell the two apart",
+    );
+
+    let after = slots(&mut f);
+    assert_eq!(
+        f.synoik().layout.expose_recompute_count(),
+        decided,
+        "the picker decided its layout again over an area change: which window belongs \
+         where is not a function of how much room there is to put them in",
+    );
+    assert_ne!(
+        after, before,
+        "precondition: the strut must have moved the slots, or there is no re-fit here to \
+         tell apart from a re-decision",
+    );
+
+    // Leaving and re-entering decides afresh, which is the one moment a held decision's
+    // packing area stops being allowed to be stale. If the fresh decision for this area
+    // matched the re-fitted one, everything above would hold whether or not the split
+    // existed — so the difference is what keeps this test honest.
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let fresh = slots(&mut f);
+    assert!(
+        f.synoik().layout.expose_recompute_count() > decided,
+        "entering the overview must decide the layout afresh",
+    );
+    assert_ne!(
+        fresh, after,
+        "precondition: a fresh decision over this area must differ from the re-fitted one, \
+         or re-fitting and re-deciding are indistinguishable here and the test proves nothing",
+    );
+}
+
 /// Every change the picker's layout is a function of makes it decide again.
 ///
 /// The other half of the claim, and the half that keeps it honest: a picker frozen forever
@@ -29607,9 +29725,13 @@ fn the_picker_decides_again_when_its_inputs_change() {
     f.settle();
     query(&mut f, "a window resizing under a client commit");
 
+    // A rescale, not an area change: it moves the view size, which the picker's decision is
+    // a function of because the grid freezes the monitor it enlarges small windows against.
+    // The area alone is a *re-fit* — see
+    // `a_strut_refits_the_previews_and_does_not_reseat_them`.
     f.resize_output(1, None, Some(1.5));
     f.settle();
-    query(&mut f, "the area the slots are packed into changing");
+    query(&mut f, "the view being rescaled");
 }
 
 /// A preview settling into the picker moves toward its new slot and does not double back.

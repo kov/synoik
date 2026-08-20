@@ -4248,6 +4248,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn overview_gesture_begin(&mut self) {
         self.overview_open = true;
+        self.forget_expose_layouts();
 
         let value = self.overview_progress.take().map_or(0., |p| p.value());
         let gesture = OverviewGesture {
@@ -5571,10 +5572,21 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Every workspace decides its picker layout afresh — see
+    /// [`Workspace::forget_expose_layout`]. Entering the overview is the one moment that
+    /// bounds how stale a held decision's packing area may get.
+    fn forget_expose_layouts(&mut self) {
+        for ws in self.workspaces_mut() {
+            ws.forget_expose_layout();
+        }
+    }
+
     pub fn toggle_overview(&mut self) {
         self.overview_open = !self.overview_open;
 
-        if !self.overview_open {
+        if self.overview_open {
+            self.forget_expose_layouts();
+        } else {
             // Leaving: drop the picker overlay before the exit animation starts, rather than
             // easing it down. `render_expose` raises the hovered preview above its neighbours
             // for as long as its hover value is non-zero, and nothing else clears it on the way
