@@ -29501,6 +29501,110 @@ fn raising_a_window_does_not_move_the_previews() {
     );
 }
 
+/// The picker decides a layout once and holds it: querying it again, over frame after
+/// frame with nothing changed, decides nothing again.
+///
+/// **A forward-only pin.** A held layout and a freshly derived one compute the same slots —
+/// that is the whole contract — so no observation of the picker's *output* can witness
+/// this, and the count it asserts on did not exist before the layout was held. It cannot
+/// have been red. It is here because the claim retention makes is about when work happens,
+/// and this is the only place that claim is written down as something that can fail.
+#[test]
+fn the_picker_decides_its_layout_once_and_holds_it() {
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    let (win_a, win_b, win_c) = tied_previews_in_the_overview(&mut f, id, (801, 601));
+    f.settle();
+
+    // Every query goes through `expose_layout`, which is what the render path calls twice a
+    // frame per workspace — the main row and the thumbnail strip.
+    let query = |f: &mut Fixture| {
+        for win in [&win_a, &win_b, &win_c] {
+            f.synoik()
+                .layout
+                .expose_slot_local(win)
+                .expect("every window in the overview has a slot");
+        }
+    };
+
+    query(&mut f);
+    let decided = f.synoik().layout.expose_recompute_count();
+    assert_eq!(
+        decided, 2,
+        "one decision per workspace holding windows, and there are two",
+    );
+
+    for round in 0..5 {
+        f.run_until_settled(5);
+        query(&mut f);
+        assert_eq!(
+            f.synoik().layout.expose_recompute_count(),
+            decided,
+            "the picker decided its layout again in round {round}, with nothing changed: \
+             frames alone must not re-seat previews",
+        );
+    }
+}
+
+/// Every change the picker's layout is a function of makes it decide again.
+///
+/// The other half of the claim, and the half that keeps it honest: a picker frozen forever
+/// passes every stability test there is. Validity is bit-equality of the inputs the layout
+/// was reached from, so each of these is one input moving — a window arriving, a window
+/// moving, a window resizing under a client commit, and the area the slots are packed into.
+#[test]
+fn the_picker_decides_again_when_its_inputs_change() {
+    let mut f = Fixture::new();
+    fractional_output(&mut f);
+
+    let id = f.add_client();
+    let (win_a, win_b, win_c) = tied_previews_in_the_overview(&mut f, id, (801, 601));
+    f.settle();
+
+    let mut decided = 0;
+    let mut query = |f: &mut Fixture, what: &str| {
+        for win in [&win_a, &win_b, &win_c] {
+            let _ = f.synoik().layout.expose_slot_local(win);
+        }
+        let now = f.synoik().layout.expose_recompute_count();
+        assert!(
+            now > decided,
+            "{what} left the picker holding the layout it had, and the layout is a function \
+             of what just changed",
+        );
+        decided = now;
+    };
+
+    query(&mut f, "the first query");
+
+    let surface = map_window_sized(&mut f, id, (400, 300), None);
+    f.settle();
+    query(&mut f, "a window arriving");
+
+    let focused = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik().layout.move_floating_window(
+        Some(&focused),
+        synoik_ipc::PositionChange::AdjustFixed(17.),
+        synoik_ipc::PositionChange::AdjustFixed(23.),
+        false,
+    );
+    f.settle();
+    query(&mut f, "a window moving");
+
+    let window = f.client(id).window(&surface);
+    window.set_size(512, 384);
+    window.commit();
+    f.roundtrip(id);
+    f.settle();
+    query(&mut f, "a window resizing under a client commit");
+
+    f.resize_output(1, None, Some(1.5));
+    f.settle();
+    query(&mut f, "the area the slots are packed into changing");
+}
+
 /// A preview settling into the picker moves toward its new slot and does not double back.
 ///
 /// The picker recomputes its whole layout every frame (`Workspace::expose_layout`, called

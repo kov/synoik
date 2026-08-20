@@ -66,6 +66,7 @@ fn window_scale(window: Rectangle<f64, Logical>, monitor_height: f64) -> f64 {
     1.5 + (1. - 1.5) * ratio
 }
 
+#[derive(Debug)]
 struct Row {
     /// Sum of unscaled (window-scale only) widths; no spacing.
     full_width: f64,
@@ -86,7 +87,8 @@ struct Row {
 /// row-count search settled on. Packing it into concrete rects is a separate step
 /// ([`pack_grid`]), because a container resize must re-fit without reconsidering the
 /// assignment — gnome-shell's `_layout` / `_windowSlots` split (`js/ui/workspace.js:668-681`).
-struct GridLayout {
+#[derive(Debug)]
+pub(super) struct GridLayout {
     rows: Vec<Row>,
     max_columns: usize,
     grid_width: f64,
@@ -284,7 +286,7 @@ pub fn compute_slots(
 /// `area`. It is the half that must not run per frame: it is the only half that *orders*
 /// anything, and both its sorts are stable with no tie-break, so any jitter in the input
 /// rects re-orders the grid.
-fn compute_grid(
+pub(super) fn compute_grid(
     monitor_height: f64,
     area: Rectangle<f64, Logical>,
     windows: &[Rectangle<f64, Logical>],
@@ -335,7 +337,7 @@ fn compute_grid(
 /// grid shifts and re-fits, and nothing moves between cells. Growth is then shrink-only
 /// until the next assignment, because `additional_scale` caps at 1 — gnome-shell tolerates
 /// the same staleness.
-fn pack_grid(
+pub(super) fn pack_grid(
     layout: &mut GridLayout,
     area: Rectangle<f64, Logical>,
     windows: &[Rectangle<f64, Logical>],

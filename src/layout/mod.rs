@@ -6220,6 +6220,18 @@ impl<W: LayoutElement> Layout<W> {
         })
     }
 
+    /// How many times the picker has decided a layout, over every workspace.
+    ///
+    /// Retention's claim is about *when* work happens: a held layout and a freshly derived
+    /// one compute the same slots, so nothing about the picker's output can witness it.
+    /// This is the observation the claim is made of.
+    pub fn expose_recompute_count(&self) -> u64 {
+        self.monitors()
+            .flat_map(|mon| mon.workspaces.iter())
+            .map(|ws| ws.expose_recompute_count())
+            .sum()
+    }
+
     /// Where the picker believes `window` sits with no animation running.
     ///
     /// The slots are laid out over these, so a settled position that moves while an

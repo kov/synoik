@@ -6,7 +6,9 @@
 // distributed under the GNU General Public License version 3 or later.
 // Modified for synoik in 2026.
 
+use std::cell::{Cell, RefCell};
 use std::cmp::max;
+use std::iter;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -122,6 +124,16 @@ pub struct Workspace<W: LayoutElement> {
     /// (gnome-shell's frozen workspace layout), keyed by window.
     expose_frozen: Option<FrozenExposeSlots<W>>,
 
+    /// The picker's held layout — see [`RetainedExpose`]. `RefCell` because
+    /// [`Workspace::expose_layout`] is a read: the layout is a value the workspace
+    /// remembers, not a thing a caller has to ask it to update.
+    expose_retained: RefCell<Option<RetainedExpose<W>>>,
+
+    /// How many times the picker has decided a layout. The claim retention makes is about
+    /// *when work happens*, and this is the only way to observe it: a held layout and a
+    /// freshly derived one are otherwise indistinguishable by construction.
+    expose_recomputes: Cell<u64>,
+
     /// Previews easing from the slots they held to the ones the picker now gives them —
     /// see [`Workspace::slide_expose_slots_from`].
     expose_slides: ExposeSlides<W>,
@@ -175,6 +187,52 @@ type ExposeLayout<'a, W> = Vec<(
 
 /// Frozen picker slots, keyed by window.
 type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>;
+
+/// One input to the picker's layout: a window, and the rect it is laid out over.
+type ExposeInput<W> = (<W as LayoutElement>::Id, Rectangle<f64, Logical>);
+
+/// The picker's standing layout decision, and the exact inputs it was reached from.
+///
+/// Held rather than re-derived because deciding is the half that *orders*: the row and
+/// column sorts in [`expose::compute_grid`] are stable with no tie-break, and centred
+/// placement makes exact ties ordinary, so re-running them over inputs that moved by a
+/// sub-pixel re-seats previews that had no business moving.
+#[derive(Debug)]
+struct RetainedExpose<W: LayoutElement> {
+    /// Every input the decision was reached from, in the order the grid's rows index —
+    /// stable creation order. Validity is bit-equality against this, recomputed per call.
+    ///
+    /// **Comparing the inputs rather than dirtying on the events that change them** is a
+    /// deliberate departure from what a dirty flag would do. Under-invalidation is this
+    /// design's one real hazard — a permanently wrong picker is worse than a transient
+    /// wobble — and the mutation surface cannot be closed by inspection:
+    /// `tiles_with_offsets_mut` (`floating.rs`) hands out `&mut Tile` past every named
+    /// mutator, and an interactive resize reaches a window's size through it. Comparison
+    /// makes a missed event unrepresentable: the worst it can do is recompute.
+    inputs: Vec<ExposeInput<W>>,
+    /// The view height the grid was summed at, and the area it was searched in. Compared
+    /// like the rest, so a resize re-decides exactly as a fresh layout would.
+    monitor_height: f64,
+    area: Rectangle<f64, Logical>,
+    grid: expose::GridLayout,
+}
+
+/// Bit-equality of two layout inputs.
+///
+/// Bits, not `==`: `-0.` and `0.` compare equal but sort apart under `total_cmp`, which is
+/// what the grid orders with, so a value that flipped sign of zero really can re-seat a
+/// preview. `NaN` going the other way — never equal to itself — only costs a recompute.
+fn same_expose_input<W: LayoutElement>(a: &ExposeInput<W>, b: &ExposeInput<W>) -> bool {
+    let bits = |r: &Rectangle<f64, Logical>| {
+        [
+            r.loc.x.to_bits(),
+            r.loc.y.to_bits(),
+            r.size.w.to_bits(),
+            r.size.h.to_bits(),
+        ]
+    };
+    a.0 == b.0 && bits(&a.1) == bits(&b.1)
+}
 
 /// Picker-overlay progress per window — see [`Workspace::expose_hover`].
 type ExposeHovers<W> = Vec<(<W as LayoutElement>::Id, Animation)>;
@@ -435,6 +493,8 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_retained: RefCell::new(None),
+            expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
@@ -502,6 +562,8 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_retained: RefCell::new(None),
+            expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
@@ -2158,7 +2220,7 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         // Lay out in a stable order, not the front-to-back one this vec is in.
-        // `compute_slots` sorts stably and breaks no ties, so windows whose centres tie
+        // `compute_grid` sorts stably and breaks no ties, so windows whose centres tie
         // exactly — which centred placement makes ordinary — are ordered by nothing but the
         // input, and the stacking order changes on every raise. gnome-shell lays out
         // `_sortedWindows`, held in `get_stable_sequence()` order (`workspace.js:811-817`),
@@ -2166,9 +2228,13 @@ impl<W: LayoutElement> Workspace<W> {
         let mut order: Vec<usize> = (0..tiles.len()).collect();
         order.sort_by_key(|&i| tiles[i].0.window().stable_sequence());
 
-        let rects: Vec<_> = order.iter().map(|&i| tiles[i].2).collect();
+        let inputs: Vec<ExposeInput<W>> = order
+            .iter()
+            .map(|&i| (tiles[i].0.window().id().clone(), tiles[i].2))
+            .collect();
         let area = self.expose_area();
-        let packed = expose::compute_slots(self.view_size.h, area, &rects);
+        let monitor_height = self.view_size.h;
+        let packed = self.retained_expose_slots(inputs, monitor_height, area);
 
         // Scatter the slots back onto the render order the caller expects.
         let mut slots = vec![Rectangle::default(); tiles.len()];
@@ -2181,6 +2247,59 @@ impl<W: LayoutElement> Workspace<W> {
             .zip(slots)
             .map(|((tile, rect, _), slot)| (tile, rect, self.slide_slot(tile, slot)))
             .collect()
+    }
+
+    /// The picker's slots for `inputs`, deciding the layout only if this is not the
+    /// decision it is already holding.
+    ///
+    /// The decision is validated by comparing the inputs it was reached from, not by a flag
+    /// some mutator was supposed to set — see [`RetainedExpose::inputs`]. A hit re-packs the
+    /// held grid, which reads window *sizes* only and so cannot re-order anything; a miss
+    /// decides afresh and is indistinguishable from never having held one.
+    fn retained_expose_slots(
+        &self,
+        inputs: Vec<ExposeInput<W>>,
+        monitor_height: f64,
+        area: Rectangle<f64, Logical>,
+    ) -> Vec<Rectangle<f64, Logical>> {
+        let mut retained = self.expose_retained.borrow_mut();
+
+        let hit = retained.as_ref().is_some_and(|r| {
+            r.monitor_height.to_bits() == monitor_height.to_bits()
+                && r.area == area
+                && r.inputs.len() == inputs.len()
+                && iter::zip(&r.inputs, &inputs).all(|(a, b)| same_expose_input::<W>(a, b))
+        });
+
+        let rects: Vec<_> = inputs.iter().map(|(_, rect)| *rect).collect();
+        if hit {
+            // Packing reads sizes only and is pure over the grid, so the held decision packs
+            // to the same slots it packed to before — and would still be the same decision
+            // packed into a different area.
+            let r = retained.as_mut().unwrap();
+            return expose::pack_grid(&mut r.grid, area, &rects);
+        }
+
+        self.expose_recomputes.set(self.expose_recomputes.get() + 1);
+        let Some(mut grid) = expose::compute_grid(monitor_height, area, &rects) else {
+            *retained = None;
+            return Vec::new();
+        };
+        let slots = expose::pack_grid(&mut grid, area, &rects);
+        *retained = Some(RetainedExpose {
+            inputs,
+            monitor_height,
+            area,
+            grid,
+        });
+        slots
+    }
+
+    /// How many times this workspace has decided a picker layout — see
+    /// [`Workspace::expose_recomputes`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn expose_recompute_count(&self) -> u64 {
+        self.expose_recomputes.get()
     }
 
     /// A preview's slot on the way to the one just computed for it, if it is mid-ease.
