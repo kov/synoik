@@ -141,37 +141,77 @@ the held inputs with it.
 
 ## The close
 
-A window leaving re-decides the layout — membership is an input — so the survivors would jump.
-They ease instead, over the same 200 ms `EaseOutQuad` a drop uses, which is what gnome-shell
-runs on the same event (`animateAllocation` off `layoutChanged`, `workspace.js:759-766`,
-`:389-399`).
+A window leaving re-decides the layout — membership is an input — so the picker would reflow
+out from under a pointer that is still working in it. It **holds still** instead, for 750 ms of
+pointer stillness, and reflows with a 200 ms `EaseOutQuad` when the hold runs out. Both halves
+are gnome-shell's `_doRemoveWindow` (`workspace.js:1140-1183`): clearing `layout_frozen` emits
+`layout_changed()` (`:937`) onto the `_needsLayout` the removal set, so the reflow arrives
+through `animateAllocation` (`:759-766`). **The ease belongs to the release, not to the close.**
 
-Armed in `Layout::remove_window`, the one site every close funnels through — a client
-destroying its toplevel, `Action::CloseWindow`, the preview's own close button. Two conditions
-on it:
+A freeze holds the **whole input list**, not the departed window's entry. One vacant entry is
+not enough: a removal in the scrolling layout shifts every column after it, so the survivors'
+own settled rects move and the grid re-decides over them anyway — and, with the ease at the
+release, snaps them. Substituting the list does not bypass retention, it feeds it: the held
+decision is still validated bit-for-bit against exactly what it is handed.
 
-- **Only while something shows the spread**, `overview_open || peek_open` — the workspace peek
-  renders the picker with the overview shut. Arming a slide nobody can see costs 200 ms of
-  redraws per close, because `are_animations_ongoing` counts `expose_slides`.
-- **Not on a drag pickup**, which removes the window too but reserves its place first, so
-  nothing reflows.
+Armed in `Layout::remove_window` — the one site every close funnels through, a client
+destroying its toplevel, `Action::CloseWindow`, the preview's own close button — and at the
+source of a move (below). Two conditions:
 
-It does **not** port `_doRemoveWindow`'s freeze (`workspace.js:1140-1183`): GNOME holds the
-layout until the pointer has been still for 750 ms, so a close button stays under the cursor
-for a second click. That needs a repeating timer, pointer-stillness sampling and hit-testing,
-and a hold that several removals can share — where the reservation here is a single `Option`
-the drag owns. It is a separate mechanism, not a parameter of this one.
+- **Only while something shows the spread**, `overview_open || peek_open`.
+- **Not on a drag pickup**, which removes the window too but reserves its place first.
 
-**Left open**, all the same class and all the same fix, reached through different doors:
+### What ends a hold
 
-- A window *arriving* in the picker outside a drop — a fresh map — snaps the previews it
-  displaces.
-- Move-to-workspace and move-to-output bypass `Layout::remove_window` entirely
-  (`monitor.rs:1215`, `:1301`, `mod.rs:3849`), so they snap **both** sides: the workspace the
-  window left and the one it arrived on.
-- The dragged window's own client dying mid-drag returns early from `remove_window`'s
-  interactive-move arm (`mod.rs:1370-1394`) before the ease. It drops the reservation, which
-  closes the gap the drag was holding, with the picker on screen and nothing armed.
+- **750 ms with the pointer still**, which is the `Some(hold)` case. That hold is an `Animation`
+  and so claims a running frame — which is what guarantees a frame arrives to notice it, at a
+  bounded cost of 750 ms of static redraws per close. gnome-shell's GLib timeout pays nothing
+  there; expiring on the animation clock is what makes the hold testable under a frozen one,
+  and no calloop timer is.
+- **Never, while the pointer rests on one of this workspace's previews** — gnome-shell's second
+  disjunct at `:1170`, and the point of the whole mechanism: a close button must stay under the
+  cursor for a second click. That hold is `None`, claims no animation, and so costs nothing
+  however long it lasts. Only a *live* preview counts: a close-button click leaves the pointer
+  over a corpse, and `Workspace::remove_tile` drops the departed window's hover entry.
+  Unreachable during a peek, whose hover is never computed, so a peek's freeze always runs its
+  750 ms out.
+- **A window arriving**, per workspace (`_doAddWindow`, `:1245-1251`). Fidelity and invariant
+  both: a freeze holds a fixed list, and a tile with no entry in it has no slot to land in.
+  Every insertion funnels through `Workspace::add_tile`/`add_tile_to_column` for that reason.
+- **The overview fully hiding**, not the start of its exit. The exit interpolates each preview
+  between its window rect and its slot, so reflowing there shuffles the picker on its way out —
+  gnome-shell holds it across the exit for the same reason (`:1300`, `:1316-1318`).
+- **The overview opening**, with `forget_expose_layout`.
+
+Two hazards this shape has and a poll does not, both closed: an indefinite hold needs a way
+back to a timed one, or a pointer that leaves a preview for another output freezes the picker
+for good; and a hold that expires with no motion since the close would reflow under a still
+pointer, so the expiry re-checks hover rather than trusting the motion feed alone.
+
+**Divergence: a freeze holds the list, not the allocation.** During the hold a *resize* or a
+*move* on that workspace still re-decides for us and would not for gnome-shell. The removal —
+the event the freeze exists for — is a non-event either way.
+
+## Every other door
+
+A window can also join or leave without either of those funnels, and each such door used to
+leave previews to snap:
+
+- **A fresh map.** `Layout::add_window` brackets the insertion with a `picker_slots_now`
+  snapshot and `ease_picker_from`. The arriving preview appears in its slot rather than easing
+  — it is missing from the snapshot, which is what tells the ease to skip it. gnome-shell pops
+  the added clone up from scale 0 instead (`:1233-1243`); not ported.
+- **Move-to-workspace and move-to-output**, which bypass `Layout::remove_window` and so snapped
+  *both* sides. The source now holds still like any other removal (gnome-shell's
+  `_windowRemoved`, `:1260-1262`) and the target eases apart around the arrival.
+- **The dragged window's own client dying mid-drag.** Dropping the reservation is what closes
+  the gap the drag was holding, so it freezes first.
+
+The snapshot forces a layout *decision* on a workspace that has not made one, so it is taken
+only while the picker is up; outside that it is empty and the ease is a no-op.
+
+Still snapping: toggling a window between floating and tiling reaches the sub-layouts directly
+(`workspace.rs`, `toggle_window_floating`) rather than `add_tile`/`remove_tile`.
 
 ## Tests
 
@@ -218,10 +258,23 @@ about the picker's *output* can witness retention directly.
   that never happened. The freeze is only worth as much as its writers respect: `Synoik::redraw`
   used to pin the clock at each frame's real-time target regardless, which put the machine back
   in charge of a frozen clock at every redraw.
-- `a_window_closing_in_the_picker_eases_the_survivors` — the close ease, sampled across the
-  200 ms. It must settle **frame by frame** beforehand, not with `settle_animations` — that
-  jumps the clock a second ahead and the roundtrip puts it back, arming the ease at a time no
-  sample reaches, which reads exactly like a snap.
+- `a_window_closing_in_the_picker_eases_the_survivors` — both halves: nothing has moved at
+  700 ms, and the reflow past the hold is sampled across its 200 ms. It must settle **frame by
+  frame** beforehand, not with `settle_animations` — that jumps the clock a second ahead and
+  the roundtrip puts it back, arming the ease at a time no sample reaches, which reads exactly
+  like a snap.
+- `a_pointer_resting_on_a_preview_holds_the_close_freeze`, plus
+  `the_closed_windows_own_preview_does_not_hold_the_freeze` and
+  `a_window_arriving_releases_the_close_freeze` — the three ends of a hold. The first advances
+  past the hold **in steps**: one jump lands the release and the reading on the same instant,
+  where the ease has covered nothing and a wrongly-reflowed picker is indistinguishable from a
+  held one. It passed the mutation that way before the steps were split.
+- `a_fresh_window_eases_the_previews_it_displaces` and
+  `moving_a_window_to_another_workspace_settles_both_pickers` — the other doors. The first must
+  map with `map_window_unsettled`: `map_window_sized` settles, which runs the ease to its end
+  before anything can sample it. The second reads the two sides at *different* times, because
+  they behave differently — the target eases immediately and is over by 200 ms, the source is
+  still untouched at 300 ms.
 - `the_picker_decides_its_layout_once_and_holds_it` — forward-only, and says so. The count it
   asserts on did not exist before the decision was held, so it cannot have been red. It
   queries *every* workspace, which is what the render path does and the only way an empty
