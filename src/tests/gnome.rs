@@ -27998,8 +27998,8 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
     tap(&mut f, KEY_LEFTMETA);
     // Frame by frame, not `settle_animations`: that jumps the clock a second into the
     // future, and the roundtrip below puts it back, which would leave the ease armed at a
-    // time no sample ever reaches. Then frozen, so the destroy's roundtrip cannot spend any
-    // of the 200ms the ease is sampled over.
+    // time no sample ever reaches. Then frozen, so the destroy's roundtrip spends none of the
+    // 200ms the ease is sampled over, however long the machine takes over it.
     f.settle();
     f.freeze_clock();
 
@@ -28029,23 +28029,9 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
     );
 
     // It starts where it was and arrives where it is going, having been in between.
-    //
-    // The start is a near-miss rather than an equality: the destroy has to round-trip to the
-    // compositor, and a fraction of a millisecond still gets through the frozen clock doing
-    // it, which an ease steepest at t=0 turns into a fraction of a pixel. A snap would be
-    // hundreds — the two survivors cross 498px and 818px.
-    use smithay::utils::{Logical, Rectangle};
-    type Pair = (Rectangle<f64, Logical>, Rectangle<f64, Logical>);
-    let apart = |a: Pair, b: Pair| {
-        [(a.0, b.0), (a.1, b.1)]
-            .iter()
-            .map(|(x, y)| (x.loc.x - y.loc.x).abs().max((x.loc.y - y.loc.y).abs()))
-            .fold(0f64, f64::max)
-    };
-    assert!(
-        apart(samples[0], before) < 5.,
-        "the survivors jumped on the close frame: {:?} vs {before:?}",
-        samples[0],
+    assert_eq!(
+        samples[0], before,
+        "the survivors jumped on the close frame",
     );
     assert_eq!(samples[4], after);
     for (i, sample) in samples[1..4].iter().enumerate() {

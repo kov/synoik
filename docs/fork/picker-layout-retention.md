@@ -162,10 +162,16 @@ for a second click. That needs a repeating timer, pointer-stillness sampling and
 and a hold that several removals can share — where the reservation here is a single `Option`
 the drag owns. It is a separate mechanism, not a parameter of this one.
 
-**Left open:** a window *arriving* in the picker outside a drop — a fresh map, or a
-move-to-workspace keybinding, which bypasses `Layout::remove_window` entirely
-(`mod.rs:3827`, `monitor.rs:1215`) — still snaps the previews it displaces. Same class, same
-fix, different plumbing.
+**Left open**, all the same class and all the same fix, reached through different doors:
+
+- A window *arriving* in the picker outside a drop — a fresh map — snaps the previews it
+  displaces.
+- Move-to-workspace and move-to-output bypass `Layout::remove_window` entirely
+  (`monitor.rs:1215`, `:1301`, `mod.rs:3849`), so they snap **both** sides: the workspace the
+  window left and the one it arrived on.
+- The dragged window's own client dying mid-drag returns early from `remove_window`'s
+  interactive-move arm (`mod.rs:1370-1394`) before the ease. It drops the reservation, which
+  closes the gap the drag was holding, with the picker on screen and nothing armed.
 
 ## Tests
 
@@ -209,13 +215,13 @@ about the picker's *output* can witness retention directly.
   Both sample across a live animation and so must **freeze the clock** over it.
   `run_until_settled` unfreezes on the way out when it froze on the way in, and a slide left
   running on the wall clock finishes during whatever the test does next — reading as a snap
-  that never happened.
+  that never happened. The freeze is only worth as much as its writers respect: `Synoik::redraw`
+  used to pin the clock at each frame's real-time target regardless, which put the machine back
+  in charge of a frozen clock at every redraw.
 - `a_window_closing_in_the_picker_eases_the_survivors` — the close ease, sampled across the
-  200 ms. Its start is a near-miss rather than an equality: the destroy has to round-trip to
-  the compositor and the clock ticks a fraction of a millisecond doing it, which an ease that
-  is steepest at t=0 turns into about a pixel. It must settle **frame by frame** beforehand,
-  not with `settle_animations` — that jumps the clock a second ahead and the roundtrip puts it
-  back, arming the ease at a time no sample reaches, which reads exactly like a snap.
+  200 ms. It must settle **frame by frame** beforehand, not with `settle_animations` — that
+  jumps the clock a second ahead and the roundtrip puts it back, arming the ease at a time no
+  sample reaches, which reads exactly like a snap.
 - `the_picker_decides_its_layout_once_and_holds_it` — forward-only, and says so. The count it
   asserts on did not exist before the decision was held, so it cannot have been red. It
   queries *every* workspace, which is what the render path does and the only way an empty

@@ -11917,8 +11917,13 @@ impl Synoik {
         let target_presentation_time = aim.target;
         let refresh_interval = state.frame_clock.refresh_interval();
 
-        // Freeze the clock at the target time.
-        self.clock.set_unadjusted(target_presentation_time);
+        // Freeze the clock at the target time — unless a test has already frozen it, in which
+        // case the sampled instant is the test's to choose. This target comes from real time,
+        // so writing it would hand a frozen clock back to the machine at every redraw, and a
+        // roundtrip taken mid-animation would spend as much of the animation as it took.
+        if !self.clock.is_frozen() {
+            self.clock.set_unadjusted(target_presentation_time);
+        }
 
         if let Some(scheduled_at) = aim.scheduled_at {
             self.frame_log
