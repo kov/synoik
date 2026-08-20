@@ -1402,7 +1402,7 @@ impl<W: LayoutElement> Layout<W> {
                         // Unlock the view on the workspaces.
                         for ws in self.workspaces_mut() {
                             ws.dnd_scroll_gesture_end();
-                            if picker_showing && ws.expose_is_reserved(window) {
+                            if picker_showing && ws.expose_has_reservation() {
                                 ws.freeze_expose_for_close();
                             }
                             ws.unfreeze_expose();
@@ -3822,7 +3822,7 @@ impl<W: LayoutElement> Layout<W> {
         activate: ActivateWindow,
     ) {
         let before = self.picker_slots_now();
-        let overview_open = self.overview_open;
+        let picker_showing = self.overview_open || self.peek_open;
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -3884,7 +3884,7 @@ impl<W: LayoutElement> Layout<W> {
 
             // See `Monitor::move_to_workspace_up` — the source picker holds still, the way a
             // close does, and the target's previews ease apart around the arrival.
-            let freeze = overview_open;
+            let freeze = picker_showing;
             let ws = &mut mon.workspaces[ws_idx];
             if freeze && ws.has_windows() {
                 ws.freeze_expose_for_close();
@@ -3937,6 +3937,8 @@ impl<W: LayoutElement> Layout<W> {
         target_ws_idx: Option<usize>,
         activate: bool,
     ) {
+        let before = self.picker_slots_now();
+        let picker_showing = self.overview_open || self.peek_open;
         if let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -3956,6 +3958,10 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
 
+            // See `Monitor::move_to_workspace_up`.
+            if picker_showing && ws.has_windows() {
+                ws.freeze_expose_for_close();
+            }
             let Some(column) = ws.remove_active_column() else {
                 return;
             };
@@ -3964,6 +3970,7 @@ impl<W: LayoutElement> Layout<W> {
                 .unwrap_or(monitors[new_idx].active_workspace_idx)
                 .min(monitors[new_idx].workspaces.len() - 1);
             self.add_column_by_idx(new_idx, workspace_idx, column, activate);
+            ease_picker_from(self.workspaces_mut(), &before);
         }
     }
 
@@ -4384,10 +4391,19 @@ impl<W: LayoutElement> Layout<W> {
         velocity *=
             OVERVIEW_GESTURE_RUBBER_BAND.clamp_derivative(0., 1., gesture.start + current_pos);
 
+        let from = gesture.value;
+
         self.overview_open = new_value == 1.;
+        if !self.overview_open {
+            // See `Workspace::hold_expose_freeze_through_exit` — a swipe out is an exit like
+            // any other, and a hold that ran out partway through it would shuffle the picker.
+            for ws in self.workspaces_mut() {
+                ws.hold_expose_freeze_through_exit();
+            }
+        }
         self.overview_progress = Some(OverviewProgress::Animation(Animation::new(
             self.clock.clone(),
-            gesture.value,
+            from,
             new_value,
             velocity,
             self.options.animations.overview_open_close.0,
@@ -5691,6 +5707,7 @@ impl<W: LayoutElement> Layout<W> {
             // overview handed off to the normal render path.
             for ws in self.workspaces_mut() {
                 ws.clear_expose_hover();
+                ws.hold_expose_freeze_through_exit();
             }
         }
 

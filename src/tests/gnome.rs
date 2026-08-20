@@ -28112,11 +28112,21 @@ fn a_pointer_resting_on_a_preview_holds_the_close_freeze() {
         "the picker reflowed under a pointer that never left a preview",
     );
 
-    // Moving off it starts the clock again, and the survivors reflow once it runs out — plus
-    // the 200ms the release eases over, which at the release instant has covered nothing yet.
+    // Moving off it starts the clock again — *starts*, not ends: half a second later nothing
+    // has moved yet. Without this leg a release-on-any-motion would pass the test below.
     pointer_motion_to(&mut f, 10., 400.);
     f.double_roundtrip(id);
-    f.advance_clock(Duration::from_millis(800));
+    f.advance_clock(Duration::from_millis(250));
+    f.advance_clock(Duration::from_millis(250));
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "the pointer leaving a preview released the hold instead of restarting it",
+    );
+
+    // And the survivors reflow once it runs out — plus the 200ms the release eases over, which
+    // at the release instant has covered nothing yet.
+    f.advance_clock(Duration::from_millis(300));
     f.advance_clock(Duration::from_millis(250));
     assert_ne!(
         slots(&mut f),
@@ -28162,7 +28172,10 @@ fn a_window_arriving_releases_the_close_freeze() {
 
     // A new window arrives with 450ms of hold still to run. Its arrival ends the hold, so A
     // is already on its way by 100ms — held, it would still be exactly where it was.
-    map_window_sized(&mut f, id, (740, 480), None);
+    //
+    // Unsettled: `map_window_sized` settles, which runs both the hold and the ease to their
+    // ends and would leave the reading unable to tell a release from a bare forget.
+    map_window_unsettled(&mut f, id, (740, 480), None);
     f.advance_clock(Duration::from_millis(100));
     assert_ne!(
         f.synoik().layout.expose_slot_local(&win_a).unwrap(),
@@ -28340,6 +28353,151 @@ fn moving_a_window_to_another_workspace_settles_both_pickers() {
         a_before,
         "the workspace the window left never reflowed",
     );
+}
+
+/// The dragged window's own client dying mid-flight must not snap the gap shut.
+///
+/// The drag reserves the window's layout input, and this path drops the reservation — which is
+/// what closes the gap, with the picker on screen. gnome-shell reaches `_doRemoveWindow` here
+/// too, the window having stayed in `_sortedWindows` for the whole drag, so the gap holds and
+/// then eases closed like any other removal.
+#[test]
+fn a_client_dying_mid_drag_holds_the_gap_it_left() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let c = map_window_sized(&mut f, id, (740, 480), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    // Pick C up and carry it a little, well inside its own workspace.
+    let slot_c = f.synoik().layout.expose_target_rect(&win_c).unwrap();
+    let on_c = slot_c.loc + slot_c.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, on_c.x, on_c.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(-40., -30.);
+    // No settle: a held drag never settles, and the picker is not moving anyway — the
+    // reservation is what keeps it still.
+    f.freeze_clock();
+
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    // C's client takes it away while it is still in the air.
+    let window = f.client(id).window(&c);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    // The gap it was holding is still open 700ms later.
+    f.advance_clock(Duration::from_millis(700));
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "the gap the drag was holding snapped shut when the client died",
+    );
+
+    // And closes with the ease, once the hold runs out.
+    f.advance_clock(Duration::from_millis(300));
+    f.advance_clock(Duration::from_millis(250));
+    assert_ne!(slots(&mut f), before, "the gap never closed at all",);
+}
+
+/// A hold that ran out partway through the overview's exit would reflow the slots while every
+/// preview is interpolating between its window rect and its slot — the picker shuffling on its
+/// way out. gnome-shell removes the timeout and *sets* `layout_frozen` at exit start
+/// (`prepareToLeaveOverview`, `workspace.js:1295-1303`); the freeze is dropped once hidden.
+#[test]
+fn a_close_freeze_does_not_run_out_during_the_overview_exit() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let c = map_window_sized(&mut f, id, (740, 480), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    f.freeze_clock();
+
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    let window = f.client(id).window(&c);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    // Leave with 50ms of hold left, then read a hundred milliseconds into the exit — past when
+    // it would have run out, and while the previews are still on their way home.
+    f.advance_clock(Duration::from_millis(700));
+    tap(&mut f, KEY_LEFTMETA);
+    f.advance_clock(Duration::from_millis(50));
+    f.advance_clock(Duration::from_millis(50));
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "the slots reflowed while the previews were flying home",
+    );
+}
+
+/// Moving a *column* onto a workspace whose picker is holding a close open is an arrival like
+/// any other: it has to release the hold, or the arriving tiles are laid out over a list with
+/// no entry for them.
+///
+/// A niri-mode path — GNOME windowing has no columns — but the picker is shared.
+#[test]
+fn a_column_arriving_releases_the_close_freeze() {
+    let mut f = Fixture::with_config(super::scrolling(synoik_config::Config::default()));
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Two on the workspace below, so closing one there arms a freeze over a real layout.
+    let _x = map_window_sized(&mut f, id, (800, 600), None);
+    let y = map_window_sized(&mut f, id, (600, 500), None);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    let _z = map_window_sized(&mut f, id, (700, 550), None);
+    f.settle();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let window = f.client(id).window(&y);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    // Inside the hold, send the column down onto the frozen workspace. Before the release
+    // this reached the picker with a tile the held input list had never heard of.
+    f.synoik_state()
+        .do_action(Action::MoveColumnToWorkspaceUp(true), false);
+    f.settle();
 }
 
 /// The dropped preview eases from the box it was released at into its picker slot, rather

@@ -1087,6 +1087,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn add_column(&mut self, column: Column<W>, activate: bool) {
+        self.release_expose_freeze_on_arrival();
         for (tile, _) in column.tiles() {
             self.enter_output_for_window(tile.window());
         }
@@ -2658,6 +2659,15 @@ impl<W: LayoutElement> Workspace<W> {
 
     /// Whether a drag has already reserved this window's place in the picker, i.e. whether
     /// the removal about to happen is a pickup rather than a departure.
+    /// Whether a drag is holding a reservation here at all.
+    ///
+    /// Not [`Self::expose_is_reserved`], which asks whether a *given* window's removal is the
+    /// pickup that reserved it — and so needs the window to still be a tile. Once the drag is
+    /// in flight the tile lives in the move state and no workspace can answer that.
+    pub(super) fn expose_has_reservation(&self) -> bool {
+        self.expose_reserved.is_some()
+    }
+
     pub(super) fn expose_is_reserved(&self, window: &W::Id) -> bool {
         let reserved = self.expose_reserved.map(|(seq, _)| seq);
         reserved.is_some() && reserved == self.expose_input(window).map(|(seq, _)| seq)
@@ -2730,6 +2740,19 @@ impl<W: LayoutElement> Workspace<W> {
     /// removal still settling on another.
     fn release_expose_freeze_on_arrival(&mut self) {
         self.release_expose_freeze();
+    }
+
+    /// Stop a hold from running out, without ending it — for the overview exit.
+    ///
+    /// The exit interpolates each preview between its window rect and its slot, so a hold that
+    /// expired partway through would reflow the slots mid-flight and shuffle the picker on its
+    /// way out. gnome-shell removes the timeout and *sets* `layout_frozen` at exit start
+    /// (`prepareToLeaveOverview`, `workspace.js:1295-1303`) for exactly this; the freeze is
+    /// dropped outright once hidden.
+    pub(super) fn hold_expose_freeze_through_exit(&mut self) {
+        if let Some(freeze) = &mut self.expose_freeze {
+            freeze.hold = None;
+        }
     }
 
     /// Drop a freeze without easing anything, for when nobody is looking at the picker.

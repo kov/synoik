@@ -1215,7 +1215,7 @@ impl<W: LayoutElement> Monitor<W> {
         // reaches `_doRemoveWindow` through `_windowRemoved` here too (`workspace.js:1260-1262`).
         // Only when there is something to remove — a freeze armed over a no-op would hold the
         // picker for 750ms and then ease nothing.
-        let freeze = self.overview_open;
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if freeze && workspace.has_windows() {
             workspace.freeze_expose_for_close();
@@ -1257,7 +1257,7 @@ impl<W: LayoutElement> Monitor<W> {
         // reaches `_doRemoveWindow` through `_windowRemoved` here too (`workspace.js:1260-1262`).
         // Only when there is something to remove — a freeze armed over a no-op would hold the
         // picker for 750ms and then ease nothing.
-        let freeze = self.overview_open;
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if freeze && workspace.has_windows() {
             workspace.freeze_expose_for_close();
@@ -1312,7 +1312,7 @@ impl<W: LayoutElement> Monitor<W> {
         });
 
         // See `move_to_workspace_up`.
-        let freeze = self.overview_open;
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if freeze && workspace.has_windows() {
             workspace.freeze_expose_for_close();
@@ -1356,12 +1356,17 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if workspace.floating_is_active() {
             self.move_to_workspace_up(activate);
             return;
         }
 
+        // See `move_to_workspace_up`.
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let Some(column) = workspace.remove_active_column() else {
             return;
         };
@@ -1377,12 +1382,17 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if workspace.floating_is_active() {
             self.move_to_workspace_down(activate);
             return;
         }
 
+        // See `move_to_workspace_up`.
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let Some(column) = workspace.remove_active_column() else {
             return;
         };
@@ -1398,6 +1408,7 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
+        let freeze = self.picker_showing();
         let workspace = &mut self.workspaces[source_workspace_idx];
         if workspace.floating_is_active() {
             let activate = if activate {
@@ -1409,6 +1420,10 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
+        // See `move_to_workspace_up`.
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let Some(column) = workspace.remove_active_column() else {
             return;
         };
@@ -2825,6 +2840,13 @@ impl<W: LayoutElement> Monitor<W> {
         let strip = self.thumbnail_strip()?;
         let idx = strip.thumb_under(pos_within_output)?;
         Some(&self.workspaces[idx])
+    }
+
+    /// Whether anything is showing the picker's spread here — see `Layout::remove_window`.
+    /// The peek renders it with the overview shut, and `peek_progress` is restated every frame
+    /// from the pointer's distance to the strip, so a non-zero one *is* a peek in progress.
+    pub(super) fn picker_showing(&self) -> bool {
+        self.overview_open || self.peek_progress > 0.
     }
 
     pub(super) fn set_peek_progress(&mut self, progress: f64) {

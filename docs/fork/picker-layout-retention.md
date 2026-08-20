@@ -173,24 +173,33 @@ source of a move (below). Two conditions:
   cursor for a second click. That hold is `None`, claims no animation, and so costs nothing
   however long it lasts. Only a *live* preview counts: a close-button click leaves the pointer
   over a corpse, and `Workspace::remove_tile` drops the departed window's hover entry.
-  Unreachable during a peek, whose hover is never computed, so a peek's freeze always runs its
-  750 ms out.
+  Unreachable during a peek, whose hover is never computed — a peek's hold is only ever the
+  timed kind, though pointer motion still re-arms it.
 - **A window arriving**, per workspace (`_doAddWindow`, `:1245-1251`). Fidelity and invariant
   both: a freeze holds a fixed list, and a tile with no entry in it has no slot to land in.
-  Every insertion funnels through `Workspace::add_tile`/`add_tile_to_column` for that reason.
+  Every insertion funnels through `Workspace::add_tile`, `add_tile_to_column` or `add_column`
+  for that reason — the third was missed once, and reached the `debug_assert` in
+  `expose_layout` through a column move onto a workspace with a close still settling.
 - **The overview fully hiding**, not the start of its exit. The exit interpolates each preview
-  between its window rect and its slot, so reflowing there shuffles the picker on its way out —
-  gnome-shell holds it across the exit for the same reason (`:1300`, `:1316-1318`).
+  between its window rect and its slot, so reflowing there shuffles the picker on its way out.
+  A hold that merely *ran out* mid-exit would do the same, so leaving converts every hold to
+  the indefinite kind first — which is gnome-shell exactly: `prepareToLeaveOverview` removes
+  the timeout and *sets* `layout_frozen` (`:1295-1303`), and only `_doneLeavingOverview` clears
+  it (`:1316-1318`).
 - **The overview opening**, with `forget_expose_layout`.
+
+Animations being off skips the hold along with the ease, so a close reflows at once. GNOME's
+timeout is not an animation and would survive; this is deliberate, and the alternative is a
+750 ms freeze followed by a snap.
 
 Two hazards this shape has and a poll does not, both closed: an indefinite hold needs a way
 back to a timed one, or a pointer that leaves a preview for another output freezes the picker
 for good; and a hold that expires with no motion since the close would reflow under a still
 pointer, so the expiry re-checks hover rather than trusting the motion feed alone.
 
-**Divergence: a freeze holds the list, not the allocation.** During the hold a *resize* or a
-*move* on that workspace still re-decides for us and would not for gnome-shell. The removal —
-the event the freeze exists for — is a non-event either way.
+One residue of holding a *list* rather than an allocation: a view-size change during the hold
+misses retention and re-decides — over the frozen list, so the hole survives it. Everything
+else is held, gnome-shell's frozen allocation included.
 
 ## Every other door
 
@@ -205,7 +214,10 @@ leave previews to snap:
   *both* sides. The source now holds still like any other removal (gnome-shell's
   `_windowRemoved`, `:1260-1262`) and the target eases apart around the arrival.
 - **The dragged window's own client dying mid-drag.** Dropping the reservation is what closes
-  the gap the drag was holding, so it freezes first.
+  the gap the drag was holding, so it freezes first. It must ask whether *a* reservation is
+  held, not whether this window's removal is the pickup that took it: mid-flight the tile lives
+  in the move state and no workspace can answer the second question, so the freeze it gated on
+  never armed.
 
 The snapshot forces a layout *decision* on a workspace that has not made one, so it is taken
 only while the picker is up; outside that it is empty and the ease is a no-op.
@@ -275,6 +287,14 @@ about the picker's *output* can witness retention directly.
   before anything can sample it. The second reads the two sides at *different* times, because
   they behave differently — the target eases immediately and is over by 200 ms, the source is
   still untouched at 300 ms.
+- `a_client_dying_mid_drag_holds_the_gap_it_left`, `a_close_freeze_does_not_run_out_during_the_overview_exit`
+  and `a_column_arriving_releases_the_close_freeze` — three mechanisms that were each written
+  and shipped inert. The first must **not** settle after the pickup: a held drag never settles.
+
+A hold is only pinned by a test that asserts *nothing moved* while it runs. A test that only
+watches for the reflow passes on a hold that never armed, on one that released early, and on
+the old ease-at-close alike — three of these tests were that shape until the assertions were
+added.
 - `the_picker_decides_its_layout_once_and_holds_it` — forward-only, and says so. The count it
   asserts on did not exist before the decision was held, so it cannot have been red. It
   queries *every* workspace, which is what the render path does and the only way an empty
