@@ -27972,14 +27972,14 @@ fn a_drop_eases_the_previews_it_displaces() {
     }
 }
 
-/// A window closing while the picker is up eases the survivors into their new slots
-/// rather than snapping them there. Membership is a layout input, so a removal re-decides
-/// the grid; gnome-shell eases every child from its current allocation on that same event
-/// (`_syncWindowPositions` / `animateAllocation`, `workspace.js:759-766`, `:389-399`).
+/// A window closing while the picker is up holds the layout still for 750ms, then lets the
+/// survivors *ease* into their new slots rather than snapping them there.
 ///
-/// It does **not** port `_doRemoveWindow`'s freeze (`workspace.js:1140-1183`), which holds
-/// the layout until the pointer has been still for 750ms so a close button stays under the
-/// cursor for a second click.
+/// Both halves are gnome-shell's `_doRemoveWindow` (`workspace.js:1140-1183`): the layout
+/// freezes so the previews do not reflow out from under a pointer still working in them, and
+/// clearing `layout_frozen` emits `layout_changed()` (`:937`) onto the `_needsLayout` the
+/// removal set, so the reflow arrives through `animateAllocation` (`:759-766`, `:389-399`).
+/// **The ease belongs to the release, not to the close.**
 #[test]
 fn a_window_closing_in_the_picker_eases_the_survivors() {
     let mut f = Fixture::new();
@@ -28020,6 +28020,18 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
     window.surface.destroy();
     f.double_roundtrip(id);
 
+    // Held: most of the way through `WINDOW_REPOSITIONING_DELAY`, nothing has moved at all.
+    // The pointer has never been near the picker, so only the timer is holding it.
+    f.advance_clock(Duration::from_millis(700));
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "the survivors reflowed before the pointer had held still for 750ms",
+    );
+
+    // Past it, and the release arms the ease at that instant.
+    f.advance_clock(Duration::from_millis(60));
+
     let samples = f.sample_animation(Duration::from_millis(200), 4, slots);
     f.settle_animations();
     let after = slots(&mut f);
@@ -28041,6 +28053,170 @@ fn a_window_closing_in_the_picker_eases_the_survivors() {
             i + 1,
         );
     }
+}
+
+/// A pointer resting on a preview holds the close freeze open for as long as it rests there.
+///
+/// That is the second disjunct of gnome-shell's tick (`this._windows.some(w =>
+/// w.contains(actorUnderPointer))`, `workspace.js:1170`), which continues the hold whether or
+/// not the pointer moved — and it is the whole reason the freeze exists: a close button has to
+/// stay under the cursor for a second click.
+///
+/// The hold is unbounded, so it must cost no frames; nothing here can see that, but
+/// `CloseFreeze::hold` being `None` is what `Workspace::are_animations_ongoing` reads.
+#[test]
+fn a_pointer_resting_on_a_preview_holds_the_close_freeze() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let c = map_window_sized(&mut f, id, (740, 480), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    // Park the pointer on B's preview and let the hover ease land before freezing the clock.
+    let slot_b = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    let on_b = slot_b.loc + slot_b.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, on_b.x, on_b.y);
+    f.settle();
+    f.freeze_clock();
+
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    let window = f.client(id).window(&c);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    // Far past the 750ms a still pointer elsewhere would have taken — and in *steps*, so that
+    // a hold which wrongly ran out has time to finish easing. One jump would land the release
+    // and the reading on the same instant, where the ease has covered nothing and a reflowed
+    // picker is indistinguishable from a held one.
+    f.advance_clock(Duration::from_millis(1000));
+    f.advance_clock(Duration::from_millis(1000));
+    assert_eq!(
+        slots(&mut f),
+        before,
+        "the picker reflowed under a pointer that never left a preview",
+    );
+
+    // Moving off it starts the clock again, and the survivors reflow once it runs out — plus
+    // the 200ms the release eases over, which at the release instant has covered nothing yet.
+    pointer_motion_to(&mut f, 10., 400.);
+    f.double_roundtrip(id);
+    f.advance_clock(Duration::from_millis(800));
+    f.advance_clock(Duration::from_millis(250));
+    assert_ne!(
+        slots(&mut f),
+        before,
+        "the hold never restarted once the pointer left the preview",
+    );
+}
+
+/// A window *arriving* releases the freeze rather than waiting it out — gnome-shell's
+/// `_doAddWindow`, "to ensure the new window is immediately shown" (`workspace.js:1245-1251`).
+///
+/// It is also the invariant the freeze rests on: a freeze holds a fixed input list, and a tile
+/// with no entry in it has no slot to land in.
+#[test]
+fn a_window_arriving_releases_the_close_freeze() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let b = map_window_sized(&mut f, id, (760, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    f.freeze_clock();
+
+    let before = f.synoik().layout.expose_slot_local(&win_a).unwrap();
+
+    let window = f.client(id).window(&b);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    // Well inside the hold: A has not moved.
+    f.advance_clock(Duration::from_millis(300));
+    assert_eq!(
+        f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+        before,
+        "the freeze did not take",
+    );
+
+    // A new window arrives with 450ms of hold still to run. Its arrival ends the hold, so A
+    // is already on its way by 100ms — held, it would still be exactly where it was.
+    map_window_sized(&mut f, id, (740, 480), None);
+    f.advance_clock(Duration::from_millis(100));
+    assert_ne!(
+        f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+        before,
+        "the arrival did not release the hold",
+    );
+}
+
+/// The preview the pointer is on may be the one that just closed, and a corpse must not hold
+/// the freeze open forever: a close button click leaves the pointer exactly there.
+#[test]
+fn the_closed_windows_own_preview_does_not_hold_the_freeze() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let c = map_window_sized(&mut f, id, (740, 480), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let slot_c = f.synoik().layout.expose_target_rect(&win_c).unwrap();
+    let on_c = slot_c.loc + slot_c.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, on_c.x, on_c.y);
+    f.settle();
+    f.freeze_clock();
+
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    // C goes away under the pointer, and the pointer never moves again.
+    let window = f.client(id).window(&c);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    f.advance_clock(Duration::from_millis(800));
+    f.advance_clock(Duration::from_millis(250));
+    assert_ne!(
+        slots(&mut f),
+        before,
+        "a hover entry left behind by the closed window held the picker frozen",
+    );
 }
 
 /// The dropped preview eases from the box it was released at into its picker slot, rather

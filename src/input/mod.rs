@@ -4780,6 +4780,20 @@ impl State {
             self.synoik.queue_redraw_all();
         }
 
+        // A removal holds the picker's layout still until the pointer stops working in it
+        // (`Workspace::expose_pointer_moved`). Fed from motion rather than polled, so it has
+        // to be told; after the hover above, which is where "on a preview" is decided. Not
+        // gated on the overview alone — a peek shows the same picker, though its hover is not
+        // computed, so a freeze taken under one always runs its 750ms out.
+        if self.synoik.layout.is_overview_open() || self.synoik.layout.is_peeking() {
+            if let Some((output, p)) = self.synoik.output_under(pos) {
+                let output = output.clone();
+                if self.synoik.layout.picker_pointer_moved(&output, p) {
+                    self.synoik.queue_redraw_all();
+                }
+            }
+        }
+
         // ...and its close button lightens under the pointer (`.window-close:hover`,
         // `_window-picker.scss:46-48`).
         let close_hovered = self

@@ -124,6 +124,9 @@ pub struct Workspace<W: LayoutElement> {
     /// as long as the drag lasts — see [`Workspace::freeze_expose`].
     expose_reserved: Option<ExposeInput>,
 
+    /// The picker's layout, held past a removal — see [`CloseFreeze`].
+    expose_freeze: Option<CloseFreeze>,
+
     /// The picker's held layout — see [`RetainedExpose`]. `RefCell` because
     /// [`Workspace::expose_layout`] is a read: the layout is a value the workspace
     /// remembers, not a thing a caller has to ask it to update.
@@ -265,6 +268,49 @@ struct SlotSlide {
 }
 
 type ExposeSlides<W> = Vec<(<W as LayoutElement>::Id, SlotSlide)>;
+
+/// The picker's layout, held past a removal so the previews do not reflow out from under a
+/// pointer that is still working in them — gnome-shell's `layout_frozen`
+/// (`_doRemoveWindow`, `workspace.js:1140-1183`).
+///
+/// The hole the departed window leaves stays open for as long as this lives, and closes with
+/// the ordinary 200ms ease when it is released. That is gnome-shell's ordering, not an
+/// embellishment: clearing `layout_frozen` emits `layout_changed()` (`:937`) onto a
+/// `_needsLayout` that `removeWindow` set at `:857`, so the next allocate recomputes with
+/// `layoutChanged` true and every child goes through `animateAllocation` (`:759-766`). **The
+/// ease belongs to the release, not to the close.**
+#[derive(Debug)]
+struct CloseFreeze {
+    /// The whole input list as of just before the removal, drag reservation included.
+    ///
+    /// The whole list rather than the departed window's entry alone, which is what freezing
+    /// looks like from [`Workspace::expose_layout`]: a removal in the scrolling layout shifts
+    /// every column after it, so the *survivors'* settled rects move too and holding one
+    /// vacant entry would re-decide the grid over them anyway — and snap them, since the
+    /// ease is not armed until the release. gnome-shell freezes the allocation itself and has
+    /// no such hole.
+    ///
+    /// Retention is not bypassed by this, only fed: [`Workspace::retained_expose_slots`] still
+    /// validates the held decision bit-for-bit against exactly what it is handed, which while
+    /// frozen is this list, so it hits.
+    inputs: Vec<ExposeInput>,
+    /// `None` holds indefinitely — the pointer is resting on one of this workspace's previews,
+    /// where gnome-shell's tick keeps returning `SOURCE_CONTINUE` (`workspace.js:1170`), and
+    /// where a close button has to stay put for a second click. Deliberately claims no
+    /// animation: the hold lasts as long as the user leaves the pointer there, and pinning the
+    /// frame loop for that would cost 60fps of an unchanging picture.
+    ///
+    /// `Some` releases when it is done, and *does* claim one — which is what guarantees a
+    /// frame arrives to notice, at a bounded cost of [`CLOSE_FREEZE_MS`] of static redraws.
+    /// gnome-shell pays nothing there, its GLib timeout driving no damage; this is the price
+    /// of expiring on the animation clock instead, which is what makes the hold testable
+    /// under a frozen clock at all.
+    hold: Option<Animation>,
+}
+
+/// `WINDOW_REPOSITIONING_DELAY` (`workspace.js:20`): how long the pointer must hold still
+/// before a removal is allowed to reflow the picker.
+const CLOSE_FREEZE_MS: u32 = 750;
 
 /// gnome-shell eases a preview from its current allocation to a new one over
 /// `WINDOW_REPOSITIONING_DELAY`-free `Workspace._syncWindowPositions`: 200ms `EASE_OUT_QUAD`
@@ -510,6 +556,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_reserved: None,
+            expose_freeze: None,
             expose_retained: RefCell::new(None),
             expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
@@ -579,6 +626,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_reserved: None,
+            expose_freeze: None,
             expose_retained: RefCell::new(None),
             expose_recomputes: Cell::new(0),
             expose_slides: Vec::new(),
@@ -614,6 +662,25 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+
+        // The pointer has held still long enough — gnome-shell's tick at
+        // `workspace.js:1164-1179`. A pointer resting on one of our own previews holds it
+        // open anyway, whether or not it has moved: that is the second disjunct at `:1170`,
+        // and the reason the freeze exists at all, since a close button has to stay under the
+        // cursor for a second click. Checked here rather than only on motion, because a close
+        // that is never followed by any motion would otherwise reflow under a still pointer.
+        if self
+            .expose_freeze
+            .as_ref()
+            .is_some_and(|f| f.hold.as_ref().is_some_and(Animation::is_done))
+        {
+            if self.expose_hovers_a_live_preview() {
+                self.expose_freeze.as_mut().unwrap().hold = None;
+            } else {
+                self.release_expose_freeze();
+            }
+        }
+
         self.expose_hover
             .retain(|(_, anim)| !(anim.is_done() && anim.to() == 0.));
         // A slot ease that has landed is over: the preview is at the slot the picker
@@ -623,7 +690,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing()
+        // A timed hold has to be noticed by a frame to run out, so it asks for them. An
+        // indefinite one deliberately does not — see [`CloseFreeze::hold`].
+        self.expose_freeze
+            .as_ref()
+            .is_some_and(|f| f.hold.is_some())
+            || self.scrolling.are_animations_ongoing()
             || self.floating.are_animations_ongoing()
             || self.expose_hover.iter().any(|(_, anim)| !anim.is_done())
             || self
@@ -889,6 +961,7 @@ impl<W: LayoutElement> Workspace<W> {
         is_full_width: bool,
         is_floating: bool,
     ) {
+        self.release_expose_freeze_on_arrival();
         self.enter_output_for_window(tile.window());
 
         // GNOME windowing has a single layer: windows stack, they never tile into columns. Its
@@ -1003,6 +1076,7 @@ impl<W: LayoutElement> Workspace<W> {
         tile: Tile<W>,
         activate: bool,
     ) {
+        self.release_expose_freeze_on_arrival();
         self.enter_output_for_window(tile.window());
         self.scrolling
             .add_tile_to_column(col_idx, tile_idx, tile, activate);
@@ -1050,6 +1124,12 @@ impl<W: LayoutElement> Workspace<W> {
             removed.tile.window().output_leave(output);
         }
 
+        // The pointer is very often still on the preview that just went away — a close button
+        // click is exactly that — and nothing else clears the entry until the next motion. A
+        // corpse left in there reads as "the pointer is on a preview" to the freeze, which
+        // would hold the picker until the user moved the mouse.
+        self.expose_hover.retain(|(other, _)| other != id);
+
         self.update_focus_floating_tiling_after_removing(from_floating);
 
         removed
@@ -1066,6 +1146,10 @@ impl<W: LayoutElement> Workspace<W> {
         if let Some(output) = &self.output {
             removed.tile.window().output_leave(output);
         }
+
+        // See [`Self::remove_tile`].
+        let id = removed.tile.window().id().clone();
+        self.expose_hover.retain(|(other, _)| *other != id);
 
         self.update_focus_floating_tiling_after_removing(from_floating);
 
@@ -2185,55 +2269,27 @@ impl<W: LayoutElement> Workspace<W> {
         self.expose_input(window).map(|(_, rect)| rect.loc)
     }
 
-    fn expose_layout(&self) -> ExposeLayout<'_, W> {
+    /// The layout input list a decision is made over: one entry per window here, in stable
+    /// creation order, plus the reservation a drag is holding.
+    ///
+    /// Stable order, not the front-to-back one the tiles come in. `compute_grid` sorts stably
+    /// and breaks no ties, so windows whose centres tie exactly — which centred placement
+    /// makes ordinary — are ordered by nothing but the input, and the stacking order changes
+    /// on every raise. gnome-shell lays out `_sortedWindows`, held in `get_stable_sequence()`
+    /// order (`workspace.js:811-817`), for exactly this reason: there, a restack recomputes to
+    /// the identical assignment.
+    ///
+    /// The *live* list — what a [`CloseFreeze`] is taken from, never what it hands back.
+    fn expose_live_inputs(&self) -> Vec<ExposeInput> {
         let scale = self.scale().fractional_scale();
-        // Two rects per tile: the *render* rect, which the overview
-        // open/close leg interpolates from, and the *settled* rect the slots
-        // are laid out over.
-        //
-        // They differ by `Tile::render_offset()` — a move animation or an
-        // interactive-move offset. gnome-shell's layout strategy reads
-        // `metaWindow.get_frame_rect()` (`workspace.js` `_getWindowCenter`,
-        // `computeLayout`), never the actor's animated position, and it has
-        // to: `compute_slots` assigns rows by `center().y` and columns by
-        // `center().x`, so an animating rect re-sorts the grid for as long as
-        // the animation runs and the whole picker shuffles and snaps back
-        // when it lands. A drop's move-back animation did exactly that to
-        // every other preview.
-        //
-        // The settled position is read from its own source rather than
-        // recovered from `pos` by subtracting the offset back off. `pos` is
-        // already rounded to physical pixels, and at a fractional scale
-        // `round(round(X + R) - R) != X` — so recovering it that way moved it
-        // by a physical pixel for the life of `R`, which is all a sort with no
-        // tie-break needs to swap two previews and swap them back.
-        let tiles: Vec<_> = self
-            .tiles_with_render_positions()
-            .zip(self.tiles_with_settled_positions())
-            .map(|((tile, pos, _), (_, settled))| {
-                let size = tile.tile_size();
-                let settled = Self::settled_pos(scale, settled);
-                (
-                    tile,
-                    Rectangle::new(pos, size),
-                    Rectangle::new(settled, size),
-                )
+        let mut inputs: Vec<ExposeInput> = self
+            .tiles_with_settled_positions()
+            .map(|(tile, settled)| {
+                let rect = Rectangle::new(Self::settled_pos(scale, settled), tile.tile_size());
+                (tile.window().stable_sequence(), rect)
             })
             .collect();
-
-        // Lay out in a stable order, not the front-to-back one this vec is in.
-        // `compute_grid` sorts stably and breaks no ties, so windows whose centres tie
-        // exactly — which centred placement makes ordinary — are ordered by nothing but the
-        // input, and the stacking order changes on every raise. gnome-shell lays out
-        // `_sortedWindows`, held in `get_stable_sequence()` order (`workspace.js:811-817`),
-        // for exactly this reason: there, a restack recomputes to the identical assignment.
-        let mut order: Vec<usize> = (0..tiles.len()).collect();
-        order.sort_by_key(|&i| tiles[i].0.window().stable_sequence());
-
-        let mut inputs: Vec<ExposeInput> = order
-            .iter()
-            .map(|&i| (tiles[i].0.window().stable_sequence(), tiles[i].2))
-            .collect();
+        inputs.sort_by_key(|(seq, _)| *seq);
 
         // A window being dragged out of the picker has left the workspace, but it is still
         // laid out for: it keeps its place in the order and its slot stays vacant, so the
@@ -2246,33 +2302,68 @@ impl<W: LayoutElement> Workspace<W> {
         // stretch the window is both. The reservation is dropped while that lasts: laying it
         // out twice would decide a grid over a window that does not exist, and poison the
         // held inputs with it.
-        let reserved_at = self
+        if let Some(reserved) = self
             .expose_reserved
             .filter(|reserved| !inputs.iter().any(|(seq, _)| *seq == reserved.0))
-            .map(|reserved| {
-                let at = inputs.partition_point(|(seq, _)| *seq < reserved.0);
-                inputs.insert(at, reserved);
-                at
-            });
+        {
+            let at = inputs.partition_point(|(seq, _)| *seq < reserved.0);
+            inputs.insert(at, reserved);
+        }
 
-        let packed = self.retained_expose_slots(inputs, self.view_size, self.expose_area());
+        inputs
+    }
 
-        // Scatter the slots back onto the render order the caller expects, dropping the
-        // reserved one — no tile is asking for it.
+    fn expose_layout(&self) -> ExposeLayout<'_, W> {
+        // The tile's *render* rect, which the overview open/close leg interpolates from. The
+        // slots are laid out over the *settled* rect instead ([`Self::expose_live_inputs`]),
+        // and the two differ by `Tile::render_offset()` — a move animation or an
+        // interactive-move offset.
+        //
+        // gnome-shell's layout strategy reads `metaWindow.get_frame_rect()` (`workspace.js`
+        // `_getWindowCenter`, `computeLayout`), never the actor's animated position, and it
+        // has to: `compute_grid` assigns rows by `center().y` and columns by `center().x`, so
+        // an animating rect re-sorts the grid for as long as the animation runs and the whole
+        // picker shuffles and snaps back when it lands. A drop's move-back animation did
+        // exactly that to every other preview.
+        let tiles: Vec<_> = self
+            .tiles_with_render_positions()
+            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
+            .collect();
+
+        let mut inputs = self.expose_live_inputs();
+
+        // A freeze substitutes the whole list — see [`CloseFreeze`]. It subsumes the
+        // reservation above, which it was taken with.
+        if let Some(freeze) = &self.expose_freeze {
+            debug_assert!(
+                tiles.iter().all(|(tile, _)| freeze
+                    .inputs
+                    .iter()
+                    .any(|(seq, _)| *seq == tile.window().stable_sequence())),
+                "a tile arrived without releasing the freeze; it has no slot to land in",
+            );
+            inputs.clone_from(&freeze.inputs);
+        }
+
+        let packed = self.retained_expose_slots(inputs.clone(), self.view_size, self.expose_area());
+
+        // Scatter the slots back onto the render order the caller expects, by identity: an
+        // input no tile answers to — one carried by a drag, or held open by a freeze — simply
+        // leaves its slot vacant.
         let mut slots = vec![Rectangle::default(); tiles.len()];
-        let mut next = 0;
-        for (i, slot) in packed.into_iter().enumerate() {
-            if Some(i) == reserved_at {
-                continue;
+        for ((seq, _), slot) in iter::zip(&inputs, packed) {
+            if let Some(i) = tiles
+                .iter()
+                .position(|(tile, _)| tile.window().stable_sequence() == *seq)
+            {
+                slots[i] = slot;
             }
-            slots[order[next]] = slot;
-            next += 1;
         }
 
         tiles
             .into_iter()
             .zip(slots)
-            .map(|((tile, rect, _), slot)| (tile, rect, self.slide_slot(tile, slot)))
+            .map(|((tile, rect), slot)| (tile, rect, self.slide_slot(tile, slot)))
             .collect()
     }
 
@@ -2583,10 +2674,133 @@ impl<W: LayoutElement> Workspace<W> {
     /// and a fresh `WorkspaceLayout` starts with `_needsLayout` set (`workspace.js:430`).
     pub(super) fn forget_expose_layout(&mut self) {
         *self.expose_retained.borrow_mut() = None;
+        // A freeze taken during a peek, or left over from an exit, has nothing to say about
+        // the visit starting now — and holding a stale input list into it would keep the
+        // decision below from ever being made over what is actually here.
+        self.expose_freeze = None;
     }
 
     pub(super) fn unfreeze_expose(&mut self) {
         self.expose_reserved = None;
+    }
+
+    /// Hold the picker's layout past a removal, so the previews do not reflow out from under
+    /// a pointer that is still working in them — gnome-shell's `_doRemoveWindow`
+    /// (`workspace.js:1140-1183`). Call it *before* the removal: the list it takes is the
+    /// layout that is on screen.
+    ///
+    /// Takes no window, because a freeze is not about one: it holds the whole assignment,
+    /// which is what `layout_frozen` does to an allocation.
+    pub(super) fn freeze_expose_for_close(&mut self) {
+        let hold = self.fresh_close_hold();
+
+        match &mut self.expose_freeze {
+            // A second removal inside the window shares the hold and only re-arms it, which
+            // is gnome-shell dropping and re-adding the one timeout at `workspace.js:1154-1161`.
+            // The list already held describes what is on screen; a fresh one would describe
+            // the layout as of *after* the previous removal, which nobody has seen.
+            Some(freeze) => freeze.hold = hold,
+            None => {
+                let inputs = self.expose_live_inputs();
+                self.expose_freeze = Some(CloseFreeze { inputs, hold });
+            }
+        }
+    }
+
+    /// Let the picker reflow, easing every preview from the slot the freeze was holding it
+    /// at into the one it has now — gnome-shell clearing `layout_frozen` (`workspace.js:937`)
+    /// onto the `_needsLayout` the removal set, which allocates through `animateAllocation`.
+    fn release_expose_freeze(&mut self) {
+        if self.expose_freeze.is_none() {
+            return;
+        }
+        let before = self.expose_slots_now();
+        self.expose_freeze = None;
+        self.slide_expose_slots_from(before, None);
+    }
+
+    /// A window arriving releases the freeze — gnome-shell's `_doAddWindow`, "to ensure the
+    /// new window is immediately shown" (`workspace.js:1245-1251`).
+    ///
+    /// Also an **invariant**, not just fidelity: a freeze holds a fixed input list, and a tile
+    /// with no entry in it would scatter to nowhere and draw at the origin. Every insertion
+    /// funnels through here for that reason.
+    ///
+    /// Per workspace, like gnome-shell's: an arrival on one workspace has no bearing on a
+    /// removal still settling on another.
+    fn release_expose_freeze_on_arrival(&mut self) {
+        self.release_expose_freeze();
+    }
+
+    /// Drop a freeze without easing anything, for when nobody is looking at the picker.
+    pub(super) fn forget_expose_freeze(&mut self) {
+        self.expose_freeze = None;
+    }
+
+    /// Whether the pointer is on a preview of a window that is *still here*.
+    ///
+    /// Still here matters: closing a window by its own close button leaves the pointer over a
+    /// preview that no longer exists, and nothing clears that hover entry until the next
+    /// motion. Counting the corpse would convert the hold to the indefinite kind and freeze
+    /// the picker until the user moved the mouse.
+    fn expose_hovers_a_live_preview(&self) -> bool {
+        self.expose_hover
+            .iter()
+            .any(|(id, anim)| anim.to() == 1. && self.has_window(id))
+    }
+
+    /// The pointer moved; `over_this_workspace` is whether it is inside this workspace's
+    /// picker. Returns whether the freeze state changed.
+    ///
+    /// gnome-shell samples the pointer on a 750ms tick and continues the hold when it has
+    /// *moved and is over this workspace*, or is over one of its previews at all
+    /// (`workspace.js:1164-1174`). We are handed the motion instead of polling for it, which
+    /// is strictly sharper: a pointer that wanders away and back to the same pixel reads as
+    /// moving here and as still there.
+    pub(super) fn expose_pointer_moved(&mut self, over_this_workspace: bool) -> bool {
+        if self.expose_freeze.is_none() {
+            return false;
+        }
+        let on_preview = self.expose_hovers_a_live_preview();
+        let hold = self.fresh_close_hold();
+        let freeze = self.expose_freeze.as_mut().unwrap();
+
+        if on_preview {
+            let changed = freeze.hold.is_some();
+            freeze.hold = None;
+            return changed;
+        }
+
+        // Re-arming an indefinite hold here is what keeps it from being permanent: without
+        // it, a pointer that leaves a preview for another output — or the panel, or a
+        // thumbnail — is never seen again and the picker stays frozen for good. gnome-shell
+        // cannot reach that state because its tick re-evaluates the whole predicate every
+        // time, whether or not anything moved.
+        if over_this_workspace || freeze.hold.is_none() {
+            freeze.hold = hold;
+            return true;
+        }
+
+        false
+    }
+
+    /// A hold that runs out [`CLOSE_FREEZE_MS`] from now.
+    fn fresh_close_hold(&self) -> Option<Animation> {
+        Some(Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            synoik_config::Animation {
+                off: self.options.animations.overview_open_close.0.off,
+                kind: synoik_config::animations::Kind::Easing(
+                    synoik_config::animations::EasingParams {
+                        duration_ms: CLOSE_FREEZE_MS,
+                        curve: synoik_config::animations::Curve::Linear,
+                    },
+                ),
+            },
+        ))
     }
 
     /// The picker slot of one window, in workspace coordinates.

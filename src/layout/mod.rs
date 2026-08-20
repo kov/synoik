@@ -1379,9 +1379,19 @@ impl<W: LayoutElement> Layout<W> {
                             mon.dnd_scroll_gesture_end();
                         }
 
+                        // The dragged window's own client took it away mid-flight. Dropping
+                        // the reservation below is what closes the gap the drag was holding
+                        // open, with the picker on screen — so hold the layout first, exactly
+                        // as a close does: gnome-shell reaches `_doRemoveWindow` here too,
+                        // the window having stayed in `_sortedWindows` for the whole drag.
+                        let picker_showing = self.overview_open || self.peek_open;
+
                         // Unlock the view on the workspaces.
                         for ws in self.workspaces_mut() {
                             ws.dnd_scroll_gesture_end();
+                            if picker_showing && ws.expose_is_reserved(window) {
+                                ws.freeze_expose_for_close();
+                            }
                             ws.unfreeze_expose();
                         }
 
@@ -1396,11 +1406,11 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        // A window leaving is a layout input changing, so the picker re-decides and the
-        // survivors would jump to their new slots. Ease them there instead, the way GNOME
-        // does on the same event (`workspace.js:759-766`, 200ms EASE_OUT_QUAD). Only worth
-        // the redraws while something is actually showing the spread — the overview, or the
-        // workspace peek's thumbnail strip.
+        // A window leaving is a layout input changing, so the picker would re-decide and the
+        // survivors jump to their new slots. Hold the layout instead, and let it reflow — with
+        // the 200ms ease — once the pointer has stopped working in it
+        // (`Workspace::freeze_expose_for_close`). Only worth it while something is actually
+        // showing the spread: the overview, or the workspace peek's thumbnail strip.
         let picker_showing = self.overview_open || self.peek_open;
 
         match &mut self.monitor_set {
@@ -1410,24 +1420,15 @@ impl<W: LayoutElement> Layout<W> {
                         if ws.has_window(window) {
                             // A drag pickup removes the window too, but reserves its place
                             // first (`freeze_expose`): nothing reflows, so there is nothing
-                            // to ease and no reason to pay for the snapshot.
-                            let ease = picker_showing && !ws.expose_is_reserved(window);
-                            let before = if ease {
-                                ws.expose_slots_now()
-                            } else {
-                                Vec::new()
-                            };
+                            // to hold and no reason to pay for the snapshot.
+                            if picker_showing && !ws.expose_is_reserved(window) {
+                                ws.freeze_expose_for_close();
+                            }
 
                             // Emptying a workspace no longer reaps it: it stays put and
                             // grows a close button in the overview instead (see
                             // `Monitor::clean_up_workspaces`).
-                            let removed = ws.remove_tile(window, transaction);
-
-                            if ease {
-                                ws.slide_expose_slots_from(before, None);
-                            }
-
-                            return Some(removed);
+                            return Some(ws.remove_tile(window, transaction));
                         }
                     }
                 }
@@ -3130,6 +3131,16 @@ impl<W: LayoutElement> Layout<W> {
                     mon.set_peek_progress(peek);
                     if overview_hidden {
                         mon.reset_app_grid();
+                        // Only now. The exit animation interpolates each preview between its
+                        // window rect and its slot, so a freeze released at the *start* of the
+                        // exit reflows the slots mid-fly-home and the whole picker shuffles on
+                        // its way out. gnome-shell holds it across the exit for the same
+                        // reason — `prepareToLeaveOverview` sets `layout_frozen`
+                        // (`workspace.js:1300`) and only `_doneLeavingOverview`, on `hidden`,
+                        // clears it (`:1316-1318`).
+                        for ws in mon.workspaces.iter_mut() {
+                            ws.forget_expose_freeze();
+                        }
                     }
                     mon.advance_animations();
                 }
@@ -6183,6 +6194,36 @@ impl<W: LayoutElement> Layout<W> {
     /// nothing. Hovering a preview grows it and raises it above its neighbours
     /// (gnome-shell's `showOverlay`, `windowPreview.js:310`). Returns whether
     /// anything changed, so the caller can queue a redraw.
+    /// The pointer moved over `output`; feed it to every picker freeze — see
+    /// [`Workspace::expose_pointer_moved`]. Returns whether anything changed.
+    ///
+    /// Call it *after* [`Self::set_expose_hover`], which is where "the pointer is on a
+    /// preview" is decided.
+    pub fn picker_pointer_moved(
+        &mut self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> bool {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return false;
+        };
+
+        let mut changed = false;
+        for mon in monitors {
+            let here = mon.output == *output;
+            let under = here
+                .then(|| {
+                    mon.workspace_under(pos_within_output)
+                        .map(|(ws, _)| ws.id())
+                })
+                .flatten();
+            for ws in mon.workspaces.iter_mut() {
+                changed |= ws.expose_pointer_moved(Some(ws.id()) == under);
+            }
+        }
+        changed
+    }
+
     pub fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
         let mut changed = false;
         for ws in self.workspaces_mut() {
