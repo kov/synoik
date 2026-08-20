@@ -1184,6 +1184,12 @@ impl<W: LayoutElement> Layout<W> {
         let scrolling_height = height.map(SizeChange::from);
         let id = window.id().clone();
 
+        // A window arriving displaces the previews already in the picker. gnome-shell eases
+        // them apart on the same event and pops the new clone up from scale 0 instead
+        // (`workspace.js:1233-1243`); the pop is not ported, so the arrival simply appears in
+        // its slot — it is missing from the snapshot, which is what tells the ease to skip it.
+        let picker_before = self.picker_slots_now();
+
         match &mut self.monitor_set {
             MonitorSet::Normal {
                 monitors,
@@ -1277,7 +1283,14 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
-                Some(&mon.output)
+                ease_picker_from(
+                    monitors
+                        .iter_mut()
+                        .flat_map(|mon| mon.workspaces.iter_mut()),
+                    &picker_before,
+                );
+
+                Some(&monitors[mon_idx].output)
             }
             MonitorSet::NoOutputs { workspaces } => {
                 let (ws_idx, target) = match target {
@@ -2416,17 +2429,21 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_to_workspace_up(&mut self, focus: bool) {
+        let before = self.picker_slots_now();
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_to_workspace_up(focus);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn move_to_workspace_down(&mut self, focus: bool) {
+        let before = self.picker_slots_now();
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_to_workspace_down(focus);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn move_to_workspace(
@@ -2435,6 +2452,7 @@ impl<W: LayoutElement> Layout<W> {
         idx: usize,
         activate: ActivateWindow,
     ) {
+        let before = self.picker_slots_now();
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -2458,27 +2476,34 @@ impl<W: LayoutElement> Layout<W> {
             monitor
         };
         monitor.move_to_workspace(window, idx, activate);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
+        let before = self.picker_slots_now();
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_column_to_workspace_up(activate);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn move_column_to_workspace_down(&mut self, activate: bool) {
+        let before = self.picker_slots_now();
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_column_to_workspace_down(activate);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn move_column_to_workspace(&mut self, idx: usize, activate: bool) {
+        let before = self.picker_slots_now();
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_column_to_workspace(idx, activate);
+        ease_picker_from(self.workspaces_mut(), &before);
     }
 
     pub fn switch_workspace_up(&mut self) {
@@ -3796,6 +3821,8 @@ impl<W: LayoutElement> Layout<W> {
         target_ws_idx: Option<usize>,
         activate: ActivateWindow,
     ) {
+        let before = self.picker_slots_now();
+        let overview_open = self.overview_open;
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -3855,7 +3882,13 @@ impl<W: LayoutElement> Layout<W> {
                 ActivateWindow::No
             };
 
+            // See `Monitor::move_to_workspace_up` — the source picker holds still, the way a
+            // close does, and the target's previews ease apart around the arrival.
+            let freeze = overview_open;
             let ws = &mut mon.workspaces[ws_idx];
+            if freeze && ws.has_windows() {
+                ws.freeze_expose_for_close();
+            }
             let transaction = Transaction::new();
             let mut removed = if let Some(window) = window {
                 ws.remove_tile(window, transaction)
@@ -3888,6 +3921,13 @@ impl<W: LayoutElement> Layout<W> {
             if mon.workspace_switch.is_none() {
                 monitors[mon_idx].clean_up_workspaces();
             }
+
+            ease_picker_from(
+                monitors
+                    .iter_mut()
+                    .flat_map(|mon| mon.workspaces.iter_mut()),
+                &before,
+            );
         }
     }
 
@@ -5621,6 +5661,21 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Every preview's slot as drawn right now, per workspace — the `from` of a picker ease,
+    /// handed to [`ease_picker_from`] after whatever changes the layout.
+    ///
+    /// Empty while nothing is showing the spread, which makes the ease a no-op: the snapshot
+    /// forces a layout *decision* on any workspace that has not made one, so a plain desktop
+    /// must not pay for it.
+    fn picker_slots_now(&self) -> PickerSlots<W> {
+        if !(self.overview_open || self.peek_open) {
+            return Vec::new();
+        }
+        self.workspaces()
+            .map(|(_, _, ws)| (ws.id(), ws.expose_slots_now()))
+            .collect()
+    }
+
     pub fn toggle_overview(&mut self) {
         self.overview_open = !self.overview_open;
 
@@ -6388,6 +6443,36 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
 /// The pull has to begin well before the band, or the window snaps to thumbnail size at the last
 /// moment instead of reading as being carried into the strip.
 const PEEK_PULL_DISTANCE: f64 = 260.;
+
+/// Every preview's slot as drawn, per workspace — a snapshot taken before a change and handed
+/// back to [`ease_picker_from`] after it.
+type PickerSlots<W> = Vec<(
+    WorkspaceId,
+    Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>,
+)>;
+
+/// Ease every preview from the slot it was drawn at — a [`Layout::picker_slots_now`] snapshot
+/// taken before the change — into the one the picker now gives it. gnome-shell eases each
+/// child from its current allocation on a layout change (`workspace.js:759-766`).
+///
+/// For the doors that reach past `Layout::remove_window` and `Workspace::add_tile` and would
+/// otherwise leave previews to snap: a fresh map, and the move-to-workspace / move-to-output
+/// actions, which remove and add directly.
+///
+/// A workspace with no entry is one the change created; it had no previews to come from.
+fn ease_picker_from<'a, W: LayoutElement + 'a>(
+    workspaces: impl Iterator<Item = &'a mut Workspace<W>>,
+    before: &PickerSlots<W>,
+) {
+    if before.is_empty() {
+        return;
+    }
+    for ws in workspaces {
+        if let Some((_, slots)) = before.iter().find(|(id, _)| *id == ws.id()) {
+            ws.slide_expose_slots_from(slots.clone(), None);
+        }
+    }
+}
 
 fn peek_transition_config(options: &Options) -> synoik_config::Animation {
     synoik_config::Animation {

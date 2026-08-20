@@ -1211,7 +1211,15 @@ impl<W: LayoutElement> Monitor<W> {
         }
         let new_id = self.workspaces[new_idx].id();
 
+        // A window leaving holds the source picker still, exactly as a close does: gnome-shell
+        // reaches `_doRemoveWindow` through `_windowRemoved` here too (`workspace.js:1260-1262`).
+        // Only when there is something to remove — a freeze armed over a no-op would hold the
+        // picker for 750ms and then ease nothing.
+        let freeze = self.overview_open;
         let workspace = &mut self.workspaces[source_workspace_idx];
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let Some(removed) = workspace.remove_active_tile(Transaction::new()) else {
             return;
         };
@@ -1245,7 +1253,15 @@ impl<W: LayoutElement> Monitor<W> {
         }
         let new_id = self.workspaces[new_idx].id();
 
+        // A window leaving holds the source picker still, exactly as a close does: gnome-shell
+        // reaches `_doRemoveWindow` through `_windowRemoved` here too (`workspace.js:1260-1262`).
+        // Only when there is something to remove — a freeze armed over a no-op would hold the
+        // picker for 750ms and then ease nothing.
+        let freeze = self.overview_open;
         let workspace = &mut self.workspaces[source_workspace_idx];
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let Some(removed) = workspace.remove_active_tile(Transaction::new()) else {
             return;
         };
@@ -1295,7 +1311,12 @@ impl<W: LayoutElement> Monitor<W> {
             window.is_none_or(|win| self.active_window().map(|win| win.id()) == Some(win))
         });
 
+        // See `move_to_workspace_up`.
+        let freeze = self.overview_open;
         let workspace = &mut self.workspaces[source_workspace_idx];
+        if freeze && workspace.has_windows() {
+            workspace.freeze_expose_for_close();
+        }
         let transaction = Transaction::new();
         let removed = if let Some(window) = window {
             workspace.remove_tile(window, transaction)

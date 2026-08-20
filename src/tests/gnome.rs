@@ -28219,6 +28219,129 @@ fn the_closed_windows_own_preview_does_not_hold_the_freeze() {
     );
 }
 
+/// A window *arriving* in the picker outside a drop — a fresh map — eases the previews it
+/// displaces apart rather than snapping them.
+///
+/// gnome-shell's `_doAddWindow` sets `_needsLayout` through `addWindow` (`workspace.js:823`)
+/// and the reflow arrives through `animateAllocation` like any other. It also pops the new
+/// clone up from scale 0 (`:1233-1243`); that is not ported, so the arriving preview appears
+/// in its slot — it is the previews already there that must not jump.
+#[test]
+fn a_fresh_window_eases_the_previews_it_displaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    f.freeze_clock();
+
+    let slots = |f: &mut Fixture| {
+        (
+            f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+            f.synoik().layout.expose_slot_local(&win_b).unwrap(),
+        )
+    };
+    let before = slots(&mut f);
+
+    // Unsettled: `map_window_sized` settles, which runs the 200ms ease to its end before
+    // anything can sample it.
+    map_window_unsettled(&mut f, id, (740, 480), None);
+
+    let samples = f.sample_animation(Duration::from_millis(200), 4, slots);
+    f.settle_animations();
+    let after = slots(&mut f);
+    assert_ne!(
+        after, before,
+        "the arrival must have displaced somebody, or there is nothing to ease",
+    );
+
+    assert_eq!(samples[0], before, "the neighbours jumped on the map frame");
+    assert_eq!(samples[4], after);
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            *sample != before && *sample != after,
+            "sample {} sits on an endpoint — the neighbours snapped: {samples:?}",
+            i + 1,
+        );
+    }
+}
+
+/// Moving a window to another workspace reaches neither `Layout::remove_window` nor a drop,
+/// so both pickers used to snap — the one it left and the one it landed on.
+///
+/// The source holds still like any other removal (gnome-shell's `_windowRemoved` runs
+/// `_doRemoveWindow`, `workspace.js:1260-1262`) and the target eases apart around the arrival.
+#[test]
+fn moving_a_window_to_another_workspace_settles_both_pickers() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Two on the first workspace, one on the second, so both sides have a preview that has to
+    // move: the survivor spreads out, and the window already down there is displaced.
+    let _c = map_window_sized(&mut f, id, (900, 700), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    f.freeze_clock();
+
+    let a_before = f.synoik().layout.expose_slot_local(&win_a).unwrap();
+    let c_before = f.synoik().layout.expose_slot_local(&win_c).unwrap();
+
+    // B goes down to join C. A is left alone above; C is displaced below.
+    f.synoik().layout.activate_window(&win_b);
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(false), false);
+
+    // Nothing *left* the target, so it has no hold: C is already travelling a hundred
+    // milliseconds in, and travelling rather than teleported.
+    f.advance_clock(Duration::from_millis(100));
+    let c_mid = f.synoik().layout.expose_slot_local(&win_c).unwrap();
+    f.advance_clock(Duration::from_millis(200));
+    let c_after = f.synoik().layout.expose_slot_local(&win_c).unwrap();
+    assert_ne!(
+        c_after, c_before,
+        "the arrival must have displaced C at all, or there is nothing to ease",
+    );
+    assert!(
+        c_mid != c_before && c_mid != c_after,
+        "C snapped rather than easing: {c_before:?} -> {c_mid:?} -> {c_after:?}",
+    );
+
+    // The source is held for the same 750ms a close gets, so A has not moved at all yet —
+    // three hundred milliseconds in, an un-held reflow would already have finished.
+    assert_eq!(
+        f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+        a_before,
+        "the workspace the window left reflowed before the hold ran out",
+    );
+
+    // And it reflows once the hold runs out, plus the 200ms it eases over.
+    f.advance_clock(Duration::from_millis(500));
+    f.advance_clock(Duration::from_millis(250));
+    assert_ne!(
+        f.synoik().layout.expose_slot_local(&win_a).unwrap(),
+        a_before,
+        "the workspace the window left never reflowed",
+    );
+}
+
 /// The dropped preview eases from the box it was released at into its picker slot, rather
 /// than appearing there.
 ///
