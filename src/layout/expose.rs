@@ -82,12 +82,27 @@ struct Row {
     windows: Vec<usize>,
 }
 
+/// The picker's *assignment*: which window goes in which row and column, and the scale the
+/// row-count search settled on. Packing it into concrete rects is a separate step
+/// ([`pack_grid`]), because a container resize must re-fit without reconsidering the
+/// assignment — gnome-shell's `_layout` / `_windowSlots` split (`js/ui/workspace.js:668-681`).
 struct GridLayout {
     rows: Vec<Row>,
     max_columns: usize,
     grid_width: f64,
     grid_height: f64,
     scale: f64,
+    /// The monitor height the row widths and heights were summed at. Packing consults
+    /// `window_scale` again, and must do so with the same one; gnome-shell likewise freezes
+    /// the monitor into the strategy at `_createBestLayout` time.
+    monitor_height: f64,
+    /// How many windows the row index lists span. A grid only means anything against the
+    /// slice it was built from: a shorter one indexes out of bounds, a longer one leaves
+    /// windows at a default slot. A caller holding a grid across changes must therefore key
+    /// its rows by window identity and recompute when they no longer line up — an equal
+    /// count is not the same as the same windows, so the assert below is a backstop, not
+    /// the check.
+    window_count: usize,
 }
 
 /// `computeLayout`: distribute the windows into `num_rows` rows, aiming for
@@ -168,6 +183,8 @@ fn compute_layout(
         grid_height,
         rows,
         scale: 1.,
+        monitor_height,
+        window_count: windows.len(),
     }
 }
 
@@ -246,13 +263,34 @@ fn is_better_scale_and_space(old_scale: f64, old_space: f64, scale: f64, space: 
 /// (workspace coordinates), `area` is the space the picker may use, and
 /// `monitor_height` feeds the small-window enlargement. Returns one slot per
 /// input window, same order.
+///
+/// The two halves are also callable apart ([`compute_grid`], [`pack_grid`]), for a caller
+/// that wants to hold the assignment still and only re-pack it.
 pub fn compute_slots(
     monitor_height: f64,
     area: Rectangle<f64, Logical>,
     windows: &[Rectangle<f64, Logical>],
 ) -> Vec<Rectangle<f64, Logical>> {
-    if windows.is_empty() {
+    let Some(mut grid) = compute_grid(monitor_height, area, windows) else {
         return Vec::new();
+    };
+    pack_grid(&mut grid, area, windows)
+}
+
+/// Decide the assignment: which window lands in which row, in what order, and at what
+/// scale. `None` when there is nothing to lay out.
+///
+/// This half reads window positions and sizes both, and scores candidate row counts against
+/// `area`. It is the half that must not run per frame: it is the only half that *orders*
+/// anything, and both its sorts are stable with no tie-break, so any jitter in the input
+/// rects re-orders the grid.
+fn compute_grid(
+    monitor_height: f64,
+    area: Rectangle<f64, Logical>,
+    windows: &[Rectangle<f64, Logical>],
+) -> Option<GridLayout> {
+    if windows.is_empty() {
+        return None;
     }
 
     // Sort windows vertically to minimize travel distance; this decides the
@@ -284,7 +322,28 @@ pub fn compute_slots(
         last_scale = scale;
         last_space = space;
     }
-    let mut layout = best.unwrap();
+    // The `num_rows = 1` pass always lands: its column count cannot equal the `usize::MAX`
+    // sentinel, and the score test is gated on a candidate already being held.
+    Some(best.unwrap())
+}
+
+/// Pack an assignment into concrete slot rects, one per input window, in input order.
+///
+/// This half reads window **sizes** only, never positions, so it cannot re-order anything —
+/// which is what makes it safe to run every frame over a held-still [`GridLayout`]. Packing
+/// into an `area` other than the one the grid was searched at is allowed and intended: the
+/// grid shifts and re-fits, and nothing moves between cells. Growth is then shrink-only
+/// until the next assignment, because `additional_scale` caps at 1 — gnome-shell tolerates
+/// the same staleness.
+fn pack_grid(
+    layout: &mut GridLayout,
+    area: Rectangle<f64, Logical>,
+    windows: &[Rectangle<f64, Logical>],
+) -> Vec<Rectangle<f64, Logical>> {
+    // The row index lists address this exact slice. A length mismatch is already a caller
+    // bug by then; this only makes it loud in the build that can still be debugged.
+    debug_assert_eq!(layout.window_count, windows.len());
+    let monitor_height = layout.monitor_height;
 
     // `_computeRowSizes`.
     let scale = layout.scale;
@@ -385,6 +444,217 @@ mod tests {
 
     fn area() -> Rectangle<f64, Logical> {
         rect(0., 0., 1920., 1080.)
+    }
+
+    /// A pinned input: a name, the monitor height, the area, and the window rects.
+    type GoldenCase = (
+        &'static str,
+        f64,
+        Rectangle<f64, Logical>,
+        Vec<Rectangle<f64, Logical>>,
+    );
+
+    /// Inputs the golden table below pins. Each is a documented degenerate or a branch of
+    /// the layout that a later change could silently move.
+    fn golden_cases() -> Vec<GoldenCase> {
+        vec![
+            ("single", 1080., area(), vec![rect(100., 100., 800., 600.)]),
+            (
+                "exact centre tie",
+                1080.,
+                area(),
+                vec![rect(400., 300., 700., 500.), rect(400., 300., 700., 500.)],
+            ),
+            (
+                "single row, mixed aspects",
+                1080.,
+                area(),
+                vec![
+                    rect(0., 0., 800., 600.),
+                    rect(900., 50., 640., 480.),
+                    rect(1400., 20., 300., 300.),
+                ],
+            ),
+            (
+                "multi row",
+                1080.,
+                area(),
+                vec![
+                    rect(0., 0., 800., 600.),
+                    rect(900., 50., 640., 480.),
+                    rect(100., 500., 1200., 400.),
+                    rect(1400., 600., 300., 300.),
+                    rect(600., 300., 1920., 1080.),
+                    rect(200., 800., 500., 900.),
+                    rect(1500., 900., 960., 540.),
+                    rect(700., 100., 1280., 720.),
+                ],
+            ),
+            (
+                "zero height",
+                1080.,
+                area(),
+                vec![rect(0., 0., 800., 0.), rect(900., 0., 640., 0.)],
+            ),
+            (
+                "fully degenerate",
+                1080.,
+                area(),
+                vec![rect(0., 0., 0., 0.), rect(10., 10., 0., 0.)],
+            ),
+            (
+                "negative window scale",
+                200.,
+                area(),
+                vec![rect(0., 0., 400., 900.), rect(500., 0., 300., 200.)],
+            ),
+            (
+                "offset area",
+                1080.,
+                rect(64., 48., 1600., 900.),
+                vec![rect(0., 0., 800., 600.), rect(900., 50., 640., 480.)],
+            ),
+            (
+                "tiny area",
+                1080.,
+                rect(0., 0., 200., 120.),
+                vec![
+                    rect(0., 0., 800., 600.),
+                    rect(900., 50., 640., 480.),
+                    rect(100., 500., 1200., 400.),
+                ],
+            ),
+            (
+                // A window wide enough to fail `_keepSameRow` from an empty row leaves the
+                // row it broke out of empty, which is the negative-spacing term below.
+                "empty middle row",
+                1080.,
+                rect(0., 0., 900., 700.),
+                vec![
+                    rect(0., 0., 60., 40.),
+                    rect(0., 400., 1800., 200.),
+                    rect(0., 800., 60., 40.),
+                ],
+            ),
+            ("empty", 1080., area(), vec![]),
+        ]
+    }
+
+    /// Slot values captured from this implementation, pinned field-by-field on their bit
+    /// patterns.
+    ///
+    /// The layout is a port whose every constant and quirk is answerable to gnome-shell, so
+    /// "it still computes what it computed" is the property worth holding: a refactor that
+    /// moves a slot by an ulp has changed the picker. Every value here is the result of
+    /// exactly-specified IEEE arithmetic, so the bits are reproducible; comparing them
+    /// rather than the values is what makes a sign-of-zero or a single ulp fail.
+    ///
+    /// The degenerate cases are the finite ones — a zero extent, an empty row's negative
+    /// spacing, a window tall enough to drive `window_scale` negative. Inputs that make the
+    /// arithmetic itself `NaN` (a zero monitor height) are deliberately **not** pinned here:
+    /// `NaN` bit patterns are not portable, so a golden row holding one would pin the
+    /// platform rather than the layout.
+    #[rustfmt::skip]
+    const GOLDEN: &[&[(f64, f64, f64, f64)]] = &[
+        &[(580.0, 255.0, 760.0, 570.0)],
+        &[(190.0, 302.0, 665.0, 475.0), (1064.0, 302.0, 665.0, 475.0)],
+        &[(32.0, 255.0, 760.0, 570.0), (896.0, 312.0, 608.0, 456.0), (1605.0, 397.0, 285.0, 285.0)],
+        &[
+            (350.0, 37.0, 344.36691613893686, 258.27518710420264),
+            (725.0, 79.0, 288.01596622529263, 216.0119746689695),
+            (241.0, 521.0, 555.6829783151027, 185.22765943836757),
+            (827.0, 562.0, 143.81232009211286, 143.81232009211286),
+            (1001.0, 326.0, 676.2113989637305, 380.36891191709844),
+            (638.0, 736.0, 190.77144502014968, 343.3886010362694),
+            (859.0, 842.0, 422.63212435233163, 237.73056994818654),
+            (1043.0, 0.0, 525.9421991940127, 295.84248704663213),
+        ],
+        &[(579.0, 524.0, 760.0, 0.0), (656.0, 555.0, 608.0, 0.0)],
+        &[(944.0, 524.0, 0.0, 0.0), (975.0, 524.0, 0.0, 0.0)],
+        &[(944.0, 860.0, -284.99999999999994, -641.2499999999999), (690.0, 445.0, 285.0, 190.0)],
+        &[(111.0, 213.0, 760.0, 570.0), (1002.0, 270.0, 608.0, 456.0)],
+        &[
+            (20.0, 0.0, 69.7270588235294, 52.29529411764705),
+            (120.0, 8.0, 58.31717647058822, 43.73788235294116),
+            (43.0, 82.0, 112.5141176470588, 37.50470588235294),
+        ],
+        &[
+            (435.0, 253.0, 29.48474576271186, 19.65649717514124),
+            (59.0, 426.0, 840.3152542372881, 93.3683615819209),
+            (0.0, 500.0, 29.48474576271186, 19.65649717514124),
+        ],
+        &[],
+    ];
+
+    #[test]
+    fn slots_match_the_golden_table() {
+        let cases = golden_cases();
+        // Without this a case added past the end of the table is silently never checked.
+        assert_eq!(cases.len(), GOLDEN.len(), "every case needs a golden row");
+        for ((name, mh, a, windows), golden) in cases.into_iter().zip(GOLDEN) {
+            let slots = compute_slots(mh, a, &windows);
+            assert_eq!(slots.len(), golden.len(), "{name}: slot count");
+            for (i, (slot, want)) in slots.iter().zip(*golden).enumerate() {
+                let got = (slot.loc.x, slot.loc.y, slot.size.w, slot.size.h);
+                let bits = |t: &(f64, f64, f64, f64)| {
+                    [t.0.to_bits(), t.1.to_bits(), t.2.to_bits(), t.3.to_bits()]
+                };
+                assert_eq!(
+                    bits(&got),
+                    bits(want),
+                    "{name}: slot {i} is {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// The two halves compose back into [`compute_slots`] — which is trivially true while
+    /// `compute_slots` *is* that composition, and stops being trivial the moment a caller
+    /// holds a grid still across frames. It pins the property that makes holding one legal.
+    #[test]
+    fn packing_a_grid_reproduces_compute_slots() {
+        for (name, mh, a, windows) in golden_cases() {
+            let Some(mut grid) = compute_grid(mh, a, &windows) else {
+                assert!(
+                    windows.is_empty(),
+                    "{name}: no grid for a non-empty workspace"
+                );
+                continue;
+            };
+            assert_eq!(grid.monitor_height, mh, "{name}");
+            assert_eq!(grid.window_count, windows.len(), "{name}");
+
+            // Re-packed, because retention packs the same grid again on every later frame,
+            // and packed into a *different* area in between, because that is the whole
+            // reason a grid is held: the row scratch fields must be written afresh each
+            // time, never folded into what a previous area left behind.
+            let once = pack_grid(&mut grid, a, &windows);
+            let elsewhere = Rectangle::new(
+                Point::from((a.loc.x + 37., a.loc.y - 11.)),
+                Size::from((a.size.w * 0.6 + 5., a.size.h * 1.3 + 5.)),
+            );
+            let _ = pack_grid(&mut grid, elsewhere, &windows);
+            let twice = pack_grid(&mut grid, a, &windows);
+            let bits = |s: &Rectangle<f64, Logical>| {
+                [
+                    s.loc.x.to_bits(),
+                    s.loc.y.to_bits(),
+                    s.size.w.to_bits(),
+                    s.size.h.to_bits(),
+                ]
+            };
+            let want: Vec<_> = compute_slots(mh, a, &windows).iter().map(bits).collect();
+            assert_eq!(
+                once.iter().map(bits).collect::<Vec<_>>(),
+                want,
+                "{name}: first pack"
+            );
+            assert_eq!(
+                twice.iter().map(bits).collect::<Vec<_>>(),
+                want,
+                "{name}: re-pack"
+            );
+        }
     }
 
     /// Hand-computed through the gnome-shell algorithm: window scale
