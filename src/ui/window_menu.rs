@@ -21,6 +21,10 @@
 //! - **Take Screenshot** — the window's own pixels, saved and put on the clipboard with a
 //!   notification, and without the pointer (`windowMenu.js:26-36`, whose
 //!   `captureScreenshot(texture, null, 1, null)` passes a null cursor).
+//! - **Hide** — minimize (`windowMenu.js:38-42`). GNOME dims it when `can_minimize()` is false,
+//!   which for a Wayland toplevel it never is: `has_minimize_func` only goes false for a non-NORMAL
+//!   window type or a skip-taskbar window (`window.c:6014-6018`, `:6079-6082`), and neither has an
+//!   xdg-shell equivalent.
 //! - **Maximize / Restore** — one row, whichever the window is not (`windowMenu.js:44-55`).
 //! - **Move to Workspace Left / Right** — only when the neighbour in that direction is a
 //!   *different* workspace, which is what `workspace.get_neighbor(dir) !== workspace` tests
@@ -31,8 +35,8 @@
 //! - **Close** (`windowMenu.js:185-189`).
 //!
 //! The rest are omitted rather than drawn insensitive, because every one of them is missing its
-//! *subsystem*, not merely a per-window capability: no minimized state, no stacking order, no
-//! sticky windows, no keyboard grab machinery. GNOME dims a row when
+//! *subsystem*, not merely a per-window capability: no stacking order, no sticky windows, no
+//! keyboard grab machinery. GNOME dims a row when
 //! `can_minimize()` is false for *this* window; a row we could never enable is a row that teaches
 //! the reader nothing. `docs/fork/window-menu-port.md` carries the list and what each one needs.
 
@@ -84,6 +88,7 @@ pub enum WindowMenuAnchor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowAction {
     TakeScreenshot,
+    Minimize,
     SetMaximized(bool),
     MoveToWorkspace(WorkspaceDirection),
     MoveToMonitor(MonitorDirection),
@@ -135,6 +140,7 @@ impl WindowMenu {
             RowAction::TakeScreenshot,
             &mut actions,
         )];
+        state.push(row("Hide", RowAction::Minimize, &mut actions));
         state.push(if ctx.is_maximized {
             row("Restore", RowAction::SetMaximized(false), &mut actions)
         } else {
@@ -267,6 +273,7 @@ impl WindowMenu {
         let window = self.window;
         match *action {
             RowAction::TakeScreenshot => PopoverAction::WindowTakeScreenshot(window),
+            RowAction::Minimize => PopoverAction::WindowMinimize(window),
             RowAction::SetMaximized(maximized) => {
                 PopoverAction::WindowSetMaximized { window, maximized }
             }

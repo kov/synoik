@@ -627,6 +627,28 @@ impl ForeignToplevelHandler for State {
         }
     }
 
+    fn set_minimized(&mut self, wl_surface: WlSurface) {
+        if let Some((mapped, _)) = self.synoik.layout.find_window_and_output(&wl_surface) {
+            let window = mapped.window.clone();
+            self.minimize_window(&window);
+        }
+    }
+
+    /// Unminimize without raising: a taskbar that wants the window *up* uses `activate`, which
+    /// unminimizes on its own. This request only says "stop being minimized".
+    fn unset_minimized(&mut self, wl_surface: WlSurface) {
+        if let Some((mapped, _)) = self.synoik.layout.find_window_and_output(&wl_surface) {
+            let window = mapped.window.clone();
+            if self
+                .synoik
+                .layout
+                .unminimize_window(&window, crate::layout::ActivateWindow::No)
+            {
+                self.synoik.queue_redraw_all();
+            }
+        }
+    }
+
     fn unset_maximized(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.synoik.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();

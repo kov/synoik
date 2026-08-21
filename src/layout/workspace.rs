@@ -64,6 +64,24 @@ pub struct Workspace<W: LayoutElement> {
     /// Whether the floating layout is active instead of the scrolling layout.
     floating_is_active: FloatingActive,
 
+    /// Windows on this workspace that are minimized: alive, still ours, and out of both layouts.
+    ///
+    /// mutter keeps a plain `window->minimized` bool and lets `CALC_SHOWING` hide the actor
+    /// (`window.c:2734-2771`), because its windows float freely and hiding one changes no other
+    /// window's geometry. Ours can be tiled, where "not showing" and "still in the column" cannot
+    /// both be true — so a minimized window is *taken out* of the layout instead, exactly the way
+    /// an interactive move takes one out (`InteractiveMoveState::Moving`), and put back on
+    /// unminimize. [`RemovedTile`] is what it was taken out with, so putting it back is exact.
+    ///
+    /// It is parked on the **workspace**, not on `Layout`: everything that reads windows through
+    /// `Layout::workspaces()` — the session store above all (`Layout::session_snapshot`) — would
+    /// otherwise stop seeing it, and a minimized window would silently stop being savable.
+    /// [`Self::tiles`] chains it, which is what keeps the switcher, IPC, the app system and the
+    /// foreign-toplevel sweep seeing it; the render and hit-test paths go through
+    /// [`Self::tiles_with_render_positions`] instead, which does not, so nothing draws it and
+    /// nothing can click it.
+    minimized: Vec<RemovedTile<W>>,
+
     /// The original output of this workspace.
     ///
     /// Most of the time this will be the workspace's current output, however, after an output
@@ -542,6 +560,7 @@ impl<W: LayoutElement> Workspace<W> {
             scrolling,
             floating,
             floating_is_active: FloatingActive::No,
+            minimized: Vec::new(),
             original_output,
             scale,
             transform: output.current_transform(),
@@ -612,6 +631,7 @@ impl<W: LayoutElement> Workspace<W> {
             scrolling,
             floating,
             floating_is_active: FloatingActive::No,
+            minimized: Vec::new(),
             output: None,
             scale,
             transform: Transform::Normal,
@@ -787,16 +807,80 @@ impl<W: LayoutElement> Workspace<W> {
         self.tiles_mut().map(Tile::window_mut)
     }
 
+    /// Every tile the workspace holds, **including the minimized ones**.
+    ///
+    /// This is the "which windows are on this workspace" question — `Workspace::windows`,
+    /// `has_window`, `has_windows_or_name` and the by-id lookups all come through here, and a
+    /// minimized window is still on its workspace (it is hidden, not gone). For "what is drawn
+    /// and what can be clicked", use [`Self::tiles_with_render_positions`].
     pub fn tiles(&self) -> impl Iterator<Item = &Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles();
         let floating = self.floating.tiles();
-        scrolling.chain(floating)
+        let minimized = self.minimized.iter().map(|removed| &removed.tile);
+        scrolling.chain(floating).chain(minimized)
     }
 
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();
-        scrolling.chain(floating)
+        let minimized = self.minimized.iter_mut().map(|removed| &mut removed.tile);
+        scrolling.chain(floating).chain(minimized)
+    }
+
+    /// Whether `id` is minimized on this workspace.
+    pub fn is_minimized(&self, id: &W::Id) -> bool {
+        self.minimized
+            .iter()
+            .any(|removed| removed.tile.window().id() == id)
+    }
+
+    /// Take `id` out of whichever layout holds it and park it — `meta_window_minimize`
+    /// (`window.c:2734-2771`). Returns whether anything changed; a window already minimized, or
+    /// not on this workspace at all, is a no-op like mutter's `if (!window->minimized)` guard.
+    ///
+    /// The focus fixup rides [`Self::remove_tile`], which is the whole reason minimizing goes
+    /// through a real removal rather than a flag the arithmetic skips: a flag would leave the
+    /// focus on an invisible window, because none of the index fixups in the scrolling and
+    /// floating halves would run.
+    pub fn minimize(&mut self, id: &W::Id, transaction: Transaction) -> bool {
+        if self.is_minimized(id) {
+            return false;
+        }
+        let in_layout = self.floating.has_window(id)
+            || self.scrolling.tiles().any(|tile| tile.window().id() == id);
+        if !in_layout {
+            return false;
+        }
+        let removed = self.remove_tile(id, transaction);
+        self.minimized.push(removed);
+        true
+    }
+
+    /// Put a minimized window back where it came from — `meta_window_unminimize`
+    /// (`window.c:2773-2790`). Returns whether anything changed.
+    pub fn unminimize(&mut self, id: &W::Id, activate: ActivateWindow) -> bool {
+        let Some(idx) = self
+            .minimized
+            .iter()
+            .position(|removed| removed.tile.window().id() == id)
+        else {
+            return false;
+        };
+        let RemovedTile {
+            tile,
+            width,
+            is_full_width,
+            is_floating,
+        } = self.minimized.remove(idx);
+        self.add_tile(
+            tile,
+            WorkspaceAddWindowTarget::Auto,
+            activate,
+            width,
+            is_full_width,
+            is_floating,
+        );
+        true
     }
 
     /// See [`FloatingSpace::raise_window_only`].
@@ -1113,6 +1197,20 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn remove_tile(&mut self, id: &W::Id, transaction: Transaction) -> RemovedTile<W> {
+        // A minimized window is still ours, so its client can still close it. It is already out
+        // of both layouts, so there is no arithmetic to fix up and no focus to move.
+        if let Some(idx) = self
+            .minimized
+            .iter()
+            .position(|removed| removed.tile.window().id() == id)
+        {
+            let removed = self.minimized.remove(idx);
+            if let Some(output) = &self.output {
+                removed.tile.window().output_leave(output);
+            }
+            return removed;
+        }
+
         let mut from_floating = false;
         let removed = if self.floating.has_window(id) {
             from_floating = true;
@@ -2117,7 +2215,28 @@ impl<W: LayoutElement> Workspace<W> {
         self.windows().next().is_some()
     }
 
+    /// Whether `window` is **laid out** on this workspace — in the scrolling or floating half,
+    /// with geometry.
+    ///
+    /// Deliberately **false** for a minimized window, which is on the workspace but in neither
+    /// half. `Layout` finds the workspace to operate on with this at some sixty call sites, and
+    /// every one of them routes into an `if floating { … } else { … }` whose else-branch would
+    /// then ask the scrolling half about a tile it does not have — `ScrollingSpace`'s lookups
+    /// unwrap, so that is a panic, not a no-op. An operation on a hidden window doing nothing is
+    /// the right answer anyway, and this is how it gets it without sixty guards.
+    ///
+    /// For "is this window on this workspace at all", use [`Self::holds_window`].
     pub fn has_window(&self, window: &W::Id) -> bool {
+        let scrolling = self.scrolling.tiles();
+        let floating = self.floating.tiles();
+        scrolling
+            .chain(floating)
+            .any(|tile| tile.window().id() == window)
+    }
+
+    /// Whether the workspace holds `window` at all, minimized included — what "which workspace is
+    /// this window on" means. See [`Self::has_window`] for why the two differ.
+    pub fn holds_window(&self, window: &W::Id) -> bool {
         self.windows().any(|win| win.id() == window)
     }
 
@@ -3090,6 +3209,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
+        // Activating unminimizes on the way in — `meta_window_activate_full`'s
+        // `meta_window_unminimize` (`window.c:3830-3836`). Hooked here rather than in `Layout` so
+        // every path that raises a window (the dash, the switcher, an activation token, a click
+        // in the overview) brings a minimized one back instead of silently doing nothing.
+        self.unminimize(window, ActivateWindow::Yes);
+
         if self.floating.activate_window(window) {
             self.floating_is_active = FloatingActive::Yes;
             true
@@ -3102,6 +3227,10 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn activate_window_without_raising(&mut self, window: &W::Id) -> bool {
+        // Same unminimize, but this caller is explicitly not raising, so the window comes back
+        // without taking activation with it.
+        self.unminimize(window, ActivateWindow::No);
+
         if self.floating.activate_window_without_raising(window) {
             self.floating_is_active = FloatingActive::Yes;
             true

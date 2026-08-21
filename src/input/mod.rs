@@ -2119,6 +2119,11 @@ impl State {
             PopoverAction::WindowTakeScreenshot(window) => {
                 self.screenshot_window_by_id(window.get(), true, false, None);
             }
+            PopoverAction::WindowMinimize(window) => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.minimize_window(&window);
+                }
+            }
             PopoverAction::WindowSetMaximized { window, maximized } => {
                 if let Some(window) = self.window_by_id(window) {
                     self.synoik.layout.set_maximized(&window, maximized);
@@ -2354,6 +2359,18 @@ impl State {
         // A menu opened off the *dock* is not the overview's, so the "close it when the
         // overview hides" rule must not reach it — there is no overview to hide.
         self.synoik.app_menu_from_dock = self.synoik.dock_owns_dash(output);
+        true
+    }
+
+    /// Hide `window` and redraw. The focus fixup is the layout's, because minimizing goes
+    /// through a real tile removal — see `Workspace::minimize`.
+    pub(crate) fn minimize_window(&mut self, window: &smithay::desktop::Window) -> bool {
+        if !self.synoik.layout.minimize_window(window) {
+            return false;
+        }
+        self.maybe_warp_cursor_to_focus();
+        // FIXME: granular
+        self.synoik.queue_redraw_all();
         true
     }
 
@@ -3072,6 +3089,13 @@ impl State {
             Action::CloseWindow => {
                 if let Some(mapped) = self.synoik.layout.focus() {
                     mapped.toplevel().send_close();
+                }
+            }
+            // `handle_minimize` (`keybindings.c`) → `meta_window_minimize`: the focused window
+            // goes, and the focus lands wherever the layout's own removal fixup puts it.
+            Action::MinimizeWindow => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.minimize_window(&window);
                 }
             }
             // `handle_activate_window_menu` (`keybindings.c:1999-2021`): the focused window's
@@ -10073,6 +10097,7 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::ShowScreenRecordingUi => Action::ToggleScreenRecord,
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ActivateWindowMenu => Action::ShowWindowMenu,
+        GnomeKeyAction::Minimize => Action::MinimizeWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
             Action::FocusWorkspace(WorkspaceReference::Index(n))

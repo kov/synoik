@@ -184,6 +184,8 @@ pub enum Action {
     /// `activate-window-menu`: pop the focused window's own menu
     /// (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
     ShowWindowMenu,
+    /// `minimize`: hide the focused window (`meta_window_minimize`, `window.c:2734-2771`).
+    MinimizeWindow,
     FullscreenWindow,
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,

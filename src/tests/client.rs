@@ -1059,6 +1059,11 @@ impl Window {
         self.xdg_toplevel.unset_fullscreen();
     }
 
+    /// `xdg_toplevel.set_minimized` — what a CSD titlebar's minimize button sends.
+    pub fn set_minimized(&self) {
+        self.xdg_toplevel.set_minimized();
+    }
+
     pub fn set_maximized(&self) {
         self.xdg_toplevel.set_maximized();
     }

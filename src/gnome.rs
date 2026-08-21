@@ -1034,6 +1034,9 @@ pub enum GnomeKeyAction {
     PanelRunDialog,
     /// `close`: close the focused window.
     Close,
+    /// `minimize` (`<Super>h`): hide the focused window
+    /// (`meta_window_minimize`, `window.c:2734-2771`).
+    Minimize,
     /// `activate-window-menu` (`<Alt>space`): pop the focused window's own menu, anchored on its
     /// top-left (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
     ActivateWindowMenu,
@@ -1205,6 +1208,7 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             strs(&["<Alt>F2"]),
         ),
         ("close".to_owned(), Close, strs(&["<Alt>F4"])),
+        ("minimize".to_owned(), Minimize, strs(&["<Super>h"])),
         (
             "activate-window-menu".to_owned(),
             ActivateWindowMenu,

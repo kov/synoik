@@ -85,6 +85,24 @@ impl XdgShellHandler for State {
         }
     }
 
+    /// `xdg_toplevel.set_minimized` — a client asking for its own window to be hidden, which is
+    /// what a CSD titlebar's minimize button sends (`xdg_toplevel_set_minimized`,
+    /// `meta-wayland-xdg-shell.c:535-549`, straight into `meta_window_minimize`).
+    ///
+    /// Unlike `show_window_menu` this carries no serial and no seat, so there is nothing to
+    /// validate: the request is a window acting on itself, which is always its own business.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self
+            .synoik
+            .layout
+            .find_window_and_output(surface.wl_surface())
+            .map(|(mapped, _)| mapped.window.clone())
+        else {
+            return;
+        };
+        self.minimize_window(&window);
+    }
+
     /// `xdg_toplevel.show_window_menu` — a CSD client's titlebar right-click asking the
     /// compositor for the window menu (`xdg_toplevel_show_window_menu`,
     /// `meta-wayland-xdg-shell.c:293-315`).

@@ -74,6 +74,7 @@ const KEY_UP: u32 = 103;
 const KEY_LEFT: u32 = 105;
 const KEY_DOWN: u32 = 108;
 const KEY_PAGEUP: u32 = 104;
+const KEY_H: u32 = 35;
 const KEY_HOME: u32 = 102;
 const KEY_END: u32 = 107;
 const KEY_PAGEDOWN: u32 = 109;
@@ -7182,6 +7183,7 @@ fn the_window_menu_offers_the_rows_the_window_has() {
         // and the trailing empty workspace is what "Right" moves to.
         vec![
             "Take Screenshot",
+            "Hide",
             "Maximize",
             "Move to Workspace Right",
             "Close"
@@ -7201,6 +7203,188 @@ fn the_window_menu_offers_the_rows_the_window_has() {
 
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
+}
+
+/// Minimizing takes the window out of the layout but not out of the workspace: it is still
+/// enumerable (the switcher, the app system and the session store must all still see it), it is
+/// no longer drawn or clickable, and the focus moves on — `meta_window_minimize`
+/// (`window.c:2734-2771`), whose focus note is "focusing default window due to minimization of
+/// focus window".
+#[test]
+fn minimizing_hides_a_window_and_moves_the_focus() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f.synoik_state().minimize_window(&second), "it minimizes");
+    f.settle();
+
+    assert!(f.synoik().layout.is_minimized(&second));
+    assert!(
+        f.synoik().layout.windows().any(|(_, m)| m.window == second),
+        "still on its workspace: the switcher, the app system and the session store all read \
+         windows this way, and a minimized window is hidden, not gone"
+    );
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    assert!(
+        !f.synoik()
+            .layout
+            .active_workspace_windows_for_output(&output)
+            .iter()
+            .any(|(m, _)| m.window == second),
+        "and out of the drawn set, so nothing renders it and nothing can click it"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().map(|m| m.window.clone()),
+        Some(first),
+        "the focus moved to the window underneath"
+    );
+}
+
+/// Activating a minimized window brings it back — `meta_window_activate_full` unminimizes on the
+/// way in (`window.c:3830-3836`), which is what makes every raise path (the dash, the switcher, an
+/// activation token) work on a hidden window instead of silently doing nothing.
+#[test]
+fn activating_a_minimized_window_brings_it_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.synoik_state().minimize_window(&second);
+    f.settle();
+
+    f.synoik().layout.activate_window(&second);
+    f.settle();
+
+    assert!(!f.synoik().layout.is_minimized(&second));
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    assert!(
+        f.synoik()
+            .layout
+            .active_workspace_windows_for_output(&output)
+            .iter()
+            .any(|(m, _)| m.window == second),
+        "it is drawn again"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().map(|m| m.window.clone()),
+        Some(second),
+        "and activating raised it"
+    );
+}
+
+/// A workspace whose only window is minimized is **not** empty — the dynamic-workspace reaper
+/// runs off `has_windows_or_name`, and a workspace that got collected out from under a hidden
+/// window would take the window with it.
+#[test]
+fn a_workspace_holding_only_a_minimized_window_is_not_empty() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let before = f.synoik().layout.workspaces().count();
+
+    f.synoik_state().minimize_window(&window);
+    f.settle();
+
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        before,
+        "the workspace survives, minimized window and all"
+    );
+}
+
+/// A minimized window's client can still close it: it is out of the layout, not out of the
+/// session, so the removal path has to find it where it is parked.
+#[test]
+fn a_minimized_window_can_still_be_closed_by_its_client() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().minimize_window(&window);
+    f.settle();
+
+    let w = f.client(id).window(&surface);
+    w.xdg_toplevel.destroy();
+    w.xdg_surface.destroy();
+    w.surface.destroy();
+    f.double_roundtrip(id);
+    f.settle();
+
+    assert!(
+        !f.synoik().layout.windows().any(|(_, m)| m.window == window),
+        "the parked tile went with the client"
+    );
+}
+
+/// `xdg_toplevel.set_minimized` — what a CSD titlebar's minimize button sends
+/// (`xdg_toplevel_set_minimized`, `meta-wayland-xdg-shell.c:535-549`). smithay defaults
+/// `minimize_request` to a no-op, so this was swallowed until the model existed.
+#[test]
+fn a_client_can_minimize_itself() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.client(id).window(&surface).set_minimized();
+    f.double_roundtrip(id);
+    f.settle();
+
+    assert!(f.synoik().layout.is_minimized(&window));
+}
+
+/// `minimize` (`<Super>h`) hides the focused window. It was in the deferred table for want of
+/// this model, while still shipping its default in the schema.
+#[test]
+fn super_h_minimizes_the_focused_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_H);
+    f.key_release(KEY_H);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+
+    assert!(f.synoik().layout.is_minimized(&window));
+}
+
+/// The window menu's Hide row (`windowMenu.js:38-42`).
+#[test]
+fn the_window_menu_hides_its_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+
+    open_window_menu_at_corner(&mut f);
+    click_window_menu_row(&mut f, "Hide");
+    f.settle();
+
+    assert!(f.synoik().layout.is_minimized(&window));
 }
 
 /// Take Screenshot leads the menu and photographs the window it belongs to
@@ -7270,7 +7454,7 @@ fn the_window_menu_maximizes_and_restores() {
 
     open_window_menu_at_corner(&mut f);
     assert_eq!(
-        f.synoik().panel_popover.window_menu().unwrap().labels()[1],
+        f.synoik().panel_popover.window_menu().unwrap().labels()[2],
         "Restore",
         "a maximized window is offered the other half of the pair"
     );

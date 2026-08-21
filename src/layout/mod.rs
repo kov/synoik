@@ -647,6 +647,7 @@ pub enum ConfigureIntent {
 }
 
 /// Tile that was just removed from the layout.
+#[derive(Debug)]
 pub struct RemovedTile<W: LayoutElement> {
     tile: Tile<W>,
     /// Width of the column the tile was in.
@@ -1430,7 +1431,9 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     for ws in mon.workspaces.iter_mut() {
-                        if ws.has_window(window) {
+                        // `holds_window`, not `has_window`: a minimized window's client can
+                        // still close it, and it is parked rather than laid out.
+                        if ws.holds_window(window) {
                             // A drag pickup removes the window too, but reserves its place
                             // first (`freeze_expose`): nothing reflows, so there is nothing
                             // to hold and no reason to pay for the snapshot.
@@ -1448,7 +1451,7 @@ impl<W: LayoutElement> Layout<W> {
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for (idx, ws) in workspaces.iter_mut().enumerate() {
-                    if ws.has_window(window) {
+                    if ws.holds_window(window) {
                         let removed = ws.remove_tile(window, transaction);
 
                         // Clean up empty workspaces.
@@ -1792,6 +1795,47 @@ impl<W: LayoutElement> Layout<W> {
                 ws.raise_window_only(id);
             }
         }
+    }
+
+    /// Whether `window` is minimized.
+    pub fn is_minimized(&self, window: &W::Id) -> bool {
+        self.workspaces().any(|(_, _, ws)| ws.is_minimized(window))
+    }
+
+    /// Hide `window` — `meta_window_minimize` (`window.c:2734-2771`). Returns whether anything
+    /// changed: a window already minimized, or unknown, is a no-op, like mutter's
+    /// `if (!window->minimized)` guard.
+    ///
+    /// A window being carried by an interactive move is refused: it is out of the layout already
+    /// and its tile belongs to the grab, so there is nothing here to park.
+    pub fn minimize_window(&mut self, window: &W::Id) -> bool {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == window {
+                return false;
+            }
+        }
+
+        let transaction = Transaction::new();
+        for ws in self.workspaces_mut() {
+            if ws.minimize(window, transaction.clone()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Bring `window` back — `meta_window_unminimize` (`window.c:2773-2790`). Returns whether
+    /// anything changed.
+    ///
+    /// Note [`Self::activate_window`] already does this, so callers that are raising a window do
+    /// not need to ask; this is for the ones that only want it visible again.
+    pub fn unminimize_window(&mut self, window: &W::Id, activate: ActivateWindow) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.unminimize(window, activate) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn activate_window(&mut self, window: &W::Id) {
