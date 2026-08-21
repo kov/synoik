@@ -48,8 +48,8 @@ use crate::synoik_render_elements;
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
-    ensure_min_max_size, ensure_min_max_size_maybe_zero, output_size, send_scale_transform,
-    ResizeEdge,
+    center_preferring_top_left_in_area, ensure_min_max_size, ensure_min_max_size_maybe_zero,
+    output_size, send_scale_transform, ResizeEdge,
 };
 use crate::window::ResolvedWindowRules;
 
@@ -2471,6 +2471,35 @@ impl<W: LayoutElement> Workspace<W> {
         settled.to_physical_precise_round(scale).to_logical(scale)
     }
 
+    /// Every minimized tile with the rect the picker lays it out over.
+    ///
+    /// A parked window is in the picker: gnome-shell's `_isOverviewWindow` is `!skip_taskbar`
+    /// with no minimized check (`workspace.js:1332`), and its layout strategy reads the window's
+    /// frame rect, which mutter keeps across a minimize. Ours is kept the same way and for the
+    /// same reason unminimize is exact — [`FloatingSpace::remove_tile_by_idx`] stamps
+    /// `floating_pos` and `floating_window_size` onto the tile on the way out, and
+    /// [`FloatingSpace::stored_or_default_tile_pos`] reads the position back.
+    ///
+    /// So the rect is the one the tile *had*, and minimizing with the overview open leaves the
+    /// picker's input unchanged: the grid does not shuffle under the user. The two can disagree
+    /// only for a window parked mostly off-screen, where [`Data::recompute_logical_pos`] clamps
+    /// the fraction and this does not.
+    fn minimized_with_expose_rects(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>)> {
+        let scale = self.scale().fractional_scale();
+        let area = self.floating.working_area();
+        self.minimized.iter().map(move |removed| {
+            let tile = &removed.tile;
+            let size = tile.tile_size();
+            let pos = self
+                .floating
+                .stored_or_default_tile_pos(tile)
+                .unwrap_or_else(|| center_preferring_top_left_in_area(area, size));
+            (tile, Rectangle::new(Self::settled_pos(scale, pos), size))
+        })
+    }
+
     /// The layout input one window contributes, if it is here.
     fn expose_input(&self, window: &W::Id) -> Option<ExposeInput> {
         let scale = self.scale().fractional_scale();
@@ -2479,6 +2508,11 @@ impl<W: LayoutElement> Workspace<W> {
             .map(|(tile, settled)| {
                 let rect = Rectangle::new(Self::settled_pos(scale, settled), tile.tile_size());
                 (tile.window().stable_sequence(), rect)
+            })
+            .or_else(|| {
+                self.minimized_with_expose_rects()
+                    .find(|(tile, _)| tile.window().id() == window)
+                    .map(|(tile, rect)| (tile.window().stable_sequence(), rect))
             })
     }
 
@@ -2506,6 +2540,10 @@ impl<W: LayoutElement> Workspace<W> {
                 let rect = Rectangle::new(Self::settled_pos(scale, settled), tile.tile_size());
                 (tile.window().stable_sequence(), rect)
             })
+            .chain(
+                self.minimized_with_expose_rects()
+                    .map(|(tile, rect)| (tile.window().stable_sequence(), rect)),
+            )
             .collect();
         inputs.sort_by_key(|(seq, _)| *seq);
 
@@ -2543,9 +2581,19 @@ impl<W: LayoutElement> Workspace<W> {
         // an animating rect re-sorts the grid for as long as the animation runs and the whole
         // picker shuffles and snaps back when it lands. A drop's move-back animation did
         // exactly that to every other preview.
+        //
+        // A minimized tile has no rect on screen to interpolate from, so it takes the one
+        // gnome-shell gives a window that is not `showing_on_its_workspace`: the work-area
+        // origin at **zero size** (`workspace.js:709-720`). It grows out of that corner into
+        // its slot instead of flying from a position it was never drawn at.
+        let minimized_from = Rectangle::new(self.floating.working_area().loc, Size::default());
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
             .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
+            .chain(
+                self.minimized_with_expose_rects()
+                    .map(|(tile, _)| (tile, minimized_from)),
+            )
             .collect();
 
         let mut inputs = self.expose_live_inputs();

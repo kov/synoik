@@ -78,7 +78,7 @@ impl TouchOverviewGrab {
                     // workspace. Otherwise, find the workspace that we tapped on.
                     let ws_matches = |ws: &Workspace<Mapped>| {
                         if let Some(window) = &self.window {
-                            ws.has_window(window)
+                            ws.holds_window(window)
                         } else if let Some(ws_id) = self.workspace_id {
                             ws.id() == ws_id
                         } else {

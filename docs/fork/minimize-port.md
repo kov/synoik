@@ -94,6 +94,21 @@ on-screen and `stored_or_default_tile_pos` does not.
 The picker is GNOME-mode-only and GNOME mode keeps every window in the floating layout, so there is
 no scrolling-layer case with no stored position.
 
+`Workspace::expose_layout` is the single seam: it chains the parked tiles into both the layout
+inputs and the render list, and every picker query — slots, hit-testing, hover, the close button,
+activation — reads through it, so nothing else needed a minimized case.
+
+A parked tile has no rect on screen to interpolate from, so on the open/close leg it takes the one
+gnome-shell gives a window that is not `showing_on_its_workspace`: the work-area origin at **zero
+size** (`workspace.js:709-720`). It grows out of that corner into its slot rather than flying from
+a position it was never drawn at.
+
+**`has_window` is the wrong question for the picker.** It means *laid out here*, so all five
+`Layout::expose_*` dispatchers, the touch tap-to-activate grab and `window_workspace_position` ask
+`holds_window` instead. A picker query that asks the positional question finds nothing and returns
+a **vacant** slot — a zero rect, not `None` — which reads as a real answer to any check that only
+tests for overlap.
+
 ## Backlog: a minimized strip instead of picker slots
 
 Preferred over GNOME's behavior (kov, 2026-08-21): show minimized windows on a **smaller
@@ -117,6 +132,14 @@ away is small. The strip **replaces** the picker slots when it lands — it is n
 
 ## Divergences, for now
 
+- **The workspace row shows minimized windows; GNOME's thumbnail strip hides them.** GNOME's strip
+  is a positional miniature of the real workspace, so a hidden window has nothing to draw there.
+  Ours renders each row entry through the same `render_expose` the picker uses, off the same
+  retained layout decision — so excluding them would mean deciding two different grids per
+  workspace and the row disagreeing with the picker it miniaturizes.
+- **No fade.** GNOME also ramps a minimized preview's opacity with the overview state
+  (`_syncOpacity`, `workspace.js:448-451`) on top of the zero-size growth. Ours has the geometry
+  only, which is most of the effect: a tile at zero scale draws nothing either way.
 - **No minimize animation.** GNOME shrinks the window toward its icon; ours vanishes.
 - **Minimized windows still get frame callbacks.** `windows_for_output_mut` reaches them through
   `Workspace::tiles_mut`, so a hidden window keeps drawing. Convenient — the picker preview has a

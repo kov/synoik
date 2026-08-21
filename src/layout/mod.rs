@@ -6400,7 +6400,7 @@ impl<W: LayoutElement> Layout<W> {
             let zoom = mon.overview_zoom();
             let (ws, geo) = mon
                 .workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(window))?;
+                .find(|(ws, _)| ws.holds_window(window))?;
             let rect = ws.expose_drawn_rect(window, progress, zoom)?;
             Some(Rectangle::new(
                 geo.loc + rect.loc.upscale(zoom),
@@ -6422,7 +6422,7 @@ impl<W: LayoutElement> Layout<W> {
             mon.expose_progress()?;
             let (ws, _) = mon
                 .workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(window))?;
+                .find(|(ws, _)| ws.holds_window(window))?;
             ws.expose_slot(window)
         })
     }
@@ -6432,7 +6432,7 @@ impl<W: LayoutElement> Layout<W> {
         self.monitors().find_map(|mon| {
             let (ws, _) = mon
                 .workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(window))?;
+                .find(|(ws, _)| ws.holds_window(window))?;
             Some(ws.expose_decided_over())
         })
     }
@@ -6472,7 +6472,7 @@ impl<W: LayoutElement> Layout<W> {
         self.monitors().find_map(|mon| {
             let (ws, _) = mon
                 .workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(window))?;
+                .find(|(ws, _)| ws.holds_window(window))?;
             ws.expose_settled_pos(window)
         })
     }
@@ -6483,7 +6483,7 @@ impl<W: LayoutElement> Layout<W> {
             let zoom = mon.overview_zoom();
             let (ws, geo) = mon
                 .workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(window))?;
+                .find(|(ws, _)| ws.holds_window(window))?;
             let slot = ws.expose_slot(window)?;
             Some(Rectangle::new(
                 geo.loc + slot.loc.upscale(zoom),

@@ -2429,7 +2429,7 @@ impl State {
             .synoik
             .layout
             .workspaces()
-            .find(|(_, _, ws)| ws.has_window(window))
+            .find(|(_, _, ws)| ws.holds_window(window))
             .and_then(|(mon, idx, _)| Some((mon?.output().clone(), idx)))?;
         let count = self
             .synoik

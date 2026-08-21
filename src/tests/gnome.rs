@@ -7742,6 +7742,131 @@ fn overview_spreads_windows_into_picker_slots() {
     );
 }
 
+/// A minimized window is still in the window picker. gnome-shell's `_isOverviewWindow` is
+/// `!win.skip_taskbar` with no minimized check (`workspace.js:1332`), so the picker is where a
+/// hidden window is reachable with the pointer alone — the only such place, since the strip
+/// hides them in GNOME and the dash needs you to know which app it was.
+#[test]
+fn a_minimized_window_keeps_its_picker_slot_and_a_click_brings_it_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second = f.synoik().layout.focus().unwrap().window.clone();
+    let second_id = f.synoik().layout.focus().unwrap().id();
+
+    assert!(f.synoik_state().minimize_window(&second), "it minimizes");
+    f.settle();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(f.synoik().layout.is_overview_open());
+
+    let hidden_slot = f
+        .synoik()
+        .layout
+        .expose_target_rect(&second)
+        .expect("a minimized window must still have a picker slot");
+    // A window that contributes no layout input keeps its place in the render order and gets a
+    // *vacant* slot scattered back to it — a zero rect, which every disjointness check below
+    // passes trivially. Reject that first or the rest of this test proves nothing.
+    assert!(
+        hidden_slot.size.w > 0. && hidden_slot.size.h > 0.,
+        "the slot must be a real one, not the vacancy left by a missing layout input: \
+         {hidden_slot:?}"
+    );
+    let shown_slot = f.synoik().layout.expose_target_rect(&first).unwrap();
+    let disjoint = hidden_slot.loc.x + hidden_slot.size.w <= shown_slot.loc.x
+        || shown_slot.loc.x + shown_slot.size.w <= hidden_slot.loc.x
+        || hidden_slot.loc.y + hidden_slot.size.h <= shown_slot.loc.y
+        || shown_slot.loc.y + shown_slot.size.h <= hidden_slot.loc.y;
+    assert!(
+        disjoint,
+        "a minimized window takes a slot of its own, not one shared with a shown window: \
+         {hidden_slot:?} {shown_slot:?}"
+    );
+
+    // Clicking it activates, and activation is what unminimizes (`window.c:3908`).
+    f.pointer_motion(
+        hidden_slot.loc.x + hidden_slot.size.w / 2.,
+        hidden_slot.loc.y + hidden_slot.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+
+    assert!(
+        !f.synoik().layout.is_minimized(&second),
+        "clicking a minimized preview must bring the window back"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        second_id,
+        "and focus it"
+    );
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    assert!(
+        f.synoik()
+            .layout
+            .active_workspace_windows_for_output(&output)
+            .iter()
+            .any(|(m, _)| m.window == second),
+        "it is laid out again, not just un-flagged"
+    );
+}
+
+/// Minimizing with the overview open must not shuffle the picker.
+///
+/// This is the property that made folding minimized windows into the picker cheaper than giving
+/// them a strip of their own: the layout input is the settled rect, and a parked tile reports the
+/// rect it *had* (`Workspace::minimized_with_expose_rects`), so the input list is unchanged across
+/// the minimize and the retained decision hits. A strip would instead resize the picker box and
+/// relayout everything. See `docs/fork/minimize-port.md`.
+#[test]
+fn minimizing_with_the_overview_open_leaves_the_other_previews_where_they_are() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let b = f.synoik().layout.focus().unwrap().window.clone();
+    let _c = map_window_sized(&mut f, id, (500, 400), None);
+    let c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(f.synoik().layout.is_overview_open());
+
+    let before_a = f.synoik().layout.expose_target_rect(&a).unwrap();
+    let before_b = f.synoik().layout.expose_target_rect(&b).unwrap();
+    let before_c = f.synoik().layout.expose_target_rect(&c).unwrap();
+
+    assert!(f.synoik_state().minimize_window(&c), "it minimizes");
+    f.settle();
+
+    assert_eq!(
+        f.synoik().layout.expose_target_rect(&a),
+        Some(before_a),
+        "minimizing another window must not move this preview"
+    );
+    assert_eq!(
+        f.synoik().layout.expose_target_rect(&b),
+        Some(before_b),
+        "minimizing another window must not move this preview"
+    );
+    assert_eq!(
+        f.synoik().layout.expose_target_rect(&c),
+        Some(before_c),
+        "and the minimized window keeps the slot it already had"
+    );
+}
+
 /// Every workspace's render rect on output 1 — the geometry the overview's row
 /// tests measure, settled.
 fn workspace_geo(f: &mut Fixture) -> Vec<smithay::utils::Rectangle<f64, smithay::utils::Logical>> {
