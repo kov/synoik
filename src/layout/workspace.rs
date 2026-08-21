@@ -1004,6 +1004,13 @@ impl<W: LayoutElement> Workspace<W> {
             is_floating,
         } = removed;
         tile.window_mut().set_minimized(false);
+        // Something has to happen, or a window that shrank away comes back by popping into
+        // existence. This is the window-open effect, not the mirror of the shrink: gnome-shell's
+        // `_unminimizeWindow` runs the *same* ease backwards, from the icon geometry
+        // (`windowManager.js:1222-1260`). Growing back out of `Parked::dest` needs a tile that is
+        // in the layout and drawn scaled, which the render path cannot do yet — see
+        // `docs/fork/minimize-port.md`.
+        tile.start_open_animation();
         self.add_tile(
             tile,
             WorkspaceAddWindowTarget::Auto,

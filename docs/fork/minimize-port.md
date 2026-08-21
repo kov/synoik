@@ -169,9 +169,14 @@ away is small. The strip **replaces** the picker slots when it lands — it is n
   the overview state (`_syncOpacity`, `workspace.js:448-451`), which is what lets its geometry
   start at zero size. The two go together: without the ramp, ours has to interpolate from a
   non-degenerate rect. Landing the fade is what would let the growth follow.
-- **Unminimize does not animate yet.** gnome-shell's `_unminimizeWindow` is the exact mirror —
-  same constant, same mode, run backwards from the icon geometry (`windowManager.js:1222-1260`) —
-  so a window that shrinks away but pops back reads as half a mechanism. Next.
+- **Unminimize animates, but not as the mirror.** gnome-shell's `_unminimizeWindow` runs the
+  *same* ease backwards, growing the window out of the icon geometry
+  (`windowManager.js:1222-1260`). Ours reuses the window-open effect instead, so something happens
+  rather than the window popping back into existence, but it does not come out of
+  [`Parked::dest`]. The true mirror needs a tile that is **in** the layout and drawn scaled, and
+  the normal render path has no way to do that — the shrink can only be drawn because a parked
+  tile is outside both halves. Closing this means giving `Tile` a from-rect the layout render
+  honors, which is also what the picker's missing fade would use.
 - **The shrink has no fade.** gnome-shell eases opacity alongside the scale and position; ours is
   the geometry only, so the window is still faintly visible at destination size when it stops
   being drawn. The smaller the destination, the less this shows.

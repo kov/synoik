@@ -7819,6 +7819,39 @@ fn a_minimized_window_keeps_its_picker_slot_and_a_click_brings_it_back() {
     );
 }
 
+/// Coming back is a motion too.
+///
+/// Not yet the mirror of the shrink — see `docs/fork/minimize-port.md` — but a window that shrank
+/// away must not pop back into existence. Pinned by the animation being *running* after the
+/// unminimize, because a still frame after it lands looks the same either way.
+#[test]
+fn unminimizing_animates_the_window_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _win = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.settle();
+    assert!(
+        !f.synoik().layout.are_animations_ongoing(None),
+        "the shrink must have landed before the unminimize is asked for"
+    );
+
+    assert!(
+        f.synoik()
+            .layout
+            .unminimize_window(&win, crate::layout::ActivateWindow::Yes),
+        "it comes back"
+    );
+    assert!(
+        f.synoik().layout.are_animations_ongoing(None),
+        "the window must animate back rather than appear"
+    );
+}
+
 /// The preview grows out of the place the window was seen to go.
 ///
 /// One rect does both motions: the window shrinks into `Parked::dest` on the desktop, and the
