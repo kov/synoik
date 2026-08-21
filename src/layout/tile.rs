@@ -135,6 +135,9 @@ pub struct Tile<W: LayoutElement> {
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
 
+    /// The animation of the tile growing out of somewhere it is not — see [`GrowAnimation`].
+    grow_animation: Option<GrowAnimation>,
+
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
 
@@ -249,6 +252,24 @@ pub(super) struct AlphaAnimation {
     offscreen_vk: OffscreenBuffer,
 }
 
+/// A tile drawn as if it were somewhere else, easing back to where it really is.
+///
+/// The mirror of the minimize shrink: an unminimized window grows out of the rect it was hidden
+/// in (its dock icon), the same rect it shrank into. The tile is in the layout for the whole
+/// animation — focusable, raisable, hit-testable from the first frame — and only its *drawing*
+/// comes from elsewhere, so nothing downstream has to know this is running.
+///
+/// Deliberately not applied inside [`Tile::render`]: the picker derives its own scale from the
+/// tile's natural size and applies it to natural-size elements, so a transform baked into the
+/// tile would compose with the picker's and draw the window at the product of the two. The space
+/// that positions the tile applies this one instead, and the picker simply does not.
+#[derive(Debug)]
+struct GrowAnimation {
+    /// Where the tile is drawn at progress 0, in the same coordinates the space positions it in.
+    from: Rectangle<f64, Logical>,
+    anim: Animation,
+}
+
 /// The `border` config a window actually gets.
 ///
 /// **GNOME draws no compositor-side window chrome.** A window is a window: focus
@@ -320,6 +341,7 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            grow_animation: None,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             view_size,
@@ -553,6 +575,12 @@ impl<W: LayoutElement> Tile<W> {
                 self.alpha_animation = None;
             }
         }
+
+        if let Some(grow) = &mut self.grow_animation {
+            if grow.anim.is_done() {
+                self.grow_animation = None;
+            }
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -568,6 +596,7 @@ impl<W: LayoutElement> Tile<W> {
                 .alpha_animation
                 .as_ref()
                 .is_some_and(|alpha| !alpha.anim.is_done())
+            || self.grow_animation.is_some()
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
@@ -691,6 +720,36 @@ impl<W: LayoutElement> Tile<W> {
             0.,
             self.options.animations.window_open.anim,
         )));
+    }
+
+    /// Draw the tile out of `from` for the next `config`'s worth of time — see [`GrowAnimation`].
+    pub fn animate_grow_from(
+        &mut self,
+        from: Rectangle<f64, Logical>,
+        config: synoik_config::Animation,
+    ) {
+        self.grow_animation = Some(GrowAnimation {
+            from,
+            anim: Animation::new(self.clock.clone(), 0., 1., 0., config),
+        });
+    }
+
+    /// Where and how big to draw a growing tile that the space would put at `pos`.
+    ///
+    /// `None` when the tile is simply where it is, which is every tile almost all of the time.
+    /// The target is read fresh each frame rather than captured at the start, so a tile that is
+    /// moved or relaid out while it grows still lands on its real place.
+    pub fn grow_transform(&self, pos: Point<f64, Logical>) -> Option<(Point<f64, Logical>, f64)> {
+        let grow = self.grow_animation.as_ref()?;
+        let natural = self.tile_size();
+        if natural.w <= 0. {
+            return None;
+        }
+
+        let t = grow.anim.clamped_value();
+        let lerp = |a: f64, b: f64| a + (b - a) * t;
+        let loc = Point::from((lerp(grow.from.loc.x, pos.x), lerp(grow.from.loc.y, pos.y)));
+        Some((loc, lerp(grow.from.size.w / natural.w, 1.)))
     }
 
     pub fn resize_animation(&self) -> Option<&Animation> {

@@ -139,10 +139,11 @@ A parked tile has no rect on screen to interpolate from, so on the open/close le
 destination's *position* at natural size, with the destination's own scale as its from-scale: it
 grows out of the place the window went. Without a destination it uses the rect it is laid out over. gnome-shell instead gives a window that is not
 `showing_on_its_workspace` the work-area origin at **zero size** (`workspace.js:709-720`) and fades
-it in over that; ours cannot, because this leg interpolates a *scale* (`slot.size.w / rect.size.w`,
+it in over that; ours does not, because this leg interpolates a *scale* (`slot.size.w / rect.size.w`,
 `expose_tile_render`), so a zero-width `from` divides by zero and the preview never draws at any
-progress. Reaching zero size means having the opacity ramp that hides the degenerate scale, which
-is the fade below.
+progress. A dock icon is a real rect and a real place, so the preview has somewhere honest to come
+from without needing a per-preview opacity ramp — which on this leg would cost an offscreen per
+preview per frame.
 
 **`has_window` is the wrong question for the picker.** It means *laid out here*, so the five
 `Layout::expose_*` dispatchers, the touch tap-to-activate grab, `window_workspace_position`,
@@ -173,6 +174,36 @@ What carries over when it is built: the preview chrome (`ui::window_preview::Pre
 takes a rect), the tile-into-slot scaling, and the synthesized-rect reading above. What is thrown
 away is small. The strip **replaces** the picker slots when it lands — it is not additive.
 
+## The two halves of the animation
+
+Minimize and unminimize are one mechanism, mirrored — gnome-shell's `MINIMIZE_WINDOW_ANIMATION_TIME`
+and `_MODE` (`windowManager.js:28-29`) are shared by `_minimizeWindow` and `_unminimizeWindow`. Both
+ease scale, position **and** opacity together, and so do we: `minimize_animation_config()` is the
+one clock all four animations run on, because an animation whose halves land at different times
+reads as two animations.
+
+Geometry and opacity ride different mechanisms, because the tile is in a different place on each
+leg:
+
+- **Out.** The parked tile is outside both layout halves, so `Workspace::render_minimizing` draws
+  it itself, wrapping the tile's elements in a rescale. Its opacity is the tile's own
+  `alpha_animation` — legal at a non-1 target only because the visible-tile invariant walks
+  `tiles_with_render_positions()`, which parked tiles are not in.
+- **Back.** The returning tile is **in** the layout from the first frame — focusable, raisable,
+  hit-testable — and only its drawing comes from elsewhere. That is `Tile::grow_animation`: the
+  space that positions the tile asks `grow_transform(pos)` and rescales, and the target is read
+  fresh each frame, so a tile relaid out mid-flight still lands on its real place. Opacity is
+  `alpha_animation` again, to 1, which the invariant allows.
+
+The transform is deliberately **not** applied inside `Tile::render`. The picker derives its own
+scale from the tile's natural size and applies it to natural-size elements, so a transform baked
+into the tile would compose with the picker's and draw the window at the product of the two — the
+forty-times-too-big class above, reinstated.
+
+**Parked tiles are advanced by `Workspace::advance_animations` explicitly.** They are in neither
+half, so nothing else walks them: without it the shrink's fade is never cleared and every picker
+preview draws at the alpha the shrink ended on, which is zero.
+
 ## Divergences, for now
 
 - **The workspace row shows minimized windows; GNOME's thumbnail strip hides them.** GNOME's strip
@@ -180,21 +211,14 @@ away is small. The strip **replaces** the picker slots when it lands — it is n
   Ours renders each row entry through the same `render_expose` the picker uses, off the same
   retained layout decision — so excluding them would mean deciding two different grids per
   workspace and the row disagreeing with the picker it miniaturizes.
-- **No fade, so no growth from a corner either.** GNOME ramps a minimized preview's opacity with
-  the overview state (`_syncOpacity`, `workspace.js:448-451`), which is what lets its geometry
-  start at zero size. The two go together: without the ramp, ours has to interpolate from a
-  non-degenerate rect. Landing the fade is what would let the growth follow.
-- **Unminimize animates, but not as the mirror.** gnome-shell's `_unminimizeWindow` runs the
-  *same* ease backwards, growing the window out of the icon geometry
-  (`windowManager.js:1222-1260`). Ours reuses the window-open effect instead, so something happens
-  rather than the window popping back into existence, but it does not come out of
-  [`Parked::dest`]. The true mirror needs a tile that is **in** the layout and drawn scaled, and
-  the normal render path has no way to do that — the shrink can only be drawn because a parked
-  tile is outside both halves. Closing this means giving `Tile` a from-rect the layout render
-  honors, which is also what the picker's missing fade would use.
-- **The shrink has no fade.** gnome-shell eases opacity alongside the scale and position; ours is
-  the geometry only, so the window is still faintly visible at destination size when it stops
-  being drawn. The smaller the destination, the less this shows.
+- **The picker preview does not fade with the overview state.** GNOME ramps a minimized preview's
+  opacity (`_syncOpacity`, `workspace.js:448-451`), which is what lets its geometry start at zero
+  size. Ours starts at the dock rect instead — a real place, and the one the desktop shrink just
+  used — so the ramp buys only the last few pixels of the growth, at the price of an offscreen per
+  preview per frame. Not worth it; the growth is what the eye follows.
+- **`Tile::grow_animation` is honored by the floating half only.** In GNOME mode every window is
+  floating, so the scrolling half has no returning tile to draw. Wiring it there is a copy of the
+  same six lines if that ever changes.
 - **Minimized windows still get frame callbacks.** `windows_for_output_mut` reaches them through
   `Workspace::tiles_mut`, so a hidden window keeps drawing. Convenient — the picker preview has a
   live texture — but it is work GNOME throttles.

@@ -8375,13 +8375,91 @@ fn vulkan_hovered_preview_draws_its_close_button() {
     );
 }
 
-/// Minimizing must be a *motion*: the window shrinks toward its destination over 400ms rather
-/// than vanishing on the spot.
+/// Unminimizing is the shrink run backwards: the window grows *out of the place it was hidden*,
+/// not out of its own final rect.
+///
+/// gnome-shell's `_unminimizeWindow` is the same ease from the same icon geometry
+/// (`windowManager.js:1222-1260`). The window-open effect this used to reuse also animates, and
+/// also makes `are_animations_ongoing` true, so the only thing that tells the two apart is
+/// *where* the window is mid-flight: the open effect grows in place, and the mirror comes up from
+/// the dock. Hence the centroid, not a count.
+#[test]
+fn vulkan_unminimizing_grows_the_window_out_of_the_dock() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    // (count, centroid y) over the pixels the window's green dominates. Faded green still counts:
+    // the return fades in alongside the growth.
+    let green = |pixels: &[u8], w: i32, h: i32| {
+        let (n, sum_y) = (0..w * h)
+            .filter(|i| {
+                let p = px(pixels, w, i % w, i / w);
+                p[1] as i32 > p[0] as i32 + 30 && p[1] as i32 > p[2] as i32 + 30
+            })
+            .fold((0usize, 0i64), |(n, sum), i| (n + 1, sum + (i / w) as i64));
+        (n, sum_y as f64 / n.max(1) as f64)
+    };
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let (settled, settled_y) = green(&pixels, w, h);
+    assert!(settled > 0, "the window must be on screen to start with");
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.settle();
+
+    assert!(
+        f.synoik()
+            .layout
+            .unminimize_window(&win, crate::layout::ActivateWindow::Yes),
+        "it comes back"
+    );
+    f.freeze_clock();
+    f.advance_clock(Duration::from_millis(40));
+    f.dispatch();
+    f.refresh();
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let (midway, midway_y) = green(&pixels, w, h);
+    assert!(
+        midway > 0,
+        "mid-animation the window must be drawn — a return that draws nothing is a return the \
+         render path does not know about"
+    );
+    assert!(
+        midway < settled,
+        "and still be growing: {midway} green pixels of the settled {settled}"
+    );
+    assert!(
+        midway_y > settled_y + 100.,
+        "and be coming up from the dock, not swelling in place: mid-flight centroid y \
+         {midway_y:.0} against the settled {settled_y:.0}"
+    );
+
+    f.settle();
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let (after, after_y) = green(&pixels, w, h);
+    assert!(
+        after.abs_diff(settled) * 20 < settled && (after_y - settled_y).abs() < 2.,
+        "and land exactly back where it was: {after} pixels at y {after_y:.0} against {settled} \
+         at y {settled_y:.0}"
+    );
+}
+
+/// Minimizing must be a *motion*: the window shrinks toward its destination and fades out over
+/// 400ms rather than vanishing on the spot.
 ///
 /// Sampled mid-flight, not at the endpoints. Both endpoints look identical whether or not the
 /// animation exists — full-size before, gone after — so an endpoint-only test passes over an
 /// animation that was never wired into `advance_animations` at all. The middle frame is the only
 /// place the mechanism is observable.
+///
+/// The window is counted as *green-dominant* rather than as pure green, because a window halfway
+/// through its fade is a blend of its own green and whatever is behind it. Its peak green is what
+/// pins the fade: full green mid-flight is a shrink with no opacity half.
 #[test]
 fn vulkan_minimizing_shrinks_the_window_instead_of_vanishing() {
     let Some(mut f) = green_window_fixture() else {
@@ -8391,27 +8469,30 @@ fn vulkan_minimizing_shrinks_the_window_instead_of_vanishing() {
     f.synoik().hotkey_overlay.hide();
     let win = f.synoik().layout.focus().unwrap().window.clone();
 
-    let count_green = |pixels: &[u8], w: i32, h: i32| {
+    // (count, peak green channel) over the pixels the window's green dominates.
+    let green = |pixels: &[u8], w: i32, h: i32| {
         (0..w * h)
-            .filter(|i| {
-                let p = px(pixels, w, i % w, i / w);
-                p[0] < 40 && p[1] > 200 && p[2] < 40
-            })
-            .count()
+            .map(|i| px(pixels, w, i % w, i / w))
+            .filter(|p| p[1] as i32 > p[0] as i32 + 30 && p[1] as i32 > p[2] as i32 + 30)
+            .fold((0usize, 0u8), |(n, peak), p| (n + 1, peak.max(p[1])))
     };
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
-    let before = count_green(&pixels, w, h);
+    let (before, before_peak) = green(&pixels, w, h);
     assert!(before > 0, "the window must be on screen to start with");
+    assert!(
+        before_peak > 200,
+        "the window is opaque green before the minimize, got peak {before_peak}"
+    );
 
     assert!(f.synoik_state().minimize_window(&win), "it minimizes");
     f.freeze_clock();
-    f.advance_clock(Duration::from_millis(150));
+    f.advance_clock(Duration::from_millis(40));
     f.dispatch();
     f.refresh();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
-    let midway = count_green(&pixels, w, h);
+    let (midway, midway_peak) = green(&pixels, w, h);
     assert!(
         midway > 0,
         "mid-animation the window must still be drawn — a minimize that is not wired into the \
@@ -8421,11 +8502,16 @@ fn vulkan_minimizing_shrinks_the_window_instead_of_vanishing() {
         midway < before,
         "and it must be shrinking: {midway} green pixels of {before}"
     );
+    assert!(
+        midway_peak < before_peak - 20,
+        "and fading: peak green {midway_peak} is as bright as the opaque {before_peak}, so the \
+         shrink is running without its opacity half"
+    );
 
     f.settle();
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     assert_eq!(
-        count_green(&pixels, w, h),
+        green(&pixels, w, h).0,
         0,
         "once the shrink lands the window is off the desktop"
     );

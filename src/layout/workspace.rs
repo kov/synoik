@@ -223,10 +223,24 @@ impl WorkspaceId {
 /// mechanism there — the same constant, the same mode, mirrored — so they are here too.
 const MINIMIZE_ANIMATION_MS: u64 = 400;
 
+/// [`MINIMIZE_ANIMATION_MS`] as the config animation the tile-level helpers take, so the fade and
+/// the grow land on the same clock as the geometry they accompany. An animation whose halves end
+/// at different times reads as two animations.
+fn minimize_animation_config() -> synoik_config::Animation {
+    synoik_config::Animation {
+        off: false,
+        kind: synoik_config::animations::Kind::Easing(synoik_config::animations::EasingParams {
+            duration_ms: MINIMIZE_ANIMATION_MS as u32,
+            curve: synoik_config::animations::Curve::EaseOutExpo,
+        }),
+    }
+}
+
 /// The smallest a destination rect may be. The picker interpolates a *scale* out of it
 /// (`slot.size.w / rect.size.w`), so a zero-sized destination divides by zero and the preview
-/// never draws — the defect fixed in `b8078c6f`. gnome-shell can end its own minimize at scale 0
-/// because it ramps opacity alongside; we have no fade yet, so the destination stays real.
+/// never draws — the defect fixed in `b8078c6f`. gnome-shell ends its own minimize at scale 0
+/// because the window is invisible by then; ours fades too, but the destination stays a real rect
+/// so that every scale derived from it is finite regardless of where the fade has got to.
 const MIN_DEST_SIZE: f64 = 8.;
 
 /// A window parked by a minimize, and where it was seen to go.
@@ -784,10 +798,15 @@ impl<W: LayoutElement> Workspace<W> {
 
         // A landed shrink stops being drawn. The window stays parked either way: the animation
         // is how it leaves the screen, never whether it is minimized.
+        //
+        // Parked tiles are advanced here because they are in neither half: nothing else walks
+        // them. Without this the shrink's fade would never be cleared, and the picker would draw
+        // every minimized preview at the alpha the shrink ended on — zero.
         for parked in &mut self.minimized {
             if parked.shrink.as_ref().is_some_and(|s| s.anim.is_done()) {
                 parked.shrink = None;
             }
+            parked.removed.tile.advance_animations();
         }
 
         // The pointer has held still long enough — gnome-shell's tick at
@@ -829,7 +848,9 @@ impl<W: LayoutElement> Workspace<W> {
                 .expose_slides
                 .iter()
                 .any(|(_, slide)| !slide.anim.is_done())
-            || self.minimized.iter().any(|parked| parked.shrink.is_some())
+            || self.minimized.iter().any(|parked| {
+                parked.shrink.is_some() || parked.removed.tile.are_animations_ongoing()
+            })
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -997,6 +1018,14 @@ impl<W: LayoutElement> Workspace<W> {
                 Curve::EaseOutExpo,
             ),
         });
+        if shrink.is_some() {
+            // The other half of gnome-shell's `_minimizeWindow`, which eases scale, position and
+            // opacity together (`windowManager.js:1198-1208`). A parked tile is outside both
+            // layout halves, so a non-1 alpha target here cannot trip the visible-tile invariant.
+            removed
+                .tile
+                .animate_alpha(1., 0., minimize_animation_config());
+        }
         self.minimized.push(Parked {
             removed,
             dest,
@@ -1015,7 +1044,7 @@ impl<W: LayoutElement> Workspace<W> {
         else {
             return false;
         };
-        let Parked { removed, .. } = self.minimized.remove(idx);
+        let Parked { removed, dest, .. } = self.minimized.remove(idx);
         let RemovedTile {
             mut tile,
             width,
@@ -1023,13 +1052,12 @@ impl<W: LayoutElement> Workspace<W> {
             is_floating,
         } = removed;
         tile.window_mut().set_minimized(false);
-        // Something has to happen, or a window that shrank away comes back by popping into
-        // existence. This is the window-open effect, not the mirror of the shrink: gnome-shell's
-        // `_unminimizeWindow` runs the *same* ease backwards, from the icon geometry
-        // (`windowManager.js:1222-1260`). Growing back out of `Parked::dest` needs a tile that is
-        // in the layout and drawn scaled, which the render path cannot do yet — see
-        // `docs/fork/minimize-port.md`.
-        tile.start_open_animation();
+        // The shrink run backwards, which is what gnome-shell's `_unminimizeWindow` is: the same
+        // ease, from the same icon geometry (`windowManager.js:1222-1260`). Growth and fade are
+        // started before the add because neither needs to know where the tile lands — the grow
+        // reads its target position fresh from the render each frame.
+        tile.animate_grow_from(dest, minimize_animation_config());
+        tile.animate_alpha(0., 1., minimize_animation_config());
         self.add_tile(
             tile,
             WorkspaceAddWindowTarget::Auto,
@@ -2598,9 +2626,8 @@ impl<W: LayoutElement> Workspace<W> {
     /// Windows on their way out: each minimizing tile drawn shrinking into its destination.
     ///
     /// gnome-shell eases the actor's scale, position *and* opacity together
-    /// (`_minimizeWindow`, `windowManager.js:1198-1208`). This is the geometry half; the tile
-    /// ends small at the destination and stops being drawn there. See `docs/fork/minimize-port.md`
-    /// for the fade this port still owes.
+    /// (`_minimizeWindow`, `windowManager.js:1198-1208`). This is the geometry half; the opacity
+    /// half rides the tile's own alpha animation, started alongside in [`Self::minimize`].
     pub fn render_minimizing(
         &self,
         mut ctx: RenderCtx,

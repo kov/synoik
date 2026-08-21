@@ -10,6 +10,7 @@ use std::cmp::max;
 use std::iter::zip;
 use std::rc::Rc;
 
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use synoik_config::utils::MergeWith as _;
 use synoik_config::{PresetSize, RelativeTo, WindowingMode};
@@ -93,6 +94,7 @@ synoik_render_elements! {
     FloatingSpaceRenderElement => {
         Tile = TileRenderElement,
         ClosingWindow = ClosingWindowRenderElement,
+        Grow = RescaleRenderElement<TileRenderElement>,
     }
 }
 
@@ -1566,6 +1568,25 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // their own order, and are then skipped in their places below.
         let mut draw = |tile: &Tile<W>, tile_pos, ctx: &mut RenderCtx| {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
+
+            // A tile growing out of somewhere else draws scaled, at the rect it has reached — see
+            // `Tile::grow_transform`. Only the drawing moves: the tile is in the layout at
+            // `tile_pos` throughout, so focus, hit-testing and stacking never see this.
+            if let Some((loc, tile_scale)) = tile.grow_transform(tile_pos) {
+                let xray_pos = xray_pos.offset(loc);
+                tile.render(ctx.r(), loc, xray_pos, focus_ring, &mut |elem| {
+                    push(
+                        RescaleRenderElement::from_element(
+                            elem,
+                            loc.to_physical_precise_round(self.scale),
+                            tile_scale,
+                        )
+                        .into(),
+                    )
+                });
+                return;
+            }
+
             let xray_pos = xray_pos.offset(tile_pos);
             tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
                 push(elem.into())
