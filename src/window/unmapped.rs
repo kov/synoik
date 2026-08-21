@@ -61,6 +61,14 @@ pub struct RestoreOnMap {
     /// un-maximizing would land on a default size instead of the one it was saved with.
     pub unmaximize_to: Option<crate::session_state::Rect>,
 
+    /// Whether the saved window was minimized.
+    ///
+    /// Carried to the map rather than seeded into a rule, because minimizing is a *layout*
+    /// operation: it takes the tile out of the layout, so there has to be a tile first. mutter
+    /// applies it in the same place and order — after the sizing state, once the window exists
+    /// (`meta-wayland-xdg-session-state.c:468-476`).
+    pub minimized: bool,
+
     /// The rule fields the restore seeded, kept so they can be put back.
     ///
     /// Restore writes itself into the window rules to keep placement, sizing and state on one

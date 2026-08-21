@@ -31,6 +31,8 @@ pub struct SwitcherWindow {
     pub on_active_workspace: bool,
     /// mutter's `wm_state_demands_attention`, our `Mapped::is_urgent`.
     pub demands_attention: bool,
+    /// Whether the window is minimized. Sorts it after every unminimized one, below.
+    pub minimized: bool,
     /// The parent this window collapses into, if it is an **attached modal dialog**.
     ///
     /// **Stock GNOME leaves this `None` for every window**, and that is the whole point of the
@@ -61,11 +63,12 @@ pub struct SwitcherWindow {
 /// (`display.c:1924-1934`). A window shouting for you is worth reaching in one Tab even though it
 /// is somewhere else.
 ///
-/// Two of mutter's rules are deliberately absent because our model has nowhere to put them:
-/// - `META_TAB_LIST_NORMAL_ALL` is *not* pure MRU — it sorts unminimized windows ahead of minimized
-///   ones (`display.c:1899-1921`; only `NORMAL_ALL_MRU` is pure). We have no minimized state, so
-///   the split is currently vacuous. It stops being vacuous the day we add one, and this is where
-///   it goes.
+/// `META_TAB_LIST_NORMAL_ALL` is *not* pure MRU — it sorts unminimized windows ahead of minimized
+/// ones (`display.c:1899-1921`; only `NORMAL_ALL_MRU` is pure), on the reasoning that a window you
+/// hid is a less intrusive thing to land on than one you can see. Minimized windows are still in
+/// the list: Tab reaches them, and activating one unminimizes it (`altTab.js:519-522`).
+///
+/// One of mutter's rules is deliberately absent because our model has nowhere to put it:
 /// - `in_tab_chain` for `NORMAL_ALL` excludes `DOCK` and `DESKTOP` window types
 ///   (`display.c:1730-1738`). Those are X11 types; on Wayland a dock is a layer-shell surface,
 ///   which is not a toplevel and so never reaches this list.
@@ -77,9 +80,11 @@ pub struct SwitcherWindow {
 pub fn tab_list(windows: &[SwitcherWindow], current_workspace_only: bool) -> Vec<MappedId> {
     let mut candidates: Vec<&SwitcherWindow> = windows.iter().collect();
 
-    // MRU: most recently focused first, never-focused windows last. Stable, so windows that
-    // share a timestamp (or have none) keep the caller's order.
-    candidates.sort_by_key(|w| std::cmp::Reverse(w.focus_timestamp));
+    // MRU: most recently focused first, never-focused windows last, with every unminimized
+    // window ahead of every minimized one — mutter builds the two lists separately and
+    // concatenates them (`display.c:1899-1921`). Stable, so windows that share a timestamp (or
+    // have none) keep the caller's order.
+    candidates.sort_by_key(|w| (w.minimized, std::cmp::Reverse(w.focus_timestamp)));
 
     if current_workspace_only {
         let (here, elsewhere): (Vec<_>, Vec<_>) =
@@ -111,8 +116,28 @@ mod tests {
             focus_timestamp: focused_at.map(Duration::from_millis),
             on_active_workspace: true,
             demands_attention: false,
+            minimized: false,
             attached_to: None,
         }
+    }
+
+    /// A minimized window sorts after every unminimized one, however recently it was focused —
+    /// mutter builds the two lists separately and concatenates them (`display.c:1899-1921`),
+    /// because a window you hid is a less intrusive thing for Tab to land on than one you can
+    /// see. It is still in the list; activating it unminimizes it (`altTab.js:519-522`).
+    #[test]
+    fn minimized_windows_sort_last_but_stay_in_the_list() {
+        let a = MappedId::next();
+        let b = MappedId::next();
+        let mut hidden = win(a, Some(300));
+        hidden.minimized = true;
+        let visible = win(b, Some(100));
+
+        assert_eq!(
+            tab_list(&[hidden, visible], false),
+            vec![b, a],
+            "the older visible window comes first, and the minimized one is still reachable"
+        );
     }
 
     /// The order is focus recency, and it is what makes item 1 "the window before this one".

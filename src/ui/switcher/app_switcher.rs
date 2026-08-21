@@ -172,6 +172,7 @@ mod tests {
                     id,
                     app_id: None,
                     title: None,
+                    minimized: false,
                     urgent: false,
                     last_focus: None,
                 })

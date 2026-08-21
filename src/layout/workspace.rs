@@ -2389,10 +2389,21 @@ impl<W: LayoutElement> Workspace<W> {
         floating.chain(scrolling)
     }
 
+    /// Every tile with what IPC reports about its geometry — **including the minimized ones**,
+    /// which is what `Layout::with_windows` sweeps and therefore what IPC, the introspect API,
+    /// the app system and the foreign-toplevel refresh all see. A hidden window is still a window
+    /// those consumers must be able to name; it is only its *geometry* that is gone.
+    ///
+    /// A minimized tile gets the position-less template, the same one an interactively-moved
+    /// window gets: it has no place on screen to report.
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
         let scrolling = self.scrolling.tiles_with_ipc_layouts();
         let floating = self.floating.tiles_with_ipc_layouts();
-        floating.chain(scrolling)
+        let minimized = self
+            .minimized
+            .iter()
+            .map(|removed| (&removed.tile, removed.tile.ipc_layout_template()));
+        floating.chain(scrolling).chain(minimized)
     }
 
     pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
@@ -3301,7 +3312,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
         // Activating unminimizes on the way in — `meta_window_activate_full`'s
-        // `meta_window_unminimize` (`window.c:3830-3836`). Hooked here rather than in `Layout` so
+        // `meta_window_unminimize` (`window.c:3908`). Hooked here rather than in `Layout` so
         // every path that raises a window (the dash, the switcher, an activation token, a click
         // in the overview) brings a minimized one back instead of silently doing nothing.
         self.unminimize(window, ActivateWindow::Yes);

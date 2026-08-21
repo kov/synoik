@@ -57,7 +57,7 @@ struct ToplevelData {
     identifier: MappedId,
     title: Option<String>,
     app_id: Option<String>,
-    states: ArrayVec<u32, 3>,
+    states: ArrayVec<u32, 4>,
     output: Option<Output>,
 
     ext_list_instances: HashSet<ExtForeignToplevelHandleV1>,
@@ -131,6 +131,7 @@ pub fn refresh(state: &mut State) {
     // the previous window and only then activate the newly focused window.
     let mut focused = None;
     state.synoik.layout.with_windows(|mapped, output, _, _| {
+        let minimized = crate::layout::LayoutElement::is_minimized(mapped);
         let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
         with_toplevel_role_and_current(toplevel, |role, cur| {
@@ -140,7 +141,12 @@ pub fn refresh(state: &mut State) {
             };
 
             if state.synoik.keyboard_focus.surface() == Some(wl_surface) {
-                focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
+                focused = Some((
+                    mapped.id(),
+                    mapped.window.clone(),
+                    output.cloned(),
+                    minimized,
+                ));
             } else {
                 refresh_toplevel(
                     protocol_state,
@@ -149,14 +155,17 @@ pub fn refresh(state: &mut State) {
                     role,
                     cur,
                     output,
-                    false,
+                    ShellState {
+                        has_focus: false,
+                        minimized,
+                    },
                 );
             }
         });
     });
 
     // Finally, refresh the focused window.
-    if let Some((identifier, window, output)) = focused {
+    if let Some((identifier, window, output, minimized)) = focused {
         let toplevel = window.toplevel().expect("no X11 support");
         let wl_surface = toplevel.wl_surface();
         with_toplevel_role_and_current(toplevel, |role, cur| {
@@ -172,7 +181,10 @@ pub fn refresh(state: &mut State) {
                 role,
                 cur,
                 output.as_ref(),
-                true,
+                ShellState {
+                    has_focus: true,
+                    minimized,
+                },
             );
         });
     }
@@ -203,6 +215,14 @@ pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput)
     }
 }
 
+/// The two things this protocol reports that the xdg state cannot: neither focus nor minimized is
+/// an `xdg_toplevel` state, so both travel alongside it as the compositor's own idea of the window.
+#[derive(Debug, Clone, Copy)]
+struct ShellState {
+    has_focus: bool,
+    minimized: bool,
+}
+
 fn refresh_toplevel(
     protocol_state: &mut ForeignToplevelManagerState,
     wl_surface: &WlSurface,
@@ -210,9 +230,9 @@ fn refresh_toplevel(
     role: &XdgToplevelSurfaceRoleAttributes,
     current: &ToplevelState,
     output: Option<&Output>,
-    has_focus: bool,
+    shell: ShellState,
 ) {
-    let states = to_state_vec(&current.states, has_focus);
+    let states = to_state_vec(&current.states, shell);
 
     match protocol_state.toplevels.entry(wl_surface.clone()) {
         Entry::Occupied(entry) => {
@@ -634,8 +654,13 @@ where
     }
 }
 
-fn to_state_vec(states: &ToplevelStateSet, has_focus: bool) -> ArrayVec<u32, 3> {
+/// [`ShellState`] is separate from `states` because neither of its flags is an `xdg_toplevel`
+/// state.
+fn to_state_vec(states: &ToplevelStateSet, shell: ShellState) -> ArrayVec<u32, 4> {
     let mut rv = ArrayVec::new();
+    if shell.minimized {
+        rv.push(zwlr_foreign_toplevel_handle_v1::State::Minimized as u32);
+    }
     if states.contains(xdg_toplevel::State::Maximized) {
         rv.push(zwlr_foreign_toplevel_handle_v1::State::Maximized as u32);
     }
@@ -651,7 +676,7 @@ fn to_state_vec(states: &ToplevelStateSet, has_focus: bool) -> ArrayVec<u32, 3> 
     // focus, i.e. they don't expect multiple windows to have it set at once. Even Waybar which
     // handles multiple activated windows correctly uses it in its design in such a way that
     // keyboard focus would make more sense. Let's do what the clients expect.
-    if has_focus {
+    if shell.has_focus {
         rv.push(zwlr_foreign_toplevel_handle_v1::State::Activated as u32);
     }
 

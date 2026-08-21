@@ -1222,6 +1222,7 @@ impl State {
                 .restorable_state()
                 .filter(|state| *state != WindowState::Floating)
                 .and(restore.record.floating_rect),
+            minimized: restore.record.is_minimized,
             rule_seeds,
         });
 

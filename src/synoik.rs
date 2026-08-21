@@ -4918,6 +4918,10 @@ impl State {
             state: Some(state.as_raw()),
             floating_rect,
             workspace: Some(snapshot.workspace_idx as u32),
+            // mutter saves this alongside the sizing state and re-applies it *after* on restore
+            // (`meta-wayland-xdg-session-state.c:337`, `:475`), which is also the order the
+            // restore path here takes.
+            is_minimized: self.synoik.layout.is_minimized(window),
             ..Default::default()
         })
     }
@@ -5242,7 +5246,9 @@ impl State {
     }
 
     /// `GetWindows` (`introspect.js:135-182`).
-    fn introspect_windows(&mut self) -> HashMap<u64, gnome_shell_introspect::WindowProperties> {
+    pub(crate) fn introspect_windows(
+        &mut self,
+    ) -> HashMap<u64, gnome_shell_introspect::WindowProperties> {
         use crate::utils::with_toplevel_role;
 
         let _span = tracy_client::span!("GetWindows");
@@ -5274,8 +5280,8 @@ impl State {
 
         let focused = self.synoik.layout.focus().map(|m| m.id());
         // `MetaWindow::hidden` is set by `meta_window_hide` (`window.c:2669-2674`) — a window that
-        // should not be showing right now. We have no minimize, so the only such window is one on
-        // a workspace that is not its output's active one.
+        // should not be showing right now. Two ways to be that: minimized, or on a workspace
+        // that is not its output's active one.
         let visible: std::collections::HashSet<_> = self
             .synoik
             .layout
@@ -5307,7 +5313,8 @@ impl State {
                         // portal's window list had no icons.
                         app_id: desktop_ids.get(&id).cloned().unwrap_or_default(),
                         client_type: gnome_shell_introspect::CLIENT_TYPE_WAYLAND,
-                        is_hidden: workspace.is_some_and(|ws| !visible.contains(&ws)),
+                        is_hidden: crate::layout::LayoutElement::is_minimized(mapped)
+                            || workspace.is_some_and(|ws| !visible.contains(&ws)),
                         has_focus: Some(id) == focused,
                         width: w.max(0) as u32,
                         height: h.max(0) as u32,
@@ -14881,6 +14888,7 @@ impl Synoik {
                 app_id,
                 pid: mapped.credentials().map(|c| c.pid),
                 title,
+                minimized: crate::layout::LayoutElement::is_minimized(mapped),
                 urgent: mapped.is_urgent(),
                 last_focus: mapped.get_focus_timestamp(),
             });
@@ -16083,6 +16091,7 @@ impl Synoik {
                     focus_timestamp: mapped.get_focus_timestamp(),
                     on_active_workspace,
                     demands_attention: mapped.is_urgent(),
+                    minimized: crate::layout::LayoutElement::is_minimized(mapped),
                     // Attached modal dialogs need mutter's `attach-modal-dialogs`, which is off by
                     // default and which we do not model — see `SwitcherWindow::attached_to`.
                     attached_to: None,

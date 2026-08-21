@@ -109,7 +109,9 @@ pub struct ToplevelRecord {
     )]
     pub tiled_rect: Option<Rect>,
 
-    /// Likewise: no minimize yet, but the slot is part of the format.
+    /// Whether the window was minimized. Applied *after* the sizing state on restore, which is
+    /// the order mutter takes (`meta-wayland-xdg-session-state.c:468-476`) — a window is restored
+    /// to the size it would have had, then hidden.
     #[serde(rename = "is-minimized", default, skip_serializing_if = "is_false")]
     pub is_minimized: bool,
 

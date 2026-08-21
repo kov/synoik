@@ -7247,7 +7247,7 @@ fn minimizing_hides_a_window_and_moves_the_focus() {
 }
 
 /// Activating a minimized window brings it back — `meta_window_activate_full` unminimizes on the
-/// way in (`window.c:3830-3836`), which is what makes every raise path (the dash, the switcher, an
+/// way in (`window.c:3908`), which is what makes every raise path (the dash, the switcher, an
 /// activation token) work on a hidden window instead of silently doing nothing.
 #[test]
 fn activating_a_minimized_window_brings_it_back() {
@@ -7385,6 +7385,41 @@ fn the_window_menu_hides_its_window() {
     f.settle();
 
     assert!(f.synoik().layout.is_minimized(&window));
+}
+
+/// The state surfaces a hidden window has to show up on: IPC says minimized, the introspect API
+/// says hidden (`MetaWindow::hidden`, which `window.c:2669-2674` sets for a window that should not
+/// be showing), and the app system sorts an app whose every window is hidden after one you can
+/// still see (`shell_app_is_minimized`, `shell-app.c:812-827`).
+#[test]
+fn minimizing_shows_up_on_the_state_surfaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let mapped_id = f.synoik().layout.focus().unwrap().id();
+
+    let hidden =
+        |f: &mut Fixture| f.synoik_state().introspect_windows()[&mapped_id.get()].is_hidden;
+    assert!(
+        !hidden(&mut f),
+        "precondition: a laid-out window is not hidden"
+    );
+
+    f.synoik_state().minimize_window(&window);
+    f.settle();
+
+    assert!(hidden(&mut f), "the introspect API reports it hidden");
+
+    // And the app system sees it, which is what re-orders the dash and the app switcher.
+    f.synoik().sync_running_apps();
+    let running = f.synoik().app_system.running();
+    assert!(
+        running.iter().all(|app| app.is_minimized()),
+        "the only app's only window is hidden, so the app counts as minimized"
+    );
 }
 
 /// Take Screenshot leads the menu and photographs the window it belongs to
@@ -27058,6 +27093,61 @@ fn shutting_down_saves_windows_that_are_still_mapped() {
         .expect("a still-mapped window must be swept into the store at shutdown");
     assert_eq!(record.restorable_state(), Some(WindowState::Floating));
     assert_eq!(record.workspace, Some(0));
+}
+
+/// A minimized window is saved minimized and comes back minimized — mutter writes `is-minimized`
+/// alongside the sizing state and re-applies it *after* on restore
+/// (`meta-wayland-xdg-session-state.c:337`, `:468-476`). Our record has carried the slot since the
+/// format landed, with nothing to put in it.
+#[test]
+fn a_minimized_window_is_saved_and_restored_minimized() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let _surface = map_session_window(&mut f, id, &session, "main");
+
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().minimize_window(&window);
+    f.settle();
+
+    f.synoik_state().save_session_toplevels_still_mapped();
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels
+        .get("main")
+        .cloned()
+        .expect("the still-mapped window is swept into the store");
+    assert!(record.is_minimized, "saved minimized");
+
+    // Bring it back in a fresh session.
+    let second = f.add_client();
+    f.roundtrip(second);
+    let restored_session = f
+        .client(second)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &restored_session, "main");
+    map_at_configured_size(&mut f, second, &surface);
+    f.settle();
+
+    let restored = f
+        .synoik()
+        .layout
+        .windows()
+        .map(|(_, m)| m.window.clone())
+        .find(|w| w != &window)
+        .expect("the restored window");
+    assert!(
+        f.synoik().layout.is_minimized(&restored),
+        "and comes back hidden"
+    );
 }
 
 /// Renaming carries the saved state to the new name, rather than orphaning it under the old one.

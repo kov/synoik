@@ -572,6 +572,9 @@ fn make_ipc_window(
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
         is_urgent: mapped.is_urgent(),
+        // Not from `states`: minimized has no xdg_toplevel state to be acked, so unlike its
+        // neighbours here it is read straight off the window. See `Window::is_minimized`.
+        is_minimized: crate::layout::LayoutElement::is_minimized(mapped),
         is_maximized: states.is_maximized,
         is_fullscreen: states.is_fullscreen,
         is_activated: states.is_activated,
@@ -814,6 +817,7 @@ impl State {
             let states = ipc_window_states(mapped);
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.is_minimized != crate::layout::LayoutElement::is_minimized(mapped)
                 || ipc_win.is_maximized != states.is_maximized
                 || ipc_win.is_fullscreen != states.is_fullscreen
                 || ipc_win.is_activated != states.is_activated

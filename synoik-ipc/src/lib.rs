@@ -1686,6 +1686,13 @@ pub struct Window {
     pub is_floating: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether the window is minimized — hidden, and out of the layout.
+    ///
+    /// Unlike the three below this is **not** an `xdg_toplevel` state, because there is no such
+    /// state: minimized is entirely the compositor's own idea of the window. So it is our
+    /// *intent* rather than what the client was last told, and there is nothing a client can ack
+    /// that would move it.
+    pub is_minimized: bool,
     /// Whether the window is maximized (`xdg_toplevel` `maximized`).
     pub is_maximized: bool,
     /// Whether the window is fullscreen (`xdg_toplevel` `fullscreen`).

@@ -116,6 +116,7 @@ impl CompositorHandler for State {
                         was_restored,
                         restore_reason,
                         unmaximize_to,
+                        restore_minimized,
                     ) = if let InitialConfigureState::Configured {
                         rules,
                         width,
@@ -152,6 +153,8 @@ impl CompositorHandler for State {
 
                         let was_restored = restore.is_some();
                         let restore_reason = restore.as_ref().map(|restore| restore.reason);
+                        let restore_minimized =
+                            restore.as_ref().is_some_and(|restore| restore.minimized);
                         let unmaximize_to = restore.and_then(|restore| restore.unmaximize_to);
 
                         (
@@ -165,6 +168,7 @@ impl CompositorHandler for State {
                             was_restored,
                             restore_reason,
                             unmaximize_to,
+                            restore_minimized,
                         )
                     } else {
                         // Can happen when a surface unmaps by attaching a null buffer while
@@ -181,6 +185,7 @@ impl CompositorHandler for State {
                             false,
                             None,
                             None,
+                            false,
                         )
                     };
 
@@ -456,6 +461,15 @@ impl CompositorHandler for State {
                         }
                     } else {
                         error!("layout is missing the window that we just added");
+                    }
+
+                    // A restored window that was saved minimized is hidden here, *after* the
+                    // sizing state has been applied to it — mutter's order
+                    // (`meta-wayland-xdg-session-state.c:468-476`). It has to be after the add
+                    // either way: minimizing takes a tile out of the layout, so there has to be a
+                    // tile.
+                    if restore_minimized {
+                        self.synoik.layout.minimize_window(&window);
                     }
 
                     if denied_focus_steal || wants_attention {

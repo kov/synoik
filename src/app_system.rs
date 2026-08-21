@@ -177,6 +177,10 @@ pub struct RunningWindow {
     /// The toplevel title — an "Open Windows" row's label, falling back to the app
     /// name when empty (`_updateWindowsSection`, `appMenu.js:283`).
     pub title: Option<String>,
+    /// Whether this window is minimized — `!meta_window_showing_on_its_workspace`, which is
+    /// what both of `shell_app_compare`'s and `shell_app_compare_windows`' visibility clauses
+    /// read.
+    pub minimized: bool,
     /// Whether this window is demanding attention (`Mapped::is_urgent`).
     ///
     /// Carried per window rather than per app because it clears on focus, one window at a time.
@@ -205,6 +209,12 @@ pub struct RunningApp {
 }
 
 impl RunningApp {
+    /// Whether every one of this app's windows is minimized — `shell_app_is_minimized`
+    /// (`shell-app.c:812-827`), which is false the moment *one* window is showing.
+    pub fn is_minimized(&self) -> bool {
+        self.windows.iter().all(|window| window.minimized)
+    }
+
     /// Whether any of the app's windows is demanding attention.
     pub fn is_urgent(&self) -> bool {
         self.windows.iter().any(|window| window.urgent)
@@ -666,11 +676,16 @@ impl AppSystem {
 
     /// Resolve, group and order the window snapshot into [`running`](Self::running).
     ///
-    /// Ordering is `shell_app_compare` (`shell-app.c:839`) reduced to the running
-    /// set: every app here is running and has windows, and we have no minimized
-    /// state to speak of, so the two leading clauses are vacuous and the rule is
-    /// "most recently used first". Ties break by id — GNOME's tie order is its
-    /// hash-table iteration order, i.e. arbitrary; ours is merely deterministic.
+    /// Ordering is `shell_app_compare` (`shell-app.c:841-870`) reduced to the running set: every
+    /// app here is running and has windows, so its first clause (running before not-running) is
+    /// vacuous. The second is not — an app **all** of whose windows are minimized sorts after one
+    /// with a window you can see (`shell_app_is_minimized`, `shell-app.c:812-827`) — and then the
+    /// rule is "most recently used first". Ties break by id: GNOME's tie order is its hash-table
+    /// iteration order, i.e. arbitrary; ours is merely deterministic.
+    ///
+    /// Windows within an app take `shell_app_compare_windows` (`shell-app.c:695-725`), which is
+    /// the same visibility clause over MRU. Its *first* clause — windows on the active workspace
+    /// before the rest — has no counterpart here: this list has no workspace in it.
     fn recompute_running(&mut self) {
         // Resolved up front, in one pass, because reading a sandbox id needs `&mut self` for the
         // cache while the loop below borrows `self.windows`. Cheap after the first refresh: every
@@ -712,19 +727,20 @@ impl AppSystem {
             }
         }
 
-        // Most recent first; never-focused (`None`) last, as GNOME's `0` sorts.
-        // Windows within an app take the same order — `shell_app_get_windows()`
-        // hands them out sorted by `shell_app_compare_windows`.
+        // Visible before hidden, then most recent first; never-focused (`None`) last, as
+        // GNOME's `0` sorts.
         for app in &mut apps {
             app.windows.sort_by(|a, b| {
-                b.last_focus
-                    .cmp(&a.last_focus)
+                a.minimized
+                    .cmp(&b.minimized)
+                    .then_with(|| b.last_focus.cmp(&a.last_focus))
                     .then_with(|| a.id.get().cmp(&b.id.get()))
             });
         }
         apps.sort_by(|a, b| {
-            b.last_focus
-                .cmp(&a.last_focus)
+            a.is_minimized()
+                .cmp(&b.is_minimized())
+                .then_with(|| b.last_focus.cmp(&a.last_focus))
                 .then_with(|| a.id.cmp(&b.id))
         });
 
@@ -2329,6 +2345,7 @@ Actions=newwin;\n\n\
             id,
             app_id: Some(app_id.to_owned()),
             title: None,
+            minimized: false,
             urgent: false,
             last_focus: secs.map(Duration::from_secs),
         }
@@ -2594,6 +2611,7 @@ Actions=newwin;\n\n\
                 id: untitled,
                 app_id: None,
                 title: None,
+                minimized: false,
                 urgent: false,
                 last_focus: Some(Duration::from_secs(3)),
             },
@@ -2632,6 +2650,7 @@ Actions=newwin;\n\n\
             id,
             app_id: Some("nonesuch".to_owned()),
             title: Some("Some Document".to_owned()),
+            minimized: false,
             urgent: false,
             last_focus: None,
         };

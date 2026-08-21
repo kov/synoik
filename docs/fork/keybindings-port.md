@@ -169,7 +169,7 @@ Three unit tests keep it honest, each covering a failure that is otherwise silen
 - `synoik_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
   *default* in the vendored schemas plus gnome-settings-daemon's media keys, adopted or not.
   The narrower test above has two blind spots and both were real: a GNOME key we deliberately
-  **deferred** still ships a default (`minimize` = `<Super>h`), and **gsd's keys are in no
+  **deferred** still ships a default (`begin-move` = `<Alt>F7`), and **gsd's keys are in no
   table of ours at all** (`screensaver` = `<Super>l`). Comparison goes through
   `parse_accelerator`, so `<Primary>` vs `<Control>` and `<Alt><Super>` vs `<Super><Alt>`
   cannot hide a clash. It asserts on the *number* of accelerators it extracted, because the
@@ -311,7 +311,6 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 
 | Key | Why |
 |---|---|
-| `minimize` (`<Super>h`) | no minimized-window state in layout |
 | `begin-move` / `begin-resize` | no keyboard interactive-grab machinery |
 | `show-desktop` | not implemented |
 | `raise` / `lower` / `raise-or-lower`, `always-on-top` / `toggle-above` | no stacking model |
