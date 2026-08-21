@@ -191,6 +191,13 @@ pub struct Mapped {
     /// sizing mode.
     is_maximized: bool,
 
+    /// Whether this window is minimized — hidden, and out of both layout halves.
+    ///
+    /// A cache the layout writes (see `LayoutElement::set_minimized`); there is no xdg_toplevel
+    /// state for minimized, so unlike the sizing modes this cannot be read back off the last
+    /// acked configure.
+    is_minimized: bool,
+
     /// Whether this window is pending to be maximized.
     ///
     /// We have to track this ourselves due to windowed fullscreen.
@@ -328,6 +335,7 @@ impl Mapped {
             is_pending_windowed_fullscreen: false,
             uncommitted_windowed_fullscreen: Vec::new(),
             is_maximized: false,
+            is_minimized: false,
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
@@ -1170,6 +1178,14 @@ impl LayoutElement for Mapped {
         let changed = self.is_floating != floating;
         self.is_floating = floating;
         self.need_to_recompute_rules |= changed;
+    }
+
+    fn set_minimized(&mut self, minimized: bool) {
+        self.is_minimized = minimized;
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.is_minimized
     }
 
     fn set_bounds(&self, bounds: Size<i32, Logical>) {

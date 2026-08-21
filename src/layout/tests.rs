@@ -45,6 +45,7 @@ struct TestWindowInner {
     sizing_mode: Cell<SizingMode>,
     is_windowed_fullscreen: Cell<bool>,
     is_pending_windowed_fullscreen: Cell<bool>,
+    minimized: Cell<bool>,
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
@@ -97,6 +98,7 @@ impl TestWindow {
             sizing_mode: Cell::new(SizingMode::Normal),
             is_windowed_fullscreen: Cell::new(false),
             is_pending_windowed_fullscreen: Cell::new(false),
+            minimized: Cell::new(false),
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
@@ -241,6 +243,14 @@ impl LayoutElement for TestWindow {
     fn set_active_in_column(&mut self, _active: bool) {}
 
     fn set_floating(&mut self, _floating: bool) {}
+
+    fn set_minimized(&mut self, minimized: bool) {
+        self.0.minimized.set(minimized);
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.0.minimized.get()
+    }
 
     fn sizing_mode(&self) -> SizingMode {
         self.0.sizing_mode.get()

@@ -276,6 +276,15 @@ pub trait LayoutElement {
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);
+    /// Record whether this window is minimized.
+    ///
+    /// A **cache**, written only by [`Workspace::minimize`] / [`Workspace::unminimize`]; the
+    /// truth is which side of the workspace the tile is parked on. It exists because every
+    /// consumer that sweeps windows (IPC, the foreign-toplevel refresh, the app system, the
+    /// switcher) holds the window and not the layout, and asking the layout per window would be
+    /// quadratic. Same arrangement as `Mapped::is_maximized`, which caches a toplevel state.
+    fn set_minimized(&mut self, minimized: bool);
+    fn is_minimized(&self) -> bool;
     fn set_bounds(&self, bounds: Size<i32, Logical>);
     fn is_ignoring_opacity_window_rule(&self) -> bool;
 

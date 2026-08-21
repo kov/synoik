@@ -53,6 +53,25 @@ use crate::utils::{
 };
 use crate::window::ResolvedWindowRules;
 
+/// Where a window this workspace holds actually is.
+///
+/// Three-state because it must be. The `if self.floating.has_window(id) { … } else { … }` this
+/// replaces read the scrolling half as "everything that is not floating", which stopped being
+/// true the moment a window could be minimized — and the scrolling half's lookups `unwrap`, so a
+/// wrong guess is a panic, not a no-op. Every dispatch matches on this **exhaustively, with no
+/// catch-all**, so adding or removing a mode makes the compiler name every site that has to
+/// answer for it rather than letting one hide in an `else`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Home {
+    /// Laid out by the scrolling half.
+    Scrolling,
+    /// Laid out by the floating half.
+    Floating,
+    /// Parked minimized: on the workspace, in neither half, with no geometry. Every operation
+    /// that asks "where is this window" has nothing to do for one of these.
+    Minimized,
+}
+
 #[derive(Debug)]
 pub struct Workspace<W: LayoutElement> {
     /// The scrollable-tiling layout.
@@ -846,12 +865,13 @@ impl<W: LayoutElement> Workspace<W> {
         if self.is_minimized(id) {
             return false;
         }
-        let in_layout = self.floating.has_window(id)
-            || self.scrolling.tiles().any(|tile| tile.window().id() == id);
-        if !in_layout {
-            return false;
+        match self.home_of(id) {
+            Some(Home::Floating) | Some(Home::Scrolling) => (),
+            // Already parked (handled above) or not ours.
+            Some(Home::Minimized) | None => return false,
         }
-        let removed = self.remove_tile(id, transaction);
+        let mut removed = self.remove_tile(id, transaction);
+        removed.tile.window_mut().set_minimized(true);
         self.minimized.push(removed);
         true
     }
@@ -867,11 +887,12 @@ impl<W: LayoutElement> Workspace<W> {
             return false;
         };
         let RemovedTile {
-            tile,
+            mut tile,
             width,
             is_full_width,
             is_floating,
         } = self.minimized.remove(idx);
+        tile.window_mut().set_minimized(false);
         self.add_tile(
             tile,
             WorkspaceAddWindowTarget::Auto,
@@ -899,7 +920,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn is_floating(&self, id: &W::Id) -> bool {
-        self.floating.has_window(id)
+        self.home_of(id) == Some(Home::Floating)
     }
 
     pub fn current_output(&self) -> Option<&Output> {
@@ -1056,6 +1077,20 @@ impl<W: LayoutElement> Workspace<W> {
         //
         // In niri's scrolling mode only the scrolling layout can size a window to the screen, so a
         // window that opens maximized or fullscreen goes there regardless of `is_floating`.
+        // A `NextTo` reference has to be somewhere with a position: a minimized window is in
+        // neither half, and one this workspace does not hold was never a position here either.
+        // Normalizing to `Auto` up front is what keeps the placement below reading a plain
+        // floating-or-scrolling question.
+        let target = match target {
+            WorkspaceAddWindowTarget::NextTo(next_to) => match self.home_of(next_to) {
+                Some(Home::Floating) | Some(Home::Scrolling) => {
+                    WorkspaceAddWindowTarget::NextTo(next_to)
+                }
+                Some(Home::Minimized) | None => WorkspaceAddWindowTarget::Auto,
+            },
+            other => other,
+        };
+
         let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
         let is_floating = is_floating || gnome_mode;
         let opens_floating =
@@ -1105,6 +1140,8 @@ impl<W: LayoutElement> Workspace<W> {
             WorkspaceAddWindowTarget::NextTo(next_to) => {
                 let activate = activate.map_smart(|| self.active_window().unwrap().id() == next_to);
 
+                // Normalized above, so `next_to` is known to be laid out in one half or the
+                // other and this boolean cannot be reading a third state as the second.
                 let floating_has_window = self.floating.has_window(next_to);
 
                 if opens_floating {
@@ -1204,7 +1241,8 @@ impl<W: LayoutElement> Workspace<W> {
             .iter()
             .position(|removed| removed.tile.window().id() == id)
         {
-            let removed = self.minimized.remove(idx);
+            let mut removed = self.minimized.remove(idx);
+            removed.tile.window_mut().set_minimized(false);
             if let Some(output) = &self.output {
                 removed.tile.window().output_leave(output);
             }
@@ -1212,11 +1250,16 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         let mut from_floating = false;
-        let removed = if self.floating.has_window(id) {
-            from_floating = true;
-            self.floating.remove_tile(id)
-        } else {
-            self.scrolling.remove_tile(id, transaction)
+        let removed = match self.home_of(id) {
+            Some(Home::Floating) => {
+                from_floating = true;
+                self.floating.remove_tile(id)
+            }
+            Some(Home::Scrolling) => self.scrolling.remove_tile(id, transaction),
+            // Handled above, and a window the workspace does not hold cannot be removed from it.
+            Some(Home::Minimized) | None => {
+                panic!("removing a window this workspace does not lay out")
+            }
         };
 
         if let Some(output) = &self.output {
@@ -1584,21 +1627,19 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            return;
+        match self.target_home(window) {
+            Some(Home::Scrolling) => self.scrolling.consume_or_expel_window_left(window),
+            // Columns are the scrolling half's idea; there is nothing to consume into or expel
+            // from for a floating window, and nothing at all for a hidden one.
+            Some(Home::Floating) | Some(Home::Minimized) | None => (),
         }
-        self.scrolling.consume_or_expel_window_left(window);
     }
 
     pub fn consume_or_expel_window_right(&mut self, window: Option<&W::Id>) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            return;
+        match self.target_home(window) {
+            Some(Home::Scrolling) => self.scrolling.consume_or_expel_window_right(window),
+            Some(Home::Floating) | Some(Home::Minimized) | None => (),
         }
-        self.scrolling.consume_or_expel_window_right(window);
     }
 
     pub fn consume_into_column(&mut self) {
@@ -1645,12 +1686,10 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {
-        if id.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.center_window(id);
-        } else {
-            self.scrolling.center_window(id);
+        match self.target_home(id) {
+            Some(Home::Floating) => self.floating.center_window(id),
+            Some(Home::Scrolling) => self.scrolling.center_window(id),
+            Some(Home::Minimized) | None => (),
         }
     }
 
@@ -1687,51 +1726,42 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.set_window_width(window, change, true);
-        } else {
-            self.scrolling.set_window_width(window, change);
+        match self.target_home(window) {
+            Some(Home::Floating) => self.floating.set_window_width(window, change, true),
+            Some(Home::Scrolling) => self.scrolling.set_window_width(window, change),
+            Some(Home::Minimized) | None => (),
         }
     }
 
     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.set_window_height(window, change, true);
-        } else {
-            self.scrolling.set_window_height(window, change);
+        match self.target_home(window) {
+            Some(Home::Floating) => self.floating.set_window_height(window, change, true),
+            Some(Home::Scrolling) => self.scrolling.set_window_height(window, change),
+            Some(Home::Minimized) | None => (),
         }
     }
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            return;
+        match self.target_home(window) {
+            Some(Home::Scrolling) => self.scrolling.reset_window_height(window),
+            // A floating window has no column height to reset.
+            Some(Home::Floating) | Some(Home::Minimized) | None => (),
         }
-        self.scrolling.reset_window_height(window);
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.toggle_window_width(window, forwards);
-        } else {
-            self.scrolling.toggle_window_width(window, forwards);
+        match self.target_home(window) {
+            Some(Home::Floating) => self.floating.toggle_window_width(window, forwards),
+            Some(Home::Scrolling) => self.scrolling.toggle_window_width(window, forwards),
+            Some(Home::Minimized) | None => (),
         }
     }
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
-        if window.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.toggle_window_height(window, forwards);
-        } else {
-            self.scrolling.toggle_window_height(window, forwards);
+        match self.target_home(window) {
+            Some(Home::Floating) => self.floating.toggle_window_height(window, forwards),
+            Some(Home::Scrolling) => self.scrolling.toggle_window_height(window, forwards),
+            Some(Home::Minimized) | None => (),
         }
     }
 
@@ -1754,6 +1784,13 @@ impl<W: LayoutElement> Workspace<W> {
         // Like maximize: fullscreening an edge-tiled window carries the
         // pre-tile rect as the restore rect.
         let mut tiled_restore = None;
+        // Not a two-way dispatch below but a chain, so the third state is a guard rather than an
+        // arm — still exhaustive, so a new mode still has to answer here.
+        match self.home_of(window) {
+            Some(Home::Floating) | Some(Home::Scrolling) => (),
+            // A hidden window has no geometry to size.
+            Some(Home::Minimized) | None => return,
+        }
         if self.floating.has_window(window) {
             if is_fullscreen {
                 tiled_restore = self.floating.take_tile_restore(window);
@@ -1839,9 +1876,15 @@ impl<W: LayoutElement> Workspace<W> {
         // A maximized window tiles from its maximized state (mutter clears the maximization and
         // tiles from the pre-maximize rect); in GNOME mode it never left the floating layout, so
         // `toggle_tiled` handles it directly.
-        if self.floating.has_window(&id) {
-            self.floating.toggle_tiled(Some(&id), side);
-            return;
+        match self.home_of(&id) {
+            Some(Home::Floating) => {
+                self.floating.toggle_tiled(Some(&id), side);
+                return;
+            }
+            // Handled below: a scrolling-half maximized window comes back to floating first.
+            Some(Home::Scrolling) => (),
+            // A hidden window has no edge to tile to.
+            Some(Home::Minimized) | None => return,
         }
 
         // In scrolling mode a maximized window lives in the scrolling layout: bring it back to
@@ -1876,8 +1919,10 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn auto_maximize_if_too_big(&mut self, window: &W::Id) -> bool {
         const MAX_UNMAXIMIZED_WINDOW_AREA: f64 = 0.8;
 
-        if !self.floating.has_window(window) {
-            return false;
+        match self.home_of(window) {
+            Some(Home::Floating) => (),
+            // Only the floating half places a window where it could be too big for the screen.
+            Some(Home::Scrolling) | Some(Home::Minimized) | None => return false,
         }
         let area = self.floating.working_area();
 
@@ -1951,6 +1996,11 @@ impl<W: LayoutElement> Workspace<W> {
         // Applied after the move to the scrolling layout, which stores the
         // live (tiled) geometry as the floating restore.
         let mut tiled_restore = None;
+        // As in `set_fullscreen`: a chain, so the third state is a guard rather than an arm.
+        match self.home_of(window) {
+            Some(Home::Floating) | Some(Home::Scrolling) => (),
+            Some(Home::Minimized) | None => return,
+        }
         if self.floating.has_window(window) {
             if maximize {
                 tiled_restore = self.floating.take_tile_restore(window);
@@ -2037,6 +2087,12 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         };
 
+        match self.home_of(&id) {
+            Some(Home::Floating) | Some(Home::Scrolling) => (),
+            // A hidden window is in neither half; it takes its half back on unminimize.
+            Some(Home::Minimized) | None => return,
+        }
+
         let (_, render_pos, _) = self
             .tiles_with_render_positions()
             .find(|(tile, _, _)| *tile.window().id() == id)
@@ -2091,10 +2147,13 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {
-        if id.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) == floating
-        {
+        let is_floating = match self.target_home(id) {
+            Some(Home::Floating) => true,
+            Some(Home::Scrolling) => false,
+            // A hidden window is in neither half; it takes its half back on unminimize.
+            Some(Home::Minimized) | None => return,
+        };
+        if is_floating == floating {
             return;
         }
 
@@ -2136,83 +2195,110 @@ impl<W: LayoutElement> Workspace<W> {
         y: PositionChange,
         animate: bool,
     ) {
-        if id.map_or(self.floating_is_active.get(), |id| {
-            self.floating.has_window(id)
-        }) {
-            self.floating.move_window(id, x, y, animate);
-        } else {
-            // If the target tile isn't floating, set its stored floating position.
-            let tile = if let Some(id) = id {
-                self.scrolling
-                    .tiles_mut()
-                    .find(|tile| tile.window().id() == id)
-                    .unwrap()
-            } else if let Some(tile) = self.scrolling.active_tile_mut() {
-                tile
-            } else {
-                return;
-            };
+        match self.target_home(id) {
+            Some(Home::Floating) => self.floating.move_window(id, x, y, animate),
+            Some(Home::Minimized) | None => (),
+            Some(Home::Scrolling) => {
+                // If the target tile isn't floating, set its stored floating position.
+                let tile = if let Some(id) = id {
+                    self.scrolling
+                        .tiles_mut()
+                        .find(|tile| tile.window().id() == id)
+                        .unwrap()
+                } else if let Some(tile) = self.scrolling.active_tile_mut() {
+                    tile
+                } else {
+                    return;
+                };
 
-            let pos = self.floating.stored_or_default_tile_pos(tile);
+                let pos = self.floating.stored_or_default_tile_pos(tile);
 
-            // If there's no stored floating position, we can only set both components at once, not
-            // adjust.
-            let pos = pos.or_else(|| {
-                (matches!(
-                    x,
-                    PositionChange::SetFixed(_) | PositionChange::SetProportion(_)
-                ) && matches!(
-                    y,
-                    PositionChange::SetFixed(_) | PositionChange::SetProportion(_)
-                ))
-                .then_some(Point::default())
-            });
+                // If there's no stored floating position, we can only set both components at once,
+                // not adjust.
+                let pos = pos.or_else(|| {
+                    (matches!(
+                        x,
+                        PositionChange::SetFixed(_) | PositionChange::SetProportion(_)
+                    ) && matches!(
+                        y,
+                        PositionChange::SetFixed(_) | PositionChange::SetProportion(_)
+                    ))
+                    .then_some(Point::default())
+                });
 
-            let Some(mut pos) = pos else {
-                return;
-            };
+                let Some(mut pos) = pos else {
+                    return;
+                };
 
-            let working_area = self.floating.working_area();
-            let available_width = working_area.size.w;
-            let available_height = working_area.size.h;
-            let working_area_loc = working_area.loc;
+                let working_area = self.floating.working_area();
+                let available_width = working_area.size.w;
+                let available_height = working_area.size.h;
+                let working_area_loc = working_area.loc;
 
-            const MAX_F: f64 = 10000.;
+                const MAX_F: f64 = 10000.;
 
-            match x {
-                PositionChange::SetFixed(x) => pos.x = x + working_area_loc.x,
-                PositionChange::SetProportion(prop) => {
-                    let prop = (prop / 100.).clamp(0., MAX_F);
-                    pos.x = available_width * prop + working_area_loc.x;
+                match x {
+                    PositionChange::SetFixed(x) => pos.x = x + working_area_loc.x,
+                    PositionChange::SetProportion(prop) => {
+                        let prop = (prop / 100.).clamp(0., MAX_F);
+                        pos.x = available_width * prop + working_area_loc.x;
+                    }
+                    PositionChange::AdjustFixed(x) => pos.x += x,
+                    PositionChange::AdjustProportion(prop) => {
+                        let current_prop = (pos.x - working_area_loc.x) / available_width.max(1.);
+                        let prop = (current_prop + prop / 100.).clamp(0., MAX_F);
+                        pos.x = available_width * prop + working_area_loc.x;
+                    }
                 }
-                PositionChange::AdjustFixed(x) => pos.x += x,
-                PositionChange::AdjustProportion(prop) => {
-                    let current_prop = (pos.x - working_area_loc.x) / available_width.max(1.);
-                    let prop = (current_prop + prop / 100.).clamp(0., MAX_F);
-                    pos.x = available_width * prop + working_area_loc.x;
+                match y {
+                    PositionChange::SetFixed(y) => pos.y = y + working_area_loc.y,
+                    PositionChange::SetProportion(prop) => {
+                        let prop = (prop / 100.).clamp(0., MAX_F);
+                        pos.y = available_height * prop + working_area_loc.y;
+                    }
+                    PositionChange::AdjustFixed(y) => pos.y += y,
+                    PositionChange::AdjustProportion(prop) => {
+                        let current_prop = (pos.y - working_area_loc.y) / available_height.max(1.);
+                        let prop = (current_prop + prop / 100.).clamp(0., MAX_F);
+                        pos.y = available_height * prop + working_area_loc.y;
+                    }
                 }
+
+                let pos = self.floating.logical_to_size_frac(pos);
+                tile.floating_pos = Some(pos);
             }
-            match y {
-                PositionChange::SetFixed(y) => pos.y = y + working_area_loc.y,
-                PositionChange::SetProportion(prop) => {
-                    let prop = (prop / 100.).clamp(0., MAX_F);
-                    pos.y = available_height * prop + working_area_loc.y;
-                }
-                PositionChange::AdjustFixed(y) => pos.y += y,
-                PositionChange::AdjustProportion(prop) => {
-                    let current_prop = (pos.y - working_area_loc.y) / available_height.max(1.);
-                    let prop = (current_prop + prop / 100.).clamp(0., MAX_F);
-                    pos.y = available_height * prop + working_area_loc.y;
-                }
-            }
-
-            let pos = self.floating.logical_to_size_frac(pos);
-            tile.floating_pos = Some(pos);
         }
     }
 
     pub fn has_windows(&self) -> bool {
         self.windows().next().is_some()
+    }
+
+    /// Where `id` is, or `None` when this workspace does not hold it at all.
+    fn home_of(&self, id: &W::Id) -> Option<Home> {
+        if self.floating.has_window(id) {
+            Some(Home::Floating)
+        } else if self.scrolling.tiles().any(|tile| tile.window().id() == id) {
+            Some(Home::Scrolling)
+        } else if self.is_minimized(id) {
+            Some(Home::Minimized)
+        } else {
+            None
+        }
+    }
+
+    /// Where an operation aimed at `id` should go: the window's own home, or the active half
+    /// when no window is named — `None` means "whatever is active", which is the convention the
+    /// callers taking `Option<&W::Id>` use.
+    fn target_home(&self, id: Option<&W::Id>) -> Option<Home> {
+        match id {
+            Some(id) => self.home_of(id),
+            None => Some(if self.floating_is_active.get() {
+                Home::Floating
+            } else {
+                Home::Scrolling
+            }),
+        }
     }
 
     /// Whether `window` is **laid out** on this workspace — in the scrolling or floating half,
@@ -2318,10 +2404,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn popup_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
-        if self.floating.has_window(window) {
-            self.floating.popup_target_rect(window)
-        } else {
-            self.scrolling.popup_target_rect(window)
+        match self.home_of(window) {
+            Some(Home::Floating) => self.floating.popup_target_rect(window),
+            Some(Home::Scrolling) => self.scrolling.popup_target_rect(window),
+            // A hidden window has no rect to unconstrain a popup against.
+            Some(Home::Minimized) | None => None,
         }
     }
 
@@ -3099,12 +3186,15 @@ impl<W: LayoutElement> Workspace<W> {
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
-        if self.floating.has_window(window) {
-            self.floating
-                .start_close_animation_for_window(window, blocker);
-        } else {
-            self.scrolling
-                .start_close_animation_for_window(window, blocker);
+        match self.home_of(window) {
+            Some(Home::Floating) => self
+                .floating
+                .start_close_animation_for_window(window, blocker),
+            Some(Home::Scrolling) => self
+                .scrolling
+                .start_close_animation_for_window(window, blocker),
+            // Nothing on screen to animate away.
+            Some(Home::Minimized) | None => (),
         }
     }
 
@@ -3197,11 +3287,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
-        if self.floating.has_window(window) {
-            return 0.;
+        match self.home_of(window) {
+            Some(Home::Scrolling) => self.scrolling.scroll_amount_to_activate(window),
+            // Nothing to scroll to: a floating window is already in view, and a minimized one
+            // is not in the view at all.
+            Some(Home::Floating) | Some(Home::Minimized) | None => 0.,
         }
-
-        self.scrolling.scroll_amount_to_activate(window)
     }
 
     pub fn is_urgent(&self) -> bool {
@@ -3365,10 +3456,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
-        if self.floating.has_window(&window) {
-            self.floating.interactive_resize_begin(window, edges)
-        } else {
-            self.scrolling.interactive_resize_begin(window, edges)
+        match self.home_of(&window) {
+            Some(Home::Floating) => self.floating.interactive_resize_begin(window, edges),
+            Some(Home::Scrolling) => self.scrolling.interactive_resize_begin(window, edges),
+            // Nothing to grab the edge of.
+            Some(Home::Minimized) | None => false,
         }
     }
 
@@ -3377,19 +3469,19 @@ impl<W: LayoutElement> Workspace<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
-        if self.floating.has_window(window) {
-            self.floating.interactive_resize_update(window, delta)
-        } else {
-            self.scrolling.interactive_resize_update(window, delta)
+        match self.home_of(window) {
+            Some(Home::Floating) => self.floating.interactive_resize_update(window, delta),
+            Some(Home::Scrolling) => self.scrolling.interactive_resize_update(window, delta),
+            Some(Home::Minimized) | None => false,
         }
     }
 
     pub fn interactive_resize_end(&mut self, window: Option<&W::Id>) {
         if let Some(window) = window {
-            if self.floating.has_window(window) {
-                self.floating.interactive_resize_end(Some(window));
-            } else {
-                self.scrolling.interactive_resize_end(Some(window));
+            match self.home_of(window) {
+                Some(Home::Floating) => self.floating.interactive_resize_end(Some(window)),
+                Some(Home::Scrolling) => self.scrolling.interactive_resize_end(Some(window)),
+                Some(Home::Minimized) | None => (),
             }
         } else {
             self.floating.interactive_resize_end(None);
