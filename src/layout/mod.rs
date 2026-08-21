@@ -1879,6 +1879,23 @@ impl<W: LayoutElement> Layout<W> {
         self.workspaces().any(|(_, _, ws)| ws.is_above(window))
     }
 
+    /// Whether `window` is in the floating layout, which is the only one with a stacking order
+    /// or a free position.
+    pub fn is_window_floating(&self, window: &W::Id) -> bool {
+        self.workspaces()
+            .any(|(_, _, ws)| ws.has_window(window) && ws.is_floating(window))
+    }
+
+    /// Step `window` by `amount` — see [`FloatingSpace::nudge_window`].
+    pub fn nudge_window(&mut self, window: &W::Id, amount: Point<f64, Logical>) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.nudge_window(window, amount) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Bring `window` to the top of its band without changing the focus — `meta_window_raise`
     /// (`window.c:5404-5442`).
     pub fn raise_window(&mut self, window: &W::Id) -> bool {

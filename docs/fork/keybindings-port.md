@@ -72,13 +72,16 @@ gsd media keys.
 `switch-applications(-backward)`, `toggle-maximized`, `switch-to-workspace-last`,
 `move-to-workspace-last`, `move-to-monitor-{left,right,up,down}`,
 `switch-input-source(-backward)`, `minimize`, `always-on-top`, `toggle-above`, `raise`,
-`lower`, `raise-or-lower`.
+`lower`, `raise-or-lower`, `begin-move`, `begin-resize`.
 
 `always-on-top` and `toggle-above` are **two settings keys sharing one action**: mutter
 registers both, against handlers that differ only in name (`handle_always_on_top`,
 `keybindings.c:1803-1813`; `handle_toggle_above`, `:2086-2096`). All five of the stacking keys
 default to nothing, so adopting them costs no default chord — see
 `docs/fork/window-menu-port.md` for what always-on-top means to the stack.
+
+`begin-move` (`<Alt>F7`) and `begin-resize` (`<Alt>F8`) start the keyboard grabs — see
+`docs/fork/window-menu-port.md`, "The keyboard grabs".
 
 `switch-input-source` is a **divergence**: gnome-shell puts up an input-source switcher popup
 for the duration of the modifier hold, and we switch straight away. That popup is the same
@@ -175,8 +178,8 @@ Three unit tests keep it honest, each covering a failure that is otherwise silen
   isn't there.
 - `synoik_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
   *default* in the vendored schemas plus gnome-settings-daemon's media keys, adopted or not.
-  The narrower test above has two blind spots and both were real: a GNOME key we deliberately
-  **deferred** still ships a default (`begin-move` = `<Alt>F7`), and **gsd's keys are in no
+  The narrower test above has two blind spots and both were real: a GNOME key deferred at the
+  time still shipped a default (`begin-move` = `<Alt>F7`), and **gsd's keys are in no
   table of ours at all** (`screensaver` = `<Super>l`). Comparison goes through
   `parse_accelerator`, so `<Primary>` vs `<Control>` and `<Alt><Super>` vs `<Super><Alt>`
   cannot hide a clash. It asserts on the *number* of accelerators it extracted, because the
@@ -318,7 +321,6 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 
 | Key | Why |
 |---|---|
-| `begin-move` / `begin-resize` | no keyboard interactive-grab machinery |
 | `show-desktop` | not implemented |
 | `maximize-vertically` / `-horizontally`, `move-to-corner-*`, `move-to-side-*`, `move-to-center` | no half-max / floating-placement infra |
 | `toggle-on-all-workspaces` | no sticky windows |

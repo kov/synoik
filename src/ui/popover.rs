@@ -113,7 +113,10 @@ pub enum PopoverAction {
     /// its own with `set_serial(0, seat)`, which our activation gate refuses — as mutter's
     /// `token_can_activate` would too (`src/wayland/meta-wayland-activation.c:288-312`). So we
     /// take GNOME's *other* mechanism for the panel choice and do the raise ourselves.
-    LaunchSettingsPanel { panel: String, args: Vec<String> },
+    LaunchSettingsPanel {
+        panel: String,
+        args: Vec<String>,
+    },
     /// Set `org.gnome.desktop.interface color-scheme` (Dark Style tile).
     SetDarkStyle(bool),
     /// Set the inverse of `org.gnome.desktop.notifications show-banners` (DND).
@@ -161,13 +164,22 @@ pub enum PopoverAction {
     ToggleBluetooth,
     /// Connect or disconnect a Bluetooth device (`Device1.Connect`/`Disconnect`, a device-list
     /// row). The menu stays open; the row shows a busy mark until the call finishes.
-    ConnectBluetoothDevice { path: String, connect: bool },
+    ConnectBluetoothDevice {
+        path: String,
+        connect: bool,
+    },
     /// Activate a row of an app indicator's remote menu — `Event(id, "clicked")` on the client.
     /// The popover closes, as a menu activation does everywhere else.
-    IndicatorMenuActivate { item_id: String, node_id: i32 },
+    IndicatorMenuActivate {
+        item_id: String,
+        node_id: i32,
+    },
     /// Expand a submenu of an app indicator's remote menu. The menu stays open, and the client is
     /// told (`AboutToShow`) so it can fill the submenu in before it is drawn.
-    IndicatorMenuExpand { item_id: String, node_id: i32 },
+    IndicatorMenuExpand {
+        item_id: String,
+        node_id: i32,
+    },
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -192,11 +204,17 @@ pub enum PopoverAction {
     /// default action, emit ActivationToken+ActionInvoked and destroy unless
     /// resident; without one, `source.open()`'s destroy-all-non-resident
     /// (`js/ui/messageList.js:730-732`, `js/ui/notificationDaemon.js:231-240`).
-    ActivateNotification { id: u32, has_default: bool },
+    ActivateNotification {
+        id: u32,
+        has_default: bool,
+    },
     /// An expanded message-list card's action button: emit
     /// ActivationToken+ActionInvoked for `key` and destroy unless resident
     /// (`js/ui/notificationDaemon.js:224-227`, `js/ui/messageTray.js:430-442`).
-    InvokeNotificationAction { id: u32, key: String },
+    InvokeNotificationAction {
+        id: u32,
+        key: String,
+    },
     /// The message list's Clear pill: close every notification.
     ClearNotifications,
     /// A media card's transport button (`js/ui/messageList.js:778-791`). The popover stays open —
@@ -217,7 +235,10 @@ pub enum PopoverAction {
     AppNewWindow(String),
     /// An app menu `.desktop` action row (`appMenu.js:235-241`): launch it and leave
     /// the overview.
-    AppLaunchAction { id: String, action: String },
+    AppLaunchAction {
+        id: String,
+        action: String,
+    },
     /// The app menu's "Pin to Dash" / "Unpin" (`appMenu.js:74-80`). Unlike the launch
     /// rows this does *not* leave the overview — gnome-shell only hides it for the
     /// items that raise a window.
@@ -241,6 +262,9 @@ pub enum PopoverAction {
         window: crate::window::mapped::MappedId,
         maximized: bool,
     },
+    /// The window menu's Move and Resize — the keyboard grabs (`windowMenu.js:58-84`).
+    WindowBeginMove(crate::window::mapped::MappedId),
+    WindowBeginResize(crate::window::mapped::MappedId),
     /// The window menu's Always on Top (`windowMenu.js:86-98`).
     WindowSetAlwaysOnTop {
         window: crate::window::mapped::MappedId,
@@ -315,6 +339,8 @@ impl PopoverAction {
                 | PopoverAction::WindowTakeScreenshot(_)
                 | PopoverAction::WindowMinimize(_)
                 | PopoverAction::WindowSetMaximized { .. }
+                | PopoverAction::WindowBeginMove(_)
+                | PopoverAction::WindowBeginResize(_)
                 | PopoverAction::WindowSetAlwaysOnTop { .. }
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }

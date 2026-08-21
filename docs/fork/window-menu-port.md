@@ -44,6 +44,9 @@ Built in GNOME's order, each shown only when its target exists — the neighbour
 - **Maximize / Restore** — one row, whichever the window is not. Reads the *pending* sizing mode:
   `window.is_maximized()` is the compositor's own state, which flips when the request is made, not
   when the client acks the configure.
+- **Move / Resize** — the keyboard grabs (`windowMenu.js:58-84`), insensitive when the window
+  does not own its own geometry, which is `allows_move` / `allows_resize`. See "The keyboard
+  grabs" below.
 - **Always on Top** — `make_above` / `unmake_above` (`windowMenu.js:86-98`), ticked with
   `Ornament::Check` when set. Drawn **insensitive while the window is maximized**, which is not a
   nicety: a maximized window is in the normal layer even with the flag set
@@ -74,12 +77,39 @@ window, and a row that could never enable teaches the reader nothing. In the ord
 
 | Row | Needs |
 |---|---|
-| Move | keyboard interactive-move grab (`Meta.GrabOp.KEYBOARD_MOVING`) |
-| Resize | keyboard interactive-resize grab (`Meta.GrabOp.KEYBOARD_RESIZING_UNKNOWN`) |
 | Always on Visible Workspace | sticky windows — `stick` / `unstick` |
 
-The same three are `deferred` rows in `docs/fork/keybindings-port.md` (`begin-move` /
-`begin-resize`, `toggle-on-all-workspaces`); landing a subsystem there adds its row here.
+That one is also a `deferred` row in `docs/fork/keybindings-port.md`
+(`toggle-on-all-workspaces`); landing the subsystem there adds its row here.
+
+## The keyboard grabs
+
+Move and Resize are one state machine, `src/input/keyboard_window_grab.rs`, driving a **virtual
+pointer**: the arrows walk a delta and the layout's own interactive move and resize see the
+numbers a real drag would give them. mutter's is `process_keyboard_move_grab` and
+`process_keyboard_resize_grab` (`meta-window-drag.c:614-1070`), reached from `begin-move` /
+`begin-resize` or from the menu rows.
+
+- **The step is ten pixels, one under Ctrl**, and Shift — mutter's snap mode — also steps by one.
+- **Releases and modifier presses are eaten and keep the grab.** Reaching for Ctrl to slow the
+  step down must not cancel the drag.
+- **Escape restores and ends**; any other key commits and ends. Either way the key is swallowed.
+- **A resize starts with no edge** (`RESIZING_UNKNOWN`): the first arrow picks one and resizes
+  nothing, and an arrow across the chosen edge's axis moves the grab to that edge, also resizing
+  nothing. Only arrows along the current edge's axis drag it. Each edge change ends the layout's
+  interactive resize and begins a new one, so the size it measures from is always current.
+- The grab also ends on a pointer button press and when its window goes away. mutter needs
+  neither rule because its keyboard grab holds the pointer too; ours does not, so without the
+  first a click on another window would leave the grab driving an unfocused one.
+
+Both are refused for a window that does not own its own geometry — mutter's `has_move_func` /
+`has_resize_func` — which is the same gate the menu rows are dimmed by, so an enabled row always
+does something. Floating only, for the reason the band is.
+
+**Divergences.** Shift is only the smaller step: mutter's snap flag also turns on edge
+resistance against other windows and the work area, which we have no model for. And mutter's
+keyboard move is unconstrained but still snaps to a nearby edge when the increment would
+overshoot it; ours walks the plain increment.
 
 ## The always-on-top band
 

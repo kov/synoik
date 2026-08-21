@@ -529,6 +529,19 @@ impl Menu {
             .collect()
     }
 
+    /// The labels of the rows that are drawn insensitive, in the same order [`labels`] gives.
+    ///
+    /// [`labels`]: Self::labels
+    pub fn disabled_labels(&self) -> Vec<&str> {
+        self.visible_rows()
+            .into_iter()
+            .filter_map(|row| match self.entry_at(&row.path)? {
+                MenuEntry::Item(item) if !item.enabled => Some(item.label.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The menu-local centre of the row labelled `label`, so a test can click a row by name rather
     /// than by arithmetic that would drift with the box model.
     pub fn row_center(&self, label: &str) -> Option<Point<f64, Logical>> {

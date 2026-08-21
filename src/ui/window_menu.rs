@@ -26,6 +26,8 @@
 //!   window type or a skip-taskbar window (`window.c:6014-6018`, `:6079-6082`), and neither has an
 //!   xdg-shell equivalent.
 //! - **Maximize / Restore** — one row, whichever the window is not (`windowMenu.js:44-55`).
+//! - **Move / Resize** — the keyboard move and resize grabs (`windowMenu.js:58-84`), insensitive
+//!   when the window does not own its own geometry.
 //! - **Always on Top** — `make_above` / `unmake_above` (`windowMenu.js:86-98`), checked when set
 //!   and insensitive while maximized.
 //! - **Move to Workspace Left / Right** — only when the neighbour in that direction is a
@@ -36,11 +38,10 @@
 //!   monitor, in GNOME's order (`windowMenu.js:143-181`).
 //! - **Close** (`windowMenu.js:185-189`).
 //!
-//! The rest are omitted rather than drawn insensitive, because every one of them is missing its
-//! *subsystem*, not merely a per-window capability: no stacking order, no sticky windows, no
-//! keyboard grab machinery. GNOME dims a row when
-//! `can_minimize()` is false for *this* window; a row we could never enable is a row that teaches
-//! the reader nothing. `docs/fork/window-menu-port.md` carries the list and what each one needs.
+//! A row is omitted rather than drawn insensitive when it is missing its *subsystem* rather than
+//! a per-window capability: GNOME dims a row when `can_minimize()` is false for *this* window, and
+//! a row we could never enable is a row that teaches the reader nothing.
+//! `docs/fork/window-menu-port.md` carries what is left and what each one needs.
 
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Size};
@@ -92,6 +93,8 @@ enum RowAction {
     TakeScreenshot,
     Minimize,
     SetMaximized(bool),
+    BeginMove,
+    BeginResize,
     SetAlwaysOnTop(bool),
     MoveToWorkspace(WorkspaceDirection),
     MoveToMonitor(MonitorDirection),
@@ -105,6 +108,9 @@ pub struct WindowMenuContext {
     pub window: MappedId,
     /// Drawn as Restore when true, Maximize when false (`window.is_maximized()`).
     pub is_maximized: bool,
+    /// Whether the window still owns its own geometry — `allows_move` / `allows_resize`, which
+    /// are `has_move_func`/`has_resize_func` and false for a maximized or fullscreen window.
+    pub is_normal_size: bool,
     /// Ticks the Always on Top row (`window.is_above()`).
     pub is_above: bool,
     /// Whether a workspace exists before / after this one on its monitor.
@@ -151,10 +157,23 @@ impl WindowMenu {
         } else {
             row("Maximize", RowAction::SetMaximized(true), &mut actions)
         });
-        // Always on Top sits directly after Maximize/Restore — gnome-shell's construction order
-        // puts Move and Resize between them, and those two rows are not built (see the module
-        // docs), so this is the next one that is.
-        //
+        // Move and Resize start the keyboard grabs (`windowMenu.js:58-84`), dimmed when the
+        // window does not own its own geometry — which is the same gate
+        // `begin_keyboard_window_grab` applies, so an enabled row always does something.
+        for (label, action) in [
+            ("Move", RowAction::BeginMove),
+            ("Resize", RowAction::BeginResize),
+        ] {
+            state.push({
+                let id = actions.len() as u64;
+                actions.push(action);
+                let mut item = MenuItem::new(id, label);
+                if !ctx.is_normal_size {
+                    item = item.disabled();
+                }
+                MenuEntry::Item(item)
+            });
+        }
         // Checked when set, and **insensitive while maximized**, which is not a UI nicety: a
         // maximized window is in the normal layer even with the flag set
         // (`meta_window_get_default_layer`), so the row would claim an effect it does not have.
@@ -263,6 +282,11 @@ impl WindowMenu {
         self.menu.labels()
     }
 
+    /// The labels of the rows drawn insensitive — see [`Menu::disabled_labels`].
+    pub fn disabled_labels(&self) -> Vec<&str> {
+        self.menu.disabled_labels()
+    }
+
     /// The menu-local centre of the row labelled `label`, so the corpus can click a row by name
     /// rather than by arithmetic that would drift with the box model.
     pub fn row_center(&self, label: &str) -> Option<Point<f64, Logical>> {
@@ -300,6 +324,8 @@ impl WindowMenu {
         match *action {
             RowAction::TakeScreenshot => PopoverAction::WindowTakeScreenshot(window),
             RowAction::Minimize => PopoverAction::WindowMinimize(window),
+            RowAction::BeginMove => PopoverAction::WindowBeginMove(window),
+            RowAction::BeginResize => PopoverAction::WindowBeginResize(window),
             RowAction::SetAlwaysOnTop(above) => {
                 PopoverAction::WindowSetAlwaysOnTop { window, above }
             }

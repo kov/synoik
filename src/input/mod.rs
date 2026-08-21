@@ -57,6 +57,7 @@ use crate::gnome::{
     modifiers_from_accel, Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction,
     GnomeKeybinding, KeybindingAction, ScreenDirection, TileSide,
 };
+use crate::input::keyboard_window_grab::{GrabKey, GrabKind, KeyboardWindowGrab};
 use crate::input_method::ShellEntry;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
@@ -83,6 +84,7 @@ use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
+pub mod keyboard_window_grab;
 pub mod move_grab;
 pub mod peripherals;
 pub mod pick_color_grab;
@@ -789,6 +791,9 @@ impl State {
             if let Some(token) = self.synoik.bind_repeat_timer.take() {
                 self.synoik.event_loop.remove(token);
             }
+            if let Some(token) = self.synoik.grab_repeat_timer.take() {
+                self.synoik.event_loop.remove(token);
+            }
         }
 
         if pressed {
@@ -1134,6 +1139,40 @@ impl State {
                         return FilterResult::Intercept(None);
                     } else {
                         // Release of a key pressed before the dialog opened; the client saw the
+                        // press, give it the release.
+                        return FilterResult::Forward;
+                    }
+                }
+
+                // A keyboard move or resize grab owns the keyboard the same way a modal popover
+                // does: the arrows drive it, Escape puts the window back, and any other key
+                // commits and ends it (`process_key_event`, `meta-window-drag.c:1170-1204`). The
+                // VT-switch chord still goes through, for the reason it does under a popover.
+                if this.synoik.keyboard_window_grab.is_some() {
+                    #[allow(non_upper_case_globals)]
+                    if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
+                        modified.raw()
+                    {
+                        if pressed {
+                            let vt = (modified.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
+                            this.backend.change_vt(vt);
+                            this.synoik.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(None);
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        } else {
+                            return FilterResult::Forward;
+                        }
+                    }
+
+                    if pressed {
+                        this.keyboard_window_grab_key(raw.unwrap_or(Keysym::NoSymbol), *mods);
+                        this.synoik.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // Release of a key pressed before the grab began; the client saw the
                         // press, give it the release.
                         return FilterResult::Forward;
                     }
@@ -2124,6 +2163,16 @@ impl State {
                     self.minimize_window(&window);
                 }
             }
+            PopoverAction::WindowBeginMove(window) => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.begin_keyboard_window_grab(window, GrabKind::Move);
+                }
+            }
+            PopoverAction::WindowBeginResize(window) => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.begin_keyboard_window_grab(window, GrabKind::Resize);
+                }
+            }
             PopoverAction::WindowSetAlwaysOnTop { window, above } => {
                 if let Some(window) = self.window_by_id(window) {
                     self.synoik.layout.set_window_above(&window, above);
@@ -2505,6 +2554,161 @@ impl State {
         Some((output, idx, count))
     }
 
+    /// Start a keyboard move or resize grab — `handle_begin_move` / `handle_begin_resize`
+    /// (`keybindings.c:2194-2244`).
+    ///
+    /// Refused for a window that does not own its own geometry: mutter gates both on
+    /// `has_move_func` / `has_resize_func`, which a maximized or fullscreen window fails. Refused
+    /// for a non-floating one too — a scrolling column has neither a free position nor an edge to
+    /// drag.
+    pub fn begin_keyboard_window_grab(&mut self, window: smithay::desktop::Window, kind: GrabKind) {
+        if self.synoik.keyboard_window_grab.is_some() {
+            return;
+        }
+
+        let Some(id) = self
+            .synoik
+            .layout
+            .windows()
+            .find(|(_, m)| m.window == window)
+            .filter(|(_, m)| m.pending_sizing_mode().is_normal())
+            .map(|(_, m)| m.id())
+        else {
+            return;
+        };
+        if !self.synoik.layout.is_window_floating(&window) {
+            return;
+        }
+
+        self.synoik.keyboard_window_grab = Some(KeyboardWindowGrab::new(window, id, kind));
+    }
+
+    /// Feed one key press to the running keyboard grab.
+    pub fn keyboard_window_grab_key(&mut self, keysym: Keysym, mods: ModifiersState) {
+        self.keyboard_window_grab_key_inner(keysym, mods, true);
+    }
+
+    /// `arm_repeat` is false when the repeat timer is the caller: re-arming from inside its own
+    /// dispatch would remove the source calloop is running.
+    fn keyboard_window_grab_key_inner(
+        &mut self,
+        keysym: Keysym,
+        mods: ModifiersState,
+        arm_repeat: bool,
+    ) {
+        let Some(grab) = &mut self.synoik.keyboard_window_grab else {
+            return;
+        };
+        let window = grab.window.clone();
+        let kind = grab.kind;
+        let outcome = grab.handle_key(keysym, &mods, true);
+        let delta = grab.delta;
+        let edges = grab.edges;
+
+        match outcome {
+            GrabKey::Ignore => return,
+            GrabKey::Update { step } => {
+                match kind {
+                    GrabKind::Move => {
+                        self.synoik.layout.nudge_window(&window, step);
+                    }
+                    // The layout's resize reads the whole travel, not the step, exactly as it
+                    // does for a pointer drag.
+                    GrabKind::Resize => {
+                        self.synoik.layout.interactive_resize_update(&window, delta);
+                    }
+                }
+                if arm_repeat {
+                    self.start_grab_key_repeat(keysym, mods);
+                }
+            }
+            GrabKey::ReEdge(edge) => {
+                self.synoik.layout.interactive_resize_end(&window);
+                if !self
+                    .synoik
+                    .layout
+                    .interactive_resize_begin(window.clone(), edge)
+                {
+                    self.end_keyboard_window_grab();
+                }
+                // No repeat: holding the key that picked the edge should not then walk it back
+                // and forth between two edges.
+            }
+            GrabKey::Cancel => {
+                match kind {
+                    // Escape leaves the delta alone, so walking it back off is the original
+                    // position to the pixel.
+                    GrabKind::Move => {
+                        self.synoik
+                            .layout
+                            .nudge_window(&window, Point::from((-delta.x, -delta.y)));
+                    }
+                    GrabKind::Resize => {
+                        if edges.is_some() {
+                            self.synoik
+                                .layout
+                                .interactive_resize_update(&window, Point::from((0., 0.)));
+                        }
+                    }
+                }
+                self.end_keyboard_window_grab();
+            }
+            GrabKey::Commit => self.end_keyboard_window_grab(),
+        }
+
+        self.synoik.queue_redraw_all();
+    }
+
+    /// End the grab, committing wherever the window has got to.
+    pub fn end_keyboard_window_grab(&mut self) {
+        let Some(grab) = self.synoik.keyboard_window_grab.take() else {
+            return;
+        };
+        if let Some(token) = self.synoik.grab_repeat_timer.take() {
+            self.synoik.event_loop.remove(token);
+        }
+        if grab.kind == GrabKind::Resize {
+            self.synoik.layout.interactive_resize_end(&grab.window);
+        }
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Wayland delivers one press per physical key, so a held arrow would nudge once. mutter gets
+    /// its repeats from Clutter; ours come from the same timer the keybindings use.
+    fn start_grab_key_repeat(&mut self, keysym: Keysym, mods: ModifiersState) {
+        if let Some(token) = self.synoik.grab_repeat_timer.take() {
+            self.synoik.event_loop.remove(token);
+        }
+
+        let (repeat_rate, repeat_delay) = {
+            let config = self.synoik.config.borrow();
+            let config = &config.input.keyboard;
+            (config.repeat_rate, config.repeat_delay)
+        };
+        if repeat_rate == 0 {
+            return;
+        }
+        let period = Duration::from_secs_f64(1. / f64::from(repeat_rate));
+
+        let timer = Timer::from_duration(Duration::from_millis(u64::from(repeat_delay)));
+        let token = self
+            .synoik
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                // Out of the state for the duration of the dispatch: ending the grab removes
+                // whatever token it finds, and this one is the source calloop is running.
+                let token = state.synoik.grab_repeat_timer.take();
+                state.keyboard_window_grab_key_inner(keysym, mods, false);
+                if state.synoik.keyboard_window_grab.is_none() {
+                    return TimeoutAction::Drop;
+                }
+                state.synoik.grab_repeat_timer = token;
+                TimeoutAction::ToDuration(period)
+            })
+            .unwrap();
+        self.synoik.grab_repeat_timer = Some(token);
+    }
+
     /// Snapshot what the window menu needs to know about `window`, with the output it is on and
     /// its rect there — `WindowMenu._buildMenu` (`windowMenu.js:22-190`) reads the same model.
     fn window_menu_context(
@@ -2535,6 +2739,7 @@ impl State {
             // the request is made, not when the client gets round to acking the configure. A
             // menu reopened in that gap must already say Restore.
             is_maximized: mapped.pending_sizing_mode().is_maximized(),
+            is_normal_size: mapped.pending_sizing_mode().is_normal(),
             is_above: self.synoik.layout.is_window_above(window),
             workspace_left: ws_idx > 0,
             workspace_right: ws_idx + 1 < ws_count,
@@ -3189,6 +3394,20 @@ impl State {
                 if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
                     self.synoik.layout.raise_or_lower_window(&window);
                     self.synoik.queue_redraw_all();
+                }
+            }
+            // `handle_begin_move` / `handle_begin_resize` (`keybindings.c:2194-2244`): a
+            // keyboard grab on the focused window, ended by Escape or any key that is not an
+            // arrow. Both are gated the way mutter gates them, on the window still owning its
+            // own geometry.
+            Action::BeginWindowMove => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.begin_keyboard_window_grab(window, GrabKind::Move);
+                }
+            }
+            Action::BeginWindowResize => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.begin_keyboard_window_grab(window, GrabKind::Resize);
                 }
             }
             // `handle_activate_window_menu` (`keybindings.c:1999-2021`): the focused window's
@@ -7411,6 +7630,13 @@ impl State {
             return;
         }
 
+        // A click ends a keyboard grab, and is then handled normally. mutter has no rule for
+        // this because its keyboard grab holds the pointer too; ours does not, so without it a
+        // click on another window would leave the grab driving an unfocused one.
+        if button_state == ButtonState::Pressed && self.synoik.keyboard_window_grab.is_some() {
+            self.end_keyboard_window_grab();
+        }
+
         // End any quick-settings volume-slider drag on button release (the press that
         // started it is suppressed below, so handle it before that early return).
         if button_state == ButtonState::Released && self.synoik.panel_popover.end_drag() {
@@ -10195,6 +10421,8 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::Raise => Action::RaiseWindow,
         GnomeKeyAction::Lower => Action::LowerWindow,
         GnomeKeyAction::RaiseOrLower => Action::RaiseOrLowerWindow,
+        GnomeKeyAction::BeginMove => Action::BeginWindowMove,
+        GnomeKeyAction::BeginResize => Action::BeginWindowResize,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
             Action::FocusWorkspace(WorkspaceReference::Index(n))

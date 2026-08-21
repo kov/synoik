@@ -140,6 +140,7 @@ use crate::frame_clock::{Dispatch, FrameClock};
 use crate::frame_log::{AnimCauses, FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
+use crate::input::keyboard_window_grab::KeyboardWindowGrab;
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::pressure::{Barrier, Edge, Segment};
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
@@ -905,6 +906,10 @@ pub struct Synoik {
     pub app_grid_pan: Option<AppGridPan>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
+    /// The running keyboard move or resize grab, if any — see
+    /// [`crate::input::keyboard_window_grab`].
+    pub keyboard_window_grab: Option<KeyboardWindowGrab>,
+    pub grab_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -3028,6 +3033,16 @@ impl State {
         // over whatever the focus fell back to (`windowMenu.js:235-237`).
         if self.synoik.panel_popover.close_window_menu_for(id) {
             self.synoik.queue_redraw_all();
+        }
+        // Same for a keyboard move or resize grab: there is nothing left to drag, and the grab
+        // would keep swallowing every key.
+        if self
+            .synoik
+            .keyboard_window_grab
+            .as_ref()
+            .is_some_and(|grab| grab.id == id)
+        {
+            self.end_keyboard_window_grab();
         }
     }
 
@@ -7814,6 +7829,8 @@ impl Synoik {
             app_grid_pan: None,
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
+            keyboard_window_grab: Option::default(),
+            grab_repeat_timer: Option::default(),
             presentation_state,
             security_context_state,
             gamma_control_manager_state,

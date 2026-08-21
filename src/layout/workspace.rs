@@ -1092,6 +1092,11 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.raise_or_lower(id)
     }
 
+    /// See [`FloatingSpace::nudge_window`].
+    pub fn nudge_window(&mut self, id: &W::Id, amount: Point<f64, Logical>) -> bool {
+        self.floating.nudge_window(id, amount)
+    }
+
     /// See [`FloatingSpace::raise_window_only`].
     pub fn raise_window_only(&mut self, id: &W::Id) -> bool {
         self.floating.raise_window_only(id)

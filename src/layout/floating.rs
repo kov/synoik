@@ -1815,6 +1815,20 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
+    /// Move `id` by `amount`, with no animation and no constraint — the keyboard move grab's
+    /// step. mutter's keyboard path calls `meta_window_move_frame` directly rather than going
+    /// through the pointer drag, and passes `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED`
+    /// (`keybindings.c:2194-2218`), so the window may be walked off the edge.
+    pub fn nudge_window(&mut self, id: &W::Id, amount: Point<f64, Logical>) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let new_pos = self.data[idx].logical_pos + amount;
+        self.move_to(idx, new_pos, false);
+        true
+    }
+
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
         if self.interactive_resize.is_some() {
             return false;

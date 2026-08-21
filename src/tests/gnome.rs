@@ -7185,6 +7185,8 @@ fn the_window_menu_offers_the_rows_the_window_has() {
             "Take Screenshot",
             "Hide",
             "Maximize",
+            "Move",
+            "Resize",
             "Always on Top",
             "Move to Workspace Right",
             "Close"
@@ -31838,5 +31840,266 @@ fn raise_or_lower_ignores_coverage_from_another_band() {
         vec![a.clone(), b.clone(), c.clone()],
         "the always-on-top window overlapping it is in another band, so it does not count as \
          cover — c is already as high as it goes and comes down"
+    );
+}
+
+/// Settle, then ack whatever configure came out of it, if it named a size. Reading the queue
+/// drains it, so this cannot be layered over `take_the_configured_size`; and a window that has
+/// been asked for nothing since it mapped still has only its "you choose" 0x0 configure, which is
+/// a protocol error to ack.
+fn settle_at_the_configured_size(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    f.settle();
+    f.double_roundtrip(id);
+    let size = f
+        .client(id)
+        .window(surface)
+        .recent_configures()
+        .last()
+        .map(|configure| configure.size);
+    let Some((w, h)) = size.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return;
+    };
+    let window = f.client(id).window(surface);
+    window.attach_new_buffer();
+    window.set_size(w as u16, h as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+}
+
+/// The focused window's rect within the workspace view: x, y, width, height.
+fn focused_window_rect(f: &mut Fixture) -> (f64, f64, f64, f64) {
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().id();
+    let ws = synoik.layout.active_workspace().unwrap();
+    let (tile, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == focused)
+        .unwrap();
+    let size = tile.window_size();
+    (pos.x, pos.y, size.w, size.h)
+}
+
+/// The keyboard move grab walks the window by mutter's increments: ten pixels an arrow,
+/// one under Ctrl (`NORMAL_INCREMENT` / `SMALL_INCREMENT`, `meta-window-drag.c:650-657`).
+/// Pressing the modifier must not end the grab — `process_keyboard_move_grab` returns early
+/// for `is_modifier`, and without that reaching for Ctrl to slow the step down would cancel
+/// the drag instead.
+#[test]
+fn a_keyboard_move_steps_by_ten_and_by_one_under_ctrl() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let (x0, y0, _, _) = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowMove, false);
+
+    tap(&mut f, KEY_RIGHT);
+    let (x1, y1, _, _) = focused_window_rect(&mut f);
+    assert_eq!(
+        (x1 - x0, y1 - y0),
+        (10., 0.),
+        "a plain arrow is NORMAL_INCREMENT"
+    );
+
+    f.key_press(KEY_LEFTCTRL);
+    tap(&mut f, KEY_DOWN);
+    f.key_release(KEY_LEFTCTRL);
+    let (x2, y2, _, _) = focused_window_rect(&mut f);
+    assert_eq!(
+        (x2 - x1, y2 - y1),
+        (0., 1.),
+        "Ctrl is SMALL_INCREMENT, and pressing it did not end the grab"
+    );
+    assert!(
+        f.synoik().keyboard_window_grab.is_some(),
+        "only Escape or a non-arrow key ends the grab"
+    );
+}
+
+/// Escape ends the keyboard move and puts the window back exactly where it was
+/// (`meta-window-drag.c:659-681`, restoring `initial_window_pos`).
+#[test]
+fn escape_puts_a_keyboard_moved_window_back_where_it_started() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let start = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowMove, false);
+
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_DOWN);
+    let moved = focused_window_rect(&mut f);
+    assert_ne!(moved, start, "the window did move first");
+
+    tap(&mut f, KEY_ESC);
+    assert_eq!(focused_window_rect(&mut f), start);
+    assert!(f.synoik().keyboard_window_grab.is_none(), "Escape ends it");
+}
+
+/// Any key that is not an arrow commits the move and ends the grab, and is swallowed doing it —
+/// `process_key_event` ends the drag on an unhandled key (`meta-window-drag.c:1170-1204`).
+#[test]
+fn a_key_that_is_not_an_arrow_commits_the_keyboard_move() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let (x0, _, _, _) = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowMove, false);
+
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_A);
+    assert!(
+        f.synoik().keyboard_window_grab.is_none(),
+        "any other key ends it"
+    );
+
+    let (x1, _, _, _) = focused_window_rect(&mut f);
+    assert_eq!(x1 - x0, 10., "the move it had made stands");
+
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(
+        focused_window_rect(&mut f).0,
+        x1,
+        "with the grab gone the arrows are nobody's"
+    );
+}
+
+/// The first arrow of a keyboard resize only picks the edge — mutter starts in
+/// `RESIZING_UNKNOWN` and `process_keyboard_resize_grab_op_change` consumes the press that
+/// chooses one (`meta-window-drag.c:750-870`).
+#[test]
+fn the_first_arrow_of_a_keyboard_resize_only_picks_the_edge() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let start = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowResize, false);
+
+    tap(&mut f, KEY_RIGHT);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    assert_eq!(
+        focused_window_rect(&mut f),
+        start,
+        "the op change resizes nothing"
+    );
+
+    tap(&mut f, KEY_RIGHT);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    let (x, y, w, h) = focused_window_rect(&mut f);
+    assert_eq!(
+        (x, y, w - start.2, h - start.3),
+        (start.0, start.1, 10., 0.),
+        "the east edge moved out by one increment, and nothing else did"
+    );
+}
+
+/// An arrow across the current edge's axis moves the grab to that edge instead of resizing, and
+/// resizing from the new edge takes the position with it — the west edge's gravity is east
+/// (`process_keyboard_resize_grab_op_change`, and `meta_resize_gravity_from_grab_op`).
+#[test]
+fn an_arrow_across_the_axis_moves_the_keyboard_resize_to_that_edge() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let start = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowResize, false);
+
+    // Down picks the south edge, the second Down moves it.
+    tap(&mut f, KEY_DOWN);
+    tap(&mut f, KEY_DOWN);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    let grown = focused_window_rect(&mut f);
+    assert_eq!(
+        (grown.0, grown.1, grown.2, grown.3 - start.3),
+        (start.0, start.1, start.2, 10.),
+        "the south edge grows downwards, leaving the top-left alone"
+    );
+
+    // Left switches to the west edge without resizing; the next Left drags it.
+    tap(&mut f, KEY_LEFT);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    assert_eq!(
+        focused_window_rect(&mut f),
+        grown,
+        "the switch resizes nothing"
+    );
+
+    tap(&mut f, KEY_LEFT);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    let widened = focused_window_rect(&mut f);
+    assert_eq!(
+        (
+            widened.0 - grown.0,
+            widened.1,
+            widened.2 - grown.2,
+            widened.3
+        ),
+        (-10., grown.1, 10., grown.3),
+        "the west edge grows leftwards: the window gets wider and its left edge moves"
+    );
+}
+
+/// Escape ends the resize at the size it started from (`meta-window-drag.c:946-957`).
+#[test]
+fn escape_restores_the_size_a_keyboard_resize_started_from() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let start = focused_window_rect(&mut f);
+    f.synoik_state().do_action(Action::BeginWindowResize, false);
+
+    tap(&mut f, KEY_DOWN);
+    tap(&mut f, KEY_DOWN);
+    tap(&mut f, KEY_DOWN);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    assert_ne!(focused_window_rect(&mut f), start, "it did resize first");
+
+    tap(&mut f, KEY_ESC);
+    settle_at_the_configured_size(&mut f, id, &surface);
+    assert_eq!(focused_window_rect(&mut f), start);
+    assert!(f.synoik().keyboard_window_grab.is_none(), "Escape ends it");
+}
+
+/// Neither grab starts on a window that does not own its own geometry: mutter gates both on
+/// `has_move_func` / `has_resize_func` (`keybindings.c:2194-2244`), and the window menu's Move
+/// and Resize rows are drawn insensitive for the same reason.
+#[test]
+fn a_keyboard_grab_is_refused_on_a_maximized_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().synoik.layout.set_maximized(&window, true);
+    f.settle();
+
+    f.synoik_state().do_action(Action::BeginWindowMove, false);
+    assert!(
+        f.synoik().keyboard_window_grab.is_none(),
+        "a maximized window cannot be moved"
+    );
+    f.synoik_state().do_action(Action::BeginWindowResize, false);
+    assert!(f.synoik().keyboard_window_grab.is_none(), "nor resized");
+
+    open_window_menu_at_corner(&mut f);
+    let menu = f.synoik().panel_popover.window_menu().expect("a menu");
+    assert_eq!(
+        menu.disabled_labels(),
+        vec!["Move", "Resize", "Always on Top"],
+        "the rows say so too"
     );
 }

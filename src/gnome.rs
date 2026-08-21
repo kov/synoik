@@ -1049,6 +1049,12 @@ pub enum GnomeKeyAction {
     /// `raise-or-lower`: raise if covered, else lower (`handle_raise_or_lower`,
     /// `keybindings.c:2359-2402`).
     RaiseOrLower,
+    /// `begin-move` (`<Alt>F7`): start the keyboard move grab on the focused window
+    /// (`handle_begin_move`, `keybindings.c:2194-2218`).
+    BeginMove,
+    /// `begin-resize` (`<Alt>F8`): start the keyboard resize grab (`handle_begin_resize`,
+    /// `keybindings.c:2220-2244`).
+    BeginResize,
     /// `activate-window-menu` (`<Alt>space`): pop the focused window's own menu, anchored on its
     /// top-left (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
     ActivateWindowMenu,
@@ -1228,6 +1234,8 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
         ("raise".to_owned(), Raise, strs(&[])),
         ("lower".to_owned(), Lower, strs(&[])),
         ("raise-or-lower".to_owned(), RaiseOrLower, strs(&[])),
+        ("begin-move".to_owned(), BeginMove, strs(&["<Alt>F7"])),
+        ("begin-resize".to_owned(), BeginResize, strs(&["<Alt>F8"])),
         (
             "activate-window-menu".to_owned(),
             ActivateWindowMenu,

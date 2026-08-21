@@ -198,6 +198,12 @@ pub enum Action {
     /// `raise-or-lower`: raise the focused window if something covers it, else lower it
     /// (`handle_raise_or_lower`, `keybindings.c:2359-2402`).
     RaiseOrLowerWindow,
+    /// `begin-move`: start the keyboard move grab on the focused window
+    /// (`handle_begin_move`, `keybindings.c:2194-2218`).
+    BeginWindowMove,
+    /// `begin-resize`: start the keyboard resize grab on the focused window
+    /// (`handle_begin_resize`, `keybindings.c:2220-2244`).
+    BeginWindowResize,
     FullscreenWindow,
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,
