@@ -86,6 +86,12 @@ along, so a sticky window you were using is still the focused one when the switc
 carried window can empty the workspace it left, and the dynamic-workspace cull then reindexes, so
 the target is re-found by `WorkspaceId` afterwards.
 
+**Both ways of switching carry.** `workspace_switch_gesture_end` sets the active workspace itself
+rather than going through `activate_workspace`, so a three-finger swipe needs the carry of its
+own; without it a swipe strands the window. Nothing is culled underneath that one — a
+`move_to_workspace` skips the cleanup while a switch is running — so the landing index stays
+valid across it.
+
 **The flag is on the tile**, like `is_above`, so it rides `RemovedTile` through a minimize or a
 workspace move. **Membership is derived**: a window is carried if it is flagged *or* any ancestor
 of it is. mutter stores the flag on each transient at stick time (`stick_foreach_func`), which

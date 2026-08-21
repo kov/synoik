@@ -863,7 +863,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// Move every sticky window onto the workspace with `target_id`. Returns the one that had
-    /// the focus, if a carried window did — see `docs/fork/sticky-windows-port.md`.
+    /// the focus, if a carried window did — see `docs/fork/window-menu-port.md`.
     fn carry_sticky_to(&mut self, target_id: WorkspaceId) -> Option<W::Id> {
         let was_active = self.active_window().map(|win| win.id().clone());
         let carried: Vec<W::Id> = self
@@ -4249,14 +4249,27 @@ impl<W: LayoutElement> Monitor<W> {
 
         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
 
+        let current_idx = gesture.current_idx;
+
+        // A swipe lands on a workspace the same way a keybinding does, so the sticky windows come
+        // along here too. Nothing can be culled underneath us: `move_to_workspace` skips the
+        // cleanup while a switch is running, so `new_idx` still names the same workspace after.
+        let mut keep_focus = None;
         if self.active_workspace_idx != new_idx {
+            let target_id = self.workspaces[new_idx].id();
+            keep_focus = self.carry_sticky_to(target_id);
             self.previous_workspace_id = Some(self.workspaces[self.active_workspace_idx].id());
         }
 
         self.active_workspace_idx = new_idx;
+
+        if let Some(id) = keep_focus {
+            self.workspaces[new_idx].activate_window(&id);
+        }
+
         self.workspace_switch = Some(WorkspaceSwitch::Animation(Animation::new(
             self.clock.clone(),
-            gesture.current_idx,
+            current_idx,
             new_idx as f64,
             velocity,
             self.options.animations.workspace_switch.0,

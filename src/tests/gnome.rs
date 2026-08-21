@@ -32337,3 +32337,40 @@ fn the_windows_that_are_not_sticky_stay_where_they_are() {
         "the window that was not stuck did not come along"
     );
 }
+
+/// A three-finger swipe lands on a workspace the same way a keybinding does, and the sticky
+/// window has to come along on that path too — the gesture sets the active workspace itself
+/// rather than going through `activate_workspace`.
+#[test]
+fn a_sticky_window_follows_a_swipe_to_the_next_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    assert!(f
+        .synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, true));
+
+    let layout = &mut f.synoik_state().synoik.layout;
+    layout.workspace_switch_gesture_begin(&out, true);
+    layout.workspace_switch_gesture_update(400., Duration::from_millis(50), true);
+    layout.workspace_switch_gesture_end(Some(true));
+    f.synoik_complete_animations();
+    f.settle();
+
+    assert_eq!(
+        active_workspace_index(&mut f),
+        1,
+        "the swipe moved us off the first workspace"
+    );
+    assert_eq!(
+        workspace_index_of(&mut f, &window),
+        active_workspace_index(&mut f),
+        "the window came along with the swipe"
+    );
+}
