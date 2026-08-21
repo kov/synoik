@@ -125,6 +125,21 @@ pub struct Tile<W: LayoutElement> {
     /// `FloatingSpace::is_in_above_band`, which also carves out maximized windows.
     pub(super) is_above: bool,
 
+    /// Always on Visible Workspace: mutter's `on_all_workspaces_requested`
+    /// (`window_stick_impl`, `window.c:5271-5299`).
+    ///
+    /// On the tile for the same reason `is_above` is, and derived the same way: a window is
+    /// carried between workspaces if it is flagged *or* an ancestor of it is, so a dialog that
+    /// maps after the stick is sticky too — which storing the flag on the transients, as mutter
+    /// does, would miss.
+    pub(super) is_sticky: bool,
+
+    /// The workspace the tile was on when it was stuck, so unsticking puts it back. mutter keeps
+    /// `window->workspaces` untouched across a stick for exactly this
+    /// (`window.c:5279-5282`); the window vanishing from the current view on unstick is the
+    /// behavior, not a bug. `None` once that workspace is gone, and the tile stays put.
+    pub(super) sticky_home: Option<super::workspace::WorkspaceId>,
+
     /// Currently selected preset width index when this tile is floating.
     pub(super) floating_preset_width_idx: Option<usize>,
 
@@ -346,6 +361,8 @@ impl<W: LayoutElement> Tile<W> {
             restore_in_flight: None,
             saved_maximize: false,
             is_above: false,
+            is_sticky: false,
+            sticky_home: None,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
             open_animation: None,

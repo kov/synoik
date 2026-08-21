@@ -7188,6 +7188,7 @@ fn the_window_menu_offers_the_rows_the_window_has() {
             "Move",
             "Resize",
             "Always on Top",
+            "Always on Visible Workspace",
             "Move to Workspace Right",
             "Close"
         ],
@@ -32101,5 +32102,238 @@ fn a_keyboard_grab_is_refused_on_a_maximized_window() {
         menu.disabled_labels(),
         vec!["Move", "Resize", "Always on Top"],
         "the rows say so too"
+    );
+}
+
+/// Which workspace of the only monitor holds `window`, by index.
+fn workspace_index_of(f: &mut Fixture, window: &smithay::desktop::Window) -> usize {
+    f.synoik()
+        .layout
+        .workspaces()
+        .position(|(_, _, ws)| ws.holds_window(window))
+        .expect("the window is on some workspace")
+}
+
+/// The index of the active workspace on the only monitor.
+fn active_workspace_index(f: &mut Fixture) -> usize {
+    let active = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik()
+        .layout
+        .workspaces()
+        .position(|(_, _, ws)| ws.id() == active)
+        .unwrap()
+}
+
+/// A stuck window comes along to whichever workspace you switch to — `meta_window_stick`
+/// (`window.c:5333-5346`), which is what Always on Visible Workspace means.
+#[test]
+fn a_sticky_window_follows_you_to_the_next_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f
+        .synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, true));
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    assert_eq!(
+        workspace_index_of(&mut f, &window),
+        active_workspace_index(&mut f),
+        "the window is on whatever workspace you are looking at"
+    );
+}
+
+/// Unsticking puts the window back on the workspace it was stuck on, even when that is not the
+/// one you are looking at. mutter never touches `window->workspaces` across a stick precisely so
+/// this reverts exactly (`window.c:5279-5299`).
+#[test]
+fn unsticking_sends_the_window_back_to_the_workspace_it_was_stuck_on() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let home = workspace_index_of(&mut f, &window);
+
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, true);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    f.settle();
+    assert_ne!(workspace_index_of(&mut f, &window), home, "it did travel");
+
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    assert_eq!(workspace_index_of(&mut f, &window), home);
+    assert_ne!(
+        workspace_index_of(&mut f, &window),
+        active_workspace_index(&mut f),
+        "and it is gone from the workspace you are on, which is the behavior"
+    );
+}
+
+/// A dialog rides its sticky parent even when it maps after the stick. mutter stores the flag on
+/// each transient at stick time (`stick_foreach_func`) and so misses this one; deriving
+/// membership from the transient chain does not.
+#[test]
+fn a_dialog_that_maps_after_the_stick_rides_along() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let parent = map_window_sized(&mut f, id, (800, 600), None);
+    let parent_window = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&parent_window, true);
+
+    let _dialog = map_window_sized(&mut f, id, (300, 200), Some(&parent));
+    let dialog_window = f.synoik().layout.focus().unwrap().window.clone();
+    assert_ne!(dialog_window, parent_window, "the dialog took the focus");
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    let active = active_workspace_index(&mut f);
+    assert_eq!(workspace_index_of(&mut f, &parent_window), active);
+    assert_eq!(
+        workspace_index_of(&mut f, &dialog_window),
+        active,
+        "the dialog is sticky because its parent is, not because it was flagged"
+    );
+}
+
+/// A sticky window that had the focus keeps it across the switch — it is the window you were
+/// using and it is still on screen. The workspace it lands on has a window of its own, so the
+/// focus has something to lose to.
+#[test]
+fn a_focused_sticky_window_keeps_the_focus_across_the_switch() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // A window waiting one workspace down, and the view back up on the sticky one.
+    let _resident = map_window_sized(&mut f, id, (800, 600), None);
+    let resident = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+    f.settle();
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, true);
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    assert_eq!(
+        workspace_index_of(&mut f, &resident),
+        active_workspace_index(&mut f),
+        "the resident is the one we switched to"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().map(|m| m.window.clone()),
+        Some(window),
+        "the focus stayed on the window that came along, not the one already there"
+    );
+}
+
+/// The menu ticks the row and drops the Move to Workspace rows: a window on every workspace has
+/// nowhere to be moved to, which is why gnome-shell builds them inside `if (!isSticky)`
+/// (`windowMenu.js:116`).
+#[test]
+fn a_sticky_window_has_nowhere_to_be_moved_to() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+
+    open_window_menu_at_corner(&mut f);
+    let before = f
+        .synoik()
+        .panel_popover
+        .window_menu()
+        .unwrap()
+        .labels()
+        .len();
+    assert!(
+        f.synoik()
+            .panel_popover
+            .window_menu()
+            .unwrap()
+            .labels()
+            .contains(&"Move to Workspace Right"),
+        "an ordinary window has somewhere to go"
+    );
+    f.synoik_state().synoik.panel_popover.close();
+
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&window, true);
+    open_window_menu_at_corner(&mut f);
+    let menu = f.synoik().panel_popover.window_menu().unwrap();
+    assert!(!menu.labels().contains(&"Move to Workspace Right"));
+    assert!(menu.labels().len() < before);
+}
+
+/// Only the sticky window travels. Everything else stays on the workspace it was on — which is
+/// the whole point of the flag being per-window.
+#[test]
+fn the_windows_that_are_not_sticky_stay_where_they_are() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let stay = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let travel = f.synoik().layout.focus().unwrap().window.clone();
+
+    let home = workspace_index_of(&mut f, &stay);
+    f.synoik_state()
+        .synoik
+        .layout
+        .set_window_sticky(&travel, true);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    let active = active_workspace_index(&mut f);
+    assert_ne!(active, home, "the switch went somewhere");
+    assert_eq!(workspace_index_of(&mut f, &travel), active);
+    assert_eq!(
+        workspace_index_of(&mut f, &stay),
+        home,
+        "the window that was not stuck did not come along"
     );
 }

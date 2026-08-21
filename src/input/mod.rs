@@ -2173,6 +2173,12 @@ impl State {
                     self.begin_keyboard_window_grab(window, GrabKind::Resize);
                 }
             }
+            PopoverAction::WindowSetSticky { window, sticky } => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.synoik.layout.set_window_sticky(&window, sticky);
+                    self.synoik.queue_redraw_all();
+                }
+            }
             PopoverAction::WindowSetAlwaysOnTop { window, above } => {
                 if let Some(window) = self.window_by_id(window) {
                     self.synoik.layout.set_window_above(&window, above);
@@ -2741,6 +2747,7 @@ impl State {
             is_maximized: mapped.pending_sizing_mode().is_maximized(),
             is_normal_size: mapped.pending_sizing_mode().is_normal(),
             is_above: self.synoik.layout.is_window_above(window),
+            is_sticky: self.synoik.layout.is_window_sticky(window),
             workspace_left: ws_idx > 0,
             workspace_right: ws_idx + 1 < ws_count,
             monitor_up: self.synoik.output_up_of(&output).is_some(),
@@ -3408,6 +3415,14 @@ impl State {
             Action::BeginWindowResize => {
                 if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
                     self.begin_keyboard_window_grab(window, GrabKind::Resize);
+                }
+            }
+            // `handle_toggle_on_all_workspaces` (`keybindings.c:2245-2255`).
+            Action::ToggleWindowOnAllWorkspaces => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    let sticky = self.synoik.layout.is_window_sticky(&window);
+                    self.synoik.layout.set_window_sticky(&window, !sticky);
+                    self.synoik.queue_redraw_all();
                 }
             }
             // `handle_activate_window_menu` (`keybindings.c:1999-2021`): the focused window's
@@ -10423,6 +10438,7 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::RaiseOrLower => Action::RaiseOrLowerWindow,
         GnomeKeyAction::BeginMove => Action::BeginWindowMove,
         GnomeKeyAction::BeginResize => Action::BeginWindowResize,
+        GnomeKeyAction::ToggleOnAllWorkspaces => Action::ToggleWindowOnAllWorkspaces,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
             Action::FocusWorkspace(WorkspaceReference::Index(n))

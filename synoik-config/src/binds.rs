@@ -204,6 +204,9 @@ pub enum Action {
     /// `begin-resize`: start the keyboard resize grab on the focused window
     /// (`handle_begin_resize`, `keybindings.c:2220-2244`).
     BeginWindowResize,
+    /// `toggle-on-all-workspaces`: stick or unstick the focused window
+    /// (`handle_toggle_on_all_workspaces`, `keybindings.c:2245-2255`).
+    ToggleWindowOnAllWorkspaces,
     FullscreenWindow,
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,

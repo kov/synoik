@@ -270,6 +270,11 @@ pub enum PopoverAction {
         window: crate::window::mapped::MappedId,
         above: bool,
     },
+    /// The window menu's Always on Visible Workspace (`windowMenu.js:105-114`).
+    WindowSetSticky {
+        window: crate::window::mapped::MappedId,
+        sticky: bool,
+    },
     /// The window menu's "Move to Workspace Left" / "Right" (`windowMenu.js:110-135`).
     WindowMoveToWorkspace {
         window: crate::window::mapped::MappedId,
@@ -342,6 +347,7 @@ impl PopoverAction {
                 | PopoverAction::WindowBeginMove(_)
                 | PopoverAction::WindowBeginResize(_)
                 | PopoverAction::WindowSetAlwaysOnTop { .. }
+                | PopoverAction::WindowSetSticky { .. }
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }
                 | PopoverAction::WindowClose(_)

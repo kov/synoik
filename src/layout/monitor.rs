@@ -797,9 +797,22 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn activate_workspace_with_anim_config(
         &mut self,
-        idx: usize,
+        mut idx: usize,
         config: Option<synoik_config::Animation>,
     ) {
+        // The sticky windows come along, and they move before anything else does: the carry reads
+        // the *outgoing* workspace's active window to decide whether the focus travels with them.
+        // Moving a window out can cull the workspace it left, so the target is re-found by id.
+        let mut keep_focus = None;
+        if idx != self.active_workspace_idx {
+            let target_id = self.workspaces[idx].id();
+            keep_focus = self.carry_sticky_to(target_id);
+            let Some(found) = self.workspaces.iter().position(|ws| ws.id() == target_id) else {
+                return;
+            };
+            idx = found;
+        }
+
         // FIXME: also compute and use current velocity.
         let current_idx = self.workspace_render_idx();
 
@@ -809,6 +822,12 @@ impl<W: LayoutElement> Monitor<W> {
 
         let prev_active_idx = self.active_workspace_idx;
         self.active_workspace_idx = idx;
+
+        // A sticky window that had the focus keeps it. Activating it on its new workspace rather
+        // than through `activate_workspace` avoids re-entering this function.
+        if let Some(id) = keep_focus {
+            self.workspaces[idx].activate_window(&id);
+        }
 
         let config = config.unwrap_or(self.options.animations.workspace_switch.0);
 
@@ -841,6 +860,74 @@ impl<W: LayoutElement> Monitor<W> {
                 )));
             }
         }
+    }
+
+    /// Move every sticky window onto the workspace with `target_id`. Returns the one that had
+    /// the focus, if a carried window did — see `docs/fork/sticky-windows-port.md`.
+    fn carry_sticky_to(&mut self, target_id: WorkspaceId) -> Option<W::Id> {
+        let was_active = self.active_window().map(|win| win.id().clone());
+        let carried: Vec<W::Id> = self
+            .workspaces
+            .iter()
+            .filter(|ws| ws.id() != target_id)
+            .flat_map(|ws| ws.sticky_window_ids())
+            .collect();
+
+        let mut keep_focus = None;
+        for id in carried {
+            if Some(&id) == was_active.as_ref() {
+                keep_focus = Some(id.clone());
+            }
+            let Some(idx) = self.workspaces.iter().position(|ws| ws.id() == target_id) else {
+                break;
+            };
+            self.move_to_workspace(Some(&id), idx, ActivateWindow::No);
+        }
+        keep_focus
+    }
+
+    /// Set or clear Always on Visible Workspace. Unsticking sends the window — and whatever rode
+    /// along with it — back to the workspace it was stuck on, which is mutter's behavior and can
+    /// take it out of the current view (`window_unstick_impl`, `window.c:5288-5299`).
+    pub fn set_window_sticky(&mut self, window: &W::Id, sticky: bool) -> bool {
+        let Some(ws_idx) = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.holds_window(window))
+        else {
+            return false;
+        };
+
+        if sticky {
+            return self.workspaces[ws_idx].set_sticky(window, true);
+        }
+
+        let home = self.workspaces[ws_idx].sticky_home(window);
+        let before = self.workspaces[ws_idx].sticky_window_ids();
+        if !self.workspaces[ws_idx].set_sticky(window, false) {
+            return false;
+        }
+        // Whatever stopped being sticky is what goes home: the window, and the dialogs that were
+        // only sticky because of it.
+        let after = self.workspaces[ws_idx].sticky_window_ids();
+        let leaving: Vec<W::Id> = before
+            .into_iter()
+            .filter(|id| !after.contains(id))
+            .collect();
+
+        let Some(home) = home else {
+            return true;
+        };
+        for id in leaving {
+            let Some(idx) = self.workspaces.iter().position(|ws| ws.id() == home) else {
+                break;
+            };
+            if idx == ws_idx {
+                break;
+            }
+            self.move_to_workspace(Some(&id), idx, ActivateWindow::No);
+        }
+        true
     }
 
     pub(super) fn resolve_add_window_target<'a>(

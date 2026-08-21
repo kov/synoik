@@ -53,8 +53,13 @@ Built in GNOME's order, each shown only when its target exists — the neighbour
   (`meta_window_get_default_layer`, `window.c:6416-6432`), so an enabled row would promise an
   effect it does not have. gnome-shell's three other disabling cases are X11 window types that
   xdg-shell has no equivalent of. See "The always-on-top band" below.
+- **Always on Visible Workspace** — `stick` / `unstick` (`windowMenu.js:105-114`), ticked when
+  set. gnome-shell's one disabling case, `is_always_on_all_workspaces()`, is a window type
+  xdg-shell has no equivalent of. See "Sticky windows" below.
 - **Move to Workspace Left / Right** — GNOME's horizontal workspace axis is our vertical one, the
-  same mapping `move-to-workspace-left` → `MoveWindowToWorkspaceUp` already uses.
+  same mapping `move-to-workspace-left` → `MoveWindowToWorkspaceUp` already uses. **Not shown for
+  a sticky window**: it is on every workspace already, so there is nowhere to move it to, which
+  is why gnome-shell builds these rows inside `if (!isSticky)` (`windowMenu.js:116`).
 - **Move to Monitor Up / Down / Left / Right**.
 - **Close**.
 
@@ -66,21 +71,40 @@ the focus fell back to.
 The menu comes up with its first row focused (`navigate_focus TAB_FORWARD`, `windowMenu.js:247`),
 and takes Up/Down/Tab, Enter/Space and Escape. It is the only popover with a keyboard way in, which
 is why it is the only one with key navigation; the pointer-summoned menus (app, indicator) get it
-when they get a keyboard trigger.
+when they get a keyboard trigger. Every row gnome-shell builds is built.
 
-## Not built
+## Sticky windows
 
-Each of these is missing a *subsystem*, not a per-window capability, so they are omitted rather
-than drawn permanently insensitive: GNOME dims a row when `can_minimize()` is false for *this*
-window, and a row that could never enable teaches the reader nothing. In the order they appear in
-`_buildMenu`:
+`stick` / `unstick` (`window.c:5333-5359`), a **carry**: the window is moved onto whichever
+workspace you switch to, rather than drawn on all of them. That keeps the single-owner answer to
+"which workspace holds this window" — the `has_window` / `holds_window` pair — which a
+draw-everywhere model would give two answers to.
 
-| Row | Needs |
-|---|---|
-| Always on Visible Workspace | sticky windows — `stick` / `unstick` |
+The carry runs at the top of `Monitor::activate_workspace_with_anim_config`, before anything else
+moves: it reads the *outgoing* workspace's active window to decide whether the focus travels
+along, so a sticky window you were using is still the focused one when the switch lands. A
+carried window can empty the workspace it left, and the dynamic-workspace cull then reindexes, so
+the target is re-found by `WorkspaceId` afterwards.
 
-That one is also a `deferred` row in `docs/fork/keybindings-port.md`
-(`toggle-on-all-workspaces`); landing the subsystem there adds its row here.
+**The flag is on the tile**, like `is_above`, so it rides `RemovedTile` through a minimize or a
+workspace move. **Membership is derived**: a window is carried if it is flagged *or* any ancestor
+of it is. mutter stores the flag on each transient at stick time (`stick_foreach_func`), which
+misses the dialog that maps after the stick; deriving it does not. Minimized windows are left out
+— they are parked rather than laid out, and there is nothing on screen to carry.
+
+**Unsticking sends the window home**, to the workspace it was stuck on, and can therefore take it
+out of the view you are in. That is the behavior, not a bug: mutter deliberately leaves
+`window->workspaces` untouched across a stick so the revert is exact (`window.c:5279-5299`). The
+home is a `WorkspaceId`, never an index — dynamic workspaces cull, and an index would name a
+different workspace by the time it was read. A home that no longer exists is no home, and the
+window stays put. Whatever rode along with the window goes home with it: the set that leaves is
+the set that stopped being derived-sticky.
+
+**Divergences.** GNOME draws a sticky window in *every* workspace preview in the overview
+(`located_on_workspace` is true everywhere); the carry draws it once, on the active workspace.
+And during the switch animation gnome-shell holds sticky windows in a group that does not move
+(`workspaceAnimation.js`), while ours slides out with the old workspace and back in with the new.
+Sticky is not saved across a session restore, where minimized is; it is a "for now" state.
 
 ## The keyboard grabs
 

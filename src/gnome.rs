@@ -1055,6 +1055,9 @@ pub enum GnomeKeyAction {
     /// `begin-resize` (`<Alt>F8`): start the keyboard resize grab (`handle_begin_resize`,
     /// `keybindings.c:2220-2244`).
     BeginResize,
+    /// `toggle-on-all-workspaces`: stick or unstick the focused window
+    /// (`handle_toggle_on_all_workspaces`, `keybindings.c:2245-2255`). Defaults to nothing.
+    ToggleOnAllWorkspaces,
     /// `activate-window-menu` (`<Alt>space`): pop the focused window's own menu, anchored on its
     /// top-left (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
     ActivateWindowMenu,
@@ -1236,6 +1239,11 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
         ("raise-or-lower".to_owned(), RaiseOrLower, strs(&[])),
         ("begin-move".to_owned(), BeginMove, strs(&["<Alt>F7"])),
         ("begin-resize".to_owned(), BeginResize, strs(&["<Alt>F8"])),
+        (
+            "toggle-on-all-workspaces".to_owned(),
+            ToggleOnAllWorkspaces,
+            strs(&[]),
+        ),
         (
             "activate-window-menu".to_owned(),
             ActivateWindowMenu,

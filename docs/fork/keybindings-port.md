@@ -72,7 +72,7 @@ gsd media keys.
 `switch-applications(-backward)`, `toggle-maximized`, `switch-to-workspace-last`,
 `move-to-workspace-last`, `move-to-monitor-{left,right,up,down}`,
 `switch-input-source(-backward)`, `minimize`, `always-on-top`, `toggle-above`, `raise`,
-`lower`, `raise-or-lower`, `begin-move`, `begin-resize`.
+`lower`, `raise-or-lower`, `begin-move`, `begin-resize`, `toggle-on-all-workspaces`.
 
 `always-on-top` and `toggle-above` are **two settings keys sharing one action**: mutter
 registers both, against handlers that differ only in name (`handle_always_on_top`,
@@ -80,8 +80,9 @@ registers both, against handlers that differ only in name (`handle_always_on_top
 default to nothing, so adopting them costs no default chord — see
 `docs/fork/window-menu-port.md` for what always-on-top means to the stack.
 
-`begin-move` (`<Alt>F7`) and `begin-resize` (`<Alt>F8`) start the keyboard grabs — see
-`docs/fork/window-menu-port.md`, "The keyboard grabs".
+`begin-move` (`<Alt>F7`) and `begin-resize` (`<Alt>F8`) start the keyboard grabs, and
+`toggle-on-all-workspaces` (no default) sticks a window — both in
+`docs/fork/window-menu-port.md`.
 
 `switch-input-source` is a **divergence**: gnome-shell puts up an input-source switcher popup
 for the duration of the modifier hold, and we switch straight away. That popup is the same
@@ -323,7 +324,6 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 |---|---|
 | `show-desktop` | not implemented |
 | `maximize-vertically` / `-horizontally`, `move-to-corner-*`, `move-to-side-*`, `move-to-center` | no half-max / floating-placement infra |
-| `toggle-on-all-workspaces` | no sticky windows |
 | `switch-panels` / `cycle-panels` | no keyboard navigation between shell surfaces |
 | `switch-monitor` / `rotate-monitor` | no display-config switcher OSD |
 | `cancel-input-capture` | no input-capture protocol support |

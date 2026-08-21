@@ -15,8 +15,8 @@
 //!
 //! **Scope.** gnome-shell builds, in order: Take Screenshot, Hide, Maximize/Restore, Move, Resize,
 //! Always on Top, Always on Visible Workspace, Move to Workspace {Left,Right,Up,Down}, a
-//! separator, Move to Monitor {Up,Down,Left,Right}, a separator, and Close. We build the rows
-//! that have a model behind them:
+//! separator, Move to Monitor {Up,Down,Left,Right}, a separator, and Close. All of them are
+//! built:
 //!
 //! - **Take Screenshot** — the window's own pixels, saved and put on the clipboard with a
 //!   notification, and without the pointer (`windowMenu.js:26-36`, whose
@@ -30,6 +30,8 @@
 //!   when the window does not own its own geometry.
 //! - **Always on Top** — `make_above` / `unmake_above` (`windowMenu.js:86-98`), checked when set
 //!   and insensitive while maximized.
+//! - **Always on Visible Workspace** — `stick` / `unstick` (`windowMenu.js:105-114`), checked when
+//!   set. See `docs/fork/window-menu-port.md`.
 //! - **Move to Workspace Left / Right** — only when the neighbour in that direction is a
 //!   *different* workspace, which is what `workspace.get_neighbor(dir) !== workspace` tests
 //!   (`windowMenu.js:110-135`). GNOME's horizontal workspace axis is our vertical one, the same
@@ -38,10 +40,8 @@
 //!   monitor, in GNOME's order (`windowMenu.js:143-181`).
 //! - **Close** (`windowMenu.js:185-189`).
 //!
-//! A row is omitted rather than drawn insensitive when it is missing its *subsystem* rather than
-//! a per-window capability: GNOME dims a row when `can_minimize()` is false for *this* window, and
-//! a row we could never enable is a row that teaches the reader nothing.
-//! `docs/fork/window-menu-port.md` carries what is left and what each one needs.
+//! `docs/fork/window-menu-port.md` carries the stacking, keyboard-grab and sticky models the
+//! rows sit on.
 
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Size};
@@ -96,6 +96,7 @@ enum RowAction {
     BeginMove,
     BeginResize,
     SetAlwaysOnTop(bool),
+    SetSticky(bool),
     MoveToWorkspace(WorkspaceDirection),
     MoveToMonitor(MonitorDirection),
     Close,
@@ -113,6 +114,9 @@ pub struct WindowMenuContext {
     pub is_normal_size: bool,
     /// Ticks the Always on Top row (`window.is_above()`).
     pub is_above: bool,
+    /// Ticks Always on Visible Workspace, and hides the Move to Workspace rows
+    /// (`window.is_on_all_workspaces()`, `windowMenu.js:103-142`).
+    pub is_sticky: bool,
     /// Whether a workspace exists before / after this one on its monitor.
     pub workspace_left: bool,
     pub workspace_right: bool,
@@ -191,14 +195,28 @@ impl WindowMenu {
             }
             MenuEntry::Item(item)
         });
-        if ctx.workspace_left {
+        // Always on Visible Workspace, ticked when set. GNOME's `is_always_on_all_workspaces()`
+        // disabling case is a window type xdg-shell has no equivalent of, so the row is never
+        // insensitive here.
+        state.push({
+            let id = actions.len() as u64;
+            actions.push(RowAction::SetSticky(!ctx.is_sticky));
+            let mut item = MenuItem::new(id, "Always on Visible Workspace");
+            if ctx.is_sticky {
+                item = item.with_ornament(Ornament::Check(true));
+            }
+            MenuEntry::Item(item)
+        });
+        // A sticky window is on every workspace already, so there is nowhere to move it to:
+        // gnome-shell builds these rows inside `if (!isSticky)` (`windowMenu.js:116`).
+        if ctx.workspace_left && !ctx.is_sticky {
             state.push(row(
                 "Move to Workspace Left",
                 RowAction::MoveToWorkspace(WorkspaceDirection::Left),
                 &mut actions,
             ));
         }
-        if ctx.workspace_right {
+        if ctx.workspace_right && !ctx.is_sticky {
             state.push(row(
                 "Move to Workspace Right",
                 RowAction::MoveToWorkspace(WorkspaceDirection::Right),
@@ -326,6 +344,7 @@ impl WindowMenu {
             RowAction::Minimize => PopoverAction::WindowMinimize(window),
             RowAction::BeginMove => PopoverAction::WindowBeginMove(window),
             RowAction::BeginResize => PopoverAction::WindowBeginResize(window),
+            RowAction::SetSticky(sticky) => PopoverAction::WindowSetSticky { window, sticky },
             RowAction::SetAlwaysOnTop(above) => {
                 PopoverAction::WindowSetAlwaysOnTop { window, above }
             }

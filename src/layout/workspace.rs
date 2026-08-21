@@ -1092,6 +1092,66 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.raise_or_lower(id)
     }
 
+    /// Whether `id` carries the Always on Visible Workspace flag itself. For "does it ride a
+    /// workspace switch", which also covers its dialogs, see [`Self::sticky_window_ids`].
+    pub fn is_sticky(&self, id: &W::Id) -> bool {
+        self.tiles()
+            .any(|tile| tile.window().id() == id && tile.is_sticky)
+    }
+
+    /// The workspace `id` was on when it was stuck, if it still remembers one.
+    pub fn sticky_home(&self, id: &W::Id) -> Option<WorkspaceId> {
+        self.tiles()
+            .find(|tile| tile.window().id() == id)
+            .and_then(|tile| tile.sticky_home)
+    }
+
+    /// Set or clear the flag, recording this workspace as the home to revert to. Returns whether
+    /// anything changed.
+    pub fn set_sticky(&mut self, id: &W::Id, sticky: bool) -> bool {
+        let home = self.id();
+        let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
+            return false;
+        };
+        if tile.is_sticky == sticky {
+            return false;
+        }
+        tile.is_sticky = sticky;
+        if sticky {
+            tile.sticky_home = Some(home);
+        }
+        true
+    }
+
+    /// The windows that ride a workspace switch: flagged, or descended from a flagged one.
+    ///
+    /// Derived rather than stored on each transient the way mutter does (`stick_foreach_func`),
+    /// so a dialog that maps *after* its parent was stuck is sticky too. Minimized windows are
+    /// left out: they are parked rather than laid out, and there is nothing on screen to carry.
+    pub fn sticky_window_ids(&self) -> Vec<W::Id> {
+        let tiles: Vec<&Tile<W>> = self.tiles().collect();
+        let mut ids = Vec::new();
+        for (idx, tile) in tiles.iter().enumerate() {
+            let mut current = idx;
+            for _ in 0..tiles.len() {
+                if tiles[current].is_sticky {
+                    if self.has_window(tile.window().id()) {
+                        ids.push(tile.window().id().clone());
+                    }
+                    break;
+                }
+                let win = tiles[current].window();
+                let parent = (0..tiles.len())
+                    .find(|&other| other != current && win.is_child_of(tiles[other].window()));
+                match parent {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+        }
+        ids
+    }
+
     /// See [`FloatingSpace::nudge_window`].
     pub fn nudge_window(&mut self, id: &W::Id, amount: Point<f64, Logical>) -> bool {
         self.floating.nudge_window(id, amount)

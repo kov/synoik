@@ -1879,6 +1879,22 @@ impl<W: LayoutElement> Layout<W> {
         self.workspaces().any(|(_, _, ws)| ws.is_above(window))
     }
 
+    /// Set or clear Always on Visible Workspace — `meta_window_stick` / `meta_window_unstick`
+    /// (`window.c:5333-5359`). Returns whether anything changed.
+    pub fn set_window_sticky(&mut self, window: &W::Id, sticky: bool) -> bool {
+        for mon in self.monitors_mut() {
+            if mon.set_window_sticky(window, sticky) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `window` carries the sticky flag itself.
+    pub fn is_window_sticky(&self, window: &W::Id) -> bool {
+        self.workspaces().any(|(_, _, ws)| ws.is_sticky(window))
+    }
+
     /// Whether `window` is in the floating layout, which is the only one with a stacking order
     /// or a free position.
     pub fn is_window_floating(&self, window: &W::Id) -> bool {
