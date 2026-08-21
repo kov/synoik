@@ -8375,6 +8375,48 @@ fn vulkan_hovered_preview_draws_its_close_button() {
     );
 }
 
+/// A minimized window's picker preview must actually show the window.
+///
+/// It has a slot — the headless tests pin that — but a slot the window does not draw into is a
+/// hole in the grid: space taken, nothing in it, and no way to tell which window it is. Only a
+/// real frame can answer whether the pixels arrive, because every step between the tile and the
+/// screen (the client's buffer, our texture import, the offscreen) can drop them without the
+/// layout noticing.
+#[test]
+fn vulkan_a_minimized_windows_preview_draws_the_window() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.settle_animations();
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
+    f.settle_animations();
+
+    let slot = f
+        .synoik()
+        .layout
+        .expose_target_rect(&win)
+        .expect("a minimized window keeps its picker slot");
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let center = px(
+        &pixels,
+        w,
+        (slot.loc.x + slot.size.w / 2.) as i32,
+        (slot.loc.y + slot.size.h / 2.) as i32,
+    );
+
+    assert!(
+        center[0] < 40 && center[1] > 200 && center[2] < 40,
+        "the middle of a minimized window's slot must be the window, not backdrop: {center:?}"
+    );
+}
+
 /// The overview search bakes through the owned renderer: the entry pill composites an
 /// opaque dark fill, and (with a query + results) the results card draws with the
 /// selected tile washed *lighter* than an unselected one — the `.overview-tile`

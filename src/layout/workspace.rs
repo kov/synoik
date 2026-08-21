@@ -2582,18 +2582,18 @@ impl<W: LayoutElement> Workspace<W> {
         // picker shuffles and snaps back when it lands. A drop's move-back animation did
         // exactly that to every other preview.
         //
-        // A minimized tile has no rect on screen to interpolate from, so it takes the one
-        // gnome-shell gives a window that is not `showing_on_its_workspace`: the work-area
-        // origin at **zero size** (`workspace.js:709-720`). It grows out of that corner into
-        // its slot instead of flying from a position it was never drawn at.
-        let minimized_from = Rectangle::new(self.floating.working_area().loc, Size::default());
+        // A minimized tile has no rect on screen, so it interpolates from the same rect it is
+        // laid out over: the one it had. gnome-shell instead gives a window that is not
+        // `showing_on_its_workspace` the work-area origin at **zero size**
+        // (`workspace.js:709-720`) and fades it in over that. We cannot: this leg interpolates a
+        // *scale*, `slot.size.w / rect.size.w` ([`expose_tile_render`]), so a zero-width `from`
+        // divides by zero and the preview never draws at any progress — a slot with a hole in it.
+        // Reaching zero size would mean an opacity ramp to hide the degenerate scale, which is
+        // the fade this port does not have yet.
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
             .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
-            .chain(
-                self.minimized_with_expose_rects()
-                    .map(|(tile, _)| (tile, minimized_from)),
-            )
+            .chain(self.minimized_with_expose_rects())
             .collect();
 
         let mut inputs = self.expose_live_inputs();

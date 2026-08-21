@@ -98,10 +98,13 @@ no scrolling-layer case with no stored position.
 inputs and the render list, and every picker query — slots, hit-testing, hover, the close button,
 activation — reads through it, so nothing else needed a minimized case.
 
-A parked tile has no rect on screen to interpolate from, so on the open/close leg it takes the one
-gnome-shell gives a window that is not `showing_on_its_workspace`: the work-area origin at **zero
-size** (`workspace.js:709-720`). It grows out of that corner into its slot rather than flying from
-a position it was never drawn at.
+A parked tile has no rect on screen to interpolate from, so on the open/close leg it uses the same
+rect it is laid out over — the one it had. gnome-shell instead gives a window that is not
+`showing_on_its_workspace` the work-area origin at **zero size** (`workspace.js:709-720`) and fades
+it in over that; ours cannot, because this leg interpolates a *scale* (`slot.size.w / rect.size.w`,
+`expose_tile_render`), so a zero-width `from` divides by zero and the preview never draws at any
+progress. Reaching zero size means having the opacity ramp that hides the degenerate scale, which
+is the fade below.
 
 **`has_window` is the wrong question for the picker.** It means *laid out here*, so all five
 `Layout::expose_*` dispatchers, the touch tap-to-activate grab and `window_workspace_position` ask
@@ -137,10 +140,16 @@ away is small. The strip **replaces** the picker slots when it lands — it is n
   Ours renders each row entry through the same `render_expose` the picker uses, off the same
   retained layout decision — so excluding them would mean deciding two different grids per
   workspace and the row disagreeing with the picker it miniaturizes.
-- **No fade.** GNOME also ramps a minimized preview's opacity with the overview state
-  (`_syncOpacity`, `workspace.js:448-451`) on top of the zero-size growth. Ours has the geometry
-  only, which is most of the effect: a tile at zero scale draws nothing either way.
-- **No minimize animation.** GNOME shrinks the window toward its icon; ours vanishes.
+- **No fade, so no growth from a corner either.** GNOME ramps a minimized preview's opacity with
+  the overview state (`_syncOpacity`, `workspace.js:448-451`), which is what lets its geometry
+  start at zero size. The two go together: without the ramp, ours has to interpolate from a
+  non-degenerate rect. Landing the fade is what would let the growth follow.
+- **No minimize animation.** GNOME shrinks the window toward its icon
+  (`META_COMP_EFFECT_MINIMIZE`, `meta_window_minimize`); ours vanishes on the spot. Reported from
+  the seat (kov, 2026-08-21) as the thing that reads as broken — a window that disappears with no
+  motion gives the eye nothing to follow, so there is no cue where it went or that it still
+  exists. Wanted next after this port; `Tile::alpha_animation` and the open animation are the
+  existing shapes to build it from.
 - **Minimized windows still get frame callbacks.** `windows_for_output_mut` reaches them through
   `Workspace::tiles_mut`, so a hidden window keeps drawing. Convenient — the picker preview has a
   live texture — but it is work GNOME throttles.
