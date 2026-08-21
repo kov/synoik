@@ -8375,6 +8375,62 @@ fn vulkan_hovered_preview_draws_its_close_button() {
     );
 }
 
+/// Minimizing must be a *motion*: the window shrinks toward its destination over 400ms rather
+/// than vanishing on the spot.
+///
+/// Sampled mid-flight, not at the endpoints. Both endpoints look identical whether or not the
+/// animation exists — full-size before, gone after — so an endpoint-only test passes over an
+/// animation that was never wired into `advance_animations` at all. The middle frame is the only
+/// place the mechanism is observable.
+#[test]
+fn vulkan_minimizing_shrinks_the_window_instead_of_vanishing() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| {
+                let p = px(pixels, w, i % w, i / w);
+                p[0] < 40 && p[1] > 200 && p[2] < 40
+            })
+            .count()
+    };
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let before = count_green(&pixels, w, h);
+    assert!(before > 0, "the window must be on screen to start with");
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.freeze_clock();
+    f.advance_clock(Duration::from_millis(150));
+    f.dispatch();
+    f.refresh();
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let midway = count_green(&pixels, w, h);
+    assert!(
+        midway > 0,
+        "mid-animation the window must still be drawn — a minimize that is not wired into the \
+         frame loop looks exactly like one that finished instantly"
+    );
+    assert!(
+        midway < before,
+        "and it must be shrinking: {midway} green pixels of {before}"
+    );
+
+    f.settle();
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(
+        count_green(&pixels, w, h),
+        0,
+        "once the shrink lands the window is off the desktop"
+    );
+}
+
 /// A minimized window's picker preview must actually show the window.
 ///
 /// It has a slot — the headless tests pin that — but a slot the window does not draw into is a

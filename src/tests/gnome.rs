@@ -7819,6 +7819,60 @@ fn a_minimized_window_keeps_its_picker_slot_and_a_click_brings_it_back() {
     );
 }
 
+/// The preview grows out of the place the window was seen to go.
+///
+/// One rect does both motions: the window shrinks into `Parked::dest` on the desktop, and the
+/// picker grows the preview back out of that same rect. Without it the preview would come from
+/// the window's old place — a position the user watched it leave, so the overview would
+/// contradict what the desktop had just shown.
+#[test]
+fn a_minimized_windows_preview_comes_from_where_the_window_went() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _win = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let was = f
+        .synoik()
+        .layout
+        .window_render_rect(&win, &output)
+        .expect("the window is on screen before it minimizes");
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.settle();
+
+    // With no dash on screen the destination is the dock's home edge: the bottom centre of the
+    // output, nowhere near a window sitting in the middle of the work area.
+    let dest = (1920. / 2., 1080.);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.freeze_clock();
+    f.advance_clock(Duration::from_millis(20));
+    f.dispatch();
+    f.refresh();
+
+    let drawn = f
+        .synoik()
+        .layout
+        .expose_drawn_rect(&win)
+        .expect("the preview draws while the overview opens");
+    let center = |r: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        (r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.)
+    };
+    let (dx, dy) = center(drawn);
+    let (wx, wy) = center(was);
+
+    let to_dest = (dx - dest.0).hypot(dy - dest.1);
+    let to_old = (dx - wx).hypot(dy - wy);
+    assert!(
+        to_dest < to_old,
+        "early in the open the preview must still be near where the window went {dest:?}, not \
+         near where it used to live ({wx}, {wy}): drawn at ({dx}, {dy})"
+    );
+}
+
 /// Minimizing with the overview open must not shuffle the picker.
 ///
 /// This is the property that made folding minimized windows into the picker cheaper than giving

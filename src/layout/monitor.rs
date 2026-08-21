@@ -3833,6 +3833,9 @@ impl<W: LayoutElement> Monitor<W> {
             if hint_above_all {
                 push_hint!();
             }
+            // A window on its way out draws above both layers: it is leaving the place it had,
+            // and sliding under whatever took that place reads as the wrong window moving.
+            ws.render_minimizing(ctx.r(), xray_pos, push!());
             if ws.scrolling_renders_on_top() {
                 ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
                 ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());

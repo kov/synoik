@@ -2362,10 +2362,70 @@ impl State {
         true
     }
 
+    /// Where a minimizing window is seen to go, in the workspace's coordinates.
+    ///
+    /// **Divergence.** gnome-shell aims at `meta_window_get_icon_geometry` and, when nothing set
+    /// one, at the monitor's top-left corner at scale 0 (`_minimizeWindow`,
+    /// `windowManager.js:1178-1197`). Nothing in gnome-shell 50.3 ever calls
+    /// `set_icon_geometry`, so its shipped behavior is always that corner. We have a dock, which
+    /// is what icon geometry was for: aim at the window's own app icon in it. When the app is not
+    /// in the dash, or the dock is slid away, aim at the dock's home edge — the bottom centre of
+    /// the work area — so the motion still points where the window's icon lives rather than at an
+    /// unrelated corner.
+    fn minimize_destination(
+        &self,
+        window: &smithay::desktop::Window,
+    ) -> Option<Rectangle<f64, Logical>> {
+        // The overview is already showing this window in the picker, before and after. There is
+        // no desktop for it to cross, so it does not move.
+        if self.synoik.layout.is_overview_open() {
+            return None;
+        }
+
+        let output = self.synoik.layout.active_output()?.clone();
+        let size = crate::utils::output_size(&output);
+        // The dock's home edge: bottom centre, where the icon would be if the dash were out.
+        let home = Rectangle::new(Point::from((size.w / 2., size.h)), Size::default());
+
+        let Some(dash_area) = self.synoik.dash_area(&output) else {
+            return Some(home);
+        };
+        let Some(mapped) = self
+            .synoik
+            .layout
+            .windows()
+            .find(|(_, m)| &m.window == window)
+        else {
+            return Some(home);
+        };
+        let id = mapped.1.id();
+        let Some(app_id) = self
+            .synoik
+            .app_system
+            .running()
+            .iter()
+            .find(|app| app.windows.iter().any(|w| w.id == id))
+            .map(|app| app.id.clone())
+        else {
+            return Some(home);
+        };
+        let Some(i) = self
+            .synoik
+            .dash
+            .items()
+            .iter()
+            .position(|entry| entry.id == app_id)
+        else {
+            return Some(home);
+        };
+        Some(self.synoik.dash.tile_rect(i, dash_area).unwrap_or(home))
+    }
+
     /// Hide `window` and redraw. The focus fixup is the layout's, because minimizing goes
     /// through a real tile removal — see `Workspace::minimize`.
     pub(crate) fn minimize_window(&mut self, window: &smithay::desktop::Window) -> bool {
-        if !self.synoik.layout.minimize_window(window) {
+        let dest = self.minimize_destination(window);
+        if !self.synoik.layout.minimize_window(window, dest) {
             return false;
         }
         self.maybe_warp_cursor_to_focus();

@@ -71,6 +71,31 @@ Every consumer that answers "what windows are there, and can you see them" carri
   maps.
 - **`is_hidden`** now means minimized *or* on an inactive workspace.
 
+## The shrink
+
+400ms on `EASE_OUT_EXPO` — gnome-shell's `MINIMIZE_WINDOW_ANIMATION_TIME` and
+`..._MODE` (`windowManager.js:28-29`).
+
+**One rect does both motions.** The window shrinks into `Parked::dest` on the desktop, and the
+picker grows the preview back out of that same rect, so the overview cannot contradict what the
+desktop just showed. `dest` is `None` for a window that was never seen to go anywhere — a session
+restore parks one that was never on screen, and a minimize with the overview already up has no
+desktop to cross — and then there is no shrink and the picker falls back to the layout input.
+
+**Where it goes — a divergence.** gnome-shell aims at `meta_window_get_icon_geometry`, and at the
+monitor's top-left corner at scale 0 when nothing set one (`_minimizeWindow`,
+`windowManager.js:1178-1197`). Nothing in gnome-shell 50.3 ever calls `set_icon_geometry`, so its
+shipped behavior is always that corner. We have a dock, which is what icon geometry was for: the
+window aims at its own app icon there, or at the dock's home edge (the bottom centre of the work
+area) when the app is not in the dash or the dock is slid away. `State::minimize_destination`
+resolves it and passes it in — the layout never learns about the dock.
+
+The destination is clamped to `MIN_DEST_SIZE`. The picker divides by the from-rect's width, so a
+zero-sized destination reproduces the blank-preview defect of `b8078c6f`.
+
+**Cancellation is structural.** Unminimizing removes the whole `Parked` entry, so a shrink
+interrupted by an activation goes with it; there is no half-state to unwind.
+
 ## The overview
 
 GNOME's split, and ours: the **window picker shows** minimized windows — `_isOverviewWindow` is
@@ -144,12 +169,12 @@ away is small. The strip **replaces** the picker slots when it lands — it is n
   the overview state (`_syncOpacity`, `workspace.js:448-451`), which is what lets its geometry
   start at zero size. The two go together: without the ramp, ours has to interpolate from a
   non-degenerate rect. Landing the fade is what would let the growth follow.
-- **No minimize animation.** GNOME shrinks the window toward its icon
-  (`META_COMP_EFFECT_MINIMIZE`, `meta_window_minimize`); ours vanishes on the spot. Reported from
-  the seat (kov, 2026-08-21) as the thing that reads as broken — a window that disappears with no
-  motion gives the eye nothing to follow, so there is no cue where it went or that it still
-  exists. Wanted next after this port; `Tile::alpha_animation` and the open animation are the
-  existing shapes to build it from.
+- **Unminimize does not animate yet.** gnome-shell's `_unminimizeWindow` is the exact mirror —
+  same constant, same mode, run backwards from the icon geometry (`windowManager.js:1222-1260`) —
+  so a window that shrinks away but pops back reads as half a mechanism. Next.
+- **The shrink has no fade.** gnome-shell eases opacity alongside the scale and position; ours is
+  the geometry only, so the window is still faintly visible at destination size when it stops
+  being drawn. The smaller the destination, the less this shows.
 - **Minimized windows still get frame callbacks.** `windows_for_output_mut` reaches them through
   `Workspace::tiles_mut`, so a hidden window keeps drawing. Convenient — the picker preview has a
   live texture — but it is work GNOME throttles.

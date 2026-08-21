@@ -38,7 +38,7 @@ use super::{
     expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac, SizingMode,
 };
-use crate::animation::{Animation, Clock};
+use crate::animation::{Animation, Clock, Curve};
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -99,7 +99,7 @@ pub struct Workspace<W: LayoutElement> {
     /// foreign-toplevel sweep seeing it; the render and hit-test paths go through
     /// [`Self::tiles_with_render_positions`] instead, which does not, so nothing draws it and
     /// nothing can click it.
-    minimized: Vec<RemovedTile<W>>,
+    minimized: Vec<Parked<W>>,
 
     /// The original output of this workspace.
     ///
@@ -215,6 +215,72 @@ impl WorkspaceId {
 
     pub fn specific(id: u64) -> Self {
         Self(id)
+    }
+}
+
+/// gnome-shell's `MINIMIZE_WINDOW_ANIMATION_TIME` (`windowManager.js:28`), whose
+/// `MINIMIZE_WINDOW_ANIMATION_MODE` is `EASE_OUT_EXPO` (`:29`). Minimize and unminimize are one
+/// mechanism there — the same constant, the same mode, mirrored — so they are here too.
+const MINIMIZE_ANIMATION_MS: u64 = 400;
+
+/// The smallest a destination rect may be. The picker interpolates a *scale* out of it
+/// (`slot.size.w / rect.size.w`), so a zero-sized destination divides by zero and the preview
+/// never draws — the defect fixed in `b8078c6f`. gnome-shell can end its own minimize at scale 0
+/// because it ramps opacity alongside; we have no fade yet, so the destination stays real.
+const MIN_DEST_SIZE: f64 = 8.;
+
+/// A window parked by a minimize, and where it was seen to go.
+#[derive(Debug)]
+struct Parked<W: LayoutElement> {
+    /// The exact take-out record, so putting it back is a put-back and not a re-place.
+    removed: RemovedTile<W>,
+    /// The rect the window shrank into, in workspace coordinates. The picker grows the preview
+    /// back out of this same rect, so the desktop motion and the overview motion agree about
+    /// where the window went.
+    ///
+    /// `None` when the window was never seen to go anywhere — a session restore parks a window
+    /// that was never on screen, and a minimize with the overview already up has no desktop to
+    /// cross. Then the picker falls back to the rect the tile was laid out over.
+    dest: Option<Rectangle<f64, Logical>>,
+    /// The shrink itself, while it runs. `None` once it has landed.
+    shrink: Option<Shrink>,
+}
+
+/// The 400ms shrink from a window's last on-screen rect into [`Parked::dest`].
+#[derive(Debug)]
+struct Shrink {
+    from: Rectangle<f64, Logical>,
+    anim: Animation,
+}
+
+/// Clamp a destination to [`MIN_DEST_SIZE`].
+fn sane_dest(dest: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        dest.loc,
+        Size::from((
+            dest.size.w.max(MIN_DEST_SIZE),
+            dest.size.h.max(MIN_DEST_SIZE),
+        )),
+    )
+}
+
+impl<W: LayoutElement> Parked<W> {
+    /// Where the tile draws right now, while the shrink runs.
+    fn shrinking_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let shrink = self.shrink.as_ref()?;
+        let dest = self.dest?;
+        let t = shrink.anim.clamped_value();
+        let lerp = |a: f64, b: f64| a + (b - a) * t;
+        Some(Rectangle::new(
+            Point::from((
+                lerp(shrink.from.loc.x, dest.loc.x),
+                lerp(shrink.from.loc.y, dest.loc.y),
+            )),
+            Size::from((
+                lerp(shrink.from.size.w, dest.size.w),
+                lerp(shrink.from.size.h, dest.size.h),
+            )),
+        ))
     }
 }
 
@@ -702,6 +768,14 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
 
+        // A landed shrink stops being drawn. The window stays parked either way: the animation
+        // is how it leaves the screen, never whether it is minimized.
+        for parked in &mut self.minimized {
+            if parked.shrink.as_ref().is_some_and(|s| s.anim.is_done()) {
+                parked.shrink = None;
+            }
+        }
+
         // The pointer has held still long enough — gnome-shell's tick at
         // `workspace.js:1164-1179`. A pointer resting on one of our own previews holds it
         // open anyway, whether or not it has moved: that is the second disjunct at `:1170`,
@@ -741,6 +815,7 @@ impl<W: LayoutElement> Workspace<W> {
                 .expose_slides
                 .iter()
                 .any(|(_, slide)| !slide.anim.is_done())
+            || self.minimized.iter().any(|parked| parked.shrink.is_some())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -835,14 +910,17 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn tiles(&self) -> impl Iterator<Item = &Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles();
         let floating = self.floating.tiles();
-        let minimized = self.minimized.iter().map(|removed| &removed.tile);
+        let minimized = self.minimized.iter().map(|parked| &parked.removed.tile);
         scrolling.chain(floating).chain(minimized)
     }
 
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();
-        let minimized = self.minimized.iter_mut().map(|removed| &mut removed.tile);
+        let minimized = self
+            .minimized
+            .iter_mut()
+            .map(|parked| &mut parked.removed.tile);
         scrolling.chain(floating).chain(minimized)
     }
 
@@ -850,7 +928,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn is_minimized(&self, id: &W::Id) -> bool {
         self.minimized
             .iter()
-            .any(|removed| removed.tile.window().id() == id)
+            .any(|parked| parked.removed.tile.window().id() == id)
     }
 
     /// Take `id` out of whichever layout holds it and park it — `meta_window_minimize`
@@ -861,7 +939,16 @@ impl<W: LayoutElement> Workspace<W> {
     /// through a real removal rather than a flag the arithmetic skips: a flag would leave the
     /// focus on an invisible window, because none of the index fixups in the scrolling and
     /// floating halves would run.
-    pub fn minimize(&mut self, id: &W::Id, transaction: Transaction) -> bool {
+    /// `dest` is where the window is seen to go: the app's dock icon when the shell could name
+    /// one, else the monitor corner ([`Layout::minimize_window`] resolves it). In workspace
+    /// coordinates. The window shrinks into it, and the picker later grows the preview back out
+    /// of it — one rect, so the two motions cannot disagree about where the window went.
+    pub fn minimize(
+        &mut self,
+        id: &W::Id,
+        transaction: Transaction,
+        dest: Option<Rectangle<f64, Logical>>,
+    ) -> bool {
         if self.is_minimized(id) {
             return false;
         }
@@ -870,9 +957,32 @@ impl<W: LayoutElement> Workspace<W> {
             // Already parked (handled above) or not ours.
             Some(Home::Minimized) | None => return false,
         }
+
+        // Taken before the removal: afterwards the tile has no place to have come from.
+        let from = self
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == id)
+            .map(|(tile, pos, _)| Rectangle::new(pos, tile.tile_size()));
+
+        let dest = dest.map(sane_dest);
         let mut removed = self.remove_tile(id, transaction);
         removed.tile.window_mut().set_minimized(true);
-        self.minimized.push(removed);
+        let shrink = dest.and(from).map(|from| Shrink {
+            from,
+            anim: Animation::ease(
+                self.clock.clone(),
+                0.,
+                1.,
+                0.,
+                MINIMIZE_ANIMATION_MS,
+                Curve::EaseOutExpo,
+            ),
+        });
+        self.minimized.push(Parked {
+            removed,
+            dest,
+            shrink,
+        });
         true
     }
 
@@ -882,16 +992,17 @@ impl<W: LayoutElement> Workspace<W> {
         let Some(idx) = self
             .minimized
             .iter()
-            .position(|removed| removed.tile.window().id() == id)
+            .position(|parked| parked.removed.tile.window().id() == id)
         else {
             return false;
         };
+        let Parked { removed, .. } = self.minimized.remove(idx);
         let RemovedTile {
             mut tile,
             width,
             is_full_width,
             is_floating,
-        } = self.minimized.remove(idx);
+        } = removed;
         tile.window_mut().set_minimized(false);
         self.add_tile(
             tile,
@@ -1239,9 +1350,9 @@ impl<W: LayoutElement> Workspace<W> {
         if let Some(idx) = self
             .minimized
             .iter()
-            .position(|removed| removed.tile.window().id() == id)
+            .position(|parked| parked.removed.tile.window().id() == id)
         {
-            let mut removed = self.minimized.remove(idx);
+            let mut removed = self.minimized.remove(idx).removed;
             removed.tile.window_mut().set_minimized(false);
             if let Some(output) = &self.output {
                 removed.tile.window().output_leave(output);
@@ -2399,10 +2510,12 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
         let scrolling = self.scrolling.tiles_with_ipc_layouts();
         let floating = self.floating.tiles_with_ipc_layouts();
-        let minimized = self
-            .minimized
-            .iter()
-            .map(|removed| (&removed.tile, removed.tile.ipc_layout_template()));
+        let minimized = self.minimized.iter().map(|parked| {
+            (
+                &parked.removed.tile,
+                parked.removed.tile.ipc_layout_template(),
+            )
+        });
         floating.chain(scrolling).chain(minimized)
     }
 
@@ -2456,6 +2569,42 @@ impl<W: LayoutElement> Workspace<W> {
             });
     }
 
+    /// Windows on their way out: each minimizing tile drawn shrinking into its destination.
+    ///
+    /// gnome-shell eases the actor's scale, position *and* opacity together
+    /// (`_minimizeWindow`, `windowManager.js:1198-1208`). This is the geometry half; the tile
+    /// ends small at the destination and stops being drawn there. See `docs/fork/minimize-port.md`
+    /// for the fade this port still owes.
+    pub fn render_minimizing(
+        &self,
+        mut ctx: RenderCtx,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(WorkspaceRenderElement),
+    ) {
+        let scale = self.scale().fractional_scale();
+        for parked in &self.minimized {
+            let Some(rect) = parked.shrinking_rect() else {
+                continue;
+            };
+            let tile = &parked.removed.tile;
+            let size = tile.tile_size();
+            if size.w <= 0. {
+                continue;
+            }
+            let tile_scale = rect.size.w / size.w;
+            tile.render(ctx.r(), rect.loc, xray_pos, false, &mut |elem| {
+                push(
+                    RescaleRenderElement::from_element(
+                        elem,
+                        rect.loc.to_physical_precise_round(scale),
+                        tile_scale,
+                    )
+                    .into(),
+                )
+            });
+        }
+    }
+
     /// The GNOME overview window picker ("exposé"): every tile with its
     /// current rect and its picker slot, both in workspace coordinates.
     ///
@@ -2484,13 +2633,11 @@ impl<W: LayoutElement> Workspace<W> {
     /// picker's input unchanged: the grid does not shuffle under the user. The two can disagree
     /// only for a window parked mostly off-screen, where [`Data::recompute_logical_pos`] clamps
     /// the fraction and this does not.
-    fn minimized_with_expose_rects(
-        &self,
-    ) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>)> {
+    fn minimized_layout_inputs(&self) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>)> {
         let scale = self.scale().fractional_scale();
         let area = self.floating.working_area();
-        self.minimized.iter().map(move |removed| {
-            let tile = &removed.tile;
+        self.minimized.iter().map(move |parked| {
+            let tile = &parked.removed.tile;
             let size = tile.tile_size();
             let pos = self
                 .floating
@@ -2498,6 +2645,20 @@ impl<W: LayoutElement> Workspace<W> {
                 .unwrap_or_else(|| center_preferring_top_left_in_area(area, size));
             (tile, Rectangle::new(Self::settled_pos(scale, pos), size))
         })
+    }
+
+    /// Every minimized tile with the rect its preview grows *out of* on the overview leg.
+    ///
+    /// The destination it shrank into, so the preview comes from where the user watched the
+    /// window go. This is deliberately **not** the layout input above: feeding a destination into
+    /// the grid would re-sort it and shuffle every other preview, which is the property
+    /// `minimizing_with_the_overview_open_leaves_the_other_previews_where_they_are` pins.
+    ///
+    /// Falls back to the layout input for a window that was never seen to go anywhere — see
+    /// [`Parked::dest`].
+    fn minimized_render_rects(&self) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>)> {
+        iter::zip(&self.minimized, self.minimized_layout_inputs())
+            .map(|(parked, (tile, settled))| (tile, parked.dest.unwrap_or(settled)))
     }
 
     /// The layout input one window contributes, if it is here.
@@ -2510,7 +2671,7 @@ impl<W: LayoutElement> Workspace<W> {
                 (tile.window().stable_sequence(), rect)
             })
             .or_else(|| {
-                self.minimized_with_expose_rects()
+                self.minimized_layout_inputs()
                     .find(|(tile, _)| tile.window().id() == window)
                     .map(|(tile, rect)| (tile.window().stable_sequence(), rect))
             })
@@ -2541,7 +2702,7 @@ impl<W: LayoutElement> Workspace<W> {
                 (tile.window().stable_sequence(), rect)
             })
             .chain(
-                self.minimized_with_expose_rects()
+                self.minimized_layout_inputs()
                     .map(|(tile, rect)| (tile.window().stable_sequence(), rect)),
             )
             .collect();
@@ -2593,7 +2754,7 @@ impl<W: LayoutElement> Workspace<W> {
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
             .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
-            .chain(self.minimized_with_expose_rects())
+            .chain(self.minimized_render_rects())
             .collect();
 
         let mut inputs = self.expose_live_inputs();

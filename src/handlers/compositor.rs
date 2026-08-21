@@ -469,7 +469,7 @@ impl CompositorHandler for State {
                     // either way: minimizing takes a tile out of the layout, so there has to be a
                     // tile.
                     if restore_minimized {
-                        self.synoik.layout.minimize_window(&window);
+                        self.synoik.layout.minimize_window(&window, None);
                     }
 
                     if denied_focus_steal || wants_attention {
