@@ -238,10 +238,12 @@ struct Parked<W: LayoutElement> {
     /// back out of this same rect, so the desktop motion and the overview motion agree about
     /// where the window went.
     ///
-    /// `None` when the window was never seen to go anywhere — a session restore parks a window
-    /// that was never on screen, and a minimize with the overview already up has no desktop to
-    /// cross. Then the picker falls back to the rect the tile was laid out over.
-    dest: Option<Rectangle<f64, Logical>>,
+    /// Always known, even when nothing was animated into it: where a hidden window *lives* is
+    /// not the same question as whether the user watched it go there. A session restore parks a
+    /// window that was never on screen and a minimize with the overview up has no desktop to
+    /// cross — neither shrinks, but both must still grow out of the dock when the picker opens,
+    /// or the preview appears at full size somewhere the user never saw it.
+    dest: Rectangle<f64, Logical>,
     /// The shrink itself, while it runs. `None` once it has landed.
     shrink: Option<Shrink>,
 }
@@ -268,7 +270,7 @@ impl<W: LayoutElement> Parked<W> {
     /// Where the tile draws right now, while the shrink runs.
     fn shrinking_rect(&self) -> Option<Rectangle<f64, Logical>> {
         let shrink = self.shrink.as_ref()?;
-        let dest = self.dest?;
+        let dest = self.dest;
         let t = shrink.anim.clamped_value();
         let lerp = |a: f64, b: f64| a + (b - a) * t;
         Some(Rectangle::new(
@@ -951,15 +953,20 @@ impl<W: LayoutElement> Workspace<W> {
     /// through a real removal rather than a flag the arithmetic skips: a flag would leave the
     /// focus on an invisible window, because none of the index fixups in the scrolling and
     /// floating halves would run.
-    /// `dest` is where the window is seen to go: the app's dock icon when the shell could name
-    /// one, else the monitor corner ([`Layout::minimize_window`] resolves it). In workspace
+    /// `dest` is where the hidden window lives: the app's dock icon when the shell could name one,
+    /// else the dock's home edge ([`Layout::minimize_window`] resolves it), in workspace
     /// coordinates. The window shrinks into it, and the picker later grows the preview back out
     /// of it — one rect, so the two motions cannot disagree about where the window went.
+    ///
+    /// `animate` is whether the *desktop* shrink runs. It is a separate question: a window that
+    /// was never on screen has nowhere to shrink from, but still has to grow out of the right
+    /// place when the overview opens.
     pub fn minimize(
         &mut self,
         id: &W::Id,
         transaction: Transaction,
-        dest: Option<Rectangle<f64, Logical>>,
+        dest: Rectangle<f64, Logical>,
+        animate: bool,
     ) -> bool {
         if self.is_minimized(id) {
             return false;
@@ -976,10 +983,10 @@ impl<W: LayoutElement> Workspace<W> {
             .find(|(tile, _, _)| tile.window().id() == id)
             .map(|(tile, pos, _)| Rectangle::new(pos, tile.tile_size()));
 
-        let dest = dest.map(sane_dest);
+        let dest = sane_dest(dest);
         let mut removed = self.remove_tile(id, transaction);
         removed.tile.window_mut().set_minimized(true);
-        let shrink = dest.and(from).map(|from| Shrink {
+        let shrink = from.filter(|_| animate).map(|from| Shrink {
             from,
             anim: Animation::ease(
                 self.clock.clone(),
@@ -2681,9 +2688,10 @@ impl<W: LayoutElement> Workspace<W> {
         iter::zip(&self.minimized, self.minimized_layout_inputs()).map(
             |(parked, (tile, settled))| {
                 let natural = tile.tile_size();
-                let Some(dest) = parked.dest.filter(|_| natural.w > 0.) else {
+                if natural.w <= 0. {
                     return (tile, settled, 1.);
-                };
+                }
+                let dest = parked.dest;
                 // Natural size at the destination's *position*, shrunk by the destination's own
                 // scale: the rect keeps the size the draw scale is derived from, and the fourth
                 // field carries how small the preview starts.
@@ -3045,8 +3053,12 @@ impl<W: LayoutElement> Workspace<W> {
     /// (`windowPreview.js:561-568`). A window that isn't on this workspace just
     /// clears it, so the caller can hand the same target to every workspace.
     /// Returns whether anything changed.
+    ///
+    /// `holds_window`, not `has_window`: a minimized window has a preview in the picker like any
+    /// other, and asking the *laid out here* question left it the one preview that could not be
+    /// hovered — no growth, and no close button, since both are gated on the hover being armed.
     pub(super) fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
-        let mine = window.filter(|id| self.has_window(id));
+        let mine = window.filter(|id| self.holds_window(id));
 
         let mut changed = false;
         for (id, anim) in &mut self.expose_hover {
@@ -3232,7 +3244,7 @@ impl<W: LayoutElement> Workspace<W> {
     fn expose_hovers_a_live_preview(&self) -> bool {
         self.expose_hover
             .iter()
-            .any(|(id, anim)| anim.to() == 1. && self.has_window(id))
+            .any(|(id, anim)| anim.to() == 1. && self.holds_window(id))
     }
 
     /// The pointer moved; `over_this_workspace` is whether it is inside this workspace's

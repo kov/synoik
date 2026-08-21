@@ -7819,6 +7819,43 @@ fn a_minimized_window_keeps_its_picker_slot_and_a_click_brings_it_back() {
     );
 }
 
+/// A minimized window's preview hovers like any other: it grows, and it gets a close button.
+///
+/// Both are gated on the hover being *armed*, and `set_expose_hover` was asking `has_window` —
+/// laid out here — which a parked window is not. It left exactly one preview in the picker that
+/// the pointer could not touch.
+#[test]
+fn a_minimized_windows_preview_can_be_hovered() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _win = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f.synoik_state().minimize_window(&win), "it minimizes");
+    f.settle();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    let cur = f.synoik().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(center.x - cur.x, center.y - cur.y);
+    f.settle();
+
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+    let overlays = mon.preview_overlays();
+    assert!(
+        overlays
+            .iter()
+            .any(|(w, _, hover)| w == &win && *hover > 0.),
+        "a hovered minimized preview must show its overlay — that is what draws the close \
+         button and grows the preview: {overlays:?}"
+    );
+}
+
 /// A settled preview fills its slot — including a minimized window's.
 ///
 /// The picker derives the tile's draw scale as `slot.w / rect.w` and then rescales the tile's
@@ -27394,6 +27431,38 @@ fn a_minimized_window_is_saved_and_restored_minimized() {
     assert!(
         f.synoik().layout.is_minimized(&restored),
         "and comes back hidden"
+    );
+
+    // It never crossed the desktop, so nothing shrank — but it still has to *live* somewhere, or
+    // its preview grows out of a layout position the user has never seen it in. Where a hidden
+    // window lives and whether it was watched going there are separate questions.
+    tap(&mut f, KEY_LEFTMETA);
+    f.freeze_clock();
+    f.advance_clock(Duration::from_millis(20));
+    f.dispatch();
+    f.refresh();
+
+    let drawn = f
+        .synoik()
+        .layout
+        .expose_drawn_rect(&restored)
+        .expect("the restored window has a preview");
+    let slot = f.synoik().layout.expose_target_rect(&restored).unwrap();
+    assert!(
+        drawn.size.w < slot.size.w / 2.,
+        "early in the open a restored-minimized preview must still be small, growing out of the \
+         dock rather than appearing at full size: drawn {drawn:?} slot {slot:?}"
+    );
+    // Small is not enough: it has to be small *at the dock*. With no dash on screen that is the
+    // home edge, the bottom centre of the output.
+    let (cx, cy) = (
+        drawn.loc.x + drawn.size.w / 2.,
+        drawn.loc.y + drawn.size.h / 2.,
+    );
+    assert!(
+        (cx - 1280. / 2.).abs() < 1280. / 4. && cy > 720. / 2.,
+        "and it must be small where the window lives — near the dock at the bottom centre — not \
+         wherever the layout would have put it: drawn at ({cx}, {cy})"
     );
 }
 

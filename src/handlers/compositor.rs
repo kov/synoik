@@ -469,7 +469,11 @@ impl CompositorHandler for State {
                     // either way: minimizing takes a tile out of the layout, so there has to be a
                     // tile.
                     if restore_minimized {
-                        self.synoik.layout.minimize_window(&window, None);
+                        // No shrink — the window was never on screen to shrink from — but it
+                        // still gets a destination, or its preview grows out of a place the
+                        // user has never seen it.
+                        let dest = self.minimize_destination(&window);
+                        self.synoik.layout.minimize_window(&window, dest, false);
                     }
 
                     if denied_focus_steal || wants_attention {

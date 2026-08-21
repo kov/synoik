@@ -1822,12 +1822,17 @@ impl<W: LayoutElement> Layout<W> {
     /// icon when the shell can name one, else the dock's home edge. It is a parameter rather than
     /// something the layout works out because the dock is the shell's, not the layout's — and it
     /// is one rect, shared by the shrink and by the picker's grow-back, so the two motions cannot
-    /// disagree about where the window went. `None` parks the window with no motion at all, for a
-    /// window that was never on screen to move.
+    /// disagree about where the window went.
+    ///
+    /// `animate` is whether the desktop shrink runs — false for a window that was never on screen
+    /// to move. It does **not** suppress the picker's grow-back: where a hidden window lives and
+    /// whether the user watched it go there are different questions, and answering the first with
+    /// "nowhere" made a restored window appear at full size in a place it had never been.
     pub fn minimize_window(
         &mut self,
         window: &W::Id,
-        dest: Option<Rectangle<f64, Logical>>,
+        dest: Rectangle<f64, Logical>,
+        animate: bool,
     ) -> bool {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {
@@ -1837,7 +1842,7 @@ impl<W: LayoutElement> Layout<W> {
 
         let transaction = Transaction::new();
         for ws in self.workspaces_mut() {
-            if ws.minimize(window, transaction.clone(), dest) {
+            if ws.minimize(window, transaction.clone(), dest, animate) {
                 return true;
             }
         }

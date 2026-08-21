@@ -78,9 +78,14 @@ Every consumer that answers "what windows are there, and can you see them" carri
 
 **One rect does both motions.** The window shrinks into `Parked::dest` on the desktop, and the
 picker grows the preview back out of that same rect, so the overview cannot contradict what the
-desktop just showed. `dest` is `None` for a window that was never seen to go anywhere — a session
-restore parks one that was never on screen, and a minimize with the overview already up has no
-desktop to cross — and then there is no shrink and the picker falls back to the layout input.
+desktop just showed.
+
+**Where a hidden window lives is not the same question as whether the user watched it go there.**
+`dest` is always known; `animate` is separate and says only whether the desktop shrink runs. A
+session restore parks a window that was never on screen and a minimize with the overview up has no
+desktop to cross — neither shrinks, but both still grow out of the dock when the picker opens.
+Answering the first question with "nowhere" made a restored window appear at full size in a place
+it had never been.
 
 **Where it goes — a divergence.** gnome-shell aims at `meta_window_get_icon_geometry`, and at the
 monitor's top-left corner at scale 0 when nothing set one (`_minimizeWindow`,
@@ -139,9 +144,11 @@ it in over that; ours cannot, because this leg interpolates a *scale* (`slot.siz
 progress. Reaching zero size means having the opacity ramp that hides the degenerate scale, which
 is the fade below.
 
-**`has_window` is the wrong question for the picker.** It means *laid out here*, so all five
-`Layout::expose_*` dispatchers, the touch tap-to-activate grab and `window_workspace_position` ask
-`holds_window` instead. A picker query that asks the positional question finds nothing and returns
+**`has_window` is the wrong question for the picker.** It means *laid out here*, so the five
+`Layout::expose_*` dispatchers, the touch tap-to-activate grab, `window_workspace_position`,
+`set_expose_hover` and `expose_hovers_a_live_preview` all ask `holds_window` instead. The two hover
+ones were missed in the first sweep and cost a minimized preview both its growth and its close
+button, since each is gated on the hover being armed. A picker query that asks the positional question finds nothing and returns
 a **vacant** slot — a zero rect, not `None` — which reads as a real answer to any check that only
 tests for overlap.
 
