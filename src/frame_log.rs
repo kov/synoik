@@ -2034,7 +2034,12 @@ impl FrameLog {
         totals: &Totals,
         budget: Option<Duration>,
     ) -> String {
-        let mut line = format!("frame on {} took {}", frame.output, ms(total));
+        let mut line = format!(
+            "[{}] frame on {} took {}",
+            wall_clock(frame.started),
+            frame.output,
+            ms(total)
+        );
         // Only when the two differ, i.e. only when the frame walked away from GPU work that
         // `took` therefore does not contain. See [`frame_cost`].
         let cost = frame_cost(total, totals);
@@ -2997,6 +3002,54 @@ fn ms_us(us: i64) -> String {
     format!("{:.2}ms", us as f64 / 1000.)
 }
 
+/// Ties the ring's monotonic [`Instant`]s to wall-clock time.
+///
+/// Sampled once and never again: the two clocks are read together, and every banked record is
+/// placed by its offset from that pair. So a stamp costs nothing per frame — the work happens at
+/// dump time, where a record already pays a `format!` — and the stamps stay mutually consistent
+/// even if the system clock is stepped mid-session (they drift from the wall together rather than
+/// jumping apart from each other).
+fn wall_anchor() -> (Instant, std::time::SystemTime) {
+    static ANCHOR: std::sync::OnceLock<(Instant, std::time::SystemTime)> =
+        std::sync::OnceLock::new();
+    *ANCHOR.get_or_init(|| (Instant::now(), std::time::SystemTime::now()))
+}
+
+/// Local wall-clock time of a banked record as `HH:MM:SS.mmm`, so a dump can be lined up against
+/// the journal, a screen recording, or a user saying when they saw something.
+///
+/// The ring holds raw records and formats them only when a dump is written, so this reads
+/// [`InFlight::started`] rather than sampling a clock on the frame path. Unrepresentable times
+/// render as dashes: a stamp that cannot be trusted must not look like one that can.
+fn wall_clock(at: Instant) -> String {
+    const UNKNOWN: &str = "--:--:--.---";
+
+    let (anchor_at, anchor_wall) = wall_anchor();
+    let wall = if at >= anchor_at {
+        anchor_wall.checked_add(at - anchor_at)
+    } else {
+        anchor_wall.checked_sub(anchor_at - at)
+    };
+    let Some(wall) = wall else {
+        return UNKNOWN.to_owned();
+    };
+    let Ok(since_epoch) = wall.duration_since(std::time::UNIX_EPOCH) else {
+        return UNKNOWN.to_owned();
+    };
+    let Ok(secs) = i64::try_from(since_epoch.as_secs()) else {
+        return UNKNOWN.to_owned();
+    };
+    let Ok(ts) = jiff::Timestamp::from_second(secs) else {
+        return UNKNOWN.to_owned();
+    };
+    format!(
+        "{}.{:03}",
+        ts.to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%H:%M:%S"),
+        since_epoch.subsec_millis()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3721,10 +3774,17 @@ mod tests {
             "every banked entry must reach the file"
         );
         assert!(
-            text.lines()
-                .all(|l| l.starts_with("frame on out") && l.contains(" took ")),
-            "dumped lines must be byte-identical to the journal's, so \
-             correlate-frame-log.py reads a dump directly: {text}"
+            text.lines().all(|l| {
+                let (stamp, rest) = l.split_once("] ").unwrap_or(("", l));
+                // `[HH:MM:SS.mmm`, so a dump lines up against the journal, a screen recording, or
+                // a user saying when they saw something.
+                stamp.len() == "[00:00:00.000".len()
+                    && rest.starts_with("frame on out")
+                    && rest.contains(" took ")
+            }),
+            "every dumped frame carries a wall-clock stamp, and the rest of the line stays \
+             byte-identical to the journal's so correlate-frame-log.py reads a dump \
+             directly: {text}"
         );
 
         // A second dump reports the window since the first, not the same frames again.
