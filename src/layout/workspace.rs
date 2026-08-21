@@ -284,11 +284,20 @@ impl<W: LayoutElement> Parked<W> {
     }
 }
 
-/// Picker layout: (tile, current rect, slot rect), workspace coordinates.
+/// Picker layout: (tile, current rect, slot rect, scale at progress 0), workspace coordinates.
+///
+/// **`rect.size` is the tile's natural size, always.** The draw scale is derived from it
+/// (`slot.size.w / rect.size.w`) and then applied to the tile's own natural-size elements, so a
+/// `rect` sized as anything else scales the window by exactly that ratio — a dock-icon-sized one
+/// drew a window forty times too big, one corner of it covering the workspace.
+///
+/// A preview that starts somewhere it was never drawn says so with the fourth field instead: the
+/// scale it has at progress 0, which is 1 for a tile that is simply where it looks like it is.
 type ExposeLayout<'a, W> = Vec<(
     &'a Tile<W>,
     Rectangle<f64, Logical>,
     Rectangle<f64, Logical>,
+    f64,
 )>;
 
 /// One input to the picker's layout: a window's stable sequence, and the rect it is laid
@@ -468,12 +477,13 @@ fn hover_scale(size: Size<f64, Logical>, hover: f64) -> f64 {
 fn expose_tile_render(
     rect: Rectangle<f64, Logical>,
     slot: Rectangle<f64, Logical>,
+    from_scale: f64,
     hover: f64,
     progress: f64,
     zoom: f64,
 ) -> (Point<f64, Logical>, f64) {
     let target_scale = slot.size.w / rect.size.w;
-    let tile_scale = 1. + (target_scale - 1.) * progress;
+    let tile_scale = from_scale + (target_scale - from_scale) * progress;
     let pos = Point::from((
         rect.loc.x + (slot.loc.x - rect.loc.x) * progress,
         rect.loc.y + (slot.loc.y - rect.loc.y) * progress,
@@ -508,16 +518,18 @@ fn expose_tile_render(
 /// Pinned by `the_expose_xray_covers_exactly_the_drawn_preview`.
 ///
 /// [`Xray::render`]: crate::render_helpers::xray::Xray::render
+#[allow(clippy::too_many_arguments)]
 fn expose_tile_placement(
     xray_pos: XrayPos,
     rect: Rectangle<f64, Logical>,
     slot: Rectangle<f64, Logical>,
+    from_scale: f64,
     hover: f64,
     progress: f64,
     zoom: f64,
     scale: f64,
 ) -> (Point<f64, Logical>, f64, XrayPos) {
-    let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+    let (pos, tile_scale) = expose_tile_render(rect, slot, from_scale, hover, progress, zoom);
 
     // Round to physical pixels.
     let pos = pos.to_physical_precise_round(scale).to_logical(scale);
@@ -2663,9 +2675,25 @@ impl<W: LayoutElement> Workspace<W> {
     ///
     /// Falls back to the layout input for a window that was never seen to go anywhere — see
     /// [`Parked::dest`].
-    fn minimized_render_rects(&self) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>)> {
-        iter::zip(&self.minimized, self.minimized_layout_inputs())
-            .map(|(parked, (tile, settled))| (tile, parked.dest.unwrap_or(settled)))
+    fn minimized_render_rects(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Rectangle<f64, Logical>, f64)> {
+        iter::zip(&self.minimized, self.minimized_layout_inputs()).map(
+            |(parked, (tile, settled))| {
+                let natural = tile.tile_size();
+                let Some(dest) = parked.dest.filter(|_| natural.w > 0.) else {
+                    return (tile, settled, 1.);
+                };
+                // Natural size at the destination's *position*, shrunk by the destination's own
+                // scale: the rect keeps the size the draw scale is derived from, and the fourth
+                // field carries how small the preview starts.
+                (
+                    tile,
+                    Rectangle::new(dest.loc, natural),
+                    dest.size.w / natural.w,
+                )
+            },
+        )
     }
 
     /// The layout input one window contributes, if it is here.
@@ -2760,7 +2788,7 @@ impl<W: LayoutElement> Workspace<W> {
         // the fade this port does not have yet.
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
-            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
+            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size()), 1.))
             .chain(self.minimized_render_rects())
             .collect();
 
@@ -2770,7 +2798,7 @@ impl<W: LayoutElement> Workspace<W> {
         // reservation above, which it was taken with.
         if let Some(freeze) = &self.expose_freeze {
             debug_assert!(
-                tiles.iter().all(|(tile, _)| freeze
+                tiles.iter().all(|(tile, _, _)| freeze
                     .inputs
                     .iter()
                     .any(|(seq, _)| *seq == tile.window().stable_sequence())),
@@ -2788,7 +2816,7 @@ impl<W: LayoutElement> Workspace<W> {
         for ((seq, _), slot) in iter::zip(&inputs, packed) {
             if let Some(i) = tiles
                 .iter()
-                .position(|(tile, _)| tile.window().stable_sequence() == *seq)
+                .position(|(tile, _, _)| tile.window().stable_sequence() == *seq)
             {
                 slots[i] = slot;
             }
@@ -2797,7 +2825,9 @@ impl<W: LayoutElement> Workspace<W> {
         tiles
             .into_iter()
             .zip(slots)
-            .map(|((tile, rect), slot)| (tile, rect, self.slide_slot(tile, slot)))
+            .map(|((tile, rect, from_scale), slot)| {
+                (tile, rect, self.slide_slot(tile, slot), from_scale)
+            })
             .collect()
     }
 
@@ -2908,7 +2938,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub(super) fn expose_slots_now(&self) -> Vec<(W::Id, Rectangle<f64, Logical>)> {
         self.expose_layout()
             .into_iter()
-            .map(|(tile, _, slot)| (tile.window().id().clone(), slot))
+            .map(|(tile, _, slot, _)| (tile.window().id().clone(), slot))
             .collect()
     }
 
@@ -3263,8 +3293,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub(super) fn expose_slot(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         self.expose_layout()
             .into_iter()
-            .find(|(tile, _, _)| tile.window().id() == window)
-            .map(|(_, _, slot)| slot)
+            .find(|(tile, _, _, _)| tile.window().id() == window)
+            .map(|(_, _, slot, _)| slot)
     }
 
     /// Renders the workspace as the GNOME overview window picker: each tile
@@ -3284,16 +3314,17 @@ impl<W: LayoutElement> Workspace<W> {
         let mut layout = self.expose_layout();
         if let Some(i) = layout
             .iter()
-            .position(|(tile, _, _)| self.expose_hover_value(tile.window().id()) > 0.)
+            .position(|(tile, _, _, _)| self.expose_hover_value(tile.window().id()) > 0.)
         {
             let hovered = layout.remove(i);
             layout.insert(0, hovered);
         }
 
-        for (tile, rect, slot) in layout {
+        for (tile, rect, slot, from_scale) in layout {
             let hover = self.expose_hover_value(tile.window().id());
-            let (pos, tile_scale, tile_xray_pos) =
-                expose_tile_placement(xray_pos, rect, slot, hover, progress, zoom, scale);
+            let (pos, tile_scale, tile_xray_pos) = expose_tile_placement(
+                xray_pos, rect, slot, from_scale, hover, progress, zoom, scale,
+            );
 
             tile.render(ctx.r(), pos, tile_xray_pos, false, &mut |elem| {
                 push(
@@ -3317,12 +3348,12 @@ impl<W: LayoutElement> Workspace<W> {
         progress: f64,
         zoom: f64,
     ) -> Option<Rectangle<f64, Logical>> {
-        let (_, rect, slot) = self
+        let (_, rect, slot, from_scale) = self
             .expose_layout()
             .into_iter()
-            .find(|(tile, _, _)| tile.window().id() == window)?;
+            .find(|(tile, _, _, _)| tile.window().id() == window)?;
         let hover = self.expose_hover_value(window);
-        let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+        let (pos, tile_scale) = expose_tile_render(rect, slot, from_scale, hover, progress, zoom);
         Some(Rectangle::new(pos, rect.size.upscale(tile_scale)))
     }
 
@@ -3331,7 +3362,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub(super) fn window_under_expose(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
         self.expose_layout()
             .into_iter()
-            .find_map(|(tile, _, slot)| {
+            .find_map(|(tile, _, slot, _)| {
                 slot.contains(pos).then(|| {
                     (
                         tile.window(),
@@ -4022,7 +4053,7 @@ mod expose_xray_tests {
             ),
         ] {
             let (pos, tile_scale, xray) =
-                expose_tile_placement(base, tile, slot, hover, progress, ws_zoom, 1.);
+                expose_tile_placement(base, tile, slot, 1., hover, progress, ws_zoom, 1.);
 
             // What the xray samples for, in backdrop coordinates.
             let xray_origin = xray.pos_in_backdrop.upscale(xray.zoom);
@@ -4054,7 +4085,7 @@ mod expose_xray_tests {
         let base = XrayPos::new(Point::from((10., 20.)), 0.8);
         let tile = Rectangle::<f64, Logical>::new(Point::from((0., 0.)), Size::from((100., 100.)));
         let slot = Rectangle::new(Point::from((0., 0.)), Size::from((0., 0.)));
-        let (_, _, xray) = expose_tile_placement(base, tile, slot, 0., 1., 0.8, 1.);
+        let (_, _, xray) = expose_tile_placement(base, tile, slot, 1., 0., 1., 0.8, 1.);
         assert!(
             xray.zoom.is_finite() && xray.zoom > 0.,
             "zoom {}",

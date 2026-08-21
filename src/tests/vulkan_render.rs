@@ -8459,7 +8459,7 @@ fn vulkan_a_minimized_windows_preview_draws_the_window() {
         .layout
         .expose_target_rect(&win)
         .expect("a minimized window keeps its picker slot");
-    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     let center = px(
         &pixels,
         w,
@@ -8470,6 +8470,21 @@ fn vulkan_a_minimized_windows_preview_draws_the_window() {
     assert!(
         center[0] < 40 && center[1] > 200 && center[2] < 40,
         "the middle of a minimized window's slot must be the window, not backdrop: {center:?}"
+    );
+
+    // And it must stay *inside* the slot. The draw scale is `slot.w / rect.w` applied to the
+    // tile's natural-size elements, so a `rect` that is not the natural size blows the window up
+    // by that ratio — a dock-icon-sized one covered the workspace with a single corner while every
+    // position assert stayed green. Sampling the middle cannot see that; a point well clear of the
+    // slot can.
+    // Sampled past the slot's *bottom-right*, the direction an over-scaled tile grows: the draw
+    // origin is the slot's own corner, so a blowup runs down and right from it, never left.
+    let ox = ((slot.loc.x + slot.size.w + 20.) as i32).min(w - 1);
+    let oy = ((slot.loc.y + slot.size.h + 20.) as i32).min(h - 1);
+    let outside = px(&pixels, w, ox, oy);
+    assert!(
+        !(outside[0] < 40 && outside[1] > 200 && outside[2] < 40),
+        "the preview must not spill outside its slot: {outside:?} just past its bottom-right"
     );
 }
 

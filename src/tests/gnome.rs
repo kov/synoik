@@ -7819,6 +7819,41 @@ fn a_minimized_window_keeps_its_picker_slot_and_a_click_brings_it_back() {
     );
 }
 
+/// A settled preview fills its slot — including a minimized window's.
+///
+/// The picker derives the tile's draw scale as `slot.w / rect.w` and then rescales the tile's
+/// **natural-size** elements by it, so `rect.size` has to *be* the tile's natural size. Feed it
+/// anything else and the scale is wrong by exactly that ratio: pointing `rect` at a dock-icon-
+/// sized destination drew the window at roughly forty times its size, one corner of it filling
+/// the workspace. Position asserts cannot see this — the preview is still centred on its slot —
+/// so this checks the size.
+#[test]
+fn a_minimized_windows_settled_preview_is_the_size_of_its_slot() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second = f.synoik().layout.focus().unwrap().window.clone();
+
+    assert!(f.synoik_state().minimize_window(&second), "it minimizes");
+    f.settle();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    for (win, what) in [(&first, "a shown window"), (&second, "a minimized window")] {
+        let slot = f.synoik().layout.expose_target_rect(win).unwrap();
+        let drawn = f.synoik().layout.expose_drawn_rect(win).unwrap();
+        assert!(
+            (drawn.size.w - slot.size.w).abs() < 1. && (drawn.size.h - slot.size.h).abs() < 1.,
+            "{what}'s settled preview must be its slot's size: drawn {drawn:?} slot {slot:?}"
+        );
+    }
+}
+
 /// Coming back is a motion too.
 ///
 /// Not yet the mirror of the shrink — see `docs/fork/minimize-port.md` — but a window that shrank

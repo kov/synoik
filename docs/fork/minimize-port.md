@@ -123,8 +123,16 @@ no scrolling-layer case with no stored position.
 inputs and the render list, and every picker query — slots, hit-testing, hover, the close button,
 activation — reads through it, so nothing else needed a minimized case.
 
-A parked tile has no rect on screen to interpolate from, so on the open/close leg it uses the same
-rect it is laid out over — the one it had. gnome-shell instead gives a window that is not
+**The picker's from-rect is always the tile's natural size.** The draw scale is derived from it
+(`slot.size.w / rect.size.w`) and then applied to the tile's own natural-size elements, so a rect
+sized as anything else scales the window by exactly that ratio. Pointing it at a dock-icon-sized
+destination drew a window some forty times too big, one corner of it covering the workspace, while
+every position assert stayed green. A preview that starts somewhere it was never drawn says so
+with a separate **from-scale** — the scale it has at progress 0 — not by lying about its size.
+
+A parked tile has no rect on screen to interpolate from, so on the open/close leg it uses the
+destination's *position* at natural size, with the destination's own scale as its from-scale: it
+grows out of the place the window went. Without a destination it uses the rect it is laid out over. gnome-shell instead gives a window that is not
 `showing_on_its_workspace` the work-area origin at **zero size** (`workspace.js:709-720`) and fades
 it in over that; ours cannot, because this leg interpolates a *scale* (`slot.size.w / rect.size.w`,
 `expose_tile_render`), so a zero-width `from` divides by zero and the preview never draws at any
