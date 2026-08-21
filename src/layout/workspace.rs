@@ -1069,6 +1069,29 @@ impl<W: LayoutElement> Workspace<W> {
         true
     }
 
+    /// Set or clear always-on-top — see [`FloatingSpace::set_above`].
+    ///
+    /// Floating only, and that is not a gap: in GNOME mode every window is floating, and niri's
+    /// scrolling layout has no stacking order for a window to be on top *of*.
+    pub fn set_above(&mut self, id: &W::Id, above: bool) -> bool {
+        self.floating.set_above(id, above)
+    }
+
+    /// Whether `id` is flagged always-on-top — see [`FloatingSpace::is_above`].
+    pub fn is_above(&self, id: &W::Id) -> bool {
+        self.floating.is_above(id)
+    }
+
+    /// See [`FloatingSpace::lower_window`].
+    pub fn lower_window(&mut self, id: &W::Id) -> bool {
+        self.floating.lower_window(id)
+    }
+
+    /// See [`FloatingSpace::raise_or_lower`].
+    pub fn raise_or_lower(&mut self, id: &W::Id) -> bool {
+        self.floating.raise_or_lower(id)
+    }
+
     /// See [`FloatingSpace::raise_window_only`].
     pub fn raise_window_only(&mut self, id: &W::Id) -> bool {
         self.floating.raise_window_only(id)

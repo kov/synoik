@@ -373,6 +373,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.advance_animations();
         }
 
+        // The band is re-established rather than maintained. Membership is *derived* — a flag
+        // plus a sizing mode plus the transient chain — so it can change under paths that never
+        // touch the stacking code at all (maximize is the obvious one, but so is a dialog
+        // appearing under an always-on-top parent). A stable partition is idempotent and costs
+        // nothing on the common path, so the invariant holds by construction instead of by a
+        // checklist of call sites. `set_above` still resettles immediately, because its raise
+        // must see the settled band and cannot wait a frame.
+        self.resettle_band();
+
         self.closing_windows.retain_mut(|closing| {
             closing.advance_animations();
             closing.are_animations_ongoing()
@@ -540,6 +549,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
             {
                 idx = active_idx + 1;
             }
+        }
+
+        // A tile that does not belong in the band goes no higher than it — whether it was
+        // heading for the top of the stack or for just below a focused window that happens to be
+        // in the band itself. A tile that *does* belong keeps its index: `is_above` rides
+        // `RemovedTile`, so an always-on-top window arrives here again after an unminimize or a
+        // workspace move, and clamping it would file it under every other band member.
+        let eligible = tile.is_above && !tile.window().pending_sizing_mode().is_maximized();
+        if !eligible {
+            idx = idx.max(self.band_len());
         }
 
         self.add_tile_at(idx, tile, activate);
@@ -763,9 +782,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return false;
         };
 
-        self.raise_window(idx, 0);
+        let to = self.raise_target(idx);
+        self.raise_window(idx, to);
         self.active_window_id = Some(id.clone());
-        self.bring_up_descendants_of(0);
+        self.bring_up_descendants_of(to);
 
         true
     }
@@ -779,10 +799,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return false;
         };
 
-        self.raise_window(idx, 0);
+        // Not always index 0: an ordinary window raises only as far as the always-on-top band,
+        // which is `meta_stack_raise` clamped by the layer constraints.
+        let to = self.raise_target(idx);
+        self.raise_window(idx, to);
         // A raise takes the window's transients with it, as `meta_window_raise` does — leaving a
         // dialog behind its own parent is the one stacking mistake a raise must never make.
-        self.bring_up_descendants_of(0);
+        self.bring_up_descendants_of(to);
         true
     }
 
@@ -798,8 +821,182 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.preview_raised = mine;
     }
 
+    /// Whether the tile at `idx` is flagged always-on-top *and* currently eligible for it.
+    ///
+    /// mutter's layer rule is `wm_state_above && !meta_window_is_maximized`
+    /// (`meta_window_get_default_layer`, `window.c:6416-6432`): a maximized window drops back to
+    /// the normal layer even while the flag is set, which is why gnome-shell draws the menu row
+    /// checked but insensitive on one (`windowMenu.js:94-98`). Fullscreen has no case there and
+    /// needs none — modern mutter has no fullscreen layer, so an always-on-top window legitimately
+    /// stacks over a fullscreen one.
+    fn tile_is_above(&self, idx: usize) -> bool {
+        let tile = &self.tiles[idx];
+        tile.is_above && !tile.window().pending_sizing_mode().is_maximized()
+    }
+
+    /// Whether the tile at `idx` belongs in the always-on-top band.
+    ///
+    /// Membership is **derived, never stored on children**: a tile is in the band if it is
+    /// flagged, or if any ancestor of it is. mutter computes the layer per window and lets the
+    /// stack constraints keep a transient with its parent; ours reads one predicate instead, so
+    /// the band boundary cannot come down between a dialog and the window it belongs to.
+    fn is_in_above_band(&self, idx: usize) -> bool {
+        let mut current = idx;
+        // The transient chain is shorter than the stack; the bound is a guard, not a limit.
+        for _ in 0..self.tiles.len() {
+            if self.tile_is_above(current) {
+                return true;
+            }
+            let win = self.tiles[current].window();
+            let parent = (0..self.tiles.len())
+                .find(|&i| i != current && win.is_child_of(self.tiles[i].window()));
+            match parent {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// How many tiles the always-on-top band holds. The band is a **prefix** of the stack —
+    /// `verify_invariants` asserts it, so a membership change that forgets to resettle fails
+    /// loudly rather than drifting.
+    fn band_len(&self) -> usize {
+        (0..self.tiles.len())
+            .take_while(|&i| self.is_in_above_band(i))
+            .count()
+    }
+
+    /// The topmost index the tile at `idx` may be raised to: over everything if it is in the
+    /// band, else no further than the first index below it.
+    fn raise_target(&self, idx: usize) -> usize {
+        if self.is_in_above_band(idx) {
+            0
+        } else {
+            self.band_len()
+        }
+    }
+
+    /// Re-establish the band as a prefix of the stack, moving as little as possible.
+    ///
+    /// A stable partition, so a tile that is already in the right band does not move at all and
+    /// running this twice changes nothing. mutter re-sorts through `meta_window_update_layer` on
+    /// every change that could move a window between layers; the one that is easy to forget is
+    /// **maximize**, which ejects a flagged window from the band without anybody asking about the
+    /// band at all.
+    fn resettle_band(&mut self) {
+        let band: Vec<bool> = (0..self.tiles.len())
+            .map(|idx| self.is_in_above_band(idx))
+            .collect();
+        // Already a prefix: every false is followed only by falses.
+        if !band.windows(2).any(|w| !w[0] && w[1]) {
+            return;
+        }
+
+        let mut order: Vec<usize> = (0..self.tiles.len()).collect();
+        order.sort_by_key(|&idx| !band[idx]);
+
+        let mut tiles: Vec<Option<Tile<W>>> = self.tiles.drain(..).map(Some).collect();
+        let data = std::mem::take(&mut self.data);
+        for &idx in &order {
+            self.tiles.push(tiles[idx].take().unwrap());
+            self.data.push(data[idx]);
+        }
+    }
+
+    /// Set or clear always-on-top — `meta_window_make_above` / `meta_window_unmake_above`
+    /// (`window.c:3622-3639`). Returns whether anything changed.
+    ///
+    /// **Both directions raise**, which is not a symmetry mistake in mutter: making a window
+    /// always-on-top puts it over everything, and *unmaking* one leaves it at the top of the
+    /// normal band rather than dropping it wherever the band boundary happens to fall.
+    ///
+    /// The raise does not activate. Making a window always-on-top while another has the focus
+    /// leaves the focus where it was — mutter's `always-on-top.metatest` pins exactly that.
+    pub fn set_above(&mut self, id: &W::Id, above: bool) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+        if self.tiles[idx].is_above == above {
+            return false;
+        }
+
+        self.tiles[idx].is_above = above;
+        self.resettle_band();
+        self.raise_window_only(id);
+        true
+    }
+
+    /// Whether `id` is flagged always-on-top. The *flag*, not the band: a maximized window
+    /// answers true here while stacking with the ordinary ones.
+    pub fn is_above(&self, id: &W::Id) -> bool {
+        self.idx_of(id).is_some_and(|idx| self.tiles[idx].is_above)
+    }
+
+    /// Send `id` to the bottom of its own band — `meta_window_lower` (`window.c:5467-5475`).
+    ///
+    /// mutter lowers to the bottom of the whole stack and lets the layer constraints clamp it to
+    /// its own layer; the band is that clamp. Descendants come down with it, for the same reason
+    /// they go up with a raise.
+    pub fn lower_window(&mut self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let band_len = self.band_len();
+        let bottom = if self.is_in_above_band(idx) {
+            band_len.saturating_sub(1)
+        } else {
+            self.tiles.len() - 1
+        };
+        self.move_tile(idx, bottom);
+        self.bring_up_descendants_of(bottom);
+        true
+    }
+
+    /// Raise `id` if something is covering it, else lower it — `handle_raise_or_lower`
+    /// (`keybindings.c:2359-2402`).
+    ///
+    /// The two tests have **different scopes**, which is the whole behavior: "is it on top" asks
+    /// the entire stack (`meta_stack_get_top`), while "is it covered" asks only its own band
+    /// (`meta_stack_get_above` with `only_within_layer`). Without the second scope a normal
+    /// window under an always-on-top one would raise forever and never come back down.
+    pub fn raise_or_lower(&mut self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        if idx == 0 {
+            return self.lower_window(id);
+        }
+
+        let band = self.is_in_above_band(idx);
+        let rect = self.tile_rect(idx);
+        let covered =
+            (0..idx).any(|i| self.is_in_above_band(i) == band && self.tile_rect(i).overlaps(rect));
+
+        if covered {
+            self.raise_window_only(id)
+        } else {
+            self.lower_window(id)
+        }
+    }
+
+    /// The tile's on-screen rect, for the overlap tests that decide stacking and map-time focus.
+    fn tile_rect(&self, idx: usize) -> Rectangle<f64, Logical> {
+        Rectangle::new(self.data[idx].logical_pos, self.tiles[idx].tile_size())
+    }
+
     fn raise_window(&mut self, from_idx: usize, to_idx: usize) {
         assert!(to_idx <= from_idx);
+        self.move_tile(from_idx, to_idx);
+    }
+
+    /// Move the tile at `from_idx` so that it ends up at `to_idx`, in either direction.
+    fn move_tile(&mut self, from_idx: usize, to_idx: usize) {
+        if from_idx == to_idx {
+            return;
+        }
 
         let tile = self.tiles.remove(from_idx);
         let data = self.data.remove(from_idx);
@@ -1342,6 +1539,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.restore_normal(idx);
         }
 
+        // Maximizing ejects an always-on-top window from the band and unmaximizing re-admits it
+        // (`tile_is_above`), so this is a stacking change even though nothing asked to restack.
+        self.resettle_band();
+
         true
     }
 
@@ -1407,6 +1608,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         } else {
             self.restore_normal(idx);
         }
+
+        // Fullscreen crosses the band boundary in both directions: a flagged window that was
+        // maximized is back in the band while fullscreen, and out of it again on the way down.
+        self.resettle_band();
 
         true
     }
@@ -2268,6 +2473,17 @@ impl<W: LayoutElement> FloatingSpace<W> {
                     "children must be stacked above parents"
                 );
             }
+        }
+
+        // The always-on-top band is a prefix of the stack. Every membership change has to
+        // resettle it, and the one that is easy to forget is maximize, which ejects a flagged
+        // window without going anywhere near the stacking code.
+        let band_len = self.band_len();
+        for i in band_len..self.tiles.len() {
+            assert!(
+                !self.is_in_above_band(i),
+                "always-on-top window at {i} below the band, which ends at {band_len}"
+            );
         }
 
         if let Some(id) = &self.active_window_id {

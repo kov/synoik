@@ -1037,6 +1037,18 @@ pub enum GnomeKeyAction {
     /// `minimize` (`<Super>h`): hide the focused window
     /// (`meta_window_minimize`, `window.c:2734-2771`).
     Minimize,
+    /// `always-on-top` and `toggle-above`: two settings keys, one handler
+    /// (`handle_always_on_top`, `keybindings.c:1803-1813`; `handle_toggle_above`, `:2086-2096`) —
+    /// mutter registers both and they do the same thing, so they share one action here.
+    AlwaysOnTop,
+    /// `raise`: bring the focused window to the top of its band (`handle_raise`,
+    /// `keybindings.c:2405-2412`).
+    Raise,
+    /// `lower`: send it to the bottom (`handle_lower`, `keybindings.c:2414-2422`).
+    Lower,
+    /// `raise-or-lower`: raise if covered, else lower (`handle_raise_or_lower`,
+    /// `keybindings.c:2359-2402`).
+    RaiseOrLower,
     /// `activate-window-menu` (`<Alt>space`): pop the focused window's own menu, anchored on its
     /// top-left (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
     ActivateWindowMenu,
@@ -1209,6 +1221,13 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
         ),
         ("close".to_owned(), Close, strs(&["<Alt>F4"])),
         ("minimize".to_owned(), Minimize, strs(&["<Super>h"])),
+        // Two schema keys, one behavior — mutter registers both `always-on-top` and
+        // `toggle-above` against handlers that differ only in name. Both default to nothing.
+        ("always-on-top".to_owned(), AlwaysOnTop, strs(&[])),
+        ("toggle-above".to_owned(), AlwaysOnTop, strs(&[])),
+        ("raise".to_owned(), Raise, strs(&[])),
+        ("lower".to_owned(), Lower, strs(&[])),
+        ("raise-or-lower".to_owned(), RaiseOrLower, strs(&[])),
         (
             "activate-window-menu".to_owned(),
             ActivateWindowMenu,

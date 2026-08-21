@@ -44,6 +44,12 @@ Built in GNOME's order, each shown only when its target exists — the neighbour
 - **Maximize / Restore** — one row, whichever the window is not. Reads the *pending* sizing mode:
   `window.is_maximized()` is the compositor's own state, which flips when the request is made, not
   when the client acks the configure.
+- **Always on Top** — `make_above` / `unmake_above` (`windowMenu.js:86-98`), ticked with
+  `Ornament::Check` when set. Drawn **insensitive while the window is maximized**, which is not a
+  nicety: a maximized window is in the normal layer even with the flag set
+  (`meta_window_get_default_layer`, `window.c:6416-6432`), so an enabled row would promise an
+  effect it does not have. gnome-shell's three other disabling cases are X11 window types that
+  xdg-shell has no equivalent of. See "The always-on-top band" below.
 - **Move to Workspace Left / Right** — GNOME's horizontal workspace axis is our vertical one, the
   same mapping `move-to-workspace-left` → `MoveWindowToWorkspaceUp` already uses.
 - **Move to Monitor Up / Down / Left / Right**.
@@ -70,10 +76,49 @@ window, and a row that could never enable teaches the reader nothing. In the ord
 |---|---|
 | Move | keyboard interactive-move grab (`Meta.GrabOp.KEYBOARD_MOVING`) |
 | Resize | keyboard interactive-resize grab (`Meta.GrabOp.KEYBOARD_RESIZING_UNKNOWN`) |
-| Always on Top | a stacking model — `make_above` / `unmake_above` |
 | Always on Visible Workspace | sticky windows — `stick` / `unstick` |
 
-The same four are the `deferred` rows in `docs/fork/keybindings-port.md` (`begin-move` /
-`begin-resize`, `always-on-top` / `toggle-above`, `toggle-on-all-workspaces`);
-landing a subsystem there adds its row here, and the ornament (`Ornament::Check`) the two toggles
-want is already in `widget::Menu`.
+The same three are `deferred` rows in `docs/fork/keybindings-port.md` (`begin-move` /
+`begin-resize`, `toggle-on-all-workspaces`); landing a subsystem there adds its row here.
+
+## The always-on-top band
+
+`FloatingSpace::tiles` is the stacking order, topmost first, and always-on-top is a **partition**
+of it: the flagged windows occupy a prefix, the ordinary ones the rest. Every raise clamps to its
+own side of the boundary (`raise_target`), which is `meta_stack_raise` under mutter's layer
+constraints — an ordinary window activated over an always-on-top one rises only as far as the
+band's floor.
+
+Three things follow from mutter that are easy to get wrong:
+
+- **Both directions raise.** `meta_window_make_above` and `meta_window_unmake_above`
+  (`window.c:3622-3639`) each end in `meta_window_raise`. Unmaking leaves the window at the top of
+  the *normal* band rather than dropping it wherever the boundary falls.
+- **The raise does not activate.** Making a window always-on-top while another has the focus
+  leaves the focus alone; mutter's `always-on-top.metatest` asserts exactly that.
+- **`raise-or-lower` uses two different scopes.** "Is it on top" asks the whole stack
+  (`meta_stack_get_top`); "is it covered" asks only the window's own band (`meta_stack_get_above`
+  with `only_within_layer`). With one scope a normal window under an always-on-top one would raise
+  forever and never come back down.
+
+**Membership is derived, never stored.** A tile is in the band if it is flagged, or if any
+ancestor of it is — so the boundary cannot come down between a dialog and its parent. And a
+*maximized* window is out of the band while it is maximized, flag and all, which is the rule the
+menu row's insensitivity reflects.
+
+Because membership is derived from a flag *and* a sizing mode *and* the transient chain, it can
+change under code that never touches the stacking order — maximize is the obvious one. So the band
+is **re-established, not maintained**: `resettle_band` is a stable partition, idempotent and free
+on the common path, run once per frame and immediately after a flag change. `verify_invariants`
+asserts the band is a prefix, so a path that manages to break it fails loudly.
+
+Floating only, and that is not a gap: in GNOME mode every window is floating, and niri's scrolling
+layout has no stacking order for a window to be on top *of*.
+
+**Not ported: the map-time focus rule.** mutter denies focus to a window that would map with 40%
+or less of itself visible under the always-on-top windows
+(`window_would_mostly_be_covered_by_always_above_window`, `window.c:2213-2246`, checked at
+`:2476-2480`). It needs the window's *placed* rect, and mutter runs `force_placement` before the
+check; ours decides focus above the layer that decides position, so the predicate has no rect to
+ask about yet. It is a focus-policy rule rather than part of the stacking model, and wiring it at
+the wrong seam would apply it to unminimize and workspace moves as well as to a first map.

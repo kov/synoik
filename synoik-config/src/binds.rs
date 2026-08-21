@@ -186,6 +186,18 @@ pub enum Action {
     ShowWindowMenu,
     /// `minimize`: hide the focused window (`meta_window_minimize`, `window.c:2734-2771`).
     MinimizeWindow,
+    /// `always-on-top` / `toggle-above`: keep the focused window over the others
+    /// (`meta_window_make_above` / `unmake_above`, `window.c:3622-3639`).
+    ToggleWindowAlwaysOnTop,
+    /// `raise`: bring the focused window to the top of its stacking band
+    /// (`meta_window_raise`, `window.c:5404-5442`).
+    RaiseWindow,
+    /// `lower`: send the focused window to the bottom of its stacking band
+    /// (`meta_window_lower`, `window.c:5467-5475`).
+    LowerWindow,
+    /// `raise-or-lower`: raise the focused window if something covers it, else lower it
+    /// (`handle_raise_or_lower`, `keybindings.c:2359-2402`).
+    RaiseOrLowerWindow,
     FullscreenWindow,
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,

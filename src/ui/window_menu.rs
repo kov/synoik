@@ -26,6 +26,8 @@
 //!   window type or a skip-taskbar window (`window.c:6014-6018`, `:6079-6082`), and neither has an
 //!   xdg-shell equivalent.
 //! - **Maximize / Restore** — one row, whichever the window is not (`windowMenu.js:44-55`).
+//! - **Always on Top** — `make_above` / `unmake_above` (`windowMenu.js:86-98`), checked when set
+//!   and insensitive while maximized.
 //! - **Move to Workspace Left / Right** — only when the neighbour in that direction is a
 //!   *different* workspace, which is what `workspace.get_neighbor(dir) !== workspace` tests
 //!   (`windowMenu.js:110-135`). GNOME's horizontal workspace axis is our vertical one, the same
@@ -46,7 +48,7 @@ use smithay::utils::{Logical, Point, Size};
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem};
+use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem, Ornament};
 use crate::window::mapped::MappedId;
 
 /// A neighbouring monitor's direction, in the order gnome-shell lists them.
@@ -90,6 +92,7 @@ enum RowAction {
     TakeScreenshot,
     Minimize,
     SetMaximized(bool),
+    SetAlwaysOnTop(bool),
     MoveToWorkspace(WorkspaceDirection),
     MoveToMonitor(MonitorDirection),
     Close,
@@ -102,6 +105,8 @@ pub struct WindowMenuContext {
     pub window: MappedId,
     /// Drawn as Restore when true, Maximize when false (`window.is_maximized()`).
     pub is_maximized: bool,
+    /// Ticks the Always on Top row (`window.is_above()`).
+    pub is_above: bool,
     /// Whether a workspace exists before / after this one on its monitor.
     pub workspace_left: bool,
     pub workspace_right: bool,
@@ -145,6 +150,27 @@ impl WindowMenu {
             row("Restore", RowAction::SetMaximized(false), &mut actions)
         } else {
             row("Maximize", RowAction::SetMaximized(true), &mut actions)
+        });
+        // Always on Top sits directly after Maximize/Restore — gnome-shell's construction order
+        // puts Move and Resize between them, and those two rows are not built (see the module
+        // docs), so this is the next one that is.
+        //
+        // Checked when set, and **insensitive while maximized**, which is not a UI nicety: a
+        // maximized window is in the normal layer even with the flag set
+        // (`meta_window_get_default_layer`), so the row would claim an effect it does not have.
+        // gnome-shell's other three disabling cases are X11 window types that xdg-shell has no
+        // equivalent of.
+        state.push({
+            let id = actions.len() as u64;
+            actions.push(RowAction::SetAlwaysOnTop(!ctx.is_above));
+            let mut item = MenuItem::new(id, "Always on Top");
+            if ctx.is_above {
+                item = item.with_ornament(Ornament::Check(true));
+            }
+            if ctx.is_maximized {
+                item = item.disabled();
+            }
+            MenuEntry::Item(item)
         });
         if ctx.workspace_left {
             state.push(row(
@@ -274,6 +300,9 @@ impl WindowMenu {
         match *action {
             RowAction::TakeScreenshot => PopoverAction::WindowTakeScreenshot(window),
             RowAction::Minimize => PopoverAction::WindowMinimize(window),
+            RowAction::SetAlwaysOnTop(above) => {
+                PopoverAction::WindowSetAlwaysOnTop { window, above }
+            }
             RowAction::SetMaximized(maximized) => {
                 PopoverAction::WindowSetMaximized { window, maximized }
             }

@@ -7185,6 +7185,7 @@ fn the_window_menu_offers_the_rows_the_window_has() {
             "Take Screenshot",
             "Hide",
             "Maximize",
+            "Always on Top",
             "Move to Workspace Right",
             "Close"
         ],
@@ -31524,5 +31525,318 @@ fn a_preview_settling_into_the_picker_never_doubles_back() {
         travelled > 20.,
         "precondition: the drop must have re-laid the picker out — the furthest a resident \
          preview moved was {travelled:.1}px, too little for a reversal to have anywhere to happen",
+    );
+}
+
+/// The stacking order of the active workspace, topmost first.
+fn stack(f: &mut Fixture) -> Vec<smithay::desktop::Window> {
+    let synoik = f.synoik();
+    let ws = synoik.layout.active_workspace().unwrap();
+    ws.tiles_with_render_positions()
+        .map(|(tile, _, _)| crate::layout::LayoutElement::id(tile.window()).clone())
+        .collect()
+}
+
+/// Map a window and hand back its id.
+fn map_window_id(f: &mut Fixture, id: ClientId) -> smithay::desktop::Window {
+    let _ = map_window_sized(f, id, (400, 300), None);
+    f.synoik().layout.focus().unwrap().window.clone()
+}
+
+/// Always on top is a **band**, not a one-off raise: the window stays over the others no matter
+/// what else is activated afterwards.
+///
+/// mutter's `always-on-top.metatest`, whose `assert_stacking` is bottom-to-top — its
+/// `1/2 1/1 1/3` is our `[c, a, b]`. Three separate claims live here, and the middle one is the
+/// band: making `c` always-on-top raises it *without taking the focus* (mutter checks
+/// `assert_focused 1/1` right after `make_above 1/3`), and activating an ordinary window
+/// afterwards lifts it only as far as the band's floor.
+#[test]
+fn an_always_on_top_window_stays_over_the_ones_activated_after_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    let c = map_window_id(&mut f, client);
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![c.clone(), b.clone(), a.clone()],
+        "last mapped is on top"
+    );
+
+    f.synoik_state().synoik.layout.activate_window(&a);
+    f.settle();
+    assert_eq!(stack(&mut f), vec![a.clone(), c.clone(), b.clone()]);
+
+    assert!(f.synoik_state().synoik.layout.set_window_above(&b, true));
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), a.clone(), c.clone()],
+        "the always-on-top window goes over everything"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().window,
+        a,
+        "and takes no focus doing it — a raise, not an activation"
+    );
+
+    f.synoik_state().synoik.layout.activate_window(&c);
+    // Read before settling, deliberately. The band is also re-established once per frame, so a
+    // raise that ignored it entirely would still look right by the time anything has settled —
+    // and would have drawn an ordinary window over an always-on-top one for that frame.
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), c.clone(), a.clone()],
+        "the raise itself must land in the band's floor, not be swept back down later"
+    );
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), c.clone(), a.clone()],
+        "activating an ordinary window lifts it to the band's floor, not over it"
+    );
+
+    // Unmaking leaves it at the top of the normal band rather than dropping it to the boundary —
+    // `meta_window_unmake_above` raises too, which is the half that looks like a mutter typo and
+    // is not.
+    assert!(f.synoik_state().synoik.layout.set_window_above(&b, false));
+    f.settle();
+    assert_eq!(stack(&mut f), vec![b.clone(), c.clone(), a.clone()]);
+
+    f.synoik_state().synoik.layout.activate_window(&a);
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone(), c.clone()],
+        "and with the flag gone the window is ordinary again"
+    );
+}
+
+/// A maximized window is in the normal band even while flagged always-on-top.
+///
+/// mutter's layer rule is `wm_state_above && !meta_window_is_maximized`
+/// (`meta_window_get_default_layer`, `window.c:6416-6432`), and it re-sorts through
+/// `meta_window_update_layer`. This is the case none of mutter's three always-on-top metatests
+/// cover, and the one where a hand-maintained band rots: maximize is a *stacking* change that
+/// goes nowhere near the stacking code.
+#[test]
+fn maximizing_an_always_on_top_window_puts_it_back_among_the_ordinary_ones() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    assert!(f.synoik_state().synoik.layout.set_window_above(&a, true));
+    f.settle();
+    assert_eq!(stack(&mut f), vec![a.clone(), b.clone()]);
+
+    f.synoik_state().synoik.layout.set_maximized(&a, true);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_window_above(&a),
+        "the flag itself survives — it is the eligibility that lapsed"
+    );
+    // Leaving the band is not itself a move: mutter's re-sort is stable, so a window ejected from
+    // the top layer keeps its place relative to the normal ones it was already over. What changed
+    // is that nothing holds it there any more.
+    f.synoik_state().synoik.layout.activate_window(&b);
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), a.clone()],
+        "an ordinary window can now go over it, which the band would have forbidden"
+    );
+
+    f.synoik_state().synoik.layout.set_maximized(&a, false);
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone()],
+        "and unmaximizing re-admits it to the band without anyone asking for a raise"
+    );
+}
+
+/// The band boundary never comes down between a dialog and its parent.
+///
+/// Membership is derived from the transient chain, not stored on the child: mutter computes the
+/// layer per window and lets the stack constraints keep them together. A dialog left below the
+/// boundary while its always-on-top parent sits above it is the one stacking mistake
+/// `bring_up_descendants_of` exists to prevent, and the band must not reintroduce it.
+#[test]
+fn a_dialog_rides_its_always_on_top_parent_into_the_band() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let other = map_window_id(&mut f, client);
+    let parent_surface = map_window_sized(&mut f, client, (400, 300), None);
+    let parent = f.synoik().layout.focus().unwrap().window.clone();
+    let _dialog_surface = map_window_sized(&mut f, client, (200, 150), Some(&parent_surface));
+    let dialog = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+
+    assert!(f
+        .synoik_state()
+        .synoik
+        .layout
+        .set_window_above(&parent, true));
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![dialog.clone(), parent.clone(), other.clone()],
+        "the dialog comes into the band with its parent, still above it"
+    );
+
+    f.synoik_state().synoik.layout.activate_window(&other);
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![dialog.clone(), parent.clone(), other.clone()],
+        "and an ordinary activation cannot get between them"
+    );
+}
+
+/// `raise-or-lower` on the topmost window lowers it; on a covered one it raises it —
+/// `handle_raise_or_lower` (`keybindings.c:2359-2402`).
+#[test]
+fn raise_or_lower_sends_the_top_window_down_and_brings_a_covered_one_up() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    f.settle();
+    assert_eq!(stack(&mut f), vec![b.clone(), a.clone()]);
+
+    assert!(f.synoik_state().synoik.layout.raise_or_lower_window(&b));
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone()],
+        "the top window has nothing covering it, so it goes down"
+    );
+
+    assert!(f.synoik_state().synoik.layout.raise_or_lower_window(&b));
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), a.clone()],
+        "and now that something covers it, back up"
+    );
+}
+
+/// A lower goes to the bottom of the window's own band, never past it.
+///
+/// mutter lowers to the bottom of the whole stack and lets the layer constraints clamp it
+/// (`meta_window_lower` -> `meta_stack_lower`); the band is that clamp. Both halves matter: an
+/// always-on-top window lowered out of its band would fall behind ordinary windows, and an
+/// ordinary one is not entitled to stop at the band's floor.
+#[test]
+fn lowering_stops_at_the_bottom_of_the_windows_own_band() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    let c = map_window_id(&mut f, client);
+    assert!(f.synoik_state().synoik.layout.set_window_above(&a, true));
+    assert!(f.synoik_state().synoik.layout.set_window_above(&b, true));
+    f.settle();
+    assert_eq!(stack(&mut f), vec![b.clone(), a.clone(), c.clone()]);
+
+    assert!(f.synoik_state().synoik.layout.lower_window(&b));
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone(), c.clone()],
+        "an always-on-top window lowers within the band, not behind the ordinary windows"
+    );
+
+    assert!(f.synoik_state().synoik.layout.lower_window(&a));
+    assert_eq!(
+        stack(&mut f),
+        vec![b.clone(), a.clone(), c.clone()],
+        "and the band's own floor is where it stops"
+    );
+}
+
+/// A window entering the layout lands under the band, not over it.
+///
+/// Every arrival goes through `FloatingSpace::add_tile`, which aims an activating window at the
+/// top of the stack; the band is where it has to stop. Driven here through an unminimize, which
+/// is that path with no frame in between — read before settling, because the band is also
+/// re-established once per frame, and an insertion that ignored it would be swept back down after
+/// a frame in which an ordinary window covered an always-on-top one.
+#[test]
+fn a_window_entering_the_layout_lands_under_the_always_on_top_band() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    assert!(f.synoik_state().synoik.layout.set_window_above(&a, true));
+    assert!(f.synoik_state().minimize_window(&b));
+    f.settle();
+
+    assert!(f
+        .synoik()
+        .layout
+        .unminimize_window(&b, crate::layout::ActivateWindow::Yes));
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone()],
+        "the returning window is activated, but stops at the band"
+    );
+
+    // The other half of the clamp: `is_above` rides `RemovedTile`, so an always-on-top window
+    // comes back still flagged, and clamping *it* would file it under every other band member.
+    assert!(f.synoik_state().synoik.layout.set_window_above(&b, true));
+    assert!(f.synoik_state().minimize_window(&a));
+    f.settle();
+    assert!(f
+        .synoik()
+        .layout
+        .unminimize_window(&a, crate::layout::ActivateWindow::Yes));
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone()],
+        "an always-on-top window returns to the top of the band, not to its floor"
+    );
+}
+
+/// `raise-or-lower` asks about coverage **within the window's own band**.
+///
+/// The always-on-top window covering `b` is not in `b`'s band, so it does not count as covering
+/// it: `b` is as high as it can go and must come down. Asking the whole stack instead would raise
+/// `b` to the band's floor, where the same always-on-top window still covers it, and the key
+/// would never lower anything again — `meta_stack_get_above`'s `only_within_layer`
+/// (`keybindings.c:2378`).
+#[test]
+fn raise_or_lower_ignores_coverage_from_another_band() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let a = map_window_id(&mut f, client);
+    let b = map_window_id(&mut f, client);
+    let c = map_window_id(&mut f, client);
+    assert!(f.synoik_state().synoik.layout.set_window_above(&a, true));
+    f.settle();
+    assert_eq!(stack(&mut f), vec![a.clone(), c.clone(), b.clone()]);
+
+    assert!(f.synoik_state().synoik.layout.raise_or_lower_window(&c));
+    f.settle();
+    assert_eq!(
+        stack(&mut f),
+        vec![a.clone(), b.clone(), c.clone()],
+        "the always-on-top window overlapping it is in another band, so it does not count as \
+         cover — c is already as high as it goes and comes down"
     );
 }

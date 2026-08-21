@@ -241,6 +241,11 @@ pub enum PopoverAction {
         window: crate::window::mapped::MappedId,
         maximized: bool,
     },
+    /// The window menu's Always on Top (`windowMenu.js:86-98`).
+    WindowSetAlwaysOnTop {
+        window: crate::window::mapped::MappedId,
+        above: bool,
+    },
     /// The window menu's "Move to Workspace Left" / "Right" (`windowMenu.js:110-135`).
     WindowMoveToWorkspace {
         window: crate::window::mapped::MappedId,
@@ -310,6 +315,7 @@ impl PopoverAction {
                 | PopoverAction::WindowTakeScreenshot(_)
                 | PopoverAction::WindowMinimize(_)
                 | PopoverAction::WindowSetMaximized { .. }
+                | PopoverAction::WindowSetAlwaysOnTop { .. }
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }
                 | PopoverAction::WindowClose(_)

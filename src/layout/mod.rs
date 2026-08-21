@@ -1863,6 +1863,54 @@ impl<W: LayoutElement> Layout<W> {
         false
     }
 
+    /// Set or clear always-on-top — `meta_window_make_above` / `meta_window_unmake_above`
+    /// (`window.c:3622-3639`). Returns whether anything changed.
+    pub fn set_window_above(&mut self, window: &W::Id, above: bool) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.set_above(window, above) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `window` is flagged always-on-top.
+    pub fn is_window_above(&self, window: &W::Id) -> bool {
+        self.workspaces().any(|(_, _, ws)| ws.is_above(window))
+    }
+
+    /// Bring `window` to the top of its band without changing the focus — `meta_window_raise`
+    /// (`window.c:5404-5442`).
+    pub fn raise_window(&mut self, window: &W::Id) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.raise_window_only(window) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Send `window` to the bottom of its band — `meta_window_lower` (`window.c:5467-5475`).
+    pub fn lower_window(&mut self, window: &W::Id) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.lower_window(window) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Raise `window` if something is covering it, else lower it — `handle_raise_or_lower`
+    /// (`keybindings.c:2359-2402`).
+    pub fn raise_or_lower_window(&mut self, window: &W::Id) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.raise_or_lower(window) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn activate_window(&mut self, window: &W::Id) {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {

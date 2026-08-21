@@ -2124,6 +2124,12 @@ impl State {
                     self.minimize_window(&window);
                 }
             }
+            PopoverAction::WindowSetAlwaysOnTop { window, above } => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.synoik.layout.set_window_above(&window, above);
+                    self.synoik.queue_redraw_all();
+                }
+            }
             PopoverAction::WindowSetMaximized { window, maximized } => {
                 if let Some(window) = self.window_by_id(window) {
                     self.synoik.layout.set_maximized(&window, maximized);
@@ -2529,6 +2535,7 @@ impl State {
             // the request is made, not when the client gets round to acking the configure. A
             // menu reopened in that gap must already say Restore.
             is_maximized: mapped.pending_sizing_mode().is_maximized(),
+            is_above: self.synoik.layout.is_window_above(window),
             workspace_left: ws_idx > 0,
             workspace_right: ws_idx + 1 < ws_count,
             monitor_up: self.synoik.output_up_of(&output).is_some(),
@@ -3155,6 +3162,33 @@ impl State {
             Action::MinimizeWindow => {
                 if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
                     self.minimize_window(&window);
+                }
+            }
+            // `handle_always_on_top` (`keybindings.c:1803-1813`): make or unmake above. The
+            // raise it carries does not activate — the focus stays where it was.
+            Action::ToggleWindowAlwaysOnTop => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    let above = self.synoik.layout.is_window_above(&window);
+                    self.synoik.layout.set_window_above(&window, !above);
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            Action::RaiseWindow => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.synoik.layout.raise_window(&window);
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            Action::LowerWindow => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.synoik.layout.lower_window(&window);
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            Action::RaiseOrLowerWindow => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.synoik.layout.raise_or_lower_window(&window);
+                    self.synoik.queue_redraw_all();
                 }
             }
             // `handle_activate_window_menu` (`keybindings.c:1999-2021`): the focused window's
@@ -10157,6 +10191,10 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ActivateWindowMenu => Action::ShowWindowMenu,
         GnomeKeyAction::Minimize => Action::MinimizeWindow,
+        GnomeKeyAction::AlwaysOnTop => Action::ToggleWindowAlwaysOnTop,
+        GnomeKeyAction::Raise => Action::RaiseWindow,
+        GnomeKeyAction::Lower => Action::LowerWindow,
+        GnomeKeyAction::RaiseOrLower => Action::RaiseOrLowerWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
             Action::FocusWorkspace(WorkspaceReference::Index(n))

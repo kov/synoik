@@ -71,7 +71,14 @@ gsd media keys.
 `switch-group(-backward)`, `cycle-windows(-backward)`, `cycle-group(-backward)`,
 `switch-applications(-backward)`, `toggle-maximized`, `switch-to-workspace-last`,
 `move-to-workspace-last`, `move-to-monitor-{left,right,up,down}`,
-`switch-input-source(-backward)`.
+`switch-input-source(-backward)`, `minimize`, `always-on-top`, `toggle-above`, `raise`,
+`lower`, `raise-or-lower`.
+
+`always-on-top` and `toggle-above` are **two settings keys sharing one action**: mutter
+registers both, against handlers that differ only in name (`handle_always_on_top`,
+`keybindings.c:1803-1813`; `handle_toggle_above`, `:2086-2096`). All five of the stacking keys
+default to nothing, so adopting them costs no default chord — see
+`docs/fork/window-menu-port.md` for what always-on-top means to the stack.
 
 `switch-input-source` is a **divergence**: gnome-shell puts up an input-source switcher popup
 for the duration of the modifier hold, and we switch straight away. That popup is the same
@@ -313,7 +320,6 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 |---|---|
 | `begin-move` / `begin-resize` | no keyboard interactive-grab machinery |
 | `show-desktop` | not implemented |
-| `raise` / `lower` / `raise-or-lower`, `always-on-top` / `toggle-above` | no stacking model |
 | `maximize-vertically` / `-horizontally`, `move-to-corner-*`, `move-to-side-*`, `move-to-center` | no half-max / floating-placement infra |
 | `toggle-on-all-workspaces` | no sticky windows |
 | `switch-panels` / `cycle-panels` | no keyboard navigation between shell surfaces |

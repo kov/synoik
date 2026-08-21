@@ -114,6 +114,17 @@ pub struct Tile<W: LayoutElement> {
     /// to land on maximized or on the saved rect.
     pub(super) saved_maximize: bool,
 
+    /// Always on top: mutter's `wm_state_above` (`window.c:3623-3652`).
+    ///
+    /// Compositor state, not a window state: neither `xdg_toplevel` nor the foreign-toplevel
+    /// protocol has an "above" state, so like `minimized` this is only ours. It lives on the tile
+    /// rather than the window so it rides [`RemovedTile`] through a minimize or a workspace move
+    /// for free, the same way `saved_maximize` does.
+    ///
+    /// Whether the tile is *drawn* above others is a derived question — see
+    /// `FloatingSpace::is_in_above_band`, which also carves out maximized windows.
+    pub(super) is_above: bool,
+
     /// Currently selected preset width index when this tile is floating.
     pub(super) floating_preset_width_idx: Option<usize>,
 
@@ -334,6 +345,7 @@ impl<W: LayoutElement> Tile<W> {
             tiled_restore_pos: None,
             restore_in_flight: None,
             saved_maximize: false,
+            is_above: false,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
             open_animation: None,
