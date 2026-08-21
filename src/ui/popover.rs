@@ -230,6 +230,10 @@ pub enum PopoverAction {
     /// "Quit" (`appMenu.js:99-100`) — `shell_app_request_quit`. Unlike the launch
     /// rows this does *not* leave the overview: gnome-shell's handler is bare.
     AppQuit(String),
+    /// The window menu's Take Screenshot (`windowMenu.js:26-36`): the window's own pixels,
+    /// saved and put on the clipboard with a notification, and without the pointer — the null
+    /// cursor `captureScreenshot(texture, null, 1, null)` passes.
+    WindowTakeScreenshot(crate::window::mapped::MappedId),
     /// The window menu's Maximize / Restore (`windowMenu.js:44-55`).
     WindowSetMaximized {
         window: crate::window::mapped::MappedId,
@@ -301,6 +305,7 @@ impl PopoverAction {
                 | PopoverAction::IndicatorMenuActivate { .. }
                 // Every window-menu row is a plain `PopupMenuItem`, so activating any of them
                 // runs `menu.itemActivated()` and the menu goes.
+                | PopoverAction::WindowTakeScreenshot(_)
                 | PopoverAction::WindowSetMaximized { .. }
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }

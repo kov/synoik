@@ -34,6 +34,10 @@ Built in GNOME's order, each shown only when its target exists — the neighbour
 `workspace.get_neighbor(dir) !== workspace` and `get_monitor_neighbor_index(…) !== -1`
 (`windowMenu.js:110-181`) make:
 
+- **Take Screenshot** — the window's own pixels, stored the way a keypress stores one (file,
+  clipboard, notification) and without the pointer: `captureScreenshot(texture, null, 1, null)`
+  passes a null cursor and a null geometry (`windowMenu.js:26-36`). Shares one capture with the
+  `screenshot-window` action.
 - **Maximize / Restore** — one row, whichever the window is not. Reads the *pending* sizing mode:
   `window.is_maximized()` is the compositor's own state, which flips when the request is made, not
   when the client acks the configure.
@@ -61,14 +65,13 @@ window, and a row that could never enable teaches the reader nothing. In the ord
 
 | Row | Needs |
 |---|---|
-| Take Screenshot | per-window capture — `window.paint_to_content()` into the screenshot pipeline (`windowMenu.js:26-36`) |
 | Hide | minimized window state in the layout |
 | Move | keyboard interactive-move grab (`Meta.GrabOp.KEYBOARD_MOVING`) |
 | Resize | keyboard interactive-resize grab (`Meta.GrabOp.KEYBOARD_RESIZING_UNKNOWN`) |
 | Always on Top | a stacking model — `make_above` / `unmake_above` |
 | Always on Visible Workspace | sticky windows — `stick` / `unstick` |
 
-The same six are the `deferred` rows in `docs/fork/keybindings-port.md` (`minimize`,
+The same five are the `deferred` rows in `docs/fork/keybindings-port.md` (`minimize`,
 `begin-move` / `begin-resize`, `always-on-top` / `toggle-above`, `toggle-on-all-workspaces`);
 landing a subsystem there adds its row here, and the ornament (`Ornament::Check`) the two toggles
 want is already in `widget::Menu`.

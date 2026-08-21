@@ -7180,7 +7180,12 @@ fn the_window_menu_offers_the_rows_the_window_has() {
         menu.labels(),
         // One monitor, so no "Move to Monitor *"; the first workspace has nothing to its left,
         // and the trailing empty workspace is what "Right" moves to.
-        vec!["Maximize", "Move to Workspace Right", "Close"],
+        vec![
+            "Take Screenshot",
+            "Maximize",
+            "Move to Workspace Right",
+            "Close"
+        ],
         "the rows a single-monitor, unmaximized window on the first workspace gets"
     );
 
@@ -7196,6 +7201,51 @@ fn the_window_menu_offers_the_rows_the_window_has() {
 
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
+}
+
+/// Take Screenshot leads the menu and photographs the window it belongs to
+/// (`windowMenu.js:26-36`).
+///
+/// Asserts the *action* the row yields rather than applying it: running the capture would write a
+/// PNG into the user's real `~/Pictures/Screenshots` — the corpus has littered a home directory
+/// that way before (`docs/fork/screenshot-ui-port.md`).
+#[test]
+fn the_window_menu_photographs_its_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window = f.synoik().layout.focus().unwrap().id();
+
+    open_window_menu_at_corner(&mut f);
+    assert_eq!(
+        f.synoik().panel_popover.window_menu().unwrap().labels()[0],
+        "Take Screenshot",
+        "it leads the menu, as in `_buildMenu`"
+    );
+
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let row = f
+        .synoik()
+        .panel_popover
+        .window_menu()
+        .unwrap()
+        .row_center("Take Screenshot")
+        .expect("the row");
+    let at = origin + row;
+    assert_eq!(
+        f.synoik().panel_popover.pointer_click(&output, at),
+        Some(crate::ui::popover::PopoverAction::WindowTakeScreenshot(
+            window
+        )),
+        "the row photographs the menu's own window"
+    );
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "and closes the menu, like every other row"
+    );
 }
 
 /// Maximize / Restore is one row, whichever the window is not (`windowMenu.js:44-55`), and it
@@ -7220,7 +7270,7 @@ fn the_window_menu_maximizes_and_restores() {
 
     open_window_menu_at_corner(&mut f);
     assert_eq!(
-        f.synoik().panel_popover.window_menu().unwrap().labels()[0],
+        f.synoik().panel_popover.window_menu().unwrap().labels()[1],
         "Restore",
         "a maximized window is offered the other half of the pair"
     );
@@ -7315,11 +7365,9 @@ fn alt_space_pops_the_window_menu_and_the_keyboard_drives_it() {
         "the keyboard binding anchors on the window's own top-left"
     );
 
-    // Down off the first row (Maximize) lands on the second; Down again on Close.
-    f.key_press(KEY_DOWN);
-    f.key_release(KEY_DOWN);
-    f.key_press(KEY_DOWN);
-    f.key_release(KEY_DOWN);
+    // Up off the first row wraps to the last one, Close — the wrap GNOME's menus do.
+    f.key_press(KEY_UP);
+    f.key_release(KEY_UP);
     f.key_press(KEY_ENTER);
     f.key_release(KEY_ENTER);
     f.double_roundtrip(id);

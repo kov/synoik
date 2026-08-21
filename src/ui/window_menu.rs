@@ -18,6 +18,9 @@
 //! separator, Move to Monitor {Up,Down,Left,Right}, a separator, and Close. We build the rows
 //! that have a model behind them:
 //!
+//! - **Take Screenshot** — the window's own pixels, saved and put on the clipboard with a
+//!   notification, and without the pointer (`windowMenu.js:26-36`, whose
+//!   `captureScreenshot(texture, null, 1, null)` passes a null cursor).
 //! - **Maximize / Restore** — one row, whichever the window is not (`windowMenu.js:44-55`).
 //! - **Move to Workspace Left / Right** — only when the neighbour in that direction is a
 //!   *different* workspace, which is what `workspace.get_neighbor(dir) !== workspace` tests
@@ -29,7 +32,7 @@
 //!
 //! The rest are omitted rather than drawn insensitive, because every one of them is missing its
 //! *subsystem*, not merely a per-window capability: no minimized state, no stacking order, no
-//! sticky windows, no keyboard grab machinery, no per-window capture. GNOME dims a row when
+//! sticky windows, no keyboard grab machinery. GNOME dims a row when
 //! `can_minimize()` is false for *this* window; a row we could never enable is a row that teaches
 //! the reader nothing. `docs/fork/window-menu-port.md` carries the list and what each one needs.
 
@@ -80,6 +83,7 @@ pub enum WindowMenuAnchor {
 /// id to action lives here — the id is this table's index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowAction {
+    TakeScreenshot,
     SetMaximized(bool),
     MoveToWorkspace(WorkspaceDirection),
     MoveToMonitor(MonitorDirection),
@@ -123,9 +127,14 @@ impl WindowMenu {
             MenuEntry::Item(MenuItem::new(id, label))
         };
 
-        // Group 0: the size verbs and the workspace moves — one flat group, as in gnome-shell,
-        // which puts no separator between them.
-        let mut state = Vec::new();
+        // Group 0: the capture, the size verbs and the workspace moves — one flat group, as in
+        // gnome-shell, which puts no separator between them. Take Screenshot leads, and has no
+        // `can_*` gate: every window can be photographed.
+        let mut state = vec![row(
+            "Take Screenshot",
+            RowAction::TakeScreenshot,
+            &mut actions,
+        )];
         state.push(if ctx.is_maximized {
             row("Restore", RowAction::SetMaximized(false), &mut actions)
         } else {
@@ -257,6 +266,7 @@ impl WindowMenu {
         };
         let window = self.window;
         match *action {
+            RowAction::TakeScreenshot => PopoverAction::WindowTakeScreenshot(window),
             RowAction::SetMaximized(maximized) => {
                 PopoverAction::WindowSetMaximized { window, maximized }
             }

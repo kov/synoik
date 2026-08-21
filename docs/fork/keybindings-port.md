@@ -324,7 +324,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | `focus-active-notification` (`<Super>n`) | banner exists, no keyboard-focus path — belongs to a notifications slice |
 | `shift-overview-up` / `-down` | overview lacks the staged state machine |
 
-Six of these are also the rows the window menu leaves out, so landing one lands both:
+Five of these are also the rows the window menu leaves out, so landing one lands both:
 `docs/fork/window-menu-port.md`.
 
 ## Slices

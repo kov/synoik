@@ -2110,8 +2110,15 @@ impl State {
                 }
             }
             // The window-menu rows act on the window the menu was summoned on, not on the
-            // focus: gnome-shell's items close over `window` (`windowMenu.js:44-189`), and a
+            // focus: gnome-shell's items close over `window` (`windowMenu.js:26-189`), and a
             // menu can outlive the focus that opened it.
+            //
+            // `captureScreenshot(texture, null, 1, null)` (`windowMenu.js:33`): the null cursor
+            // keeps the pointer out, and the null geometry takes the whole window. It stores the
+            // shot the way a keypress does — file, clipboard and notification.
+            PopoverAction::WindowTakeScreenshot(window) => {
+                self.screenshot_window_by_id(window.get(), true, false, None);
+            }
             PopoverAction::WindowSetMaximized { window, maximized } => {
                 if let Some(window) = self.window_by_id(window) {
                     self.synoik.layout.set_maximized(&window, maximized);
@@ -2348,6 +2355,40 @@ impl State {
         // overview hides" rule must not reach it — there is no overview to hide.
         self.synoik.app_menu_from_dock = self.synoik.dock_owns_dash(output);
         true
+    }
+
+    /// Photograph one window: its own pixels, saved through whichever path `write_to_disk` and
+    /// `path` name. Shared by the `screenshot-window` action and the window menu's row, which
+    /// gnome-shell also routes into the same `captureScreenshot` (`windowMenu.js:26-36`).
+    fn screenshot_window_by_id(
+        &mut self,
+        id: u64,
+        write_to_disk: bool,
+        show_pointer: bool,
+        path: Option<String>,
+    ) {
+        let mut windows = self.synoik.layout.windows();
+        let window = windows.find(|(_, m)| m.id().get() == id);
+        let Some((Some(monitor), mapped)) = window else {
+            return;
+        };
+        let output = monitor.output();
+        let res = self.backend.with_vulkan_renderer(|renderer| {
+            self.synoik.screenshot_window(
+                renderer,
+                output,
+                mapped,
+                write_to_disk,
+                show_pointer,
+                path,
+                None,
+            )
+        });
+        match res {
+            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+            None => warn!("renderer unavailable for screenshot"),
+            Some(Ok(())) => {}
+        }
     }
 
     /// The layout id of the window with this stable id.
@@ -2999,27 +3040,7 @@ impl State {
                 show_pointer,
                 path,
             } => {
-                let mut windows = self.synoik.layout.windows();
-                let window = windows.find(|(_, m)| m.id().get() == id);
-                if let Some((Some(monitor), mapped)) = window {
-                    let output = monitor.output();
-                    let res = self.backend.with_vulkan_renderer(|renderer| {
-                        self.synoik.screenshot_window(
-                            renderer,
-                            output,
-                            mapped,
-                            write_to_disk,
-                            show_pointer,
-                            path,
-                            None,
-                        )
-                    });
-                    match res {
-                        Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
-                        None => warn!("renderer unavailable for screenshot"),
-                        Some(Ok(())) => {}
-                    }
-                }
+                self.screenshot_window_by_id(id, write_to_disk, show_pointer, path);
             }
             Action::ToggleKeyboardShortcutsInhibit => {
                 if let Some(inhibitor) = self.synoik.keyboard_focus.surface().and_then(|surface| {
