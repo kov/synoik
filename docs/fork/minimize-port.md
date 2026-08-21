@@ -71,8 +71,53 @@ Every consumer that answers "what windows are there, and can you see them" carri
   maps.
 - **`is_hidden`** now means minimized *or* on an inactive workspace.
 
+## The overview
+
+GNOME's split, and ours: the **window picker shows** minimized windows — `_isOverviewWindow` is
+`!win.skip_taskbar` with no minimized check (`workspace.js:1332`) — while the **thumbnail strip
+hides** them, its own `_isOverviewWindow` adding `showing_on_its_workspace()`
+(`workspaceThumbnail.js:461-463`), which is false when minimized; both `_addWindowClone` sites
+connect `notify::minimized` to add and remove clones live (`:275`, `:374`).
+
+A parked tile can produce the picker's layout input without any new state. The input is
+`(stable_sequence, rect)` where `rect` is the settled position plus the tile size
+(`Workspace::expose_live_inputs`), and removal stamps both onto the tile:
+`floating_pos` (a size-fraction of the working area) and `floating_window_size`
+(`FloatingSpace::remove_tile_by_idx`). Those are the same fields `stored_or_default_tile_pos`
+reads back to put the window where it was, which is what makes unminimize exact.
+
+Because the rect comes from the position the tile *had*, minimizing with the overview open leaves
+the picker's input unchanged and the grid does not shuffle. The one place the two can disagree is
+off-screen windows: `Data::recompute_logical_pos` clamps the fraction to keep a window mostly
+on-screen and `stored_or_default_tile_pos` does not.
+
+The picker is GNOME-mode-only and GNOME mode keeps every window in the floating layout, so there is
+no scrolling-layer case with no stored position.
+
+## Backlog: a minimized strip instead of picker slots
+
+Preferred over GNOME's behavior (kov, 2026-08-21): show minimized windows on a **smaller
+affordance** — a preview strip across the bottom of the workspace area — rather than as
+full picker slots, the way macOS keeps minimized windows in the Dock rather than in Exposé.
+
+Deferred because it is **more** work than folding them into the picker, not less:
+
+- `overview_layout::layout` is pure geometry, so the strip is a new `Measured` height, a new
+  `ControlsLayout` box, and a subtraction from the picker box — cheap and pinnable, but it makes
+  the picker box **depend on whether any window is minimized**. Minimizing with the overview open
+  would then relayout the whole picker, which is exactly the shuffle that folding avoids.
+- The strip needs its own render path, hit-testing and click-to-restore. Folding needs none: a
+  minimized window that is an ordinary picker entry gets slots, hover, the close button and
+  activation for free.
+- It competes with the dash for the bottom of the work area.
+
+What carries over when it is built: the preview chrome (`ui::window_preview::PreviewChrome`
+takes a rect), the tile-into-slot scaling, and the synthesized-rect reading above. What is thrown
+away is small. The strip **replaces** the picker slots when it lands — it is not additive.
+
 ## Divergences, for now
 
-- **The overview does not show minimized windows.** GNOME's window picker includes them (the
-  thumbnail strip does not). Ours drops them, because the picker reads the laid-out tiles.
 - **No minimize animation.** GNOME shrinks the window toward its icon; ours vanishes.
+- **Minimized windows still get frame callbacks.** `windows_for_output_mut` reaches them through
+  `Workspace::tiles_mut`, so a hidden window keeps drawing. Convenient — the picker preview has a
+  live texture — but it is work GNOME throttles.
