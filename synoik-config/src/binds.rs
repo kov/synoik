@@ -181,6 +181,9 @@ pub enum Action {
     RestoreKeyboardShortcuts,
     CloseWindow,
     CloseWindowById(u64),
+    /// `activate-window-menu`: pop the focused window's own menu
+    /// (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
+    ShowWindowMenu,
     FullscreenWindow,
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,

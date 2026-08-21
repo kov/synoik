@@ -313,7 +313,6 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 |---|---|
 | `minimize` (`<Super>h`) | no minimized-window state in layout |
 | `begin-move` / `begin-resize` | no keyboard interactive-grab machinery |
-| `activate-window-menu` | no window menu UI |
 | `show-desktop` | not implemented |
 | `raise` / `lower` / `raise-or-lower`, `always-on-top` / `toggle-above` | no stacking model |
 | `maximize-vertically` / `-horizontally`, `move-to-corner-*`, `move-to-side-*`, `move-to-center` | no half-max / floating-placement infra |
@@ -324,6 +323,9 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | `set-spew-mark` | mutter debug hook; never |
 | `focus-active-notification` (`<Super>n`) | banner exists, no keyboard-focus path — belongs to a notifications slice |
 | `shift-overview-up` / `-down` | overview lacks the staged state machine |
+
+Six of these are also the rows the window menu leaves out, so landing one lands both:
+`docs/fork/window-menu-port.md`.
 
 ## Slices
 

@@ -3015,6 +3015,22 @@ impl State {
     }
 
     /// Act on a finished switcher session: activate the selection, or leave focus alone.
+    /// Everything that must let go of a window as it is removed, in one place so the next
+    /// overlay to hold a window cannot be wired into one removal path and not the other (a
+    /// toplevel destroy and a surface unmap are separate sites).
+    pub fn window_removed(&mut self, id: crate::window::mapped::MappedId) {
+        // A window vanishing under an open switcher removes its item -- or, for an app
+        // switcher, only that app's chevron unless it was the app's last window
+        // (`_itemRemoved`, `switcherPopup.js:269-284`).
+        let outcome = self.synoik.switcher.window_removed(id);
+        self.finish_switcher(outcome);
+        // A window menu whose window is gone acts on nothing, and would keep the modal grab
+        // over whatever the focus fell back to (`windowMenu.js:235-237`).
+        if self.synoik.panel_popover.close_window_menu_for(id) {
+            self.synoik.queue_redraw_all();
+        }
+    }
+
     pub fn finish_switcher(
         &mut self,
         outcome: Option<(

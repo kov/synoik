@@ -81,6 +81,7 @@ use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::panel_height;
 use crate::ui::quick_settings::QuickSettings;
 use crate::ui::widget;
+use crate::ui::window_menu::{WindowMenu, WindowMenuContext};
 use crate::utils::output_size;
 
 /// The Settings app's desktop id, which every quick-settings route into Settings resolves
@@ -229,6 +230,23 @@ pub enum PopoverAction {
     /// "Quit" (`appMenu.js:99-100`) — `shell_app_request_quit`. Unlike the launch
     /// rows this does *not* leave the overview: gnome-shell's handler is bare.
     AppQuit(String),
+    /// The window menu's Maximize / Restore (`windowMenu.js:44-55`).
+    WindowSetMaximized {
+        window: crate::window::mapped::MappedId,
+        maximized: bool,
+    },
+    /// The window menu's "Move to Workspace Left" / "Right" (`windowMenu.js:110-135`).
+    WindowMoveToWorkspace {
+        window: crate::window::mapped::MappedId,
+        dir: crate::ui::window_menu::WorkspaceDirection,
+    },
+    /// The window menu's "Move to Monitor *" (`windowMenu.js:143-181`).
+    WindowMoveToMonitor {
+        window: crate::window::mapped::MappedId,
+        dir: crate::ui::window_menu::MonitorDirection,
+    },
+    /// The window menu's Close — `window.delete()` (`windowMenu.js:185-189`).
+    WindowClose(crate::window::mapped::MappedId),
     /// Flip one accessibility menu row: write the backing gsettings key and close the
     /// menu (`PopupSwitchMenuItem.activate`, `js/ui/popupMenu.js:539-550`).
     SetA11yToggle {
@@ -281,6 +299,12 @@ impl PopoverAction {
                 // Activating a remote row closes the menu too — but *expanding* one does not,
                 // which is why the two are separate actions.
                 | PopoverAction::IndicatorMenuActivate { .. }
+                // Every window-menu row is a plain `PopupMenuItem`, so activating any of them
+                // runs `menu.itemActivated()` and the menu goes.
+                | PopoverAction::WindowSetMaximized { .. }
+                | PopoverAction::WindowMoveToWorkspace { .. }
+                | PopoverAction::WindowMoveToMonitor { .. }
+                | PopoverAction::WindowClose(_)
         )
     }
 }
@@ -296,6 +320,8 @@ pub enum PopoverContent {
     App(Box<AppMenu>),
     /// An app indicator's remote menu, which opens empty and fills in when the client answers.
     Indicator(Box<IndicatorMenu>),
+    /// A window's own menu, summoned on its titlebar.
+    Window(Box<WindowMenu>),
 }
 
 impl PopoverContent {
@@ -307,6 +333,7 @@ impl PopoverContent {
             PopoverContent::A11y(m) => m.logical_size(),
             PopoverContent::App(m) => m.logical_size(),
             PopoverContent::Indicator(m) => m.logical_size(),
+            PopoverContent::Window(m) => m.logical_size(),
         }
     }
 
@@ -319,6 +346,7 @@ impl PopoverContent {
             PopoverContent::A11y(m) => m.corner_radius(),
             PopoverContent::App(m) => m.corner_radius(),
             PopoverContent::Indicator(m) => m.corner_radius(),
+            PopoverContent::Window(m) => m.corner_radius(),
         }
     }
 }
@@ -338,6 +366,12 @@ pub enum PopoverSide {
     /// (`popupMenuSide ?? St.Side.LEFT`, `appDisplay.js:2928`), which is what an
     /// app-grid or search-result icon gets.
     Left,
+    /// Arrow on top with alignment 0 → the box hangs *below* the anchor and is aligned to its
+    /// left edge, rather than centred on it. gnome-shell's window menu, whose source actor is a
+    /// zero-sized widget parked at the point the client asked for
+    /// (`PopupMenu(sourceActor, 0, St.Side.TOP)`, `windowMenu.js:10-11`, over the rect
+    /// `_shell_wm_show_window_menu` builds with `width = height = 0`, `shell-wm.c:336-350`).
+    Point,
 }
 
 /// A single panel popover, owned on `Synoik` alongside the other overlays.
@@ -361,6 +395,9 @@ pub struct PanelPopover {
     /// While closing, the content is kept and rendered (fading out) until the animation
     /// settles, then dropped by [`advance_animations`](Self::advance_animations).
     closing: bool,
+    /// An action a keyboard activation produced, waiting for the caller to drain it once it is
+    /// out of the keyboard filter. See [`Self::handle_key`].
+    pending_action: Option<PopoverAction>,
     /// The `.popup-menu-content` drop shadow, baked into its own texture and cached by
     /// `(scale, size)` (keyed on the content radius so a same-size different-radius content
     /// re-bakes). Composited behind whatever content is up.
@@ -386,6 +423,7 @@ impl PanelPopover {
             config,
             anim: None,
             closing: false,
+            pending_action: None,
             shadow_cache: RefCell::new(widget::BakeCache::new()),
             border_cache: RefCell::new(widget::BakeCache::new()),
             fill_cache: RefCell::new(widget::BakeCache::new()),
@@ -432,6 +470,8 @@ impl PanelPopover {
             PopoverContent::A11y(_) => Some(crate::ui::panel::ROLE_A11Y),
             // Not a panel menu: nothing in the panel should light up for it.
             PopoverContent::App(_) => None,
+            // Not a panel menu either: it hangs off a window, not off the bar.
+            PopoverContent::Window(_) => None,
             // The indicator cluster is one panel item per icon, so the pressed-role highlight
             // would have to name *which* icon; it does not, and lighting the whole cluster would
             // be worse than lighting none of it.
@@ -696,6 +736,51 @@ impl PanelPopover {
         menu.set_max_height(Some(self.available_menu_height()));
         self.content = Some(PopoverContent::App(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Pop up a window's own menu, anchored at `anchor` — the point the client asked for, or the
+    /// window's top-left for the keyboard binding. `WindowMenuManager.showWindowMenuForWindow`
+    /// (`windowMenu.js:213-250`).
+    ///
+    /// Unconditionally opens, like the app context menu: a right-click is not a latching button.
+    pub fn open_window_menu(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        ctx: &WindowMenuContext,
+    ) {
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Point;
+        let mut menu = WindowMenu::new(ctx);
+        menu.set_max_height(Some(self.available_menu_height()));
+        // `menu.actor.navigate_focus(null, TAB_FORWARD, false)` (`windowMenu.js:247`): the menu
+        // comes up with its first row focused, so Enter acts without an arrow key first.
+        menu.focus_step(1);
+        self.content = Some(PopoverContent::Window(Box::new(menu)));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// The open window menu, if that is what is up — for the corpus, and for the unmap path that
+    /// has to take the menu down with its window.
+    pub fn window_menu(&self) -> Option<&WindowMenu> {
+        match &self.content {
+            Some(PopoverContent::Window(m)) if self.open && !self.closing => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Close the menu if it belongs to `window`. gnome-shell wires the same thing to the window's
+    /// `unmanaged` signal (`windowMenu.js:235-237`): a menu whose window is gone acts on nothing,
+    /// and would keep the modal grab over whatever the focus fell back to.
+    pub fn close_window_menu_for(&mut self, window: crate::window::mapped::MappedId) -> bool {
+        if self.window_menu().map(|m| m.window()) != Some(window) {
+            return false;
+        }
+        self.close();
+        true
     }
 
     /// Pop up an app indicator's menu, anchored on its panel icon.
@@ -1066,6 +1151,7 @@ impl PanelPopover {
             Some(PopoverContent::A11y(m)) => m.pointer_hover(local),
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
             Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
+            Some(PopoverContent::Window(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -1117,17 +1203,55 @@ impl PanelPopover {
         self.anim = None;
     }
 
-    /// Feed a key while the popover is open. Escape closes it; every other key is
-    /// swallowed (a modal grab, like GNOME popup menus). Returns whether the key
-    /// was consumed. A closing (fading-out) popover no longer grabs input.
+    /// Feed a key while the popover is open. Escape closes it; a window menu also takes the
+    /// arrows and Enter/Space, since it is the one popover with a keyboard way in
+    /// (`activate-window-menu`). Every other key is swallowed (a modal grab, like GNOME popup
+    /// menus). Returns whether the key was consumed. A closing (fading-out) popover no longer
+    /// grabs input.
+    ///
+    /// An activated row's action is *parked* on [`Self::take_pending_action`] rather than
+    /// returned: this runs inside smithay's keyboard filter, which holds the keyboard borrowed,
+    /// and applying an action there would re-enter it. The caller drains it once `input()` is
+    /// done.
+    ///
+    /// The pointer-summoned menus (app, indicator) have no key navigation because they have no
+    /// keyboard trigger to arrive from; they get it when they get one.
     pub fn handle_key(&mut self, raw: Option<Keysym>, pressed: bool) -> bool {
         if !self.open || self.closing {
             return false;
         }
-        if pressed && raw == Some(Keysym::Escape) {
+        if !pressed {
+            return true;
+        }
+        if raw == Some(Keysym::Escape) {
             self.close();
+            return true;
+        }
+        let Some(PopoverContent::Window(menu)) = self.content.as_mut() else {
+            return true;
+        };
+        match raw {
+            Some(Keysym::Down | Keysym::Tab) => {
+                menu.focus_step(1);
+            }
+            Some(Keysym::Up | Keysym::ISO_Left_Tab) => {
+                menu.focus_step(-1);
+            }
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
+                let action = menu.activate_focused();
+                if action.closes_menu() {
+                    self.close();
+                }
+                self.pending_action = Some(action);
+            }
+            _ => (),
         }
         true
+    }
+
+    /// Take the action a keyboard activation parked, if any. See [`Self::handle_key`].
+    pub fn take_pending_action(&mut self) -> Option<PopoverAction> {
+        self.pending_action.take()
     }
 
     /// Feed a pointer click at output-local logical `pos` on `output`. A click
@@ -1165,6 +1289,7 @@ impl PanelPopover {
                 Some(PopoverContent::A11y(m)) => m.pointer_click(local),
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
                 Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
+                Some(PopoverContent::Window(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -1217,6 +1342,7 @@ impl PanelPopover {
             // event for whatever is behind it.
             Some(PopoverContent::App(m)) => m.scroll(delta),
             Some(PopoverContent::Indicator(m)) => m.scroll(delta),
+            Some(PopoverContent::Window(m)) => m.scroll(delta),
             _ => false,
         }
     }
@@ -1275,6 +1401,12 @@ impl PanelPopover {
                 (self.anchor.loc.y + self.anchor.size.h / 2. - size.h / 2.)
                     .clamp(POPOVER_MARGIN, max_y),
             )),
+            // Straight off the anchor point, not centred on it: the window menu's arrow
+            // alignment is 0, so the box's left edge lines up with where the click was.
+            PopoverSide::Point => Point::from((
+                (self.anchor.loc.x).clamp(POPOVER_MARGIN, max_x),
+                (self.anchor.loc.y + self.anchor.size.h).clamp(POPOVER_MARGIN, max_y),
+            )),
         };
         loc.to_physical_precise_round(scale).to_logical(scale)
     }
@@ -1312,6 +1444,7 @@ impl PanelPopover {
             Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 

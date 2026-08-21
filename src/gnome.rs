@@ -1034,6 +1034,9 @@ pub enum GnomeKeyAction {
     PanelRunDialog,
     /// `close`: close the focused window.
     Close,
+    /// `activate-window-menu` (`<Alt>space`): pop the focused window's own menu, anchored on its
+    /// top-left (`handle_activate_window_menu`, `keybindings.c:1999-2021`).
+    ActivateWindowMenu,
     /// `toggle-fullscreen`: fullscreen the focused window.
     ToggleFullscreen,
     /// `switch-to-workspace-N` (1-based, like the settings keys).
@@ -1202,6 +1205,11 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             strs(&["<Alt>F2"]),
         ),
         ("close".to_owned(), Close, strs(&["<Alt>F4"])),
+        (
+            "activate-window-menu".to_owned(),
+            ActivateWindowMenu,
+            strs(&["<Alt>space"]),
+        ),
         ("toggle-fullscreen".to_owned(), ToggleFullscreen, strs(&[])),
         ("maximize".to_owned(), Maximize, strs(&["<Super>Up"])),
         (

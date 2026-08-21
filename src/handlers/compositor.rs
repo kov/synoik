@@ -582,11 +582,7 @@ impl CompositorHandler for State {
                     self.synoik
                         .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
-                    // A window vanishing under an open switcher removes its item -- or, for an
-                    // app switcher, only that app's chevron unless it was the app's last window
-                    // (`_itemRemoved`, `switcherPopup.js:269-284`).
-                    let outcome = self.synoik.switcher.window_removed(id);
-                    self.finish_switcher(outcome);
+                    self.window_removed(id);
                     self.synoik
                         .layout
                         .remove_window(&window, transaction.clone());

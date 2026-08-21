@@ -37,7 +37,7 @@ use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
@@ -75,6 +75,9 @@ use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::{CaptureType, ScreenshotUi};
 use crate::ui::switcher::SwitcherKey;
+use crate::ui::window_menu::{
+    MonitorDirection, WindowMenuAnchor, WindowMenuContext, WorkspaceDirection,
+};
 use crate::ui::window_preview;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
@@ -1546,6 +1549,13 @@ impl State {
             self.synoik.queue_redraw_switcher_output();
         }
 
+        // A window-menu row activated by Enter parks its action rather than applying it inside
+        // the keyboard filter, which still holds the keyboard borrowed. Drain it here.
+        if let Some(action) = self.synoik.panel_popover.take_pending_action() {
+            self.apply_popover_action(action);
+            self.synoik.queue_redraw_all();
+        }
+
         let Some(Some(bind)) = filtered else {
             return;
         };
@@ -2099,6 +2109,64 @@ impl State {
                     self.commit_favorites();
                 }
             }
+            // The window-menu rows act on the window the menu was summoned on, not on the
+            // focus: gnome-shell's items close over `window` (`windowMenu.js:44-189`), and a
+            // menu can outlive the focus that opened it.
+            PopoverAction::WindowSetMaximized { window, maximized } => {
+                if let Some(window) = self.window_by_id(window) {
+                    self.synoik.layout.set_maximized(&window, maximized);
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            PopoverAction::WindowMoveToWorkspace { window, dir } => {
+                if let Some(window) = self.window_by_id(window) {
+                    if let Some((_, idx, count)) = self.window_workspace_position(&window) {
+                        // GNOME's horizontal workspace axis is our vertical one. The row is only
+                        // built when the neighbour exists, but the layout can have moved under an
+                        // open menu, so re-check rather than trusting the snapshot.
+                        let target = match dir {
+                            WorkspaceDirection::Left => idx.checked_sub(1),
+                            WorkspaceDirection::Right => (idx + 1 < count).then_some(idx + 1),
+                        };
+                        if let Some(target) = target {
+                            self.synoik.layout.move_to_workspace(
+                                Some(&window),
+                                target,
+                                ActivateWindow::Smart,
+                            );
+                            self.synoik.queue_redraw_all();
+                        }
+                    }
+                }
+            }
+            PopoverAction::WindowMoveToMonitor { window, dir } => {
+                if let Some(window) = self.window_by_id(window) {
+                    let from = self.window_workspace_position(&window).map(|(o, _, _)| o);
+                    let target = from.and_then(|from| match dir {
+                        MonitorDirection::Up => self.synoik.output_up_of(&from),
+                        MonitorDirection::Down => self.synoik.output_down_of(&from),
+                        MonitorDirection::Left => self.synoik.output_left_of(&from),
+                        MonitorDirection::Right => self.synoik.output_right_of(&from),
+                    });
+                    if let Some(target) = target {
+                        self.synoik.layout.move_to_output(
+                            Some(&window),
+                            &target,
+                            None,
+                            ActivateWindow::Smart,
+                        );
+                        self.synoik.queue_redraw_all();
+                    }
+                }
+            }
+            // `window.delete(event.get_time())` (`windowMenu.js:185-188`).
+            PopoverAction::WindowClose(window) => {
+                if let Some((_, mapped)) =
+                    self.synoik.layout.windows().find(|(_, m)| m.id() == window)
+                {
+                    mapped.toplevel().send_close();
+                }
+            }
         }
     }
 
@@ -2279,6 +2347,111 @@ impl State {
         // A menu opened off the *dock* is not the overview's, so the "close it when the
         // overview hides" rule must not reach it — there is no overview to hide.
         self.synoik.app_menu_from_dock = self.synoik.dock_owns_dash(output);
+        true
+    }
+
+    /// The layout id of the window with this stable id.
+    fn window_by_id(
+        &self,
+        id: crate::window::mapped::MappedId,
+    ) -> Option<smithay::desktop::Window> {
+        self.synoik
+            .layout
+            .windows()
+            .find(|(_, m)| m.id() == id)
+            .map(|(_, m)| m.window.clone())
+    }
+
+    /// Where `window` sits along its monitor's workspace axis: `(output, index, count)`.
+    fn window_workspace_position(
+        &self,
+        window: &smithay::desktop::Window,
+    ) -> Option<(Output, usize, usize)> {
+        let (output, idx) = self
+            .synoik
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(window))
+            .and_then(|(mon, idx, _)| Some((mon?.output().clone(), idx)))?;
+        let count = self
+            .synoik
+            .layout
+            .workspaces()
+            .filter(|(mon, _, _)| mon.map(|m| m.output()) == Some(&output))
+            .count();
+        Some((output, idx, count))
+    }
+
+    /// Snapshot what the window menu needs to know about `window`, with the output it is on and
+    /// its rect there — `WindowMenu._buildMenu` (`windowMenu.js:22-190`) reads the same model.
+    fn window_menu_context(
+        &self,
+        window: &smithay::desktop::Window,
+    ) -> Option<(Output, Rectangle<f64, Logical>, WindowMenuContext)> {
+        let (output, ws_idx, ws_count) = self.window_workspace_position(window)?;
+        let mapped = self
+            .synoik
+            .layout
+            .windows()
+            .find(|(_, m)| &m.window == window)
+            .map(|(_, m)| m)?;
+        // The rect the window is drawn in, output-local. A window on a workspace that is not
+        // the visible one has no rect to hang a menu off; the output's origin stands in, and the
+        // clamp in `location` keeps the menu on screen either way.
+        let rect = self
+            .synoik
+            .layout
+            .active_workspace_windows_for_output(&output)
+            .into_iter()
+            .find(|(w, _)| &w.window == window)
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        let ctx = WindowMenuContext {
+            window: mapped.id(),
+            // The *pending* mode: `window.is_maximized()` is mutter's own state, which flips when
+            // the request is made, not when the client gets round to acking the configure. A
+            // menu reopened in that gap must already say Restore.
+            is_maximized: mapped.pending_sizing_mode().is_maximized(),
+            workspace_left: ws_idx > 0,
+            workspace_right: ws_idx + 1 < ws_count,
+            monitor_up: self.synoik.output_up_of(&output).is_some(),
+            monitor_down: self.synoik.output_down_of(&output).is_some(),
+            monitor_left: self.synoik.output_left_of(&output).is_some(),
+            monitor_right: self.synoik.output_right_of(&output).is_some(),
+        };
+        Some((output, rect, ctx))
+    }
+
+    /// Pop the window menu for `window`, anchored at `anchor` (output-local logical, a point).
+    /// `meta_window_show_menu` (`window.c:6121-6129`) → `showWindowMenuForWindow`
+    /// (`windowMenu.js:213-250`).
+    ///
+    /// Returns whether it opened: a window the layout does not know is a menu with nothing to
+    /// act on.
+    pub(crate) fn show_window_menu(
+        &mut self,
+        window: &smithay::desktop::Window,
+        anchor: WindowMenuAnchor,
+    ) -> bool {
+        let Some((output, rect, ctx)) = self.window_menu_context(window) else {
+            return false;
+        };
+        let loc = match anchor {
+            WindowMenuAnchor::Window => rect.loc,
+            // `rect` is the *geometry* rect; the client's point is measured from the buffer
+            // origin, which sits `geometry().loc` further up and to the left. A GTK window's
+            // shadow margin is exactly that difference, and skipping it would hang the menu
+            // that far off the click.
+            WindowMenuAnchor::Surface(p) => rect.loc - window.geometry().loc.to_f64() + p.to_f64(),
+            WindowMenuAnchor::Output(p) => p,
+        };
+        // A zero-sized anchor, like the rect `_shell_wm_show_window_menu` builds
+        // (`shell-wm.c:336-350`).
+        let anchor = Rectangle::new(loc, Size::from((0., 0.)));
+        self.synoik
+            .panel_popover
+            .open_window_menu(output, anchor, &ctx);
+        self.synoik.queue_redraw_all();
         true
     }
 
@@ -2878,6 +3051,14 @@ impl State {
             Action::CloseWindow => {
                 if let Some(mapped) = self.synoik.layout.focus() {
                     mapped.toplevel().send_close();
+                }
+            }
+            // `handle_activate_window_menu` (`keybindings.c:1999-2021`): the focused window's
+            // menu, anchored at the frame plus the client area's origin — for an undecorated
+            // window, its own top-left.
+            Action::ShowWindowMenu => {
+                if let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) {
+                    self.show_window_menu(&window, WindowMenuAnchor::Window);
                 }
             }
             Action::CloseWindowById(id) => {
@@ -7569,10 +7750,25 @@ impl State {
                         }
                     }
                 }
-                // Check if we need to start an interactive resize. Mutter's passive button
-                // grabs are Mod+LMB to move, Mod+MMB to resize and Mod+RMB for the window
-                // menu (`window.c:7743-7844`, `meta_prefs_get_mouse_button_resize` defaults
-                // to button 2). The window menu is not ported yet, so Mod+RMB is inert.
+                // Mutter's passive button grabs are Mod+LMB to move, Mod+MMB to resize and
+                // Mod+RMB for the window menu (`window.c:7743-7844`,
+                // `meta_prefs_get_mouse_button_resize` defaults to button 2). The menu is
+                // anchored where the pointer is, which is what mutter passes as the event
+                // coordinates.
+                else if button == Some(MouseButton::Right) && !pointer.is_grabbed() && mod_down {
+                    let location = pointer.current_location();
+                    let anchor = self
+                        .synoik
+                        .output_under(location)
+                        .map(|(_, pos_within_output)| pos_within_output);
+                    if let Some(anchor) = anchor {
+                        self.synoik.layout.activate_window(&window);
+                        if self.show_window_menu(&window, WindowMenuAnchor::Output(anchor)) {
+                            return;
+                        }
+                    }
+                }
+                // Check if we need to start an interactive resize.
                 else if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
                     let location = pointer.current_location();
                     let (output, pos_within_output) = self.synoik.output_under(location).unwrap();
@@ -9855,6 +10051,7 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::ScreenshotWindow => Action::ScreenshotWindow(true, true, None),
         GnomeKeyAction::ShowScreenRecordingUi => Action::ToggleScreenRecord,
         GnomeKeyAction::Close => Action::CloseWindow,
+        GnomeKeyAction::ActivateWindowMenu => Action::ShowWindowMenu,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
             Action::FocusWorkspace(WorkspaceReference::Index(n))

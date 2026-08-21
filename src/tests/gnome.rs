@@ -4384,6 +4384,60 @@ fn map_window_sized(
 }
 
 /// The focused window's position within the workspace view.
+/// Pop the focused window's menu at its top-left, the way `<Alt>space` does — the shortest way
+/// into the menu for a test that is about a row, not about the trigger.
+fn open_window_menu_at_corner(f: &mut Fixture) {
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let opened = f
+        .synoik_state()
+        .show_window_menu(&window, crate::ui::window_menu::WindowMenuAnchor::Window);
+    assert!(opened, "the focused window has a menu");
+}
+
+/// Click the window-menu row labelled `label`.
+/// Ack the last configure at the size it asked for and commit — what a client does, and what the
+/// committed (as opposed to pending) sizing mode waits on.
+fn take_the_configured_size(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    let size = f
+        .client(id)
+        .window(surface)
+        .recent_configures()
+        .last()
+        .expect("a configure")
+        .size;
+    let window = f.client(id).window(surface);
+    window.attach_new_buffer();
+    window.set_size(size.0 as u16, size.1 as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+}
+
+/// Whether the layout has *committed* `window` to maximized — the client has acked.
+fn window_is_maximized(f: &mut Fixture, window: &smithay::desktop::Window) -> bool {
+    f.synoik()
+        .layout
+        .windows()
+        .find(|(_, m)| &m.window == window)
+        .is_some_and(|(_, m)| crate::layout::LayoutElement::sizing_mode(m).is_maximized())
+}
+
+fn click_window_menu_row(f: &mut Fixture, label: &str) {
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let row = f
+        .synoik()
+        .panel_popover
+        .window_menu()
+        .unwrap()
+        .row_center(label)
+        .unwrap_or_else(|| panic!("the menu has a {label} row"));
+    let at = origin + row;
+    pointer_motion_to(f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+}
+
 fn focused_window_pos(f: &mut Fixture) -> (f64, f64) {
     let synoik = f.synoik();
     let focused = synoik.layout.focus().unwrap().id();
@@ -7063,8 +7117,8 @@ fn super_middle_drag_in_the_frame_centre_does_not_resize() {
     f.key_release(KEY_LEFTMETA);
 }
 
-/// Mod+RMB is mutter's window-menu button, not a resize (niri's mapping). The
-/// menu itself is not ported yet, so the press must simply not resize.
+/// Mod+RMB is mutter's window-menu button, not a resize (niri's mapping): it pops the window
+/// menu and never sizes the window (`window.c:7743-7844`).
 #[test]
 fn super_right_drag_does_not_resize() {
     let mut f = Fixture::new();
@@ -7086,8 +7140,280 @@ fn super_right_drag_does_not_resize() {
         "Mod+RMB must not resize, got: {configures}"
     );
 
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "Mod+RMB is the window menu"
+    );
+
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
+    // The release lands *outside* the box — the pointer is still on the window where the press
+    // was. It must not read as the outside-click that dismisses: a real toolkit sends the menu
+    // request on the press, so the menu is always up while its own button is still down.
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "the release of the button that opened the menu does not dismiss it"
+    );
+}
+
+/// The window menu is gnome-shell's `WindowMenu` (`js/ui/windowMenu.js`): the rows a window
+/// actually has a model for, in GNOME's order, anchored where the click was.
+///
+/// The unported rows (Take Screenshot, Hide, Move, Resize, Always on Top, Always on Visible
+/// Workspace) are *omitted* rather than drawn insensitive — each is missing a whole subsystem,
+/// not a per-window capability. `docs/fork/window-menu-port.md`.
+#[test]
+fn the_window_menu_offers_the_rows_the_window_has() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+
+    pointer_motion_to(&mut f, x + 40., y + 10.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let menu = f.synoik().panel_popover.window_menu().expect("a menu");
+    assert_eq!(
+        menu.labels(),
+        // One monitor, so no "Move to Monitor *"; the first workspace has nothing to its left,
+        // and the trailing empty workspace is what "Right" moves to.
+        vec!["Maximize", "Move to Workspace Right", "Close"],
+        "the rows a single-monitor, unmaximized window on the first workspace gets"
+    );
+
+    // Anchored at the click, not centred on it: the menu's arrow alignment is 0
+    // (`PopupMenu(sourceActor, 0, St.Side.TOP)`, `windowMenu.js:10-11`).
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    assert_eq!(
+        (loc.x, loc.y),
+        (x + 40., y + 10.),
+        "the menu's top-left is the point that was clicked"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+}
+
+/// Maximize / Restore is one row, whichever the window is not (`windowMenu.js:44-55`), and it
+/// acts on the window the menu was summoned on.
+#[test]
+fn the_window_menu_maximizes_and_restores() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    open_window_menu_at_corner(&mut f);
+    click_window_menu_row(&mut f, "Maximize");
+    f.double_roundtrip(id);
+    take_the_configured_size(&mut f, id, &surface);
+    assert!(
+        window_is_maximized(&mut f, &win),
+        "the Maximize row maximizes"
+    );
+
+    open_window_menu_at_corner(&mut f);
+    assert_eq!(
+        f.synoik().panel_popover.window_menu().unwrap().labels()[0],
+        "Restore",
+        "a maximized window is offered the other half of the pair"
+    );
+    click_window_menu_row(&mut f, "Restore");
+    f.double_roundtrip(id);
+    take_the_configured_size(&mut f, id, &surface);
+    assert!(
+        !window_is_maximized(&mut f, &win),
+        "the Restore row unmaximizes"
+    );
+}
+
+/// Close sends `xdg_toplevel.close` to the window the menu belongs to
+/// (`window.delete()`, `windowMenu.js:185-188`).
+#[test]
+fn the_window_menu_closes_its_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    open_window_menu_at_corner(&mut f);
+    click_window_menu_row(&mut f, "Close");
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "the Close row asks the client to close"
+    );
+}
+
+/// A menu whose window is gone acts on nothing, so it goes with it — gnome-shell closes it from
+/// the window's `unmanaged` signal (`windowMenu.js:235-237`). Left open, it would keep the modal
+/// grab over whatever the focus fell back to.
+#[test]
+fn the_window_menu_goes_when_its_window_does() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    open_window_menu_at_corner(&mut f);
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "precondition: the menu is up"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+    f.settle();
+
+    assert!(
+        f.synoik().panel_popover.window_menu().is_none(),
+        "the menu went with its window"
+    );
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "the menu released its grab when its window went"
+    );
+}
+
+/// `activate-window-menu` (`<Alt>space`) pops the focused window's menu at its top-left
+/// (`handle_activate_window_menu`, `keybindings.c:1999-2021`), with the first row focused so
+/// Enter acts without an arrow key first (`navigate_focus TAB_FORWARD`, `windowMenu.js:247`).
+#[test]
+fn alt_space_pops_the_window_menu_and_the_keyboard_drives_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_SPACE);
+    f.key_release(KEY_SPACE);
+    f.key_release(KEY_LEFTALT);
+
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "<Alt>space opens the window menu"
+    );
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    assert_eq!(
+        (loc.x, loc.y),
+        (x, y),
+        "the keyboard binding anchors on the window's own top-left"
+    );
+
+    // Down off the first row (Maximize) lands on the second; Down again on Close.
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "Enter activates the focused row"
+    );
+}
+
+/// Escape dismisses the window menu, like every other popup menu.
+#[test]
+fn escape_dismisses_the_window_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    open_window_menu_at_corner(&mut f);
+
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "Escape closes the window menu"
+    );
+}
+
+/// On Wayland the titlebar is the *client's*, so a CSD toolkit recognizes the right-click itself
+/// and asks for the menu with `xdg_toplevel.show_window_menu`
+/// (`xdg_toplevel_show_window_menu`, `meta-wayland-xdg-shell.c:293-315`). Dropping that request
+/// is what "right-clicking the titlebar does nothing" was.
+///
+/// The point is measured from the *buffer* origin, which for a window with a shadow margin sits
+/// above and left of its geometry rect — mutter adds it to `buffer_rect`, not to the geometry.
+#[test]
+fn a_client_asking_for_its_window_menu_gets_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    // A 20px shadow margin all round: the geometry rect starts 20px into the buffer.
+    f.client(id)
+        .window(&surface)
+        .set_window_geometry(20, 20, 800, 600);
+    f.client(id).window(&surface).commit();
+    f.double_roundtrip(id);
+    f.settle();
+    let (x, y) = focused_window_pos(&mut f);
+
+    f.client(id).show_window_menu(&surface, 1, 60, 30);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "the client's request opens the menu"
+    );
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    assert_eq!(
+        (loc.x, loc.y),
+        (x + 60. - 20., y + 30. - 20.),
+        "the point is buffer-relative, so the geometry offset comes back off it"
+    );
+
+    // GTK asks on the button *press*, so the release that follows arrives with the menu already
+    // up and the pointer still on the titlebar, outside the box.
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "the release that follows the client's request does not dismiss the menu"
+    );
+}
+
+/// smithay hands `show_window_menu` through without checking the serial mutter validates
+/// (`meta_wayland_seat_get_grab_info`), so the gate is focus: a background client asking for a
+/// menu would take the modal grab out from under whatever the user is actually using.
+#[test]
+fn an_unfocused_client_cannot_summon_a_window_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let background = map_window_sized(&mut f, id, (800, 600), None);
+    let _focused = map_window_sized(&mut f, id, (800, 600), None);
+
+    f.client(id).show_window_menu(&background, 1, 10, 10);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.synoik().panel_popover.window_menu().is_none(),
+        "only the focused window may summon its menu"
+    );
 }
 
 /// The overview is GNOME's window picker (Experiment 1): windows spread into

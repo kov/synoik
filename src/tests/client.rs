@@ -614,6 +614,15 @@ impl Client {
         }
     }
 
+    /// `xdg_toplevel.show_window_menu` at surface-local `(x, y)` — what a CSD toolkit sends when
+    /// its titlebar is right-clicked. `serial` is the button press the menu is asking for.
+    pub fn show_window_menu(&mut self, surface: &WlSurface, serial: u32, x: i32, y: i32) {
+        let seat = self.state.seat.clone().unwrap();
+        self.window(surface)
+            .xdg_toplevel
+            .show_window_menu(&seat, serial, x, y);
+    }
+
     pub fn release_shortcuts_inhibitor(&mut self, surface: &WlSurface) {
         self.state.release_shortcuts_inhibitor(surface);
     }

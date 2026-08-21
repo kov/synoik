@@ -55,6 +55,7 @@ use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manag
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
 use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik::{CastTarget, PopupGrabState, State};
+use crate::ui::window_menu::WindowMenuAnchor;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
@@ -82,6 +83,42 @@ impl XdgShellHandler for State {
         if let Err(err) = self.synoik.popups.track_popup(popup) {
             warn!("error tracking popup: {err:?}");
         }
+    }
+
+    /// `xdg_toplevel.show_window_menu` — a CSD client's titlebar right-click asking the
+    /// compositor for the window menu (`xdg_toplevel_show_window_menu`,
+    /// `meta-wayland-xdg-shell.c:293-315`).
+    ///
+    /// mutter validates the request against the seat's recorded grab serial and drops it
+    /// otherwise. smithay hands the serial straight through without checking it, so the gate
+    /// here is focus: only the window the keyboard is on may summon its menu, which is the same
+    /// rule `grab` above applies to a toplevel popup grab. A background client asking for a menu
+    /// would otherwise steal the modal grab from under the user.
+    fn show_window_menu(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: WlSeat,
+        _serial: Serial,
+        location: Point<i32, Logical>,
+    ) {
+        let focused = self
+            .synoik
+            .layout
+            .focus()
+            .map(|win| win.toplevel().wl_surface().clone());
+        if focused.as_ref() != Some(surface.wl_surface()) {
+            trace!("ignoring show_window_menu because another window has focus");
+            return;
+        }
+        let Some((window, _)) = self
+            .synoik
+            .layout
+            .find_window_and_output(surface.wl_surface())
+            .map(|(mapped, output)| (mapped.window.clone(), output))
+        else {
+            return;
+        };
+        self.show_window_menu(&window, WindowMenuAnchor::Surface(location));
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
@@ -787,8 +824,7 @@ impl XdgShellHandler for State {
         let active_window = self.synoik.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
-        let outcome = self.synoik.switcher.window_removed(id);
-        self.finish_switcher(outcome);
+        self.window_removed(id);
         self.synoik
             .layout
             .remove_window(&window, transaction.clone());
