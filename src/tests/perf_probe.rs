@@ -55,16 +55,23 @@
 //! Compare like with like — the probe's minimum against the live *minimum* of a draw bucket, and a
 //! probe scene carrying the seat's ingredients rather than `Scene::default()`:
 //!
-//! | | gpu |
-//! |---|---|
-//! | probe, bare | 0.70 ms |
-//! | probe, + wallpaper | 0.89 ms |
-//! | probe, + wallpaper + blur | **1.13 ms** |
-//! | live seat, >=150 draws, **minimum** | **2.71 ms** |
-//! | live seat, >=150 draws, median | 9.30 ms |
+//! Re-measured 2026-08-22, after the see-through blur path was deleted. Every blurred surface now
+//! captures the framebuffer for itself, so the blur row carries per-window captures the shared
+//! buffer used to absorb — the +1.0 ms it adds over the wallpaper row is that, and its coverage
+//! doubles (3.25x → 6.47x the output). The earlier reading of this table was taken on the shared
+//! path and priced blur at +0.24 ms.
 //!
-//! So the like-for-like residue is **2.4x**, not the 15x that came from holding a probe minimum
-//! against a live median on a bare scene. Candidates for the 1.6 ms: the full-damage present blit
+//! | | gpu (min) | coverage |
+//! |---|---|---|
+//! | probe, bare | 0.34 ms | 2.25x |
+//! | probe, + wallpaper | 0.78 ms | 3.25x |
+//! | probe, + wallpaper + blur | **1.76 ms** | 6.47x |
+//! | live seat, >=150 draws, **minimum** | **2.71 ms** | ~2.2x |
+//! | live seat, >=150 draws, median | 9.30 ms | |
+//!
+//! The live figures are the 2026-07-26 seat capture, so the ratio across the two is soft — but the
+//! like-for-like residue is **~1.5x**, not the 15x that came from holding a probe minimum against a
+//! live median on a bare scene. Candidates for it: the full-damage present blit
 //! into the LINEAR scanout dmabuf (inside the timestamp bracket, `frame.rs:1560`, and **not counted
 //! by `shaded`** — blits are not draws), per-commit client-dmabuf acquire barriers (also bracketed,
 //! also absent here), and real LINEAR client buffers minified into thumbnails.

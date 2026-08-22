@@ -105,9 +105,13 @@ Reach: toplevels, their popups, and layer-shell surfaces (`window/mapped.rs`, `l
 **Not subsurfaces** — `layout/tile.rs:1301` says so outright. Not XWayland: we honor no
 `_KDE_NET_WM_BLUR_BEHIND_REGION`.
 
-One thing we do that neither reference does: the effect state is **per render target**
-(one effect buffer per `RenderTarget`), so a screencast that must block out a window cannot
-composite from a capture the on-screen target filled. That is a privacy invariant, not a nicety.
+One thing we do that neither reference does: the effect state is **per render target**, so a
+screencast that must block out a window cannot composite from a capture the on-screen target
+filled. It falls out of where the state lives — each target has its own `OutputDamageTracker`, and
+the capture texture and blur chain live in that tracker's per-element `UserDataMap`
+(`FramebufferEffect::new` says so at the point it matters). Block-out rules key off the target, so
+a capture shared across targets is exactly how a screencast would come to composite the unblocked
+scene. That is a privacy invariant, not a nicety.
 
 ## 3. KWin (Plasma 6.7)
 
