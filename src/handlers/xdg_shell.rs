@@ -1035,18 +1035,44 @@ impl State {
             return None;
         }
 
-        let record = self
+        // Both misses are logged rather than swallowed: a client asking under a session id or a
+        // name the store has never seen is indistinguishable, from the outside, from a restore
+        // that replayed a stale record — and it is the likelier of the two.
+        let Some(session) = self
             .synoik
             .session_manager_state
             .store
-            .get(&target.session_id)?
-            .toplevels
-            .get(&target.name)?
-            .clone();
+            .get(&target.session_id)
+        else {
+            info!(
+                "session restore: no session {} in the store (toplevel {})",
+                target.session_id, target.name
+            );
+            return None;
+        };
+        let Some(record) = session.toplevels.get(&target.name).cloned() else {
+            info!(
+                "session restore: session {} has no toplevel {} ({} known: {:?})",
+                target.session_id,
+                target.name,
+                session.toplevels.len(),
+                session.toplevels.keys().collect::<Vec<_>>()
+            );
+            return None;
+        };
 
         let output = record
             .floating_rect
             .and_then(|rect| self.output_for_saved_rect(rect));
+        info!(
+            "session restore: {}/{} replaying {:?} state {:?} workspace {:?} onto {:?}",
+            target.session_id,
+            target.name,
+            record.floating_rect,
+            record.state,
+            record.workspace,
+            output.as_ref().map(|o| o.name())
+        );
 
         Some(SessionRestore {
             handle: target.handle,

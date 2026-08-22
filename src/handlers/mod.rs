@@ -998,7 +998,7 @@ impl SessionManagerHandler for State {
     }
 
     fn save_live_session_toplevels(&mut self, session_id: &str) {
-        self.save_live_session_toplevels_matching(Some(session_id));
+        let _ = self.save_live_session_toplevels_matching(Some(session_id));
     }
 
     fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel) {

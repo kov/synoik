@@ -4895,6 +4895,10 @@ impl State {
             return;
         };
 
+        info!(
+            "session store: saving {session_id}/{name} as {:?} state {:?}",
+            record.floating_rect, record.state
+        );
         self.synoik
             .session_manager_state
             .store
@@ -4947,8 +4951,13 @@ impl State {
     /// before the context's synchronous save (`meta-context-main.c:445`), so each one goes through
     /// the unmap path above. We tear down without unmapping, so the sweep is explicit — without it
     /// the flagship case, logging out with windows open, would save nothing.
+    ///
+    /// Logged, because this is the one save nobody can watch happen: it runs as the compositor
+    /// exits, and both of its skip branches are silent. A restore that came back stale is answered
+    /// by this line — either it swept nothing, or it swept and the record is not what was expected.
     pub fn save_session_toplevels_still_mapped(&mut self) {
-        self.save_live_session_toplevels_matching(None);
+        let (saved, skipped) = self.save_live_session_toplevels_matching(None);
+        info!("session store: swept {saved} still-mapped toplevels ({skipped} skipped)");
     }
 
     /// Snapshots every still-mapped registered toplevel, or only one session's when `only` is set.
@@ -4956,7 +4965,13 @@ impl State {
     /// Two callers with the same need: shutdown, which has to sweep everything because we tear down
     /// without unmapping, and `xdg_session_v1.destroy`, which has to freeze one session's state
     /// before its registrations go away.
-    pub(crate) fn save_live_session_toplevels_matching(&mut self, only: Option<&str>) {
+    /// Returns how many were saved and how many were passed over — a registration whose window is
+    /// no longer in the layout, or one the layout has no geometry for.
+    pub(crate) fn save_live_session_toplevels_matching(
+        &mut self,
+        only: Option<&str>,
+    ) -> (usize, usize) {
+        let (mut saved, mut skipped) = (0, 0);
         for (session_id, name, toplevel) in self.synoik.session_manager_state.live_registrations() {
             if only.is_some_and(|wanted| wanted != session_id) {
                 continue;
@@ -4968,17 +4983,21 @@ impl State {
                 .find(|(_, mapped)| mapped.toplevel().xdg_toplevel() == &toplevel)
                 .map(|(_, mapped)| mapped.window.clone())
             else {
+                skipped += 1;
                 continue;
             };
 
             let Some(record) = self.session_record_for(&window) else {
+                skipped += 1;
                 continue;
             };
             self.synoik
                 .session_manager_state
                 .store
                 .save_toplevel(&session_id, &name, record);
+            saved += 1;
         }
+        (saved, skipped)
     }
 
     pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
