@@ -20,6 +20,7 @@
 //! Clients present through the GPU here, same as on a real seat: [`Headless::add_dmabuf_global`]
 //! advertises dmabuf off a plain render node — no DRM master, no seat, no VT.
 
+use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -91,6 +92,18 @@ pub struct Headless {
     /// the real clock, on exactly the turns the redraw machinery decided to render.
     #[cfg(test)]
     pub(crate) frame_sink: Option<FrameSink>,
+    /// One damage tracker per output, kept across frames.
+    ///
+    /// Headless discards the damage it computes — it runs the element pass for the
+    /// [`RenderElementStates`] alone. It keeps the tracker anyway because a tracker rebuilt every
+    /// frame has no previous frame to compare against, so every element reads as new and every
+    /// headless frame reports a full-output repaint. That makes damage the one compositor behavior
+    /// the corpus cannot pin, on the backend that exists to pin behavior.
+    ///
+    /// Staleness is not a reason to rebuild it: [`OutputDamageTracker::from_output`] holds a weak
+    /// output and reads the mode through it, and smithay damages the whole output by itself when
+    /// the size or transform changes.
+    damage_trackers: HashMap<Output, OutputDamageTracker>,
 }
 
 /// A test's hook into [`Headless::render`]: the renderer, the output, and the element list of a
@@ -115,6 +128,7 @@ impl Headless {
             dmabuf_global: None,
             #[cfg(test)]
             frame_sink: None,
+            damage_trackers: HashMap::new(),
         }
     }
 
@@ -326,8 +340,8 @@ impl Headless {
     /// to answer the same way the real compositor does.
     ///
     /// `damage_output` computes coverage and occlusion without drawing; the damage it returns is
-    /// discarded, and the tracker is built per call so it can never go stale against an output that
-    /// changed mode or scale.
+    /// discarded here, but the tracker is kept per output so the damage it computes is real — see
+    /// [`Headless::damage_trackers`].
     fn render_element_states(&mut self, synoik: &Synoik, output: &Output) -> RenderElementStates {
         let Some(renderer) = &mut self.renderer else {
             // No renderer means no dmabuf global and inert capture paths, so nothing is drawing
@@ -342,13 +356,30 @@ impl Headless {
         };
         let elements = synoik.render_to_vec(ctx, output, true);
 
+        // Attribute the frame's damage inputs *before* any debug overlay is spliced in: the overlay
+        // z-shifts everything below it, and an instrument that reads its own presence is worse than
+        // none.
+        crate::frame_log::log_damage_attribution(
+            &output.name(),
+            &elements,
+            output.current_scale().fractional_scale().into(),
+            smithay::utils::Rectangle::from_size(
+                output
+                    .current_mode()
+                    .map_or_else(Default::default, |m| m.size),
+            ),
+        );
+
         #[cfg(test)]
         if let Some(sink) = &mut self.frame_sink {
             let renderer = self.renderer.as_mut().expect("checked just above");
             sink(renderer, output, &elements);
         }
 
-        let mut damage_tracker = OutputDamageTracker::from_output(output);
+        let damage_tracker = self
+            .damage_trackers
+            .entry(output.clone())
+            .or_insert_with(|| OutputDamageTracker::from_output(output));
         match damage_tracker.damage_output(1, &elements) {
             Ok((_damage, states)) => states,
             Err(err) => {
