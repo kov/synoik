@@ -51,17 +51,59 @@ There are two draw paths behind that flag:
 | `FramebufferEffect` (non-xray) | **the real framebuffer** — mid-frame capture of everything drawn behind the surface, then the gaussian, then the postprocess/clip draw | `render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs` |
 | `Xray` | an offscreen holding **only the background-layer surfaces and the GNOME wallpaper** (`Synoik::fill_xray_elements`, `synoik.rs:10446`) | `render_helpers/xray.rs`, `vulkan/effect_blur.rs` |
 
-**A client that sets a blur region gets the real-backdrop path; everything the shell blurs on its
-own behalf gets xray.** The `!has_blur_region` guard is what splits them: a client asking through
-`ext-background-effect-v1` is asking for the windows behind it, blurred, and the xray buffer holds
-only the background layer and the wallpaper, so it could not answer that. The shell's own chrome —
-panel plate, dash pill — has no blur region and takes xray, which is both cheaper and correct for
-something that sits over the desktop.
+That rule governs only the surfaces that go *through* `BackgroundEffect` — window and layer
+surfaces. **The shell's own chrome does not: `ui/panel.rs` and `ui/dash.rs` construct a
+`FramebufferEffect` directly**, so the panel plate and the dock pill blur the real framebuffer and
+show the windows behind them. Anything visible through them is the evidence.
 
-The cost follows the split. Xray surfaces share one background-only offscreen per output and per
-render target (`Synoik::fill_xray_elements`), refilled once a frame. Real-backdrop surfaces each
-take their own mid-frame capture of the framebuffer, because each one sits at a different depth in
-the stack and must see exactly what is under *it*.
+For the surfaces that do go through it, `!has_blur_region` is the split: a client asking through
+`ext-background-effect-v1` is asking for the windows behind it, blurred, and the xray buffer holds
+only the background layer and the wallpaper, so it could not answer that.
+
+**Which leaves xray with no live caller.** Reaching the default needs a visible effect that the
+*shell* turned on — `blur`, `noise` or `saturation` from a window or layer rule — and those come
+only from `BackgroundEffectRule`, whose fields are all `Option` and whose only source was the
+config file. With the file gone every field is `None`, `is_visible()` is false, and the default
+never fires. `Synoik::fill_xray_elements` still runs on every frame (and again per screencast
+target), building a background-layer-plus-wallpaper element list that nothing samples.
+
+So the cost today is: **one mid-frame framebuffer capture and one gaussian chain per blurred
+surface** — every blurred client, plus the panel, plus the dock — because each sits at a different
+depth in the stack and must see exactly what is under *it*.
+
+## Where the cost is, and what could be reclaimed
+
+Measured on kov's seat (2026-08-22), settled overview, corrected instruments:
+
+| | |
+| --- | --- |
+| scene | **2.8x** the output |
+| blur | **5.9x** |
+| blits | **4.0x**, all of it `capture` |
+
+Blur is more than twice everything else on screen combined.
+
+A chain costs roughly **its destination's area plus a third again** — the descent is quarter-area
+and shrinking, the two gaussian passes happen at the smallest rung, and the magnifying draw back
+to the destination dominates. So the bill tracks *total blurred destination area*, not the number
+of chains.
+
+That splits the 5.9x + 4.0x into three parts with very different prospects:
+
+- **The captures (4.0x) are the reclaimable part.** A surface with nothing but the wallpaper under
+  it is blitting the framebuffer to obtain pixels the cached blurred wallpaper already holds. In
+  the overview the previews mostly do not overlap, so most captures are of wallpaper. Deciding
+  per surface per frame — "nothing is behind me, sample the shared backdrop" — is the shape of the
+  win, and it is a *scene* question, not a rule.
+- **The mid-frame pass splits go with them.** Every real-backdrop surface ends and restarts the
+  render pass (`VulkanFrame::capture_region`). Remove a capture and its split goes too.
+- **The magnifying draw is irreducible.** That is just painting the surface.
+
+Already right, and not to be re-litigated: the **overview's blurred wallpaper is cached**
+(`Wallpaper::render_blurred`, keyed on `texture_generation`, re-blurred only when
+`is_current(radius, brightness)` fails), so its chain does not run per frame — the per-frame cost is
+one magnified draw of the cached texture. It also declares its opaque region, which is what culls
+the full-output `SolidColor` beneath it.
 
 Blur maths, both paths: GNOME's separable gaussian (`synoik-vk/src/blur.rs`) — a downscale
 cascade to where the surviving sigma is small, one horizontal and one vertical pass there, and one
