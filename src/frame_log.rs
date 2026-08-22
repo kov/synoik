@@ -1673,8 +1673,14 @@ struct TrackedInstance {
     framebuffer_effect: bool,
 }
 
-/// Why one element contributed damage. Ordered by how much it tells you: a changed axis names a
-/// mechanism, a bare commit bump only says the client drew.
+/// Why one element contributed damage.
+///
+/// The order is the reporting priority for an [`Id`] appearing more than once in a frame, resolved
+/// by `min`: a changed axis names a mechanism, a bare commit bump only says the client drew, so an
+/// element with one instance that moved and another that merely committed is reported as *moved*.
+/// `New` and `Gone` cannot mix with the rest — both are decided by whether the id was there at all.
+///
+/// [`Id`]: smithay::backend::renderer::element::Id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Reason {
     /// Absent last frame: the tracker damages its whole geometry.
