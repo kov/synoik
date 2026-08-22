@@ -128,7 +128,7 @@ pub enum Action {
     Reboot,
     ToggleDebugTint,
     DebugToggleOpaqueRegions,
-    DebugToggleDamage,
+    DebugToggleDamage(Option<u8>),
     DebugDumpScanout,
     DebugToggleDeadlineDispatch,
     DebugSetRenderTimeMargin(f64),
@@ -736,7 +736,7 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::MoveWorkspaceToMonitorNext {} => Self::MoveWorkspaceToMonitorNext,
             synoik_ipc::Action::ToggleDebugTint {} => Self::ToggleDebugTint,
             synoik_ipc::Action::DebugToggleOpaqueRegions {} => Self::DebugToggleOpaqueRegions,
-            synoik_ipc::Action::DebugToggleDamage {} => Self::DebugToggleDamage,
+            synoik_ipc::Action::DebugToggleDamage { age } => Self::DebugToggleDamage(age),
             synoik_ipc::Action::DebugDumpScanout {} => Self::DebugDumpScanout,
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
             synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {

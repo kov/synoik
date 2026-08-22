@@ -1058,7 +1058,16 @@ pub enum Action {
     /// Toggle visualization of render element opaque regions.
     DebugToggleOpaqueRegions {},
     /// Toggle visualization of output damage.
-    DebugToggleDamage {},
+    DebugToggleDamage {
+        /// Buffer age to report, i.e. how many frames back the buffer being repainted is.
+        ///
+        /// The overlay tints the composed frame's ask for a buffer this old. Defaults to 1, which
+        /// is the buffer the next frame will land in; 2 is the one after that, and the two differ
+        /// wherever a region was damaged in one frame but not the previous. Matches the ages
+        /// `SYNOIK_DEBUG_DAMAGE` logs.
+        #[cfg_attr(feature = "clap", arg(long))]
+        age: Option<u8>,
+    },
     /// Dump the framebuffer we are actually scanning out to a PNG, for debugging.
     ///
     /// Answers the one question a screenshot cannot: a screenshot re-renders the scene into a

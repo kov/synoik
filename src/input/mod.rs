@@ -3241,8 +3241,8 @@ impl State {
                 warn!("dispatch deadline margin is now {margin:?}");
                 self.synoik.queue_redraw_all();
             }
-            Action::DebugToggleDamage => {
-                self.synoik.debug_toggle_damage();
+            Action::DebugToggleDamage(age) => {
+                self.synoik.debug_toggle_damage(age.map(usize::from));
             }
             Action::DebugDumpScanout => {
                 // Armed here, taken by the tty backend once the next frame has been rendered —
@@ -10590,7 +10590,7 @@ fn is_debug_action(action: &Action) -> bool {
     matches!(
         action,
         Action::DebugToggleOpaqueRegions
-            | Action::DebugToggleDamage
+            | Action::DebugToggleDamage(_)
             | Action::DebugDumpScanout
             | Action::DebugToggleDeadlineDispatch
             | Action::DebugSetRenderTimeMargin(_)

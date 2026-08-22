@@ -1346,7 +1346,23 @@ pub struct OutputState {
     pub shield_backstop_buffer: SolidColorBuffer,
     pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
+    ///
+    /// Its own, never shared with [`Self::damage_log_trackers`]: a tracker answers for exactly one
+    /// buffer, and both are asked once per frame.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Buffer age the overlay reports, chosen over IPC.
+    pub debug_damage_age: usize,
+    /// What the overlay is currently tinting: the previous frame's composed damage — planes
+    /// included — with the tint's own contribution subtracted back off.
+    ///
+    /// It lags one frame because the honest source only exists *after* the frame is composed. A
+    /// tracker of our own asked before the frame would answer a different question: what a
+    /// one-frame-old buffer would need, planes excluded.
+    pub debug_damage_shown: Vec<Rectangle<i32, Physical>>,
+    /// The tint rects of the frame before, for that subtraction.
+    pub debug_damage_tinted: Vec<Rectangle<i32, Physical>>,
+    /// One stable `Id` per tint slot, so an unmoved rect damages nothing.
+    pub debug_damage_ids: Vec<Id>,
     /// Trackers for the `SYNOIK_DEBUG_DAMAGE` log — one per age it reports.
     ///
     /// A tracker answers for exactly one buffer: `damage_output`/`damage_from_age` folds the frame
@@ -8359,6 +8375,10 @@ impl Synoik {
             shield_backstop_buffer: SolidColorBuffer::new(size, [0., 0., 0., 1.]),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            debug_damage_age: 1,
+            debug_damage_shown: Vec::new(),
+            debug_damage_tinted: Vec::new(),
+            debug_damage_ids: Vec::new(),
             damage_log_trackers: crate::frame_log::damage_log_enabled().then(|| {
                 Box::new([
                     OutputDamageTracker::from_output(&output),
@@ -12960,12 +12980,15 @@ impl Synoik {
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn stop_native_recordings_for_output(&mut self, _output: &Output) {}
 
-    pub fn debug_toggle_damage(&mut self) {
+    pub fn debug_toggle_damage(&mut self, age: Option<usize>) {
         self.debug_draw_damage = !self.debug_draw_damage;
 
         if self.debug_draw_damage {
             for (output, state) in &mut self.output_state {
                 state.debug_damage_tracker = OutputDamageTracker::from_output(output);
+                state.debug_damage_age = age.unwrap_or(1).max(1);
+                state.debug_damage_shown.clear();
+                state.debug_damage_tinted.clear();
                 if let Some(trackers) = state.damage_log_trackers.as_mut() {
                     **trackers = [
                         OutputDamageTracker::from_output(output),

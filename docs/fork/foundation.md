@@ -335,6 +335,7 @@ drop-in: `LimitMEMLOCK` is an rlimit and needs a **restart**, unlike `MemoryLow`
 | `SIGUSR1` | non-terminating ring dump; the only way to get the ring out of a live session |
 | `SYNOIK_SCENE_BREAKDOWN=verbose` | per-element damage and opacity — the cheapest first look at a redraw question |
 | `SYNOIK_VK_FULL_DAMAGE=1` | turns the whole partial-damage chain off: separates "we drew the wrong thing" from "what we drew did not survive" |
+| `msg action debug-toggle-damage [--age N]` | the same ask, tinted on the glass, one frame late — the visual companion to the line below |
 | `SYNOIK_DEBUG_DAMAGE=1` | one line per frame per output: what the screen was told to repaint, for a one-frame-old buffer and a two-frame-old one, and whether the frame went to a swapchain buffer or straight to a plane |
 | `SYNOIK_DEBUG_INSTANCES=1` | names the element whenever one drops an instance while a sibling stays put — the damage tracker's only under-report |
 | `debug-dump-scanout` | reads back the framebuffer we actually present (and the client's buffer when it owns the plane) |
@@ -347,6 +348,21 @@ about the buffers. Only two things see the buffers: what is on the glass, and a 
 which draws incrementally through its own tracker and so inherits the same miss. A trace that a
 running screencast records and a one-shot capture cannot is therefore a damage question, not a
 scene question — that is what `SYNOIK_DEBUG_DAMAGE` is for.
+
+**The damage overlay tints the frame before.** It takes its rects from the composed
+`RenderFrameResult` — planes included, at an age you pick — which only exists *after* the frame is
+built, so what is on the glass is the previous frame's ask. Two rules keep it from measuring itself,
+and both are load-bearing. Its tint elements hold **stable `Id`s from a pool indexed by sorted
+rect**, so a region that keeps being damaged at the same geometry tints for free; a fresh `Id` per
+rect per frame instead repaints every tinted region for as long as the overlay is on. And its own
+contribution — for each pool slot that moved, the rect it left plus the rect it took — is
+**subtracted back off** before the rects are shown. That subtraction cannot be done with
+`damage_from_age`'s element filter: the tint is composited into the primary plane, so its pixels are
+inside that plane's recorded damage and no id can lift them out. Left in, the churn reads as damage,
+gets tinted, and never drains. The residual cost is that real damage coinciding with tint churn is
+masked for one frame — the right trade for a locator. On a still screen with the overlay on, the
+tint converges and `SYNOIK_DEBUG_DAMAGE` drains to empty; if it does not, one of those two rules
+broke. Pinned by `render_helpers::debug::tests`.
 
 **A stale rectangle nothing ever asks for is an instance that departed.** The tracker lets one
 `Id` appear many times in a frame and we lean on it — one cached texture draws a window in the
@@ -534,14 +550,6 @@ Slottable any time:
   without buying it with idle wakeups. We already have the whole cross-context toolkit and it is
   proven in production — importing a client's dmabuf *is* sampling another context's render, and the
   worker would be a client we own. Images must be dmabuf-backed with modifiers to cross the boundary.
-- **Make the damage overlay usable as an instrument.** `msg action debug-toggle-damage` already
-  tints repainted regions, but it answers a *different* question from the one it looks like it
-  answers: it runs its own `OutputDamageTracker` at age 1 over the element list, so it reports what
-  a one-frame-old buffer would need, never what the screen was actually told to repaint (planes
-  included) — that is `SYNOIK_DEBUG_DAMAGE`, §4. It is also self-feeding: the tint elements are
-  themselves damage, so the overlay perturbs what it measures. Wanted: pick the reported age over
-  IPC, take the rects from the composed frame's result rather than a private tracker, and keep the
-  tint out of its own input. Until then, read the log and treat the overlay as a locator only.
 - **An arena for reconstructible caches**, without which the `madvise` options in §3 cannot be
   expressed at all.
 - **Read `heapBudget` from `VK_EXT_memory_budget`.** The extension is available under

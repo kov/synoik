@@ -74,7 +74,7 @@ use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
 use crate::monitors_xml::{MonitorsConfig, SavedMode};
-use crate::render_helpers::debug::draw_damage;
+use crate::render_helpers::debug::{draw_damage, tint_damage};
 use crate::render_helpers::vulkan::{matches_render_order, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::synoik::{RedrawState, ScanoutTally, State, Synoik};
@@ -3311,10 +3311,20 @@ fn render_surface_with(
     synoik.frame_log.phase(Phase::Collect);
     let mut elements = synoik.render_to_vec(ctx, output, true);
 
-    // Visualize the damage, if enabled.
+    // Visualize the damage, if enabled. What is tinted is the *previous* frame's composed damage
+    // (see `OutputState::debug_damage_shown`); this frame's is taken from the frame result below.
+    let mut tinted_now = Vec::new();
     if synoik.debug_draw_damage {
         let output_state = synoik.output_state.get_mut(output).unwrap();
-        draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+        if let Ok((_, scale, _)) = output_state.debug_damage_tracker.mode().try_into() {
+            tinted_now.clone_from(&output_state.debug_damage_shown);
+            draw_damage(
+                &mut output_state.debug_damage_ids,
+                &tinted_now,
+                scale,
+                &mut elements,
+            );
+        }
     }
 
     // Give the compositor the current cursor hotspot before it assigns the cursor plane. On
@@ -3425,6 +3435,27 @@ fn render_surface_with(
                     PrimaryPlaneElement::Element(element) => {
                         dump_client_scanout_png(renderer, *element, &output.name());
                     }
+                }
+            }
+
+            // Feed the damage overlay from the frame result too, for the same reason: this is the
+            // ask the screen was given, planes included, at the age the overlay was asked for.
+            // The tint's own contribution comes back off before it is shown, or the overlay reads
+            // its own churn as damage and never drains.
+            if synoik.debug_draw_damage {
+                if let Some(state) = synoik.output_state.get_mut(output) {
+                    let age = state.debug_damage_age;
+                    let composed = res
+                        .damage_from_age(&mut state.debug_damage_tracker, age, [])
+                        .ok()
+                        .and_then(|(damage, _)| damage.cloned())
+                        .unwrap_or_default();
+                    let mine = tint_damage(&state.debug_damage_tinted, &tinted_now);
+                    let mut shown = Rectangle::subtract_rects_many(composed, mine);
+                    // The pool assigns ids by index, so an unstable order would read as movement.
+                    shown.sort_by_key(|r| (r.loc.y, r.loc.x, r.size.h, r.size.w));
+                    state.debug_damage_tinted = tinted_now;
+                    state.debug_damage_shown = shown;
                 }
             }
 
