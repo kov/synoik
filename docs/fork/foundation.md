@@ -360,9 +360,16 @@ contribution — for each pool slot that moved, the rect it left plus the rect i
 `damage_from_age`'s element filter: the tint is composited into the primary plane, so its pixels are
 inside that plane's recorded damage and no id can lift them out. Left in, the churn reads as damage,
 gets tinted, and never drains. The residual cost is that real damage coinciding with tint churn is
-masked for one frame — the right trade for a locator. On a still screen with the overlay on, the
-tint converges and `SYNOIK_DEBUG_DAMAGE` drains to empty; if it does not, one of those two rules
-broke. Pinned by `render_helpers::debug::tests`.
+masked for one frame — the right trade for a locator. A third rule follows from the first two: when
+the subtraction leaves nothing, the tint **stays put** rather than clearing. Clearing it is a limit
+cycle, not a convergence — dropping the tint damages what it covered, that damage is tinted next
+frame, and the two alternate for as long as the overlay is on. Holding it means the overlay shows
+the last region that really changed until something really changes again.
+
+On a still screen with the overlay on, `SYNOIK_DEBUG_DAMAGE` drains to `[none]` within a few frames
+— a few rather than one, because damage is recorded per swapchain slot and a slot that last
+rendered several frames ago still owes the tint's last move. If it never drains, one of the three
+rules broke. Pinned by `render_helpers::debug::tests`.
 
 **A stale rectangle nothing ever asks for is an instance that departed.** The tracker lets one
 `Id` appear many times in a frame and we lean on it — one cached texture draws a window in the

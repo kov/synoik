@@ -3455,7 +3455,16 @@ fn render_surface_with(
                     // The pool assigns ids by index, so an unstable order would read as movement.
                     shown.sort_by_key(|r| (r.loc.y, r.loc.x, r.size.h, r.size.w));
                     state.debug_damage_tinted = tinted_now;
-                    state.debug_damage_shown = shown;
+                    // Nothing left after the subtraction means nothing but the tint changed, so
+                    // the tint stays where it is and the frame after it draws no damage at all.
+                    // Clearing it instead is a limit cycle, not a convergence: dropping the tint
+                    // damages what it covered, that damage is tinted next frame, and the pair
+                    // alternate for as long as the overlay is on. The overlay therefore holds the
+                    // last region that really changed until something really changes again, which
+                    // is what a locator should do on a still screen anyway.
+                    if !shown.is_empty() {
+                        state.debug_damage_shown = shown;
+                    }
                 }
             }
 
