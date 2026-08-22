@@ -464,10 +464,14 @@ fn launch_panel_target(panel: &str, args: &[String]) -> Option<zvariant::OwnedVa
         .iter()
         .map(|a| zvariant::Value::from(a.as_str()))
         .collect();
-    let inner = zvariant::Structure::from((
-        zvariant::Value::from(panel),
-        zvariant::Value::from(zvariant::Array::from(args)),
-    ));
+    // `append_field` keeps each field's own signature; `Structure::from((..))` (and
+    // `add_field`) re-wraps an already-built `Value` as a variant, which yields `(vv)`
+    // and gets the call rejected with `InvalidArgs`.
+    let inner = zvariant::StructureBuilder::new()
+        .append_field(zvariant::Value::from(panel))
+        .append_field(zvariant::Value::from(zvariant::Array::from(args)))
+        .build()
+        .ok()?;
     zvariant::Value::from(inner).try_to_owned().ok()
 }
 
@@ -622,6 +626,19 @@ impl Start for GtkNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gnome-shell builds `new GLib.Variant('(sav)', [panel, args])`
+    /// (`js/ui/status/network.js:68`); Settings rejects anything else with
+    /// `InvalidArgs`, so the signature is the contract, not the shape.
+    #[test]
+    fn launch_panel_target_is_sav() {
+        let with_args = launch_panel_target("wifi", &["connect-8021x-wifi".to_owned()]).unwrap();
+        assert_eq!(with_args.value_signature().to_string(), "(sav)");
+
+        // An argument-less panel still says `av`, never an empty-signature array.
+        let bare = launch_panel_target("network", &[]).unwrap();
+        assert_eq!(bare.value_signature().to_string(), "(sav)");
+    }
 
     #[test]
     fn object_path_mangles_dots_and_hyphens() {
