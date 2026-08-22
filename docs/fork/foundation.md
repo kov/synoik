@@ -541,38 +541,30 @@ Everything here was measured. Re-deriving any of it costs a day.
    synchronous `finish()` — are the two hardest multi-GPU sub-problems pre-collapsed to their trivial
    cases. **The real cost is validation, not code**, and no production Wayland compositor does
    render-on-A/scan-out-on-B with a Vulkan renderer today.
-8. **Number the damage tracker's z-index from the back.** smithay walks elements front-to-back and
-   increments `render_element_z_index` as it goes, so an element's z-index is the count of
-   everything *in front of* it — and `ElementInstanceState::matches` compares it. The wallpaper is
-   therefore numbered by the size of the whole scene: one element appearing or disappearing
-   anywhere above it renumbers it, the match fails, and the tracker damages its full geometry.
-   Since the wallpaper is full-output and fully opaque, that is a full-output repaint caused by
-   nothing having been redrawn.
+8. **A reorder still repaints everything it moved past.** ~~Number the z-index from the back~~ —
+   **DONE**, smithay `ed2d0627`. `ElementInstanceState::matches` compares z-index; counted from the
+   front, the bottom-most element's z-index was the size of the whole scene, so anything appearing
+   in front of the wallpaper renumbered it and damaged its full geometry. Counting from the back
+   makes the wallpaper index 0 and immune to front-end churn (cursors, popups, overlays), which is
+   where churn actually happens. Pinned by
+   `an_element_appearing_in_front_does_not_repaint_the_background`, which asserts the rect against
+   the real tracker.
 
-   Measured on kov's seat 2026-08-22 (`SYNOIK_DEBUG_DAMAGE_ATTRIB=1`, pid 265009): **all 12** frames
-   whose inputs justified 1.000x were the wallpaper — ten by `z-index`, two by the startup
-   `RelocatedColor` → `RelocatedRoundedTexture` swap. No other element ever reached full output. The
-   same shape hits anything with a crowded stack above it: one frame renumbered four `Monitor`
-   elements at once for 0.981x, triggered by a single pointer element changing `Id`.
+   **What remains is the move case, and the reordering does not help it.** An element that changes
+   *position* renumbers everything it passed under either scheme — front-index +1 is back-index −1.
+   The live instance is the overview's hovered-preview restack (`layout/workspace.rs:3420`, faithful
+   to GNOME's `_restack` at `windowPreview.js:620`): `remove(i)` + `insert(0)` renumbers every
+   preview between the hovered one and the front, and each pays a full-geometry repaint. Measured:
+   four previews at 0.491x each, 0.981x of the output, for moving the mouse onto a preview — the
+   most common thing anyone does in the overview.
 
-   Numbering from the back inverts the asymmetry. The wallpaper becomes index 0 and stays matched;
-   an insertion at the very front shifts nothing, and one mid-stack shifts only what is in front of
-   it. This does not remove churn — it moves it onto the elements that are cheapest to damage, which
-   is the whole point: renumbering the pointer costs 0.000x, renumbering the wallpaper costs 1.000x.
+   The behavior is correct and must stay; the cost is the tracker's. A fix has to make a reorder
+   that changes no occlusion cost nothing, which means comparing what is actually in front of an
+   element rather than its ordinal. smithay already computes that (`opaque_regions_index`), so the
+   material is there; the argument that it is sufficient is not yet made. Do not simply drop
+   `z_index` from the comparison — z-order genuinely changes what covers what.
 
-   The storage side is a one-line change: `last_z_index` is written in a separate `.enumerate()`
-   fold *after* the walk, where `render_elements.len()` is already known. The comparison side is the
-   work — it happens inside the walk, where the total is not known yet, because the cull that
-   decides which elements count depends on opaque regions accumulated front-to-back. It needs a
-   pre-pass for the count or the damage decision deferred to a second pass, in our smithay fork.
-
-   **Do not instead drop `z_index` from the comparison.** Z-order genuinely changes what covers
-   what; the ordinal is a proxy for that and removing it needs an argument this does not have.
-
-   Element-count churn is the trigger, so fixing churners is the cheaper first move and may make
-   this much less urgent — it is worth doing anyway, because it bounds the cost of churn we have not
-   found yet. Attribution instrument and the rules for reading it: `frame_log::DamageAttribution`,
-   `SYNOIK_DEBUG_DAMAGE_ATTRIB=1`.
+   Attribution instrument: `frame_log::DamageAttribution`, `SYNOIK_DEBUG_DAMAGE_ATTRIB=1`.
 
 Slottable any time:
 
