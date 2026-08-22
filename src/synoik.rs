@@ -167,7 +167,6 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::session_management::{SessionManagerHandler as _, SessionManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
-use crate::render_helpers::blur::GNOME_CLIENT_BLUR_RADIUS;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
@@ -178,7 +177,6 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_shm, render_to_vec, RenderCtx, RenderTarget,
 };
@@ -1334,7 +1332,6 @@ pub struct OutputState {
     /// Solid color buffer for the backdrop that we use instead of clearing to avoid damage
     /// tracking issues and make screenshots easier.
     pub backdrop_buffer: SolidColorBuffer,
-    pub xray: Xray,
     pub lock_render_state: LockRenderState,
     pub lock_surface: Option<LockSurface>,
     pub lock_color_buffer: SolidColorBuffer,
@@ -5016,50 +5013,9 @@ impl State {
         (saved, skipped)
     }
 
-    pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
-        let appearance = self.synoik.appearance();
-        // The unmapping tile may have an xray background, in which case we will render xray
-        // elements, so they need to be updated.
-        self.synoik.update_xray_render_elements(output);
-
+    pub fn store_unmap_snapshot(&mut self, window: &Window) {
         self.backend.with_vulkan_renderer(|renderer| {
-            if let Some(output) = output {
-                let mut ctx = RenderCtx {
-                    target: RenderTarget::Output,
-                    renderer,
-                    xray: None,
-                    appearance: Some(appearance),
-                };
-
-                self.synoik.fill_xray_elements(ctx.r(), output);
-
-                // If any background layer has block_out_from, also fill the Screencast xray
-                // buffer so the unmap snapshot can render a buffer with blocked-out background.
-                //
-                // This will be used in Tile::render_snapshot().
-                let has_blocked_out = self.synoik.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
-                    };
-                    self.synoik.fill_xray_elements(screencast_ctx, output);
-                }
-
-                let state = self.synoik.output_state.get_mut(output).unwrap();
-                self.synoik.layout.store_unmap_snapshot(
-                    renderer,
-                    Some(&mut state.xray),
-                    has_blocked_out,
-                    window,
-                );
-
-                self.synoik.clear_xray_elements(output);
-            } else {
-                self.synoik
-                    .layout
-                    .store_unmap_snapshot(renderer, None, false, window);
-            }
+            self.synoik.layout.store_unmap_snapshot(renderer, window);
         });
     }
 
@@ -8367,7 +8323,6 @@ impl Synoik {
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
             frame_callback_sequence: 0,
             backdrop_buffer: SolidColorBuffer::new(size, backdrop_color),
-            xray: Xray::new(),
             lock_render_state,
             lock_surface: None,
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
@@ -10673,7 +10628,6 @@ impl Synoik {
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
-        self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
 
         // Retire a finished curtain slide. Without this the state stays `Hiding` forever and the
@@ -10694,51 +10648,6 @@ impl Synoik {
 
                 let layer_map = layer_map_for_output(out);
                 for surface in layer_map.layers() {
-                    let Some(mapped) = self.mapped_layer_surfaces.get_mut(surface) else {
-                        continue;
-                    };
-                    let Some(geo) = layer_map.layer_geometry(surface) else {
-                        continue;
-                    };
-
-                    mapped.update_render_elements(geo.size.to_f64());
-                }
-            }
-        }
-    }
-
-    // Updates only those render elements that go in the xray buffer.
-    pub fn update_xray_render_elements(&mut self, output: Option<&Output>) {
-        for (out, state) in self.output_state.iter_mut() {
-            if output.is_none_or(|output| out == output) {
-                let scale = Scale::from(out.current_scale().fractional_scale());
-                let mode = out.current_mode().unwrap();
-                let transform = out.current_transform();
-                let size = transform.transform_size(mode.size);
-
-                state.xray.workspaces.clear();
-                let mon = self.layout.monitor_for_output(out).unwrap();
-                for (ws, geo) in mon.workspaces_with_render_geo() {
-                    let bg_color = ws.render_background().color();
-                    state.xray.workspaces.push((geo, bg_color));
-                }
-                state.xray.backdrop_color = state.backdrop_buffer.color();
-                // The xray buffer is the cheap stand-in for a surface's real backdrop blur, so it
-                // runs at the same radius that backdrop would — GNOME's, scaled to this output.
-                let blur_radius = GNOME_CLIENT_BLUR_RADIUS * scale.x;
-                for buf in &state.xray.background {
-                    let mut buffer = buf.borrow_mut();
-                    buffer.update_size(size, scale);
-                    buffer.update_blur_radius(blur_radius);
-                }
-                for buf in &state.xray.backdrop {
-                    let mut buffer = buf.borrow_mut();
-                    buffer.update_size(size, scale);
-                    buffer.update_blur_radius(blur_radius);
-                }
-
-                let layer_map = layer_map_for_output(out);
-                for surface in layer_map.layers_on(Layer::Background) {
                     let Some(mapped) = self.mapped_layer_surfaces.get_mut(surface) else {
                         continue;
                     };
@@ -10803,17 +10712,7 @@ impl Synoik {
             }
         }
 
-        // Fill the xray background/backdrop capture buffers.
-        self.fill_xray_elements(ctx.r(), output);
-
-        // Reborrow to shorten lifetime to be able to put in xray.
-        let mut ctx = ctx.r();
-        let state = self.output_state.get(output).unwrap();
-        ctx.xray = Some(&state.xray);
-
         self.render_inner(ctx, output, include_pointer, push);
-
-        self.clear_xray_elements(output);
     }
 
     fn render_inner(
@@ -11496,55 +11395,31 @@ impl Synoik {
         // We use macros instead of closures to avoid borrowing issues (renderer and push() go
         // into different functions).
         macro_rules! push_popups_from_layer {
-            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
-                self.render_layer_popups(
-                    ctx.r(),
-                    $ns,
-                    &layer_map,
-                    $layer,
-                    $xray_pos,
-                    $backdrop,
-                    $push,
-                );
+            ($layer:expr, $ns:expr, $backdrop:expr, $push:expr) => {{
+                self.render_layer_popups(ctx.r(), $ns, &layer_map, $layer, $backdrop, $push);
             }};
             ($layer:expr, true) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!($layer, None, true, &mut |elem| push(elem.into()));
             }};
-            ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
-                push_popups_from_layer!($layer, $ns, $xray_pos, false, $push);
+            ($layer:expr, $ns:expr, $push:expr) => {{
+                push_popups_from_layer!($layer, $ns, false, $push);
             }};
             ($layer:expr) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!($layer, None, false, &mut |elem| push(elem.into()));
             }};
         }
         macro_rules! push_normal_from_layer {
-            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
-                self.render_layer_normal(
-                    ctx.r(),
-                    $ns,
-                    &layer_map,
-                    $layer,
-                    $xray_pos,
-                    $backdrop,
-                    $push,
-                );
+            ($layer:expr, $ns:expr, $backdrop:expr, $push:expr) => {{
+                self.render_layer_normal(ctx.r(), $ns, &layer_map, $layer, $backdrop, $push);
             }};
             ($layer:expr, true) => {{
-                push_normal_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| {
-                    push(elem.into())
-                });
+                push_normal_from_layer!($layer, None, true, &mut |elem| { push(elem.into()) });
             }};
-            ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
-                push_normal_from_layer!($layer, $ns, $xray_pos, false, $push);
+            ($layer:expr, $ns:expr, $push:expr) => {{
+                push_normal_from_layer!($layer, $ns, false, $push);
             }};
             ($layer:expr) => {{
-                push_normal_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| {
-                    push(elem.into())
-                });
+                push_normal_from_layer!($layer, None, false, &mut |elem| { push(elem.into()) });
             }};
         }
 
@@ -11709,9 +11584,8 @@ impl Synoik {
             for ((idx, ws), geo) in mon.workspaces_with_render_geo_idx() {
                 let ws_zoom = zoom * mon.workspace_render_scale(idx);
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, ws_zoom);
-                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(ws_zoom, geo));
-                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
+                push_popups_from_layer!(Layer::Bottom, ns, process!(ws_zoom, geo));
+                push_popups_from_layer!(Layer::Background, ns, process!(ws_zoom, geo));
             }
 
             // Topmost in the group: each preview's chrome — close button, caption
@@ -11761,16 +11635,15 @@ impl Synoik {
                 let ws_zoom = zoom * mon.workspace_render_scale(idx);
                 // The render element namespace. This will be set to the workspace index for
                 // elements duplicated across workspaces (i.e. background and bottom layers) in
-                // order to have their non-xray framebuffer effects separated from each other.
+                // order to have their framebuffer effects separated from each other.
                 //
                 // This doesn't have to correspond exactly to workspace id or idx, the only
                 // requirement is that there's only one framebuffer effect element with a given id +
                 // namespace on the frame at once. Id + namespace is used as the cache key in the
                 // damage tracker.
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, ws_zoom);
-                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(ws_zoom, geo));
-                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
+                push_normal_from_layer!(Layer::Bottom, ns, process!(ws_zoom, geo));
+                push_normal_from_layer!(Layer::Background, ns, process!(ws_zoom, geo));
 
                 let mut wallpapered = false;
                 // As above: the GNOME wallpaper draws on GLES and on the owned Vulkan renderer.
@@ -11836,82 +11709,6 @@ impl Synoik {
         push(backdrop);
     }
 
-    /// Fill the per-target background/backdrop
-    /// [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s that the
-    /// [`XrayElement`](crate::render_helpers::xray::XrayElement)s sample.
-    pub fn fill_xray_elements(&self, mut ctx: RenderCtx, output: &Output) {
-        let _span = tracy_client::span!("Synoik::fill_xray_elements");
-
-        // Make sure the xrayed elements themselves cannot use xray by mistake.
-        ctx.xray = None;
-
-        let state = self.output_state.get(output).unwrap();
-        let xray = &state.xray;
-        let layer_map = layer_map_for_output(output);
-        let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
-
-        let mut buffer = xray.background[ctx.target as usize].borrow_mut();
-        {
-            let buf_logical = buffer.logical_size();
-            let buf_scale = buffer.scale();
-            let elements = buffer.elements_vulkan();
-            elements.clear();
-            self.render_layer_normal(
-                ctx.r(),
-                None,
-                &layer_map,
-                Layer::Background,
-                XrayPos::default(),
-                false,
-                &mut |elem| elements.push(elem.into()),
-            );
-            // Bake the in-compositor GNOME wallpaper into the background buffer (through the
-            // Vulkan arm's element storage) so the xray samples the wallpaper behind translucent
-            // windows.
-            push_gnome_wallpaper_into_xray(
-                gnome_mode,
-                &self.wallpaper,
-                ctx.renderer,
-                buf_logical,
-                buf_scale,
-                elements,
-            );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-
-        let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
-        {
-            let elements = buffer.elements_vulkan();
-            elements.clear();
-            self.render_layer_normal(
-                ctx.r(),
-                None,
-                &layer_map,
-                Layer::Background,
-                XrayPos::default(),
-                true,
-                &mut |elem| elements.push(elem.into()),
-            );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-    }
-
-    pub fn clear_xray_elements(&self, output: &Output) {
-        let state = self.output_state.get(output).unwrap();
-        let xray = &state.xray;
-
-        // Clear the xray elements for all render targets after all rendering that could use them
-        // did so.
-        for buf in &xray.background {
-            buf.borrow_mut().elements_vulkan().clear();
-        }
-        for buf in &xray.backdrop {
-            buf.borrow_mut().elements_vulkan().clear();
-        }
-    }
-
     /// Checks if any background layer surface has `block_out_from` set.
     pub fn has_blocked_out_background_layers(&self, output: &Output) -> bool {
         let layer_map = layer_map_for_output(output);
@@ -11953,14 +11750,12 @@ impl Synoik {
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
-        xray_pos: XrayPos,
         for_backdrop: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
             let loc = geo.loc.to_f64();
-            let xray_pos = xray_pos.offset(loc);
-            mapped.render_normal(ctx.r(), ns, loc, xray_pos, push);
+            mapped.render_normal(ctx.r(), ns, loc, push);
         }
     }
 
@@ -11971,14 +11766,12 @@ impl Synoik {
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
-        xray_pos: XrayPos,
         for_backdrop: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
             let loc = geo.loc.to_f64();
-            let xray_pos = xray_pos.offset(loc);
-            mapped.render_popups(ctx.r(), ns, loc, xray_pos, push);
+            mapped.render_popups(ctx.r(), ns, loc, push);
         }
     }
 
@@ -12349,41 +12142,15 @@ impl Synoik {
             });
         }
 
-        let xray = &self.output_state[output].xray;
-        let xray_bg = xray.background[RenderTarget::Output as usize].borrow();
-        let xray_bd = xray.backdrop[RenderTarget::Output as usize].borrow();
-
         for layer in layer_map_for_output(output).layers() {
             let surface = layer.wl_surface();
-            let is_background = layer.layer() == Layer::Background;
 
             with_surfaces_surface_tree(surface, |surface, states| {
                 let primary_scanout_output = states
                     .data_map
                     .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
                 let mut primary_scanout_output = primary_scanout_output.lock().unwrap();
-                let mut id = Id::from_wayland_resource(surface);
-
-                // Background layers may be invisible normally but visible through an xray
-                // background effect. Try to find it and use the xray element's id in this case.
-                //
-                // FIXME: this won't work if there's another layer of offscreen (e.g. window with
-                // an xray background during its opening animation). But hopefully with the
-                // refactor to draw background effects outside offscreens it won't be a problem.
-                if is_background && !render_element_states.element_was_presented(id.clone()) {
-                    // A layer may be present either in background or backdrop, never in both.
-                    if xray_bg
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
-                    {
-                        id = xray_bg.id().clone();
-                    } else if xray_bd
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
-                    {
-                        id = xray_bd.id().clone();
-                    }
-                }
+                let id = Id::from_wayland_resource(surface);
 
                 primary_scanout_output.update_from_render_element_states(
                     id,
@@ -12395,7 +12162,6 @@ impl Synoik {
                 );
             });
 
-            // Popups never go into xray buffers.
             for (popup, _) in PopupManager::popups_for_surface(surface) {
                 let surface = popup.wl_surface();
                 with_surfaces_surface_tree(surface, |surface, states| {
@@ -12781,7 +12547,6 @@ impl Synoik {
                     let ctx = RenderCtx {
                         renderer,
                         target: RenderTarget::ScreenCapture,
-                        xray: None,
                         appearance: Some(appearance),
                     };
                     let offset = screencopy.region_loc().upscale(-1);
@@ -12860,7 +12625,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let offset = screencopy.region_loc().upscale(-1);
@@ -13096,7 +12860,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, false);
@@ -13240,7 +13003,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
@@ -13287,7 +13049,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
@@ -13390,7 +13151,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         mapped.render(
@@ -13398,7 +13158,6 @@ impl Synoik {
             mapped.window.geometry().loc.to_f64(),
             scale,
             alpha,
-            XrayPos::default(),
             &mut |elem| elements.push(elem.into()),
         );
 
@@ -13607,7 +13366,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
@@ -14152,7 +13910,6 @@ impl Synoik {
         let ctx = RenderCtx {
             renderer,
             target,
-            xray: None,
             appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, false);
@@ -16344,42 +16101,6 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
-}
-
-/// Bake the in-compositor GNOME wallpaper into an xray
-/// [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)'s element list.
-///
-/// In GNOME (Floating) mode the wallpaper is drawn directly by `render_inner`, not as a layer-shell
-/// background surface, so `render_layer_normal(Layer::Background)` — which fills the xray buffers —
-/// never sees it. Without this the xray/blur samples an empty buffer and shows only the flat
-/// `bg_color`. We fill the output-sized buffer at its origin with `zoom = 1` (the `XrayElement`
-/// applies the per-window mapping and rounded clip when it samples), pushed last so the wallpaper
-/// sits below the background-layer surfaces, matching `render_inner`'s draw order.
-/// Renderer-agnostic via [`Wallpaper::render_dual`].
-fn push_gnome_wallpaper_into_xray(
-    gnome_mode: bool,
-    wallpaper: &Wallpaper,
-    renderer: &mut VulkanRenderer,
-    buf_logical: Size<f64, Logical>,
-    buf_scale: Scale<f64>,
-    elements: &mut Vec<OutputRenderElements>,
-) {
-    if !gnome_mode {
-        return;
-    }
-
-    // Radius 0: the buffer holds the raw wallpaper; the sampling `XrayElement` does the rounded
-    // clip itself.
-    let Some(elem) = wallpaper.render(renderer, Default::default(), buf_logical, 0., buf_scale)
-    else {
-        return;
-    };
-    // Wrap into the same `CropRenderElement<Relocate<Rescale<…>>>` the on-screen path builds, but
-    // as a no-op transform (zoom 1, origin) that only crops to the buffer bounds.
-    if let Some(elem) = scale_relocate_crop(elem, buf_scale, 1., Rectangle::from_size(buf_logical))
-    {
-        elements.push(elem.into());
-    }
 }
 
 fn scale_relocate_crop<E: Element>(

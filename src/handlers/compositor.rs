@@ -798,10 +798,9 @@ impl CompositorHandler for State {
         // subsurface is destroyed; in the case of alacritty, this is the top CSD shadow. But, it
         // gets most of the job done.
         if let Some(root) = self.synoik.root_surface.get(surface) {
-            if let Some((mapped, output)) = self.synoik.layout.find_window_and_output(root) {
+            if let Some((mapped, _output)) = self.synoik.layout.find_window_and_output(root) {
                 let window = mapped.window.clone();
-                let output = output.cloned();
-                self.store_unmap_snapshot(&window, output.as_ref());
+                self.store_unmap_snapshot(&window);
             }
         }
 

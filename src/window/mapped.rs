@@ -43,7 +43,6 @@ use crate::render_helpers::surface::{
     SurfaceTreeElement,
 };
 use crate::render_helpers::vulkan::VulkanRenderer;
-use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
 use crate::synoik_render_elements;
 use crate::utils::id::IdCounter;
@@ -614,14 +613,12 @@ impl Mapped {
             RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
-                xray: None,
                 // A single-window cast has no compositor at hand; see `RenderCtx::appearance`.
                 appearance: None,
             },
             location,
             scale,
             1.,
-            XrayPos::default(),
             &mut |elem| push(use_border(elem)),
         );
     }
@@ -771,7 +768,6 @@ impl LayoutElement for Mapped {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -789,7 +785,7 @@ impl LayoutElement for Mapped {
             // subsurface that asked for it — that is what makes its backdrop "everything below me,
             // my own parent surface included". The root is excluded: its effect is the window's,
             // pushed under the whole tile by `render_background_effect`.
-            let (target, xray, appearance) = (ctx.target, ctx.xray, ctx.appearance);
+            let (target, appearance) = (ctx.target, ctx.appearance);
             let blur_config = self.blur_config;
             let effect_rules = self.rules.background_effect;
             let should_block_out = target.should_block_out(self.rules.block_out_from);
@@ -834,7 +830,6 @@ impl LayoutElement for Mapped {
                         RenderCtx {
                             renderer,
                             target,
-                            xray,
                             appearance,
                         },
                         None,
@@ -847,7 +842,6 @@ impl LayoutElement for Mapped {
                         CornerRadius::default(),
                         effect_rules,
                         should_block_out,
-                        xray_pos,
                         push_effect,
                     );
                 },
@@ -861,7 +855,6 @@ impl LayoutElement for Mapped {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -894,12 +887,7 @@ impl LayoutElement for Mapped {
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
             let surface_anim_scale = Scale::from(1.);
-            let mut effect = popup_rules.background_effect;
-            // Default xray to false for pop-ups since they're always on top of something.
-            if effect.xray.is_none() {
-                effect.xray = Some(false);
-            }
-            let xray_pos = xray_pos.offset(offset.to_f64());
+            let effect = popup_rules.background_effect;
             background_effect::render_for_tile(
                 ctx.r(),
                 None,
@@ -912,7 +900,6 @@ impl LayoutElement for Mapped {
                 popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
-                xray_pos,
                 &mut |elem| push(elem.into()),
             );
         }
@@ -925,7 +912,6 @@ impl LayoutElement for Mapped {
         scale: f64,
         surface_anim_scale: Scale<f64>,
         radius: CornerRadius,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
@@ -941,7 +927,6 @@ impl LayoutElement for Mapped {
             radius,
             self.rules.background_effect,
             should_block_out,
-            xray_pos,
             push,
         );
     }

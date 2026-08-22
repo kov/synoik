@@ -52,14 +52,6 @@ pub struct NeutralSnapshot {
     /// Contents for a normal render.
     pub contents: CapturedVariant,
 
-    /// Contents that are not blocked out, but the background is.
-    ///
-    /// `None` means **not needed** (the background has no blocked-out surfaces) — never "the
-    /// capture failed". A failed capture of a needed variant must throw the whole snapshot away:
-    /// if the two were conflated, [`Self::variant`] would fall through to the unblocked `contents`
-    /// and leak into a screencast exactly what block-out exists to hide.
-    pub contents_with_blocked_out_bg: Option<CapturedVariant>,
-
     /// Blocked-out contents. `None` means **not needed**: `block_out_from` is `None`, so
     /// `should_block_out` is never true and this is never selected. Same rule as above.
     pub blocked_out_contents: Option<CapturedVariant>,
@@ -82,12 +74,6 @@ impl NeutralSnapshot {
     pub fn variant(&self, target: RenderTarget) -> Option<(usize, &CapturedVariant)> {
         if target.should_block_out(self.block_out_from) {
             return Some((2, self.blocked_out_contents.as_ref()?));
-        }
-
-        if target != RenderTarget::Output {
-            if let Some(contents) = &self.contents_with_blocked_out_bg {
-                return Some((1, contents));
-            }
         }
 
         Some((0, &self.contents))

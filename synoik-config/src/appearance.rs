@@ -806,7 +806,6 @@ impl MergeWith<BlurPart> for Blur {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct BackgroundEffectRule {
-    pub xray: Option<bool>,
     pub blur: Option<bool>,
     pub noise: Option<FloatOrInt<0, 1000>>,
     pub saturation: Option<FloatOrInt<0, 1000>>,
@@ -815,13 +814,6 @@ pub struct BackgroundEffectRule {
 /// Resolved background effect rule.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct BackgroundEffect {
-    /// Whether to render with xray effect (see through).
-    ///
-    /// - `None`: xray if any background effect is active
-    /// - `Some(false)`: no xray
-    /// - `Some(true)`: xray even if no other background effect is active
-    pub xray: Option<bool>,
-
     /// Whether to blur the background.
     ///
     /// - `None`: blur when the window/layer requests it (e.g. through ext-background-effect
@@ -836,7 +828,7 @@ pub struct BackgroundEffect {
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
     fn merge_with(&mut self, part: &BackgroundEffectRule) {
-        merge_clone_opt!((self, part), xray, blur);
+        merge_clone_opt!((self, part), blur);
 
         if let Some(x) = part.noise {
             self.noise = Some(x.0);

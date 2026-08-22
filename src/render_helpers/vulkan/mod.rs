@@ -20,7 +20,6 @@
 mod backdrop_blur;
 mod blur_chain;
 mod custom;
-mod effect_blur;
 mod error;
 mod fence;
 mod frame;
@@ -33,10 +32,9 @@ mod types;
 
 pub(crate) use backdrop_blur::BackdropBlur;
 pub(crate) use custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
-pub(crate) use effect_blur::EffectBlur;
 pub use error::VulkanError;
 pub use frame::VulkanFrame;
-pub(crate) use frame::{pack_mat3, premultiply, ClipParams};
+pub(crate) use frame::{premultiply, ClipParams};
 pub(crate) use gaussian_backdrop::GaussianBackdrop;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;

@@ -236,7 +236,6 @@ fn render_output_vulkan_target(
             let ctx = RenderCtx {
                 renderer: vk,
                 target,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, output, false);
@@ -281,7 +280,6 @@ fn vulkan_composites_a_mapped_window() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::ScreenCapture,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -1728,7 +1726,6 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
@@ -1876,7 +1873,6 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
@@ -4333,9 +4329,8 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
     .clone();
 
     // Capture the unmap snapshot. On a Vulkan session this goes through the owned renderer and
-    // bakes no GLES texture at all. `None` output → no xray background, which is all a plain window
-    // needs.
-    f.synoik_state().store_unmap_snapshot(&window_id, None);
+    // bakes no GLES texture at all.
+    f.synoik_state().store_unmap_snapshot(&window_id);
 
     // Inspect the tile's captured snapshot. The window is still mapped (storing a snapshot does not
     // unmap it), so the tile is still in the active workspace.
@@ -4692,7 +4687,6 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::ScreenCapture,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
@@ -6285,417 +6279,6 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
     );
 }
 
-/// Phase-C slice-5 (xray port) commit-1: the `EffectBuffer` gained a Vulkan arm that renders its
-/// elements into an owned offscreen and (eagerly) blurs it, sampled through `render_postprocess` —
-/// the exact primitive the ported `XrayElement::draw` will use in commit-2. This pins the whole arm
-/// end-to-end while it is still dead code. The offscreen is a hard red|green vertical edge, and the
-/// cases target the design's actual risks:
-///   (a) full src → left-red/right-green passthrough;
-///   (b) a cropped src (right half) → all green — proves the sampled sub-rect is honored (a
-///       full-src-only test would go green while hiding a src/composition bug);
-///   (c) blur on → the hard edge softens (blended pixels the sharp scene can't have), proving the
-///       eager Vulkan blur ran and differs from the unblurred consume;
-///   (d) resize via `update_size` + re-prepare → the **atomic blur-chain rebuild** (the trap this
-///       design exists for: the chain binds a fixed source view and has no `Drop`) produces a valid
-///       blurred sample at the new size, no validation error;
-///   (e) mutate the elements + re-prepare with blur → the blurred output *changed*, exercising the
-///       `valid`-flag invalidation and the same-`EffectBlur` output-reuse (UNDEFINED-discard) path.
-/// Offscreen-only, so it runs on lavapipe too.
-#[test]
-fn vulkan_effect_buffer_renders_offscreen_and_blur() {
-    use smithay::backend::renderer::element::Kind;
-    use smithay::backend::renderer::{Offscreen, Texture as _};
-    use synoik_vk::render::PostprocessPush;
-
-    use crate::render_helpers::effect_buffer::EffectBuffer;
-    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-    use crate::render_helpers::vulkan::VkTexture;
-
-    let mut vk = match VulkanRenderer::new() {
-        Ok(vk) => vk,
-        Err(e) => {
-            eprintln!("skipping vulkan_effect_buffer_renders_offscreen_and_blur: no Vulkan ({e})");
-            return;
-        }
-    };
-
-    const IDENTITY_MAT3: [[f32; 4]; 3] = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-    ];
-
-    // Identity postprocess (no clip, no rounding, no desaturation); render_postprocess fills
-    // origin/size/proj/target/src_rect.
-    let identity_push = |geo: i32| PostprocessPush {
-        tint: [0.; 4],
-        contrast: 0.,
-        _pad0: [0.; 3],
-        origin: [0.0, 0.0],
-        size: [0.0, 0.0],
-        proj: [0.0; 4],
-        target: [0.0, 0.0],
-        geo_size: [geo as f32, geo as f32],
-        src_rect: [0.0; 4],
-        corner_radius: [0.0; 4],
-        bg_color: [0.0; 4],
-        input_to_geo: IDENTITY_MAT3,
-        sample_transform: IDENTITY_MAT3,
-        synoik_scale: 1.0,
-        synoik_alpha: 1.0,
-        saturation: 1.0,
-        noise: 0.0,
-    };
-
-    // Sample `tex` (through `src`) across a whole `s`×`s` target and read it back.
-    let sample = |vk: &mut VulkanRenderer,
-                  tex: &VkTexture,
-                  src: Rectangle<f64, BufferCoord>,
-                  s: i32|
-     -> Vec<u8> {
-        let size = Size::<i32, Physical>::from((s, s));
-        let mut target = vk
-            .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((s, s)))
-            .expect("create sample target");
-        {
-            let mut fb = vk.bind(&mut target).expect("bind sample target");
-            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
-            frame
-                .clear(
-                    Color32F::from([0.0, 0.0, 0.0, 1.0]),
-                    &[Rectangle::from_size(size)],
-                )
-                .expect("clear");
-            let dst = Rectangle::<i32, Physical>::from_size(size);
-            frame
-                .render_postprocess(
-                    tex,
-                    src,
-                    dst,
-                    &[Rectangle::from_size(size)],
-                    identity_push(s),
-                )
-                .expect("render_postprocess");
-            let _ = frame.finish().expect("finish");
-        }
-        let fb = vk.bind(&mut target).expect("rebind sample target");
-        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((s, s)));
-        let mapping = vk
-            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
-            .expect("copy");
-        vk.map_texture(&mapping).expect("map").to_vec()
-    };
-
-    // Fill the effect buffer's offscreen with a hard edge: left half red, right half green.
-    let fill_edge = |buffer: &mut EffectBuffer, s: i32| {
-        let red =
-            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [1.0, 0.0, 0.0, 1.0]);
-        let green =
-            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [0.0, 1.0, 0.0, 1.0]);
-        let elements = buffer.elements_vulkan();
-        elements.clear();
-        elements.push(
-            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
-        );
-        elements.push(
-            SolidColorRenderElement::from_buffer(
-                &green,
-                (s as f64 / 2.0, 0.0),
-                1.0,
-                Kind::Unspecified,
-            )
-            .into(),
-        );
-    };
-
-    const S: i32 = 64;
-    let scale = Scale::from(1.0);
-    let full_src = Rectangle::<f64, BufferCoord>::from_size(Size::from((S as f64, S as f64)));
-    let right_src = Rectangle::<f64, BufferCoord>::new(
-        (S as f64 / 2.0, 0.0).into(),
-        (S as f64 / 2.0, S as f64).into(),
-    );
-
-    let mut buffer = EffectBuffer::new();
-    assert!(
-        buffer.render_element_states().is_none(),
-        "no states before the first render"
-    );
-    buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
-    fill_edge(&mut buffer, S);
-    assert!(
-        buffer.prepare_vulkan(&mut vk, false),
-        "prepare_vulkan (no blur) failed"
-    );
-
-    // The states of the Vulkan render must be observable: `Synoik::update_primary_scanout_output`
-    // reads them to remap a background layer surface that is visible only through this xray buffer
-    // onto the xray element's id. Reading the GLES arm here returned `None` on every real frame, so
-    // that remap silently never fired and such a surface had its frame callbacks throttled.
-    assert!(
-        buffer.render_element_states().is_some(),
-        "the Vulkan render's element states must be observable, else the background-layer id \
-         remap in update_primary_scanout_output silently never fires"
-    );
-
-    // (a) full src → left red, right green; (b) cropped src = right half → all green.
-    {
-        let tex = buffer.texture_vulkan(false).expect("offscreen texture");
-
-        let full = sample(&mut vk, &tex, full_src, S);
-        let l = px(&full, S, 4, S / 2);
-        let r = px(&full, S, S - 5, S / 2);
-        assert!(
-            l[0] > 200 && l[1] < 50,
-            "full-src left should be red, got {l:?}"
-        );
-        assert!(
-            r[1] > 200 && r[0] < 50,
-            "full-src right should be green, got {r:?}"
-        );
-
-        let cropped = sample(&mut vk, &tex, right_src, S);
-        let l = px(&cropped, S, 4, S / 2);
-        let r = px(&cropped, S, S - 5, S / 2);
-        assert!(
-            l[1] > 200 && l[0] < 50,
-            "cropped-src left should sample the green right half, got {l:?}"
-        );
-        assert!(
-            r[1] > 200 && r[0] < 50,
-            "cropped-src right should be green, got {r:?}"
-        );
-    } // drop the offscreen clone before the next prepare so `is_unique_reference` holds
-
-    // (c) blur on → the hard edge softens.
-    buffer.update_blur_radius(24.0);
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "prepare_vulkan (blur) failed"
-    );
-    let edge_blend = {
-        let tex = buffer.texture_vulkan(true).expect("blurred texture");
-        let blurred = sample(&mut vk, &tex, full_src, S);
-        let y = S / 2;
-        let mut best = 0u8;
-        for x in 0..S {
-            let p = px(&blurred, S, x, y);
-            best = best.max(p[0].min(p[1]));
-        }
-        assert!(
-            best > 40,
-            "blur did not soften the edge (max min(R,G) = {best})"
-        );
-        best
-    };
-
-    // (d) resize → the atomic blur-chain rebuild at the new size (a full recreate: old chain
-    // dropped with the old offscreen, new chain bound to the new texture view).
-    const S2: i32 = 96;
-    buffer.update_size(Size::<i32, Physical>::from((S2, S2)), scale);
-    fill_edge(&mut buffer, S2);
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "prepare_vulkan after resize failed"
-    );
-    let full_src2 = Rectangle::<f64, BufferCoord>::from_size(Size::from((S2 as f64, S2 as f64)));
-    {
-        let tex = buffer
-            .texture_vulkan(true)
-            .expect("resized blurred texture");
-        assert_eq!(
-            tex.size(),
-            Size::<i32, BufferCoord>::from((S2, S2)),
-            "resized offscreen has the wrong size"
-        );
-        let blurred = sample(&mut vk, &tex, full_src2, S2);
-        let l = px(&blurred, S2, 3, S2 / 2);
-        let r = px(&blurred, S2, S2 - 4, S2 / 2);
-        assert!(
-            l[0] > 120 && l[0] > l[1],
-            "resized far-left should stay red-dominant, got {l:?}"
-        );
-        assert!(
-            r[1] > 120 && r[1] > r[0],
-            "resized far-right should stay green-dominant, got {r:?}"
-        );
-    }
-
-    // (e) mutate the offscreen (all blue) + re-prepare with blur → the blurred output changed (same
-    // texture re-rendered in place, blur invalidated + re-run into the reused output).
-    {
-        let blue = SolidColorBuffer::new(Size::from((S2 as f64, S2 as f64)), [0.0, 0.0, 1.0, 1.0]);
-        let elements = buffer.elements_vulkan();
-        elements.clear();
-        elements.push(
-            SolidColorRenderElement::from_buffer(&blue, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
-        );
-    }
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "prepare_vulkan after mutate failed"
-    );
-    {
-        let tex = buffer
-            .texture_vulkan(true)
-            .expect("mutated blurred texture");
-        let blurred = sample(&mut vk, &tex, full_src2, S2);
-        let c = px(&blurred, S2, S2 / 2, S2 / 2);
-        assert!(
-            c[2] > 180 && c[0] < 60 && c[1] < 60,
-            "mutated blur should be blue, got {c:?}"
-        );
-    }
-
-    eprintln!(
-        "vulkan_effect_buffer_renders_offscreen_and_blur: ok (edge blend min(R,G)={edge_blend})"
-    );
-}
-
-/// Phase-C slice-5 commit-2: the ported `XrayElement` Vulkan draw against the GLES oracle. This
-/// targets the coordinate-fold trap — GLES feeds `input_to_geo` the full-buffer UV (its `v_coords`
-/// maps the quad to `src` within the texture), while the Vulkan `postprocess.frag` feeds it
-/// quad-local `v_uv` + a separate `src_rect`, so the Vulkan draw must re-base `input_to_clip_geo`
-/// onto `v_uv` using the SAME draw-time `src`. Build a Vulkan `XrayElement` with a **cropped src
-/// (right half)** / identity `input_to_clip_geo` / nonzero `corner_radius`, over red|green
-/// offscreen content, and assert the composited output directly:
-///   - the sampled content is the GREEN right half (proves the cropped `src` is honored: a full src
-///     would sample red on the left);
-///   - only the RIGHT corners are rounded (the geometry maps to `[0.5,1]×[0,1]`); the top-LEFT
-///     corner stays GREEN — this is the fold discriminator: dropping the fold would clip via raw
-///     `v_uv ∈ [0,1]` and round the left corners too, cutting the top-left to transparent.
-///
-/// The probes state what the fold must produce, so they hold without a second renderer to compare
-/// against. Offscreen-only, so it runs on lavapipe.
-#[test]
-fn vulkan_xray_honors_the_cropped_src_fold() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use glam::{Mat3, Vec2};
-    use smithay::backend::renderer::element::Kind;
-    use smithay::utils::Logical;
-    use synoik_config::CornerRadius;
-
-    use crate::render_helpers::effect_buffer::EffectBuffer;
-    use crate::render_helpers::render_to_vec;
-    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-    use crate::render_helpers::xray::XrayElement;
-
-    let Some(mut f) = window_fixture(GREEN) else {
-        return;
-    };
-    if VulkanRenderer::new().is_err() {
-        eprintln!("skipping vulkan_xray_honors_the_cropped_src_fold: no Vulkan");
-        return;
-    }
-
-    const S: i32 = 64;
-    const R: f32 = 16.0;
-    let size = Size::<i32, Physical>::from((S, S));
-    let scale = Scale::from(1.0);
-
-    // Shared element parameters (identical for both renderers). Identity input_to_clip_geo + a
-    // right-half `src` crop: the fold must map v_uv → [0.5,1]×[0,1] geo, so only the right corners
-    // round. `clip_geo_size` is the geometry size in the rounding coordinate space.
-    let geometry = Rectangle::<f64, Logical>::from_size(Size::from((S as f64, S as f64)));
-    let src = Rectangle::<f64, BufferCoord>::new(
-        (S as f64 / 2.0, 0.0).into(),
-        (S as f64 / 2.0, S as f64).into(),
-    );
-    let i2g = Mat3::IDENTITY;
-    let clip_geo_size = Vec2::new(S as f32, S as f32);
-    let corner_radius = CornerRadius::from(R);
-    let bg = Color32F::TRANSPARENT;
-
-    // Left-red / right-green content for the effect buffer, as this renderer's element type.
-    fn build_edge<E: From<SolidColorRenderElement>>() -> Vec<E> {
-        let red = SolidColorBuffer::new(Size::from((S as f64 / 2.0, S as f64)), [1., 0., 0., 1.]);
-        let green = SolidColorBuffer::new(Size::from((S as f64 / 2.0, S as f64)), [0., 1., 0., 1.]);
-        vec![
-            SolidColorRenderElement::from_buffer(&red, (0., 0.), 1., Kind::Unspecified).into(),
-            SolidColorRenderElement::from_buffer(
-                &green,
-                (S as f64 / 2., 0.),
-                1.,
-                Kind::Unspecified,
-            )
-            .into(),
-        ]
-    }
-
-    let state = f.synoik_state();
-
-    // Vulkan (program = None → draws through render_postprocess).
-    let vk = state
-        .backend
-        .headless()
-        .with_vulkan_renderer(|v| {
-            let buffer = Rc::new(RefCell::new(EffectBuffer::new()));
-            {
-                let mut b = buffer.borrow_mut();
-                b.update_size(size, scale);
-                let elements = b.elements_vulkan();
-                elements.clear();
-                elements.extend(build_edge());
-            }
-            buffer.borrow_mut().prepare_vulkan(v, false);
-            let elem = XrayElement::new_for_test(
-                buffer.clone(),
-                geometry,
-                src,
-                i2g,
-                clip_geo_size,
-                corner_radius,
-                scale.x as f32,
-                false,
-                bg,
-            );
-            render_to_vec(
-                v,
-                size,
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                [elem].into_iter(),
-            )
-        })
-        .expect("Vulkan renderer present")
-        .expect("Vulkan xray render");
-
-    let green = |p: [u8; 4]| p[1] > 200 && p[0] < 60 && p[3] > 200;
-    let clipped = |p: [u8; 4]| p[3] < 60;
-
-    // Probes: center (green), top-left corner (green — the fold discriminator), top-right corner
-    // (clipped — confirms the right corner IS rounded, so the clip is active, not a no-op).
-    let probes = [
-        ("center", S / 2, S / 2, true),
-        ("top-left", 2, 2, true),
-        ("top-right", S - 3, 2, false),
-    ];
-    for (name, x, y, want_green) in probes {
-        let vp = px(&vk, S, x, y);
-        if want_green {
-            assert!(green(vp), "{name} ({x},{y}) should be green, vk={vp:?}");
-        } else {
-            assert!(clipped(vp), "{name} ({x},{y}) should be clipped, vk={vp:?}");
-        }
-    }
-
-    // No red anywhere: the cropped `src` sampled only the green right half.
-    let red = (0..S * S)
-        .filter(|i| {
-            let p = px(&vk, S, i % S, i / S);
-            p[0] > 120 && p[1] < 80 && p[3] > 120
-        })
-        .count();
-    assert_eq!(red, 0, "cropped src leaked red (count {red})");
-
-    eprintln!(
-        "vulkan_xray_honors_the_cropped_src_fold: ok (fold applied, cropped src leaks no red)"
-    );
-}
-
 /// A blur-off, saturation-1, noise-0, unclipped framebuffer effect over the *whole* output is a
 /// no-op: it captures the backdrop and redraws it unchanged. That invariant must hold under **any**
 /// output transform — the capture blit grabs the scene in physical orientation, so the postprocess
@@ -7378,7 +6961,7 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
 /// Close the mapped window exactly as `XdgShellHandler::toplevel_destroyed` does: capture the unmap
 /// snapshot, start the close animation, and remove the window from the layout. Leaves the layout
 /// with a `ClosingWindow` mid-animation.
-fn close_the_only_window(f: &mut Fixture, output: &Output) {
+fn close_the_only_window(f: &mut Fixture) {
     use crate::utils::transaction::Transaction;
 
     let window_id = crate::layout::LayoutElement::id(
@@ -7391,8 +6974,7 @@ fn close_the_only_window(f: &mut Fixture, output: &Output) {
     )
     .clone();
 
-    f.synoik_state()
-        .store_unmap_snapshot(&window_id, Some(output));
+    f.synoik_state().store_unmap_snapshot(&window_id);
 
     let transaction = Transaction::new();
     let blocker = transaction.blocker();
@@ -7418,7 +7000,7 @@ fn vulkan_draws_a_closing_window_into_a_cast() {
     };
     let output = f.synoik_output(1);
 
-    close_the_only_window(&mut f, &output);
+    close_the_only_window(&mut f);
     assert!(
         f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing close animation to composite",
@@ -7497,7 +7079,7 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);
-    close_the_only_window(&mut f, &output);
+    close_the_only_window(&mut f);
     assert!(
         f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing close animation to composite",
@@ -7603,7 +7185,6 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Screencast,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -10096,243 +9677,6 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     }
 }
 
-/// The xray blur costs no submit of its own, and the pixels still come out right.
-///
-/// A blur's own round trip costs about as much as the blur (`docs/fork/foundation.md` §5),
-/// so `EffectBlur::queue` does not make one: the chain is recorded into the next frame's command
-/// buffer, alongside the uploads and the dmabuf acquires. Two things have to hold for that to be
-/// safe, and neither is visible in a frame that merely looks correct:
-///
-///   (a) the blurred output is still fully written before anything samples it. Ordering replaces
-///       the wait *inside* a frame, and outside one the consumer has to drain the queue itself
-///       (`flush_pending_blurs`) — a regression here shows up as a *stale or blank* blur, not a
-///       torn one;
-///   (b) the blur chain outlives the recording that names it. It owns the render pass, pipelines
-///       and descriptor sets a queued blur binds, so rebuilding it (a resize) while one is queued
-///       would free objects the command buffer still refers to. `SharedBlurChain`'s reference
-///       count is what holds it; under `SYNOIK_VK_VALIDATION=1` a missing one is a use-after-free,
-///       not a wrong pixel.
-///
-/// [`vulkan_effect_buffer_renders_offscreen_and_blur`] covers the same path through a real frame;
-/// this one drives the queue directly, so the accounting is visible.
-#[test]
-fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
-    use smithay::backend::renderer::element::Kind;
-
-    use crate::render_helpers::effect_buffer::EffectBuffer;
-    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-
-    let skip = |why: &str| eprintln!("skipping vulkan_the_xray_blur_costs_no_submit: {why}");
-    let mut vk = match VulkanRenderer::new() {
-        Ok(vk) => vk,
-        Err(e) => return skip(&format!("no Vulkan device ({e})")),
-    };
-    if !vk.gpu().orders_submits() {
-        return skip("no timeline semaphore, so deferring would be unsafe");
-    }
-    // Headless there is no KMS plane to take a fence, so the session opt-in has to be forced.
-    vk.set_defer_scanout(true);
-
-    let scale = Scale::from(1.0);
-    let fill_edge = |buffer: &mut EffectBuffer, s: i32| {
-        let red =
-            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [1.0, 0.0, 0.0, 1.0]);
-        let green =
-            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [0.0, 1.0, 0.0, 1.0]);
-        let elements = buffer.elements_vulkan();
-        elements.clear();
-        elements.push(
-            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
-        );
-        elements.push(
-            SolidColorRenderElement::from_buffer(
-                &green,
-                (s as f64 / 2.0, 0.0),
-                1.0,
-                Kind::Unspecified,
-            )
-            .into(),
-        );
-    };
-
-    // Read the blurred output back and return the strongest blend along the mid scanline. A hard
-    // red|green edge has min(R,G) == 0 everywhere; blurring it mixes the two.
-    let edge_blend = |vk: &mut VulkanRenderer, buffer: &EffectBuffer, s: i32| -> u8 {
-        let mut tex = buffer.texture_vulkan(true).expect("blurred texture");
-        let fb = vk.bind(&mut tex).expect("bind blurred");
-        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((s, s)));
-        let mapping = vk
-            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
-            .expect("copy");
-        let pixels = vk.map_texture(&mapping).expect("map").to_vec();
-        let y = s / 2;
-        (0..s).fold(0u8, |best, x| {
-            let p = px(&pixels, s, x, y);
-            best.max(p[0].min(p[1]))
-        })
-    };
-
-    const S: i32 = 64;
-    let mut buffer = EffectBuffer::new();
-    buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
-    buffer.update_blur_radius(24.0);
-    fill_edge(&mut buffer, S);
-
-    let before = vk.in_flight_len();
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "prepare_vulkan (blur) failed"
-    );
-
-    // Exactly one, and the exactness is the test. This prepare used to make two submits — the
-    // offscreen render that fills the source, and the blur — and only the offscreen one is left;
-    // the blur is queued for the next frame's command buffer instead. A blur that went back to a
-    // submit of its own would read 2 here whether or not anyone waited for it.
-    //
-    // The obvious assertion — that the `Blur` site's `retiring` is zero, the number the frame log
-    // prints as `1 blur in Xms` — cannot be used here: `synoik_vk::stats`' timers are gated on
-    // `set_enabled`, which only the frame log turns on, so every duration reads zero under test
-    // whether or not anything waited.
-    assert_eq!(
-        vk.in_flight_len() - before,
-        1,
-        "the offscreen render is the only submit this prepare may make; the blur must be queued,          not submitted"
-    );
-    assert_eq!(
-        vk.pending_blurs_len(),
-        1,
-        "and it must actually be queued — an empty queue with no submit means no blur at all"
-    );
-
-    // Rebuild the chain **with that blur still queued** — the lifetime hazard. A resize drops the
-    // old offscreen and its `EffectBlur`, while the queue still holds a blur naming that chain's
-    // images, framebuffers and pipelines.
-    //
-    // Nothing may read pixels back before this point, and that is the whole design of the test: a
-    // readback drains the queue, and a drained queue makes the hazard unreachable.
-    const S2: i32 = 96;
-    buffer.update_size(Size::<i32, Physical>::from((S2, S2)), scale);
-    fill_edge(&mut buffer, S2);
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "prepare_vulkan after resize failed"
-    );
-
-    // Only now read back — proving the deferred blur lands at all, and that the rebuild did not
-    // corrupt it. A blank or stale output here means ordering did not stand in for the wait.
-    let blend = edge_blend(&mut vk, &buffer, S2);
-    assert!(
-        blend > 40,
-        "the deferred blur did not land: the edge is still hard (max min(R,G) = {blend})"
-    );
-}
-
-/// A fresh offscreen must not cost a submit to become sampleable.
-///
-/// `make_offscreen_sampleable` is a no-op for a texture a frame just rendered into — the frame
-/// leaves it sampleable on the submit it was making anyway. The path that is *not* a no-op is the
-/// effect buffer's no-redraw branch: when its elements have not changed but its texture has just
-/// been recreated (a size change — an overview zoom does that every frame), it makes a brand-new
-/// `UNDEFINED` image sampleable without rendering into it, and that cost a whole command buffer,
-/// submit and fence wait for one pipeline barrier. On the live seat it was `2 transition in
-/// 3.03ms`, the only wait left in the frame line.
-///
-/// Measured here rather than assumed: every redraw round must cost zero transition submits (it
-/// always did), and so must the no-redraw round (it used to cost one). The barrier is queued for
-/// the next frame's command buffer instead — which is safe for exactly this layout, because
-/// `UNDEFINED` means there are no contents to discard.
-#[test]
-fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
-    use smithay::backend::renderer::element::Kind;
-    use smithay::backend::renderer::Texture as _;
-
-    use crate::render_helpers::effect_buffer::EffectBuffer;
-    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-
-    let mut vk = match VulkanRenderer::new() {
-        Ok(vk) => vk,
-        Err(e) => {
-            eprintln!(
-                "skipping vulkan_a_fresh_offscreen_costs_no_transition_submit: no Vulkan ({e})"
-            );
-            return;
-        }
-    };
-    let site = synoik_vk::stats::SubmitSite::ALL
-        .iter()
-        .position(|s| *s == synoik_vk::stats::SubmitSite::Transition)
-        .expect("transition site");
-    let transitions = |_: ()| synoik_vk::stats::take_sites()[site].submits;
-
-    let scale = Scale::from(1.0);
-    let mut buffer = EffectBuffer::new();
-    buffer.update_blur_radius(24.0);
-
-    // Redraw rounds, including the size changes that recreate the texture.
-    for s in [64i32, 96, 96, 128] {
-        buffer.update_size(Size::<i32, Physical>::from((s, s)), scale);
-        let red = SolidColorBuffer::new(Size::from((s as f64, s as f64)), [1.0, 0.0, 0.0, 1.0]);
-        let elements = buffer.elements_vulkan();
-        elements.clear();
-        elements.push(
-            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
-        );
-        let _ = transitions(());
-        assert!(
-            buffer.prepare_vulkan(&mut vk, true),
-            "prepare failed at {s}"
-        );
-        assert_eq!(
-            transitions(()),
-            0,
-            "a rendered offscreen is left sampleable by its own frame; nothing may submit a \
-             barrier for it",
-        );
-    }
-
-    // The no-redraw round: elements unchanged, so nothing renders and the texture is made
-    // sampleable on its own. This is the one that used to submit.
-    let _ = transitions(());
-    assert!(
-        buffer.prepare_vulkan(&mut vk, true),
-        "no-redraw prepare failed"
-    );
-    assert_eq!(
-        transitions(()),
-        0,
-        "making a fresh offscreen sampleable submitted a command buffer for one barrier — it must \
-         ride the next frame's instead",
-    );
-
-    // And the barrier still lands. Sampling an image whose *tracked* layout says
-    // SHADER_READ_ONLY while the image is really still UNDEFINED is a layout violation — invisible
-    // in the pixels (this texture is legitimately blank: its elements never re-rendered into the
-    // recreated image), which is why the assertion here is the readback completing at all. Under
-    // `SYNOIK_VK_VALIDATION=1` a barrier that never got recorded is reported on this draw.
-    let tex = buffer.texture_vulkan(true).expect("blurred texture");
-    let (w, h) = (tex.size().w, tex.size().h);
-    let buf = TextureBuffer::from_texture(&vk, tex, 1.0, Transform::Normal, Vec::new());
-    let element = TextureRenderElement::from_texture_buffer(
-        buf,
-        Point::from((0.0, 0.0)),
-        1.0,
-        None,
-        None,
-        Kind::Unspecified,
-    );
-    let out = render_to_vec(
-        &mut vk,
-        Size::<i32, Physical>::from((w, h)),
-        scale,
-        Transform::Normal,
-        Fourcc::Abgr8888,
-        std::iter::once(element),
-    )
-    .expect("sampling the queued-barrier offscreen must not fail");
-    assert_eq!(out.len(), (w * h * 4) as usize, "unexpected readback size");
-}
-
 // ---------------------------------------------------------------------------
 // Animation bake guardrails
 // ---------------------------------------------------------------------------
@@ -10560,7 +9904,6 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             synoik
@@ -10614,7 +9957,6 @@ fn the_scene_breakdown_totals_what_was_actually_shaded() {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let els = synoik.render_to_vec(ctx, &output, false);
@@ -10924,77 +10266,10 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
     );
 }
 
-/// A wallpaper change must not put the xray effect buffer into a permanent per-frame
-/// recreate-and-reblur.
-///
-/// The frame that *records* a queued blur holds the effect buffer's offscreen alive as
-/// `blur.source` until its submit retires — and under deferred scanout (the live KMS path, where
-/// the fence goes to the plane and the CPU walks away) that record outlives the frame. The reuse
-/// check counted that keep-alive as a foreign owner, so the next frame's prepare threw the
-/// offscreen away, which invalidated the blur, which queued another blur for the next frame to
-/// record and hold: **self-sustaining**. One wallpaper change cost the live seat a full-output blur
-/// plus three image creations on every idle frame — ~15ms of GPU on a 16.67ms budget — until an
-/// unrelated blocking wait (closing a window) drained the in-flight list.
-///
-/// Both halves are load-bearing, and each is invisible without the other:
-///   - **deferral on**, or every submit is waited out and the keep-alive is gone before the next
-///     prepare ever looks (the undeferred path settles after one frame either way — that is what
-///     made this bug live-only);
-///   - **a wallpaper change**, or no blur is ever queued and nothing holds the offscreen at all.
-///
-/// The assertion is on image *creations* per frame rather than pixels: the composite is identical
-/// either way — the recreated offscreen is re-rendered and re-blurred with the same contents — so
-/// no pixel comparison can see this.
-#[test]
-fn a_wallpaper_change_does_not_leave_the_xray_buffer_rebuilding_every_frame() {
-    let Some((mut f, output, red, blue)) = xray_wallpaper_fixture() else {
-        return;
-    };
-
-    set_wallpaper(&mut f, &red);
-    synoik_vk::stats::set_enabled(true);
-    let _ = synoik_vk::stats::take_creates();
-
-    // Warm: the offscreen, its blur chain and the wallpaper texture all exist and are steady.
-    let steady: Vec<(u64, u64)> = (0..4)
-        .map(|_| render_deferred_once(&mut f, &output))
-        .collect();
-    let baseline = *steady.last().unwrap();
-
-    set_wallpaper(&mut f, &blue);
-    // Frame 1 legitimately re-renders and re-blurs (the wallpaper really did change); every frame
-    // after it must be back to the steady cost.
-    let after: Vec<(u64, u64)> = (0..5)
-        .map(|_| render_deferred_once(&mut f, &output))
-        .collect();
-
-    // `render_to_texture` allocates the frame's own target, and that is the *only* thing a steady
-    // frame may allocate. An absolute bound, not a comparison against the warm frames: under the
-    // bug the warm frames are broken too, so any "same as before" assertion passes.
-    const OWN_TARGET: u64 = 1;
-    let rebuilding: Vec<_> = steady[1..]
-        .iter()
-        .chain(&after[1..])
-        .filter(|&&(_, creates)| creates > OWN_TARGET)
-        .collect();
-    assert!(
-        rebuilding.is_empty(),
-        "the xray effect buffer is being rebuilt on frames that changed nothing: \
-         (draws, creations)/frame were {steady:?} while steady, then {after:?} across a wallpaper \
-         change. The frame that recorded the blur holds its source — our own keep-alive, not a \
-         foreign owner (`VulkanRenderer::discount_pending_holds`)."
-    );
-    assert_ne!(
-        after[0].0, baseline.0,
-        "the wallpaper change cost the xray buffer no extra draws, so this scene never blurs and \
-         the test cannot see the bug it exists for: {steady:?} then {after:?}"
-    );
-}
-
-/// The fixture the xray/wallpaper tests share: the gsrs XRAY rule (translucent, no opaque border
-/// background, `background-effect` blur+xray) over a window, plus two solid wallpapers to swap
-/// between.
-fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std::path::PathBuf)> {
+/// A translucent, blurred window (no opaque border background) over a wallpaper, plus two solid
+/// wallpapers to swap between.
+fn blurred_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std::path::PathBuf)>
+{
     use synoik_config::BackgroundEffectRule;
 
     if let Err(e) = VulkanRenderer::new() {
@@ -11002,7 +10277,7 @@ fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std:
         return None;
     }
 
-    let dir = std::env::temp_dir().join("synoik-xray-wallpaper-test");
+    let dir = std::env::temp_dir().join("synoik-blurred-wallpaper-test");
     std::fs::create_dir_all(&dir).unwrap();
     let red = dir.join("red.png");
     let blue = dir.join("blue.png");
@@ -11015,7 +10290,6 @@ fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std:
         draw_border_with_background: Some(false),
         background_effect: BackgroundEffectRule {
             blur: Some(true),
-            xray: Some(true),
             ..Default::default()
         },
         ..Default::default()
@@ -11091,11 +10365,10 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
-            // Reset before *collection*: the xray effect buffer is prepared while elements are
-            // built, so its offscreen and blur allocations land there, not in the render below.
+            // Reset before *collection*: effect buffers are prepared while elements are built, so
+            // their offscreen and blur allocations land there, not in the render below.
             let _ = synoik_vk::stats::take_creates();
             let d0 = synoik_vk::stats::draws();
             let elements = synoik.render_to_vec(ctx, output, false);
@@ -11145,7 +10418,7 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
 /// every time — mutation-checked. The `<=` invariant needs no retry: it holds whatever the flag is.
 #[test]
 fn the_attributed_union_stays_inside_the_work_it_measures() {
-    let Some((mut f, output, red, _blue)) = xray_wallpaper_fixture() else {
+    let Some((mut f, output, red, _blue)) = blurred_wallpaper_fixture() else {
         return;
     };
 

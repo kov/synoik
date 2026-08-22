@@ -1634,7 +1634,6 @@ fn probe_frame(
             let ctx = crate::render_helpers::RenderCtx {
                 renderer: vk,
                 target: crate::render_helpers::RenderTarget::Output,
-                xray: None,
                 appearance: Some(state.synoik.appearance()),
             };
             let elements = state.synoik.render_to_vec(ctx, out, true);
@@ -1653,7 +1652,6 @@ fn probe_frame(
                 let ctx = crate::render_helpers::RenderCtx {
                     renderer: vk,
                     target: crate::render_helpers::RenderTarget::Output,
-                    xray: None,
                     appearance: Some(state.synoik.appearance()),
                 };
                 let fresh = state.synoik.render_to_vec(ctx, out, true);
@@ -2142,7 +2140,6 @@ fn no_element_drops_an_instance_while_another_stays_put() {
                 let ctx = crate::render_helpers::RenderCtx {
                     renderer: vk,
                     target: crate::render_helpers::RenderTarget::Output,
-                    xray: None,
                     appearance: Some(state.synoik.appearance()),
                 };
                 crate::frame_log::instances_of(&state.synoik.render_to_vec(ctx, &out, true), scale)
@@ -2189,7 +2186,6 @@ fn read_buffers(f: &mut Fixture, out: &Output, warm: &mut WarmTarget) -> Vec<Vec
             let ctx = crate::render_helpers::RenderCtx {
                 renderer: vk,
                 target: crate::render_helpers::RenderTarget::Output,
-                xray: None,
                 appearance: Some(state.synoik.appearance()),
             };
             let elements = state.synoik.render_to_vec(ctx, out, true);
@@ -2215,7 +2211,6 @@ fn cold_frame(f: &mut Fixture, out: &Output) -> Vec<u8> {
             let ctx = crate::render_helpers::RenderCtx {
                 renderer: vk,
                 target: crate::render_helpers::RenderTarget::Output,
-                xray: None,
                 appearance: Some(state.synoik.appearance()),
             };
             let fresh = state.synoik.render_to_vec(ctx, out, true);
@@ -2592,7 +2587,6 @@ fn a_screens_older_buffer_is_told_about_every_frame_it_missed() {
                 let ctx = crate::render_helpers::RenderCtx {
                     renderer: vk,
                     target: crate::render_helpers::RenderTarget::Output,
-                    xray: None,
                     appearance: Some(state.synoik.appearance()),
                 };
                 let elements = state.synoik.render_to_vec(ctx, &out, true);

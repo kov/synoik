@@ -107,8 +107,7 @@ pub enum SubmitSite {
     /// A frame rendered into a dmabuf that is not a scanout target: a screencast or screencopy
     /// buffer, whose consumer expects it finished.
     DmabufFrame,
-    /// A frame rendered into an offscreen texture: a widget bake, a window preview, a snapshot,
-    /// an xray or effect buffer.
+    /// A frame rendered into an offscreen texture: a widget bake, a window preview, a snapshot.
     OffscreenFrame,
     /// A frame cut in half mid-record, so a captured region is complete before the separately
     /// submitted blur that samples it.

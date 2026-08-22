@@ -21,7 +21,6 @@ use crate::ui::widget::style::Appearance;
 /// | surface | radius | source |
 /// | --- | --- | --- |
 /// | client (`ext-background-effect-v1`) | 24 | mutter's `BACKGROUND_EFFECT_BLUR_RADIUS` |
-/// | xray effect buffer | 24 | stands in for exactly that backdrop |
 /// | panel plate, dash pill | 30 | Blur my Shell's default ([`crate::ui::panel::BAR_BLUR_RADIUS`]) |
 /// | lock wallpaper | 90 | GNOME's `BLUR_RADIUS`, `unlockDialog.js` |
 /// | overview backdrop | 90 | ours, `OVERVIEW_BLUR_RADIUS` |

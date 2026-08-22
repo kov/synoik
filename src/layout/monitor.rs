@@ -37,7 +37,6 @@ use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::vulkan::VkTexture;
-use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
 use crate::synoik_render_elements;
@@ -3502,7 +3501,6 @@ impl<W: LayoutElement> Monitor<W> {
             let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
             let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
-            let xray_pos = XrayPos::new(thumb.loc, thumb_scale);
 
             // Clip each miniature to its workspace, and to the part of it the band
             // leaves visible. Both live in *workspace* coordinates, because the crop
@@ -3546,7 +3544,7 @@ impl<W: LayoutElement> Monitor<W> {
             // spread previews the window picker does, at the row's scale, so the two read
             // as one thing at two sizes (and so the show-apps transition, which fades the
             // picker away over this row, has nothing to reconcile).
-            ws.render_expose(ctx.r(), xray_pos, progress, thumb_scale, push_thumb!());
+            ws.render_expose(ctx.r(), progress, thumb_scale, push_thumb!());
 
             // The wallpaper behind, rounded exactly as the shadow under it is — the
             // drawn radius expressed in workspace coordinates, since this is applied
@@ -3881,8 +3879,6 @@ impl<W: LayoutElement> Monitor<W> {
                 };
             }
 
-            let xray_pos = XrayPos::new(geo.loc, ws_zoom);
-
             macro_rules! push_hint {
                 () => {
                     if let Some(loc) = insert_hint_render_loc {
@@ -3899,7 +3895,6 @@ impl<W: LayoutElement> Monitor<W> {
                 push_hint!();
                 ws.render_expose(
                     ctx.r(),
-                    xray_pos,
                     progress,
                     ws_zoom,
                     push_cropped_to!(expose_crop_bounds),
@@ -3922,16 +3917,16 @@ impl<W: LayoutElement> Monitor<W> {
             }
             // A window on its way out draws above both layers: it is leaving the place it had,
             // and sliding under whatever took that place reads as the wrong window moving.
-            ws.render_minimizing(ctx.r(), xray_pos, push!());
+            ws.render_minimizing(ctx.r(), push!());
             if ws.scrolling_renders_on_top() {
-                ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
-                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
+                ws.render_scrolling(ctx.r(), focus_ring, push!());
+                ws.render_floating(ctx.r(), focus_ring, push!());
             } else {
-                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
+                ws.render_floating(ctx.r(), focus_ring, push!());
                 if !hint_above_all {
                     push_hint!();
                 }
-                ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
+                ws.render_scrolling(ctx.r(), focus_ring, push!());
             }
         }
     }

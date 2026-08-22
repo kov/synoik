@@ -21,7 +21,6 @@ use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::vulkan::VulkanRenderer;
-use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx};
 use crate::synoik_render_elements;
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
@@ -195,7 +194,6 @@ impl MappedLayer {
         mut ctx: RenderCtx,
         ns: Option<usize>,
         location: Point<f64, Logical>,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         let scale = Scale::from(self.scale);
@@ -203,7 +201,6 @@ impl MappedLayer {
 
         let bob_offset = self.bob_offset();
         let location = location + bob_offset;
-        let xray_pos = xray_pos.offset(bob_offset);
 
         let surface = self.surface.wl_surface();
 
@@ -242,7 +239,7 @@ impl MappedLayer {
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
-        // Background effect (blur/xray behind the layer surface) — renders on the GLES and the
+        // Background effect (blur behind the layer surface) — renders on the GLES and the
         // owned Vulkan renderer alike (`render_for_tile` dispatches the prepare per renderer).
         background_effect::render_for_tile(
             ctx.r(),
@@ -256,7 +253,6 @@ impl MappedLayer {
             radius,
             self.rules.background_effect,
             should_block_out,
-            xray_pos,
             &mut |elem| push(elem.into()),
         );
     }
@@ -266,7 +262,6 @@ impl MappedLayer {
         mut ctx: RenderCtx,
         ns: Option<usize>,
         location: Point<f64, Logical>,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -278,7 +273,6 @@ impl MappedLayer {
 
         let bob_offset = self.bob_offset();
         let location = location + bob_offset;
-        let xray_pos = xray_pos.offset(bob_offset);
 
         let surface = self.surface.wl_surface();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {
@@ -306,12 +300,7 @@ impl MappedLayer {
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
             let surface_anim_scale = Scale::from(1.);
-            let mut effect = popup_rules.background_effect;
-            // Default xray to false for pop-ups since they're always on top of something.
-            if effect.xray.is_none() {
-                effect.xray = Some(false);
-            }
-            let xray_pos = xray_pos.offset(offset.to_f64());
+            let effect = popup_rules.background_effect;
             background_effect::render_for_tile(
                 ctx.r(),
                 ns,
@@ -324,7 +313,6 @@ impl MappedLayer {
                 popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
-                xray_pos,
                 &mut |elem| push(elem.into()),
             );
         }

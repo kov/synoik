@@ -77,7 +77,6 @@ fn sample_effect(
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             // Building the elements is what runs the resolution; nothing needs to be drawn.
@@ -136,7 +135,6 @@ fn sample_with_damage(
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -181,7 +179,6 @@ fn render_frame(
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -530,7 +527,6 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
                 let ctx = RenderCtx {
                     renderer: vk,
                     target: RenderTarget::Output,
-                    xray: None,
                     appearance: Some(synoik.appearance()),
                 };
                 let elements = synoik.render_to_vec(ctx, &output, false);
@@ -551,10 +547,7 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
     eprintln!("--- settled ---");
     for (c, e) in c0.iter().zip(e0.iter()) {
         eprintln!("  capture dst={:?} src={:?}", c.dst, c.src);
-        eprintln!(
-            "  effect  geo={:?} xray={} blur={}",
-            e.effect_geometry, e.xray, e.blur
-        );
+        eprintln!("  effect  geo={:?} blur={}", e.effect_geometry, e.blur);
     }
 
     // Grow the window a step at a time, the way a drag does. It has to keep moving: the capture
@@ -833,13 +826,11 @@ fn a_subsurface_blur_region_blurs_that_subsurface() {
         "the blur region landed at {bbox:?}, not on the subsurface at {:?}",
         sub.effect_geometry.loc,
     );
-    // The client region is what selects the real-backdrop path; xray holds only the wallpaper and
-    // the background layer, so it could not show the parent surface beneath the chrome.
+    // The client's blur region is what turns the effect on at all — without it the subsurface
+    // would draw no backdrop.
     assert!(
-        sub.blur && !sub.xray,
-        "the subsurface effect resolved to xray={} blur={}, so its backdrop would be the wallpaper \
-         rather than what is actually beneath it",
-        sub.xray,
+        sub.blur,
+        "the subsurface effect resolved to blur={}, so it would draw no backdrop at all",
         sub.blur,
     );
 }

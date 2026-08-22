@@ -24,7 +24,6 @@ use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Opti
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::SizingMode;
-use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::synoik_render_elements;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
@@ -2913,7 +2912,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn render(
         &self,
         mut ctx: RenderCtx,
-        xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(ScrollingSpaceRenderElement),
     ) {
@@ -2973,10 +2971,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     continue;
                 }
 
-                let xray_pos = xray_pos.offset(tile_pos);
-                tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
-                    push(elem.into())
-                });
+                tile.render(ctx.r(), tile_pos, focus_ring, &mut |elem| push(elem.into()));
             }
         }
     }

@@ -56,9 +56,9 @@ impl OffscreenRenderer for VulkanRenderer {
         //
         // Both are safe to re-render into: a queued blur has not been recorded yet, so it simply
         // blurs the new contents, and a recorded one is ordered ahead of this render on the queue
-        // timeline. Gating on the retire poll instead is what made the xray buffer rebuild itself
-        // forever after a wallpaper change — `VulkanRenderer::discount_pending_holds` has the
-        // whole story.
+        // timeline. Gating on the retire poll instead is what made a cached blur's offscreen
+        // rebuild itself forever after a wallpaper change —
+        // `VulkanRenderer::discount_pending_holds` has the whole story.
         self.discount_pending_holds(texture)
     }
 }

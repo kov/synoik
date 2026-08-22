@@ -341,9 +341,9 @@ pub struct VulkanRenderer {
 
 /// A blur waiting for a frame to record it, with everything it names held alive.
 ///
-/// The xray effect buffer builds its blur while collecting elements, where no command buffer is
-/// open — so unlike the backdrop blur (which is invoked mid-frame and records straight into the
-/// gap `capture_region` opens) it has to be queued. See [`VulkanRenderer::queue_gaussian_blur`].
+/// The wallpaper's blur is built while collecting elements, where no command buffer is open — so
+/// unlike the backdrop blur (which is invoked mid-frame and records straight into the gap
+/// `capture_region` opens) it has to be queued. See [`VulkanRenderer::queue_gaussian_blur`].
 struct PendingBlur {
     chain: Arc<SharedBlurChain>,
     /// What the chain samples, and what it writes. Both held for the usual reason: the copy and
@@ -1371,7 +1371,7 @@ impl VulkanRenderer {
         via: Option<&VkTexture>,
     ) -> Result<Vec<u8>, VulkanError> {
         // Reading an image whose staged copy — or queued blur — has not landed would read a blank
-        // or stale one. A readback of a blurred offscreen (a test, a screenshot of an xray
+        // or stale one. A readback of a blurred offscreen (a test, a screenshot of a blurred
         // surface) is exactly that consumer.
         self.flush_pending_texture_uploads()?;
         self.flush_pending_blurs()?;
@@ -1607,13 +1607,13 @@ impl VulkanRenderer {
     ///   `orders_submits()` — so this branch is never reached without that guarantee.
     ///
     /// Answering "owned" about our own keep-alive tells the caller to discard a perfectly good
-    /// offscreen and allocate a replacement, every frame. Missing the in-flight half of that made
-    /// the xray effect buffer **self-sustaining**: the frame that records a queued blur holds the
-    /// effect buffer's offscreen as `blur.source`, so the next frame's prepare called it foreign,
-    /// recreated it, and thereby invalidated the blur — which queued another blur, for the next
-    /// frame to record and hold. One wallpaper change put the seat into a permanent one-recreate-
-    /// plus-one-full-output-blur per idle frame, ~15ms of GPU on a 16.67ms budget, until an
-    /// unrelated blocking wait (closing a window) happened to drain the in-flight list.
+    /// offscreen and allocate a replacement, every frame. Missing the in-flight half of that makes
+    /// a queued blur's offscreen **self-sustaining**: the frame that records the blur holds that
+    /// offscreen as `blur.source`, so the next frame's prepare calls it foreign, recreates it, and
+    /// thereby invalidates the blur — which queues another blur, for the next frame to record and
+    /// hold. One wallpaper change put the seat into a permanent one-recreate-plus-one-full-output-
+    /// blur per idle frame, ~15ms of GPU on a 16.67ms budget, until an unrelated blocking wait
+    /// (closing a window) happened to drain the in-flight list.
     pub(super) fn discount_pending_holds(&self, texture: &VkTexture) -> bool {
         let image = texture.image();
         let mut ours = self
@@ -3162,13 +3162,6 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn pending_texture_uploads_len(&self) -> usize {
         self.pending_texture_uploads.len()
-    }
-
-    /// Count of blurs awaiting a frame's command buffer (test-only: asserts that preparing one
-    /// submitted nothing, and that a frame drained it). See [`Self::pending_blurs`].
-    #[cfg(test)]
-    pub(crate) fn pending_blurs_len(&self) -> usize {
-        self.pending_blurs.len()
     }
 
     /// Staging buffers the pool owns (test-only): the count that must not grow with the number of

@@ -3305,7 +3305,6 @@ fn render_surface_with(
     let ctx = RenderCtx {
         renderer: &mut *renderer,
         target: RenderTarget::Output,
-        xray: None,
         appearance: Some(synoik.appearance()),
     };
     synoik.frame_log.phase(Phase::Collect);

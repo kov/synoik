@@ -26,7 +26,6 @@ use super::{
 };
 use crate::animation::{Animation, Clock};
 use crate::gnome::TileSide;
-use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::synoik_render_elements;
 use crate::utils::transaction::TransactionBlocker;
@@ -1746,7 +1745,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn render(
         &self,
         mut ctx: RenderCtx,
-        xray_pos: XrayPos,
         view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
         push: &mut dyn FnMut(FloatingSpaceRenderElement),
@@ -1778,8 +1776,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             // `Tile::grow_transform`. Only the drawing moves: the tile is in the layout at
             // `tile_pos` throughout, so focus, hit-testing and stacking never see this.
             if let Some((loc, tile_scale)) = tile.grow_transform(tile_pos) {
-                let xray_pos = xray_pos.offset(loc);
-                tile.render(ctx.r(), loc, xray_pos, focus_ring, &mut |elem| {
+                tile.render(ctx.r(), loc, focus_ring, &mut |elem| {
                     push(
                         RescaleRenderElement::from_element(
                             elem,
@@ -1792,10 +1789,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 return;
             }
 
-            let xray_pos = xray_pos.offset(tile_pos);
-            tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
-                push(elem.into())
-            });
+            tile.render(ctx.r(), tile_pos, focus_ring, &mut |elem| push(elem.into()));
         };
 
         for id in &raised {

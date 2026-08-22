@@ -13,9 +13,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::render_helpers::blur::{client_finish, GNOME_CLIENT_BLUR_RADIUS};
-use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
-use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::synoik_render_elements;
 use crate::ui::widget::style::Appearance;
@@ -24,9 +22,7 @@ use crate::utils::surface_geo;
 
 #[derive(Debug)]
 pub struct BackgroundEffect {
-    nonxray: FramebufferEffect,
-    /// Damage when options change.
-    damage: ExtraDamage,
+    backdrop: FramebufferEffect,
     /// Corner radius for clipping.
     ///
     /// Stored here in addition to `RenderParams` to damage when it changes.
@@ -39,7 +35,6 @@ pub struct BackgroundEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Options {
     pub blur: bool,
-    pub xray: bool,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
     /// Which appearance the client-blur recipe was last resolved for
@@ -56,10 +51,7 @@ pub struct Options {
 
 impl Options {
     fn is_visible(&self) -> bool {
-        self.xray
-            || self.blur
-            || self.noise.is_some_and(|x| x > 0.)
-            || self.saturation.is_some_and(|x| x != 1.)
+        self.blur || self.noise.is_some_and(|x| x > 0.) || self.saturation.is_some_and(|x| x != 1.)
     }
 }
 
@@ -92,16 +84,13 @@ impl RenderParams {
 synoik_render_elements! {
     BackgroundEffectElement => {
         FramebufferEffect = FramebufferEffectElement,
-        Xray = XrayElement,
-        ExtraDamage = ExtraDamage,
     }
 }
 
 impl BackgroundEffect {
     pub fn new() -> Self {
         Self {
-            nonxray: FramebufferEffect::new(),
-            damage: ExtraDamage::new(),
+            backdrop: FramebufferEffect::new(),
             corner_radius: CornerRadius::default(),
             blur_config: synoik_config::Blur::default(),
             options: Options::default(),
@@ -110,8 +99,7 @@ impl BackgroundEffect {
 
     /// Damage the background effect, for example when a blur subregion changes.
     pub fn damage(&mut self) {
-        self.damage.damage_all();
-        self.nonxray.damage();
+        self.backdrop.damage();
     }
 
     pub fn update_config(&mut self, config: synoik_config::Blur) {
@@ -120,8 +108,7 @@ impl BackgroundEffect {
         }
 
         self.blur_config = config;
-        self.damage.damage_all();
-        self.nonxray.damage();
+        self.backdrop.damage();
     }
 
     pub fn update_render_elements(
@@ -145,9 +132,8 @@ impl BackgroundEffect {
         // strictly worse than ignoring the request. `capabilities()` clears the blur bit to match.
         let blur = blur && !self.blur_config.off;
 
-        let mut options = Options {
+        let options = Options {
             blur,
-            xray: effect.xray == Some(true),
             noise: effect.noise,
             saturation: effect.saturation,
             // `None` keeps what we were last told — a path that cannot name the live appearance
@@ -156,26 +142,13 @@ impl BackgroundEffect {
             appearance: appearance.unwrap_or(self.options.appearance),
         };
 
-        // If we have some background effect but xray wasn't explicitly set, default it to true
-        // since it's cheaper.
-        //
-        // Only for effects the *shell* turned on. A client asking through
-        // `ext-background-effect-v1` is asking for the real thing — the windows behind it, blurred
-        // — and xray cannot give it that: the xray buffer holds only the background layer and the
-        // wallpaper (`Synoik::fill_xray_elements`), so a window with another window behind it would
-        // show the wallpaper through it. KWin and macOS both blur the true backdrop; so do we.
-        if !has_blur_region && options.is_visible() && effect.xray.is_none() {
-            options.xray = true;
-        }
-
         if self.options == options && self.corner_radius == corner_radius {
             return;
         }
 
         self.options = options;
         self.corner_radius = corner_radius;
-        self.damage.damage_all();
-        self.nonxray.damage();
+        self.backdrop.damage();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -184,10 +157,9 @@ impl BackgroundEffect {
 
     pub fn render(
         &self,
-        ctx: RenderCtx,
+        _ctx: RenderCtx,
         ns: Option<usize>,
         mut params: RenderParams,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         if !self.is_visible() {
@@ -199,8 +171,6 @@ impl BackgroundEffect {
         }
         params.fit_clip_radius();
 
-        let damage = self.damage.render(params.geometry);
-
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred. `blur_config.off` was already folded into `options.blur`.
         let blur = self.options.blur;
@@ -209,8 +179,7 @@ impl BackgroundEffect {
         // itself — `BACKGROUND_EFFECT_BLUR_RADIUS` through `clutter_blur`'s separable gaussian
         // (`src/compositor/meta-surface-actor.c`, `meta-background-effect.c`). So this path runs
         // at GNOME's radius, and the config's `passes`/`offset` no longer reach it. They still
-        // drive the xray effect buffer below and the shell's own chrome, which answer to nobody
-        // upstream.
+        // drive the shell's own chrome, which answers to nobody upstream.
         //
         // The radius is logical and multiplied by the output scale here, exactly as mutter does at
         // paint time (`create_blur_node` takes `radius * view_scale`) — that is what keeps the blur
@@ -226,30 +195,12 @@ impl BackgroundEffect {
         };
         let saturation = self.options.saturation.unwrap_or(saturation) as f32;
 
-        if self.options.xray {
-            let Some(xray) = ctx.xray else {
-                return;
-            };
-
-            push(damage.into());
-            xray.render(
-                ctx,
-                params,
-                xray_pos,
-                blur,
-                noise,
-                saturation,
-                &mut |elem| push(elem.into()),
-            );
-        } else {
-            // Render non-xray effect.
-            // The appearance-aware client recipe: the tint and contrast that make a blurred
-            // backdrop something a client's own text can sit on. Only here — the shell's chrome
-            // paints its own `$system_*` fill over its blur and passes `Finish::NONE`.
-            let finish = client_finish(self.options.appearance, noise, saturation);
-            let elem = self.nonxray.render(ns, params, blur_radius, finish);
-            push(elem.into());
-        }
+        // The appearance-aware client recipe: the tint and contrast that make a blurred
+        // backdrop something a client's own text can sit on. Only here — the shell's chrome
+        // paints its own `$system_*` fill over its blur and passes `Finish::NONE`.
+        let finish = client_finish(self.options.appearance, noise, saturation);
+        let elem = self.backdrop.render(ns, params, blur_radius, finish);
+        push(elem.into());
     }
 }
 
@@ -333,9 +284,6 @@ pub mod trace {
         pub effect_geometry: Rectangle<f64, Logical>,
         /// Bounding box of the blur subregion, in the same space as `effect_geometry`.
         pub subregion_bbox: Option<Rectangle<f64, Logical>>,
-        /// Which draw path this resolved to: xray (sample the background-only offscreen) or the
-        /// real-backdrop framebuffer capture.
-        pub xray: bool,
         /// Whether the blur is on at all.
         pub blur: bool,
     }
@@ -408,7 +356,6 @@ pub fn render_for_tile(
     radius: CornerRadius,
     effect: synoik_config::BackgroundEffect,
     should_block_out: bool,
-    xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
@@ -424,7 +371,6 @@ pub fn render_for_tile(
             radius,
             effect,
             should_block_out,
-            xray_pos,
             push,
         );
     });
@@ -450,7 +396,6 @@ pub fn render_for_surface(
     radius: CornerRadius,
     effect: synoik_config::BackgroundEffect,
     should_block_out: bool,
-    xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     {
@@ -486,7 +431,6 @@ pub fn render_for_surface(
             tile_geometry: geometry,
             surface_geo,
             effect_geometry: params.geometry,
-            xray: background_effect.options.xray,
             blur: background_effect.options.blur,
             subregion_bbox: params.subregion.as_ref().and_then(|region| {
                 region
@@ -501,8 +445,7 @@ pub fn render_for_surface(
             }),
         });
 
-        let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
-        background_effect.render(ctx, ns, params, xray_pos, push);
+        background_effect.render(ctx, ns, params, push);
     }
 }
 
@@ -522,9 +465,8 @@ mod tests {
         bg.options
     }
 
-    /// A client asking through `ext-background-effect-v1` gets the real backdrop blurred, not the
-    /// xray see-through — the xray buffer holds only the wallpaper and the background layer, so a
-    /// window stacked over another window would show the wallpaper through it.
+    /// A client asking through `ext-background-effect-v1` gets the real backdrop blurred — the
+    /// windows actually behind it, not the wallpaper.
     #[test]
     fn a_client_blur_region_blurs_the_real_backdrop() {
         let options = resolve(
@@ -533,30 +475,18 @@ mod tests {
             true,
         );
         assert!(options.blur);
-        assert!(!options.xray, "client-requested blur must not use xray");
     }
 
-    /// ...but a rule that explicitly asks for xray still gets it.
+    /// An effect the *shell* turns on takes the same path: there is only one.
     #[test]
-    fn an_explicit_xray_rule_beats_the_client_default() {
-        let effect = synoik_config::BackgroundEffect {
-            xray: Some(true),
-            ..Default::default()
-        };
-        let options = resolve(synoik_config::Blur::default(), effect, true);
-        assert!(options.xray);
-    }
-
-    /// An effect the *shell* turns on keeps defaulting to xray, which is the cheap path.
-    #[test]
-    fn a_shell_requested_effect_still_defaults_to_xray() {
+    fn a_shell_requested_effect_blurs_the_real_backdrop_too() {
         let effect = synoik_config::BackgroundEffect {
             blur: Some(true),
             ..Default::default()
         };
         let options = resolve(synoik_config::Blur::default(), effect, false);
         assert!(options.blur);
-        assert!(options.xray);
+        assert!(options.is_visible());
     }
 
     /// Blur off globally means the client's request is ignored outright. It must not degrade into a

@@ -30,6 +30,12 @@ pub type SurfaceEffectHook<'a> = dyn FnMut(
         &mut dyn FnMut(BackgroundEffectElement),
     ) + 'a;
 
+// `Surface` is ~456 bytes against `Effect`'s handful, which clippy wants boxed. It is the hot
+// variant — one per surface in every tree walk — so boxing it would trade a padded stack slot for
+// a heap allocation per element, on the path that runs most. The values are moved straight into a
+// push callback and dropped, never stored in a long-lived collection, so the padding costs nothing
+// that lasts.
+#[allow(clippy::large_enum_variant)]
 pub enum SurfaceTreeElement {
     Surface(WaylandSurfaceRenderElement<VulkanRenderer>),
     /// A background effect belonging to the surface just pushed, and therefore drawn beneath it.

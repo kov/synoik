@@ -688,7 +688,6 @@ impl Synoik {
                 let ctx = RenderCtx {
                     renderer,
                     target: RenderTarget::Screencast,
-                    xray: None,
                     appearance: Some(appearance),
                 };
                 self.render(ctx, output, false, &mut |elem| elements.push(elem.into()));
@@ -883,7 +882,6 @@ impl Synoik {
             let ctx = RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
-                xray: None,
                 appearance: Some(appearance),
             };
             self.render(ctx, output, false, &mut |elem| {
@@ -1335,7 +1333,6 @@ impl Synoik {
                 let ctx = RenderCtx {
                     renderer,
                     target: RenderTarget::Screencast,
-                    xray: None,
                     appearance: Some(appearance),
                 };
                 let elements: Vec<_> = self

@@ -366,7 +366,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             fb.buffer.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         }
 
-        // Blurs queued while collecting elements (the xray effect buffer). Recorded here for the
+        // Blurs queued while collecting elements (the wallpaper's). Recorded here for the
         // same reason and into the same slot — outside the render pass, riding this frame's
         // submit. Their chains and images must outlive it, exactly as the staging must.
         let (blur_chains, blur_targets) = renderer.record_pending_blurs(cbuf);
@@ -1462,7 +1462,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // That leaves a residual: a *visible but unblurred* effect (`is_visible()` is also true for
         // noise or saturation alone) under animating geometry still allocates one capture texture
         // per frame. Reachable only through a window rule that asks for noise/saturation with
-        // `blur: false` and an explicit `xray: false` — no default path builds one — so it is a
+        // `blur: false` — no default path builds one — so it is a
         // known gap, not an oversight. Quantizing it is the wrong trade: the raw capture is a
         // resample of the framebuffer, so slack would upsample and then downsample it, and that
         // path exists precisely to leave the backdrop crisp.

@@ -77,7 +77,6 @@ impl PickColorGrab {
             renderer,
             // This is an interactive operation so we can render without blocking out.
             target: RenderTarget::Output,
-            xray: None,
             appearance: Some(synoik.appearance()),
         };
         let elements = synoik.render_to_vec(ctx, output, false);

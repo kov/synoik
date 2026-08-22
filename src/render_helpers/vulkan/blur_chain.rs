@@ -51,7 +51,7 @@ impl SharedBlurChain {
     /// image the caller owns, level-0 sized and `COLOR_ATTACHMENT`-usable — so
     /// [`Self::record_gaussian_into`] has nothing to copy afterwards. Worth it
     /// only for a blur that re-runs every frame — a cached one (the lock screen's wallpaper, the
-    /// xray buffer) re-blurs so rarely that the copy is noise.
+    /// overview backdrop) re-blurs so rarely that the copy is noise.
     pub(crate) fn new_gaussian_into(
         gpu: &Arc<Gpu>,
         source: &SynoikTexture,

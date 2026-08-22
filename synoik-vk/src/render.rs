@@ -229,8 +229,8 @@ pub struct PostprocessPush {
     /// makes a blur legible rather than merely soft. Alpha is the strength; all-zero is the
     /// identity, so `Default` leaves it off.
     ///
-    /// Not [`Self::bg_color`], which mixes *behind* the texture and belongs to the xray path. A
-    /// tint that went behind an opaque capture would do nothing at all.
+    /// Not [`Self::bg_color`], which mixes *behind* the texture: a tint that went behind an opaque
+    /// capture would do nothing at all. No live path sets `bg_color` — every caller passes zero.
     pub tint: [f32; 4],
     /// Contrast boost about the mid-grey pivot: `0.0` is the identity (so `Default` is safe),
     /// positive steepens. Applied premultiplied-correctly, see `postprocess.frag`.

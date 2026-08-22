@@ -33,7 +33,6 @@ use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::VulkanRenderer;
-use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::synoik_render_elements;
 use crate::utils::transaction::Transaction;
@@ -1283,7 +1282,6 @@ impl<W: LayoutElement> Tile<W> {
         &self,
         mut ctx: RenderCtx,
         location: Point<f64, Logical>,
-        mut xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement),
     ) {
@@ -1313,14 +1311,12 @@ impl<W: LayoutElement> Tile<W> {
         // passed to update_render_elements(). But, it works well enough for what it is.
         let bob_offset = self.bob_offset();
         let location = location + bob_offset;
-        xray_pos = xray_pos.offset(bob_offset);
 
         let window_loc = self.window_loc();
         let window_size = self.window_size();
         let animated_window_size = self.animated_window_size();
         let window_render_loc = location + window_loc;
         let area = Rectangle::new(window_render_loc, animated_window_size);
-        xray_pos = xray_pos.offset(window_loc);
 
         let rules = self.window.rules();
 
@@ -1330,14 +1326,10 @@ impl<W: LayoutElement> Tile<W> {
             .scaled_by(1. - expanded_progress as f32);
 
         // Popups go on top, whether it's resize or not.
-        self.window.render_popups(
-            ctx.r(),
-            window_render_loc,
-            scale,
-            win_alpha,
-            xray_pos,
-            &mut |elem| push(elem.into()),
-        );
+        self.window
+            .render_popups(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
+                push(elem.into())
+            });
 
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
@@ -1380,7 +1372,6 @@ impl<W: LayoutElement> Tile<W> {
                                 Point::from((0., 0.)),
                                 scale,
                                 1.,
-                                xray_pos,
                                 &mut |elem| window_elements.push(elem),
                             );
 
@@ -1484,14 +1475,10 @@ impl<W: LayoutElement> Tile<W> {
                 }
             };
 
-            self.window.render_normal(
-                ctx.r(),
-                window_render_loc,
-                scale,
-                win_alpha,
-                xray_pos,
-                &mut |elem| push(clip(elem)),
-            );
+            self.window
+                .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
+                    push(clip(elem))
+                });
         }
 
         if fullscreen_progress > 0. {
@@ -1556,16 +1543,12 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         let surface_anim_scale = animated_window_size / window_size;
-        // Background effects (blur/xray behind the window) now render on both the GLES and the
-        // owned Vulkan renderer — `render_background_effect` dispatches the effect buffer's
-        // prepare per renderer (see `xray::prepare_effect_buffer`).
         self.window.render_background_effect(
             ctx.r(),
             area,
             self.scale,
             surface_anim_scale,
             radius,
-            xray_pos,
             &mut |elem| push(elem.into()),
         );
     }
@@ -1574,7 +1557,6 @@ impl<W: LayoutElement> Tile<W> {
         &self,
         mut ctx: RenderCtx,
         location: Point<f64, Logical>,
-        xray_pos: XrayPos,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement),
     ) {
@@ -1597,13 +1579,9 @@ impl<W: LayoutElement> Tile<W> {
             {
                 let mut vctx = ctx.r();
                 let mut elements = Vec::new();
-                self.render_inner(
-                    vctx.r(),
-                    Point::new(0., 0.),
-                    xray_pos,
-                    focus_ring,
-                    &mut |elem| elements.push(elem),
-                );
+                self.render_inner(vctx.r(), Point::new(0., 0.), focus_ring, &mut |elem| {
+                    elements.push(elem)
+                });
                 match open.render_vulkan(
                     vctx.renderer,
                     &elements,
@@ -1629,13 +1607,9 @@ impl<W: LayoutElement> Tile<W> {
                 {
                     let mut vctx = ctx.r();
                     let mut elements = Vec::new();
-                    self.render_inner(
-                        vctx.r(),
-                        Point::new(0., 0.),
-                        xray_pos,
-                        focus_ring,
-                        &mut |elem| elements.push(elem),
-                    );
+                    self.render_inner(vctx.r(), Point::new(0., 0.), focus_ring, &mut |elem| {
+                        elements.push(elem)
+                    });
                     match alpha.offscreen_vk.render(vctx.renderer, scale, &elements) {
                         Ok((elem, _sync, data)) => {
                             let offset = elem.offset();
@@ -1657,17 +1631,11 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if !pushed {
-            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
+            self.render_inner(ctx, location, focus_ring, &mut |elem| push(elem));
         }
     }
 
-    pub fn store_unmap_snapshot_if_empty(
-        &mut self,
-        renderer: SnapshotRenderer,
-        xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        xray_pos: XrayPos,
-    ) {
+    pub fn store_unmap_snapshot_if_empty(&mut self, renderer: SnapshotRenderer) {
         if self.unmap_snapshot.is_some() {
             return;
         }
@@ -1675,8 +1643,7 @@ impl<W: LayoutElement> Tile<W> {
         // A failed capture stores nothing: the close animation is skipped (it warned), rather than
         // half-captured. Storing a partial snapshot would let the blocked-out variant fall back to
         // the unblocked contents on a screencast.
-        self.unmap_snapshot =
-            self.render_snapshot_vulkan(renderer, xray, xray_has_blocked_out_layers, xray_pos);
+        self.unmap_snapshot = self.render_snapshot_vulkan(renderer);
     }
 
     pub fn take_unmap_snapshot(&mut self) -> Option<TileUnmapSnapshot> {
@@ -1692,9 +1659,6 @@ impl<W: LayoutElement> Tile<W> {
     fn render_snapshot_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
-        mut xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        xray_pos: XrayPos,
     ) -> Option<NeutralSnapshot> {
         let _span = tracy_client::span!("Tile::render_snapshot_vulkan");
 
@@ -1702,98 +1666,34 @@ impl<W: LayoutElement> Tile<W> {
         let block_out_from = self.window.rules().block_out_from;
 
         let capture =
-            |target: RenderTarget,
-             xray: Option<&Xray>,
-             renderer: &mut crate::render_helpers::vulkan::VulkanRenderer| {
+            |target: RenderTarget, renderer: &mut crate::render_helpers::vulkan::VulkanRenderer| {
                 let mut elements = Vec::new();
                 self.render(
                     RenderCtx {
                         target,
                         renderer,
-                        xray,
                         // A snapshot capture cannot name the live appearance — see
                         // `RenderCtx::appearance` for why it must not guess one either.
                         appearance: None,
                     },
                     Point::from((0., 0.)),
-                    xray_pos,
                     false,
                     &mut |elem| elements.push(elem),
                 );
                 rasterize_neutral(renderer, scale, &elements)
             };
 
-        let contents = capture(RenderTarget::Output, xray.as_deref(), renderer)?;
-
-        let mut contents_with_blocked_out_bg = None;
-
-        // Do a bit of pointer surgery on Xray.
-        //
-        // The idea is to avoid the combinatorial combination of capturing snapshots for target
-        // (Output, Screencast) × Xray target (Output, Screencast, ScreenCapture).
-        //
-        // Our main goals:
-        // - Everything must look unblocked for RenderTarget::Output.
-        // - If anything is potentially blocked-out, it must not show up on any screen capture.
-        //
-        // Right above we captured a fully-unblocked snapshot for the Output, so that's covered.
-        //
-        // Next, *only if Xray has any blocked-out surfaces* (which is a rare case), we will capture
-        // a snapshot where the window itself is unblocked, but the Xray background is blocked. To
-        // do this, we swap the Output target buffers in Xray with the Screencast target buffers
-        // (which were prepared for us higher up the stack).
-        //
-        // Finally, we capture a fully blocked-out snapshot. If Xray has blocked-out surfaces, then
-        // Xray's Screencast buffers are already filled-in, but if not, then we swap in the Output
-        // buffers, to avoid an extra render. This is safe since we know there are no blocked
-        // surfaces there.
-        let output_idx = RenderTarget::Output as usize;
-        let screencast_idx = RenderTarget::Screencast as usize;
-        let mut screencast_background = None;
-        let mut screencast_backdrop = None;
-        let mut output_background = None;
-        let mut output_backdrop = None;
-        if let Some(xray) = &mut xray {
-            screencast_background = Some(Rc::clone(&xray.background[screencast_idx]));
-            screencast_backdrop = Some(Rc::clone(&xray.backdrop[screencast_idx]));
-            output_background = Some(Rc::clone(&xray.background[output_idx]));
-            output_backdrop = Some(Rc::clone(&xray.backdrop[output_idx]));
-
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = screencast_background.clone().unwrap();
-                xray.backdrop[output_idx] = screencast_backdrop.clone().unwrap();
-
-                contents_with_blocked_out_bg = capture(RenderTarget::Output, Some(xray), renderer);
-            } else {
-                xray.background[screencast_idx] = output_background.clone().unwrap();
-                xray.backdrop[screencast_idx] = output_backdrop.clone().unwrap();
-            }
-        }
+        let contents = capture(RenderTarget::Output, renderer)?;
 
         // Only bake the blocked-out variant if a target can actually select it: `should_block_out`
         // is never true when `block_out_from` is `None`, so skipping it is safe — and it's the
         // common case, which keeps this to a single render.
         let blocked_out_contents = block_out_from
             .is_some()
-            .then(|| capture(RenderTarget::Screencast, xray.as_deref(), renderer))
+            .then(|| capture(RenderTarget::Screencast, renderer))
             .flatten();
 
-        // Put everything back to normal.
-        if let Some(xray) = &mut xray {
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = output_background.take().unwrap();
-                xray.backdrop[output_idx] = output_backdrop.take().unwrap();
-            } else {
-                xray.background[screencast_idx] = screencast_background.take().unwrap();
-                xray.backdrop[screencast_idx] = screencast_backdrop.take().unwrap();
-            }
-        }
-
         // Fail closed: a needed variant that didn't capture throws the whole snapshot away.
-        if xray_has_blocked_out_layers && contents_with_blocked_out_bg.is_none() {
-            warn!("could not capture the blocked-out-background closing snapshot; skipping it");
-            return None;
-        }
         if block_out_from.is_some() && blocked_out_contents.is_none() {
             warn!("could not capture the blocked-out closing snapshot; skipping it");
             return None;
@@ -1801,7 +1701,6 @@ impl<W: LayoutElement> Tile<W> {
 
         Some(NeutralSnapshot {
             contents,
-            contents_with_blocked_out_bg,
             blocked_out_contents,
             block_out_from,
             size: self.animated_tile_size(),

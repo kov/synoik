@@ -829,7 +829,7 @@ impl XdgShellHandler for State {
             .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
         self.save_session_toplevel(&window);
-        self.store_unmap_snapshot(&window, output.as_ref());
+        self.store_unmap_snapshot(&window);
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
@@ -1728,8 +1728,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
 
         let window = mapped.window.clone();
         if got_unmapped {
-            let output = output.cloned();
-            state.store_unmap_snapshot(&window, output.as_ref());
+            state.store_unmap_snapshot(&window);
         } else {
             if animate {
                 // The snapshot struct is still stored: the capture below needs it to exist.

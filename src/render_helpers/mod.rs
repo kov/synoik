@@ -24,7 +24,6 @@ use synoik_config::BlockOutFrom;
 
 use self::vulkan::VulkanRenderer;
 pub use self::vulkan::NATIVE_FOURCC;
-use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
 pub mod blur;
@@ -34,7 +33,6 @@ pub mod clipped_surface;
 pub mod custom_anim;
 pub mod damage;
 pub mod debug;
-pub mod effect_buffer;
 pub mod framebuffer_effect;
 pub mod gradient_fade_texture;
 pub mod icon;
@@ -53,7 +51,6 @@ pub mod surface;
 pub mod texture;
 pub mod vulkan;
 pub mod window_thumbnail;
-pub mod xray;
 
 /// A rendering context.
 ///
@@ -61,7 +58,6 @@ pub mod xray;
 pub struct RenderCtx<'a> {
     pub renderer: &'a mut VulkanRenderer,
     pub target: RenderTarget,
-    pub xray: Option<&'a Xray>,
     /// Which way `org.gnome.desktop.interface color-scheme` is pointing, for the client-blur
     /// recipe ([`blur::client_finish`]).
     ///
@@ -88,7 +84,6 @@ impl<'a> RenderCtx<'a> {
         RenderCtx {
             renderer: self.renderer,
             target: self.target,
-            xray: self.xray,
             appearance: self.appearance,
         }
     }

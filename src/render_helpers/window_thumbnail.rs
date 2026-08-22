@@ -165,23 +165,14 @@ pub fn render(
         elem @ LayoutElementRenderElement::BackgroundEffect(_) => elem.into(),
     };
 
-    // A thumbnail is composited into its own offscreen, so there is no backdrop to place an
-    // xray sample against; the default is the identity.
-    mapped.render_normal(
-        ctx.r(),
-        Point::from((0., 0.)),
-        s,
-        alpha,
-        crate::render_helpers::xray::XrayPos::default(),
-        &mut |elem| {
-            let elem = RescaleRenderElement::from_element(clip(elem), Point::from((0, 0)), zoom);
-            push(RelocateRenderElement::from_element(
-                elem,
-                dest.loc.to_physical_precise_round(output_scale),
-                Relocate::Relative,
-            ));
-        },
-    );
+    mapped.render_normal(ctx.r(), Point::from((0., 0.)), s, alpha, &mut |elem| {
+        let elem = RescaleRenderElement::from_element(clip(elem), Point::from((0, 0)), zoom);
+        push(RelocateRenderElement::from_element(
+            elem,
+            dest.loc.to_physical_precise_round(output_scale),
+            Relocate::Relative,
+        ));
+    });
 }
 
 #[cfg(test)]

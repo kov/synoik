@@ -338,7 +338,6 @@ impl Headless {
         let ctx = crate::render_helpers::RenderCtx {
             renderer,
             target: crate::render_helpers::RenderTarget::Output,
-            xray: None,
             appearance: Some(synoik.appearance()),
         };
         let elements = synoik.render_to_vec(ctx, output, true);

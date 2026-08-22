@@ -59,7 +59,7 @@
 //! |---|---|
 //! | probe, bare | 0.70 ms |
 //! | probe, + wallpaper | 0.89 ms |
-//! | probe, + wallpaper + xray/blur | **1.13 ms** |
+//! | probe, + wallpaper + blur | **1.13 ms** |
 //! | live seat, >=150 draws, **minimum** | **2.71 ms** |
 //! | live seat, >=150 draws, median | 9.30 ms |
 //!
@@ -124,10 +124,8 @@ struct Scene {
     /// Decode and upload the real `org.gnome.desktop.background` picture, so the backdrop is a
     /// sampled 4K texture rather than a solid fill.
     wallpaper: bool,
-    /// The gsrs XRAY rule: 85% opacity, no opaque border background, `background-effect blur`.
+    /// 85% opacity, no opaque border background, `background-effect blur`.
     blur: bool,
-    /// …and `background-effect xray`, the see-through sampling path.
-    xray: bool,
 }
 
 fn build(out: (u16, u16), windows: usize) -> Option<Fixture> {
@@ -144,13 +142,12 @@ fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture>
     synoik_vk::stats::set_enabled(true);
 
     let mut config = Config::default();
-    if scene.blur || scene.xray {
+    if scene.blur {
         config.window_rules.push(WindowRule {
             opacity: Some(0.85),
             draw_border_with_background: Some(false),
             background_effect: BackgroundEffectRule {
                 blur: scene.blur.then_some(true),
-                xray: scene.xray.then_some(true),
                 ..Default::default()
             },
             ..Default::default()
@@ -218,7 +215,6 @@ fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -285,7 +281,6 @@ fn render_once_dmabuf(
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
@@ -384,7 +379,7 @@ fn row(label: &str, out: (u16, u16), (ms, draws, shaded): (Duration, u64, u64)) 
 /// The backdrop blur is **shared**: one output-sized effect buffer per frame, sampled by every
 /// window that asks for it. So adding blurred windows must not add blurs.
 ///
-/// It did. Each window's `Xray::render` re-prepared the shared buffer, and the reuse check
+/// It did. Each window's effect re-prepared the shared buffer, and the reuse check
 /// answered "someone else owns this texture" about the renderer's *own* pending queues — so every
 /// window threw the offscreen away, allocated a replacement with a fresh blur chain, and queued
 /// the blur again. Four blurred windows meant four full-output blur chains in a frame that needed
@@ -500,15 +495,6 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
             Scene {
                 wallpaper: true,
                 blur: true,
-                ..Default::default()
-            },
-        ),
-        (
-            "  + xray",
-            Scene {
-                wallpaper: true,
-                blur: true,
-                xray: true,
             },
         ),
     ] {
@@ -529,7 +515,6 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     let blur = Scene {
         wallpaper: true,
         blur: true,
-        ..Default::default()
     };
     for (label, open) in [
         ("  closed (full-size)", false),
@@ -699,7 +684,7 @@ fn perf_probe_what_does_a_draw_call_cost() {
 
     // The comparison that matters: a settled overview frame priced in GPU time, **with the live
     // seat's scene ingredients added one at a time**. The first version of this ran
-    // `Scene::default()` — no wallpaper, no blur, no xray — against a seat that has all three, and
+    // `Scene::default()` — no wallpaper, no blur — against a seat that has both, and
     // then attributed the whole difference to client-dmabuf sampling. Half the "content" hypothesis
     // was testable with flags already in this file.
     //
@@ -720,11 +705,10 @@ fn perf_probe_what_does_a_draw_call_cost() {
             },
         ),
         (
-            "+ wallpaper + xray/blur",
+            "+ wallpaper + blur",
             Scene {
                 wallpaper: true,
                 blur: true,
-                xray: true,
             },
         ),
     ];
@@ -782,7 +766,6 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
-                xray: None,
                 appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);

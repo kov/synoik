@@ -71,7 +71,6 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
-use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
 use crate::synoik_render_elements;
@@ -201,11 +200,10 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
-        self.render_popups(ctx.r(), location, scale, alpha, xray_pos, push);
-        self.render_normal(ctx.r(), location, scale, alpha, xray_pos, push);
+        self.render_popups(ctx.r(), location, scale, alpha, push);
+        self.render_normal(ctx.r(), location, scale, alpha, push);
     }
 
     /// Renders the non-popup parts of the element.
@@ -215,10 +213,9 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
-        let _ = (ctx, location, scale, alpha, xray_pos, push);
+        let _ = (ctx, location, scale, alpha, push);
     }
 
     /// Renders the popups of the element.
@@ -228,10 +225,9 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
-        let _ = (ctx, location, scale, alpha, xray_pos, push);
+        let _ = (ctx, location, scale, alpha, push);
     }
 
     /// Renders the background effect behind the main surface of the element.
@@ -243,7 +239,6 @@ pub trait LayoutElement {
         _scale: f64,
         _surface_anim_scale: Scale<f64>,
         _radius: CornerRadius,
-        _xray_pos: XrayPos,
         _push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
     }
@@ -5977,13 +5972,7 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    pub fn store_unmap_snapshot(
-        &mut self,
-        renderer: SnapshotRenderer,
-        xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        window: &W::Id,
-    ) {
+    pub fn store_unmap_snapshot(&mut self, renderer: SnapshotRenderer, window: &W::Id) {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
         let zoom = self.interactive_move_zoom();
@@ -5998,12 +5987,7 @@ impl<W: LayoutElement> Layout<W> {
                         .downscale(zoom);
                 move_.tile.update_render_elements(false, view_rect);
 
-                move_.tile.store_unmap_snapshot_if_empty(
-                    renderer,
-                    xray,
-                    xray_has_blocked_out_layers,
-                    XrayPos::new(pos_within_output, zoom),
-                );
+                move_.tile.store_unmap_snapshot_if_empty(renderer);
                 return;
             }
         }
@@ -6013,16 +5997,9 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     // Not the drag's zoom: this window is on a workspace, so the
                     // snapshot must record the zoom its *own* monitor renders at.
-                    let ws_zoom = mon.overview_zoom();
-                    for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
+                    for (ws, _geo) in mon.workspaces_with_render_geo_mut(false) {
                         if ws.has_window(window) {
-                            ws.store_unmap_snapshot_if_empty(
-                                renderer,
-                                xray,
-                                xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, ws_zoom),
-                                window,
-                            );
+                            ws.store_unmap_snapshot_if_empty(renderer, window);
                             return;
                         }
                     }
@@ -6031,13 +6008,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        ws.store_unmap_snapshot_if_empty(
-                            renderer,
-                            xray,
-                            xray_has_blocked_out_layers,
-                            XrayPos::default(),
-                            window,
-                        );
+                        ws.store_unmap_snapshot_if_empty(renderer, window);
                         return;
                     }
                 }
@@ -6172,17 +6143,14 @@ impl<W: LayoutElement> Layout<W> {
         // tile keeps the on-screen footprint it was picked up at.
         let render_scale = zoom * move_.expose_extra_scale(zoom);
         let pos_in_backdrop = move_.tile_render_location(zoom);
-        let xray_pos = XrayPos::new(pos_in_backdrop, render_scale);
 
-        move_
-            .tile
-            .render(ctx, pos_in_backdrop, xray_pos, true, &mut |elem| {
-                push(RescaleRenderElement::from_element(
-                    elem,
-                    pos_in_backdrop.to_physical_precise_round(scale),
-                    render_scale,
-                ));
-            });
+        move_.tile.render(ctx, pos_in_backdrop, true, &mut |elem| {
+            push(RescaleRenderElement::from_element(
+                elem,
+                pos_in_backdrop.to_physical_precise_round(scale),
+                render_scale,
+            ));
+        });
     }
 
     pub fn refresh(&mut self, is_active: bool) {
