@@ -198,7 +198,7 @@ pub struct ShadowPush {
 /// layout, `origin`/`size`/`proj`/`target` first like [`QuadPush`] so the shared quad emission
 /// works). `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry space) is passed
 /// as three `vec4` columns — the shader reads `.xyz` of each — to avoid `mat3` push-constant layout
-/// ambiguity (`sample_transform` likewise). 240 bytes. Callers must set every field except
+/// ambiguity (`sample_transform` likewise). 224 bytes. Callers must set every field except
 /// `tint`/`contrast`/`_pad0`, whose zero value is the identity (there is no meaningful default for
 /// the rest).
 #[repr(C)]
@@ -212,8 +212,6 @@ pub struct PostprocessPush {
     pub geo_size: [f32; 2],
     pub src_rect: [f32; 4],
     pub corner_radius: [f32; 4],
-    /// Premultiplied background mixed behind the (premultiplied) texture.
-    pub bg_color: [f32; 4],
     /// `input_to_geo` as 3 column vectors (`.xyz` used); build from a `glam::Mat3`'s columns.
     pub input_to_geo: [[f32; 4]; 3],
     /// `sample_transform` as 3 column vectors (`.xyz` used): maps `v_uv` to the capture's UV,
@@ -229,8 +227,8 @@ pub struct PostprocessPush {
     /// makes a blur legible rather than merely soft. Alpha is the strength; all-zero is the
     /// identity, so `Default` leaves it off.
     ///
-    /// Not [`Self::bg_color`], which mixes *behind* the texture: a tint that went behind an opaque
-    /// capture would do nothing at all. No live path sets `bg_color` — every caller passes zero.
+    /// Composited *over* the backdrop, never behind it: a tint that went behind an opaque capture
+    /// would do nothing at all.
     pub tint: [f32; 4],
     /// Contrast boost about the mid-grey pivot: `0.0` is the identity (so `Default` is safe),
     /// positive steepens. Applied premultiplied-correctly, see `postprocess.frag`.
@@ -241,16 +239,15 @@ pub struct PostprocessPush {
 // The Rust layout must match the GLSL std430 `Push` block byte-for-byte; catch drift at compile
 // time the way `ClippedTexturePush` does.
 const _: () = {
-    assert!(std::mem::size_of::<PostprocessPush>() == 240);
+    assert!(std::mem::size_of::<PostprocessPush>() == 224);
     assert!(std::mem::offset_of!(PostprocessPush, src_rect) == 48);
     assert!(std::mem::offset_of!(PostprocessPush, corner_radius) == 64);
-    assert!(std::mem::offset_of!(PostprocessPush, bg_color) == 80);
-    assert!(std::mem::offset_of!(PostprocessPush, input_to_geo) == 96);
-    assert!(std::mem::offset_of!(PostprocessPush, sample_transform) == 144);
-    assert!(std::mem::offset_of!(PostprocessPush, synoik_scale) == 192);
-    // The new tail. A `vec4` must land 16-aligned in std430, which 208 is.
-    assert!(std::mem::offset_of!(PostprocessPush, tint) == 208);
-    assert!(std::mem::offset_of!(PostprocessPush, contrast) == 224);
+    assert!(std::mem::offset_of!(PostprocessPush, input_to_geo) == 80);
+    assert!(std::mem::offset_of!(PostprocessPush, sample_transform) == 128);
+    assert!(std::mem::offset_of!(PostprocessPush, synoik_scale) == 176);
+    // A `vec4` must land 16-aligned in std430, which 192 is.
+    assert!(std::mem::offset_of!(PostprocessPush, tint) == 192);
+    assert!(std::mem::offset_of!(PostprocessPush, contrast) == 208);
 };
 
 /// Push constants for the resize cross-fade material (`resize.vert`/`resize.frag`). Blends two

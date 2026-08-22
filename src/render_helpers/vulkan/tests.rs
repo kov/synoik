@@ -1167,7 +1167,6 @@ fn vulkan_postprocess_clips_and_desaturates() {
         let push = PostprocessPush {
             geo_size: [W as f32, H as f32],
             corner_radius: [16.0; 4],
-            bg_color: [0.0; 4],
             tint: [0.0; 4],
             contrast: 0.0,
             _pad0: [0.0; 3],

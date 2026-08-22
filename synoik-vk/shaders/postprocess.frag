@@ -26,7 +26,6 @@ layout(push_constant) uniform Push {
     vec2 geo_size;
     vec4 src_rect;       // sub-rect to sample, normalized [u0, v0, du, dv]
     vec4 corner_radius;
-    vec4 bg_color;       // premultiplied
     vec4 i2g0;           // input_to_geo columns (xyz used): maps vec3(v_uv, 1) -> [0,1] geo space
     vec4 i2g1;
     vec4 i2g2;
@@ -39,7 +38,7 @@ layout(push_constant) uniform Push {
     float noise;
     vec4 tint;           // premultiplied, composited OVER the backdrop
     float contrast;      // boost about mid-grey; 0 is identity
-    // Pad to the std430 struct alignment so the Rust side's 240 bytes match exactly.
+    // Pad to the std430 struct alignment so the Rust side's 224 bytes match exactly.
     float pad0;
     float pad1;
     float pad2;
@@ -111,9 +110,6 @@ vec4 postprocess(vec4 color) {
     if (pc.noise > 0.0) {
         color.rgb += (hash12(gl_FragCoord.xy) - 0.5) * pc.noise;
     }
-
-    // Mix bg_color behind the texture (both premultiplied alpha).
-    color = color + pc.bg_color * (1.0 - color.a);
 
     return color;
 }

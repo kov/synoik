@@ -1575,7 +1575,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// effect, paired with [`Self::capture_backdrop`]. Samples the cached
     /// [`BackdropBlur::intermediate`] (blurred output, or the raw capture when blur is off)
     /// across its whole extent; the caller fills the material fields of `push` (`geo_size`,
-    /// `corner_radius`, `input_to_geo`, `synoik_scale`, `saturation`, `noise`, `bg_color`), this
+    /// `corner_radius`, `input_to_geo`, `synoik_scale`, `saturation`, `noise`), this
     /// fills the placement + `src_rect` via [`Self::render_postprocess`] and clips to the
     /// rounded geometry.
     pub(crate) fn draw_backdrop(

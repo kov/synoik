@@ -172,7 +172,6 @@ mod vulkan_impl {
             PostprocessPush {
                 geo_size: [self.clip_geo.size.w as f32, self.clip_geo.size.h as f32],
                 corner_radius: <[f32; 4]>::from(self.corner_radius),
-                bg_color: [0.0; 4],
                 input_to_geo: pack_mat3(input_to_geo),
                 sample_transform: pack_mat3(sample_transform),
                 synoik_scale: self.scale,

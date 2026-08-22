@@ -17,7 +17,6 @@ layout(push_constant) uniform Push {
     vec2 geo_size;
     vec4 src_rect;
     vec4 corner_radius;
-    vec4 bg_color;
     vec4 i2g0;
     vec4 i2g1;
     vec4 i2g2;
@@ -30,7 +29,7 @@ layout(push_constant) uniform Push {
     float noise;
     vec4 tint;
     float contrast;
-    // Pad to the std430 struct alignment so the Rust side's 240 bytes match exactly.
+    // Pad to the std430 struct alignment so the Rust side's 224 bytes match exactly.
     float pad0;
     float pad1;
     float pad2;
