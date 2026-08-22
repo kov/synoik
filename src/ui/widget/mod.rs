@@ -1708,7 +1708,7 @@ pub struct BakeCache {
     // the buffer is what carries the element `Id`, so wrapping a cached texture in a fresh buffer
     // each frame churns an *identity* even though not a pixel changed. Damage tracking then sees
     // the old element leave and a stranger arrive every frame, which throws away everything keyed
-    // on that id — including each backdrop blur's whole dual-Kawase chain, rebuilt from render
+    // on that id — including each backdrop blur's whole chain, rebuilt from render
     // pass to pipelines. That cost ~15 GPU resource creations a frame for the length of every
     // overview transition (`ui/window_preview.rs`, `ui/dash.rs`), which is why `bake` hands back
     // the buffer rather than leaving the wrap to its callers.

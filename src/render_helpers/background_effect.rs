@@ -208,14 +208,14 @@ impl BackgroundEffect {
         // there through `ext-background-effect-v1`, and as of 51 mutter implements that protocol
         // itself — `BACKGROUND_EFFECT_BLUR_RADIUS` through `clutter_blur`'s separable gaussian
         // (`src/compositor/meta-surface-actor.c`, `meta-background-effect.c`). So this path runs
-        // the gaussian at GNOME's radius rather than the dual-Kawase inherited from niri, and the
-        // config's `passes`/`offset` no longer reach it. They still drive the xray effect buffer
-        // below and the shell's own chrome, which answer to nobody upstream.
+        // at GNOME's radius, and the config's `passes`/`offset` no longer reach it. They still
+        // drive the xray effect buffer below and the shell's own chrome, which answer to nobody
+        // upstream.
         //
         // The radius is logical and multiplied by the output scale here, exactly as mutter does at
         // paint time (`create_blur_node` takes `radius * view_scale`) — that is what keeps the blur
         // the same size on screen across monitors of different scale, which the physical-pixel
-        // Kawase offset never did.
+        // tap offset the inherited chain took never did.
         let blur_radius = blur.then_some(GNOME_CLIENT_BLUR_RADIUS * params.scale);
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;

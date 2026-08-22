@@ -12,8 +12,9 @@
 //! open and a submit of its own would be a host round trip the frame was going to make anyway
 //! (`docs/fork/frame-submit-discipline.md`).
 //!
-//! What differs is the parameter. The Kawase chain takes a tap offset; this takes a **radius in the
-//! source texture's pixels**, because that is the only thing GNOME's blur is specified in. Callers
+//! What differs is the parameter. The effect path's radius is in texels of whatever intermediate
+//! the ladder picked; this takes a **radius in the source texture's pixels**, because that is the
+//! only thing GNOME's blur is specified in. Callers
 //! whose texture is not at output resolution owe the conversion — see
 //! [`crate::wallpaper::Wallpaper::render_blurred`], where a 4K picture on a 1080p screen needs
 //! twice the radius to look the same.

@@ -48,7 +48,7 @@ There are two draw paths behind that flag:
 
 | path | source of the backdrop | code |
 | --- | --- | --- |
-| `FramebufferEffect` (non-xray) | **the real framebuffer** — mid-frame capture of everything drawn behind the surface, then dual-Kawase, then the postprocess/clip draw | `render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs` |
+| `FramebufferEffect` (non-xray) | **the real framebuffer** — mid-frame capture of everything drawn behind the surface, then the gaussian, then the postprocess/clip draw | `render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs` |
 | `Xray` | an offscreen holding **only the background-layer surfaces and the GNOME wallpaper** (`Synoik::fill_xray_elements`, `synoik.rs:10446`) | `render_helpers/xray.rs`, `vulkan/effect_blur.rs` |
 
 **Today every client that sets a blur region gets the xray path.** The config file is gone, so no
@@ -60,7 +60,9 @@ blurred terminals and the top one does not see the bottom one.
 The real-backdrop path exists, works, and is exercised by tests
 (`vulkan_backdrop_effect_roundtrips_under_rotation`); it is simply unreachable from a client.
 
-Blur maths, both paths: dual-Kawase (`synoik-vk/src/blur.rs`), `passes = 3`, `offset = 3.0`, plus
+Blur maths, both paths: GNOME's separable gaussian (`synoik-vk/src/blur.rs`) — a downscale
+cascade to where the surviving sigma is small, one horizontal and one vertical pass there, and one
+magnifying draw back to the destination — plus
 `noise = 0.02` and `saturation = 1.5` — global defaults in `synoik-config::Blur`, identical for
 every surface. A separable-gaussian variant exists (`vulkan/gaussian_backdrop.rs`) but is the lock
 screen's, specified in source pixels to match `Shell.BlurEffect`.
@@ -103,7 +105,7 @@ Sources: `plasma/kwin/src/plugins/blur/blur.cpp`, MR
 
 So against KWin, the discriminators are: what gets sampled (real backdrop vs. our wallpaper-only),
 the rounded-corner shader, decoration/X11 region sources, and the contrast matrix. Our
-noise/saturation and Kawase parameters are the same class of knob at similar defaults.
+noise/saturation and blur parameters are the same class of knob at similar defaults.
 
 ## 4. macOS
 
@@ -149,7 +151,7 @@ Defects first — these are wrong, not merely absent.
    The draw itself was already pinned: `vulkan_backdrop_blur_honours_the_subregion` renders the
    real-backdrop path with a `set_blur_region` subregion and checks the edge softens inside it and
    stays sharp outside.
-   **Cost note:** each blurred surface now pays a mid-frame capture + its own Kawase chain per
+   **Cost note:** each blurred surface now pays a mid-frame capture + its own blur chain per
    frame, where the xray path shared one buffer per output. Both are cached across frames
    (`BackdropBlur` in the element's `UserDataMap`) and the blur records into the frame's own command
    buffer, so it is not a submit — but it is real per-surface GPU work, and gap 8 (occlusion skip)
@@ -331,7 +333,7 @@ Then the absent capabilities, in the order I'd take them:
 
    What was genuinely left is allocation churn under **animated geometry**. `BackdropBlur::matches`
    keyed on the exact intermediate size, so a geometry that moved by one pixel discarded the capture
-   texture, the whole Kawase chain (a level image and its ping-pong twin per pass, with render
+   texture, the whole blur chain (a level image and its ping-pong twin per pass, with render
    passes and descriptor sets) and the blurred output, and rebuilt them — every frame of the
    animation. Two halves, both now DONE (bar the seat flag noted under each):
    - **The stall — DONE.** `SharedBlurChain::drop` called `device_wait_idle`, on the strength of a

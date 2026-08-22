@@ -89,12 +89,12 @@ GNOME puts a `Shell.BlurEffect` on the lock screen's *background actor* — not 
 with `BLUR_RADIUS = 90` and `BLUR_BRIGHTNESS = 0.65` (`unlockDialog.js:706-713`, `:34-35`), so the
 brightness rides inside the blur rather than being a wash laid over it.
 
-Its blur is a separable gaussian with `sigma = radius / 2`, run on a downscaled copy. The renderer
-already had a blur, but it was niri's dual-Kawase, parameterised by passes and a tap offset — a
-different kernel with no way to say "90 pixels". So the gaussian went in beside it (Gustavo's call,
-2026-08-01), sharing the existing chain object's pyramid, render pass and sampler; the Kawase keeps
-driving the window background effect. Retiring the Kawase is a separate decision, and moot if that
-niri feature is ever dropped.
+Its blur is a separable gaussian with `sigma = radius / 2`, run on a downscaled copy — the same
+kernel the whole renderer uses. The chain (`synoik-vk/src/blur.rs`) is gaussian-only: there is no
+Kawase shader and every entry point on it is a gaussian one, so the window background effect runs
+this too. The pyramid, render pass and sampler are shared; only the parameter differs, a radius in
+pixels rather than the passes and tap offset the inherited chain took, which had no way to say
+"90 pixels".
 
 Three things worth keeping:
 
@@ -107,7 +107,7 @@ Three things worth keeping:
   4K picture on a 1080p output come out half as blurred as GNOME's. `render_blurred` converts by
   the magnification the draw will apply.
 - **The blur is queued, never submitted.** It runs during element building, where no command buffer
-  is open; `VulkanRenderer::queue_gaussian_blur` hands it to the next frame's, as the Kawase path
+  is open; `VulkanRenderer::queue_gaussian_blur` hands it to the next frame's, as the older path
   already did (`docs/fork/frame-submit-discipline.md`). It also only re-runs when the wallpaper,
   radius or brightness actually change — a lock screen redraws on every clock tick and keystroke.
 

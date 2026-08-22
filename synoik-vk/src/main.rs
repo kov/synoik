@@ -12,7 +12,7 @@
 //! Three offscreen render demos, each split into a pure `render_*` (returns read-back pixels) and
 //! a shared `assert_*` (structural, resolution-independent invariants):
 //!   - `scene`: solid + SDF rounded-rect (from niri's corner shader) + sampled-texture quads,
-//!   - `blur`:  dual-kawase blur of a hard edge into a smooth gradient,
+//!   - `blur`:  gaussian blur of a hard edge into a smooth gradient,
 //!   - `text`:  hinted swash glyph-atlas text (vs a stacked pango/cairo reference in the PNG).
 //!
 //! `main` renders + asserts + writes a PNG for each, then prints forward-looking device `probes`.
@@ -210,7 +210,7 @@ fn assert_scene(pixels: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// --- blur: dual-kawase of a hard edge ----------------------------------------------------------
+// --- blur: gaussian of a hard edge --------------------------------------------------------------
 
 const SRC_W: u32 = 192;
 const SRC_H: u32 = 128;

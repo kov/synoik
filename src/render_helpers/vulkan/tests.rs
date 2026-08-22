@@ -1058,7 +1058,7 @@ fn vulkan_offscreen_snapshot() {
     assert_close(&direct, &snapshot);
 }
 
-// --- Dual-kawase blur: a hard edge becomes a smooth ramp ----------------------------------------
+// --- Gaussian blur: a hard edge becomes a smooth ramp -------------------------------------------
 
 /// The owned renderer's gaussian (`render_blur`, driving synoik-vk's `BlurChain`) softens a
 /// hard black|white split into a monotonic mid-gray ramp localized around the boundary. Structural

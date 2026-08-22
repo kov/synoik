@@ -1226,7 +1226,7 @@ impl Dash {
         //
         // Only the dock asks for it, and the reason is not thrift: the overview's own backdrop is
         // already a blurred wallpaper (`overview-port.md` §13), so a second blur there would cost
-        // a capture and a Kawase chain to re-blur something blurred. The dock hangs over the raw
+        // a capture and a blur chain to re-blur something blurred. The dock hangs over the raw
         // desktop instead, where the wash alone reads as a flat grey slab. It also cannot fade —
         // `FramebufferEffectElement` carries no alpha — and the overview dash fades in with the
         // overview, which is the other reason it would not belong there.

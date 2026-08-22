@@ -10,7 +10,7 @@
 //!   - [`gpu`]     — instance/device bring-up, extension probing (`Gpu`),
 //!   - [`render`]  — offscreen render target + solid/SDF/textured quad pipeline,
 //!   - [`texture`] — sampled-texture upload,
-//!   - [`blur`]    — dual-kawase blur chain,
+//!   - [`blur`]    — gaussian blur chain,
 //!   - [`text`]    — hinted swash glyph-atlas text,
 //!   - [`dmabuf`]  — foreign (GBM) dmabuf allocation + import,
 //!   - [`probes`]  — forward-looking physical-device capability probes.

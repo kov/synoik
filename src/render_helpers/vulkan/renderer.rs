@@ -1690,7 +1690,7 @@ impl VulkanRenderer {
         .map_err(|e| VulkanError::Other(format!("flushing queued layout barriers: {e:#}")))
     }
 
-    /// Blur `source` with the dual-kawase [`BlurChain`] and return the result as a fresh,
+    /// Blur `source` with the gaussian [`BlurChain`] and return the result as a fresh,
     /// sampleable offscreen [`VkTexture`] the same size as `source` — the owned-renderer
     /// equivalent of niri's GLES `Blur` (the `FramebufferEffectElement` backdrop blur).
     /// `source` must be sampleable (`SHADER_READ_ONLY_OPTIMAL`): imported textures are; an

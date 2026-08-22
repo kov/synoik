@@ -369,7 +369,7 @@ earlier "defer the `ash`/Vulkan renderer to the Phase-4 endgame." The motivation
 HDR but **zero-copy on virtio-gpu Venus + deleting the zink GL-translation layer**: the guest
 runs GLES-over-zink-over-Venus today; a native Vulkan renderer talks to Venus directly. We
 hand-roll bounded primitives on `ash` — our repo already owns the full finite shader set
-(textured quad, SDF rounded-rect, dual-kawase blur, glyph atlas) — **not** wgpu/Skia/Vello
+(textured quad, SDF rounded-rect, gaussian blur, glyph atlas) — **not** wgpu/Skia/Vello
 (wgpu hides dmabuf/explicit-sync/modifier control, the same reason §3.2 keeps GLES for
 untrusted client buffers). The **Smithay GLES backend stays live behind a flag** through the
 whole port (Smithay allows coexisting renderers); testability/verify-throughout is a
@@ -377,7 +377,7 @@ first-class constraint on this work.
 
 **Staged (GLES daily-drives until the last step):**
 - **(0) standalone ash-on-Venus offscreen spike — COMPLETE.** Device bring-up + unified quad
-  pipeline (solid / SDF-rounded / textured) + dual-kawase blur + hinted cosmic-text/swash
+  pipeline (solid / SDF-rounded / textured) + gaussian blur + hinted cosmic-text/swash
   glyph-atlas text vs a pango reference, all verified on both Venus and lavapipe via structural
   pixel-invariant `cargo test` (no golden images), plus forward-looking DRM-modifier /
   external-semaphore probes. Lives in `synoik-vk/` (workspace member, promoted from the spike into a

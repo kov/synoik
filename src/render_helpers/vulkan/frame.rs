@@ -43,7 +43,7 @@ const REST_AFTER_STILL_FRAMES: u8 = 3;
 /// A resting effect is never capped. See [`VulkanFrame::capture_backdrop`].
 ///
 /// The intermediate is a resample, so its size is purely a resolution dial, and the on-screen blur
-/// radius is held constant across the cap by the tap-offset compensation next to it — what a cap
+/// radius is held constant across the cap by the radius compensation next to it — what a cap
 /// costs is detail in the blurred image, which is what an animation hides best and a still frame
 /// shows worst.
 ///
@@ -1500,16 +1500,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     backdrop_blur::quantize(size.w),
                     backdrop_blur::quantize(size.h),
                 ));
-                // The taps are `offset` half-texels of the intermediate, so a higher-resolution
-                // intermediate is a proportionally *smaller* radius on screen. Scale the offset
+                // The radius is in texels of the intermediate, so a higher-resolution
+                // intermediate is a proportionally *smaller* radius on screen. Scale the radius
                 // back up by how much we overshot, or the blur would visibly thin at every rung
                 // crossing. One scalar, not one per axis: the two overshoots differ by at most
                 // 1.25:1, and that much anisotropy in a blur is not something you can see.
                 //
                 // Measured against the *pre-cap* need, so the cap above changes resolution and
-                // nothing else. A dual-Kawase's radius in texels is proportional to `offset`, and
-                // the on-screen radius is that times (screen / intermediate) — so capping the
-                // intermediate by `k` and scaling `offset` by the same `k` leaves the on-screen
+                // nothing else. The radius is in texels of the intermediate, and the on-screen
+                // radius is that times (screen / intermediate) — so capping the
+                // intermediate by `k` and scaling the radius by the same `k` leaves the on-screen
                 // radius exactly where it was. Comparing against the capped size instead would
                 // leave the blur `1/k` times wider while moving, and it would visibly snap back
                 // the moment the animation settled.

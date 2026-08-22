@@ -45,7 +45,7 @@ serve.
 
   | | mutter 51 | synoik default |
   | --- | --- | --- |
-  | strength | gaussian **σ = 12 logical px**, × `view_scale` at paint | dual-Kawase `passes=3, offset=3` → **σ ≈ 19 physical px**, no scale factor |
+  | strength | gaussian **σ = 12 logical px**, × `view_scale` at paint | the same gaussian at mutter's `BACKGROUND_EFFECT_BLUR_RADIUS` = 24 logical px, i.e. **σ = 12 logical px**, × output scale at paint |
   | saturation | `1.25`, `mix(luma, color, s)`, Rec.601 luma | `1.5`, same `mix`, Rec.709 luma |
   | noise | `0.015`, `(hash(gl_FragCoord) − 0.5) · noise` | `0.02`, identical formula |
   | tint | none | 20%-alpha wash, white or near-black by color-scheme |

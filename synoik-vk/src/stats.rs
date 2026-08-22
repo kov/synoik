@@ -121,7 +121,7 @@ pub enum SubmitSite {
     UploadShm,
     /// A layout transition or queue-family acquire on a command buffer of its own.
     Transition,
-    /// A dual-Kawase blur chain.
+    /// A blur chain.
     Blur,
     /// Pixels back to the CPU. Always synchronous by definition.
     Readback,
@@ -180,9 +180,10 @@ pub enum DrawSite {
     /// One element of the scene: a surface, a texture, a solid, a shadow. The compositor's own
     /// layering, and the only class where the count reflects what is on screen.
     Scene,
-    /// One pass of a dual-Kawase chain, shading its whole destination level. A chain is `passes`
-    /// levels down and the same back up, so it costs a fixed multiple of its intermediate's area
-    /// however small that intermediate is on screen.
+    /// One pass of a blur chain, shading its whole destination level. A chain descends by
+    /// resampling, runs a separable gaussian at the working size, and magnifies back in one draw
+    /// — so it costs roughly its **destination's** area plus a third again, and a blur that
+    /// covers little of the screen is correspondingly cheap.
     Blur,
     /// One glyph quad.
     Text,

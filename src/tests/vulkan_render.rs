@@ -5454,9 +5454,9 @@ fn vulkan_capture_region_splits_the_render_pass() {
 /// blur and nothing else — in particular not its radius.
 ///
 /// The cap exists to stop the rebuild churn (see `MOVING_INTERMEDIATE_CAP`), and it is only safe
-/// to trade because the on-screen radius is held constant across it: a dual-Kawase's radius in
-/// texels is proportional to the tap offset, and the on-screen radius is that times
-/// (screen / intermediate), so scaling the offset by the same factor the intermediate was capped
+/// to trade because the on-screen radius is held constant across it: the radius is in texels of
+/// the intermediate, and the on-screen radius is that times
+/// (screen / intermediate), so scaling the radius by the same factor the intermediate was capped
 /// by leaves the result where it was. Get that compensation wrong — compare against the capped
 /// size instead of the pre-cap need, say — and the blur is ~2x wider whenever anything animates,
 /// snapping back the instant it settles. That is very visible and no pixel test elsewhere sees it.
@@ -5921,8 +5921,8 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
     );
 }
 
-/// A surface a *client* asked to blur (`ext-background-effect-v1`) runs GNOME's separable gaussian
-/// at GNOME's radius, not the dual-Kawase the shell's own chrome uses — mutter 51 implements that
+/// A surface a *client* asked to blur (`ext-background-effect-v1`) runs at GNOME's radius rather
+/// than the one the shell's own chrome picks — mutter 51 implements that
 /// protocol itself, with `BACKGROUND_EFFECT_BLUR_RADIUS` through `clutter_blur`
 /// (`src/compositor/meta-surface-actor.c`).
 ///

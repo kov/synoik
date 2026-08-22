@@ -6,7 +6,7 @@
 //! [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)'s Vulkan arm.
 //!
 //! A focused sibling of [`BackdropBlur`](super::backdrop_blur::BackdropBlur): it runs the same
-//! dual-Kawase [`SharedBlurChain`] but over an **externally-owned** offscreen [`VkTexture`] (the
+//! gaussian [`SharedBlurChain`] but over an **externally-owned** offscreen [`VkTexture`] (the
 //! effect buffer's offscreen) rather than owning a capture of the scene. It is held *inside* the
 //! effect buffer's Vulkan offscreen so it is rebuilt **atomically** with that texture — the chain
 //! binds the source's image view at construction, so a chain left over a recreated offscreen would

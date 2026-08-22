@@ -2,17 +2,25 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! Dual-Kawase blur chain, ported from niri's GLES `render_helpers/blur.rs`.
+//! GNOME's blur, as `Shell.BlurEffect`: a downscale cascade and one separable gaussian.
 //!
-//! A pyramid of `passes + 1` levels halving in size: level 0 is full-size (the output), levels
-//! 1..=passes shrink. Downsample folds `source → L1 → … → Lₙ`; upsample folds
-//! `Lₙ → … → L1 → L0`. Each pass is its own render pass writing one level while sampling another;
-//! the render pass leaves each level `SHADER_READ_ONLY_OPTIMAL` and its subpass dependencies order
-//! the write of one pass before the sample of the next (and the final write before readback).
+//! A pyramid of `passes + 1` levels halving in size: level 0 is full-size, levels 1..=passes
+//! shrink. A blur of radius *r* descends *k* rungs by plain resampling — `k` from
+//! [`downscale_levels`], GNOME's own cascade — until the surviving `sigma = r / 2ᵏ / 2` is small,
+//! runs the gaussian horizontally into that level's same-sized twin and vertically back, then
+//! magnifies to the destination in one draw. That last draw is the expensive one: everything
+//! before it happens at a quarter of the area or less, so a chain costs roughly its
+//! **destination's** area plus a third again, not a multiple of the intermediate's.
+//!
+//! Each pass is its own render pass writing one level while sampling another; the render pass
+//! leaves each level `SHADER_READ_ONLY_OPTIMAL` and its subpass dependencies order the write of
+//! one pass before the sample of the next (and the final write before readback).
 //!
 //! Blending is off — every pass fully overwrites its destination. Sampling is LINEAR + clamp,
-//! matching the reference. `half_pixel` is half a *destination* pixel on the way down and half a
-//! *source* pixel on the way up (both in the sampled texture's 0..1 UV space), exactly as niri.
+//! matching the reference.
+//!
+//! The dual-Kawase chain this was bootstrapped from (niri's GLES `render_helpers/blur.rs`) is
+//! gone: there is no Kawase shader, and every entry point on the chain is a gaussian one.
 //!
 //! Resources are freed explicitly in [`BlurChain::destroy`] (no `Drop` — teardown needs a `&Gpu`).
 //! [`BlurChain::new`] unwinds a *failed* build via an internal guard (the compositor now rebuilds a
@@ -26,15 +34,6 @@ use ash::vk;
 use crate::gpu::Gpu;
 use crate::render::{as_bytes, load_module, RENDER_FORMAT};
 use crate::texture::Texture;
-
-/// Push constants for the blur taps (matches the GLSL `Push` block; `offset` at 8, 16 bytes).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct BlurPush {
-    half_pixel: [f32; 2],
-    offset: f32,
-    _pad0: f32,
-}
 
 /// Push constants for one direction of the gaussian (matches `blur_gaussian.frag`'s `Push`).
 #[repr(C)]
@@ -64,9 +63,11 @@ pub struct BlurChain {
     set_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
-    /// GNOME's separable gaussian, and the plain resample its rungs use. `None` when the chain was
-    /// built without it — the dual-Kawase path needs neither, and the scratch levels the gaussian
-    /// ping-pongs through are not worth allocating for a chain that will never run it.
+    /// GNOME's separable gaussian, and the plain resample its rungs use.
+    ///
+    /// Always `Some` today — every chain is built by a gaussian constructor. The `Option` is the
+    /// last trace of the dual-Kawase path, which needed neither these pipelines nor the scratch
+    /// levels, and it can go with the next change that touches the build.
     gaussian: Option<Gaussian>,
     vert: vk::ShaderModule,
     /// Level 0 is full-size (the output); levels 1..=passes shrink.
@@ -246,13 +247,12 @@ impl BlurChain {
         guard.desc_pool =
             unsafe { device.create_descriptor_pool(&dp_ci, None) }.context("blur desc pool")?;
 
-        // Pipeline layout: set 0 = sampler, push constants = BlurPush (fragment).
+        // Pipeline layout: set 0 = sampler, push constants = GaussianPush (fragment). The
+        // resample rungs read none of it and share the layout.
         let push = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            // Both blocks share one layout, so the range is the larger of the two: the Kawase
-            // shaders read the first 16 bytes, the gaussian the first 20.
-            .size(std::mem::size_of::<BlurPush>().max(std::mem::size_of::<GaussianPush>()) as u32);
+            .size(std::mem::size_of::<GaussianPush>() as u32);
         let layout_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&guard.set_layout))
             .push_constant_ranges(std::slice::from_ref(&push));
@@ -547,9 +547,9 @@ impl BlurChain {
                 );
             }
             device.cmd_draw(cbuf, 3, 1, 0, 0);
-            // A blur pass shades its whole destination level. Counted here for the same reason the
-            // Kawase's passes were: these are draws, so they belong to `DrawSite::Blur` rather than
-            // to whichever site happens to be nearest in the code. Without it a frame full of blur
+            // A blur pass shades its whole destination level. Counted here because these are
+            // draws, so they belong to `DrawSite::Blur` rather than to whichever site happens to
+            // be nearest in the code. Without it a frame full of blur
             // reports none of it, which reads as a free blur rather than an unmeasured one.
             crate::stats::draw(
                 crate::stats::DrawSite::Blur,
