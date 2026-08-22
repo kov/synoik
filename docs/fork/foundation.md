@@ -332,7 +332,7 @@ drop-in: `LimitMEMLOCK` is an rlimit and needs a **restart**, unlike `MemoryLow`
 | `SYNOIK_VK_VALIDATION=1` | **the only spec check.** A plain env var read in `Gpu::with_selector`, so the live session honors it via a unit drop-in |
 | `SYNOIK_FRAME_LOG=ring,gpu,autodump` | the flight recorder to leave on a session you actually use |
 | `synoik msg frame-perf` | reads the running session's tallies (the rolling summary resets, so the journal cannot answer "has this been happening?") |
-| `SIGUSR1` | non-terminating ring dump; the only way to get the ring out of a live session |
+| `SIGUSR1` | non-terminating ring dump; the only way to get the ring out of a live session. Signal the **main process only** — `systemctl --user kill --kill-whom=main -s SIGUSR1 org.gnome.Shell@user.service`. Without `--kill-whom=main` systemd signals the whole cgroup, and xwayland-satellite does not handle SIGUSR1: it dies, taking every X11 client's server with it |
 | `SYNOIK_SCENE_BREAKDOWN=verbose` | per-element damage and opacity — the cheapest first look at a redraw question |
 | `SYNOIK_VK_FULL_DAMAGE=1` | turns the whole partial-damage chain off: separates "we drew the wrong thing" from "what we drew did not survive" |
 | `msg action debug-toggle-damage [--age N]` | the same ask, tinted on the glass, one frame late — the visual companion to the line below |
