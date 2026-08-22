@@ -32486,3 +32486,82 @@ fn a_settled_desktop_justifies_no_damage() {
         "a repaint inside one window must be attributed to that window alone: {moved:?}"
     );
 }
+
+/// Inserting an element in front of the background must not repaint the background.
+///
+/// smithay's `ElementInstanceState::matches` compares z-index, so the direction z-index counts in
+/// decides who pays for scene churn. Counted from the front — the natural direction for the
+/// occlusion cull — the background's z-index is the number of elements drawn over it, so a cursor
+/// or popup appearing anywhere renumbers it and damages its whole geometry. For a full-output
+/// opaque background that is a full-output repaint with nothing redrawn, and it was the mechanism
+/// behind ten of the twelve full-output frames measured on a live seat.
+///
+/// Our smithay fork counts z-index from the back instead. This drives the real
+/// `OutputDamageTracker` because the property lives in it, and asserts the damage rect directly:
+/// with front-counting the third frame asks for the whole output, with back-counting it asks only
+/// for the element that actually appeared.
+#[test]
+fn an_element_appearing_in_front_does_not_repaint_the_background() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
+    use smithay::backend::renderer::element::Kind;
+
+    let output = Output::new(
+        "damage-z".to_owned(),
+        smithay::output::PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: smithay::output::Subpixel::Unknown,
+            make: "test".into(),
+            model: "test".into(),
+            serial_number: "test".into(),
+        },
+    );
+    let mode = smithay::output::Mode {
+        size: (1920, 1080).into(),
+        refresh: 60_000,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+
+    // A fully opaque full-output background, and a small thing that will appear over it.
+    let bg_buffer = SolidColorBuffer::new((1920, 1080), Color32F::from([0., 0., 0., 1.]));
+    let background =
+        SolidColorRenderElement::from_buffer(&bg_buffer, (0, 0), 1.0, 1.0, Kind::Unspecified);
+    let top_buffer = SolidColorBuffer::new((64, 64), Color32F::from([1., 1., 1., 1.]));
+    let popup =
+        SolidColorRenderElement::from_buffer(&top_buffer, (100, 100), 1.0, 1.0, Kind::Unspecified);
+
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // Frame 1: nothing to compare against, so everything is damaged. Frame 2 settles it.
+    let alone = [background.clone()];
+    tracker.damage_output(1, &alone).unwrap();
+    let (settled, _) = tracker.damage_output(1, &alone).unwrap();
+    assert!(
+        settled.is_none_or(|d| d.is_empty()),
+        "a still background must ask for nothing once settled: {settled:?}"
+    );
+
+    // Frame 3: the popup appears in front. The background did not move, resize or redraw.
+    let with_popup = [popup, background];
+    let (damage, _) = tracker.damage_output(1, &with_popup).unwrap();
+    let damage = damage.expect("the popup appearing is damage").clone();
+    let total: i32 = damage.iter().map(|r| r.size.w * r.size.h).sum();
+    assert!(
+        total < 1920 * 1080,
+        "the background was repainted for a popup appearing over it: {damage:?}"
+    );
+    assert_eq!(
+        damage,
+        vec![Rectangle::new(
+            Point::from((100, 100)),
+            Size::from((64, 64))
+        )],
+        "only the popup's own geometry should be damaged"
+    );
+}
