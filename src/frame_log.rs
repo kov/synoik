@@ -1757,14 +1757,22 @@ impl FrameAttribution {
     }
 
     /// The human-readable line, without the suppression count.
+    ///
+    /// Only the largest few culprits are named, but the ones left out are **counted by reason**
+    /// rather than dropped. A truncated list that does not say it is truncated reads as the whole
+    /// story: the first live capture showed a pointer changing identity next to four renumbered
+    /// windows and invited the conclusion that the pointer renumbered them, when the element that
+    /// actually changed the count could have been sitting just past the cut.
     fn line(&self) -> String {
+        const NAMED: usize = 6;
+
         let top: Vec<String> = self
             .culprits
             .iter()
-            .take(6)
+            .take(NAMED)
             .map(|c| format!("{} {} {:.3}x n={}", c.kind, c.reason, c.share, c.rects))
             .collect();
-        format!(
+        let mut line = format!(
             "predicted {:.3}x over {} shaded ({} quiet) — {}",
             self.predicted,
             self.shaded,
@@ -1774,7 +1782,25 @@ impl FrameAttribution {
             } else {
                 top.join(", ")
             },
-        )
+        );
+        if self.culprits.len() > NAMED {
+            let mut by_reason: Vec<(&str, usize)> = Vec::new();
+            for c in &self.culprits[NAMED..] {
+                match by_reason.iter_mut().find(|(r, _)| *r == c.reason) {
+                    Some((_, n)) => *n += 1,
+                    None => by_reason.push((c.reason, 1)),
+                }
+            }
+            by_reason.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let tail: Vec<String> = by_reason.iter().map(|(r, n)| format!("{n}x {r}")).collect();
+            let _ = write!(
+                line,
+                " (+{} smaller: {})",
+                self.culprits.len() - NAMED,
+                tail.join(", "),
+            );
+        }
+        line
     }
 }
 
@@ -5244,6 +5270,59 @@ mod tests {
         assert!(
             line.contains("2.00x the output"),
             "a translucent element hides nothing, so both are shaded: {line}"
+        );
+    }
+
+    /// A truncated culprit list must say what it left out.
+    ///
+    /// The line names only the largest few, which is what keeps it readable — but an unnamed
+    /// culprit is exactly where the cause hides: the element that changed the scene's element
+    /// count is often tiny, and it is the *count* that renumbers everything below it.
+    #[test]
+    fn the_attribution_line_counts_the_culprits_it_does_not_name() {
+        let culprit = |kind: &str, reason: &'static str, share: f64| super::Culprit {
+            kind: kind.to_owned(),
+            reason,
+            rects: 1,
+            share,
+        };
+        // Eight culprits, descending, so two fall past the six the line names.
+        let a = super::FrameAttribution {
+            shaded: 20,
+            quiet: 12,
+            predicted: 0.5,
+            culprits: vec![
+                culprit("Monitor", "z-index", 0.4),
+                culprit("Monitor", "z-index", 0.3),
+                culprit("Monitor", "z-index", 0.2),
+                culprit("Monitor", "z-index", 0.1),
+                culprit("Panel", "commit", 0.05),
+                culprit("Panel", "commit", 0.04),
+                culprit("Pointer", "new", 0.0),
+                culprit("Pointer", "gone", 0.0),
+            ],
+        };
+        let line = a.line();
+        assert!(
+            line.contains("+2 smaller"),
+            "the line must admit it truncated: {line}"
+        );
+        assert!(
+            line.contains("1x gone") && line.contains("1x new"),
+            "the omitted culprits must still be counted by reason: {line}"
+        );
+
+        // Nothing omitted, nothing claimed.
+        let short = super::FrameAttribution {
+            shaded: 3,
+            quiet: 2,
+            predicted: 0.1,
+            culprits: vec![culprit("Monitor", "commit", 0.1)],
+        };
+        assert!(
+            !short.line().contains("smaller"),
+            "a complete list must not claim a tail: {}",
+            short.line()
         );
     }
 }
