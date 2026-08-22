@@ -1616,6 +1616,418 @@ where
     ))
 }
 
+/// Why a frame's damage happened, per element — the question no other instrument here answers.
+///
+/// The damage log says *what* a frame asked to repaint; the scene breakdown says *what it cost*.
+/// Neither says **which element made the ask**, so a full-output repaint over a stable element set
+/// reads as unattributable: nothing in the list changed size, count or kind, yet the tracker asks
+/// for everything.
+///
+/// This mirrors the six axes smithay's `OutputDamageTracker` actually compares
+/// (`ElementInstanceState::matches`: src, geometry, transform, alpha, z-index, framebuffer-effect
+/// flag) plus the commit counter, and names the elements that failed to match. Mirroring a subset
+/// would be worse than nothing: on a frame whose culprit moved along an axis we do not watch, the
+/// instrument would report "nobody changed" — an omission that reads as a clean bill of health.
+///
+/// It deliberately does **not** try to predict the composed damage rect. The tracker unions our
+/// per-element rects with the previous frames' damage for the buffer's age and then runs them
+/// through `DamageShaper`, which merges and re-splits; a predicted rect could never match, and
+/// chasing that difference would only measure the shaper. What it predicts instead is the union
+/// *area* of the damage its own inputs justify, so the honest comparison is available: inputs quiet
+/// but the composed frame full-output means the amplifier is inside the tracker, not in our
+/// elements — and that is a different investigation with a different fix.
+///
+/// Z-index is counted over the **shaded** elements only, the same way the tracker counts it: an
+/// element culled by the opaque regions above it never reaches `render_element_z_index`, so
+/// counting raw list positions would report a z-shift on every frame where a hidden element came
+/// or went.
+#[derive(Debug, Default)]
+pub struct DamageAttribution {
+    prev: HashMap<smithay::backend::renderer::element::Id, ElementSnapshot>,
+    /// The last culprit set reported, so a steady state logs once and then counts.
+    last_signature: Option<String>,
+    /// Frames elided since [`Self::last_signature`] was logged.
+    suppressed: u64,
+}
+
+/// One element as the tracker last saw it. Instances are kept as a list because a single [`Id`]
+/// may legally appear more than once in a frame, and the tracker matches an instance against *any*
+/// of the previous ones.
+///
+/// [`Id`]: smithay::backend::renderer::element::Id
+#[derive(Debug, Clone)]
+struct ElementSnapshot {
+    commit: smithay::backend::renderer::utils::CommitCounter,
+    instances: Vec<TrackedInstance>,
+    /// Kept for the report only — an id alone cannot be read by a human.
+    kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TrackedInstance {
+    src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+    geometry: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    transform: smithay::utils::Transform,
+    alpha: f32,
+    z_index: usize,
+    framebuffer_effect: bool,
+}
+
+/// Why one element contributed damage. Ordered by how much it tells you: a changed axis names a
+/// mechanism, a bare commit bump only says the client drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reason {
+    /// Absent last frame: the tracker damages its whole geometry.
+    New,
+    /// Present last frame, gone now: the tracker damages where it *was*.
+    Gone,
+    Geometry,
+    Src,
+    Transform,
+    Alpha,
+    /// The element did not move, but something above it appeared or vanished, so every element
+    /// below shifted down one. Cheap to cause and expensive to pay for: it invalidates the match
+    /// for the whole tail of the list at once.
+    ZIndex,
+    FramebufferEffect,
+    /// Matched on every axis; the element reported its own damage since our last commit.
+    Commit,
+}
+
+impl Reason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Reason::New => "new",
+            Reason::Gone => "gone",
+            Reason::Geometry => "geometry",
+            Reason::Src => "src",
+            Reason::Transform => "transform",
+            Reason::Alpha => "alpha",
+            Reason::ZIndex => "z-index",
+            Reason::FramebufferEffect => "fb-effect",
+            Reason::Commit => "commit",
+        }
+    }
+}
+
+/// One element's contribution to a frame, as this instrument accounts for it.
+#[derive(Debug, Clone)]
+pub struct Culprit {
+    pub kind: String,
+    pub reason: &'static str,
+    /// Damage rects this element justified, clipped to the output.
+    pub rects: usize,
+    /// Their union area as a multiple of the output's area.
+    pub share: f64,
+}
+
+/// What one frame's inputs justify. Returned rather than logged so tests can assert on it —
+/// a `tracing` call proves nothing.
+#[derive(Debug, Clone, Default)]
+pub struct FrameAttribution {
+    /// Elements that survived the occlusion cull, i.e. the ones the tracker actually compared.
+    pub shaded: usize,
+    /// Of those, how many matched on every axis and reported no damage.
+    pub quiet: usize,
+    /// Union area of all justified damage, as a multiple of the output area.
+    pub predicted: f64,
+    /// Non-quiet elements, largest share first.
+    pub culprits: Vec<Culprit>,
+}
+
+impl FrameAttribution {
+    /// The culprit *set*, ignoring how much each one damaged. Two frames with the same signature
+    /// are the same story, and logging the second one adds nothing — which is the whole reason
+    /// this instrument can afford to run every frame.
+    fn signature(&self) -> String {
+        let mut parts: Vec<String> = self
+            .culprits
+            .iter()
+            .map(|c| format!("{}:{}", c.kind, c.reason))
+            .collect();
+        parts.sort();
+        parts.dedup();
+        parts.join(",")
+    }
+
+    /// The human-readable line, without the suppression count.
+    fn line(&self) -> String {
+        let top: Vec<String> = self
+            .culprits
+            .iter()
+            .take(6)
+            .map(|c| format!("{} {} {:.3}x n={}", c.kind, c.reason, c.share, c.rects))
+            .collect();
+        format!(
+            "predicted {:.3}x over {} shaded ({} quiet) — {}",
+            self.predicted,
+            self.shaded,
+            self.quiet,
+            if top.is_empty() {
+                "nothing changed".to_owned()
+            } else {
+                top.join(", ")
+            },
+        )
+    }
+}
+
+/// Union area of `rects` as a fraction of `output_px`, computed by subtracting each rect against
+/// the ones already counted. Overlapping damage is the norm — a moved element contributes both its
+/// old and its new geometry — so summing areas would double-count exactly where the number matters.
+fn union_share(
+    rects: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+    output_px: f64,
+) -> f64 {
+    use smithay::utils::Rectangle;
+
+    let mut disjoint: Vec<Rectangle<i32, smithay::utils::Physical>> = Vec::new();
+    let mut area = 0f64;
+    for r in rects {
+        for piece in Rectangle::subtract_rects_many([*r], disjoint.iter().copied()) {
+            area += f64::from(piece.size.w.max(0)) * f64::from(piece.size.h.max(0));
+            disjoint.push(piece);
+        }
+    }
+    area / output_px
+}
+
+impl DamageAttribution {
+    /// Account for one frame and roll the state forward.
+    ///
+    /// `elements` must be the list **as the damage tracker will see it** — in particular, before
+    /// any debug overlay is spliced in. The overlay inserts a variable number of tint elements at
+    /// index 0, which z-shifts everything below it; attributing that shift to the elements it
+    /// happened to land on would be the instrument reporting its own presence.
+    // smithay's element `Id` carries an `Arc<AtomicBool>` liveness flag, which is interior
+    // mutability clippy cannot tell apart from a key that can change its own hash. It cannot: `Id`
+    // hashes and compares on its identity alone, and the tracker we are mirroring keys its own
+    // per-element state by `Id` for exactly that reason.
+    #[allow(clippy::mutable_key_type)]
+    pub fn frame<E>(
+        &mut self,
+        elements: &[E],
+        scale: smithay::utils::Scale<f64>,
+        output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    ) -> FrameAttribution
+    where
+        E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+    {
+        use smithay::backend::renderer::element::Id;
+
+        let output_px = f64::from(output.size.w.max(0)) * f64::from(output.size.h.max(0));
+        if output_px == 0. {
+            return FrameAttribution::default();
+        }
+
+        let mut now: HashMap<Id, ElementSnapshot> = HashMap::new();
+        // Per element, the rects it justified — kept apart from the frame total so a culprit can
+        // report its own share without re-deriving it.
+        let mut per_element: HashMap<
+            Id,
+            (
+                Reason,
+                Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+            ),
+        > = HashMap::new();
+        let mut all_rects = Vec::new();
+        let mut quiet = 0usize;
+
+        let shaded = shaded_elements(elements, scale, output);
+        for (z_index, (_, e, _)) in shaded.iter().enumerate() {
+            let id = e.id().clone();
+            let geometry = e.geometry(scale);
+            let instance = TrackedInstance {
+                src: e.src(),
+                geometry,
+                transform: e.transform(),
+                alpha: e.alpha(),
+                z_index,
+                framebuffer_effect: e.is_framebuffer_effect(),
+            };
+            let name = format!("{e:?}");
+            let kind = name.split(['(', ' ', '{']).next().unwrap_or("?").to_owned();
+
+            let previous = self.prev.get(&id);
+            let matched = previous.is_some_and(|p| p.instances.contains(&instance));
+
+            let mut rects = Vec::new();
+            let reason = if let Some(p) = previous {
+                if matched {
+                    // Same as the tracker: ask the element what changed since the commit we last
+                    // saw. Element-local rects, so they need the geometry offset before they mean
+                    // anything on the output.
+                    let since: Vec<_> = e
+                        .damage_since(scale, Some(p.commit))
+                        .iter()
+                        .map(|d| {
+                            let mut d = *d;
+                            d.loc += geometry.loc;
+                            d
+                        })
+                        .filter_map(|d| d.intersection(output))
+                        .collect();
+                    if since.is_empty() {
+                        quiet += 1;
+                        None
+                    } else {
+                        rects.extend(since);
+                        Some(Reason::Commit)
+                    }
+                } else {
+                    // A mismatch damages both where it is and where it was, so both go in.
+                    if let Some(clipped) = geometry.intersection(output) {
+                        rects.push(clipped);
+                    }
+                    rects.extend(
+                        p.instances
+                            .iter()
+                            .filter_map(|i| i.geometry.intersection(output)),
+                    );
+                    // Name the first axis that differs from the nearest previous instance. With
+                    // one instance — the overwhelming case — this is exact.
+                    let axis = p
+                        .instances
+                        .first()
+                        .map(|o| {
+                            if o.geometry != instance.geometry {
+                                Reason::Geometry
+                            } else if o.src != instance.src {
+                                Reason::Src
+                            } else if o.transform != instance.transform {
+                                Reason::Transform
+                            } else if o.alpha != instance.alpha {
+                                Reason::Alpha
+                            } else if o.framebuffer_effect != instance.framebuffer_effect {
+                                Reason::FramebufferEffect
+                            } else {
+                                Reason::ZIndex
+                            }
+                        })
+                        .unwrap_or(Reason::New);
+                    Some(axis)
+                }
+            } else {
+                if let Some(clipped) = geometry.intersection(output) {
+                    rects.push(clipped);
+                }
+                Some(Reason::New)
+            };
+
+            if let Some(reason) = reason {
+                all_rects.extend(rects.iter().copied());
+                let entry = per_element
+                    .entry(id.clone())
+                    .or_insert((reason, Vec::new()));
+                entry.0 = entry.0.min(reason);
+                entry.1.extend(rects);
+            }
+
+            now.entry(id)
+                .and_modify(|s| s.instances.push(instance.clone()))
+                .or_insert_with(|| ElementSnapshot {
+                    commit: e.current_commit(),
+                    instances: vec![instance],
+                    kind,
+                });
+        }
+
+        // Elements that were here last frame and are not now — including ones that merely became
+        // hidden, which is the same thing to the tracker. It damages where they were.
+        for (id, p) in &self.prev {
+            if now.contains_key(id) {
+                continue;
+            }
+            let rects: Vec<_> = p
+                .instances
+                .iter()
+                .filter_map(|i| i.geometry.intersection(output))
+                .collect();
+            all_rects.extend(rects.iter().copied());
+            per_element.insert(id.clone(), (Reason::Gone, rects));
+        }
+
+        let mut culprits: Vec<Culprit> = per_element
+            .iter()
+            .map(|(id, (reason, rects))| Culprit {
+                kind: now
+                    .get(id)
+                    .or_else(|| self.prev.get(id))
+                    .map(|s| s.kind.clone())
+                    .unwrap_or_else(|| "?".to_owned()),
+                reason: reason.as_str(),
+                rects: rects.len(),
+                share: union_share(rects, output_px),
+            })
+            .collect();
+        culprits.sort_by(|a, b| {
+            b.share
+                .total_cmp(&a.share)
+                .then_with(|| a.kind.cmp(&b.kind))
+        });
+
+        self.prev = now;
+
+        FrameAttribution {
+            shaded: shaded.len(),
+            quiet,
+            predicted: union_share(&all_rects, output_px),
+            culprits,
+        }
+    }
+}
+
+/// Whether [`log_damage_attribution`] does anything — `SYNOIK_DEBUG_DAMAGE_ATTRIB`.
+///
+/// Its own knob rather than a mode of `SYNOIK_DEBUG_DAMAGE`, because the damage overlay is a
+/// damage *participant*: it splices a variable number of tint elements into the scene, and a
+/// varying count z-shifts every element below it. Sharing one switch would mean the attribution
+/// could only ever be read with its own confound turned on.
+pub fn damage_attribution_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SYNOIK_DEBUG_DAMAGE_ATTRIB").is_some())
+}
+
+/// Log one output's damage attribution, but only when the story changes.
+///
+/// A settled scene repeats the same culprit set every frame; printing it 60 times a second would
+/// push the rest of the journal out and cost more than the thing it measures. So a repeat is
+/// counted, and the count is reported when the set finally moves — a suppressed frame is visible
+/// as a number rather than absent.
+pub fn log_damage_attribution<E>(
+    output_name: &str,
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) where
+    E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+{
+    if !damage_attribution_enabled() {
+        return;
+    }
+    static STATE: OnceLock<Mutex<HashMap<String, DamageAttribution>>> = OnceLock::new();
+    let mut map = STATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let state = map.entry(output_name.to_owned()).or_default();
+
+    let attribution = state.frame(elements, scale, output);
+    let signature = attribution.signature();
+    if state.last_signature.as_deref() == Some(signature.as_str()) {
+        state.suppressed += 1;
+        return;
+    }
+    let held = std::mem::take(&mut state.suppressed);
+    state.last_signature = Some(signature);
+    let line = attribution.line();
+    if held > 0 {
+        tracing::info!("damage-attrib {output_name}: {line} (previous held {held} frames)");
+    } else {
+        tracing::info!("damage-attrib {output_name}: {line}");
+    }
+}
+
 /// See the [module docs](self).
 #[derive(Debug)]
 pub struct FrameLog {

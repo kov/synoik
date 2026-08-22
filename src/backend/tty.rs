@@ -3310,6 +3310,20 @@ fn render_surface_with(
     synoik.frame_log.phase(Phase::Collect);
     let mut elements = synoik.render_to_vec(ctx, output, true);
 
+    // Attribute the frame's damage inputs *before* any debug overlay is spliced in: the overlay
+    // z-shifts everything below it, and an instrument that reads its own presence is worse than
+    // none.
+    crate::frame_log::log_damage_attribution(
+        &output.name(),
+        &elements,
+        output.current_scale().fractional_scale().into(),
+        smithay::utils::Rectangle::from_size(
+            output
+                .current_mode()
+                .map_or_else(Default::default, |m| m.size),
+        ),
+    );
+
     // Visualize the damage, if enabled. What is tinted is the *previous* frame's composed damage
     // (see `OutputState::debug_damage_shown`); this frame's is taken from the frame result below.
     let mut tinted_now = Vec::new();

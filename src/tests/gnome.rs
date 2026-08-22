@@ -32368,3 +32368,121 @@ fn a_sticky_window_follows_a_swipe_to_the_next_workspace() {
         "the window came along with the swipe"
     );
 }
+
+/// What a settled desktop's damage inputs actually are, per element.
+///
+/// The live seat repaints the whole output on frames whose element set never changes, and no
+/// instrument here could say which element asked for it. [`DamageAttribution`] mirrors the six axes
+/// smithay's tracker compares (src, geometry, transform, alpha, z-index, framebuffer-effect flag)
+/// plus the commit counter, so this drives the real frame loop and reads the answer back.
+///
+/// Both arms matter and the test is worth nothing with either one missing. "A settled desktop
+/// justifies no damage" is the invariant, but an instrument that reported *nothing* would satisfy
+/// it perfectly — so the first frame, where every element is genuinely new, and a pointer move,
+/// where exactly one element genuinely changed, are asserted too. Quiet is only evidence once the
+/// same instrument has been seen to speak.
+///
+/// [`DamageAttribution`]: crate::frame_log::DamageAttribution
+#[test]
+fn a_settled_desktop_justifies_no_damage() {
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("renderer");
+    f.add_output(1, (1920, 1080));
+    f.settle();
+
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (600, 400), None);
+    f.client(id)
+        .window(&surface)
+        .attach_solid_buffer(0, 0, 0, u32::MAX);
+    f.client(id).window(&surface).commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let scale = Scale::from(out.current_scale().fractional_scale());
+    let geo = Rectangle::from_size(out.current_mode().unwrap().size);
+
+    let seen = std::rc::Rc::new(std::cell::RefCell::new((
+        crate::frame_log::DamageAttribution::default(),
+        Vec::<crate::frame_log::FrameAttribution>::new(),
+    )));
+    {
+        let seen = seen.clone();
+        f.synoik_state().backend.headless().frame_sink =
+            Some(Box::new(move |_vk, _o, elements| {
+                let mut st = seen.borrow_mut();
+                let (ref mut attrib, ref mut frames) = *st;
+                let a = attrib.frame(elements, scale, geo);
+                frames.push(a);
+            }));
+    }
+
+    // Frames with nothing to say. The commits carry no damage, which is the point: the compositor
+    // still redraws, and the question is whether anything in the scene claims to have changed.
+    for _ in 0..5 {
+        f.client(id).window(&surface).commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+    let quiet_frames = seen.borrow().1.len();
+
+    // Now change exactly one thing: the window paints a new colour, the way a terminal
+    // streaming output does.
+    f.client(id)
+        .window(&surface)
+        .attach_solid_buffer(u32::MAX, 0, 0, u32::MAX);
+    f.client(id).window(&surface).damage_all();
+    f.client(id).window(&surface).commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    f.synoik_state().backend.headless().frame_sink = None;
+    let frames = seen.borrow().1.clone();
+
+    assert!(
+        quiet_frames >= 2,
+        "precondition: the compositor has to have drawn for any of this to mean anything — it drew \
+         {quiet_frames} frames before the pointer moved"
+    );
+
+    // Arm one: the instrument speaks. On the first frame it ever sees, everything is new.
+    let first = &frames[0];
+    assert_eq!(
+        first.quiet, 0,
+        "the first frame has no predecessor, so every element is new: {first:?}"
+    );
+    assert!(
+        first.culprits.iter().any(|c| c.reason == "new"),
+        "first frame must name new elements: {first:?}"
+    );
+
+    // Arm two: the invariant. Once settled, nothing in a still scene justifies a repaint.
+    for (i, a) in frames[1..quiet_frames].iter().enumerate() {
+        assert_eq!(
+            a.predicted,
+            0.0,
+            "settled frame {} justifies damage it should not: {a:?}",
+            i + 1
+        );
+        assert_eq!(
+            a.quiet,
+            a.shaded,
+            "settled frame {} is not quiet: {a:?}",
+            i + 1
+        );
+    }
+
+    // Arm three: the instrument names the one thing that moved, and only that.
+    let moved = &frames[quiet_frames];
+    let kinds: Vec<&str> = moved.culprits.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["Monitor"],
+        "a repaint inside one window must be attributed to that window alone: {moved:?}"
+    );
+}

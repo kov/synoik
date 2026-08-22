@@ -927,6 +927,15 @@ impl Window {
         self.surface.attach(Some(&buffer), 0, 0);
     }
 
+    /// Mark the whole surface damaged, the way a client that repainted its contents does.
+    ///
+    /// Attaching a buffer is not damage: a commit that names no damage region asks the compositor
+    /// to repaint nothing, and the compositor is right to skip it. A test about what a repaint
+    /// costs has to say it repainted.
+    pub fn damage_all(&self) {
+        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    }
+
     /// Attach a `wl_buffer` made from `dmabuf` — the GPU path a real client presents through, and
     /// the one the compositor imports with [`Headless::import_dmabuf`].
     ///
