@@ -1477,9 +1477,18 @@ where
             if area / px < 0.01 {
                 return None;
             }
+            // `Element::opaque_regions` answers relative to the element, so the rects have to be
+            // moved to where the element sits before they can be clipped to the output. Without
+            // the offset every element away from the origin reads as declaring nothing opaque —
+            // which is exactly the answer this column exists to distinguish from the real thing.
             let opaque: f64 = e
                 .opaque_regions(scale)
                 .iter()
+                .map(|r| {
+                    let mut r = *r;
+                    r.loc += g.loc;
+                    r
+                })
                 .filter_map(|r| r.intersection(output))
                 .map(|r| f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0)))
                 .sum();
