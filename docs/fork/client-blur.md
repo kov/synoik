@@ -41,7 +41,7 @@ region, the global `Blur` config, and the per-window/per-layer `BackgroundEffect
 
 ```
 has_blur_region → blur = true                                (unless a rule says blur: false)
-any effect visible && rule.xray is None → xray = true        ← the important line
+!has_blur_region && effect visible && rule.xray is None → xray = true   ← the important line
 ```
 
 There are two draw paths behind that flag:
@@ -51,14 +51,17 @@ There are two draw paths behind that flag:
 | `FramebufferEffect` (non-xray) | **the real framebuffer** — mid-frame capture of everything drawn behind the surface, then the gaussian, then the postprocess/clip draw | `render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs` |
 | `Xray` | an offscreen holding **only the background-layer surfaces and the GNOME wallpaper** (`Synoik::fill_xray_elements`, `synoik.rs:10446`) | `render_helpers/xray.rs`, `vulkan/effect_blur.rs` |
 
-**Today every client that sets a blur region gets the xray path.** The config file is gone, so no
-window or layer rule can set `xray: false`; `rule.xray` is always `None`; the line above therefore
-always fires. The consequence is not a quality difference, it is a semantic one: a window with a
-blur region shows *the wallpaper, blurred* — the windows stacked behind it are not there. Stack two
-blurred terminals and the top one does not see the bottom one.
+**A client that sets a blur region gets the real-backdrop path; everything the shell blurs on its
+own behalf gets xray.** The `!has_blur_region` guard is what splits them: a client asking through
+`ext-background-effect-v1` is asking for the windows behind it, blurred, and the xray buffer holds
+only the background layer and the wallpaper, so it could not answer that. The shell's own chrome —
+panel plate, dash pill — has no blur region and takes xray, which is both cheaper and correct for
+something that sits over the desktop.
 
-The real-backdrop path exists, works, and is exercised by tests
-(`vulkan_backdrop_effect_roundtrips_under_rotation`); it is simply unreachable from a client.
+The cost follows the split. Xray surfaces share one background-only offscreen per output and per
+render target (`Synoik::fill_xray_elements`), refilled once a frame. Real-backdrop surfaces each
+take their own mid-frame capture of the framebuffer, because each one sits at a different depth in
+the stack and must see exactly what is under *it*.
 
 Blur maths, both paths: GNOME's separable gaussian (`synoik-vk/src/blur.rs`) — a downscale
 cascade to where the surviving sigma is small, one horizontal and one vertical pass there, and one
