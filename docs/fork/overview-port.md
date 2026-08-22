@@ -554,7 +554,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   - **Inactive-workspace shrink (`74536094`).** `WORKSPACE_INACTIVE_SCALE` 0.94 about a centered pivot
     (`_updateWorkspacesState`, `:243-266`; `workspace.js:1039`) — the "one we are in is a little
     bigger" read. The zoom became per workspace; the slot keeps the full size so the row's advance and
-    anchor don't move, and hit-testing / drag targets / xray / shadows all follow the same rect.
+    anchor don't move, and hit-testing / drag targets / shadows all follow the same rect.
     **Divergence:** gnome-shell scales overview-only actors, so ours ramps in with the overview
     progress or a desktop workspace switch would shrink both workspaces mid-slide.
 - **S8e — Overview interaction fidelity (reported live, 2026-07-24). ✅ DONE.** A second batch
@@ -721,7 +721,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   workspace-thumbnail strip in the internal shot is **not** a bug: 2 workspaces there, 3 in the
   external shot, and GNOME's strip only shows above `NUM_WORKSPACES_THRESHOLD = 2`
   (`workspaceThumbnail.js:16,697`). Related and already fixed at a different layer: the expose
-  xray was sampling the backdrop unscaled (`39e25b69`) — done, not this.
+  the see-through path was sampling the backdrop unscaled (`39e25b69`) — done, not this.
   **Approved follow-on divergence (Gustavo, 2026-07-26): adaptive overview chrome** — everything
   in the overview except the panel and text sizes adapts to the logical canvas (GNOME's fixed
   constants read comically on small canvases: near-round 30px preview corners, picker gaps

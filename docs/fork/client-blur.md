@@ -24,48 +24,29 @@ We register the global unconditionally (`synoik.rs:6790`) and always answer `Cap
 we cache the committed region as non-overlapping surface-local rects and damage the surface's
 background effect on commit.
 
-**Fixed 2026-08-06** (§5 defects 1 and 2): client-requested blur now takes the real-backdrop path,
-and blur turned off globally makes the request a no-op rather than a see-through hole. §2 describes
-the state before that change and the machinery both paths still share; the resolution rule now reads:
-
 ```
-has_blur_region → blur = true, xray = false        (unless a rule says otherwise)
-shell-requested → blur per rule, xray = true       (unchanged: the cheap path)
+has_blur_region → blur = true                (unless a rule says blur: false)
 blur.off        → nothing renders, capability bit cleared
 ```
 
 ## 2. Today's rendering path
 
 `src/render_helpers/background_effect.rs` decides, per surface, from three inputs: the client's blur
-region, the global `Blur` config, and the per-window/per-layer `BackgroundEffect` rule.
-
-```
-has_blur_region → blur = true                                (unless a rule says blur: false)
-!has_blur_region && effect visible && rule.xray is None → xray = true   ← the important line
-```
-
-There are two draw paths behind that flag:
-
-| path | source of the backdrop | code |
-| --- | --- | --- |
-| `FramebufferEffect` (non-xray) | **the real framebuffer** — mid-frame capture of everything drawn behind the surface, then the gaussian, then the postprocess/clip draw | `render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs` |
-| `Xray` | an offscreen holding **only the background-layer surfaces and the GNOME wallpaper** (`Synoik::fill_xray_elements`, `synoik.rs:10446`) | `render_helpers/xray.rs`, `vulkan/effect_blur.rs` |
+region, the global `Blur` config, and the per-window/per-layer `BackgroundEffect` rule. There is one
+draw path: `FramebufferEffect` takes a mid-frame capture of everything drawn behind the surface,
+runs the gaussian over it, and draws the postprocess/clip
+(`render_helpers/framebuffer_effect.rs`, `vulkan/backdrop_blur.rs`).
 
 That rule governs only the surfaces that go *through* `BackgroundEffect` — window and layer
 surfaces. **The shell's own chrome does not: `ui/panel.rs` and `ui/dash.rs` construct a
 `FramebufferEffect` directly**, so the panel plate and the dock pill blur the real framebuffer and
 show the windows behind them. Anything visible through them is the evidence.
 
-For the surfaces that do go through it, `!has_blur_region` is the split: a client asking through
-`ext-background-effect-v1` is asking for the windows behind it, blurred, and the xray buffer holds
-only the background layer and the wallpaper, so it could not answer that.
-
-**Which leaves xray with no live caller.** Reaching the default needs a visible effect that the
-*shell* turned on — `blur`, `noise` or `saturation` from a window or layer rule — and those come
-only from `BackgroundEffectRule`, whose fields are all `Option` and whose only source was the
-config file. With the file gone every field is `None`, `is_visible()` is false, and the default
-never fires. `Synoik::fill_xray_elements` still runs on every frame (and again per screencast
-target), building a background-layer-plus-wallpaper element list that nothing samples.
+A client asking through `ext-background-effect-v1` is asking for the windows behind it, blurred, so
+the real framebuffer is the only thing that can answer. A shared background-only offscreen is
+cheaper, but it can show only the wallpaper and the background layer — a window stacked over another
+window would see through to the desktop — so it can never be the *general* path. Where it could pay
+is the case below, where nothing is behind a surface but the background.
 
 So the cost today is: **one mid-frame framebuffer capture and one gaussian chain per blurred
 surface** — every blurred client, plus the panel, plus the dock — because each sits at a different
@@ -105,7 +86,7 @@ Already right, and not to be re-litigated: the **overview's blurred wallpaper is
 one magnified draw of the cached texture. It also declares its opaque region, which is what culls
 the full-output `SolidColor` beneath it.
 
-Blur maths, both paths: GNOME's separable gaussian (`synoik-vk/src/blur.rs`) — a downscale
+Blur maths: GNOME's separable gaussian (`synoik-vk/src/blur.rs`) — a downscale
 cascade to where the surviving sigma is small, one horizontal and one vertical pass there, and one
 magnifying draw back to the destination — plus
 `noise = 0.02` and `saturation = 1.5` — global defaults in `synoik-config::Blur`, identical for
@@ -125,7 +106,7 @@ Reach: toplevels, their popups, and layer-shell surfaces (`window/mapped.rs`, `l
 `_KDE_NET_WM_BLUR_BEHIND_REGION`.
 
 One thing we do that neither reference does: the effect state is **per render target**
-(`RenderTarget::COUNT` buffers, `xray.rs:29`), so a screencast that must block out a window cannot
+(one effect buffer per `RenderTarget`), so a screencast that must block out a window cannot
 composite from a capture the on-screen target filled. That is a privacy invariant, not a nicety.
 
 ## 3. KWin (Plasma 6.7)
@@ -186,18 +167,16 @@ per-material tint/vibrancy recipe, the active/inactive fallback, and the accessi
 
 Defects first — these are wrong, not merely absent.
 
-1. ~~**Client blur is wallpaper-only.**~~ **DONE 2026-08-06.** `update_render_elements` no longer
-   defaults xray on when the region came from the client, so client blur reaches the existing
-   `FramebufferEffect` real-backdrop path. An explicit `xray: true` rule still wins; shell-requested
-   effects still default to xray, which is the cheaper path and what the overview/shell chrome want.
-   Pinned by `a_client_blur_region_blurs_the_real_backdrop` and its three siblings, over the
+1. ~~**Client blur is wallpaper-only.**~~ **DONE 2026-08-06.** Client blur reaches the
+   `FramebufferEffect` real-backdrop path; the cheap wallpaper-only path it used to default to is
+   gone entirely. Pinned by `a_client_blur_region_blurs_the_real_backdrop` and its sibling, over the
    resolution rule, and by `src/tests/background_effect.rs` over the protocol seam either side of it
    (a real client binds the manager, sets a region, and the compositor-side cache is read back).
    The draw itself was already pinned: `vulkan_backdrop_blur_honours_the_subregion` renders the
    real-backdrop path with a `set_blur_region` subregion and checks the edge softens inside it and
    stays sharp outside.
-   **Cost note:** each blurred surface now pays a mid-frame capture + its own blur chain per
-   frame, where the xray path shared one buffer per output. Both are cached across frames
+   **Cost note:** each blurred surface pays a mid-frame capture + its own blur chain per
+   frame, where the deleted see-through path shared one buffer per output. Both are cached across frames
    (`BackdropBlur` in the element's `UserDataMap`) and the blur records into the frame's own command
    buffer, so it is not a submit — but it is real per-surface GPU work, and gap 8 (occlusion skip)
    is what bounds it.
@@ -303,9 +282,7 @@ Then the absent capabilities, in the order I'd take them:
    they are one recipe rather than four knobs — macOS's actual insight, and the thing a
    blur-strength slider cannot buy. `Finish::NONE` is what the shell's chrome passes: the panel and
    dash paint their own `$system_*` fill over the blur, so a tint underneath would only muddy a
-   colour the theme already specifies. The xray path stays untinted for a different reason — it
-   samples only the wallpaper and the background layer, so a legibility wash over a backdrop that
-   is already wrong would make the wrongness harder to see, not easier.
+   colour the theme already specifies.
 
    **Where it is resolved matters more than the values.** The appearance goes into `Options`, which
    `update_render_elements` compares to decide whether to `damage_all()`. Read at draw time instead,
@@ -443,7 +420,7 @@ Then the absent capabilities, in the order I'd take them:
      **Residual, deliberate.** `passes: None` is exempt, and `is_visible()` is true for noise or
      saturation alone, so a *visible but unblurred* effect under animating geometry still allocates
      one capture texture per frame. No default path builds one — it needs a window rule asking for
-     noise/saturation with `blur: false` and an explicit `xray: false` — and quantizing it is the
+     noise/saturation with `blur: false` — and quantizing it is the
      wrong trade: the raw capture is a resample, so slack would upsample then downsample it, and
      that path exists precisely to leave the backdrop crisp.
 

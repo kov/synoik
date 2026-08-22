@@ -48,7 +48,7 @@ precisely because one thread hands out the numbers.
    be outside a render pass. This is where new work goes by default. Today it carries
    `pending_glyphs`, `pending_dmabuf_acquires` (fresh imports and recommits alike),
    `pending_texture_uploads` (host imports, shm re-uploads and the wallpaper), `pending_sampleable`
-   (the layout barrier a never-rendered offscreen needs) and `pending_blurs` (the xray blur chain).
+   (the layout barrier a never-rendered offscreen needs) and `pending_blurs` (the wallpaper's blur chain).
    The order within `begin` is the order of dependencies: barriers before the blurs that sample them,
    and everything before the render pass.
 

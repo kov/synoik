@@ -97,7 +97,7 @@ user's sigma/brightness apply. Nothing to adopt unless we want the knob.
 ### 2.6 Applications (per-window) — default **OFF** — **partly ours already**
 Two separate things bundled:
 - blur *behind* a translucent window, whitelist/blacklist by `wm_class` with wildcards. This is
-  what our `ext-background-effect-v1` + xray path already does, client-driven rather than
+  what our `ext-background-effect-v1` path already does, client-driven rather than
   compositor-forced.
 - `opacity` (default 215/255) **forced onto the window actor**, with `dynamic-opacity` (default
   true) making the *focused* window solid and unfocused ones translucent. That is a real behavior
