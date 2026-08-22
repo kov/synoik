@@ -8232,7 +8232,7 @@ impl Synoik {
 
         let scale = applied
             .and_then(|a| a.scale)
-            .or_else(|| saved.map(|s| s.scale))
+            .or_else(|| saved.as_ref().map(|s| s.scale))
             .or_else(|| c.and_then(|c| c.scale).map(|s| s.0))
             .unwrap_or_else(|| {
                 let size_mm = output.physical_properties().size;
@@ -8243,7 +8243,7 @@ impl Synoik {
 
         let base_transform = applied
             .and_then(|a| a.transform)
-            .or_else(|| saved.map(|s| s.transform))
+            .or_else(|| saved.as_ref().map(|s| s.transform))
             .unwrap_or_else(|| {
                 c.map(|c| ipc_transform_to_smithay(c.transform))
                     .unwrap_or(Transform::Normal)

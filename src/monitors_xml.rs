@@ -14,6 +14,27 @@
 //! We read the v2 format (`monitors version="2"`) that mutter 50.1 writes; the schema and matching
 //! semantics follow `~/Projects/mutter/src/backends/meta-monitor-config-store.c`. Writing it back
 //! lives with the `Mutter/DisplayConfig` `ApplyMonitorsConfig` handler.
+//!
+//! # A configuration is a set, not a monitor
+//!
+//! The unit of storage *and* of matching is the `<configuration>`: it covers a whole set of
+//! monitors and decides all of their positions, scales, transforms and which one is primary,
+//! together. mutter looks one up by the key of the currently connected set
+//! (`MetaMonitorsConfigKey`, `meta-monitor-config-manager.c:1499`) and applies it whole, or falls
+//! through to a generated layout. [`MonitorsConfig::configuration_for`] is that lookup.
+//!
+//! Position cannot be recovered any other way: it is a statement about where a monitor sits
+//! *relative to the others in that set*, so a per-monitor lookup has nothing to say about it.
+//!
+//! Below it we keep one tier mutter does not have: [`MonitorsConfig::setting_for`] matches a
+//! single monitor by connector and hands back the scale/transform it was last saved with. It is
+//! what keeps a remembered scale working when the user connects a display in a combination they
+//! have never saved — where mutter would go straight to the DPI guess.
+//!
+//! The key includes the connector, exactly as `meta_monitor_spec_equals` does, so a connector
+//! rename loses the match and the set comes up on generated defaults. On a VM whose connector
+//! names are assigned in hotplug order that is a real hazard; matching on EDID identity alone is
+//! a deliberate divergence we have scoped but not taken.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,11 +42,13 @@ use std::path::PathBuf;
 use smithay::utils::Transform;
 use synoik_config::OutputName;
 
-/// One saved logical-monitor setting for a single physical monitor, flattened out of the
-/// `<logicalmonitor>`/`<monitor>` nesting. We keep what we apply today (scale + transform) plus
-/// the `<mode>` the setting was saved *for*; position/primary are parsed-but-ignored for now
-/// (single-monitor is the common case and the preferred mode already matches — see the module
-/// TODO).
+/// One saved monitor flattened out of the `<logicalmonitor>`/`<monitor>` nesting: the scale and
+/// transform of the logical monitor it belonged to, plus the `<mode>` it was saved at.
+///
+/// This is the *fallback* view of the store, used only when no whole configuration matches the
+/// connected set ([`MonitorsConfig::setting_for`]). Position and primary are deliberately absent:
+/// both are properties of a configuration as a whole, so they are only meaningful through
+/// [`SavedConfiguration`], never through a single monitor picked out of one.
 #[derive(Debug, Clone)]
 pub struct MonitorSetting {
     /// EDID/DRM connector, e.g. `Virtual-1` — the primary match key.
@@ -83,11 +106,95 @@ impl MonitorSetting {
     }
 }
 
-/// The parsed contents of `monitors.xml`: every saved per-monitor setting, flattened across all
-/// `<configuration>`s. Lookup returns the first matching entry (see [`Self::setting_for`]).
+/// One physical monitor inside a saved `<logicalmonitor>`: its `<monitorspec>` identity and the
+/// `<mode>` it was saved at.
+#[derive(Debug, Clone)]
+pub struct SavedMonitor {
+    pub connector: String,
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub serial: Option<String>,
+    pub mode: Option<SavedMode>,
+}
+
+/// One saved `<logicalmonitor>`: where the logical monitor sits, how it is scaled and oriented,
+/// whether it is primary, and which physical monitor(s) drive it (more than one = mirroring,
+/// which we parse but do not yet apply).
+#[derive(Debug, Clone)]
+pub struct SavedLogicalMonitor {
+    pub x: i32,
+    pub y: i32,
+    pub scale: f64,
+    pub primary: bool,
+    pub transform: Transform,
+    pub monitors: Vec<SavedMonitor>,
+}
+
+/// One saved `<configuration>` — mutter's unit of both storage *and* matching.
+///
+/// A configuration describes a whole monitor **set**: it applies only when exactly those monitors
+/// are connected, and then it decides every logical monitor's position, scale, transform and
+/// primary flag together. Matching one monitor at a time cannot reproduce that, because position
+/// is a property of the set (see [`MonitorsConfig::configuration_for`]).
+#[derive(Debug, Clone)]
+pub struct SavedConfiguration {
+    pub logical_monitors: Vec<SavedLogicalMonitor>,
+}
+
+impl SavedConfiguration {
+    /// The set of monitor specs this configuration covers — mutter's `MetaMonitorsConfigKey`
+    /// (`meta-monitor-config-manager.c:1499`), which is what a stored config is looked up by.
+    fn key(&self) -> BTreeSet<SpecKey> {
+        self.logical_monitors
+            .iter()
+            .flat_map(|lm| &lm.monitors)
+            .map(|m| {
+                SpecKey::new(
+                    &m.connector,
+                    m.product.as_deref().unwrap_or(""),
+                    m.serial.as_deref().unwrap_or(""),
+                )
+            })
+            .collect()
+    }
+
+    /// The saved logical monitor driven by `connector`, if this configuration covers it.
+    pub fn logical_monitor_for(&self, connector: &str) -> Option<&SavedLogicalMonitor> {
+        self.logical_monitors
+            .iter()
+            .find(|lm| lm.monitors.iter().any(|m| m.connector == connector))
+    }
+
+    /// Whether every saved `<mode>` in this configuration is the mode its monitor is running.
+    ///
+    /// mutter refuses a stored config whose modes cannot be assigned ("Invalid mode",
+    /// `meta-monitor-config-manager.c:327`) and falls through to the next tier; a saved scale is a
+    /// judgement about *that* mode's pixel density, so applying it at another mode would be wrong.
+    /// A monitor with no saved `<mode>`, or one whose current mode we don't know, does not veto.
+    pub fn modes_applicable(
+        &self,
+        current: &dyn Fn(&str) -> Option<smithay::output::Mode>,
+    ) -> bool {
+        self.logical_monitors
+            .iter()
+            .flat_map(|lm| &lm.monitors)
+            .all(|m| match (m.mode, current(&m.connector)) {
+                (Some(saved), Some(current)) => saved.matches(current),
+                _ => true,
+            })
+    }
+}
+
+/// The parsed contents of `monitors.xml`: every saved `<configuration>`, in file order.
+///
+/// The store is read at two levels. [`Self::configuration_for`] is mutter's own: match the whole
+/// connected set and get position/scale/transform/primary for all of it. [`Self::setting_for`] is
+/// our per-monitor fallback for when no configuration matches the set — mutter has no such tier
+/// (it goes straight to a generated default), but it keeps a remembered scale working when the
+/// user plugs in a display they have never had in *this* combination.
 #[derive(Debug, Clone, Default)]
 pub struct MonitorsConfig {
-    settings: Vec<MonitorSetting>,
+    configurations: Vec<SavedConfiguration>,
 }
 
 #[cfg(test)]
@@ -140,58 +247,72 @@ impl MonitorsConfig {
             return Ok(Self::default());
         }
 
-        let mut settings = Vec::new();
-        for logical in root
-            .children()
-            .filter(|c| c.has_tag_name("configuration"))
-            .flat_map(|conf| conf.children())
-            .filter(|c| c.has_tag_name("logicalmonitor"))
-        {
-            let text = |parent: roxmltree::Node, tag: &str| {
-                parent
-                    .children()
-                    .find(|c| c.has_tag_name(tag))
-                    .and_then(|c| c.text())
-                    .map(str::trim)
-                    .map(str::to_owned)
-            };
+        let text = |parent: roxmltree::Node, tag: &str| {
+            parent
+                .children()
+                .find(|c| c.has_tag_name(tag))
+                .and_then(|c| c.text())
+                .map(str::trim)
+                .map(str::to_owned)
+        };
 
-            let scale = match text(logical, "scale").and_then(|s| s.parse::<f64>().ok()) {
-                Some(s) if s > 0. => s,
-                _ => continue, // a logicalmonitor with no usable scale is not useful to us
-            };
-            let transform = parse_transform(logical);
+        let mut configurations = Vec::new();
+        for conf in root.children().filter(|c| c.has_tag_name("configuration")) {
+            let mut logical_monitors = Vec::new();
+            for logical in conf.children().filter(|c| c.has_tag_name("logicalmonitor")) {
+                let scale = match text(logical, "scale").and_then(|s| s.parse::<f64>().ok()) {
+                    Some(s) if s > 0. => s,
+                    _ => continue, // a logicalmonitor with no usable scale is not useful to us
+                };
 
-            for monitor in logical.children().filter(|c| c.has_tag_name("monitor")) {
-                let Some(spec) = monitor.children().find(|c| c.has_tag_name("monitorspec")) else {
-                    continue;
-                };
-                let Some(connector) = text(spec, "connector") else {
-                    continue;
-                };
-                let mode = monitor
-                    .children()
-                    .find(|c| c.has_tag_name("mode"))
-                    .and_then(|m| {
-                        let num = |tag: &str| text(m, tag)?.parse::<f64>().ok();
-                        Some(SavedMode {
-                            width: num("width")? as i32,
-                            height: num("height")? as i32,
-                            rate: num("rate")?,
-                        })
+                let mut monitors = Vec::new();
+                for monitor in logical.children().filter(|c| c.has_tag_name("monitor")) {
+                    let Some(spec) = monitor.children().find(|c| c.has_tag_name("monitorspec"))
+                    else {
+                        continue;
+                    };
+                    let Some(connector) = text(spec, "connector") else {
+                        continue;
+                    };
+                    let mode = monitor
+                        .children()
+                        .find(|c| c.has_tag_name("mode"))
+                        .and_then(|m| {
+                            let num = |tag: &str| text(m, tag)?.parse::<f64>().ok();
+                            Some(SavedMode {
+                                width: num("width")? as i32,
+                                height: num("height")? as i32,
+                                rate: num("rate")?,
+                            })
+                        });
+                    monitors.push(SavedMonitor {
+                        connector,
+                        vendor: text(spec, "vendor"),
+                        product: text(spec, "product"),
+                        serial: text(spec, "serial"),
+                        mode,
                     });
-                settings.push(MonitorSetting {
-                    connector,
-                    product: text(spec, "product"),
-                    serial: text(spec, "serial"),
-                    mode,
+                }
+                if monitors.is_empty() {
+                    continue;
+                }
+
+                logical_monitors.push(SavedLogicalMonitor {
+                    // Position is optional in the schema; mutter defaults it to the origin.
+                    x: text(logical, "x").and_then(|s| s.parse().ok()).unwrap_or(0),
+                    y: text(logical, "y").and_then(|s| s.parse().ok()).unwrap_or(0),
                     scale,
-                    transform,
+                    primary: text(logical, "primary").as_deref() == Some("yes"),
+                    transform: parse_transform(logical),
+                    monitors,
                 });
+            }
+            if !logical_monitors.is_empty() {
+                configurations.push(SavedConfiguration { logical_monitors });
             }
         }
 
-        Ok(Self { settings })
+        Ok(Self { configurations })
     }
 
     /// The saved setting for `name` at `current_mode`, if any (`None` → use the DPI guess). The
@@ -211,8 +332,8 @@ impl MonitorsConfig {
         &self,
         name: &OutputName,
         current_mode: Option<smithay::output::Mode>,
-    ) -> Option<&MonitorSetting> {
-        let applicable = |s: &&MonitorSetting| {
+    ) -> Option<MonitorSetting> {
+        let applicable = |s: &MonitorSetting| {
             s.connector == name.connector
                 && match (s.mode, current_mode) {
                     (Some(saved), Some(current)) => saved.matches(current),
@@ -220,18 +341,62 @@ impl MonitorsConfig {
                     _ => true,
                 }
         };
-        let mut by_connector = self.settings.iter().filter(applicable);
+        let mut by_connector = self.settings().filter(applicable);
         let first = by_connector.next()?;
         // Fast path: a single entry for this connector — use it regardless of product/serial.
         if by_connector.next().is_none() {
             return Some(first);
         }
         // Multiple: prefer a corroborating entry, else the first.
-        self.settings
-            .iter()
+        self.settings()
             .filter(applicable)
             .find(|s| s.corroborates(name))
             .or(Some(first))
+    }
+
+    /// The stored configuration for exactly this set of connected monitors, if one is saved.
+    ///
+    /// This is mutter's lookup (`meta_monitor_config_manager_get_stored`,
+    /// `meta-monitor-config-manager.c:506`): build the key for the current state and find the
+    /// configuration stored under it. The key is the **set** of monitor specs, so a configuration
+    /// applies only when precisely those monitors are connected — plugging a third display in
+    /// means a different key and a different (or no) stored configuration.
+    ///
+    /// The key follows `meta_monitor_spec_equals` except for `<vendor>`, which we leave out for
+    /// the reason [`SpecKey`] documents: it is one code per manufacturer, so it adds no
+    /// discrimination, and our own builds before `28212e78` spelled it differently from mutter.
+    /// Connector **is** part of the key, exactly as in mutter — which means a connector rename
+    /// loses the match. That is deliberate for now; identity-only matching is a separate step.
+    ///
+    /// If several stored configurations share a key (as happens in a file written across a
+    /// connector rename), the **last** wins: [`merge`] appends the configuration it is saving, so
+    /// last in the file is the most recently saved.
+    pub fn configuration_for<'a>(
+        &self,
+        connected: impl IntoIterator<Item = &'a OutputName>,
+    ) -> Option<&SavedConfiguration> {
+        let key: BTreeSet<SpecKey> = connected.into_iter().map(SpecKey::of).collect();
+        if key.is_empty() {
+            return None;
+        }
+        self.configurations.iter().rev().find(|c| c.key() == key)
+    }
+
+    /// Every saved monitor in the store, flattened across configurations, as the per-monitor view
+    /// the fallback tier ([`Self::setting_for`], [`Self::saved_modes_for`]) works in.
+    fn settings(&self) -> impl Iterator<Item = MonitorSetting> + '_ {
+        self.configurations.iter().flat_map(|c| {
+            c.logical_monitors.iter().flat_map(|lm| {
+                lm.monitors.iter().map(move |m| MonitorSetting {
+                    connector: m.connector.clone(),
+                    product: m.product.clone(),
+                    serial: m.serial.clone(),
+                    mode: m.mode,
+                    scale: lm.scale,
+                    transform: lm.transform,
+                })
+            })
+        })
     }
 
     /// Every mode saved for `name`'s connector, corroborating entries first.
@@ -250,15 +415,13 @@ impl MonitorsConfig {
         &'a self,
         name: &'a OutputName,
     ) -> impl Iterator<Item = SavedMode> + 'a {
-        let for_connector = |s: &&MonitorSetting| s.connector == name.connector;
+        let for_connector = |s: &MonitorSetting| s.connector == name.connector;
         let corroborating = self
-            .settings
-            .iter()
+            .settings()
             .filter(for_connector)
             .filter(|s| s.corroborates(name));
         let rest = self
-            .settings
-            .iter()
+            .settings()
             .filter(for_connector)
             .filter(|s| !s.corroborates(name));
         corroborating.chain(rest).filter_map(|s| s.mode)
@@ -307,6 +470,18 @@ impl SpecKey {
             connector.to_lowercase(),
             product.to_lowercase(),
             serial.to_lowercase(),
+        )
+    }
+
+    /// The key of a *connected* output, as [`MonitorsConfig::configuration_for`] looks it up.
+    /// `OutputName`'s `model`/`serial` are the same two fields the writer persists as
+    /// `<product>`/`<serial>`, and absent ones become empty strings — which is what a
+    /// `<monitorspec>` missing that element parses to, so the two sides agree.
+    fn of(name: &OutputName) -> Self {
+        Self::new(
+            &name.connector,
+            name.model.as_deref().unwrap_or(""),
+            name.serial.as_deref().unwrap_or(""),
         )
     }
 
@@ -672,7 +847,11 @@ mod tests {
     #[test]
     fn wrong_version_is_ignored() {
         let xml = KOV_XML.replace(r#"version="2""#, r#"version="1""#);
-        assert!(MonitorsConfig::parse(&xml).unwrap().settings.is_empty());
+        assert!(MonitorsConfig::parse(&xml)
+            .unwrap()
+            .settings()
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -921,12 +1100,197 @@ mod tests {
         }
     }
 
+    /// A store shaped like one a real session accumulates: the external alone, the built-in panel
+    /// alone under *two* different connectors (the same panel, saved before and after a connector
+    /// rename), and the two together. This is the shape that made whole-configuration matching
+    /// necessary — see the module docs.
+    fn accumulated_store() -> String {
+        fn solo(
+            connector: &str,
+            product: &str,
+            serial: &str,
+            w: i32,
+            h: i32,
+            scale: &str,
+        ) -> String {
+            format!(
+                r#"  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>{scale}</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>{connector}</connector>
+          <vendor>LMN</vendor>
+          <product>{product}</product>
+          <serial>{serial}</serial>
+        </monitorspec>
+        <mode>
+          <width>{w}</width>
+          <height>{h}</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+"#
+            )
+        }
+        let mut xml = String::from("<monitors version=\"2\">\n");
+        xml.push_str(&solo("Virtual-1", "EXT-4K", "0xaaaa", 3840, 2160, "1.25"));
+        xml.push_str(&solo("Virtual-1", "Built-in", "0xbbbb", 2048, 1328, "1"));
+        xml.push_str(&solo("Virtual-2", "Built-in", "0xbbbb", 2048, 1328, "1"));
+        // The pair: external primary at the origin, the panel to its right.
+        xml.push_str(
+            r#"  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>3072</x>
+      <y>0</y>
+      <scale>1</scale>
+      <monitor>
+        <monitorspec>
+          <connector>Virtual-2</connector>
+          <vendor>LMN</vendor>
+          <product>Built-in</product>
+          <serial>0xbbbb</serial>
+        </monitorspec>
+        <mode>
+          <width>2048</width>
+          <height>1328</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1.25</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>Virtual-1</connector>
+          <vendor>LMN</vendor>
+          <product>EXT-4K</product>
+          <serial>0xaaaa</serial>
+        </monitorspec>
+        <mode>
+          <width>3840</width>
+          <height>2160</height>
+          <rate>60.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+"#,
+        );
+        xml.push_str("</monitors>\n");
+        xml
+    }
+
+    #[test]
+    fn the_configuration_for_a_pair_places_both_and_names_the_primary() {
+        let store = MonitorsConfig::parse(&accumulated_store()).unwrap();
+        let ext = name("Virtual-1", Some("EXT-4K"), Some("0xaaaa"));
+        let panel = name("Virtual-2", Some("Built-in"), Some("0xbbbb"));
+
+        let conf = store
+            .configuration_for([&ext, &panel])
+            .expect("the pair is saved");
+
+        let ext_lm = conf.logical_monitor_for("Virtual-1").unwrap();
+        assert_eq!((ext_lm.x, ext_lm.y), (0, 0));
+        assert_eq!(ext_lm.scale, 1.25);
+        assert!(ext_lm.primary);
+
+        let panel_lm = conf.logical_monitor_for("Virtual-2").unwrap();
+        assert_eq!((panel_lm.x, panel_lm.y), (3072, 0));
+        assert_eq!(panel_lm.scale, 1.);
+        assert!(!panel_lm.primary);
+    }
+
+    #[test]
+    fn a_configuration_matches_the_whole_set_or_not_at_all() {
+        let store = MonitorsConfig::parse(&accumulated_store()).unwrap();
+        let ext = name("Virtual-1", Some("EXT-4K"), Some("0xaaaa"));
+        let panel = name("Virtual-2", Some("Built-in"), Some("0xbbbb"));
+        let third = name("Virtual-3", Some("Portable"), Some("0xcccc"));
+
+        // The external alone matches its own solo configuration, not the pair.
+        let solo = store.configuration_for([&ext]).expect("solo is saved");
+        assert_eq!(solo.logical_monitors.len(), 1);
+        assert_eq!(solo.logical_monitor_for("Virtual-1").unwrap().x, 0);
+
+        // A set we have never saved matches nothing, even though every monitor in it is known.
+        assert!(store.configuration_for([&ext, &panel, &third]).is_none());
+        assert!(store.configuration_for([]).is_none());
+    }
+
+    #[test]
+    fn a_connector_rename_loses_both_the_match_and_the_fallback() {
+        let store = MonitorsConfig::parse(&accumulated_store()).unwrap();
+        // The same panel, same EDID, on a connector it has not been saved under.
+        let renamed = name("Virtual-9", Some("Built-in"), Some("0xbbbb"));
+
+        // mutter's key includes the connector, so the whole-set lookup misses. This is the
+        // deliberate limitation the module documents; identity-only matching is a separate step.
+        assert!(store.configuration_for([&renamed]).is_none());
+
+        // The per-monitor fallback tier is keyed on the connector too, so it misses as well —
+        // the display comes up on the DPI guess.
+        assert!(store.setting_for(&renamed, None).is_none());
+    }
+
+    #[test]
+    fn among_configurations_sharing_a_key_the_last_saved_wins() {
+        // Two stanzas for one connected set, as `merge` leaves things when a foreign writer got
+        // there first: the fresh one is appended last, so it is the one that must win.
+        let stanza = |scale: &str| {
+            mutter_written("DELL", "0x1", 3840, 2160, scale)
+                .replace("<monitors version=\"2\">\n", "")
+                .replace("</monitors>\n", "")
+        };
+        let xml = format!(
+            "<monitors version=\"2\">\n{}{}</monitors>\n",
+            stanza("1"),
+            stanza("2"),
+        );
+        let store = MonitorsConfig::parse(&xml).unwrap();
+        let dell = name("Virtual-1", Some("DELL"), Some("0x1"));
+        let conf = store.configuration_for([&dell]).unwrap();
+        assert_eq!(conf.logical_monitor_for("Virtual-1").unwrap().scale, 2.);
+    }
+
+    #[test]
+    fn a_configuration_saved_for_another_mode_is_not_applicable() {
+        let store = MonitorsConfig::parse(&accumulated_store()).unwrap();
+        let ext = name("Virtual-1", Some("EXT-4K"), Some("0xaaaa"));
+        let conf = store.configuration_for([&ext]).unwrap();
+
+        let at = |w, h, refresh| {
+            move |_: &str| {
+                Some(smithay::output::Mode {
+                    size: smithay::utils::Size::from((w, h)),
+                    refresh,
+                })
+            }
+        };
+        assert!(conf.modes_applicable(&at(3840, 2160, 60_000)));
+        assert!(!conf.modes_applicable(&at(1920, 1200, 60_000)));
+        // An output whose mode we don't know does not veto.
+        assert!(conf.modes_applicable(&|_| None));
+    }
+
     #[test]
     fn missing_or_garbage_is_empty_not_panic() {
         assert!(MonitorsConfig::parse("not xml at all <<<").is_err());
         assert!(MonitorsConfig::parse("<monitors version=\"2\"></monitors>")
             .unwrap()
-            .settings
-            .is_empty());
+            .settings()
+            .next()
+            .is_none());
     }
 }
