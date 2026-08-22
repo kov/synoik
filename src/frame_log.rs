@@ -1443,6 +1443,58 @@ pub fn log_scene_breakdown<E>(
     }
 }
 
+/// Walk `elements` front-to-back the way the renderer does, yielding the ones it would actually
+/// shade, each with the area it costs.
+///
+/// smithay's rule, matched here exactly: an element whose output-clipped geometry is *entirely*
+/// covered by the opaque regions declared above it is skipped and costs nothing; every other one
+/// is drawn over its whole geometry, so a partially covered element still pays in full. A hidden
+/// element does not contribute its own opaque regions, because it never gets that far.
+///
+/// Summing geometry without the skip is how this instrument came to report a full-output backdrop
+/// that was already culled — a whole output of cost attributed to an element that costs nothing,
+/// which is the most expensive kind of wrong an attribution tool can be.
+fn shaded_elements<E>(
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) -> Vec<(usize, &E, f64)>
+where
+    E: smithay::backend::renderer::element::Element,
+{
+    use smithay::utils::Rectangle;
+
+    let mut opaque: Vec<Rectangle<i32, smithay::utils::Physical>> = Vec::new();
+    let mut shaded = Vec::with_capacity(elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        let geo = e.geometry(scale);
+        let Some(clipped) = geo.intersection(output) else {
+            continue;
+        };
+        let visible = Rectangle::subtract_rects_many([clipped], opaque.iter().copied());
+        let visible_area: i64 = visible
+            .iter()
+            .map(|r| i64::from(r.size.w.max(0)) * i64::from(r.size.h.max(0)))
+            .sum();
+        if visible_area == 0 {
+            continue;
+        }
+        opaque.extend(
+            e.opaque_regions(scale)
+                .iter()
+                .map(|r| {
+                    let mut r = *r;
+                    r.loc += geo.loc;
+                    r
+                })
+                .filter_map(|r| r.intersection(output)),
+        );
+        let area = f64::from(clipped.size.w.max(0)) * f64::from(clipped.size.h.max(0));
+        shaded.push((i, e, area));
+    }
+    shaded
+}
+
 /// One line per element, for when the per-kind [`scene_breakdown`] has named the expensive class
 /// and the question becomes *which* element that is and *why it is not culled*.
 ///
@@ -1464,14 +1516,10 @@ where
         return Vec::new();
     }
     let px = output_px as f64;
-    elements
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| {
+    shaded_elements(elements, scale, output)
+        .into_iter()
+        .filter_map(|(i, e, area)| {
             let g = e.geometry(scale);
-            let area = g.intersection(output).map_or(0.0, |r| {
-                f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0))
-            });
             // Below a hundredth of the output an element cannot be the answer to "what is drawing
             // 3.87x", and there are dozens of them.
             if area / px < 0.01 {
@@ -1536,14 +1584,12 @@ where
 
     let mut by_kind: HashMap<String, (usize, f64)> = HashMap::new();
     let mut total = 0.0;
-    for e in elements {
-        // Clipped to the output, because that is what gets shaded: an element hanging off the
-        // edge — every overview element does, mid-animation — pays only for the part inside. The
-        // unclipped sum reads high and stays plausible, which is the worst way for an instrument
-        // to be wrong; `the_scene_breakdown_totals_what_was_actually_shaded` is the guard.
-        let area = e.geometry(scale).intersection(output).map_or(0.0, |r| {
-            f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0))
-        });
+    // Clipped to the output and occlusion-aware, because that is what gets shaded: an element
+    // hanging off the edge — every overview element does, mid-animation — pays only for the part
+    // inside, and one entirely behind opaque regions pays nothing at all. A sum that ignores
+    // either reads high and stays plausible, which is the worst way for an instrument to be wrong;
+    // `the_scene_breakdown_totals_what_was_actually_shaded` is the guard.
+    for (_, e, area) in shaded_elements(elements, scale, output) {
         total += area;
         // The `Debug` prefix is the element enum's variant name — the granularity that answers
         // "what is this" without adding a trait method to every element type.
@@ -4735,6 +4781,51 @@ mod tests {
             stats.worst >= Duration::from_millis(20),
             "the summary's worst frame ignores the GPU time the verdict counted: {:?}",
             stats.worst
+        );
+    }
+
+    /// A full-output opaque element hides everything under it, and the renderer does not shade
+    /// what it skips. An instrument that keeps counting those elements reports a cost nobody pays
+    /// and sends the next optimisation at something already free — which is exactly what it did:
+    /// a full-output `SolidColor` backdrop under an opaque wallpaper read as a whole extra output
+    /// of scene on kov's seat, against a fill-rate counter that never saw it.
+    #[test]
+    fn a_hidden_element_costs_nothing_in_the_breakdown() {
+        use smithay::backend::renderer::element::{Id, Kind};
+        use smithay::backend::renderer::utils::CommitCounter;
+        use smithay::backend::renderer::Color32F;
+        use smithay::utils::{Point, Rectangle, Size};
+
+        use crate::render_helpers::solid_color::SolidColorRenderElement;
+
+        let output = Rectangle::from_size(Size::from((100, 100)));
+        let full = Rectangle::new(Point::from((0., 0.)), Size::from((100., 100.)));
+        let solid = |color| {
+            SolidColorRenderElement::new(
+                Id::new(),
+                full,
+                CommitCounter::default(),
+                color,
+                Kind::Unspecified,
+            )
+        };
+        let opaque = Color32F::from([1., 0., 0., 1.]);
+        let translucent = Color32F::from([0., 1., 0., 0.5]);
+
+        // Opaque on top, backdrop beneath: the backdrop is never shaded.
+        let line = scene_breakdown(&[solid(opaque), solid(opaque)], 1.0.into(), output)
+            .expect("a non-empty output has a breakdown");
+        assert!(
+            line.contains("1.00x the output"),
+            "an element hidden behind an opaque one must not be counted: {line}"
+        );
+
+        // The same two with a translucent element on top: nothing is hidden, both are shaded.
+        let line = scene_breakdown(&[solid(translucent), solid(opaque)], 1.0.into(), output)
+            .expect("a non-empty output has a breakdown");
+        assert!(
+            line.contains("2.00x the output"),
+            "a translucent element hides nothing, so both are shaded: {line}"
         );
     }
 }
