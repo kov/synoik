@@ -541,6 +541,38 @@ Everything here was measured. Re-deriving any of it costs a day.
    synchronous `finish()` — are the two hardest multi-GPU sub-problems pre-collapsed to their trivial
    cases. **The real cost is validation, not code**, and no production Wayland compositor does
    render-on-A/scan-out-on-B with a Vulkan renderer today.
+8. **Number the damage tracker's z-index from the back.** smithay walks elements front-to-back and
+   increments `render_element_z_index` as it goes, so an element's z-index is the count of
+   everything *in front of* it — and `ElementInstanceState::matches` compares it. The wallpaper is
+   therefore numbered by the size of the whole scene: one element appearing or disappearing
+   anywhere above it renumbers it, the match fails, and the tracker damages its full geometry.
+   Since the wallpaper is full-output and fully opaque, that is a full-output repaint caused by
+   nothing having been redrawn.
+
+   Measured on kov's seat 2026-08-22 (`SYNOIK_DEBUG_DAMAGE_ATTRIB=1`, pid 265009): **all 12** frames
+   whose inputs justified 1.000x were the wallpaper — ten by `z-index`, two by the startup
+   `RelocatedColor` → `RelocatedRoundedTexture` swap. No other element ever reached full output. The
+   same shape hits anything with a crowded stack above it: one frame renumbered four `Monitor`
+   elements at once for 0.981x, triggered by a single pointer element changing `Id`.
+
+   Numbering from the back inverts the asymmetry. The wallpaper becomes index 0 and stays matched;
+   an insertion at the very front shifts nothing, and one mid-stack shifts only what is in front of
+   it. This does not remove churn — it moves it onto the elements that are cheapest to damage, which
+   is the whole point: renumbering the pointer costs 0.000x, renumbering the wallpaper costs 1.000x.
+
+   The storage side is a one-line change: `last_z_index` is written in a separate `.enumerate()`
+   fold *after* the walk, where `render_elements.len()` is already known. The comparison side is the
+   work — it happens inside the walk, where the total is not known yet, because the cull that
+   decides which elements count depends on opaque regions accumulated front-to-back. It needs a
+   pre-pass for the count or the damage decision deferred to a second pass, in our smithay fork.
+
+   **Do not instead drop `z_index` from the comparison.** Z-order genuinely changes what covers
+   what; the ordinal is a proxy for that and removing it needs an argument this does not have.
+
+   Element-count churn is the trigger, so fixing churners is the cheaper first move and may make
+   this much less urgent — it is worth doing anyway, because it bounds the cost of churn we have not
+   found yet. Attribution instrument and the rules for reading it: `frame_log::DamageAttribution`,
+   `SYNOIK_DEBUG_DAMAGE_ATTRIB=1`.
 
 Slottable any time:
 
