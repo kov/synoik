@@ -1481,8 +1481,8 @@ where
             // moved to where the element sits before they can be clipped to the output. Without
             // the offset every element away from the origin reads as declaring nothing opaque —
             // which is exactly the answer this column exists to distinguish from the real thing.
-            let opaque: f64 = e
-                .opaque_regions(scale)
+            let declared = e.opaque_regions(scale);
+            let opaque: f64 = declared
                 .iter()
                 .map(|r| {
                     let mut r = *r;
@@ -1492,13 +1492,23 @@ where
                 .filter_map(|r| r.intersection(output))
                 .map(|r| f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0)))
                 .sum();
+            // "declared nothing" and "declared something that clipped away to nothing" are
+            // different answers and the difference is the whole point of this column, so say
+            // which. They are otherwise told apart only by a *negative* zero — `Sum for f64`
+            // folds from `-0.0`, so an empty region list prints `-0.00` and a zero-area one
+            // prints `0.00`. Nobody reads a log that way.
+            let opaque = if declared.is_empty() {
+                "none".to_owned()
+            } else {
+                format!("{:.2}x", opaque / px)
+            };
             let name = format!("{e:?}");
             let kind = name.split(['(', ' ', '{']).next().unwrap_or("?");
             Some(format!(
-                "  scene element #{i} {kind} {:.2}x alpha={:.2} opaque={:.2}x {}x{}+{}+{} {:?}",
+                "  scene element #{i} {kind} {:.2}x alpha={:.2} opaque={} {}x{}+{}+{} {:?}",
                 area / px,
                 e.alpha(),
-                opaque / px,
+                opaque,
                 g.size.w,
                 g.size.h,
                 g.loc.x,
