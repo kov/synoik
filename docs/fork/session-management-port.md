@@ -747,15 +747,17 @@ Pinned by `tests::window_opening::maximize_after_the_initial_configure_keeps_the
 
 ### Backlog: absent-display offsets do not coordinate across sessions
 
-**Wanted, not built.** The workspace offset an absent display's records get is computed per
-session (see "A record is anchored to a display"). Two applications restoring at once each measure
-against the primary's own strip, so their homeless windows can interleave with each other's — each
-group is internally correct and consistent, but they overlap.
+**Designed, not built — `multi-display.md` §3.** The workspace offset an absent display's records
+get is computed per session (see "A record is anchored to a display"). Two applications restoring
+at once each measure against the primary's own strip, so their homeless windows can interleave with
+each other's — each group is internally correct and consistent, but they overlap.
 
-Coordinating them needs a base every session agrees on, which means reading the whole store rather
-than one session, and deciding what to do about sessions that will never be restored: a stale
-entry must not reserve workspaces for windows that are not coming back. That is the hard half —
-the arithmetic is trivial once there is a rule for who counts.
+The offset goes away rather than getting coordinated. `SessionStore::load` already reads every
+session at once, so restore sorts the distinct `(display identity, workspace name or index)` slots
+across the whole store into **one ordering** and consults that instead of counting — the result no
+longer depends on who restores first. And the ordering **reserves nothing**: a workspace
+materializes only when a window actually restores into its slot, which is the rule for who counts.
+A stale entry that never restores creates no workspaces, however many it names.
 
 ### Eviction — cap at 1000 sessions, most-recently-used
 

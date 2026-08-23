@@ -204,12 +204,14 @@ workspace out of it.
 
 ## Accepted losses
 
-**Empty workspaces do not survive their output going away.** `Monitor::into_workspaces` and
+**Empty workspaces do not survive their output going away** — the shipped behavior, and a
+**decided reversal, not yet built** (`multi-display.md` §2). `Monitor::into_workspaces` and
 `Layout::add_output` both filter to `has_windows_or_name()` when migrating workspaces between
 monitors, so unplugging a display drops its empty desktops rather than piling them onto the
-primary. Keeping them would mean a monitor that is plugged and unplugged repeatedly accumulates
-anonymous empties on whichever output is left. The persistent-desktop promise is a within-session,
-within-output one.
+primary, and a workspace emptied while its display is away can never come home. The reason for the
+filter — a display plugged and unplugged repeatedly must not accumulate anonymous empties on
+whichever output is left — is kept by parking an absent display's empty workspaces in `Layout`
+rather than materializing them on the primary at all.
 
 **niri's `empty-workspace-above-first` is gone** (config field, ~50 special-case sites, its
 tests, and its wiki section). It is niri's way of doing workspaces, GNOME has no equivalent, and
@@ -250,6 +252,11 @@ promise here: the index is an index into *that display's* stack. And "Accepted l
 where empty workspaces do not survive their output going away, is only a question that exists
 because workspaces belong to a monitor in the first place.
 
+**What a display going away and coming back costs, and what it should cost, is
+`multi-display.md`** — display identity, home groups, the pointer-decides chooser, moving a
+workspace between displays, and the geometry a window owes a smaller work area. The two backlog
+entries below are that document's §2, §3 and §6.
+
 ### Consequence: `<primary>` is nearly inert
 
 With per-monitor workspaces, the primary monitor stops being the thing that owns the desktops.
@@ -266,7 +273,12 @@ switching happens, because nothing global does.
 global list there is nothing to move a workspace *to*, but with a stack per display, moving a
 desktop between displays is the natural operation and there is currently no way to express it.
 
-Two things it runs into, both already documented here and worth reading before starting:
+Designed in `multi-display.md` §6, which puts a workspace **context menu** — rename, close, send to
+a display — ahead of the drag: it is the keyboard- and screen-reader-reachable way to express the
+same move, and it does not wait on either problem below.
+
+Two things the drag itself runs into, both already documented here and worth reading before
+starting:
 
 - The layout does not know monitor positions (`src/layout/mod.rs:4887`), which is why a
   cross-output *window* drag teleports rather than animating. A cross-output workspace drag will
@@ -277,32 +289,27 @@ Two things it runs into, both already documented here and worth reading before s
 
 ### Backlog: workspace state should survive an unplug and a replug
 
-**Wanted, not built.** Unplugging a display appends its workspaces to the primary
-(`Monitor::append_workspaces`); replugging it does not take them back. What comes back is a fresh
-empty strip, and the desktops that display owned are now scattered through the primary's. On a
-laptop that docks daily, that is the common case, not the corner one.
+**Designed, not built — `multi-display.md` §2 and §3.** Unplugging a display appends its
+workspaces to the primary (`Monitor::append_workspaces`), and `Layout::add_output` does take back
+the ones whose `original_output` matches when it returns (`src/layout/mod.rs:1038-1074`), with
+`Layout::last_active_workspace_id` (`:427`) restoring which was active. Three things are missing,
+and a laptop that docks daily meets all three: an emptied workspace is filtered out by
+`has_windows_or_name()` and never comes home; nothing pins *where* in the returning strip a
+workspace sat, so a reorder made while it was homeless is unrecoverable; and the home tag is a name
+(`OutputId`, `src/layout/workspace.rs:192`) rather than the identity the session store already
+matches by (`session_state::OutputIdentity`).
 
-What exists today is a shard of the answer: `Layout::last_active_workspace_id`
-(`src/layout/mod.rs:427`) remembers which workspace was *active* on an output, keyed by its name,
-and hands it back when that output returns. It remembers one id, not the stack, and a name is not
-an identity.
-
-The shape this wants is workspace state keyed the way display state already is — by monitor
-identity, or by the **whole configuration**, exactly as `monitors.xml` keys a layout by the set of
-connected monitors (`src/monitors_xml.rs`, "A configuration is a set, not a monitor"). Docked and
-undocked would then be two remembered arrangements rather than one arrangement being repeatedly
-destroyed and rebuilt.
-
-Two consumers, and they should not grow separate answers:
-
-- the **live** layout, which is what makes a replug restore the strip;
-- the **session store**, whose records already name a display
-  (`docs/fork/session-management-port.md`) but whose workspace index is only meaningful relative
-  to a stack nothing else remembers.
+The answer is per-workspace, not per-configuration: a home `OutputIdentity` plus a home ordinal,
+stamped at detach and rewritten only by an explicit move. Keying the *whole configuration* the way
+`monitors.xml` does was considered and rejected — it would restore a stale arrangement and fight the
+edits the user made while the display was away, where per-workspace tags degrade one workspace at a
+time. The live layout and the session store share the one identity, and the store persists no stack
+of its own: restore derives an ordering from the whole record set at load and materializes a
+workspace only when a window actually lands in it (`multi-display.md` §3).
 
 Related and adjacent: a window whose display is gone currently keeps its size and loses its
-position. Recomputing a sensible size and position for a *substitute* display is wanted, and it is
-the same machinery a workspace moved between displays will need.
+position. `multi-display.md` §5 is that machinery — mutter's two-branch move, a per-axis shrink, and
+a remembered `displaced_rect` — and a workspace moved between displays uses the same path.
 
 ## Amendment 2026-08-13 — GNOME's drag & drop workspace concept: IGNORED
 
