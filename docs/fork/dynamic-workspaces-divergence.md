@@ -225,13 +225,24 @@ the one the niri-inherited `Layout` already implements (`MonitorSet::Normal { mo
 `Vec<Workspace>` per `Monitor`).
 
 GNOME's model is the opposite, and it is not a setting we are declining to honor — it is the
-shape of mutter's core. `MetaWorkspaceManager` holds **one** global workspace list; a workspace
-spans every monitor at once, and switching moves all of them together. The
-`workspaces-only-on-primary` key (`org.gnome.mutter`, **default `false`**) does not give per-monitor
-workspaces either: when on, it forces every window not on the primary monitor to
-`on_all_workspaces` (`meta-window.c` `should_be_on_all_workspaces`, `:5191-5195`), so secondary
-monitors go *static* while the primary switches. Neither setting of the key produces independent
-per-monitor stacks.
+shape of mutter's core. `MetaWorkspaceManager` holds **one** global workspace list and **one**
+`active_workspace` (`meta-workspace-manager-private.h:37-39`). There is no per-monitor current
+workspace to have: gnome-shell hands every monitor's view the same `_scrollAdjustment`
+(`workspacesView.js:610,749`) and a swipe on one monitor starts the gesture on all of them
+(`:943`), so switching to workspace 3 switches *every* display to 3.
+
+`workspaces-only-on-primary` (`org.gnome.mutter`, **default `false`**) is a different axis and
+neither of its values reaches per-monitor stacks:
+
+- **`true`** forces every window not on the primary to `on_all_workspaces`
+  (`meta-window.c` `should_be_on_all_workspaces`, `:5191-5195`) — secondary monitors go *static*
+  while the primary switches.
+- **`false`** (the default) lets non-primary monitors carry workspaces too — but in **lockstep**
+  with every other monitor, because there is still only the one `active_workspace`.
+
+The axis the key controls is *whether secondaries participate*, never *whether they switch
+independently*. Independent per-display switching is not expressible in mutter's data model, which
+is why this is a divergence rather than a choice of setting.
 
 So this is a real divergence in both directions, and it is the one the rest of this document
 already assumes. §3's promise — that `Super+3` means the same desktop all day — is a per-monitor
