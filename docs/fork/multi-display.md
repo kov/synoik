@@ -297,6 +297,12 @@ naming model has been missing: `Workspace::name`, `Layout::set_workspace_name` /
 draws a name. A finishing touch, and what makes "a name outranks the index" (§3) worth anything to
 a user.
 
+**Decide here whether a named empty workspace still parks.** §2 parks it with the rest, on the
+grounds that a name says "keep", not "put this somewhere else" — which costs it being reachable at
+all while its display is away. That trade is only worth re-examining once naming is a feature a
+user can actually reach, so it belongs to this item: build the menu, then decide whether a named
+empty should migrate to the survivor instead.
+
 ## Order of work
 
 The two the seat wants first are also the two with no dependencies, so they lead. Neither is wasted
