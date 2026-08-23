@@ -203,7 +203,7 @@ use crate::ui::screenshot_ui::{
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
 use crate::ui::switcher::SwitcherKey;
-use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose};
+use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose, ThumbnailName};
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -11721,12 +11721,33 @@ impl Synoik {
                         hovered: self.thumbnail_close_hovered == Some(id),
                     })
                     .collect();
+                // A named workspace wears its name; an unnamed one is identified by position,
+                // as it always was.
+                let names: Vec<_> = mon
+                    .thumbnail_names()
+                    .into_iter()
+                    .map(|(thumb, name)| {
+                        let max_w = thumb.size.w
+                            - 2. * crate::layout::thumbnails::NAME_INSET
+                            - 2. * crate::ui::widget::Tooltip::PAD_H;
+                        ThumbnailName {
+                            name: crate::ui::widget::ellipsized_line(
+                                &name,
+                                crate::ui::widget::Tooltip::TEXT_PT,
+                                max_w,
+                            ),
+                            thumb,
+                        }
+                    })
+                    .collect();
+                self.thumbnail_chrome.retain_names(&names);
                 for element in self.thumbnail_chrome.render(
                     ctx.renderer,
                     &self.icon_cache,
                     fade_scale,
                     crate::ui::widget::style::accent_rgba(self.gnome_settings.accent_color),
                     &buttons,
+                    &names,
                 ) {
                     group.push(element.into());
                 }

@@ -30146,6 +30146,54 @@ fn a_user_maximize_over_a_displacement_survives_the_area_growing() {
     );
 }
 
+/// A named workspace wears its name in the strip; an unnamed one wears nothing.
+///
+/// Naming a workspace has been possible all along (`Action::SetWorkspaceName`) and has always
+/// outranked the index on restore, but nothing in the shell drew it, so the feature was
+/// unreachable in practice (`docs/fork/multi-display.md` §6).
+#[test]
+fn a_named_workspace_shows_its_name_on_its_thumbnail() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let names = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("on a monitor").thumbnail_names()
+    };
+    assert!(
+        names(&mut f).is_empty(),
+        "nothing is named, so no thumbnail carries a label"
+    );
+
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    f.settle();
+
+    let labelled = names(&mut f);
+    assert_eq!(
+        labelled.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+        vec!["Mail"],
+        "the named one, and only it"
+    );
+
+    // The pill sits inside its thumbnail, along the bottom edge.
+    let (thumb, name) = labelled.into_iter().next().unwrap();
+    let size = crate::ui::widget::Tooltip::size(&name);
+    let pill = crate::layout::thumbnails::name_rect(thumb, size);
+    assert!(
+        thumb.contains_rect(pill),
+        "the label must not hang off its thumbnail: {pill:?} in {thumb:?}"
+    );
+    assert!(
+        pill.loc.y + pill.size.h < thumb.loc.y + thumb.size.h,
+        "and it sits above the bottom edge, not on it"
+    );
+}
+
 /// A right-click on a workspace thumbnail offers the workspace's own menu.
 ///
 /// The divergence `docs/fork/multi-display.md` §6 asks for: gnome-shell has no workspace menu

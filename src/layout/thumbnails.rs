@@ -102,6 +102,25 @@ pub fn close_rect(thumb: Rectangle<f64, Logical>, ramp: f64) -> Rectangle<f64, L
     )
 }
 
+/// How far a name label is inset from the thumbnail's bottom edge, logical px.
+pub const NAME_INSET: f64 = 6.;
+
+/// A name label's box on the thumbnail drawn at `thumb`: centred across it, sitting on its
+/// bottom edge. Unlike the close button the pill is *not* ramped — it holds shaped text, and
+/// re-shaping it every frame of the overview's open animation would cost a bake a frame.
+pub fn name_rect(
+    thumb: Rectangle<f64, Logical>,
+    size: Size<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((
+            (thumb.loc.x + (thumb.size.w - size.w) / 2.).round(),
+            (thumb.loc.y + thumb.size.h - NAME_INSET - size.h).round(),
+        )),
+        size,
+    )
+}
+
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {

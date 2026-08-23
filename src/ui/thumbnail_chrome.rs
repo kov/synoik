@@ -24,7 +24,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
-use crate::ui::widget::{self, style, BakeCache, Painter, Rgba};
+use crate::ui::widget::{self, style, BakeCache, Painter, Rgba, TextShaper, TextStyle};
 
 /// The glyph inside the button. The same one the window picker's close button uses, so the
 /// two "dismiss this" affordances in the overview read as one control at two sizes.
@@ -39,6 +39,15 @@ const ICON_RATIO: f64 = 2. / 3.;
 /// [`crate::ui::window_preview`], which resolves the same SCSS for the preview's button.
 const CLOSE_BG: Rgba = [0.2471, 0.2471, 0.2745, 0.98];
 
+/// One thumbnail's name label, as the renderer needs it.
+#[derive(Debug, Clone)]
+pub struct ThumbnailName {
+    /// The thumbnail's box, in view coordinates — the pill is placed inside it.
+    pub thumb: Rectangle<f64, Logical>,
+    /// The name, already ellipsized to what the thumbnail can hold.
+    pub name: String,
+}
+
 /// One thumbnail's close button, as the renderer needs it.
 #[derive(Debug, Clone, Copy)]
 pub struct ThumbnailClose {
@@ -50,10 +59,12 @@ pub struct ThumbnailClose {
     pub hovered: bool,
 }
 
-/// The strip chrome's GPU caches: one disc bake per (size, hover) key.
+/// The strip chrome's GPU caches: one disc bake per (size, hover) key, and one pill bake per
+/// distinct label.
 #[derive(Default)]
 pub struct ThumbnailChrome {
     disc: RefCell<BakeCache>,
+    names: RefCell<std::collections::HashMap<String, BakeCache>>,
 }
 
 impl ThumbnailChrome {
@@ -61,7 +72,16 @@ impl ThumbnailChrome {
         Self::default()
     }
 
-    /// Render the close buttons, topmost first (the caller pushes these over the strip).
+    /// Drop the bakes for labels no thumbnail is showing any more, so a renamed or closed
+    /// workspace does not leave its pill in the cache for the session.
+    pub fn retain_names(&self, names: &[ThumbnailName]) {
+        self.names
+            .borrow_mut()
+            .retain(|key, _| names.iter().any(|n| n.name == *key));
+    }
+
+    /// Render the close buttons and the name labels, topmost first (the caller pushes these
+    /// over the strip).
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -69,8 +89,49 @@ impl ThumbnailChrome {
         scale: f64,
         accent: Rgba,
         buttons: &[ThumbnailClose],
+        names: &[ThumbnailName],
     ) -> Vec<ThumbnailChromeRenderElement> {
         let mut elements: Vec<ThumbnailChromeRenderElement> = Vec::new();
+
+        // The same caption pill the window picker puts under a preview, so the two labels in
+        // the overview read as one kind of overlay.
+        for label in names {
+            if label.name.is_empty() {
+                continue;
+            }
+            let size = widget::Tooltip::size(&label.name);
+            let mut caches = self.names.borrow_mut();
+            let cache = caches.entry(label.name.clone()).or_default();
+            let pill = widget::bake(
+                renderer,
+                cache,
+                scale,
+                size,
+                0,
+                |r| {
+                    let mut shaper = TextShaper::new(r, scale);
+                    shaper.shape(&label.name, TextStyle::new(widget::Tooltip::TEXT_PT))
+                },
+                |frame, phys, text| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.tooltip(size, text)
+                },
+            );
+            match pill {
+                Ok(buffer) => elements.push(
+                    TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        crate::layout::thumbnails::name_rect(label.thumb, size).loc,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                ),
+                Err(err) => tracing::error!("error baking a workspace name label: {err:#}"),
+            }
+        }
 
         for button in buttons {
             if button.alpha <= 0. {
