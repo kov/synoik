@@ -4028,7 +4028,9 @@ impl State {
 
         self.backend.on_output_config_changed(&mut self.synoik);
 
-        self.synoik.reposition_outputs(None);
+        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+        self.synoik
+            .reposition_outputs(None, monitors_config.as_ref());
 
         if let Some(touch) = self.synoik.seat.get_touch() {
             touch.cancel(self);
@@ -8041,7 +8043,17 @@ impl Synoik {
     }
 
     /// Repositions all outputs, optionally adding a new output.
-    pub fn reposition_outputs(&mut self, new_output: Option<&Output>) {
+    ///
+    /// `monitors_config` is GNOME's store, already loaded by the caller. When it holds a
+    /// configuration saved for exactly this set of monitors, that configuration's `<x>`/`<y>`
+    /// decide where each output goes; otherwise we fall back to laying them out left to right in
+    /// name order, which is mutter's `create_linear`
+    /// (`meta-monitor-config-manager.c:997`) in spirit.
+    pub fn reposition_outputs(
+        &mut self,
+        new_output: Option<&Output>,
+        monitors_config: Option<&crate::monitors_xml::MonitorsConfig>,
+    ) {
         let _span = tracy_client::span!("Synoik::reposition_outputs");
 
         #[derive(Debug)]
@@ -8052,12 +8064,48 @@ impl Synoik {
             config: Option<synoik_config::Position>,
         }
 
+        // The saved layout for exactly the set of monitors connected right now, if there is one.
+        // A configuration whose saved modes are not the modes we are running is not applicable —
+        // mutter rejects it and falls through to a generated layout, and so do we: its positions
+        // describe monitors at sizes they no longer have.
+        let outputs_now: Vec<_> = self
+            .global_space
+            .outputs()
+            .chain(new_output)
+            .map(|o| o.user_data().get::<OutputName>().unwrap().clone())
+            .collect();
+        let saved_layout = {
+            let modes_now = |connector: &str| {
+                self.global_space
+                    .outputs()
+                    .chain(new_output)
+                    .find(|o| o.user_data().get::<OutputName>().unwrap().connector == connector)
+                    .and_then(|o| o.current_mode())
+            };
+            monitors_config
+                .and_then(|store| store.configuration_for(&outputs_now))
+                .filter(|conf| conf.modes_applicable(&modes_now))
+        };
+        if let Some(conf) = saved_layout {
+            debug!(
+                "applying the saved layout for this monitor set: {:?}",
+                conf.logical_monitors
+                    .iter()
+                    .flat_map(|lm| lm.monitors.iter().map(move |m| (&m.connector, lm.x, lm.y)))
+                    .collect::<Vec<_>>()
+            );
+        }
+
         let config = self.config.borrow();
         let mut outputs = vec![];
         for output in self.global_space.outputs().chain(new_output) {
             let name = output.user_data().get::<OutputName>().unwrap();
             let position = self.global_space.output_geometry(output).map(|geo| geo.loc);
-            let config = config.outputs.find(name).and_then(|c| c.position);
+            // GNOME's saved layout outranks niri's KDL position, per the fork tenet.
+            let config = saved_layout
+                .and_then(|conf| conf.logical_monitor_for(&name.connector))
+                .map(|lm| synoik_config::Position { x: lm.x, y: lm.y })
+                .or_else(|| config.outputs.find(name).and_then(|c| c.position));
 
             outputs.push(Data {
                 output: output.clone(),
@@ -8350,7 +8398,7 @@ impl Synoik {
         assert!(rv.is_none(), "output was already tracked");
 
         // Must be last since it will call queue_redraw(output) which needs things to be filled-in.
-        self.reposition_outputs(Some(&output));
+        self.reposition_outputs(Some(&output), monitors_config.as_ref());
 
         // A new output means a new (scale, icon size) pair to warm. This does **not** cover
         // startup on a TTY seat: `backend.init` reaches here before the decode worker is
@@ -8384,7 +8432,8 @@ impl Synoik {
 
         self.layout.remove_output(output);
         self.global_space.unmap_output(output);
-        self.reposition_outputs(None);
+        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+        self.reposition_outputs(None, monitors_config.as_ref());
         self.gamma_control_manager_state.output_removed(output);
 
         let state = self.output_state.remove(output).unwrap();

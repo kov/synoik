@@ -20567,6 +20567,117 @@ fn dbus_scale_config(scale: f64) -> HashMap<String, Option<synoik_config::Output
     )])
 }
 
+/// A saved two-monitor layout, with the positions deliberately *reversed* from the name order the
+/// linear fallback would produce: `headless-2` at the origin, `headless-1` to its right. `<mode>`
+/// is omitted, so the mode gate cannot veto.
+fn monitors_xml_with_pair_layout() -> String {
+    r#"<monitors version="2">
+  <configuration>
+    <logicalmonitor>
+      <x>0</x><y>0</y><scale>1</scale>
+      <monitor><monitorspec>
+        <connector>headless-2</connector><product>headless</product><serial>2</serial>
+      </monitorspec></monitor>
+    </logicalmonitor>
+    <logicalmonitor>
+      <x>1280</x><y>0</y><scale>1</scale><primary>yes</primary>
+      <monitor><monitorspec>
+        <connector>headless-1</connector><product>headless</product><serial>1</serial>
+      </monitorspec></monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>"#
+        .to_owned()
+}
+
+fn output_position(f: &mut Fixture, n: u8) -> (i32, i32) {
+    let output = f.synoik_output(n);
+    let geo = f.synoik().global_space.output_geometry(&output).unwrap();
+    (geo.loc.x, geo.loc.y)
+}
+
+/// A saved layout for exactly this set of monitors decides where each one sits — not the
+/// name-order left-to-right fallback.
+#[test]
+fn monitors_xml_layout_places_a_saved_pair() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_pair_layout());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+    f.add_output(2, (1280, 1024));
+
+    assert_eq!(
+        output_position(&mut f, 2),
+        (0, 0),
+        "the saved layout puts headless-2 at the origin"
+    );
+    assert_eq!(
+        output_position(&mut f, 1),
+        (1280, 0),
+        "and headless-1 to its right — the reverse of name order"
+    );
+}
+
+/// The saved layout is keyed on the whole set: with only one of the pair connected, it does not
+/// apply, and the single output lands at the origin.
+#[test]
+fn monitors_xml_layout_does_not_apply_to_a_subset() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_pair_layout());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+
+    assert_eq!(
+        output_position(&mut f, 1),
+        (0, 0),
+        "the pair's layout must not place a lone monitor at its paired position"
+    );
+}
+
+/// Unplugging one of a saved pair re-runs placement for the set that remains.
+#[test]
+fn monitors_xml_layout_is_reapplied_when_a_monitor_leaves() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_pair_layout());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+    f.add_output(2, (1280, 1024));
+    assert_eq!(output_position(&mut f, 1), (1280, 0));
+
+    f.remove_output(2);
+
+    assert_eq!(
+        output_position(&mut f, 1),
+        (0, 0),
+        "with the pair broken up, the survivor falls back to linear placement"
+    );
+}
+
+/// A saved layout whose `<mode>` is not the mode the monitor is running does not apply: the scale
+/// and geometry it records were judged for a different-sized screen (mutter rejects it the same
+/// way, `meta-monitor-config-manager.c:327`).
+#[test]
+fn monitors_xml_layout_saved_for_another_mode_is_rejected() {
+    let xml = monitors_xml_with_pair_layout().replace(
+        "<connector>headless-1</connector><product>headless</product><serial>1</serial>
+      </monitorspec></monitor>",
+        "<connector>headless-1</connector><product>headless</product><serial>1</serial>
+      </monitorspec><mode><width>3840</width><height>2160</height><rate>60.000</rate></mode></monitor>",
+    );
+    let _store = MonitorsXmlGuard::install(&xml);
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+    f.add_output(2, (1280, 1024));
+
+    assert_eq!(
+        output_position(&mut f, 1),
+        (0, 0),
+        "rejected layout falls back to linear: headless-1 first by name"
+    );
+    assert_eq!(output_position(&mut f, 2), (1280, 0));
+}
+
 /// A saved monitors.xml scale is honored from the first frame (store > KDL > DPI guess).
 #[test]
 fn monitors_xml_scale_applies_at_startup() {
