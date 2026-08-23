@@ -217,6 +217,53 @@ it complicated every invariant this change touches. Two of its tests — `add_an
 and `move_window_to_different_output` — were generic invariant checks that merely happened to set
 the flag; they were kept, flagless.
 
+## 4. DIVERGENCE — every display owns its own workspaces
+
+**Approved by Gustavo 2026-08-22.** Each monitor has its own independent stack of workspaces, and
+switching workspaces on one monitor leaves the others alone — macOS Mission Control's model, and
+the one the niri-inherited `Layout` already implements (`MonitorSet::Normal { monitors }`, a
+`Vec<Workspace>` per `Monitor`).
+
+GNOME's model is the opposite, and it is not a setting we are declining to honor — it is the
+shape of mutter's core. `MetaWorkspaceManager` holds **one** global workspace list; a workspace
+spans every monitor at once, and switching moves all of them together. The
+`workspaces-only-on-primary` key (`org.gnome.mutter`, **default `false`**) does not give per-monitor
+workspaces either: when on, it forces every window not on the primary monitor to
+`on_all_workspaces` (`meta-window.c` `should_be_on_all_workspaces`, `:5191-5195`), so secondary
+monitors go *static* while the primary switches. Neither setting of the key produces independent
+per-monitor stacks.
+
+So this is a real divergence in both directions, and it is the one the rest of this document
+already assumes. §3's promise — that `Super+3` means the same desktop all day — is a per-monitor
+promise here: the index is an index into *that display's* stack. And "Accepted losses" above,
+where empty workspaces do not survive their output going away, is only a question that exists
+because workspaces belong to a monitor in the first place.
+
+### Consequence: `<primary>` is nearly inert
+
+With per-monitor workspaces, the primary monitor stops being the thing that owns the desktops.
+What the layout still calls `primary_idx` (`src/layout/mod.rs:468`) is only the destination for
+workspaces orphaned by an unplug. Restoring `monitors.xml`'s `<primary>` into it is therefore a
+small, low-stakes change rather than a policy decision — it no longer decides where workspace
+switching happens, because nothing global does.
+
+### Backlog: dragging a workspace across monitors
+
+**Wanted, not built.** The thumbnail strip reorders workspaces within one display
+(`ThumbGrab`, `src/input/thumb_grab.rs`); it should also be able to carry a workspace to
+*another* display's strip. This is the affordance per-monitor workspaces owe the user: with one
+global list there is nothing to move a workspace *to*, but with a stack per display, moving a
+desktop between displays is the natural operation and there is currently no way to express it.
+
+Two things it runs into, both already documented here and worth reading before starting:
+
+- The layout does not know monitor positions (`src/layout/mod.rs:4887`), which is why a
+  cross-output *window* drag teleports rather than animating. A cross-output workspace drag will
+  want the same knowledge, so the two are one problem.
+- The row must be still for the whole drag, and a row being aimed at must not move under the
+  pointer (§ "The row opens for a new workspace *during* the drag"). Two rows, on two displays,
+  both potentially reacting to one drag, makes that rule harder to keep, not easier.
+
 ## Amendment 2026-08-13 — GNOME's drag & drop workspace concept: IGNORED
 
 The design team's *Shell Design Dreams* post (2026-08-11) revives a GNOME-40-era
