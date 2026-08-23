@@ -29810,6 +29810,90 @@ fn a_move_does_not_give_up_the_geometry_a_display_overrode() {
     );
 }
 
+/// A window that restores while its display is unplugged keeps the size that display's absence
+/// cannot invalidate — only the position is display-local.
+///
+/// Without this, restoring a session with the big monitor unplugged would strand every window it
+/// had shrunk at the small size, and plugging the monitor back in would not undo it.
+#[test]
+fn a_size_a_display_overrode_survives_that_display_being_gone_at_restore() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.add_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1000, 800);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let settle = |f: &mut Fixture, client: ClientId, surface: &WlSurface| {
+        f.double_roundtrip(client);
+        let win = f.client(client).window(surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(client);
+        f.settle();
+    };
+
+    // Too short for it, so the geometry it had is the one the display overrode.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f, id, &surface);
+
+    let w = f.client(id).window(&surface);
+    w.attach_null_buffer();
+    w.commit();
+    f.double_roundtrip(id);
+    f.settle();
+    drop(session);
+
+    // Tomorrow, on a different machine entirely: the display the record names is nowhere.
+    f.add_output(2, (1280, 720));
+    f.remove_output(1);
+    f.settle();
+
+    let second = f.add_client();
+    f.roundtrip(second);
+    let session = f
+        .client(second)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+    map_at_configured_size(&mut f, second, &surface);
+    settle(&mut f, second, &surface);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.resize_output(2, Some((1920, 1080)), None);
+    settle(&mut f, second, &surface);
+
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .floating_rect
+        .expect("it floats");
+    assert_eq!(
+        (rect.size.w.round() as i32, rect.size.h.round() as i32),
+        (1000, 800),
+        "a display big enough gives back the size, even though it is not the one that took it"
+    );
+}
+
 /// The *reason* a restored window is maximized outlives the logout too.
 ///
 /// Without the mark in the record, a window restored maximized is indistinguishable from one the

@@ -2649,6 +2649,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.working_area
     }
 
+    /// Where the tile for `id` sits, in the same frame `working_area` is expressed in.
+    pub fn logical_pos_of(&self, id: &W::Id) -> Option<Point<f64, Logical>> {
+        self.idx_of(id).map(|idx| self.data[idx].logical_pos)
+    }
+
     #[cfg(test)]
     pub fn scale(&self) -> f64 {
         self.scale

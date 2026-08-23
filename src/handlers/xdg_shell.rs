@@ -1421,11 +1421,8 @@ impl State {
                 // Output-local, and only meaningful when the display it is local to came back.
                 .filter(|_| restore.output.is_some())
                 .and(restore.record.floating_rect),
-            displaced_rect: restore
-                .output
-                .is_some()
-                .then_some(restore.record.displaced_rect)
-                .flatten(),
+            displaced_rect: restore.record.displaced_rect,
+            displaced_positioned: restore.output.is_some(),
             auto_maximized: restore.record.auto_maximized,
             // Not gated on the display coming back, unlike the rects: an edge-tiled window is
             // sized and placed from the work area it lands on, so the state survives a restore

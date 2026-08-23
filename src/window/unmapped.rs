@@ -74,10 +74,15 @@ pub struct RestoreOnMap {
     /// The geometry a display too small for the window overrode, and whether the maximize it may
     /// be in is the compositor's own answer rather than the user's.
     ///
-    /// Gated on the display coming back, like `unmaximize_to` and for the same reason: a rect is
-    /// local to a display, and one that never held the window cannot be measured against it. The
-    /// mark is not — who maximized a window is true wherever it lands.
+    /// Not gated on the display coming back, unlike `unmaximize_to`: the *size* a window wants is
+    /// true wherever it lands, and losing it would mean a window that restored while its big
+    /// display was unplugged stayed small forever once it came back. Only the position half is
+    /// display-local, and `displaced_positioned` says whether it survived.
     pub displaced_rect: Option<crate::session_state::Rect>,
+
+    /// Whether the position half of `displaced_rect` means anything — the display it is local to
+    /// came back. When it does not, the window keeps the position it is placed at.
+    pub displaced_positioned: bool,
 
     /// Whether the compositor maximized the restored window rather than the user.
     pub auto_maximized: bool,

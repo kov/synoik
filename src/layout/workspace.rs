@@ -3922,13 +3922,20 @@ impl<W: LayoutElement> Workspace<W> {
     /// The rect arrives output-local and in the window's frame, which is how the store keeps every
     /// rect; the tile holds it work-area-relative and in its own, so that a strut appearing does
     /// not skew what "where it was" means.
+    ///
+    /// `positioned` is false when the display the rect is local to did not come back. The size is
+    /// kept anyway — it is what the window wants, wherever it lands — and the position is taken
+    /// from wherever placement has just put the window, so growing the area later gives the size
+    /// back without teleporting the window to coordinates from another display.
     pub fn seed_displaced_geometry(
         &mut self,
         id: &W::Id,
         rect: Option<Rectangle<f64, Logical>>,
+        positioned: bool,
         auto_maximized: bool,
     ) -> bool {
         let area = self.floating.working_area();
+        let placed = self.floating.logical_pos_of(id);
 
         let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
             return false;
@@ -3936,8 +3943,13 @@ impl<W: LayoutElement> Workspace<W> {
 
         tile.auto_maximized = auto_maximized;
         tile.displaced_rect = rect.map(|rect| {
+            let loc = if positioned {
+                rect.loc - area.loc - tile.window_offset()
+            } else {
+                placed.unwrap_or(area.loc) - area.loc
+            };
             Rectangle::new(
-                rect.loc - area.loc - tile.window_offset(),
+                loc,
                 Size::from((
                     tile.tile_width_for_window_width(rect.size.w),
                     tile.tile_height_for_window_height(rect.size.h),

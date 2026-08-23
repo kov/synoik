@@ -228,6 +228,9 @@ better, and pay for it with one field:
 - **Cleared on a user-driven resize, and on a drop onto another display.** Both are the user saying
   this is the geometry now. A plain *move* does not clear it: where the window sits and what size a
   narrow display forced on it are separate answers, and only the size was ever overridden.
+- **Not gated on the recorded display coming back**, unlike a remembered position. A size is not
+  display-local, so restoring a session while the big monitor is unplugged must not be what makes a
+  window small forever; the position half falls back to wherever placement put it.
 - **Applied when a work area grows enough to hold it again**, which is what makes a workspace
   returning to its big display return the windows to their old geometry.
 - **Unanimated**, for `refit_to_working_area`'s reason: the user did not ask for this, the area

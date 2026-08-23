@@ -203,10 +203,16 @@ impl Fixture {
         out
     }
 
+    /// The output on connector `headless-{n}`, by name rather than by position: a test that
+    /// unplugs one would otherwise silently start addressing a different display.
     pub fn synoik_output(&self, n: u8) -> Output {
         let synoik = &self.state.server.state.synoik;
-        let idx = usize::from(n - 1);
-        let output = synoik.global_space.outputs().nth(idx).unwrap();
+        let connector = format!("headless-{n}");
+        let output = synoik
+            .global_space
+            .outputs()
+            .find(|output| output.name() == connector)
+            .unwrap_or_else(|| panic!("{connector} is plugged in"));
         output.clone()
     }
 

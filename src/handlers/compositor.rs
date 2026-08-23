@@ -175,9 +175,13 @@ impl CompositorHandler for State {
                             restore.as_ref().is_some_and(|restore| restore.minimized);
                         let restore_edge_tiled =
                             restore.as_ref().and_then(|restore| restore.edge_tiled);
-                        let displaced = restore
-                            .as_ref()
-                            .map(|restore| (restore.displaced_rect, restore.auto_maximized));
+                        let displaced = restore.as_ref().map(|restore| {
+                            (
+                                restore.displaced_rect,
+                                restore.displaced_positioned,
+                                restore.auto_maximized,
+                            )
+                        });
                         let unmaximize_to = restore.and_then(|restore| restore.unmaximize_to);
 
                         (
@@ -568,16 +572,19 @@ impl CompositorHandler for State {
                     // What a display too small for this window overrode, and whether the maximize
                     // it may be in is ours. After the auto-maximize above, which is the other
                     // writer of the mark, and after the unmaximize seed for the same reason.
-                    if let Some((rect, auto_maximized)) = displaced {
+                    if let Some((rect, positioned, auto_maximized)) = displaced {
                         let rect = rect.map(|[x, y, w, h]| {
                             Rectangle::new(
                                 Point::from((f64::from(x), f64::from(y))),
                                 Size::from((f64::from(w), f64::from(h))),
                             )
                         });
-                        self.synoik
-                            .layout
-                            .seed_displaced_geometry(&window, rect, auto_maximized);
+                        self.synoik.layout.seed_displaced_geometry(
+                            &window,
+                            rect,
+                            positioned,
+                            auto_maximized,
+                        );
                     }
 
                     if let Some(output) = output {

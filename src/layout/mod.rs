@@ -6669,10 +6669,11 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         id: &W::Id,
         rect: Option<Rectangle<f64, Logical>>,
+        positioned: bool,
         auto_maximized: bool,
     ) {
         for ws in self.workspaces_mut() {
-            if ws.seed_displaced_geometry(id, rect, auto_maximized) {
+            if ws.seed_displaced_geometry(id, rect, positioned, auto_maximized) {
                 return;
             }
         }
