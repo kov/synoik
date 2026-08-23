@@ -57,6 +57,7 @@ pub mod unlock_dialog;
 pub mod utils;
 pub mod wallpaper;
 pub mod window;
+pub mod workspace_names;
 pub mod world_clocks;
 
 #[cfg(test)]

@@ -2387,10 +2387,11 @@ fn open_right_of_on_different_workspace() {
 }
 
 /// An empty workspace does not go to the surviving display, but it is not lost either: it is
-/// parked until its own display comes back (`docs/fork/multi-display.md` §2). A name does not
-/// change that — a name says "keep", not "put this somewhere else".
+/// parked until its own display comes back (`docs/fork/multi-display.md` §2). A *named* one is
+/// the exception: a name makes it furniture, and furniture is always present, so it travels with
+/// the windowed workspaces instead of waiting out the unplug somewhere unreachable (§6).
 #[test]
-fn removing_all_outputs_parks_empty_named_workspaces() {
+fn removing_all_outputs_keeps_named_workspaces_reachable() {
     let ops = [
         Op::AddOutput(1),
         Op::AddNamedWorkspace {
@@ -2412,17 +2413,22 @@ fn removing_all_outputs_parks_empty_named_workspaces() {
         unreachable!()
     };
 
-    assert!(workspaces.is_empty(), "no windows, so nothing migrates");
-
-    let mut named: Vec<_> = layout
-        .parked_workspaces
+    let mut named: Vec<_> = workspaces
         .iter()
         .filter_map(|ws| ws.name().cloned())
         .collect();
     named.sort();
-    assert_eq!(named, ["ws1", "ws2"]);
+    assert_eq!(named, ["ws1", "ws2"], "the named ones came along");
+
     assert!(
-        layout.parked_workspaces.len() > named.len(),
+        layout
+            .parked_workspaces
+            .iter()
+            .all(|ws| ws.name().is_none()),
+        "and only the anonymous empties parked"
+    );
+    assert!(
+        !layout.parked_workspaces.is_empty(),
         "the strip's own empties park too, so the holes between them come back"
     );
 }

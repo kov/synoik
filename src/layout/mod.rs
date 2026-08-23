@@ -432,7 +432,7 @@ pub struct Layout<W: LayoutElement> {
     last_active_workspace_id: Vec<(OutputIdentity, WorkspaceId)>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
-    /// Workspaces with no windows whose home display is away.
+    /// Workspaces with no windows and no name whose home display is away.
     ///
     /// They never materialize on the surviving display — nothing accumulates there, which is what
     /// the old "an emptied workspace does not survive its output going away" loss was buying — and
@@ -443,6 +443,12 @@ pub struct Layout<W: LayoutElement> {
     /// case-insensitive and tolerates a missing EDID field, so it is not an equivalence relation
     /// any `Hash`/`Eq` could agree with. Each workspace carries its own home tag anyway.
     parked_workspaces: Vec<Workspace<W>>,
+    /// Named workspaces read out of the persistent store that no display has materialized yet.
+    ///
+    /// Drained the first time a monitor exists to put them on (`docs/fork/multi-display.md` §6).
+    /// They are materialized wherever that is, tagged with the display they belong to, so a
+    /// display arriving later reclaims its own through the same path a replug uses.
+    pending_named: Vec<crate::workspace_names::NamedWorkspace>,
     /// A workspace in mid-air between two displays' strips. Set once a drag has actually crossed a
     /// display boundary, and cleared when it lands.
     thumb_carry: Option<ThumbCarry>,
@@ -1003,6 +1009,7 @@ impl<W: LayoutElement> Layout<W> {
             interactive_move: None,
             thumb_carry: None,
             parked_workspaces: Vec::new(),
+            pending_named: Vec::new(),
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -1034,6 +1041,7 @@ impl<W: LayoutElement> Layout<W> {
             interactive_move: None,
             thumb_carry: None,
             parked_workspaces: Vec::new(),
+            pending_named: Vec::new(),
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -1085,13 +1093,18 @@ impl<W: LayoutElement> Layout<W> {
 
     /// Splits a detached strip into what moves to the surviving display and what is parked.
     ///
-    /// Only *windowed* workspaces move. A named-but-empty one parks with the rest: a name says
-    /// "keep", not "put this somewhere else", and materializing it on the survivor is how the
-    /// user's strip grows a desktop they never asked for.
+    /// Windowed workspaces move, and so do *named* ones: a name makes a workspace furniture, and
+    /// furniture is always there — parking one would make it unreachable for as long as its
+    /// display is away, which is exactly the thing a user names a workspace to avoid
+    /// (`docs/fork/multi-display.md` §6). It keeps its home tag and ordinal, so plugging the
+    /// display back in reclaims it into the arrangement it left.
+    ///
+    /// The cost is deliberate and worth naming: unplugging a display grows the survivor's strip
+    /// by that display's named empties, every dock cycle.
     fn park_empties(&mut self, workspaces: Vec<Workspace<W>>) -> Vec<Workspace<W>> {
         let mut keep = Vec::with_capacity(workspaces.len());
         for ws in workspaces {
-            if ws.has_windows() {
+            if ws.has_windows_or_name() {
                 keep.push(ws);
             } else if !ws.original_output.connector.is_empty() {
                 self.parked_workspaces.push(ws);
@@ -1112,6 +1125,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
+        let output_for_named = output.clone();
         self.monitor_set = match mem::take(&mut self.monitor_set) {
             MonitorSet::Normal {
                 mut monitors,
@@ -1216,7 +1230,97 @@ impl<W: LayoutElement> Layout<W> {
                     active_monitor_idx: 0,
                 }
             }
+        };
+
+        self.materialize_pending_named(&output_for_named);
+    }
+
+    /// Puts the named workspaces the store remembered onto a strip, once there is one.
+    ///
+    /// Every pending entry materializes here, not only the ones belonging to `output`: a named
+    /// workspace is always present, so one whose display is not connected lives on whatever
+    /// display is, tagged with its own — which is the same state an unplug leaves it in, and it
+    /// comes home through the same reclaim when its display arrives.
+    ///
+    /// Ordinal order, so a display that gets all of its own back gets them in its arrangement.
+    fn materialize_pending_named(&mut self, output: &Output) {
+        if self.pending_named.is_empty() {
+            return;
         }
+
+        let mut pending = mem::take(&mut self.pending_named);
+        pending.sort_by_key(|ws| ws.ordinal);
+
+        let mut block: Vec<WorkspaceId> = Vec::with_capacity(pending.len());
+        for entry in pending {
+            // A name the layout already answers to is the store agreeing with the strip, not a
+            // second workspace to make: names are unique, and `set_workspace_name` would refuse.
+            if self.find_workspace_by_name(&entry.name).is_some() {
+                continue;
+            }
+            let Some(id) =
+                self.insert_restore_workspace(output, None, &block, entry.home, entry.ordinal)
+            else {
+                continue;
+            };
+            if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == id) {
+                ws.name = Some(entry.name);
+            }
+            block.push(id);
+        }
+
+        // Materializing takes over the trailing empties, so the strip can come out of this with
+        // no unnamed desktop at the bottom and fewer than the minimum — the workspace-list
+        // invariants every other insertion path restores the same way.
+        if let Some(mon) = self.monitor_for_output_mut(output) {
+            if mon.workspace_switch.is_none() {
+                mon.clean_up_workspaces();
+            }
+        }
+    }
+
+    /// Whether the store's named workspaces are still waiting for a display to land on.
+    pub fn has_pending_named(&self) -> bool {
+        !self.pending_named.is_empty()
+    }
+
+    /// Hands the store's named workspaces to the layout, to be materialized as soon as there is a
+    /// display to put them on. Startup's one caller.
+    pub fn set_pending_named_workspaces(
+        &mut self,
+        workspaces: Vec<crate::workspace_names::NamedWorkspace>,
+    ) {
+        self.pending_named = workspaces;
+    }
+
+    /// Every named workspace, in the frame that outlives the session: the name, the display it
+    /// belongs to, and where in that display's own strip it sits.
+    ///
+    /// Canonically ordered by home display and ordinal rather than by where the workspaces
+    /// currently are, so the list only changes when its *meaning* does — a named workspace
+    /// visiting a survivor while its display is unplugged must not read as a change.
+    pub fn named_workspaces(&self) -> Vec<crate::workspace_names::NamedWorkspace> {
+        use crate::workspace_names::NamedWorkspace;
+
+        let mut named: Vec<NamedWorkspace> = self
+            .workspaces()
+            .filter_map(|(_, _, ws)| {
+                Some(NamedWorkspace {
+                    name: ws.name()?.clone(),
+                    home: ws.original_output.clone(),
+                    ordinal: ws.home_ordinal,
+                })
+            })
+            .collect();
+        named.sort_by(|a, b| {
+            a.home
+                .connector
+                .to_lowercase()
+                .cmp(&b.home.connector.to_lowercase())
+                .then(a.ordinal.cmp(&b.ordinal))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        named
     }
 
     /// Make `output`'s monitor the primary one, as `monitors.xml`'s `<primary>` asks.
@@ -3271,8 +3375,9 @@ impl<W: LayoutElement> Layout<W> {
 
         for workspace in &self.parked_workspaces {
             assert!(
-                !workspace.has_windows(),
-                "a windowed workspace goes to the surviving display, it is never parked"
+                !workspace.has_windows_or_name(),
+                "a workspace with windows or a name goes to the surviving display, \
+                 it is never parked"
             );
             assert!(
                 workspace.current_output().is_none(),

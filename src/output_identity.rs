@@ -87,6 +87,11 @@ impl OutputIdentity {
             && agrees(&self.serial, &other.serial)
     }
 
+    /// Whether this names no display at all — a workspace made while nothing was connected.
+    pub fn is_empty(&self) -> bool {
+        self.connector.is_empty()
+    }
+
     /// Whether this names the display `output` is.
     pub fn matches_output(&self, output: &Output) -> bool {
         Self::try_from_output(output).is_some_and(|id| self.matches(&id))

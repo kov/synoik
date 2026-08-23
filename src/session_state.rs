@@ -490,7 +490,7 @@ impl SessionStore {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
         self.writer
-            .get_or_insert_with(|| StoreWriter::spawn(path))
+            .get_or_insert_with(|| StoreWriter::spawn(path, "session store"))
             .queue(bytes);
         Ok(())
     }
@@ -514,15 +514,16 @@ impl SessionStore {
 /// channel is the ordering. It coalesces — if several saves queued while one write was in flight,
 /// only the newest is written, since each payload is a complete snapshot.
 #[derive(Debug)]
-struct StoreWriter {
+pub struct StoreWriter {
     queue: mpsc::Sender<Vec<u8>>,
     thread: JoinHandle<()>,
 }
 
 impl StoreWriter {
-    fn spawn(path: PathBuf) -> Self {
+    /// `name` is the thread's, so a stuck writer names itself in a backtrace.
+    pub fn spawn(path: PathBuf, name: &str) -> Self {
         let (queue, rx) = mpsc::channel::<Vec<u8>>();
-        let builder = std::thread::Builder::new().name("session store".to_owned());
+        let builder = std::thread::Builder::new().name(name.to_owned());
         let thread = builder
             .spawn(move || {
                 // Ends when the sender drops, which is the compositor going away.
@@ -531,23 +532,23 @@ impl StoreWriter {
                         bytes = newer;
                     }
                     if let Err(err) = write_atomically(&path, &bytes) {
-                        tracing::warn!("error saving the session store: {err}");
+                        tracing::warn!("error saving {}: {err}", path.display());
                     }
                 }
             })
-            .expect("could not start the session store thread");
+            .expect("could not start the store writer thread");
 
         Self { queue, thread }
     }
 
-    fn queue(&self, bytes: Vec<u8>) {
+    pub fn queue(&self, bytes: Vec<u8>) {
         // The worker only ends when we drop it, so a closed channel means it panicked; the warning
         // it would have logged is already out.
         let _ = self.queue.send(bytes);
     }
 
     /// Drains everything queued and joins.
-    fn finish(self) {
+    pub fn finish(self) {
         let Self { queue, thread } = self;
         drop(queue);
         let _ = thread.join();

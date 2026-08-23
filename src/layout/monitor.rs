@@ -1223,14 +1223,19 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspaces.len()
     }
 
-    /// Whether this workspace may be closed from its thumbnail: it has to be windowless
-    /// (naming one means you want it kept), it can't be the trailing empty one — closing
-    /// that would just re-append it — and closing it can't take us below
-    /// [`MIN_NUM_WORKSPACES`].
+    /// Whether this workspace may be closed from its thumbnail: it has to be windowless, it
+    /// can't be the trailing empty one — closing that would just re-append it — and closing it
+    /// can't take us below [`MIN_NUM_WORKSPACES`].
+    ///
+    /// A *named* workspace is closable, and closing it is how a user is rid of one: a name now
+    /// outlives the session (`docs/fork/multi-display.md` §6), so without this the only way to
+    /// drop a workspace that persists across reboots would be to clear its name first and close
+    /// it second. Closing is deliberate enough on its own — it is a menu row, or a button that
+    /// appears on hover.
     pub fn workspace_is_closable(&self, idx: usize) -> bool {
         idx + 1 < self.workspaces.len()
             && self.workspaces.len() > MIN_NUM_WORKSPACES
-            && !self.workspaces[idx].has_windows_or_name()
+            && !self.workspaces[idx].has_windows()
     }
 
     pub fn unname_workspace(&mut self, id: WorkspaceId) -> bool {

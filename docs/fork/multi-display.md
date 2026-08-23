@@ -1,7 +1,6 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23; §1–§6 are implemented. The one decision still open is at the
-end of §6: whether a *named* empty workspace should still park with its absent display.**
+**Status: design agreed 2026-08-23; §1–§7 are implemented.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -11,7 +10,7 @@ a display**, as a member of that display's group. The group survives the display
 survives a logout, and returns as intact as the user's own edits allow. Where GNOME has no answer
 because mutter has one global workspace list, this document says what ours is.
 
-## The five things this settles
+## The six things this settles
 
 1. One notion of display identity, shared by the live layout and the session store.
 2. A workspace's home display and its place in that display's strip, remembered across an unplug
@@ -20,6 +19,7 @@ because mutter has one global workspace list, this document says what ours is.
    keyboard-only fallback.
 4. Moving a workspace between displays, by drag and by menu.
 5. What happens to a window whose work area just got smaller, and how it gets its size back.
+6. A named workspace is always present — through an unplug, a logout and a reboot.
 
 ## 1. One display identity
 
@@ -97,9 +97,9 @@ pile up on the surviving display — by not putting them there in the first plac
 > materialize on the primary. Only its **windowed** workspaces are appended to the primary's strip.
 
 Nothing accumulates on the survivor, the strip stays honest, and an emptied homeless workspace still
-has a group to return to. A **named** empty parks with the rest: a name says "keep", not "put this
-somewhere else", and materializing it on the survivor is how a strip grows a desktop the user never
-made. The cost is that a named empty workspace is unreachable while its display is away.
+has a group to return to. A **named** empty is the exception and travels with the windowed ones: a
+name makes a workspace furniture, and furniture is always present (§7). The cost is deliberate —
+unplugging a display grows the survivor's strip by that display's named empties, every dock cycle.
 
 Two things follow from parking, both wanted. `last_active_workspace_id` can now resolve to a parked
 empty, so a display that was showing an empty desktop comes back showing it — and it is keyed by
@@ -108,8 +108,9 @@ entry. And a parked workspace is deliberately **invisible**: it is not in `Layou
 IPC, a11y and every `find_workspace_by_*` are blind to it. `Layout::verify_invariants` walks the
 parked list explicitly, into the same id- and name-uniqueness sets.
 
-**A lifetime.** Parked groups live for the session and die with it. Nothing about a workspace is
+**A lifetime.** Parked groups live for the session and die with it. An *unnamed* workspace is not
 persisted on its own — across a restart, the saved application sessions are the only carriers (§3).
+A named one is (§7).
 
 ## 3. Restore derives the stack; it does not persist one — *implemented*
 
@@ -143,8 +144,8 @@ What restore materializes is tagged as the absent display's, with the saved inde
 ordinal, so plugging that display in reclaims it into the arrangement it was saved in — the same
 thing an unplug and a replug do for a workspace that never left (§2).
 
-Gaps do not survive a restart, unlike a live unplug and replug: nothing persists an empty
-workspace, so a desktop the user left empty is a desktop no record names. For the same reason a
+Gaps do not survive a restart, unlike a live unplug and replug: nothing persists an *unnamed* empty
+workspace, so a desktop the user left empty and unnamed is a desktop no record names. For the same reason a
 restored ordinal can collide with one the display's *own* strip is already using this run — the
 saved index knows nothing about it. The anonymous empty gives way (`Layout::drop_displaced_empties`)
 rather than sitting between two desktops that were side by side; a **named** empty is not filler and
@@ -348,11 +349,44 @@ none. A name another workspace already answers to is refused and the entry stays
 refuses duplicates silently, and gnome-shell's theme has no error state for an entry to wear, so
 the entry staying open is the signal — with the workspace holding the name visible on the strip.
 
-**Decide here whether a named empty workspace still parks.** §2 parks it with the rest, on the
-grounds that a name says "keep", not "put this somewhere else" — which costs it being reachable at
-all while its display is away. That trade is only worth re-examining once naming is a feature a
-user can actually reach, so it belongs to this item: build the menu, then decide whether a named
-empty should migrate to the survivor instead.
+**Close is offered on a named workspace**, unlike every other thing a name protects it from: with
+§7 a name outlives the session, so closing is how a user is rid of one. Requiring the name to be
+cleared first would be two steps for one intent, and closing is deliberate enough on its own — it
+is a menu row, or a button that only appears on hover.
+
+## 7. A named workspace is always present
+
+A name is not a label on a container of windows; it is the user saying this desktop exists. So a
+named workspace is there whether or not anything is living on it, whether or not its display is
+connected, and whether or not this is the same boot.
+
+Three rules, and everything else follows:
+
+- **It never parks.** An unplug moves it to the surviving display, keeping its home tag and
+  ordinal, so a replug takes it home into the arrangement it left (§2).
+- **It is persisted on its own**, in `$XDG_DATA_HOME/synoik/workspaces.json`: name, home display
+  identity, home ordinal. Read at startup *before* any session is restored, so a window whose
+  record names its workspace finds the one the store made rather than minting a second under a name
+  the first one holds.
+- **Closing it is how it goes away.** Clearing the name leaves an ordinary empty, which the strip
+  reaps as usual; closing removes it outright.
+
+**Not `org.gnome.desktop.wm.preferences workspace-names`.** That is GNOME's surface, and the tenet
+says GNOME's wins — but mutter keys the array by *global workspace index* (`prefs.c:1870-1924`), and
+an index is not an identity here: workspaces are per-monitor, so the number shifts whenever anything
+above it is added, closed or reordered, and it cannot say which display a workspace belongs to. A
+key we could not write correctly is not a key we can adopt.
+
+**The file is a snapshot, never an edit.** It is rewritten whole whenever the layout's list stops
+matching it, compared every refresh cycle and debounced like the session store, so no mutation site
+owes it a call and it cannot drift from the strip. Entries are canonically ordered by home display
+and ordinal, so a named workspace visiting a survivor while its display is unplugged does not read
+as a change. Two states must never be mistaken for "no named workspaces", or startup wipes the file
+it just read: before the store's own entries are materialized, and while no display is connected.
+
+**Startup materializes on whatever display exists**, tagged with the display each workspace belongs
+to — the same state an unplug leaves them in, so a display connected a moment later reclaims its own
+through the reclaim path a replug uses.
 
 ## Order of work
 
@@ -368,3 +402,4 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 5. **Derived restore ordering with lazy materialization** (§3) — LANDED.
 6. **Displaced geometry** (§5) — LANDED.
 7. **The workspace context menu and naming UI** (§6) — LANDED.
+8. **Named workspaces are always present** (§7) — LANDED.

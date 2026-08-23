@@ -9860,16 +9860,18 @@ fn thumbnail_close_button_only_on_dismissable_desktops() {
         "the close button must sit inside its thumbnail, got {rect:?} in {thumb:?}"
     );
 
-    // Naming a workspace is how you say you want it kept — that is already what makes one
-    // un-reapable, and it takes the close button away too.
+    // Naming a workspace makes it un-reapable, but it does *not* take the close button away:
+    // a name outlives the session now, so closing is the only way to be rid of one, and
+    // un-naming first would be a two-step gesture for a one-step intent
+    // (`docs/fork/multi-display.md` §6).
     f.synoik().layout.set_workspace_name(
         String::from("kept"),
         Some(synoik_config::WorkspaceReference::Id(empty_id.get())),
     );
     f.settle();
     assert!(
-        thumbnail_close_rect(&mut f, 0).is_none(),
-        "a named empty desktop is not dismissable"
+        thumbnail_close_rect(&mut f, 0).is_some(),
+        "a named empty desktop is still dismissable: closing it is how a name is retired"
     );
 }
 
@@ -30644,6 +30646,234 @@ fn a_click_in_the_name_entry_keeps_the_rename() {
             .collect::<Vec<_>>(),
         vec![String::from("a")],
         "and it was still the entry typing reached"
+    );
+}
+
+/// A named workspace is always present: unplugging the display it belongs to moves it to the
+/// survivor rather than parking it, and plugging that display back in takes it home again.
+///
+/// Parking it would make it unreachable for as long as its display is away, which is the one
+/// thing a user names a workspace to avoid (`docs/fork/multi-display.md` §6). The cost is
+/// deliberate: the survivor's strip grows by that display's named empties.
+#[test]
+fn a_named_workspace_moves_to_the_survivor_and_comes_home() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    f.synoik_focus_output(2);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    f.settle();
+
+    let names_on = |f: &mut Fixture, n: u8| -> Vec<String> {
+        let output = f.synoik_output(n);
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .map(|mon| {
+                (0..mon.workspace_count())
+                    .filter_map(|idx| mon.workspace_at(idx).and_then(|ws| ws.name().cloned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    f.remove_output(2);
+    f.settle();
+    assert_eq!(
+        names_on(&mut f, 1),
+        vec![String::from("Mail")],
+        "the named workspace must be reachable while its display is away"
+    );
+
+    f.add_output(2, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        names_on(&mut f, 2),
+        vec![String::from("Mail")],
+        "and go home when it comes back"
+    );
+    assert!(
+        names_on(&mut f, 1).is_empty(),
+        "leaving nothing of itself on the display that hosted it"
+    );
+}
+
+/// A name outlives the session, so the list the shell persists is kept in step with the strip:
+/// naming a workspace puts it in, un-naming takes it out.
+#[test]
+fn the_named_workspace_list_follows_the_strip() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.settle();
+    assert!(f.synoik().workspace_names.workspaces().is_empty());
+
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    f.settle();
+    let saved = f.synoik().workspace_names.workspaces().to_vec();
+    assert_eq!(
+        saved.iter().map(|ws| ws.name.as_str()).collect::<Vec<_>>(),
+        vec!["Mail"],
+        "the name is in the list"
+    );
+    assert_eq!(
+        saved[0].home.connector, "headless-1",
+        "with the display it belongs to, so it can be put back on it"
+    );
+
+    f.synoik_state()
+        .do_action(Action::UnsetWorkspaceName, false);
+    f.settle();
+    assert!(
+        f.synoik().workspace_names.workspaces().is_empty(),
+        "and leaves it when the name goes"
+    );
+}
+
+/// The stored list is what a fresh compositor materializes: a named workspace comes back with
+/// nothing living on it, on the display it belongs to, at the place in that display's strip it
+/// had. This is the whole point of persisting it — a session store carries *windows*, so a
+/// workspace whose windows were all closed before logout would otherwise come back as an
+/// ordinary empty.
+#[test]
+fn a_stored_named_workspace_is_materialized_at_startup() {
+    use crate::workspace_names::NamedWorkspace;
+
+    let mut f = Fixture::new();
+    f.synoik().layout.set_pending_named_workspaces(vec![
+        NamedWorkspace {
+            name: String::from("Mail"),
+            home: crate::output_identity::OutputIdentity::from_connector("headless-1"),
+            ordinal: 1,
+        },
+        NamedWorkspace {
+            name: String::from("Code"),
+            home: crate::output_identity::OutputIdentity::from_connector("headless-1"),
+            ordinal: 0,
+        },
+    ]);
+
+    f.add_output(1, (1920, 1080));
+    f.settle();
+
+    let output = f.synoik_output(1);
+    let names: Vec<Option<String>> = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .map(|mon| {
+            (0..mon.workspace_count())
+                .map(|idx| mon.workspace_at(idx).unwrap().name().cloned())
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(
+        names,
+        vec![Some(String::from("Code")), Some(String::from("Mail")), None],
+        "both come back, in the order they were stored in, above the trailing empty"
+    );
+}
+
+/// The list is not wiped by the startup that was meant to read it.
+///
+/// The snapshot is taken every refresh cycle, and until the store's own entries have been put on
+/// a strip the layout truthfully holds no named workspaces — which, taken at face value, is a
+/// write of an empty list over the file. The same is true while no display is connected at all.
+#[test]
+fn a_startup_refresh_does_not_wipe_the_stored_names() {
+    use crate::workspace_names::NamedWorkspace;
+
+    let stored = vec![NamedWorkspace {
+        name: String::from("Mail"),
+        home: crate::output_identity::OutputIdentity::from_connector("headless-1"),
+        ordinal: 0,
+    }];
+
+    let mut f = Fixture::new();
+    f.synoik().workspace_names.set(stored.clone());
+    f.synoik()
+        .layout
+        .set_pending_named_workspaces(stored.clone());
+
+    // A cycle with no display to materialize onto: exactly what the compositor does between
+    // reading the file and the first output arriving.
+    f.synoik_state().refresh();
+    assert_eq!(
+        f.synoik().workspace_names.workspaces(),
+        stored.as_slice(),
+        "a refresh before there is anywhere to put them must not read as \"no named workspaces\""
+    );
+
+    f.add_output(1, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        f.synoik().workspace_names.workspaces(),
+        stored.as_slice(),
+        "and the list still says what it said once they are on the strip"
+    );
+}
+
+/// A window whose record names its workspace lands on the one the store already made, rather
+/// than minting a second workspace under a name the first one holds — which is why the named
+/// workspaces are read before any session is restored into.
+#[test]
+fn a_restored_window_lands_on_the_stored_named_workspace() {
+    use crate::workspace_names::NamedWorkspace;
+
+    let mut f = Fixture::new();
+    f.synoik()
+        .layout
+        .set_pending_named_workspaces(vec![NamedWorkspace {
+            name: String::from("mail"),
+            home: crate::output_identity::OutputIdentity::from_connector("headless-1"),
+            ordinal: 1,
+        }]);
+    f.add_output(1, (1280, 720));
+    f.settle();
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(0),
+            workspace_name: Some(String::from("mail")),
+            output: Some(saved_on("headless-1")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let output = f.synoik_output(1);
+    let named: Vec<usize> = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .map(|mon| {
+            (0..mon.workspace_count())
+                .filter(|idx| {
+                    mon.workspace_at(*idx)
+                        .and_then(|ws| ws.name())
+                        .is_some_and(|name| name == "mail")
+                })
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(named.len(), 1, "exactly one workspace answers to the name");
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 1),
+        named[0],
+        "and the restored window brought us to it"
     );
 }
 

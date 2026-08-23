@@ -564,6 +564,10 @@ pub struct Synoik {
     pub session_manager_state: SessionManagerState,
     /// Armed by [`State::schedule_session_save`]; `None` means no write is pending.
     pub session_save_timer: Option<RegistrationToken>,
+    /// The named workspaces that outlive this session (`docs/fork/multi-display.md` §6).
+    pub workspace_names: crate::workspace_names::WorkspaceNameStore,
+    /// Armed when a snapshot differs from what the store holds; `None` means no write is pending.
+    pub workspace_names_save_timer: Option<RegistrationToken>,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -1827,6 +1831,26 @@ impl State {
                 }
                 None => warn!("no data directory; sessions will not persist"),
             }
+
+            // Named workspaces are furniture, not session state: they come back whether or not
+            // anything was living on them (`docs/fork/multi-display.md` §6). Loaded *before* the
+            // session store's records are restored into, so a window that names its workspace
+            // finds the one the store already made rather than minting a second workspace under
+            // a name the first one holds.
+            match crate::workspace_names::default_path() {
+                Some(path) => {
+                    let (store, err) = crate::workspace_names::WorkspaceNameStore::load(path);
+                    if let Some(err) = err {
+                        warn!("error loading the named workspaces, starting empty: {err}");
+                    }
+                    state
+                        .synoik
+                        .layout
+                        .set_pending_named_workspaces(store.workspaces().to_vec());
+                    state.synoik.workspace_names = store;
+                }
+                None => warn!("no data directory; workspace names will not persist"),
+            }
         }
 
         if mode != BackendMode::HeadlessTest {
@@ -2359,9 +2383,49 @@ impl State {
         // Needs to be called after updating the keyboard focus.
         self.synoik.refresh_a11y();
 
+        // A named workspace is furniture and outlives the session, so the list is kept in step
+        // with the strip rather than written at each of the many places a name, a home or an
+        // ordinal can change (`docs/fork/multi-display.md` §6). Level-triggered: the snapshot is
+        // compared, and only a different one costs anything.
+        self.save_workspace_names_if_changed();
+
         // Last: everything above can change what the input method owes the focused client, and
         // the whole point of deferring is that they are answered together.
         self.flush_im_done();
+    }
+
+    /// Keep the persistent named-workspace list in step with the strip.
+    ///
+    /// Two states must never be mistaken for "the user has no named workspaces", or the file is
+    /// wiped by the very startup that was meant to read it: before the store's own entries have
+    /// been materialized, and while no display is connected at all (the workspaces are still
+    /// there, but nothing has put them on a strip).
+    fn save_workspace_names_if_changed(&mut self) {
+        if self.synoik.layout.has_pending_named() || self.synoik.layout.primary_output().is_none() {
+            return;
+        }
+
+        let snapshot = self.synoik.layout.named_workspaces();
+        if !self.synoik.workspace_names.set(snapshot) {
+            return;
+        }
+
+        // Same debounce as the session store, and the same first-change-wins arming: a rename
+        // being typed must not push the write out indefinitely.
+        if self.synoik.workspace_names_save_timer.is_some() {
+            return;
+        }
+        let timer = calloop::timer::Timer::from_duration(crate::handlers::SESSION_SAVE_DELAY);
+        self.synoik.workspace_names_save_timer = self
+            .synoik
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.synoik.workspace_names_save_timer = None;
+                state.synoik.save_workspace_names();
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the named-workspace save: {err:?}"))
+            .ok();
     }
 
     /// Push the active keyboard-layout short label into the panel's `keyboard` indicator (GNOME's
@@ -7938,6 +8002,8 @@ impl Synoik {
             mutter_x11_interop_state,
             session_manager_state,
             session_save_timer: None,
+            workspace_names: crate::workspace_names::WorkspaceNameStore::in_memory(),
+            workspace_names_save_timer: None,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -8124,6 +8190,24 @@ impl Synoik {
             self.event_loop.remove(token);
         }
         self.session_manager_state.store.flush();
+    }
+
+    /// Queues a named-workspace write if the list changed. Called from the debounce timer.
+    pub fn save_workspace_names(&mut self) {
+        if !self.workspace_names.is_dirty() {
+            return;
+        }
+        if let Err(err) = self.workspace_names.save() {
+            warn!("error serializing the named workspaces: {err}");
+        }
+    }
+
+    /// Cancels a pending debounced save and writes synchronously. For the shutdown path.
+    pub fn flush_workspace_names(&mut self) {
+        if let Some(token) = self.workspace_names_save_timer.take() {
+            self.event_loop.remove(token);
+        }
+        self.workspace_names.flush();
     }
 
     pub fn inhibit_power_key(&mut self) -> anyhow::Result<()> {

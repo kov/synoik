@@ -398,6 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it. A SIGKILL still does, exactly as it does for mutter.
     state.save_session_toplevels_still_mapped();
     state.synoik.flush_session_store();
+    state.synoik.flush_workspace_names();
 
     outcome?;
     Ok(())
