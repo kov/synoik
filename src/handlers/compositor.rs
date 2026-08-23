@@ -116,6 +116,7 @@ impl CompositorHandler for State {
                         was_restored,
                         restore_reason,
                         unmaximize_to,
+                        restore_edge_tiled,
                         restore_minimized,
                     ) = if let InitialConfigureState::Configured {
                         rules,
@@ -155,6 +156,8 @@ impl CompositorHandler for State {
                         let restore_reason = restore.as_ref().map(|restore| restore.reason);
                         let restore_minimized =
                             restore.as_ref().is_some_and(|restore| restore.minimized);
+                        let restore_edge_tiled =
+                            restore.as_ref().and_then(|restore| restore.edge_tiled);
                         let unmaximize_to = restore.and_then(|restore| restore.unmaximize_to);
 
                         (
@@ -168,6 +171,7 @@ impl CompositorHandler for State {
                             was_restored,
                             restore_reason,
                             unmaximize_to,
+                            restore_edge_tiled,
                             restore_minimized,
                         )
                     } else {
@@ -183,6 +187,7 @@ impl CompositorHandler for State {
                             None,
                             false,
                             false,
+                            None,
                             None,
                             None,
                             false,
@@ -461,6 +466,16 @@ impl CompositorHandler for State {
                         }
                     } else {
                         error!("layout is missing the window that we just added");
+                    }
+
+                    // Edge tiling, once there is a tile to tile. The geometry comes from the work
+                    // area the window landed on — nothing here reads the record — so the state
+                    // survives a restore onto a display that never held the window, the way
+                    // maximize and fullscreen do. Before the minimize below, which takes the tile
+                    // out of the layout and would leave nothing to tile; the rect an un-tile
+                    // returns to is seeded further down and does not depend on this order.
+                    if let Some(side) = restore_edge_tiled {
+                        self.synoik.layout.restore_edge_tiled(&window, side);
                     }
 
                     // A restored window that was saved minimized is hidden here, *after* the

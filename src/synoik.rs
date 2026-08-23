@@ -138,7 +138,7 @@ use crate::dbus::gnome_shell_screenshot::{ScreenshotToSynoik, SynoikToScreenshot
 use crate::dbus::system_status::SystemStatusToSynoik;
 use crate::frame_clock::{Dispatch, FrameClock};
 use crate::frame_log::{AnimCauses, FrameContext, FrameLog, Phase};
-use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
+use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter, TileSide};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::keyboard_window_grab::KeyboardWindowGrab;
 use crate::input::pick_color_grab::PickColorGrab;
@@ -4911,8 +4911,9 @@ impl State {
         };
 
         info!(
-            "session store: saving {session_id}/{name} as {:?} on {:?} workspace {:?}/{:?} state {:?}",
+            "session store: saving {session_id}/{name} floating {:?} tiled {:?} on {:?} workspace {:?}/{:?} state {:?}",
             record.floating_rect,
+            record.tiled_rect,
             record.output.as_ref().map(|o| &o.connector),
             record.workspace,
             record.workspace_name,
@@ -4929,10 +4930,16 @@ impl State {
     fn session_record_for(&self, window: &Window) -> Option<ToplevelRecord> {
         let snapshot = self.synoik.layout.session_snapshot(window)?;
 
-        let state = match snapshot.sizing_mode {
-            SizingMode::Normal => WindowState::Floating,
-            SizingMode::Maximized => WindowState::Maximized,
-            SizingMode::Fullscreen => WindowState::Fullscreen,
+        // Edge tiling is orthogonal to the sizing mode — a tiled window reads `Normal` — so it is
+        // asked first, the way mutter orders the same branch
+        // (`meta-wayland-xdg-session-state.c:342-357`): maximize wins over tiling, tiling over
+        // everything below it.
+        let state = match (snapshot.tile.sizing_mode, snapshot.tile.edge_tiled) {
+            (SizingMode::Maximized, _) => WindowState::Maximized,
+            (_, Some(TileSide::Left)) => WindowState::TiledLeft,
+            (_, Some(TileSide::Right)) => WindowState::TiledRight,
+            (SizingMode::Fullscreen, None) => WindowState::Fullscreen,
+            (SizingMode::Normal, None) => WindowState::Floating,
         };
 
         // The rect goes to disk exactly as the layout holds it — output-local. The display it is
@@ -4948,18 +4955,30 @@ impl State {
                 serial: name.serial.clone(),
             });
 
-        let floating_rect = snapshot.floating_rect.map(|rect| {
+        let to_rect = |rect: Rectangle<f64, Logical>| {
             [
                 rect.loc.x.round() as i32,
                 rect.loc.y.round() as i32,
                 rect.size.w.round() as i32,
                 rect.size.h.round() as i32,
             ]
-        });
+        };
+
+        // Two rects, and which one a restore reads is decided by the state
+        // (`WindowState::saved_rect`). `tiled-rect` is where the window *is* when the compositor
+        // owns its geometry — mutter writes only that for a maximized, fullscreen or edge-tiled
+        // window. `floating-rect` is where it would go back to, which mutter drops for those
+        // states; keeping it is what lets an un-tile after a restore land on the size the window
+        // had before it was tiled, rather than on a default.
+        let live_rect = state
+            .saved_rect_is_live()
+            .then(|| snapshot.tile.live_rect.map(to_rect))
+            .flatten();
 
         Some(ToplevelRecord {
             state: Some(state.as_raw()),
-            floating_rect,
+            floating_rect: snapshot.tile.floating_rect.map(to_rect),
+            tiled_rect: live_rect,
             workspace: Some(snapshot.workspace_idx as u32),
             workspace_name: snapshot.workspace_name,
             output,
@@ -4967,7 +4986,6 @@ impl State {
             // (`meta-wayland-xdg-session-state.c:337`, `:475`), which is also the order the
             // restore path here takes.
             is_minimized: self.synoik.layout.is_minimized(window),
-            ..Default::default()
         })
     }
 

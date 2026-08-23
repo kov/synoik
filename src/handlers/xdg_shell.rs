@@ -1251,14 +1251,21 @@ impl State {
         // that a later recompute of the rules — a title change, a config reload — can put them
         // back instead of dropping them; see `RestoreRuleSeeds`.
         let mut rule_seeds = RestoreRuleSeeds::default();
+        let restored_state = restore.as_ref().and_then(|r| r.record.restorable_state());
         if let Some(restore) = &restore {
-            match restore.record.restorable_state() {
+            match restored_state {
                 Some(WindowState::Fullscreen) => rule_seeds.open_fullscreen = Some(true),
                 Some(WindowState::Maximized) => rule_seeds.open_maximized_to_edges = Some(true),
+                // Edge tiling is applied on the map, once there is a tile to tile — see
+                // `RestoreOnMap::edge_tiled`. What the configure owes it is the *size*, seeded
+                // below out of the saved tiled rect, so the client's first buffer is already the
+                // one the tiled slot wants instead of a floating size it will resize away from.
                 _ => (),
             }
 
-            if let Some([_, _, w, h]) = restore.record.floating_rect {
+            // Whichever of the record's two rects this state's geometry lives in: the live rect
+            // for anything the compositor sizes, the floating one otherwise.
+            if let Some([_, _, w, h]) = restored_state.and_then(|s| s.saved_rect(&restore.record)) {
                 rule_seeds.default_width = Some(Some(PresetSize::Fixed(w)));
                 rule_seeds.default_height = Some(Some(PresetSize::Fixed(h)));
             }
@@ -1349,7 +1356,7 @@ impl State {
         let restored_rect = restore
             .as_ref()
             .filter(|r| r.output.is_some())
-            .and_then(|r| r.record.floating_rect);
+            .and_then(|r| restored_state?.saved_rect(&r.record));
         if let Some(([x, y, w, h], ws)) = restored_rect.zip(ws) {
             // The rect comes off disk output-local; `default_floating_position` speaks the working
             // area of the workspace the window is actually landing on, which is per-workspace
@@ -1377,13 +1384,15 @@ impl State {
             workspace_idx: restore_workspace_idx,
             // Only for a window that maps straight into maximized or fullscreen — anything else
             // gets its floating geometry from the configure and the position rule.
-            unmaximize_to: restore
-                .record
-                .restorable_state()
+            unmaximize_to: restored_state
                 .filter(|state| *state != WindowState::Floating)
                 // Output-local, and only meaningful when the display it is local to came back.
                 .filter(|_| restore.output.is_some())
                 .and(restore.record.floating_rect),
+            // Not gated on the display coming back, unlike the rects: an edge-tiled window is
+            // sized and placed from the work area it lands on, so the state survives a restore
+            // onto a display the record never saw — the same way maximize and fullscreen do.
+            edge_tiled: restored_state.and_then(WindowState::tile_side),
             minimized: restore.record.is_minimized,
             rule_seeds,
         });

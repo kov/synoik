@@ -731,14 +731,40 @@ pub struct SessionSnapshot<'a> {
     /// meaningless across restarts, which is also why mutter persists an index.
     pub workspace_idx: usize,
 
-    pub sizing_mode: SizingMode,
-
-    /// The rect the window would take if floating, **output-local**. `None` when it has never
-    /// floated, so there is nothing remembered to restore it to.
-    pub floating_rect: Option<Rectangle<f64, Logical>>,
+    /// How the window is sized and where, from [`Workspace::session_snapshot`].
+    pub tile: TileSessionState,
 
     /// The workspace's name, when the user gave it one. The only handle that outlives a restart.
     pub workspace_name: Option<String>,
+}
+
+/// How one tile is sized and where, in the frame the session store keeps.
+///
+/// Split out from [`SessionSnapshot`] because it is what a [`Workspace`] can answer on its own;
+/// the display and the workspace around it come from the layout.
+#[derive(Debug)]
+pub struct TileSessionState {
+    pub sizing_mode: SizingMode,
+
+    /// The half of the work area the window is edge-tiled to, when it is.
+    ///
+    /// Orthogonal to [`Self::sizing_mode`], which reads `Normal` for an edge-tiled window: tiling
+    /// is a position and a size, not one of the modes that own the whole output.
+    pub edge_tiled: Option<TileSide>,
+
+    /// The rect the window would take if floating, **output-local**. `None` when it has never
+    /// floated, so there is nothing remembered to restore it to.
+    ///
+    /// For a maximized, fullscreen or edge-tiled window this is the rect it came *from* — what an
+    /// un-tile returns it to. Mutter drops that for a tiled window and only remembers the tiled
+    /// rect (`meta-wayland-xdg-session-state.c:348-357`), so an un-tile after a restore lands on a
+    /// default size; the store has a slot for both, so we keep both.
+    pub floating_rect: Option<Rectangle<f64, Logical>>,
+
+    /// The rect the window actually occupies, **output-local**, for the states whose geometry the
+    /// compositor owns. `None` for a window outside the floating layer, which has no position of
+    /// its own to save.
+    pub live_rect: Option<Rectangle<f64, Logical>>,
 }
 
 impl SizingMode {
@@ -6295,6 +6321,19 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Restores an edge-tiled window, see [`Workspace::restore_edge_tiled`].
+    ///
+    /// Runs after [`Self::seed_unmaximize_geometry`] on the map path, which is what fills in the
+    /// rect an un-tile returns to.
+    pub fn restore_edge_tiled(&mut self, id: &W::Id, side: TileSide) {
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                ws.restore_edge_tiled(id, side);
+                return;
+            }
+        }
+    }
+
     /// Everything the session store needs about `id`.
     ///
     /// Every coordinate here is relative to `output`, and the workspace index is an index into
@@ -6302,12 +6341,11 @@ impl<W: LayoutElement> Layout<W> {
     /// replayed under a monitor configuration that shares nothing with the one that wrote it.
     pub fn session_snapshot(&self, id: &W::Id) -> Option<SessionSnapshot<'_>> {
         self.workspaces().find_map(|(monitor, idx, ws)| {
-            let (sizing_mode, floating_rect) = ws.session_snapshot(id)?;
+            let tile = ws.session_snapshot(id)?;
             Some(SessionSnapshot {
                 output: monitor.map(|mon| &mon.output),
                 workspace_idx: idx,
-                sizing_mode,
-                floating_rect,
+                tile,
                 workspace_name: ws.name().cloned(),
             })
         })

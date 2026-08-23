@@ -146,16 +146,28 @@ Against synoik today:
 | floating rect | ✅ `Tile::floating_pos` + window size |
 | maximized | ✅ (`Floating` owns maximize/fullscreen in GNOME mode) |
 | fullscreen | ✅ |
-| tiled-left / tiled-right | ❌ **edge half-tiling is not ported** — no `MetaTileMode` equivalent; planned, unreachable for now |
+| tiled-left / tiled-right | ✅ `LayoutElement::edge_tiled_side` — and the pre-tile rect is kept too, which mutter drops |
 | is_minimized | ❌ **no minimize** — `synoik.rs:4712` says so outright; planned, unreachable for now |
 | workspace index | ✅ `Monitor::workspaces` is an ordered `Vec` |
 
-Minimize and edge half-tiling are both intended for synoik eventually; they are simply
-unreachable today. So: the in-memory enum carries only `Floating { rect }`, `Maximized { rect }`,
-`Fullscreen { rect }`, but the *serialized* format keeps mutter's numeric `state` values
-(1=floating, 2=maximized, 3=tiled-left, 4=tiled-right, 5=fullscreen) and both rect keys, so that
-tiled-left/right and `is-minimized` slot in unchanged when they land, and a file written by a
-future synoik still parses today. Unknown state values parse as "no restore".
+Minimize is intended for synoik eventually; it is simply unreachable today. The serialized format
+keeps mutter's numeric `state` values (1=floating, 2=maximized, 3=tiled-left, 4=tiled-right,
+5=fullscreen) and both rect keys, so `is-minimized` slots in unchanged when it lands and a file
+written by a future synoik still parses today. Unknown state values parse as "no restore".
+
+**Which rect a state reads is decided by the state** (`WindowState::saved_rect`, mutter's
+`meta-wayland-xdg-session-state.c:415-429`): a plain floating window reads `floating-rect`;
+anything the compositor sizes — maximized, fullscreen, either tiled half — reads `tiled-rect`,
+which is where its live rect was written. **We write both.** Mutter writes only the live rect for
+those states, so an un-tile or an un-maximize after a restore lands on a default size; keeping
+`floating-rect` alongside makes it land on the size the window actually had before. The slot
+already exists in the format, so this costs nothing and no other implementation is confused by it.
+
+Edge tiling is applied **on the map**, not at the initial configure: it is a layout operation, so
+there has to be a tile first (mutter tiles post-hoc for the same reason, `:461-466`). What the
+configure owes it is the *size*, seeded out of `tiled-rect` so the client's first buffer is already
+the one the tiled slot wants. The tiling itself derives from the work area the window lands on, so
+— unlike a remembered position — it is **not** gated on the recorded display coming back.
 
 Workspaces persist **by index**, like mutter — `WorkspaceId(u64)` is runtime-only and meaningless
 across restarts. With dynamic workspaces the index routinely no longer exists at restore time;
@@ -240,8 +252,10 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
    `restored` event is sent.
 4. **On map** — consume the payload: pick the workspace by the saved index, growing the strip if
    it is past the end (`Monitor::ensure_workspace_at`, capped), skip
-   GNOME auto-maximize, and seed `Tile::tiled_restore_*` with the saved rect so a window that maps
-   straight into maximized has somewhere to unmaximize *to*.
+   GNOME auto-maximize, seed `Tile::tiled_restore_*` with the saved rect so a window that maps
+   straight into maximized or tiled has somewhere to unmaximize or un-tile *to*, and edge-tile it
+   when the record named a half (`Layout::restore_edge_tiled`) — before the minimize, which takes
+   the tile out of the layout.
 
 ### Save flow
 
@@ -446,13 +460,13 @@ placement picks. Without that pairing these are screenshots of a default.
    next start.
 
    Store unit tests cover the JSON round trip, the too-new version refusal, an unsupported state
-   value (half-tiling) that keeps its record but restores nothing, an unknown-to-us state value
-   from a future synoik, MRU eviction, dirty-flag bookkeeping, save-then-load, and that a burst of queued saves coalesces
-   to the newest. Conformance
+   value from a future synoik that keeps its record but restores nothing, which of the two rects
+   each state reads, MRU eviction, dirty-flag bookkeeping, save-then-load, and that a burst of
+   queued saves coalesces to the newest. Conformance
    tests cover restore-from-a-remembered-id, destroy-keeps/remove-forgets, an inert session's
    `remove` being a no-op, and the write being scheduled rather than inline.
 3. **Save on unmap — DONE.** `State::save_session_toplevel` writes a registered window's sizing
-   mode, saved rect and workspace index into the store when it unmaps or is destroyed, mirroring
+   mode, edge-tiled half, both rects and workspace index into the store when it unmaps or is destroyed, mirroring
    mutter's one and only save trigger, `on_window_unmanaging`
    (`meta-wayland-xdg-session.c:262-276`). It runs **before the unmapping commit is processed** —
    alongside the close-animation snapshot, for the same reason: afterwards the window's size is

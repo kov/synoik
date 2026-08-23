@@ -61,6 +61,15 @@ pub struct RestoreOnMap {
     /// un-maximizing would land on a default size instead of the one it was saved with.
     pub unmaximize_to: Option<crate::session_state::Rect>,
 
+    /// The half of the work area to edge-tile the window to, when the record named one.
+    ///
+    /// Applied on the map for the same reason minimize is: tiling is a *layout* operation, so
+    /// there has to be a tile first. Mutter tiles post-hoc too
+    /// (`meta-wayland-xdg-session-state.c:461-466`, `meta_window_tile`) — the geometry comes from
+    /// the work area the window lands on, never from the record, so nothing here depends on the
+    /// display that saved it still being connected.
+    pub edge_tiled: Option<crate::gnome::TileSide>,
+
     /// Whether the saved window was minimized.
     ///
     /// Carried to the map rather than seeded into a rule, because minimizing is a *layout*

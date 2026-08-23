@@ -36,7 +36,7 @@ use super::shadow::Shadow;
 use super::tile::{SnapshotRenderer, Tile, TileRenderElement, TileUnmapSnapshot};
 use super::{
     expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac, SizingMode,
+    RemovedTile, SizeFrac, TileSessionState,
 };
 use crate::animation::{Animation, Clock, Curve};
 use crate::gnome::{EdgeTileTarget, TileSide};
@@ -2142,6 +2142,22 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Restores an edge-tiled window, see [`FloatingSpace::restore_edge_tiled`].
+    ///
+    /// Only the floating layer can hold an edge-tiled window. In niri's scrolling mode a restored
+    /// window may have opened into the scrolling layout instead, which owns its size; there is no
+    /// tiling to restore there, so the state is dropped rather than approximated.
+    pub fn restore_edge_tiled(&mut self, window: &W::Id, side: TileSide) {
+        match self.home_of(window) {
+            Some(Home::Floating) => self.floating.restore_edge_tiled(window, side),
+            Some(Home::Scrolling) => (),
+            // A hidden window has no edge to tile to; a restore that also asked for minimize
+            // applies it after this, so the tiling lands first and the window is hidden at the
+            // size it would have had.
+            Some(Home::Minimized) | None => (),
+        }
+    }
+
     /// mutter's denied-focus placement, see
     /// [`FloatingSpace::avoid_focus_window`].
     pub fn avoid_focus_window(&mut self, window: &W::Id, focus: &W::Id) -> bool {
@@ -3877,16 +3893,14 @@ impl<W: LayoutElement> Workspace<W> {
         true
     }
 
-    /// What the session store remembers about `id`: its sizing mode and the rect it would take if
-    /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`).
+    /// What the session store remembers about `id`: how it is sized, the rect it would take if
+    /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`) — and, when the
+    /// compositor owns its geometry, the rect it actually occupies.
     ///
-    /// The rect is **output-local**, which is also the frame the store keeps it in. `None` for the
-    /// rect means the window has never floated (it opened straight into maximize, say) and there
-    /// is no remembered geometry to restore — the sizing mode is still worth having.
-    pub fn session_snapshot(
-        &self,
-        id: &W::Id,
-    ) -> Option<(SizingMode, Option<Rectangle<f64, Logical>>)> {
+    /// Both rects are **output-local**, which is also the frame the store keeps them in. `None`
+    /// for the floating rect means the window has never floated (it opened straight into maximize,
+    /// say) and there is no remembered geometry to restore — how it is sized is still worth having.
+    pub fn session_snapshot(&self, id: &W::Id) -> Option<TileSessionState> {
         let tile = self.tiles().find(|tile| tile.window().id() == id)?;
 
         // Where it actually sits, as the last resort — but only the floating layer has a position
@@ -3899,10 +3913,10 @@ impl<W: LayoutElement> Workspace<W> {
             .find(|(tile, _)| tile.window().id() == id)
             .map(|(tile, offset)| (offset, tile.window_size()));
 
-        // `tiled_restore_*` first: that is the rect an un-maximize returns the window to, and in
-        // GNOME mode — where the tile stays in the floating layer — it is the one that holds the
-        // pre-maximize geometry. `floating_*` is the same memory for scrolling mode, where the
-        // tile moved layers instead. Between them they are mutter's `saved_rect`.
+        // `tiled_restore_*` first: that is the rect an un-maximize or an un-tile returns the
+        // window to, and in GNOME mode — where the tile stays in the floating layer — it is the
+        // one that holds the pre-maximize geometry. `floating_*` is the same memory for scrolling
+        // mode, where the tile moved layers instead. Between them they are mutter's `saved_rect`.
         let pos = tile
             .tiled_restore_pos
             .or(tile.floating_pos)
@@ -3914,11 +3928,14 @@ impl<W: LayoutElement> Workspace<W> {
             .map(Size::to_f64)
             .or(live.map(|(_, size)| size));
 
-        let rect = pos
-            .zip(size)
-            .map(|(pos, size)| Rectangle::new(pos + tile.window_offset(), size));
+        let rect = |pos, size| Rectangle::new(pos + tile.window_offset(), size);
 
-        Some((tile.sizing_mode(), rect))
+        Some(TileSessionState {
+            sizing_mode: tile.sizing_mode(),
+            edge_tiled: tile.window().edge_tiled_side(),
+            floating_rect: pos.zip(size).map(|(pos, size)| rect(pos, size)),
+            live_rect: live.map(|(offset, size)| rect(offset, size)),
+        })
     }
 
     pub fn layout_config(&self) -> Option<&synoik_config::LayoutPart> {

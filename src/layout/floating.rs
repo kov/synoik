@@ -1421,6 +1421,21 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
+    /// Puts a window into an edge-tiled state without saving a rect to un-tile back to.
+    ///
+    /// [`Self::toggle_tiled`] is the interactive entry and saves that rect from where the window
+    /// currently is. A session restore has already seeded it from the store — the pre-tile rect
+    /// the window had when it was saved, which is better than anything derivable here — so this
+    /// path must leave it alone. Nor does it animate: the window is arriving, not moving.
+    pub fn restore_edge_tiled(&mut self, id: &W::Id, side: TileSide) {
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+
+        self.tiles[idx].saved_maximize = false;
+        self.place_edge_tiled(idx, side, false);
+    }
+
     /// Untiles the window if it is edge-tiled, restoring its saved geometry
     /// (mutter's `meta_window_untile`).
     pub fn untile_window(&mut self, id: &W::Id) {

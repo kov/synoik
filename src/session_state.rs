@@ -32,8 +32,8 @@
 //! **Forward compatibility is deliberate.** A `version` newer than ours makes the whole load fail
 //! closed rather than silently dropping records we cannot read, and within a record a `state` value
 //! we do not understand parses as "do not restore" while still round-tripping to disk untouched.
-//! synoik cannot represent minimize or edge half-tiling yet; both are intended, so their slots are
-//! carried rather than dropped.
+//! synoik cannot represent minimize yet; it is intended, so its slot is carried rather than
+//! dropped.
 //!
 //! **The write happens off the compositor thread.** Serializing is cheap and stays inline — that is
 //! what pins the bytes to live state at save time — but the write itself is an `fsync`, measured at
@@ -95,13 +95,33 @@ impl WindowState {
         self as u32
     }
 
-    /// Whether synoik can actually put a window into this state today.
+    /// Which of the record's two rects this state's geometry lives in.
     ///
-    /// Edge half-tiling is not ported yet (and minimize is a separate flag with the same story),
-    /// so a record written by a future synoik — or migrated from mutter's store — can name a state
-    /// we have to ignore for now without that being a parse error.
-    pub fn is_supported(self) -> bool {
-        matches!(self, Self::Floating | Self::Maximized | Self::Fullscreen)
+    /// Mutter's restore switch (`meta-wayland-xdg-session-state.c:415-429`): only a plain floating
+    /// window reads `floating-rect`; everything sized by the compositor reads `tiled-rect`, which
+    /// is where its live rect was saved.
+    pub fn saved_rect(self, record: &ToplevelRecord) -> Option<Rect> {
+        match self {
+            Self::Floating => record.floating_rect,
+            Self::Maximized | Self::Fullscreen | Self::TiledLeft | Self::TiledRight => {
+                record.tiled_rect
+            }
+        }
+    }
+
+    /// Whether [`Self::saved_rect`] reads `tiled-rect`: whether the compositor owns this state's
+    /// geometry, so the window's live rect is the one worth writing.
+    pub fn saved_rect_is_live(self) -> bool {
+        !matches!(self, Self::Floating)
+    }
+
+    /// The half of the work area this state tiles to, when it is an edge-tiled one.
+    pub fn tile_side(self) -> Option<crate::gnome::TileSide> {
+        match self {
+            Self::TiledLeft => Some(crate::gnome::TileSide::Left),
+            Self::TiledRight => Some(crate::gnome::TileSide::Right),
+            _ => None,
+        }
     }
 }
 
@@ -164,7 +184,10 @@ pub struct ToplevelRecord {
     )]
     pub floating_rect: Option<Rect>,
 
-    /// Written only by a synoik that has edge half-tiling. Carried through untouched until then.
+    /// The window's *live* rect, for every state whose geometry the compositor owns — maximized,
+    /// fullscreen and both edge-tiled halves. Mutter writes exactly this
+    /// (`meta-wayland-xdg-session-state.c:340-362`) and reads it back only to pick a monitor; here
+    /// it seeds the initial configure, so the client's first buffer is already the right size.
     #[serde(
         rename = "tiled-rect",
         default,
@@ -223,10 +246,12 @@ impl ToplevelRecord {
     }
 
     /// The state to actually restore into, or `None` when there is nothing usable to apply.
+    ///
+    /// Every state synoik writes round-trips; a raw value outside the numbering — written by a
+    /// newer synoik, or migrated from a store we do not know — parses as "do not restore" while
+    /// still surviving a save untouched.
     pub fn restorable_state(&self) -> Option<WindowState> {
-        self.state
-            .and_then(WindowState::from_raw)
-            .filter(|state| state.is_supported())
+        self.state.and_then(WindowState::from_raw)
     }
 }
 
@@ -624,28 +649,61 @@ mod tests {
 
     #[test]
     fn an_unreadable_state_keeps_the_record_but_does_not_restore() {
-        // Half-tiling and anything else we do not implement yet.
+        // A raw outside the numbering: written by a newer synoik, or migrated from a store we do
+        // not know.
         let bytes = br#"{"version": 2, "sessions": {"s": {"last-used": 1,
-            "toplevels": {"w": {"state": 3, "tiled-rect": [0, 0, 100, 100], "is-minimized": true}}}}}"#;
+            "toplevels": {"w": {"state": 6, "tiled-rect": [0, 0, 100, 100], "is-minimized": true}}}}}"#;
         let parsed = SessionStore::parse(bytes).unwrap();
         let toplevel = &parsed["s"].toplevels["w"];
 
         assert_eq!(
             toplevel.restorable_state(),
             None,
-            "tiled-left is not portable to synoik yet, so nothing is restored"
+            "state 6 names nothing this synoik can apply, so nothing is restored"
         );
-        assert_eq!(toplevel.state, Some(3), "but the value is kept verbatim");
+        assert_eq!(toplevel.state, Some(6), "but the value is kept verbatim");
 
-        // ...and survives a save, so a synoik that grows half-tiling still finds it.
+        // ...and survives a save, so a synoik that grows the state still finds it.
         let mut store = SessionStore::in_memory();
         store.sessions = parsed;
         let round_tripped = SessionStore::parse(&store.serialize().unwrap()).unwrap();
-        assert_eq!(round_tripped["s"].toplevels["w"].state, Some(3));
+        assert_eq!(round_tripped["s"].toplevels["w"].state, Some(6));
         assert!(round_tripped["s"].toplevels["w"].is_minimized);
         assert_eq!(
             round_tripped["s"].toplevels["w"].tiled_rect,
             Some([0, 0, 100, 100])
+        );
+    }
+
+    #[test]
+    fn an_edge_tiled_record_restores_and_names_its_side() {
+        let bytes = br#"{"version": 2, "sessions": {"s": {"last-used": 1, "toplevels": {
+            "l": {"state": 3, "tiled-rect": [0, 0, 640, 1000], "floating-rect": [50, 50, 400, 300]},
+            "r": {"state": 4, "tiled-rect": [640, 0, 640, 1000]}}}}}"#;
+        let parsed = SessionStore::parse(bytes).unwrap();
+        let left = &parsed["s"].toplevels["l"];
+        let right = &parsed["s"].toplevels["r"];
+
+        assert_eq!(left.restorable_state(), Some(WindowState::TiledLeft));
+        assert_eq!(right.restorable_state(), Some(WindowState::TiledRight));
+        assert_eq!(
+            WindowState::TiledLeft.tile_side(),
+            Some(crate::gnome::TileSide::Left)
+        );
+        assert_eq!(
+            WindowState::TiledRight.tile_side(),
+            Some(crate::gnome::TileSide::Right)
+        );
+
+        // The geometry an edge-tiled record is seeded from is its live rect, never the pre-tile
+        // one it also carries for the un-tile.
+        assert_eq!(
+            WindowState::TiledLeft.saved_rect(left),
+            Some([0, 0, 640, 1000])
+        );
+        assert_eq!(
+            WindowState::Floating.saved_rect(left),
+            Some([50, 50, 400, 300])
         );
     }
 

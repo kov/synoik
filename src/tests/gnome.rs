@@ -34,7 +34,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::{ClientId, KeyboardFocus, SessionEvent, TextInputEvent as ClientEv};
 use super::*;
 use crate::gnome::{
-    Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
+    Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction, TileSide,
 };
 use crate::layout::SizingMode;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::Reason;
@@ -27489,6 +27489,266 @@ fn a_maximized_window_saves_its_pre_maximize_rect() {
     );
 }
 
+/// An edge-tiled window saves the half it is on, the rect it occupies — and, unlike mutter which
+/// keeps only the tiled one (`meta-wayland-xdg-session-state.c:348-357`), the rect an un-tile
+/// returns it to.
+#[test]
+fn unmapping_an_edge_tiled_window_saves_its_side_and_both_rects() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+    f.double_roundtrip(id);
+
+    // Actually take the tiled size, so the saved tiled rect cannot pass by accident on the
+    // pre-tile 300x200 the client still holds otherwise.
+    let tiled = map_at_configured_size(&mut f, id, &surface);
+    assert_ne!(tiled, (300, 200), "tiling must change the size");
+    f.settle();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let live = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("a tiled window occupies a rect");
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels["main"]
+        .clone();
+
+    assert_eq!(record.restorable_state(), Some(WindowState::TiledLeft));
+    assert_eq!(
+        record.tiled_rect,
+        Some([
+            live.loc.x.round() as i32,
+            live.loc.y.round() as i32,
+            live.size.w.round() as i32,
+            live.size.h.round() as i32,
+        ]),
+        "the saved tiled rect is the one the window occupies"
+    );
+    let floating = record
+        .floating_rect
+        .expect("the pre-tile rect is remembered too");
+    assert_eq!(
+        [floating[2], floating[3]],
+        [300, 200],
+        "and it is the size the window had before it was tiled"
+    );
+}
+
+/// Tiling to the right saves the other side, so the two are not one flag read twice.
+#[test]
+fn tiling_to_the_right_saves_the_right_side() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    f.synoik_state().do_action(Action::ToggleTiledRight, false);
+    f.double_roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels["main"]
+        .clone();
+    assert_eq!(record.restorable_state(), Some(WindowState::TiledRight));
+}
+
+/// The round trip the user sees: tile two windows to the two halves, restart, and they come back
+/// snapped to the same halves rather than floating in the middle.
+#[test]
+fn edge_tiled_windows_come_back_tiled() {
+    for (action, saved, side) in [
+        (
+            Action::ToggleTiledLeft,
+            WindowState::TiledLeft,
+            TileSide::Left,
+        ),
+        (
+            Action::ToggleTiledRight,
+            WindowState::TiledRight,
+            TileSide::Right,
+        ),
+    ] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        // First run: tile a window, then close it.
+        let first = f.add_client();
+        f.roundtrip(first);
+        let (session, session_id) = new_session(&mut f, first);
+        let surface = map_session_window(&mut f, first, &session, "main");
+        f.synoik_state().do_action(action, false);
+        f.double_roundtrip(first);
+        map_at_configured_size(&mut f, first, &surface);
+        f.settle();
+
+        let win = f.synoik().layout.focus().unwrap().window.clone();
+        let tiled_rect = f
+            .synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .live_rect
+            .expect("a tiled window occupies a rect");
+
+        let window = f.client(first).window(&surface);
+        window.attach_null_buffer();
+        window.commit();
+        f.double_roundtrip(first);
+        drop(session);
+
+        // Second run: a fresh client asks for the same session and restores the same name.
+        let second = f.add_client();
+        f.roundtrip(second);
+        let session = f
+            .client(second)
+            .get_session(Reason::SessionRestore, Some(&session_id));
+        f.roundtrip(second);
+        let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+        map_at_configured_size(&mut f, second, &surface);
+        f.settle();
+
+        let win = f.synoik().layout.focus().unwrap().window.clone();
+        let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+        assert_eq!(
+            snapshot.tile.edge_tiled,
+            Some(side),
+            "restoring {saved:?} must put the window back on that half"
+        );
+        assert_eq!(
+            snapshot.tile.live_rect,
+            Some(tiled_rect),
+            "and at the same rect the half gives it"
+        );
+    }
+}
+
+/// An un-tile after a restore lands on the size the window had *before* it was tiled, which is
+/// what keeping `floating-rect` alongside `tiled-rect` buys: mutter drops it and un-tiles to a
+/// default.
+#[test]
+fn untiling_a_restored_window_returns_to_its_pre_tile_rect() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::TiledLeft.as_raw()),
+            floating_rect: Some([500, 400, 300, 200]),
+            tiled_rect: Some([0, 0, 640, 720]),
+            workspace: Some(0),
+            output: Some(saved_on("headless-1")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+    f.double_roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+    assert_eq!(
+        snapshot.tile.edge_tiled, None,
+        "the toggle must have untiled"
+    );
+    let rect = snapshot.tile.live_rect.expect("it is back in the layout");
+    assert_eq!(
+        [
+            rect.loc.x.round() as i32,
+            rect.loc.y.round() as i32,
+            rect.size.w.round() as i32,
+            rect.size.h.round() as i32,
+        ],
+        [500, 400, 300, 200],
+        "un-tiling returns to the saved pre-tile rect, not a default"
+    );
+}
+
+/// Tiling geometry comes from the work area the window lands on, never from the record, so the
+/// state survives a restore onto a display the record never saw — the way maximize and fullscreen
+/// already do.
+#[test]
+fn an_edge_tiled_record_whose_display_is_gone_still_tiles() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::TiledRight.as_raw()),
+            tiled_rect: Some([640, 0, 640, 720]),
+            workspace: Some(0),
+            output: Some(saved_on("headless-9")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+    assert_eq!(
+        snapshot.tile.edge_tiled,
+        Some(TileSide::Right),
+        "the tiling is not gated on the recorded display coming back"
+    );
+}
+
 /// A window whose record was dropped by `remove_toplevel` must not come back when it unmaps: the
 /// registration is gone, so there is nothing to save under.
 #[test]
@@ -27757,7 +28017,10 @@ fn a_windows_geometry_survives_a_restart() {
     f.settle();
     f.double_roundtrip(first);
     let saved = f.synoik().layout.session_snapshot(&win).unwrap();
-    let saved_rect = saved.floating_rect.expect("a floated window has a rect");
+    let saved_rect = saved
+        .tile
+        .floating_rect
+        .expect("a floated window has a rect");
 
     let window = f.client(first).window(&surface);
     window.attach_null_buffer();
@@ -27791,6 +28054,7 @@ fn a_windows_geometry_survives_a_restart() {
         .layout
         .session_snapshot(&win)
         .unwrap()
+        .tile
         .floating_rect
         .expect("the restored window has a rect");
     assert_eq!(
@@ -27822,7 +28086,7 @@ fn restored_placement(f: &mut Fixture) -> (String, (i32, i32)) {
 fn placement_of(f: &mut Fixture, win: &smithay::desktop::Window) -> (String, (i32, i32), usize) {
     let synoik = f.synoik();
     let snapshot = synoik.layout.session_snapshot(win).unwrap();
-    let rect = snapshot.floating_rect.expect("it has a rect");
+    let rect = snapshot.tile.floating_rect.expect("it has a rect");
     let output = snapshot.output.expect("mapped on an output").name();
     (
         output,
@@ -28672,12 +28936,12 @@ fn a_restored_window_is_not_auto_maximized() {
     // window this size is that it scales the floating rect down by `sqrt(0.8)` and keeps that as
     // the restore size. The mode reads `Normal` either way, so asserting on it pins nothing.
     assert_eq!(
-        snapshot.floating_rect.map(|r| (r.size.w, r.size.h)),
+        snapshot.tile.floating_rect.map(|r| (r.size.w, r.size.h)),
         Some((1270., 660.)),
         "a restored window keeps its saved size; auto-maximize would have scaled it down"
     );
     assert_eq!(
-        snapshot.sizing_mode,
+        snapshot.tile.sizing_mode,
         SizingMode::Normal,
         "and it stays floating"
     );
@@ -29499,6 +29763,7 @@ fn restoring_onto_a_monitor_that_is_gone_still_maps() {
         .layout
         .session_snapshot(&win)
         .unwrap()
+        .tile
         .floating_rect
         .expect("it has a rect");
     assert!(
@@ -29543,11 +29808,11 @@ fn unmaximizing_a_restored_window_returns_it_to_the_saved_rect() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
     assert_eq!(
-        snapshot.sizing_mode,
+        snapshot.tile.sizing_mode,
         SizingMode::Normal,
         "the window must have unmaximized"
     );
-    let rect = snapshot.floating_rect.expect("it has a rect");
+    let rect = snapshot.tile.floating_rect.expect("it has a rect");
     assert_eq!(
         (rect.size.w.round() as i32, rect.size.h.round() as i32),
         (300, 400),
@@ -30345,6 +30610,7 @@ fn restoring_the_same_window_repeatedly_does_not_drift() {
             .layout
             .session_snapshot(&win)
             .unwrap()
+            .tile
             .floating_rect
             .expect("a floated window has a rect");
 
@@ -30380,6 +30646,7 @@ fn restoring_the_same_window_repeatedly_does_not_drift() {
                 .layout
                 .session_snapshot(&win)
                 .unwrap()
+                .tile
                 .floating_rect
                 .expect("the restored window has a rect");
             assert_eq!(
@@ -30458,6 +30725,7 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
         .layout
         .session_snapshot(&win)
         .unwrap()
+        .tile
         .floating_rect
         .expect("a floated window has a rect");
 
@@ -30490,6 +30758,7 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
         .layout
         .session_snapshot(&win)
         .unwrap()
+        .tile
         .floating_rect
         .expect("the restored window has a rect");
     assert_eq!(
