@@ -6333,6 +6333,40 @@ impl State {
         true
     }
 
+    /// A left press while the name entry is up. Returns whether the entry took it.
+    ///
+    /// One inside the field is swallowed: there is nothing else a click there could mean, and
+    /// the thumbnail underneath would otherwise answer it. One anywhere else leaves the entry
+    /// the way the folder rename's does — turning the entry off commits (`_showFolderLabel`,
+    /// `appDisplay.js:2633-2657`) — and then carries on to whatever the press was aimed at. A
+    /// name another workspace already holds is the exception: the entry stays up to say so, so
+    /// the press stays with it rather than dismissing the thing that is refusing.
+    fn press_on_workspace_rename(&mut self) -> bool {
+        let Some(rename) = self.synoik.workspace_rename.as_ref() else {
+            return false;
+        };
+        let workspace = rename.workspace;
+        let location = self.synoik.seat.get_pointer().unwrap().current_location();
+
+        let on_entry = self
+            .synoik
+            .thumbnail_under(location)
+            .and_then(|(output, within, _)| {
+                let thumb = self
+                    .synoik
+                    .layout
+                    .monitor_for_output(&output)?
+                    .thumbnail_rect_for(workspace)?;
+                Some(crate::ui::workspace_rename::entry_rect(thumb).contains(within))
+            })
+            .unwrap_or(false);
+        if on_entry {
+            return true;
+        }
+
+        !self.finish_workspace_rename()
+    }
+
     /// Where a keyboard-summoned workspace menu hangs from: the thumbnail's bottom-left corner,
     /// so the card drops out of the thumbnail the way it drops out of a right-click.
     ///
@@ -8304,6 +8338,19 @@ impl State {
                         }
                     }
                 }
+            }
+
+            // The name entry is being typed into, so it gets first refusal on a press: a click
+            // in the field it is editing would otherwise reach the thumbnail underneath, and a
+            // click on the *active* thumbnail closes the overview, which takes the rename with
+            // it — the most natural pointer action would lose the name.
+            if self.synoik.workspace_rename.is_some()
+                && button == Some(MouseButton::Left)
+                && !self.synoik.seat.get_pointer().unwrap().is_grabbed()
+                && self.press_on_workspace_rename()
+            {
+                self.synoik.suppressed_buttons.insert(button_code);
+                return;
             }
 
             // **A press inside a peeked strip belongs to the strip, before any modifier gesture
@@ -10859,6 +10906,7 @@ fn action_aims_at_pointer(action: &Action) -> bool {
             | Action::MoveWorkspaceToMonitorNext
             | Action::SetWorkspaceName(_)
             | Action::UnsetWorkspaceName
+            | Action::ShowWorkspaceMenu
     )
 }
 

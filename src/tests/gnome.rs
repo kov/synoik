@@ -30561,6 +30561,92 @@ fn the_workspace_menu_opens_from_the_keyboard() {
     );
 }
 
+/// The keyboard route aims like every other workspace-scoped action: at the display under the
+/// pointer, with focus as the fallback (`docs/fork/multi-display.md` §4). A menu that renames or
+/// closes a workspace is exactly the kind of action that must not act on a display the user is
+/// not looking at.
+#[test]
+fn the_keyboard_workspace_menu_opens_on_the_display_under_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    // Outputs tile left to right, so display 2 spans x = 1920..3840; focus and pointer disagree.
+    f.synoik_focus_output(1);
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+
+    f.synoik_state().do_action(Action::ShowWorkspaceMenu, false);
+    f.settle();
+
+    assert!(
+        f.synoik().panel_popover.workspace_menu().is_some(),
+        "the menu opened"
+    );
+    assert_eq!(
+        f.synoik().panel_popover.output().map(|o| o.name()),
+        Some(f.synoik_output(2).name()),
+        "on the display the pointer is on, not the focused one"
+    );
+}
+
+/// A click in the name entry keeps the rename. Nothing else on the strip may answer it: the
+/// thumbnail underneath is the *active* one, and a click on that closes the overview — which
+/// would take the entry down and drop what had been typed.
+#[test]
+fn a_click_in_the_name_entry_keeps_the_rename() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::WorkspaceRename(ws));
+    f.settle();
+
+    let entry = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let thumb = mon
+            .expect("on a monitor")
+            .thumbnail_rect_for(ws)
+            .expect("the thumbnail is up");
+        crate::ui::workspace_rename::entry_rect(thumb)
+    };
+    pointer_motion_to(
+        &mut f,
+        entry.loc.x + entry.size.w / 2.,
+        entry.loc.y + entry.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert!(
+        f.synoik().workspace_rename.is_some(),
+        "the entry is still up"
+    );
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "and the overview it lives in is still open"
+    );
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    assert_eq!(
+        mon.expect("on a monitor")
+            .thumbnail_names()
+            .into_iter()
+            .map(|(_, _, n)| n)
+            .collect::<Vec<_>>(),
+        vec![String::from("a")],
+        "and it was still the entry typing reached"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]
