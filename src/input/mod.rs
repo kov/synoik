@@ -1098,7 +1098,7 @@ impl State {
                 if this.synoik.end_session_dialog.is_open() {
                     match this.synoik.end_session_dialog.handle_key(raw, pressed) {
                         DialogOutcome::Handled => this.synoik.queue_redraw_all(),
-                        DialogOutcome::Confirm => this.synoik.confirm_end_session(),
+                        DialogOutcome::Confirm => this.confirm_end_session(),
                         DialogOutcome::Cancel => this.synoik.cancel_end_session(),
                         DialogOutcome::ToggleUpdates => this.synoik.toggle_install_updates(),
                     }
@@ -7761,7 +7761,7 @@ impl State {
                             .pointer_click(output_size, pos_within_output)
                         {
                             DialogOutcome::Handled => {}
-                            DialogOutcome::Confirm => self.synoik.confirm_end_session(),
+                            DialogOutcome::Confirm => self.confirm_end_session(),
                             DialogOutcome::Cancel => self.synoik.cancel_end_session(),
                             DialogOutcome::ToggleUpdates => self.synoik.toggle_install_updates(),
                         }

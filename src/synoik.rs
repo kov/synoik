@@ -4910,15 +4910,7 @@ impl State {
             return;
         };
 
-        info!(
-            "session store: saving {session_id}/{name} floating {:?} tiled {:?} on {:?} workspace {:?}/{:?} state {:?}",
-            record.floating_rect,
-            record.tiled_rect,
-            record.output.as_ref().map(|o| &o.connector),
-            record.workspace,
-            record.workspace_name,
-            record.state
-        );
+        log_session_record(&session_id, &name, &record);
         self.synoik
             .session_manager_state
             .store
@@ -5001,7 +4993,60 @@ impl State {
     /// by this line — either it swept nothing, or it swept and the record is not what was expected.
     pub fn save_session_toplevels_still_mapped(&mut self) {
         let (saved, skipped) = self.save_live_session_toplevels_matching(None);
-        info!("session store: swept {saved} still-mapped toplevels ({skipped} skipped)");
+        // "0 of 0" on a clean exit is the expected reading, not a lost save: the clients are gone
+        // by now and each saved itself on the way out. Spelled out because the bare count has been
+        // read as a bug twice — what a stale restore actually indicts is `froze N before session
+        // end` above, which runs while the windows are still there.
+        info!(
+            "session store: swept {saved} still-mapped toplevels at exit ({skipped} skipped);              zero here is normal — clients that exited cleanly already saved themselves"
+        );
+    }
+
+    /// The user confirmed the end-session dialog (clicked the action button, pressed Enter on it,
+    /// or the countdown expired): freeze the session, tell gnome-session to proceed, close the
+    /// dialog.
+    pub fn confirm_end_session(&mut self) {
+        if let Some(confirmation) = self.synoik.end_session.confirm() {
+            self.save_session_before_end();
+            self.synoik.emit_confirmation(confirmation);
+        }
+        self.synoik.end_session_dialog.hide();
+        self.synoik.reschedule_end_session_timer();
+        self.synoik.queue_redraw_all();
+    }
+
+    /// The countdown ticked. Auto-confirming on expiry is the same act as clicking the button —
+    /// including the sweep — so it goes through [`Self::confirm_end_session`]'s twin here rather
+    /// than emitting on its own.
+    pub fn on_end_session_timer(&mut self) {
+        let now = self.synoik.clock.now_unadjusted();
+        if let Some(confirmation) = self.synoik.end_session.tick(now) {
+            self.synoik.end_session_timer = None;
+            self.save_session_before_end();
+            self.synoik.emit_confirmation(confirmation);
+            self.synoik.end_session_dialog.hide();
+            self.synoik.queue_redraw_all();
+            return;
+        }
+        self.synoik.tick_end_session_countdown();
+    }
+
+    /// Freezes every registered window's layout state, on the way out of the session.
+    ///
+    /// **The last moment the windows are still there.** After this the session teardown starts and
+    /// each client is SIGTERMed; one that exits cleanly saves itself on the way out (unmap, or
+    /// `xdg_session_v1.destroy`), but one that is SIGKILLed at `TimeoutStopSec`, or that crashes
+    /// mid-exit, never gets to — and its record stays a whole session stale. Mutter has no
+    /// equivalent because it unmanages every window itself at `meta_display_close`
+    /// (`display.c:1052`); we tear down without unmapping, so this is explicit.
+    ///
+    /// Idempotent with the per-client saves that follow: they overwrite with the same or fresher
+    /// state. It does **not** flush — the debounce, and the unconditional flush at exit, carry the
+    /// bytes to disk; blocking on an `fsync` here would stall the frame that draws the dialog
+    /// closing.
+    pub fn save_session_before_end(&mut self) {
+        let (saved, skipped) = self.save_live_session_toplevels_matching(None);
+        info!("session store: froze {saved} toplevels before session end ({skipped} skipped)");
     }
 
     /// Snapshots every still-mapped registered toplevel, or only one session's when `only` is set.
@@ -5035,6 +5080,10 @@ impl State {
                 skipped += 1;
                 continue;
             };
+            // Same line the unmap path logs, because from outside the process the two are one
+            // question — "what does the store now hold for this window" — and a sweep that wrote
+            // silently is indistinguishable from one that never ran.
+            log_session_record(&session_id, &name, &record);
             self.synoik
                 .session_manager_state
                 .store
@@ -5428,6 +5477,19 @@ impl State {
             Login1ToSynoik::SessionActive(active) => {
                 self.synoik.session_active = active;
                 self.synoik.sync_sleep_inhibitor();
+            }
+            // The machine is going down for real, by whatever route. Freeze the session here:
+            // this is the only signal `systemctl poweroff`, the power button and an offline update
+            // all pass through, and none of them opens our end-session dialog, so none of them
+            // reaches `State::confirm_end_session`. Idempotent with that path, which is why a
+            // shutdown confirmed *in* the dialog can safely sweep twice.
+            //
+            // Snapshot only — durability rides the unconditional flush on the way out of `main`,
+            // which this machine still reaches: logind is not waiting on us here (we hold no
+            // shutdown delay inhibitor, deliberately — see `docs/fork/session-end.md`), so
+            // blocking on an `fsync` would buy nothing it does not already have.
+            Login1ToSynoik::PrepareForShutdown => {
+                self.save_session_before_end();
             }
             // The last moment before the machine goes down — logind is holding the suspend on our
             // delay inhibitor, and `apply_shield_effects` releases it once we have locked *and* the
@@ -15812,24 +15874,13 @@ impl Synoik {
         }
     }
 
-    /// The user confirmed the end-session dialog (clicked the action button, pressed Enter on it,
-    /// or the countdown expired): tell gnome-session to proceed and close the dialog.
-    pub fn confirm_end_session(&mut self) {
-        if let Some(confirmation) = self.end_session.confirm() {
-            self.emit_confirmation(confirmation);
-        }
-        self.end_session_dialog.hide();
-        self.reschedule_end_session_timer();
-        self.queue_redraw_all();
-    }
-
     /// Act on a [`Confirmation`]: settle the offline update with gnome-software first, *then* emit
     /// the signal, because what we settled decides which signal it is.
     ///
     /// Ordering is gnome-shell's (`js/ui/endSessionDialog.js:469-500`): it awaits `SetAction`
     /// before emitting, for the same reason — a `shutdown` that gnome-software accepted must
     /// become a reboot on the wire, and one it refused must not.
-    fn emit_confirmation(&self, confirmation: crate::end_session::Confirmation) {
+    pub(crate) fn emit_confirmation(&self, confirmation: crate::end_session::Confirmation) {
         use crate::end_session::UpdateDecision;
 
         let accepted = match (confirmation.updates, self.gnome_software_conn()) {
@@ -15923,25 +15974,16 @@ impl Synoik {
         let token = self
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                state.synoik.on_end_session_timer();
+                state.on_end_session_timer();
                 TimeoutAction::Drop
             })
             .unwrap();
         self.end_session_timer = Some(token);
     }
 
-    fn on_end_session_timer(&mut self) {
+    fn tick_end_session_countdown(&mut self) {
         self.end_session_timer = None;
         let now = self.clock.now_unadjusted();
-
-        if let Some(confirmation) = self.end_session.tick(now) {
-            // Countdown expired: auto-confirm the default action, exactly as clicking it would —
-            // including whatever the update checkbox was left saying.
-            self.emit_confirmation(confirmation);
-            self.end_session_dialog.hide();
-            self.queue_redraw_all();
-            return;
-        }
 
         // Still counting down: update the displayed seconds and tick again in a second.
         if let Some(presentation) = self.end_session.presentation() {
@@ -16277,6 +16319,23 @@ synoik_render_elements! {
         // The dash: baked chrome, plus the dock's backdrop blur under its pill.
         Dash = crate::ui::dash::DashElement,
     }
+}
+
+/// One line per record written to the session store, from every writer.
+///
+/// A restore that came back stale is answered by grepping this: either the window has no line for
+/// the run that should have saved it, or it has one and the record is not what was expected.
+fn log_session_record(session_id: &str, name: &str, record: &ToplevelRecord) {
+    info!(
+        "session store: saving {session_id}/{name} floating {:?} tiled {:?} on {:?} \
+         workspace {:?}/{:?} state {:?}",
+        record.floating_rect,
+        record.tiled_rect,
+        record.output.as_ref().map(|o| &o.connector),
+        record.workspace,
+        record.workspace_name,
+        record.state
+    );
 }
 
 #[cfg(test)]

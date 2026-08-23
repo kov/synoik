@@ -288,6 +288,38 @@ Found on the live seat, not in the corpus: `tools/session-probe --quit-style` dr
 teardown orders, and only *toplevels-before-session* used to save. The corpus had modelled the
 polite order alone.
 
+**The session ending is its own trigger, and it must fire while the windows are still there.**
+Every trigger above is the *client's*: it saves because that client did something. None of them
+fires for a client that is SIGKILLed at `TimeoutStopSec`, or crashes mid-exit, once the session
+teardown has started — and mutter needs no equivalent, because `meta_display_close` unmanages every
+window itself (`display.c:1052`) before its own save. So `State::save_session_before_end` sweeps
+every live registration at the two moments a session is known to be ending:
+
+- **`State::confirm_end_session`**, immediately before the `Confirmed*` signal goes out. After that
+  signal, gnome-session starts stopping things and the sweep is racing it. Both the button and the
+  countdown's auto-confirm go through this one path.
+- **logind's `PrepareForShutdown(true)`**, which is the only signal `systemctl poweroff`, the power
+  button and an offline update all pass through — none of them opens our dialog.
+
+Dialog-less *logout* (`gnome-session-quit --no-prompt`) has no signal of either kind and stays on
+the client triggers plus the exit sweep.
+
+Both are snapshot-only: durability rides the unconditional flush at the end of `main`, and we hold
+no shutdown delay inhibitor, so an inline `fsync` would buy nothing (`docs/fork/session-end.md`).
+They are idempotent with each other and with the per-client saves that follow, which overwrite with
+the same or fresher state.
+
+**`swept 0 still-mapped toplevels at exit` is the expected reading, not a lost save** — the clients
+are gone by then and each saved itself on the way out. That zero has been read as the defect twice.
+What a stale restore actually indicts is the `froze N toplevels before session end` line above it.
+Every writer logs one line per record (`log_session_record`), including the sweeps: a save that
+happened silently is indistinguishable from one that never ran.
+
+**Periodic saving is deliberately NOT here.** It would only add coverage for a compositor crash or
+a power loss, neither of which leaves time to write anything — so it is insurance against exactly
+the cases the trigger cannot reach. On the backlog with that understanding; if it ever lands, the
+shape is arming the existing 3s debounce on layout changes, not a wall clock.
+
 ---
 
 ## Conformance corpus

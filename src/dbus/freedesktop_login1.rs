@@ -40,6 +40,14 @@ pub enum Login1ToSynoik {
     /// `Manager.PrepareForSleep` — `true` while logind waits on the delay inhibitors before
     /// suspending, `false` on resume. The `true` edge is the last chance to lock the screen.
     PrepareForSleep(bool),
+    /// `Manager.PrepareForShutdown(true)` — the machine is going down, whatever asked for it.
+    ///
+    /// The one signal every poweroff and reboot route passes through: `systemctl poweroff`, the
+    /// power button, an offline update, and the end-session dialog alike. Our own dialog's
+    /// `Confirmed*` covers only the routes that went through it, so this is what catches the rest.
+    /// The `false` edge (a shutdown called off by another inhibitor) carries nothing we act on and
+    /// is not forwarded.
+    PrepareForShutdown,
     /// A [`set_brightness`] call finished, carrying the connector it was for. Drives the
     /// per-device write serializer ([`crate::backlight::BacklightWriter::write_finished`]), which
     /// is what keeps a slider drag down to one in-flight D-Bus call.
@@ -331,29 +339,25 @@ pub fn start(
         };
 
         while let Some(signal) = signals.next().await {
-            if signal
-                .header()
-                .member()
-                .map(|m| m.as_str().to_owned())
-                .as_deref()
-                != Some("PrepareForSleep")
-            {
-                continue;
-            }
-            let Ok(about_to_suspend) = signal.body().deserialize::<bool>() else {
+            let member = signal.header().member().map(|m| m.as_str().to_owned());
+            let Ok(starting) = signal.body().deserialize::<bool>() else {
                 continue;
             };
-            if to_niri
-                .send(Login1ToSynoik::PrepareForSleep(about_to_suspend))
-                .is_err()
-            {
+            let msg = match member.as_deref() {
+                Some("PrepareForSleep") => Login1ToSynoik::PrepareForSleep(starting),
+                // Only the leading edge. `false` means the shutdown was called off, and there is
+                // nothing to undo — the session snapshot it triggered is simply a fresh one.
+                Some("PrepareForShutdown") if starting => Login1ToSynoik::PrepareForShutdown,
+                _ => continue,
+            };
+            if to_niri.send(msg).is_err() {
                 break;
             }
         }
     };
     conn.inner()
         .executor()
-        .spawn(future, "monitor login1 PrepareForSleep")
+        .spawn(future, "monitor login1 PrepareForSleep/PrepareForShutdown")
         .detach();
 
     Ok(conn)

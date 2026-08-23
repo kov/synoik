@@ -12370,7 +12370,7 @@ fn end_session_dialog_open_confirm_and_cancel() {
     );
 
     // Confirming (Enter / clicking Power Off) closes the dialog; gnome-session then powers off.
-    f.synoik_state().synoik.confirm_end_session();
+    f.synoik_state().confirm_end_session();
     assert!(!f.synoik().end_session.is_open(), "confirm must close it");
     assert!(!f.synoik().end_session_dialog.is_open());
 
@@ -27487,6 +27487,93 @@ fn a_maximized_window_saves_its_pre_maximize_rect() {
         [300, 200],
         "the remembered size is the floating one, not the maximized one"
     );
+}
+
+/// Logging out with windows still open saves them. This is the flagship case and the one that has
+/// no client-side trigger: mutter unmanages every window at `meta_display_close`
+/// (`display.c:1052`) before its shutdown save, we tear down without unmapping, and a client
+/// SIGKILLed at `TimeoutStopSec` never reaches its own unmap or `xdg_session_v1.destroy`.
+#[test]
+fn confirming_the_end_session_dialog_freezes_still_mapped_windows() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+    f.double_roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    assert!(
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .unwrap()
+            .toplevels
+            .is_empty(),
+        "nothing is saved while the window is still mapped and the session is not ending"
+    );
+
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    f.synoik_state().confirm_end_session();
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .expect("the session must be in the store")
+        .toplevels
+        .get("main")
+        .cloned()
+        .expect("a still-mapped window must have been frozen by the confirm");
+    assert_eq!(
+        record.restorable_state(),
+        Some(WindowState::TiledLeft),
+        "and frozen as it actually is, not as it was last saved"
+    );
+}
+
+/// Every poweroff and reboot route passes through logind's `PrepareForShutdown`, and none of them
+/// opens our dialog — `systemctl poweroff`, the power button, an offline update. Without this the
+/// confirm-time sweep would cover only the routes the user clicked through.
+#[test]
+fn prepare_for_shutdown_freezes_still_mapped_windows() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let _surface = map_session_window(&mut f, id, &session, "main");
+    f.settle();
+
+    f.synoik_state()
+        .on_login1_msg(crate::dbus::freedesktop_login1::Login1ToSynoik::PrepareForShutdown);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .expect("the session must be in the store")
+        .toplevels
+        .get("main")
+        .cloned()
+        .expect("a still-mapped window must have been frozen by PrepareForShutdown");
+    let rect = record.floating_rect.expect("with its live geometry");
+    assert_eq!([rect[2], rect[3]], [300, 200]);
 }
 
 /// An edge-tiled window saves the half it is on, the rect it occupies — and, unlike mutter which
