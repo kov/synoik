@@ -28054,6 +28054,119 @@ fn a_restored_window_whose_workspace_name_is_gone_falls_back_to_the_index() {
     );
 }
 
+/// Undocking: of two displays only one comes back, and each record is judged on its own.
+///
+/// The window whose display is still there is exact — position included. The one whose display is
+/// gone keeps its size and its workspace, and takes a placed position, on the display that is left.
+#[test]
+fn one_display_missing_leaves_the_other_display_s_windows_exact() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    for (name, connector) in [("stays", "headless-1"), ("goes", "headless-9")] {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([500, 400, 300, 200]),
+                workspace: Some(0),
+                output: Some(saved_on(connector)),
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut placed = Vec::new();
+    for name in ["stays", "goes"] {
+        let (surface, _handle) = restore_window(&mut f, id, &session, name);
+        map_at_configured_size(&mut f, id, &surface);
+        f.settle();
+        placed.push(restored_placement(&mut f));
+    }
+
+    assert_eq!(
+        placed[0],
+        ("headless-1".to_owned(), (500, 400)),
+        "the display that came back must restore exactly"
+    );
+    assert_eq!(
+        placed[1].0, "headless-1",
+        "the other window has nowhere else"
+    );
+    assert_ne!(
+        placed[1].1,
+        (500, 400),
+        "but its position was local to a display that is not here, so it is placed, not replayed"
+    );
+}
+
+/// A record whose display is gone still takes its saved workspace on the display it lands on, and
+/// that display's strip grows to reach it.
+///
+/// The position is dropped because it is meaningless without its display; the index is kept
+/// because it is *relative*, and keeping it is what stops a set of windows spread over four
+/// desktops from collapsing onto one. The cost is real and deliberate: restoring onto a single
+/// display can create workspaces there.
+#[test]
+fn a_missing_display_still_places_the_window_on_its_saved_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([500, 400, 300, 200]),
+            workspace: Some(3),
+            output: Some(saved_on("headless-9")),
+            ..Default::default()
+        },
+    );
+
+    let before = f.synoik().layout.workspaces().count();
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let win = f
+        .synoik()
+        .layout
+        .windows()
+        .next()
+        .map(|(_, mapped)| mapped.window.clone())
+        .expect("the window must be in the layout");
+    let (idx, pos) = {
+        let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+        (
+            snapshot.workspace_idx,
+            snapshot
+                .floating_rect
+                .map(|r| (r.loc.x as i32, r.loc.y as i32)),
+        )
+    };
+
+    assert_eq!(idx, 3, "the saved workspace still applies");
+    assert!(
+        f.synoik().layout.workspaces().count() > before,
+        "and the strip grew to reach it"
+    );
+    assert_eq!(
+        pos,
+        Some((490, 276)),
+        "while the position is the placed one, not the saved one"
+    );
+}
+
 /// A record naming a display that is not connected keeps its size and state, but hands the
 /// position back to the normal placement chain: an output-local rect means nothing without its
 /// output, and replaying it onto some other monitor would be a guess dressed up as a memory.
