@@ -159,6 +159,7 @@ use crate::layout::{
     SizingMode,
 };
 use crate::notifications::{bounded_pixels, PixelIcon};
+use crate::output_identity::OutputIdentity;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -182,7 +183,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
-use crate::session_state::{OutputIdentity, ToplevelRecord, WindowState};
+use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik_render_elements;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
@@ -4949,13 +4950,8 @@ impl State {
         // the global frame mutter uses is not one a record can be written against.
         let output = snapshot
             .output
-            .and_then(|output| output.user_data().get::<OutputName>())
-            .map(|name| OutputIdentity {
-                connector: name.connector.clone(),
-                vendor: name.vendor.clone(),
-                product: name.model.clone(),
-                serial: name.serial.clone(),
-            });
+            .as_ref()
+            .and_then(|output| OutputIdentity::try_from_output(output));
 
         let to_rect = |rect: Rectangle<f64, Logical>| {
             [

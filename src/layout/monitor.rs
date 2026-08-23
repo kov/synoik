@@ -25,14 +25,15 @@ use super::shadow::Shadow;
 use super::thumbnails::{self, Strip};
 use super::tile::Tile;
 use super::workspace::{
-    active_workspace_shadow_config, compute_working_area, OutputId, Workspace,
-    WorkspaceAddWindowTarget, WorkspaceId, WorkspaceRenderElement,
+    active_workspace_shadow_config, compute_working_area, Workspace, WorkspaceAddWindowTarget,
+    WorkspaceId, WorkspaceRenderElement,
 };
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
 use crate::frame_log::AnimCauses;
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
+use crate::output_identity::OutputIdentity;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -988,7 +989,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_output = OutputIdentity::from_output(&self.output);
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -1019,7 +1020,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_output = OutputIdentity::from_output(&self.output);
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -1048,7 +1049,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_output = OutputIdentity::from_output(&self.output);
         }
 
         // Since we're adding window to an existing column, the workspace isn't empty, and
@@ -2922,7 +2923,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// **explicit** move means and an evacuation does not — `docs/fork/multi-display.md` §2.
     pub fn rehome_workspace(&mut self, idx: usize) {
         if let Some(ws) = self.workspaces.get_mut(idx) {
-            ws.original_output = OutputId::new(&self.output);
+            ws.original_output = OutputIdentity::from_output(&self.output);
         }
     }
 

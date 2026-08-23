@@ -36,6 +36,7 @@ pub mod layout;
 pub mod monitors_xml;
 pub mod mpris;
 pub mod notifications;
+pub mod output_identity;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
 /// The polkit dialog's state machine, answering the D-Bus authentication agent.

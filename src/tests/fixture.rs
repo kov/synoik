@@ -559,6 +559,17 @@ impl Fixture {
         state.backend.headless().add_output(synoik, n, size);
     }
 
+    /// Plug a display in on connector `headless-{n}` whose EDID carries `serial`, so a test can
+    /// put a *different* panel on a connector another one used.
+    pub fn add_output_with_serial(&mut self, n: u8, size: (u16, u16), serial: &str) {
+        let state = self.synoik_state();
+        let synoik = &mut state.synoik;
+        state
+            .backend
+            .headless()
+            .add_output_with_serial(synoik, n, size, serial);
+    }
+
     /// Change an existing output's mode and/or fractional scale, the way an EDID/mode change or a
     /// `ApplyMonitorsConfig` does, and run the resize through `Synoik::output_resized`.
     ///

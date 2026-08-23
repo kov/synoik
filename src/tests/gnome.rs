@@ -10232,6 +10232,47 @@ fn dragging_a_thumbnail_to_another_display_moves_the_workspace() {
     );
 }
 
+/// The home tag names a *display*, not a socket on the back of the machine. Plugging a different
+/// panel into the connector another one used must not hand it that display's workspaces
+/// (`docs/fork/multi-display.md` §1) — the two replugs below differ in nothing but the EDID serial.
+#[test]
+fn a_different_panel_on_the_same_connector_does_not_take_the_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Outputs tile left to right, so this opens the window on display 2.
+    pointer_motion_to(&mut f, 2880., 540.);
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-2");
+
+    f.remove_output(2);
+    f.settle();
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+
+    f.add_output_with_serial(2, (1920, 1080), "a-different-panel");
+    f.settle();
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-1",
+        "another panel on the same connector is another display, and inherits nothing"
+    );
+
+    // The panel the workspace belongs to comes back, on that same connector.
+    f.remove_output(2);
+    f.settle();
+    f.add_output(2, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-2",
+        "its own display returning must take the workspace back"
+    );
+}
+
 /// A drop on a display the drag did not start on is an **explicit** move, so it re-homes the
 /// workspace: unplugging that display later must hand this workspace back to *it*, not to where it
 /// happened to be born (`docs/fork/multi-display.md` §2).
@@ -28481,8 +28522,8 @@ fn a_windows_geometry_survives_a_restart() {
 }
 
 /// The display a record names, as the store spells it.
-fn saved_on(connector: &str) -> crate::session_state::OutputIdentity {
-    crate::session_state::OutputIdentity {
+fn saved_on(connector: &str) -> crate::output_identity::OutputIdentity {
+    crate::output_identity::OutputIdentity {
         connector: connector.to_owned(),
         ..Default::default()
     }

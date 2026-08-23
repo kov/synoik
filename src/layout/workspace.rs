@@ -23,8 +23,7 @@ use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use synoik_config::utils::MergeWith as _;
 use synoik_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, WindowingMode,
-    Workspace as WorkspaceConfig,
+    CenterFocusedColumn, CornerRadius, PresetSize, WindowingMode, Workspace as WorkspaceConfig,
 };
 use synoik_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 
@@ -40,6 +39,7 @@ use super::{
 };
 use crate::animation::{Animation, Clock, Curve};
 use crate::gnome::{EdgeTileTarget, TileSide};
+use crate::output_identity::OutputIdentity;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::RenderCtx;
@@ -104,7 +104,7 @@ pub struct Workspace<W: LayoutElement> {
     ///
     /// Most of the time this will be the workspace's current output, however, after an output
     /// disconnection, it may remain pointing to the disconnected output.
-    pub(super) original_output: OutputId,
+    pub(super) original_output: OutputIdentity,
 
     /// Current output of this workspace.
     output: Option<Output>,
@@ -186,16 +186,6 @@ pub struct Workspace<W: LayoutElement> {
 
     /// Unique ID of this workspace.
     id: WorkspaceId,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutputId(String);
-
-impl OutputId {
-    pub fn matches(&self, output: &Output) -> bool {
-        let output_name = output.user_data().get::<OutputName>().unwrap();
-        output_name.matches(&self.0)
-    }
 }
 
 static WORKSPACE_ID_COUNTER: IdCounter = IdCounter::new();
@@ -592,13 +582,6 @@ pub enum WorkspaceAddWindowTarget<'a, W: LayoutElement> {
     NextTo(&'a W::Id),
 }
 
-impl OutputId {
-    pub fn new(output: &Output) -> Self {
-        let output_name = output.user_data().get::<OutputName>().unwrap();
-        Self(output_name.format_make_model_serial_or_connector())
-    }
-}
-
 impl FloatingActive {
     fn get(self) -> bool {
         self == Self::Yes
@@ -619,8 +602,8 @@ impl<W: LayoutElement> Workspace<W> {
         let original_output = config
             .as_ref()
             .and_then(|c| c.open_on_output.clone())
-            .map(OutputId)
-            .unwrap_or(OutputId::new(&output));
+            .map(OutputIdentity::from_connector)
+            .unwrap_or_else(|| OutputIdentity::from_output(&output));
 
         let layout_config = config.as_mut().and_then(|c| c.layout.take().map(|x| x.0));
 
@@ -686,7 +669,9 @@ impl<W: LayoutElement> Workspace<W> {
         clock: Clock,
         base_options: Rc<Options>,
     ) -> Self {
-        let original_output = OutputId(
+        // No output to take an identity from, so the connector is whatever was configured — and
+        // the empty one when nothing was, which names no display and matches none.
+        let original_output = OutputIdentity::from_connector(
             config
                 .as_ref()
                 .and_then(|c| c.open_on_output.clone())
@@ -1198,9 +1183,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.output = output;
 
         if let Some(output) = &self.output {
-            // Normalize original output: possibly replace connector with make/model/serial.
-            if self.original_output.matches(output) {
-                self.original_output = OutputId::new(output);
+            // A home tag that came from configuration carries a connector and no EDID. Meeting
+            // its display fills the rest in, which is what makes the veto mean anything afterwards.
+            if self.original_output.matches_output(output) {
+                self.original_output = OutputIdentity::from_output(output);
             }
 
             self.update_output_size();

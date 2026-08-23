@@ -42,7 +42,7 @@ use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
 };
 use synoik_config::window_rule::{FloatingPosition, RelativeTo};
-use synoik_config::{FloatOrInt, OutputName, PresetSize, WindowingMode};
+use synoik_config::{FloatOrInt, PresetSize, WindowingMode};
 use tracing::field::Empty;
 
 use crate::input::move_grab::MoveGrab;
@@ -51,9 +51,10 @@ use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
 use crate::layout::placement::PlacementSeeds;
 use crate::layout::ActivateWindow;
+use crate::output_identity::OutputIdentity;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
-use crate::session_state::{OutputIdentity, ToplevelRecord, WindowState};
+use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::ui::window_menu::WindowMenuAnchor;
 use crate::utils::transaction::Transaction;
@@ -1199,16 +1200,7 @@ impl State {
         self.synoik
             .global_space
             .outputs()
-            .find(|output| {
-                output.user_data().get::<OutputName>().is_some_and(|name| {
-                    saved.matches(&OutputIdentity {
-                        connector: name.connector.clone(),
-                        vendor: name.vendor.clone(),
-                        product: name.model.clone(),
-                        serial: name.serial.clone(),
-                    })
-                })
-            })
+            .find(|output| saved.matches_output(output))
             .cloned()
     }
 

@@ -50,6 +50,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::output_identity::OutputIdentity;
+
 /// The format we write. A file claiming anything higher is refused outright.
 ///
 /// v2 moved rects from global to output-local and added [`ToplevelRecord::output`]. A v1 record
@@ -128,46 +130,6 @@ impl WindowState {
 /// `[x, y, width, height]`, in logical coordinates, **relative to the record's
 /// [`ToplevelRecord::output`]** — see the module docs for why this is not mutter's global frame.
 pub type Rect = [i32; 4];
-
-/// The display a record's rects are anchored to, in `monitors.xml`'s identity fields.
-///
-/// Deliberately the same four fields `<monitorspec>` carries, so that one notion of "which
-/// display" serves both stores and the deferred identity-only matching lands in both at once.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputIdentity {
-    pub connector: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vendor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub product: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial: Option<String>,
-}
-
-impl OutputIdentity {
-    /// Whether this names the same display as `other`.
-    ///
-    /// Connector-exact, with the EDID fields as a veto when both sides carry one: the same rule
-    /// `monitors.xml` matching uses today. Matching a display across a *renamed* connector is the
-    /// deferred half, and it is deferred here for the same reason — both stores should gain it
-    /// together, or a session and its layout would disagree about which display is which.
-    pub fn matches(&self, other: &Self) -> bool {
-        if !self.connector.eq_ignore_ascii_case(&other.connector) {
-            return false;
-        }
-
-        let agrees = |a: &Option<String>, b: &Option<String>| match (a, b) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            // One side did not record it. Absence is not a mismatch: an output with no EDID is
-            // normal, and a record written before we read one must still match.
-            _ => true,
-        };
-
-        agrees(&self.vendor, &other.vendor)
-            && agrees(&self.product, &other.product)
-            && agrees(&self.serial, &other.serial)
-    }
-}
 
 /// What we remember about one toplevel, keyed in its session by the client-chosen name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,38 +711,6 @@ mod tests {
         let output = toplevel.output.clone().unwrap();
         assert_eq!(output.connector, "DP-2");
         assert_eq!(output.serial.as_deref(), Some("ABC123"));
-    }
-
-    #[test]
-    fn a_display_matches_on_its_connector_and_is_vetoed_by_a_differing_edid() {
-        let saved = OutputIdentity {
-            connector: "DP-2".into(),
-            serial: Some("ABC123".into()),
-            ..Default::default()
-        };
-
-        let live = |connector: &str, serial: Option<&str>| OutputIdentity {
-            connector: connector.into(),
-            serial: serial.map(str::to_owned),
-            ..Default::default()
-        };
-
-        assert!(
-            saved.matches(&live("dp-2", Some("abc123"))),
-            "case is not identity"
-        );
-        assert!(
-            saved.matches(&live("DP-2", None)),
-            "an output with no EDID is normal, and absence is not a mismatch"
-        );
-        assert!(
-            !saved.matches(&live("DP-2", Some("XYZ789"))),
-            "a different display on the same connector is a different display"
-        );
-        assert!(
-            !saved.matches(&live("DP-1", Some("ABC123"))),
-            "matching the same panel across a renamed connector is deliberately deferred"
-        );
     }
 
     #[test]

@@ -60,12 +60,13 @@ use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
 pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
-use self::workspace::{OutputId, Workspace};
+use self::workspace::Workspace;
 use crate::animation::{Animation, Clock};
 use crate::frame_log::AnimCauses;
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
+use crate::output_identity::OutputIdentity;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -1061,7 +1062,10 @@ impl<W: LayoutElement> Layout<W> {
 
                 let mut workspaces = vec![];
                 for i in (0..primary.workspaces.len()).rev() {
-                    if primary.workspaces[i].original_output.matches(&output) {
+                    if primary.workspaces[i]
+                        .original_output
+                        .matches_output(&output)
+                    {
                         let ws = primary.workspaces.remove(i);
                         took_from_primary = true;
 
@@ -3163,14 +3167,14 @@ impl<W: LayoutElement> Layout<W> {
 
             if idx == primary_idx {
                 for ws in &monitor.workspaces {
-                    if ws.original_output.matches(&monitor.output) {
+                    if ws.original_output.matches_output(&monitor.output) {
                         // This is the primary monitor's own workspace.
                         continue;
                     }
 
                     let own_monitor_exists = monitors
                         .iter()
-                        .any(|m| ws.original_output.matches(&m.output));
+                        .any(|m| ws.original_output.matches_output(&m.output));
                     assert!(
                         !own_monitor_exists,
                         "primary monitor cannot have workspaces for which their own monitor exists"
@@ -3181,7 +3185,7 @@ impl<W: LayoutElement> Layout<W> {
                     monitor
                         .workspaces
                         .iter()
-                        .any(|workspace| workspace.original_output.matches(&monitor.output)),
+                        .any(|workspace| workspace.original_output.matches_output(&monitor.output)),
                     "secondary monitor must not have any non-own workspaces"
                 );
             }
@@ -4258,7 +4262,8 @@ impl<W: LayoutElement> Layout<W> {
         // Do not do anything if the output is already correct
         if current_idx == target_idx {
             // Just update the original output since this is an explicit movement action.
-            current.workspaces[old_idx].original_output = OutputId::new(&current.output);
+            current.workspaces[old_idx].original_output =
+                OutputIdentity::from_output(&current.output);
 
             return false;
         }
@@ -4269,7 +4274,7 @@ impl<W: LayoutElement> Layout<W> {
             current_idx == *active_monitor_idx && old_idx == current.active_workspace_idx;
 
         let mut ws = current.remove_workspace_by_idx(old_idx);
-        ws.original_output = OutputId::new(new_output);
+        ws.original_output = OutputIdentity::from_output(new_output);
 
         let target = &mut monitors[target_idx];
         target.insert_workspace(ws, target.active_workspace_idx + 1, activate);

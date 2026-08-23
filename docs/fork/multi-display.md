@@ -1,6 +1,6 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §4 and §6's drag are implemented; §1, §2, §3 and §5 are not.**
+**Status: design agreed 2026-08-23. §1, §4 and §6's drag are implemented; §2, §3 and §5 are not.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -22,18 +22,27 @@ because mutter has one global workspace list, this document says what ours is.
 
 ## 1. One display identity
 
-Two identity systems answer the same question today:
+**Implemented.** `OutputIdentity` (`src/output_identity.rs`) is the single answer, shared by the
+layout, the session store and the `monitors.xml` alignment it was shaped for. It replaced
+`layout::workspace::OutputId`, a name string matched through `OutputName` by connector **or** the
+make/model/serial triple. `OutputIdentity` is the one that can tell two displays apart when a
+connector is reused, it is already the store's, and `monitors.xml` keys layouts by it.
 
-- `layout::workspace::OutputId` (`src/layout/workspace.rs:192`) — a name string, matched through
-  `OutputName`;
-- `session_state::OutputIdentity` (`src/session_state.rs:137`) — connector plus the three EDID
-  fields, matched connector-exact with the EDID fields as a veto (`:147`), which is also
-  `monitors.xml`'s rule.
+What the layout gained and lost by the swap:
 
-`OutputIdentity` wins and the layout adopts it. It is the one that can tell two displays apart when
-a connector is reused, it is already the store's, and `monitors.xml` keys layouts by it. Matching a
-display across a *renamed* connector stays deferred, and stays deferred in both places at once — a
-session and its layout must never disagree about which display is which.
+- **Gained a veto.** A *different* panel plugged into the connector a workspace's display used no
+  longer inherits its workspaces — the old connector branch of the OR handed them over.
+- **Lost the renamed-connector reach.** The same panel returning on a *different* connector used to
+  be reclaimed through the make/model/serial branch, and now is not. Identity-only matching is the
+  deferred half, and it stays deferred in both places at once: a session and its layout must never
+  disagree about which display is which. A dock that renumbers its DisplayPort connectors is where
+  this is felt, and is the reason to land it.
+
+A home tag can still come from configuration rather than from hardware
+(`OutputIdentity::from_connector` — a connector with no EDID behind it, which vetoes nothing). It
+upgrades to the full identity the first time it meets its display, in `Workspace::set_output`. The
+identity built with no display at all carries an empty connector, which names nothing: parking
+empties by identity (§2) must not key on one.
 
 ## 2. A workspace remembers its home
 
@@ -279,8 +288,7 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 1. **The pointer-decides chooser** (§4), and the removal of niri's `*UnderMouse` actions —
    LANDED.
 2. **The cross-output workspace drag** (§6) — LANDED.
-3. **Identity unification** (§1) — `OutputIdentity` becomes the layout's home tag. Everything below
-   keys off it.
+3. **Identity unification** (§1) — LANDED.
 4. **Home ordinal and parked empties** (§2) — the unplug/replug fidelity a daily dock cycle needs.
 5. **Derived restore ordering with lazy materialization** (§3) — kills the absent-display offset.
 6. **Displaced geometry** (§5) — the two-branch move, the per-axis shrink, `displaced_rect`, the

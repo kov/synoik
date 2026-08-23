@@ -252,10 +252,24 @@ impl Headless {
     }
 
     pub fn add_output(&mut self, synoik: &mut Synoik, n: u8, size: (u16, u16)) {
+        self.add_output_with_serial(synoik, n, size, &n.to_string());
+    }
+
+    /// Plug a display in on connector `headless-{n}` carrying `serial` in its EDID.
+    ///
+    /// The serial is what tells two panels apart on one connector, which is the whole of
+    /// [`OutputIdentity`](crate::output_identity::OutputIdentity)'s veto.
+    pub fn add_output_with_serial(
+        &mut self,
+        synoik: &mut Synoik,
+        n: u8,
+        size: (u16, u16),
+        serial: &str,
+    ) {
         let connector = format!("headless-{n}");
         let make = "synoik".to_string();
         let model = "headless".to_string();
-        let serial = n.to_string();
+        let serial = serial.to_string();
 
         let output = Output::new(
             connector.clone(),
