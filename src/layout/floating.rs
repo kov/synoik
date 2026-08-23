@@ -127,6 +127,49 @@ fn anchor_for<W: LayoutElement>(tile: &Tile<W>) -> Anchor {
 }
 
 /// Extra per-tile data.
+/// Where a rect that lived in `old` goes in `new` — mutter's `move_rect_between_rects`
+/// (`window.c:4511-4562`), reached whenever a window's monitor changes underneath it.
+///
+/// Two branches, and the first is the one that makes the result feel right:
+///
+/// - **the window fits in both areas**, with room to spare in the old one: the *slack* fraction is
+///   preserved, so a right-aligned window stays right-aligned, a centred one stays centred, and
+///   nothing can hang off an edge;
+/// - **otherwise** — a window as large as its area, or larger than the new one — the *centre*
+///   fraction is preserved instead, clamped off the extremes so an oversized window is not shoved
+///   entirely off one side.
+///
+/// The naive version this replaces stored a plain top-left fraction of the area size, which is the
+/// second branch without the centre term: a window at fraction 0.5 kept its left edge at half the
+/// width and hung the rest off the right.
+fn move_rect_between_areas(
+    rect: Rectangle<f64, Logical>,
+    old: Rectangle<f64, Logical>,
+    new: Rectangle<f64, Logical>,
+) -> Point<f64, Logical> {
+    let fits_old = old.contains_rect(rect) && old.size.w > rect.size.w && old.size.h > rect.size.h;
+    let fits_new = new.size.w >= rect.size.w && new.size.h >= rect.size.h;
+
+    if fits_old && fits_new {
+        let rel_x = (rect.loc.x - old.loc.x) / (old.size.w - rect.size.w);
+        let rel_y = (rect.loc.y - old.loc.y) / (old.size.h - rect.size.h);
+        return Point::from((
+            new.loc.x + rel_x * (new.size.w - rect.size.w),
+            new.loc.y + rel_y * (new.size.h - rect.size.h),
+        ));
+    }
+
+    // Mutter clamps by FLT_EPSILON, which is only there to keep the centre strictly inside the
+    // area; the same job, in the same place.
+    let eps = f64::EPSILON;
+    let rel_x = ((rect.loc.x - old.loc.x + rect.size.w / 2.) / old.size.w).clamp(eps, 1. - eps);
+    let rel_y = ((rect.loc.y - old.loc.y + rect.size.h / 2.) / old.size.h).clamp(eps, 1. - eps);
+    Point::from((
+        new.loc.x - rect.size.w / 2. + rel_x * new.size.w,
+        new.loc.y - rect.size.h / 2. + rel_y * new.size.h,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Data {
     /// Position relative to the working area.
@@ -232,8 +275,18 @@ impl Data {
             return;
         }
 
+        let old = self.working_area;
         self.working_area = working_area;
-        self.recompute_logical_pos();
+
+        // A derived position is not carried, it is re-derived: `recompute_logical_pos` already
+        // pins a maximized window to the work area and a fullscreen one to the output.
+        if self.anchor != Anchor::Free {
+            self.recompute_logical_pos();
+            return;
+        }
+
+        let rect = Rectangle::new(self.logical_pos, self.size);
+        self.set_logical_pos(move_rect_between_areas(rect, old, working_area));
     }
 
     pub fn update<W: LayoutElement>(&mut self, tile: &Tile<W>) {

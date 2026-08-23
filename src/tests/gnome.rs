@@ -29515,6 +29515,60 @@ fn a_replug_does_not_split_restored_desktops_with_its_own_empties() {
     );
 }
 
+/// A floating window carried into a new work area keeps the *slack* it had, not its top-left
+/// fraction: a window against the right edge stays against the right edge.
+///
+/// mutter's `move_rect_between_rects` (`window.c:4511-4562`), first branch. The fraction-of-size
+/// version this replaces put a right-aligned window's left edge at the same fraction of a narrower
+/// area and hung the rest off the right, where the off-screen clamp caught it.
+#[test]
+fn a_floating_window_against_an_edge_stays_against_it_when_the_area_shrinks() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (640, 480), None);
+    f.settle();
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            // Work-area relative, which is the frame `MoveFloatingWindow` speaks.
+            x: synoik_ipc::PositionChange::SetFixed(area.size.w - 640.),
+            y: synoik_ipc::PositionChange::SetFixed(area.size.h - 480.),
+        },
+        false,
+    );
+    f.settle();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let (_, pos, _) = placement_of(&mut f, &win);
+    assert_eq!(
+        (
+            pos.0 + 640 - area.loc.x.round() as i32,
+            pos.1 + 480 - area.loc.y.round() as i32
+        ),
+        (area.size.w.round() as i32, area.size.h.round() as i32),
+        "it starts flush against the far corner of the work area"
+    );
+
+    f.resize_output(1, Some((1280, 720)), None);
+    f.double_roundtrip(id);
+    f.settle();
+    let _ = &surface;
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    let (_, pos, _) = placement_of(&mut f, &win);
+    assert_eq!(
+        (
+            pos.0 + 640 - area.loc.x.round() as i32,
+            pos.1 + 480 - area.loc.y.round() as i32
+        ),
+        (area.size.w.round() as i32, area.size.h.round() as i32),
+        "and is still flush against it once the area is smaller"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]
