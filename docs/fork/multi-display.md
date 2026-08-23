@@ -225,9 +225,9 @@ better, and pay for it with one field:
   the shrink has to be a real configure and the desired rect has to be kept on the side.
 - **Stored verbatim, restored verbatim.** Never re-derived by inverting the shrink — a recovered
   value is not the original, and rounding makes that literally true.
-- **Cleared on any user-driven resize, move or drop.** Each of those is the user saying this is the
-  geometry now. (The move and the drop are not in the original design; without them a window the
-  user had since repositioned would jump back the next time a work area grew.)
+- **Cleared on a user-driven resize, and on a drop onto another display.** Both are the user saying
+  this is the geometry now. A plain *move* does not clear it: where the window sits and what size a
+  narrow display forced on it are separate answers, and only the size was ever overridden.
 - **Applied when a work area grows enough to hold it again**, which is what makes a workspace
   returning to its big display return the windows to their old geometry.
 - **Unanimated**, for `refit_to_working_area`'s reason: the user did not ask for this, the area

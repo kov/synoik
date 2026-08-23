@@ -29753,6 +29753,63 @@ fn a_user_maximized_window_is_not_un_maximized_by_a_bigger_display() {
     );
 }
 
+/// Moving a displaced window does not forfeit the geometry the display overrode.
+///
+/// Where the user put a window and what size a narrow display forced on it are separate answers;
+/// only the second was ever overridden, so only a resize retracts it.
+#[test]
+fn a_move_does_not_give_up_the_geometry_a_display_overrode() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1000, 800), None);
+
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f);
+
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            x: synoik_ipc::PositionChange::SetFixed(40.),
+            y: synoik_ipc::PositionChange::SetFixed(20.),
+        },
+        false,
+    );
+    // A move alone configures nothing, so there is no new serial to ack here.
+    f.settle();
+
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .floating_rect
+        .expect("it floats");
+    assert_eq!(
+        (rect.size.w.round() as i32, rect.size.h.round() as i32),
+        (1000, 800),
+        "the display that can hold it again still gives the geometry back"
+    );
+}
+
 /// The *reason* a restored window is maximized outlives the logout too.
 ///
 /// Without the mark in the record, a window restored maximized is indistinguishable from one the

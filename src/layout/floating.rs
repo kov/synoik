@@ -1576,9 +1576,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         };
         let idx = self.idx_of(id).unwrap();
-        // As with a resize: the user has put the window somewhere, so a stored geometry must not
-        // pull it back the next time a work area grows.
-        self.tiles[idx].displaced_rect = None;
+        // Moving deliberately keeps `displaced_rect`: where the user put the window and what size
+        // a narrow display forced on it are separate answers, and only the size was overridden.
 
         let mut pos = self.data[idx].logical_pos;
 
