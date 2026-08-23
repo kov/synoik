@@ -339,6 +339,22 @@ impl State {
                 }
                 self.synoik.queue_redraw_all();
             }
+            ShellEntry::WorkspaceRename => {
+                use crate::ui::workspace_rename::RenameKey;
+                let outcome = match self.synoik.workspace_rename.as_mut() {
+                    Some(rename) => rename.key(raw, text, mods, theme),
+                    None => return,
+                };
+                match outcome {
+                    RenameKey::Ignored => return,
+                    RenameKey::Took => {}
+                    RenameKey::Commit => {
+                        self.finish_workspace_rename();
+                    }
+                    RenameKey::Cancel => self.synoik.workspace_rename = None,
+                }
+                self.synoik.queue_redraw_all();
+            }
             ShellEntry::OverviewSearch => {
                 use crate::ui::overview_search::SearchOutcome;
                 match self
@@ -1359,6 +1375,62 @@ impl State {
                         let text = modified
                             .key_char()
                             .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        // The workspace name entry holds the key focus the same way the folder
+                        // rename below does: while it is up, nothing else in the overview sees a
+                        // keystroke.
+                        if this.synoik.workspace_rename.is_some() {
+                            use crate::ui::workspace_rename::RenameKey;
+                            let theme = this.synoik.gnome_settings.key_theme;
+                            if this.im_offer_shell_key(
+                                crate::input_method::ShellKey {
+                                    entry: ShellEntry::WorkspaceRename,
+                                    raw,
+                                    text,
+                                    mods: edit_mods(mods),
+                                    theme,
+                                    pressed,
+                                },
+                                modified.raw(),
+                                key_code,
+                            ) {
+                                this.synoik.suppressed_keys.insert(key_code);
+                                return FilterResult::Intercept(None);
+                            }
+                            if let Some(action) =
+                                crate::clipboard::ClipboardAction::from_key(raw, edit_mods(mods))
+                            {
+                                this.shell_clipboard_action(ShellEntry::WorkspaceRename, action);
+                                this.synoik.suppressed_keys.insert(key_code);
+                                this.synoik.queue_redraw_all();
+                                return FilterResult::Intercept(None);
+                            }
+                            let outcome = this
+                                .synoik
+                                .workspace_rename
+                                .as_mut()
+                                .map(|r| r.key(raw, text, edit_mods(mods), theme))
+                                .unwrap_or(RenameKey::Ignored);
+                            match outcome {
+                                RenameKey::Ignored => {}
+                                RenameKey::Took => {
+                                    this.synoik.suppressed_keys.insert(key_code);
+                                    this.synoik.queue_redraw_all();
+                                    return FilterResult::Intercept(None);
+                                }
+                                RenameKey::Commit => {
+                                    this.finish_workspace_rename();
+                                    this.synoik.suppressed_keys.insert(key_code);
+                                    this.synoik.queue_redraw_all();
+                                    return FilterResult::Intercept(None);
+                                }
+                                RenameKey::Cancel => {
+                                    this.synoik.workspace_rename = None;
+                                    this.synoik.suppressed_keys.insert(key_code);
+                                    this.synoik.queue_redraw_all();
+                                    return FilterResult::Intercept(None);
+                                }
+                            }
+                        }
                         // The folder rename entry comes first: while it is up it holds the
                         // key focus, so the search never sees a keystroke
                         // (`_showFolderEntry`'s `grab_key_focus`, `appDisplay.js:2643-2648`).
@@ -2253,6 +2325,9 @@ impl State {
                 {
                     mapped.toplevel().send_close();
                 }
+            }
+            PopoverAction::WorkspaceRename(workspace) => {
+                self.begin_workspace_rename(workspace);
             }
             PopoverAction::WorkspaceClose(workspace) => {
                 if self.synoik.layout.close_workspace(workspace) {
@@ -6319,7 +6394,9 @@ impl State {
         use crate::ui::workspace_menu::{DisplayTarget, WorkspaceMenuContext};
 
         let mon = self.synoik.layout.monitor_for_output(output)?;
-        let workspace = mon.workspace_at(idx)?.id();
+        let ws = mon.workspace_at(idx)?;
+        let workspace = ws.id();
+        let is_named = ws.name().is_some();
         let is_closable = mon.workspace_is_closable(idx);
 
         // Every display but this one, in strip order. Labelled the way the display settings
@@ -6360,9 +6437,62 @@ impl State {
 
         Some(WorkspaceMenuContext {
             workspace,
+            is_named,
             is_closable,
             displays,
         })
+    }
+
+    /// Put the name entry up on a workspace's thumbnail. The overview has to be open for the
+    /// thumbnail to exist, which the menu's own routes both guarantee.
+    fn begin_workspace_rename(&mut self, workspace: WorkspaceId) {
+        let Some((_, ws)) = self.synoik.layout.find_workspace_by_id(workspace) else {
+            return;
+        };
+        let name = ws.name().cloned().unwrap_or_default();
+        self.synoik.workspace_rename = Some(crate::ui::workspace_rename::WorkspaceRename::new(
+            workspace, &name,
+        ));
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Apply what the name entry holds, and take it down. Returns whether it closed — a name
+    /// another workspace already answers to is refused, and the entry stays up on it.
+    ///
+    /// An empty entry *unsets* the name: a workspace may have none, so clearing the field is how
+    /// a name is taken away rather than a no-op.
+    fn finish_workspace_rename(&mut self) -> bool {
+        let Some(rename) = self.synoik.workspace_rename.as_ref() else {
+            return false;
+        };
+        let workspace = rename.workspace;
+        let name = rename.name().to_owned();
+        let reference = synoik_config::WorkspaceReference::Id(workspace.get());
+
+        if name.is_empty() {
+            self.synoik.workspace_rename = None;
+            self.synoik.layout.unset_workspace_name(Some(reference));
+            self.synoik.queue_redraw_all();
+            return true;
+        }
+
+        // `set_workspace_name` refuses a name another workspace holds, and refuses it silently.
+        // Asking first is what lets the entry stay up to say so — gnome-shell's theme has no
+        // error state for an entry to wear, and the clash is legible on the strip itself, where
+        // the workspace holding the name is showing it.
+        let taken = self
+            .synoik
+            .layout
+            .find_workspace_by_name(&name)
+            .is_some_and(|(_, ws)| ws.id() != workspace);
+        if taken {
+            return false;
+        }
+
+        self.synoik.workspace_rename = None;
+        self.synoik.layout.set_workspace_name(name, Some(reference));
+        self.synoik.queue_redraw_all();
+        true
     }
 
     /// Send a workspace to another display — what the workspace menu's Send to <display> row

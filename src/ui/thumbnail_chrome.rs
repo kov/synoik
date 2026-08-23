@@ -48,6 +48,24 @@ pub struct ThumbnailName {
     pub name: String,
 }
 
+/// Everything the strip draws over its thumbnails in one frame.
+pub struct StripChrome<'a> {
+    /// The close button an empty workspace grows while hovered.
+    pub buttons: &'a [ThumbnailClose],
+    /// Every named workspace's label — minus the one being renamed, which wears the entry.
+    pub names: &'a [ThumbnailName],
+    /// The name entry, when a rename is in progress.
+    pub entry: Option<ThumbnailEntry<'a>>,
+}
+
+/// The name entry, while a workspace is being renamed.
+pub struct ThumbnailEntry<'a> {
+    /// The thumbnail's box, in view coordinates.
+    pub thumb: Rectangle<f64, Logical>,
+    /// The editing model — text, caret and selection all come from it.
+    pub edit: &'a crate::ui::text_edit::TextEdit,
+}
+
 /// One thumbnail's close button, as the renderer needs it.
 #[derive(Debug, Clone, Copy)]
 pub struct ThumbnailClose {
@@ -65,6 +83,7 @@ pub struct ThumbnailClose {
 pub struct ThumbnailChrome {
     disc: RefCell<BakeCache>,
     names: RefCell<std::collections::HashMap<String, BakeCache>>,
+    entry: RefCell<BakeCache>,
 }
 
 impl ThumbnailChrome {
@@ -88,10 +107,57 @@ impl ThumbnailChrome {
         icons: &IconCache,
         scale: f64,
         accent: Rgba,
-        buttons: &[ThumbnailClose],
-        names: &[ThumbnailName],
+        chrome: StripChrome<'_>,
     ) -> Vec<ThumbnailChromeRenderElement> {
+        let StripChrome {
+            buttons,
+            names,
+            entry,
+        } = chrome;
         let mut elements: Vec<ThumbnailChromeRenderElement> = Vec::new();
+
+        // The name entry, where that workspace's label would be: what is being edited is where
+        // the result will show.
+        if let Some(entry) = entry {
+            let rect = crate::ui::workspace_rename::entry_rect(entry.thumb);
+            let content = widget::EntryContent::of(entry.edit, "Name this workspace", true);
+            let rev = widget::Revision::new()
+                .of(content.text)
+                .of(content.cursor)
+                .of(content.selection.clone())
+                .of(content.preedit)
+                .px(rect.size.w)
+                .done();
+            let baked = widget::Entry::bake(
+                renderer,
+                &mut self.entry.borrow_mut(),
+                scale,
+                rect.size.w,
+                rect.size.h,
+                content,
+                crate::ui::workspace_rename::STYLE,
+                true,
+                false,
+                // Unused by this family: over a wallpaper the focus ring is white, not the
+                // accent, for the reason the lock screen's is.
+                style::TEXT,
+                rev,
+            );
+            match baked {
+                Ok(buffer) => elements.push(
+                    TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        rect.loc,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                ),
+                Err(err) => tracing::error!("error baking the workspace name entry: {err:#}"),
+            }
+        }
 
         // The same caption pill the window picker puts under a preview, so the two labels in
         // the overview read as one kind of overlay.

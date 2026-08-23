@@ -1132,7 +1132,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// Unnamed workspaces are absent rather than labelled with their index: a workspace has no
     /// default name (`Workspace::name` is `None` until something sets one), and inventing one for
     /// the strip would put a label on every thumbnail to say what its position already says.
-    pub fn thumbnail_names(&self) -> Vec<(Rectangle<f64, Logical>, String)> {
+    pub fn thumbnail_names(&self) -> Vec<(WorkspaceId, Rectangle<f64, Logical>, String)> {
         let Some(strip) = self.thumbnail_strip() else {
             return Vec::new();
         };
@@ -1142,9 +1142,22 @@ impl<W: LayoutElement> Monitor<W> {
                 let name = ws.name.clone()?;
                 let thumb =
                     thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), Point::default());
-                Some((thumb, name))
+                Some((ws.id(), thumb, name))
             })
             .collect()
+    }
+
+    /// Where a particular workspace's thumbnail is drawn, named or not — what the name entry
+    /// needs, since a workspace being *given* a name has no label to find it by.
+    pub fn thumbnail_rect_for(&self, id: WorkspaceId) -> Option<Rectangle<f64, Logical>> {
+        let strip = self.thumbnail_strip()?;
+        let idx = self.workspaces.iter().position(|ws| ws.id() == id)?;
+        let slot = strip.thumbs.get(idx)?;
+        Some(thumbnail_drawn_rect(
+            *slot,
+            self.strip_render_scale(idx),
+            Point::default(),
+        ))
     }
 
     /// The workspace whose thumbnail close button is under the position.

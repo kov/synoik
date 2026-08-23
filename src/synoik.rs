@@ -203,7 +203,7 @@ use crate::ui::screenshot_ui::{
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
 use crate::ui::switcher::SwitcherKey;
-use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose, ThumbnailName};
+use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose, ThumbnailEntry, ThumbnailName};
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -1043,6 +1043,10 @@ pub struct Synoik {
     pub app_grid: AppGrid,
     /// The app-folder dialog a click on a folder tile opens.
     pub folder_dialog: crate::ui::folder_dialog::FolderDialog,
+
+    /// The workspace name entry, while one is up. Lives here rather than on the strip because
+    /// the strip is re-laid every frame and the edit must not be.
+    pub workspace_rename: Option<crate::ui::workspace_rename::WorkspaceRename>,
     /// GPU caches for the window picker's per-preview chrome (the close button).
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
@@ -7999,6 +8003,7 @@ impl Synoik {
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(animation_clock.clone()),
             folder_dialog: crate::ui::folder_dialog::FolderDialog::new(animation_clock.clone()),
+            workspace_rename: None,
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
             thumbnail_chrome: ThumbnailChrome::new(),
@@ -10793,6 +10798,14 @@ impl Synoik {
         // dismiss it.
         let overview_just_opened = overview_open && !self.overview_was_open;
         self.overview_was_open = overview_open;
+        // The name entry lives on a thumbnail, so it goes when the strip does — and when the
+        // workspace it names goes, which closing that workspace from the menu can do.
+        if let Some(rename) = self.workspace_rename.as_ref() {
+            if !overview_open || self.layout.find_workspace_by_id(rename.workspace).is_none() {
+                self.workspace_rename = None;
+            }
+        }
+
         // A workspace menu is *of* the overview — it hangs off a thumbnail in the strip — so the
         // overview coming up is not a reason to dismiss it, and the keyboard route opens both in
         // one action.
@@ -11723,10 +11736,12 @@ impl Synoik {
                     .collect();
                 // A named workspace wears its name; an unnamed one is identified by position,
                 // as it always was.
+                let renaming = self.workspace_rename.as_ref().map(|r| r.workspace);
                 let names: Vec<_> = mon
                     .thumbnail_names()
                     .into_iter()
-                    .map(|(thumb, name)| {
+                    .filter(|(id, _, _)| Some(*id) != renaming)
+                    .map(|(_, thumb, name)| {
                         let max_w = thumb.size.w
                             - 2. * crate::layout::thumbnails::NAME_INSET
                             - 2. * crate::ui::widget::Tooltip::PAD_H;
@@ -11741,13 +11756,26 @@ impl Synoik {
                     })
                     .collect();
                 self.thumbnail_chrome.retain_names(&names);
+                // The workspace being renamed wears the entry instead of its label — the two
+                // occupy the same slot, and showing both would show the same name twice.
+                let entry = self.workspace_rename.as_ref().and_then(|rename| {
+                    let thumb = mon.thumbnail_rect_for(rename.workspace)?;
+                    Some(ThumbnailEntry {
+                        thumb,
+                        edit: rename.edit(),
+                    })
+                });
+
                 for element in self.thumbnail_chrome.render(
                     ctx.renderer,
                     &self.icon_cache,
                     fade_scale,
                     crate::ui::widget::style::accent_rgba(self.gnome_settings.accent_color),
-                    &buttons,
-                    &names,
+                    crate::ui::thumbnail_chrome::StripChrome {
+                        buttons: &buttons,
+                        names: &names,
+                        entry,
+                    },
                 ) {
                     group.push(element.into());
                 }

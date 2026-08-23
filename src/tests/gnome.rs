@@ -30146,6 +30146,184 @@ fn a_user_maximize_over_a_displacement_survives_the_area_growing() {
     );
 }
 
+/// The menu's Rename row puts an entry on the thumbnail, and what is typed becomes the name.
+#[test]
+fn the_workspace_menu_renames_a_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let thumb = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("on a monitor")
+            .thumbnail_strip()
+            .expect("the strip is up")
+            .thumbs[0]
+    };
+    pointer_motion_to(&mut f, thumb.loc.x + 4., thumb.loc.y + 4.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let menu = f.synoik().panel_popover.workspace_menu().expect("a menu");
+    assert!(
+        menu.labels().contains(&"Name…"),
+        "an unnamed workspace is offered a name, not a rename: {:?}",
+        menu.labels()
+    );
+    let center = menu.row_center("Name…").expect("the row");
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    pointer_motion_to(&mut f, loc.x + center.x, loc.y + center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.settle();
+
+    assert!(
+        f.synoik().workspace_rename.is_some(),
+        "the entry is up on the thumbnail"
+    );
+
+    // "aa" — two keys we already have codes for; the point is that typing reaches the entry.
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+
+    assert!(
+        f.synoik().workspace_rename.is_none(),
+        "Enter takes the entry down"
+    );
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    assert_eq!(
+        mon.expect("on a monitor")
+            .thumbnail_names()
+            .into_iter()
+            .map(|(_, _, n)| n)
+            .collect::<Vec<_>>(),
+        vec![String::from("aa")],
+        "and the workspace wears what was typed"
+    );
+}
+
+/// Escape abandons the rename; the name it had is the name it keeps.
+#[test]
+fn escape_abandons_a_workspace_rename() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::WorkspaceRename(ws));
+    f.settle();
+    assert!(f.synoik().workspace_rename.is_some(), "the entry is up");
+
+    tap(&mut f, KEY_X);
+    tap(&mut f, KEY_ESC);
+    f.settle();
+
+    assert!(
+        f.synoik().workspace_rename.is_none(),
+        "Escape takes the entry down"
+    );
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "and stops there — the overview underneath is not what Escape was aimed at"
+    );
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    assert_eq!(
+        mon.expect("on a monitor")
+            .thumbnail_names()
+            .into_iter()
+            .map(|(_, _, n)| n)
+            .collect::<Vec<_>>(),
+        vec![String::from("Mail")],
+        "the name it had"
+    );
+}
+
+/// A name another workspace already answers to is refused, and the entry stays up saying so.
+///
+/// `set_workspace_name` refuses a duplicate *silently*, so committing one would look like the
+/// rename had worked. gnome-shell's theme has no error state for an entry to wear, so the entry
+/// staying open is the signal — and the workspace holding the name is on the strip wearing it.
+#[test]
+fn a_name_another_workspace_holds_is_refused() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("aa")), false);
+    // A second workspace to do the renaming on.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.settle();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::WorkspaceRename(ws));
+    f.settle();
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+
+    assert!(
+        f.synoik().workspace_rename.is_some(),
+        "the entry stays up: the name was not taken"
+    );
+    let named: Vec<String> = f
+        .synoik()
+        .layout
+        .workspaces()
+        .filter_map(|(_, _, ws)| ws.name().cloned())
+        .collect();
+    assert_eq!(
+        named,
+        vec![String::from("aa")],
+        "and only the workspace that already had it still has it"
+    );
+}
+
+/// An emptied entry takes the name away — a workspace is allowed to have none.
+#[test]
+fn clearing_the_entry_unnames_a_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::WorkspaceRename(ws));
+    f.settle();
+
+    // The old name comes up selected, so one Backspace clears the field.
+    tap(&mut f, KEY_BACKSPACE);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    assert!(
+        mon.expect("on a monitor").thumbnail_names().is_empty(),
+        "the workspace has no name any more"
+    );
+}
+
 /// A named workspace wears its name in the strip; an unnamed one wears nothing.
 ///
 /// Naming a workspace has been possible all along (`Action::SetWorkspaceName`) and has always
@@ -30175,13 +30353,16 @@ fn a_named_workspace_shows_its_name_on_its_thumbnail() {
 
     let labelled = names(&mut f);
     assert_eq!(
-        labelled.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+        labelled
+            .iter()
+            .map(|(_, _, n)| n.as_str())
+            .collect::<Vec<_>>(),
         vec!["Mail"],
         "the named one, and only it"
     );
 
     // The pill sits inside its thumbnail, along the bottom edge.
-    let (thumb, name) = labelled.into_iter().next().unwrap();
+    let (_, thumb, name) = labelled.into_iter().next().unwrap();
     let size = crate::ui::widget::Tooltip::size(&name);
     let pill = crate::layout::thumbnails::name_rect(thumb, size);
     assert!(
@@ -30224,7 +30405,7 @@ fn a_right_click_on_a_thumbnail_opens_the_workspace_menu() {
         .expect("a workspace menu");
     assert_eq!(
         menu.labels(),
-        vec!["Close"],
+        vec!["Name…", "Close"],
         "one display, so there is nowhere to send it"
     );
     assert_eq!(

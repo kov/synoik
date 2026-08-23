@@ -159,7 +159,7 @@ impl State {
         }
     }
 
-    /// The selected text of one of the five entries, or `None` when nothing is selected.
+    /// The selected text of one of the shell's own entries, or `None` when nothing is selected.
     fn shell_entry_selection(&self, entry: ShellEntry) -> Option<String> {
         let edit = match entry {
             ShellEntry::Shield => self.synoik.unlock_dialog.entry(),
@@ -167,6 +167,7 @@ impl State {
             ShellEntry::RunDialog => self.synoik.run_dialog.edit(),
             ShellEntry::FolderRename => self.synoik.folder_dialog.rename_edit()?,
             ShellEntry::OverviewSearch => self.synoik.overview_search.edit(),
+            ShellEntry::WorkspaceRename => self.synoik.workspace_rename.as_ref()?.edit(),
         };
         let selected = edit.selected_text()?;
         (!selected.is_empty()).then(|| selected.to_owned())

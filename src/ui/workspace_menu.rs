@@ -2,8 +2,7 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! The workspace context menu — close, and send to another display. Rename joins them with the
-//! strip's name label.
+//! The workspace context menu — rename, close, and send to another display.
 //!
 //! **Divergence** (`docs/fork/multi-display.md` §6). gnome-shell has no such menu: its
 //! workspaces are unnamed, reaped when they empty, and belong to every monitor at once, so
@@ -29,6 +28,7 @@ use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem};
 /// row id to action lives here — the id is this table's index.
 #[derive(Debug, Clone)]
 enum RowAction {
+    Rename,
     Close,
     /// Send the workspace to this display. Carried as the output itself: the menu outlives the
     /// press that opened it, and a connector name would have to be resolved again at activation.
@@ -47,6 +47,8 @@ pub struct DisplayTarget {
 #[derive(Debug, Clone)]
 pub struct WorkspaceMenuContext {
     pub workspace: WorkspaceId,
+    /// Whether it already has a name, which is what makes the row a rename rather than a naming.
+    pub is_named: bool,
     /// Whether the workspace can be dismissed at all — `Monitor::workspace_is_closable`, which
     /// refuses the trailing empty, the last few, and anything holding windows or a name.
     pub is_closable: bool,
@@ -69,8 +71,17 @@ impl WorkspaceMenu {
     pub fn new(ctx: &WorkspaceMenuContext) -> Self {
         let mut actions: Vec<RowAction> = Vec::new();
 
-        // Group 0: what the workspace itself is.
+        // Group 0: what the workspace itself is. Rename first — it is the row that exists on
+        // every workspace, closable or not.
         let mut own = Vec::new();
+        own.push({
+            let id = actions.len() as u64;
+            actions.push(RowAction::Rename);
+            MenuEntry::Item(MenuItem::new(
+                id,
+                if ctx.is_named { "Rename…" } else { "Name…" },
+            ))
+        });
         own.push({
             let id = actions.len() as u64;
             actions.push(RowAction::Close);
@@ -182,6 +193,7 @@ impl WorkspaceMenu {
         };
         let workspace = self.workspace;
         match action {
+            RowAction::Rename => PopoverAction::WorkspaceRename(workspace),
             RowAction::Close => PopoverAction::WorkspaceClose(workspace),
             RowAction::SendToDisplay(output) => PopoverAction::WorkspaceSendToDisplay {
                 workspace,

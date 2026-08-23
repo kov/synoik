@@ -81,6 +81,8 @@ pub enum ShellEntry {
     FolderRename,
     /// The overview's search entry.
     OverviewSearch,
+    /// Renaming a workspace from its thumbnail in the overview.
+    WorkspaceRename,
 }
 
 impl ShellEntry {
@@ -1150,6 +1152,11 @@ impl State {
             ShellEntry::Polkit => self.synoik.polkit_dialog.set_preedit(preedit),
             ShellEntry::FolderRename => self.synoik.folder_dialog.set_preedit(preedit),
             ShellEntry::OverviewSearch => self.synoik.overview_search.set_preedit(preedit),
+            ShellEntry::WorkspaceRename => self
+                .synoik
+                .workspace_rename
+                .as_mut()
+                .is_some_and(|r| r.edit_mut().set_preedit(preedit)),
         };
         if changed {
             self.synoik.queue_redraw_all();

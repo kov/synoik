@@ -1,7 +1,7 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §1–§4, §5 and §6's drag are implemented; what is left of §6
-is the workspace context menu and naming UI.**
+**Status: design agreed 2026-08-23; §1–§6 are implemented. The one decision still open is at the
+end of §6: whether a *named* empty workspace should still park with its absent display.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -323,13 +323,30 @@ is continuous; the visible artefact is the thumbnail resizing at the boundary wh
 displays' strips differ in scale. An animated carry lands with monitor positions, together with the
 window drag.
 
-**A workspace context menu** — rename, close, and **Send to \<display\>** — is the keyboard- and
-screen-reader-reachable way to express the same move, which a drag is not. Rename is the UI the
-naming model has been missing: `Workspace::name`, `Layout::set_workspace_name` /
-`unset_workspace_name` (`src/layout/mod.rs:5744,5783`), `Action::SetWorkspaceName` and the
-`synoik msg` verbs all exist, but nothing in the shell offers it and `ui/thumbnail_chrome.rs` never
-draws a name. A finishing touch, and what makes "a name outranks the index" (§3) worth anything to
-a user.
+**A workspace context menu** — rename, close, and **Send to \<display\>** — is **implemented**:
+a right-click on a thumbnail, or `show-workspace-menu`, which opens the overview first because the
+menu hangs off a thumbnail. It is the keyboard- and screen-reader-reachable way to express the
+move, which a drag is not. Close and Send both go through the calls the existing gestures use, so
+the closable rule and the home-tag rewrite are not restated anywhere.
+
+Rules it keeps:
+
+- **A right press on the strip is the menu, before the overview's pan grab.** That grab took every
+  right press in the overview, the strip's included — the same ordering the peek's left press
+  needed.
+- **The menu survives the overview opening.** An overview coming up dismisses an open popover; this
+  one is *of* the overview, and the keyboard route opens both in one action.
+- **A display name that is not unique earns its connector.** Two of the same monitor otherwise
+  produce two identical rows.
+
+**Rename** is the UI the naming model was missing. A workspace has no default name, so an unnamed
+thumbnail carries no label — inventing "Workspace 3" would put chrome on every thumbnail to repeat
+what its position already says. A named one wears the caption pill the window picker uses for
+window titles. The entry takes the label's place, opens with the old name selected, commits on
+Enter, abandons on Escape, and **unsets the name when emptied** — a workspace is allowed to have
+none. A name another workspace already answers to is refused and the entry stays up: `set_workspace_name`
+refuses duplicates silently, and gnome-shell's theme has no error state for an entry to wear, so
+the entry staying open is the signal — with the workspace holding the name visible on the strip.
 
 **Decide here whether a named empty workspace still parks.** §2 parks it with the rest, on the
 grounds that a name says "keep", not "put this somewhere else" — which costs it being reachable at
@@ -350,4 +367,4 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 4. **Home ordinal and parked empties** (§2) — LANDED.
 5. **Derived restore ordering with lazy materialization** (§3) — LANDED.
 6. **Displaced geometry** (§5) — LANDED.
-7. **The workspace context menu and naming UI** (§6) — any time after 2.
+7. **The workspace context menu and naming UI** (§6) — LANDED.

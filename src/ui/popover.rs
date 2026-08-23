@@ -288,6 +288,8 @@ pub enum PopoverAction {
     },
     /// The window menu's Close — `window.delete()` (`windowMenu.js:185-189`).
     WindowClose(crate::window::mapped::MappedId),
+    /// The workspace menu's Rename — open the strip's inline name entry on this workspace.
+    WorkspaceRename(crate::layout::workspace::WorkspaceId),
     /// The workspace menu's Close — `Layout::close_workspace`, the same call the strip's own
     /// close button makes.
     WorkspaceClose(crate::layout::workspace::WorkspaceId),
@@ -361,6 +363,7 @@ impl PopoverAction {
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }
                 | PopoverAction::WindowClose(_)
+                | PopoverAction::WorkspaceRename(_)
                 | PopoverAction::WorkspaceClose(_)
                 | PopoverAction::WorkspaceSendToDisplay { .. }
         )
