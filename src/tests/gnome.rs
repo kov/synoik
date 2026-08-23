@@ -27904,6 +27904,75 @@ fn a_restored_window_follows_its_display_when_the_configuration_changes() {
     );
 }
 
+/// The whole loop on a named workspace: what `session_record_for` writes is what restore reads.
+///
+/// Every other restore test seeds its record by hand, which cannot catch a save that never
+/// records the name at all.
+#[test]
+fn a_named_workspace_survives_a_save_and_restore_round_trip() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    f.synoik_state().do_action(Action::FocusMonitorRight, false);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName("mail".to_owned()), false);
+    f.settle();
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    // Onto the named workspace on the second display, then close it.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToMonitorRight, false);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels["main"]
+        .clone();
+    assert_eq!(
+        record.workspace_name.as_deref(),
+        Some("mail"),
+        "the save must record the name the workspace has"
+    );
+    assert_eq!(
+        record.output.as_ref().map(|o| o.connector.as_str()),
+        Some("headless-2")
+    );
+
+    // A second run of the same app: it comes back holding the id, takes the session over, and
+    // asks for its window by name. The first client still has "main" registered, which is why
+    // this cannot reuse it.
+    let next = f.add_client();
+    f.roundtrip(next);
+    let session = f
+        .client(next)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(next);
+
+    let (surface, _handle) = restore_window(&mut f, next, &session, "main");
+    map_at_configured_size(&mut f, next, &surface);
+    f.settle();
+
+    let saved = record.floating_rect.expect("a floated window has a rect");
+    assert_eq!(
+        restored_placement(&mut f),
+        ("headless-2".to_owned(), (saved[0], saved[1])),
+        "the round trip must be lossless"
+    );
+}
+
 /// A saved workspace *name* outranks the saved display: a name is the only workspace handle that
 /// survives a restart, and following it is what lets a window come back with a workspace the user
 /// has since moved to another display.
