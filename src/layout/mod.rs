@@ -802,6 +802,14 @@ pub struct TileSessionState {
     /// compositor owns. `None` for a window outside the floating layer, which has no position of
     /// its own to save.
     pub live_rect: Option<Rectangle<f64, Logical>>,
+
+    /// The geometry a work area too small for the window overrode, **output-local**.
+    /// See [`Tile::displaced_rect`].
+    pub displaced_rect: Option<Rectangle<f64, Logical>>,
+
+    /// Whether the compositor maximized the window rather than the user.
+    /// See [`Tile::auto_maximized`].
+    pub auto_maximized: bool,
 }
 
 impl SizingMode {
@@ -6650,6 +6658,21 @@ impl<W: LayoutElement> Layout<W> {
     pub fn seed_unmaximize_geometry(&mut self, id: &W::Id, rect: Rectangle<f64, Logical>) {
         for ws in self.workspaces_mut() {
             if ws.seed_unmaximize_geometry(id, rect) {
+                return;
+            }
+        }
+    }
+
+    /// Puts back what a restore remembers of a displacement, see
+    /// [`Workspace::seed_displaced_geometry`].
+    pub fn seed_displaced_geometry(
+        &mut self,
+        id: &W::Id,
+        rect: Option<Rectangle<f64, Logical>>,
+        auto_maximized: bool,
+    ) {
+        for ws in self.workspaces_mut() {
+            if ws.seed_displaced_geometry(id, rect, auto_maximized) {
                 return;
             }
         }

@@ -157,6 +157,27 @@ pub struct ToplevelRecord {
     )]
     pub tiled_rect: Option<Rect>,
 
+    /// The geometry a display too small for the window overrode, **output-local**, kept so a
+    /// logout does not lose the "back on the big monitor tomorrow" case.
+    ///
+    /// Read only when the display it is local to is the one the window comes back on, like
+    /// [`Self::floating_rect`]: a remembered geometry means nothing against a display that never
+    /// held the window.
+    #[serde(
+        rename = "displaced-rect",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub displaced_rect: Option<Rect>,
+
+    /// Whether the compositor maximized this window rather than the user.
+    ///
+    /// Only a window carrying the mark is un-maximized when a work area that can hold it comes
+    /// along; one the user maximized stays maximized. Persisted because the case it exists for —
+    /// a display too small for the window — outlives a logout.
+    #[serde(rename = "auto-maximized", default, skip_serializing_if = "is_false")]
+    pub auto_maximized: bool,
+
     /// Whether the window was minimized. Applied *after* the sizing state on restore, which is
     /// the order mutter takes (`meta-wayland-xdg-session-state.c:468-476`) — a window is restored
     /// to the size it would have had, then hidden.

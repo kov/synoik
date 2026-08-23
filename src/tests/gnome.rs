@@ -29753,6 +29753,113 @@ fn a_user_maximized_window_is_not_un_maximized_by_a_bigger_display() {
     );
 }
 
+/// The geometry a small display overrode outlives a logout: the record carries it, and a restore
+/// on a display that can hold it puts the window back the way it was.
+///
+/// The "back on the big monitor tomorrow" case (`docs/fork/multi-display.md` §5), which is the only
+/// reason the rect is in the store at all.
+#[test]
+fn a_displaced_geometry_comes_back_from_the_session_store() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.add_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1000, 800);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let settle = |f: &mut Fixture, surface: &WlSurface| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+
+    // Too short for it: the window is fitted, and the geometry it had is kept.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f, &surface);
+
+    // Unmapping is what makes the compositor save.
+    let w = f.client(id).window(&surface);
+    w.attach_null_buffer();
+    w.commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .and_then(|session| session.toplevels.get("main"))
+        .cloned()
+        .expect("the unmap saved it");
+    let displaced = record.displaced_rect.expect("the record carries the rect");
+    assert_eq!(
+        (displaced[2], displaced[3]),
+        (1000, 800),
+        "and it is the geometry the fit overrode, not the fitted one"
+    );
+
+    // A new client asks for it back, still on the small display.
+    drop(session);
+    let second = f.add_client();
+    f.roundtrip(second);
+    let session = f
+        .client(second)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+    map_at_configured_size(&mut f, second, &surface);
+    f.settle();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    let settle = |f: &mut Fixture, surface: &WlSurface| {
+        f.double_roundtrip(second);
+        let win = f.client(second).window(surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(second);
+        f.settle();
+    };
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f, &surface);
+
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .floating_rect
+        .expect("it floats");
+    assert_eq!(
+        (rect.size.w.round() as i32, rect.size.h.round() as i32),
+        (1000, 800),
+        "the display that can hold it again gives the window its own geometry back"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]

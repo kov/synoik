@@ -3916,6 +3916,37 @@ impl<W: LayoutElement> Workspace<W> {
         true
     }
 
+    /// Puts back the geometry a displacement overrode, and whether the compositor is the one that
+    /// maximized this window — both from a session record, on the map.
+    ///
+    /// The rect arrives output-local and in the window's frame, which is how the store keeps every
+    /// rect; the tile holds it work-area-relative and in its own, so that a strut appearing does
+    /// not skew what "where it was" means.
+    pub fn seed_displaced_geometry(
+        &mut self,
+        id: &W::Id,
+        rect: Option<Rectangle<f64, Logical>>,
+        auto_maximized: bool,
+    ) -> bool {
+        let area = self.floating.working_area();
+
+        let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
+            return false;
+        };
+
+        tile.auto_maximized = auto_maximized;
+        tile.displaced_rect = rect.map(|rect| {
+            Rectangle::new(
+                rect.loc - area.loc - tile.window_offset(),
+                Size::from((
+                    tile.tile_width_for_window_width(rect.size.w),
+                    tile.tile_height_for_window_height(rect.size.h),
+                )),
+            )
+        });
+        true
+    }
+
     /// What the session store remembers about `id`: how it is sized, the rect it would take if
     /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`) — and, when the
     /// compositor owns its geometry, the rect it actually occupies.
@@ -3953,11 +3984,26 @@ impl<W: LayoutElement> Workspace<W> {
 
         let rect = |pos, size| Rectangle::new(pos + tile.window_offset(), size);
 
+        // The inverse of `seed_displaced_geometry`: back into the window's frame, and back into
+        // output-local coordinates.
+        let area = self.floating.working_area();
+        let displaced_rect = tile.displaced_rect.map(|displaced| {
+            Rectangle::new(
+                displaced.loc + area.loc + tile.window_offset(),
+                Size::from((
+                    tile.window_width_for_tile_width(displaced.size.w),
+                    tile.window_height_for_tile_height(displaced.size.h),
+                )),
+            )
+        });
+
         Some(TileSessionState {
             sizing_mode: tile.sizing_mode(),
             edge_tiled: tile.window().edge_tiled_side(),
             floating_rect: pos.zip(size).map(|(pos, size)| rect(pos, size)),
             live_rect: live.map(|(offset, size)| rect(offset, size)),
+            displaced_rect,
+            auto_maximized: tile.auto_maximized,
         })
     }
 

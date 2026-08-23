@@ -71,6 +71,17 @@ pub struct RestoreOnMap {
     /// un-maximizing would land on a default size instead of the one it was saved with.
     pub unmaximize_to: Option<crate::session_state::Rect>,
 
+    /// The geometry a display too small for the window overrode, and whether the maximize it may
+    /// be in is the compositor's own answer rather than the user's.
+    ///
+    /// Gated on the display coming back, like `unmaximize_to` and for the same reason: a rect is
+    /// local to a display, and one that never held the window cannot be measured against it. The
+    /// mark is not — who maximized a window is true wherever it lands.
+    pub displaced_rect: Option<crate::session_state::Rect>,
+
+    /// Whether the compositor maximized the restored window rather than the user.
+    pub auto_maximized: bool,
+
     /// The half of the work area to edge-tile the window to, when the record named one.
     ///
     /// Applied on the map for the same reason minimize is: tiling is a *layout* operation, so

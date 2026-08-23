@@ -1,6 +1,7 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §1, §2, §3, §4 and §6's drag are implemented; §5 is not.**
+**Status: design agreed 2026-08-23. §1–§4, §5 and §6's drag are implemented; what is left of §6
+is the workspace context menu and naming UI.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -184,7 +185,7 @@ niri's `FocusWorkspaceDownUnderMouse` / `FocusWorkspaceUpUnderMouse` (`src/input
 are niri's way of offering this as a *separate binding*. They go: the behavior becomes the default,
 and a second set of actions for it is exactly the niri-shaped duplication the fork tenet drops.
 
-## 5. A workspace whose work area changed
+## 5. A workspace whose work area changed — *implemented*
 
 This applies to any change of the work area — a display swapped underneath a workspace, a workspace
 dragged to another display, a mode or scale change, a strut appearing. Maximized, fullscreen and
@@ -204,10 +205,10 @@ branches:
   hang off the edge;
 - **otherwise** — preserve the *center* fraction, clamped to `[ε, 1-ε]`.
 
-Ours stores a plain `top-left / area.size` fraction
-(`Data::logical_to_size_frac_in_working_area`, `src/layout/floating.rs:182`), which is the second
-branch without the center term. That is the bug the user named: a window at fraction 0.5 keeps its
-left edge at half the width and overflows the right. Adopt both branches.
+The fraction-of-size version this replaces (`Data::logical_to_size_frac_in_working_area`) was the
+second branch without the centre term: a window at fraction 0.5 kept its left edge at half the width
+and hung the rest off the right. Both branches now, in `move_rect_between_areas`, at the one seam
+where the old and the new area both exist.
 
 ### The shrink is ours, and it is remembered
 
@@ -224,7 +225,9 @@ better, and pay for it with one field:
   the shrink has to be a real configure and the desired rect has to be kept on the side.
 - **Stored verbatim, restored verbatim.** Never re-derived by inverting the shrink — a recovered
   value is not the original, and rounding makes that literally true.
-- **Cleared on any user-driven resize.** Resizing is the user saying this is the size now.
+- **Cleared on any user-driven resize, move or drop.** Each of those is the user saying this is the
+  geometry now. (The move and the drop are not in the original design; without them a window the
+  user had since repositioned would jump back the next time a work area grew.)
 - **Applied when a work area grows enough to hold it again**, which is what makes a workspace
   returning to its big display return the windows to their old geometry.
 - **Unanimated**, for `refit_to_working_area`'s reason: the user did not ask for this, the area
@@ -343,6 +346,5 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 3. **Identity unification** (§1) — LANDED.
 4. **Home ordinal and parked empties** (§2) — LANDED.
 5. **Derived restore ordering with lazy materialization** (§3) — LANDED.
-6. **Displaced geometry** (§5) — the two-branch move, the per-axis shrink, `displaced_rect`, the
-   auto-maximize mark.
+6. **Displaced geometry** (§5) — LANDED.
 7. **The workspace context menu and naming UI** (§6) — any time after 2.

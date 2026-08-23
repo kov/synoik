@@ -4977,6 +4977,11 @@ impl State {
             state: Some(state.as_raw()),
             floating_rect: snapshot.tile.floating_rect.map(to_rect),
             tiled_rect: live_rect,
+            // The geometry a display too small for the window overrode, and whether the maximize
+            // it may have ended in is ours rather than the user's — the "back on the big monitor
+            // tomorrow" case has to survive a logout, and only the mark says who to un-maximize.
+            displaced_rect: snapshot.tile.displaced_rect.map(to_rect),
+            auto_maximized: snapshot.tile.auto_maximized,
             workspace: Some(snapshot.workspace_idx as u32),
             workspace_name: snapshot.workspace_name,
             output,
