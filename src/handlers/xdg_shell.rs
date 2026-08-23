@@ -22,7 +22,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
-use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Serial};
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
     HookId, SurfaceAttributes,
@@ -42,7 +42,7 @@ use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
 };
 use synoik_config::window_rule::{FloatingPosition, RelativeTo};
-use synoik_config::{FloatOrInt, PresetSize, WindowingMode};
+use synoik_config::{FloatOrInt, OutputName, PresetSize, WindowingMode};
 use tracing::field::Empty;
 
 use crate::input::move_grab::MoveGrab;
@@ -53,7 +53,7 @@ use crate::layout::placement::PlacementSeeds;
 use crate::layout::ActivateWindow;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
-use crate::session_state::{ToplevelRecord, WindowState};
+use crate::session_state::{OutputIdentity, ToplevelRecord, WindowState};
 use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::ui::window_menu::WindowMenuAnchor;
 use crate::utils::transaction::Transaction;
@@ -1062,16 +1062,19 @@ impl State {
         };
 
         let output = record
-            .floating_rect
-            .and_then(|rect| self.output_for_saved_rect(rect));
+            .output
+            .as_ref()
+            .and_then(|saved| self.output_matching_identity(saved));
         info!(
-            "session restore: {}/{} replaying {:?} state {:?} workspace {:?} onto {:?}",
+            "session restore: {}/{} replaying {:?} state {:?} workspace {:?}/{:?} onto {:?} (saved on {:?})",
             target.session_id,
             target.name,
             record.floating_rect,
             record.state,
             record.workspace,
-            output.as_ref().map(|o| o.name())
+            record.workspace_name,
+            output.as_ref().map(|o| o.name()),
+            record.output.as_ref().map(|o| &o.connector)
         );
 
         Some(SessionRestore {
@@ -1082,28 +1085,31 @@ impl State {
         })
     }
 
-    /// The output a saved rect belongs to: the one it overlaps most, as in mutter's
-    /// `meta_monitor_manager_get_logical_monitor_from_rect`.
+    /// The connected output a record was saved on, by identity.
     ///
-    /// `None` when it overlaps none of them — the monitor it was saved on is gone, so the normal
-    /// placement chain decides instead of forcing it somewhere arbitrary.
-    fn output_for_saved_rect(&self, rect: crate::session_state::Rect) -> Option<Output> {
-        let saved = Rectangle::new(
-            Point::from((rect[0], rect[1])),
-            Size::from((rect[2].max(1), rect[3].max(1))),
-        );
-
+    /// Mutter asks which monitor a *global* rect lands in
+    /// (`meta_monitor_manager_get_logical_monitor_from_rect`), which answers a different question:
+    /// where the window would be if the layout had not changed. A record names its display, so the
+    /// answer does not depend on the layout at all — which is what lets a session come back under
+    /// a configuration that shares no origin with the one that saved it.
+    ///
+    /// `None` when that display is not connected. The normal placement chain then decides, rather
+    /// than a remembered position being replayed onto a monitor that never held the window.
+    fn output_matching_identity(&self, saved: &OutputIdentity) -> Option<Output> {
         self.synoik
             .global_space
             .outputs()
-            .filter_map(|output| {
-                let geo = self.synoik.global_space.output_geometry(output)?;
-                let overlap = geo.intersection(saved)?;
-                let area = i64::from(overlap.size.w) * i64::from(overlap.size.h);
-                (area > 0).then(|| (area, output.clone()))
+            .find(|output| {
+                output.user_data().get::<OutputName>().is_some_and(|name| {
+                    saved.matches(&OutputIdentity {
+                        connector: name.connector.clone(),
+                        vendor: name.vendor.clone(),
+                        product: name.model.clone(),
+                        serial: name.serial.clone(),
+                    })
+                })
             })
-            .max_by_key(|(area, _)| *area)
-            .map(|(_, output)| output)
+            .cloned()
     }
 
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
@@ -1194,8 +1200,20 @@ impl State {
             .and_then(|restore| restore.record.workspace)
             .map(|idx| idx as usize);
 
+        // A saved workspace *name* is asked for ahead of the index, and only when some monitor
+        // still has it: names survive a restart, indices into a dynamic stack only approximate
+        // one. A name that is gone falls back to the index rather than to nothing — unlike the
+        // `open-on-workspace` rule, which is a standing instruction, this is a memory, and a
+        // memory that no longer resolves should degrade rather than cancel the placement.
+        // Matching by name also lets a window follow a workspace the user moved to another
+        // display, which is the whole reason a name outranks the record's output here.
+        let restore_workspace_name = restore
+            .as_ref()
+            .and_then(|restore| restore.record.workspace_name.as_deref())
+            .filter(|name| self.synoik.layout.monitor_for_workspace(name).is_some());
+
         let target = self.synoik.layout.resolve_placement(PlacementSeeds {
-            workspace_name: rules.open_on_workspace.as_deref(),
+            workspace_name: restore_workspace_name.or(rules.open_on_workspace.as_deref()),
             workspace_idx: restore_workspace_idx,
             output: seed_output,
             // A dialog with a parent follows it, and `output_to_store` then declines to pin the
@@ -1220,19 +1238,30 @@ impl State {
         // folded in with the size above. Going in, a floating rule is what makes the placement
         // cascade leave the window alone (`FloatingSpace::avoid_focus_window`), which is exactly
         // what restoring a remembered position wants.
-        if let Some(([x, y, _, _], ws)) = restore
+        // A record whose display is gone has a rect that means nothing: it was output-local, and
+        // there is no output to be local to. Placement decides in that case, so the position is
+        // only replayed when the identity actually resolved.
+        let restored_rect = restore
             .as_ref()
-            .and_then(|r| r.record.floating_rect)
-            .zip(ws)
-        {
-            let origin = ws
-                .current_output()
-                .and_then(|output| self.synoik.global_space.output_geometry(output))
-                .map_or_else(Point::default, |geo| geo.loc);
+            .filter(|r| r.output.is_some())
+            .and_then(|r| r.record.floating_rect);
+        if let Some(([x, y, w, h], ws)) = restored_rect.zip(ws) {
+            // The rect comes off disk output-local; `default_floating_position` speaks the working
+            // area of the workspace the window is actually landing on, which is per-workspace
+            // (struts differ) and so has to wait until placement has resolved. No origin enters
+            // here: adding one on save and subtracting a *different* one on restore is exactly the
+            // ratchet that moved windows a monitor's width per session.
             let area = ws.working_area();
+
+            // The display it lands on may be smaller than the one it was saved on — a different
+            // configuration entirely is the case this schema exists for. Keep the window's
+            // top-left inside the working area and its body from hanging off the far edge, in the
+            // spirit of mutter's `META_MOVE_RESIZE_CONSTRAIN`.
+            let clamp = |pos: f64, size: f64, extent: f64| pos.min(extent - size).max(0.);
+
             rule_seeds.default_floating_position = Some(FloatingPosition {
-                x: FloatOrInt(f64::from(x - origin.x) - area.loc.x),
-                y: FloatOrInt(f64::from(y - origin.y) - area.loc.y),
+                x: FloatOrInt(clamp(f64::from(x) - area.loc.x, f64::from(w), area.size.w)),
+                y: FloatOrInt(clamp(f64::from(y) - area.loc.y, f64::from(h), area.size.h)),
                 relative_to: RelativeTo::TopLeft,
             });
             rule_seeds.apply(&mut rules);
@@ -1247,6 +1276,8 @@ impl State {
                 .record
                 .restorable_state()
                 .filter(|state| *state != WindowState::Floating)
+                // Output-local, and only meaningful when the display it is local to came back.
+                .filter(|_| restore.output.is_some())
                 .and(restore.record.floating_rect),
             minimized: restore.record.is_minimized,
             rule_seeds,

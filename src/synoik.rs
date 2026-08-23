@@ -182,7 +182,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
-use crate::session_state::{ToplevelRecord, WindowState};
+use crate::session_state::{OutputIdentity, ToplevelRecord, WindowState};
 use crate::synoik_render_elements;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
@@ -4911,8 +4911,12 @@ impl State {
         };
 
         info!(
-            "session store: saving {session_id}/{name} as {:?} state {:?}",
-            record.floating_rect, record.state
+            "session store: saving {session_id}/{name} as {:?} on {:?} workspace {:?}/{:?} state {:?}",
+            record.floating_rect,
+            record.output.as_ref().map(|o| &o.connector),
+            record.workspace,
+            record.workspace_name,
+            record.state
         );
         self.synoik
             .session_manager_state
@@ -4921,7 +4925,7 @@ impl State {
         self.schedule_session_save();
     }
 
-    /// The store record for a mapped window: sizing mode, global floating rect, workspace index.
+    /// The store record for a mapped window: which display, and everything else relative to it.
     fn session_record_for(&self, window: &Window) -> Option<ToplevelRecord> {
         let snapshot = self.synoik.layout.session_snapshot(window)?;
 
@@ -4931,18 +4935,23 @@ impl State {
             SizingMode::Fullscreen => WindowState::Fullscreen,
         };
 
-        // The layout works in output-local coordinates; the store is global, so that restore can
-        // pick the output back out of the rect.
-        let origin = snapshot
+        // The rect goes to disk exactly as the layout holds it — output-local. The display it is
+        // local *to* is what gets recorded alongside; see `session_state`'s module docs for why
+        // the global frame mutter uses is not one a record can be written against.
+        let output = snapshot
             .output
-            .and_then(|output| self.synoik.global_space.output_geometry(output))
-            .map_or_else(Point::default, |geo| geo.loc.to_f64());
+            .and_then(|output| output.user_data().get::<OutputName>())
+            .map(|name| OutputIdentity {
+                connector: name.connector.clone(),
+                vendor: name.vendor.clone(),
+                product: name.model.clone(),
+                serial: name.serial.clone(),
+            });
 
         let floating_rect = snapshot.floating_rect.map(|rect| {
-            let loc = rect.loc + origin;
             [
-                loc.x.round() as i32,
-                loc.y.round() as i32,
+                rect.loc.x.round() as i32,
+                rect.loc.y.round() as i32,
                 rect.size.w.round() as i32,
                 rect.size.h.round() as i32,
             ]
@@ -4952,6 +4961,8 @@ impl State {
             state: Some(state.as_raw()),
             floating_rect,
             workspace: Some(snapshot.workspace_idx as u32),
+            workspace_name: snapshot.workspace_name,
+            output,
             // mutter saves this alongside the sizing state and re-applies it *after* on restore
             // (`meta-wayland-xdg-session-state.c:337`, `:475`), which is also the order the
             // restore path here takes.

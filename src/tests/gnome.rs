@@ -27367,7 +27367,7 @@ fn unmapping_a_registered_window_saves_its_state() {
 /// The saved rect is **global**: on a second output it carries that output's origin, so restore
 /// can pick the output back out of it. And it clears the panel strut, since the working area does.
 #[test]
-fn the_saved_rect_is_in_global_coordinates() {
+fn the_saved_rect_is_local_to_the_display_the_record_names() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
     f.add_output(2, (1280, 720));
@@ -27405,19 +27405,24 @@ fn the_saved_rect_is_in_global_coordinates() {
     window.commit();
     f.double_roundtrip(id);
 
-    let rect = f
+    let record = f
         .synoik()
         .session_manager_state
         .store
         .get(&session_id)
         .unwrap()
         .toplevels["main"]
-        .floating_rect
-        .expect("a floated window has a rect");
+        .clone();
+    let rect = record.floating_rect.expect("a floated window has a rect");
 
+    assert_eq!(
+        record.output.as_ref().map(|o| o.connector.as_str()),
+        Some("headless-2"),
+        "the record must name the display it was saved on"
+    );
     assert!(
-        rect[0] >= origin.x,
-        "the saved x ({}) must carry the second output's origin ({})",
+        rect[0] < origin.x,
+        "the saved x ({}) must be local to that display, not carry its origin ({})",
         rect[0],
         origin.x
     );
@@ -27795,36 +27800,38 @@ fn a_windows_geometry_survives_a_restart() {
     );
 }
 
-/// A restored window lands at the exact position it was saved at, on the output the saved rect
-/// names — including the second one, which pins that the global origin is folded back out, and
-/// clearing the panel strut, which pins that the per-workspace working area is too.
+/// The display a record names, as the store spells it.
+fn saved_on(connector: &str) -> crate::session_state::OutputIdentity {
+    crate::session_state::OutputIdentity {
+        connector: connector.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Where a restored window ended up: its display, and its position local to it.
+fn restored_placement(f: &mut Fixture) -> (String, (i32, i32)) {
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let synoik = f.synoik();
+    let snapshot = synoik.layout.session_snapshot(&win).unwrap();
+    let rect = snapshot.floating_rect.expect("it has a rect");
+    let output = snapshot.output.expect("mapped on an output").name();
+    (
+        output,
+        (rect.loc.x.round() as i32, rect.loc.y.round() as i32),
+    )
+}
+
+/// A restored window lands at the exact position it was saved at, on the display its record names
+/// — including the second one, and clearing the panel strut, which pins that the per-workspace
+/// working area is folded in.
 #[test]
 fn a_restored_window_lands_at_its_saved_position() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
     f.add_output(2, (1280, 720));
 
-    let origin = {
-        let synoik = f.synoik();
-        let output = synoik
-            .global_space
-            .outputs()
-            .find(|output| output.name() == "headless-2")
-            .cloned()
-            .expect("the second output must exist");
-        synoik
-            .global_space
-            .output_geometry(&output)
-            .expect("in global space")
-            .loc
-    };
-    assert_ne!(
-        origin.x, 0,
-        "the outputs must not overlap, or this proves nothing"
-    );
-
-    // Somewhere unmistakable on the second output, well clear of any default placement.
-    let saved = [origin.x + 500, origin.y + 400, 300, 200];
+    // Somewhere unmistakable, well clear of any default placement, and local to the display.
+    let saved = [500, 400, 300, 200];
 
     let id = f.add_client();
     f.roundtrip(id);
@@ -27837,6 +27844,7 @@ fn a_restored_window_lands_at_its_saved_position() {
             state: Some(WindowState::Floating.as_raw()),
             floating_rect: Some(saved),
             workspace: Some(0),
+            output: Some(saved_on("headless-2")),
             ..Default::default()
         },
     );
@@ -27845,23 +27853,215 @@ fn a_restored_window_lands_at_its_saved_position() {
     map_at_configured_size(&mut f, id, &surface);
     f.settle();
 
-    let win = f.synoik().layout.focus().unwrap().window.clone();
-    let global = {
-        let synoik = f.synoik();
-        let snapshot = synoik.layout.session_snapshot(&win).unwrap();
-        let rect = snapshot.floating_rect.expect("it has a rect");
-        let origin = snapshot
-            .output
-            .and_then(|output| synoik.global_space.output_geometry(output))
-            .expect("mapped on an output")
-            .loc;
-        rect.loc + origin.to_f64()
-    };
+    assert_eq!(
+        restored_placement(&mut f),
+        ("headless-2".to_owned(), (saved[0], saved[1])),
+        "the restored window must land on the display it names, exactly where it was saved"
+    );
+}
+
+/// The point of anchoring a rect to a display: the same record replays onto the same panel even
+/// when the monitor set around it has changed, and so its origin with it.
+///
+/// A global rect could not do this. `headless-2` sits at x=1280 when it was saved and at x=0 here,
+/// so a rect carrying an origin would land a screen's width off — the ratchet that moved windows
+/// one display per session.
+#[test]
+fn a_restored_window_follows_its_display_when_the_configuration_changes() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    let saved = [500, 400, 300, 200];
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some(saved),
+            workspace: Some(0),
+            output: Some(saved_on("headless-2")),
+            ..Default::default()
+        },
+    );
+
+    // The other display goes away, so the one the record names is now at the origin.
+    f.remove_output(1);
+    f.settle();
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
 
     assert_eq!(
-        (global.x.round() as i32, global.y.round() as i32),
+        restored_placement(&mut f),
+        ("headless-2".to_owned(), (saved[0], saved[1])),
+        "the position is local to the display, so moving the display must not move the window"
+    );
+}
+
+/// A saved workspace *name* outranks the saved display: a name is the only workspace handle that
+/// survives a restart, and following it is what lets a window come back with a workspace the user
+/// has since moved to another display.
+#[test]
+fn a_restored_window_follows_its_workspace_name_across_displays() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    // Name a workspace on the *second* display.
+    f.synoik_state().do_action(Action::FocusMonitorRight, false);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName("mail".to_owned()), false);
+    f.settle();
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([500, 400, 300, 200]),
+            workspace: Some(0),
+            workspace_name: Some("mail".to_owned()),
+            // The record was saved on the first display; the named workspace has since moved.
+            output: Some(saved_on("headless-1")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let (output, _) = restored_placement(&mut f);
+    assert_eq!(
+        output, "headless-2",
+        "the named workspace must win over the recorded display"
+    );
+}
+
+/// A name that no workspace answers to any more degrades to the index rather than cancelling the
+/// placement. Unlike the `open-on-workspace` rule — a standing instruction, where silence is
+/// safer than a guess — a record is a memory, and a stale one should lose only what it got wrong.
+#[test]
+fn a_restored_window_whose_workspace_name_is_gone_falls_back_to_the_index() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([500, 400, 300, 200]),
+            workspace: Some(0),
+            workspace_name: Some("no-such-workspace".to_owned()),
+            output: Some(saved_on("headless-2")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    assert_eq!(
+        restored_placement(&mut f),
+        ("headless-2".to_owned(), (500, 400)),
+        "a vanished name must leave the display and position intact"
+    );
+}
+
+/// A record naming a display that is not connected keeps its size and state, but hands the
+/// position back to the normal placement chain: an output-local rect means nothing without its
+/// output, and replaying it onto some other monitor would be a guess dressed up as a memory.
+#[test]
+fn a_restored_window_whose_display_is_gone_is_placed_normally() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let saved = [500, 400, 300, 200];
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some(saved),
+            workspace: Some(0),
+            output: Some(saved_on("headless-9")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let (output, pos) = restored_placement(&mut f);
+    assert_eq!(output, "headless-1", "the only display there is");
+    assert_ne!(
+        pos,
         (saved[0], saved[1]),
-        "the restored window must land exactly where it was saved"
+        "the saved position must not be replayed onto a display that never held the window"
+    );
+}
+
+/// A window saved on a large display and restored onto a small one stays on screen.
+///
+/// Restoring under a different configuration is the case this schema exists for, and the sizes do
+/// not have to match — mutter constrains for the same reason (`META_MOVE_RESIZE_CONSTRAIN`).
+#[test]
+fn a_restored_position_is_constrained_to_the_display_it_lands_on() {
+    let mut f = Fixture::new();
+    f.add_output(1, (800, 600));
+
+    // Saved far to the right of anything an 800x600 panel can show.
+    let saved = [3000, 1500, 300, 200];
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some(saved),
+            workspace: Some(0),
+            output: Some(saved_on("headless-1")),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+
+    let (_, (x, y)) = restored_placement(&mut f);
+    assert!(
+        x >= 0 && x + 300 <= 800,
+        "the restored x ({x}) must keep a 300-wide window inside an 800-wide display"
+    );
+    assert!(
+        y >= 0 && y + 200 <= 600,
+        "the restored y ({y}) must keep a 200-tall window inside a 600-tall display"
     );
 }
 
@@ -28973,6 +29173,7 @@ fn unmaximizing_a_restored_window_returns_it_to_the_saved_rect() {
             state: Some(WindowState::Maximized.as_raw()),
             floating_rect: Some([100, 200, 300, 400]),
             workspace: Some(0),
+            output: Some(saved_on("headless-1")),
             ..Default::default()
         },
     );

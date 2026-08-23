@@ -7,9 +7,27 @@
 //! Plain data and serde, no Wayland types: everything here is testable on its own. See
 //! `docs/fork/session-management-port.md` for the decisions this encodes.
 //!
-//! The on-disk shape mirrors mutter's (`meta-wayland-xdg-session-state.c`) concept for concept —
-//! numeric window states, a floating and a tiled rect, a workspace index — so that the two stay
-//! comparable, but it is JSON rather than gvdb, which is a glib implementation detail.
+//! The on-disk shape starts from mutter's (`meta-wayland-xdg-session-state.c`) — numeric window
+//! states, a floating and a tiled rect, a workspace — but it is JSON rather than gvdb, which is a
+//! glib implementation detail, and it **diverges on the frame of reference**.
+//!
+//! # A saved rect is anchored to a display, not to the desktop
+//!
+//! Mutter stores rects in global coordinates and picks the monitor back out of them on restore
+//! (`determine_monitor_for_rect`). That only works while the monitor origins hold still: move
+//! them between save and restore and every rect silently shifts by the difference, which then
+//! gets re-saved, so the error ratchets. It also cannot express the thing we want — restoring a
+//! session under a *different* monitor configuration, where there is no global frame to share.
+//!
+//! So a record carries an [`OutputIdentity`] and its rects are **output-local**. Restore finds the
+//! display by identity and replays the rect on it, wherever that display now sits and whatever
+//! else is connected.
+//!
+//! # A workspace index is approximate, so a name comes with it
+//!
+//! Workspaces are dynamic and, since they are per-monitor here, a bare index is an index into a
+//! stack that grows and shrinks. It is kept as the fallback, but a *named* workspace is matched by
+//! name first: that is the only handle that survives a restart.
 //!
 //! **Forward compatibility is deliberate.** A `version` newer than ours makes the whole load fail
 //! closed rather than silently dropping records we cannot read, and within a record a `state` value
@@ -33,7 +51,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// The format we write. A file claiming anything higher is refused outright.
-pub const VERSION: u32 = 1;
+///
+/// v2 moved rects from global to output-local and added [`ToplevelRecord::output`]. A v1 record
+/// has no display to anchor its rect to, and a global rect cannot be converted into one without
+/// knowing the layout that wrote it, so [`sanitize_legacy`] drops v1 geometry and keeps the rest.
+pub const VERSION: u32 = 2;
 
 /// How many sessions survive a load, most-recently-used first.
 ///
@@ -83,8 +105,49 @@ impl WindowState {
     }
 }
 
-/// `[x, y, width, height]`, in logical coordinates, as mutter stores it.
+/// `[x, y, width, height]`, in logical coordinates, **relative to the record's
+/// [`ToplevelRecord::output`]** — see the module docs for why this is not mutter's global frame.
 pub type Rect = [i32; 4];
+
+/// The display a record's rects are anchored to, in `monitors.xml`'s identity fields.
+///
+/// Deliberately the same four fields `<monitorspec>` carries, so that one notion of "which
+/// display" serves both stores and the deferred identity-only matching lands in both at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputIdentity {
+    pub connector: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+}
+
+impl OutputIdentity {
+    /// Whether this names the same display as `other`.
+    ///
+    /// Connector-exact, with the EDID fields as a veto when both sides carry one: the same rule
+    /// `monitors.xml` matching uses today. Matching a display across a *renamed* connector is the
+    /// deferred half, and it is deferred here for the same reason — both stores should gain it
+    /// together, or a session and its layout would disagree about which display is which.
+    pub fn matches(&self, other: &Self) -> bool {
+        if !self.connector.eq_ignore_ascii_case(&other.connector) {
+            return false;
+        }
+
+        let agrees = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            // One side did not record it. Absence is not a mismatch: an output with no EDID is
+            // normal, and a record written before we read one must still match.
+            _ => true,
+        };
+
+        agrees(&self.vendor, &other.vendor)
+            && agrees(&self.product, &other.product)
+            && agrees(&self.serial, &other.serial)
+    }
+}
 
 /// What we remember about one toplevel, keyed in its session by the client-chosen name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,9 +178,29 @@ pub struct ToplevelRecord {
     #[serde(rename = "is-minimized", default, skip_serializing_if = "is_false")]
     pub is_minimized: bool,
 
-    /// Workspace *index*, not id: ids are runtime-only and meaningless across restarts.
+    /// Workspace *index* within [`Self::output`]'s stack, not id: ids are runtime-only and
+    /// meaningless across restarts. Approximate by construction — the stack is dynamic — so it is
+    /// the fallback for [`Self::workspace_name`], never the first choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<u32>,
+
+    /// The name of the workspace the window was on, when it had one.
+    ///
+    /// The only workspace handle that survives a restart, so restore matches it ahead of the
+    /// index. A workspace the user bothered to name is one they expect to find again.
+    #[serde(
+        rename = "workspace-name",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_name: Option<String>,
+
+    /// The display [`Self::floating_rect`] and [`Self::tiled_rect`] are relative to.
+    ///
+    /// `None` only in a record we could not anchor — then the rects are unusable and the normal
+    /// placement chain decides, rather than a position being replayed against nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputIdentity>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -125,6 +208,20 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ToplevelRecord {
+    /// Strips what a record written before `version` 2 cannot mean any more.
+    ///
+    /// v1 rects were global and v1 workspace indices had no display to be an index into. Neither
+    /// can be recovered without the monitor layout that wrote them, which is not stored, so both
+    /// go. The window state and the minimized flag are frame-independent and stay: a session that
+    /// comes back maximized on the wrong monitor still beats one that comes back not at all.
+    fn sanitize_legacy(&mut self) {
+        self.floating_rect = None;
+        self.tiled_rect = None;
+        self.workspace = None;
+        self.workspace_name = None;
+        self.output = None;
+    }
+
     /// The state to actually restore into, or `None` when there is nothing usable to apply.
     pub fn restorable_state(&self) -> Option<WindowState> {
         self.state
@@ -235,12 +332,24 @@ impl SessionStore {
     }
 
     fn parse(contents: &[u8]) -> Result<HashMap<String, SessionRecord>, LoadError> {
-        let file: StoreFile = serde_json::from_slice(contents)?;
+        let mut file: StoreFile = serde_json::from_slice(contents)?;
         if file.version > VERSION {
             return Err(LoadError::TooNew {
                 found: file.version,
             });
         }
+
+        // Sessions themselves survive a version change: a client still holds its id, and dropping
+        // the store would turn every `get_session` into a fresh one, which is worse than a session
+        // that restores nothing. Only the geometry a v1 record can no longer express is discarded.
+        if file.version < VERSION {
+            for session in file.sessions.values_mut() {
+                for toplevel in session.toplevels.values_mut() {
+                    toplevel.sanitize_legacy();
+                }
+            }
+        }
+
         Ok(file.sessions)
     }
 
@@ -516,7 +625,7 @@ mod tests {
     #[test]
     fn an_unreadable_state_keeps_the_record_but_does_not_restore() {
         // Half-tiling and anything else we do not implement yet.
-        let bytes = br#"{"version": 1, "sessions": {"s": {"last-used": 1,
+        let bytes = br#"{"version": 2, "sessions": {"s": {"last-used": 1,
             "toplevels": {"w": {"state": 3, "tiled-rect": [0, 0, 100, 100], "is-minimized": true}}}}}"#;
         let parsed = SessionStore::parse(bytes).unwrap();
         let toplevel = &parsed["s"].toplevels["w"];
@@ -537,6 +646,82 @@ mod tests {
         assert_eq!(
             round_tripped["s"].toplevels["w"].tiled_rect,
             Some([0, 0, 100, 100])
+        );
+    }
+
+    #[test]
+    fn a_version_1_record_keeps_its_session_but_loses_its_geometry() {
+        // v1 rects were global and its workspace index named no display, so neither can be read
+        // back without the monitor layout that wrote them. The session and the frame-independent
+        // half of the record survive: the client still holds this id, and dropping the session
+        // would cost it the identity as well as the position.
+        let bytes = br#"{"version": 1, "sessions": {"s": {"last-used": 1, "toplevels": {"w": {
+            "state": 2, "floating-rect": [2048, 100, 800, 600], "workspace": 3,
+            "is-minimized": true}}}}}"#;
+        let parsed = SessionStore::parse(bytes).unwrap();
+        let toplevel = &parsed["s"].toplevels["w"];
+
+        assert_eq!(
+            toplevel.state,
+            Some(2),
+            "the state does not depend on a frame"
+        );
+        assert!(toplevel.is_minimized);
+        assert_eq!(
+            toplevel.floating_rect, None,
+            "a global rect has no meaning now"
+        );
+        assert_eq!(
+            toplevel.workspace, None,
+            "an index with no display is not one"
+        );
+        assert_eq!(toplevel.output, None);
+    }
+
+    #[test]
+    fn a_current_record_keeps_the_display_it_is_anchored_to() {
+        let bytes = br#"{"version": 2, "sessions": {"s": {"toplevels": {"w": {
+            "floating-rect": [10, 20, 800, 600], "workspace": 3, "workspace-name": "mail",
+            "output": {"connector": "DP-2", "serial": "ABC123"}}}}}}"#;
+        let toplevel = &SessionStore::parse(bytes).unwrap()["s"].toplevels["w"];
+
+        assert_eq!(toplevel.floating_rect, Some([10, 20, 800, 600]));
+        assert_eq!(toplevel.workspace, Some(3));
+        assert_eq!(toplevel.workspace_name.as_deref(), Some("mail"));
+        let output = toplevel.output.clone().unwrap();
+        assert_eq!(output.connector, "DP-2");
+        assert_eq!(output.serial.as_deref(), Some("ABC123"));
+    }
+
+    #[test]
+    fn a_display_matches_on_its_connector_and_is_vetoed_by_a_differing_edid() {
+        let saved = OutputIdentity {
+            connector: "DP-2".into(),
+            serial: Some("ABC123".into()),
+            ..Default::default()
+        };
+
+        let live = |connector: &str, serial: Option<&str>| OutputIdentity {
+            connector: connector.into(),
+            serial: serial.map(str::to_owned),
+            ..Default::default()
+        };
+
+        assert!(
+            saved.matches(&live("dp-2", Some("abc123"))),
+            "case is not identity"
+        );
+        assert!(
+            saved.matches(&live("DP-2", None)),
+            "an output with no EDID is normal, and absence is not a mismatch"
+        );
+        assert!(
+            !saved.matches(&live("DP-2", Some("XYZ789"))),
+            "a different display on the same connector is a different display"
+        );
+        assert!(
+            !saved.matches(&live("DP-1", Some("ABC123"))),
+            "matching the same panel across a renamed connector is deliberately deferred"
         );
     }
 

@@ -3853,7 +3853,8 @@ impl<W: LayoutElement> Workspace<W> {
         self.working_area
     }
 
-    /// Seeds the geometry an un-maximize or un-fullscreen returns `id` to, from a global rect.
+    /// Seeds the geometry an un-maximize or un-fullscreen returns `id` to, from an output-local
+    /// rect.
     ///
     /// A window that maps straight into maximized or fullscreen never had a floating incarnation
     /// this run, so nothing has filled in `tiled_restore_*` and `restore_normal` would fall back
@@ -3861,13 +3862,8 @@ impl<W: LayoutElement> Workspace<W> {
     /// rect from last time.
     ///
     /// Returns whether the window was found here.
-    pub fn seed_unmaximize_geometry(
-        &mut self,
-        id: &W::Id,
-        rect: Rectangle<f64, Logical>,
-        output_origin: Point<f64, Logical>,
-    ) -> bool {
-        let pos = self.floating.logical_to_size_frac(rect.loc - output_origin);
+    pub fn seed_unmaximize_geometry(&mut self, id: &W::Id, rect: Rectangle<f64, Logical>) -> bool {
+        let pos = self.floating.logical_to_size_frac(rect.loc);
 
         let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
             return false;
@@ -3884,10 +3880,9 @@ impl<W: LayoutElement> Workspace<W> {
     /// What the session store remembers about `id`: its sizing mode and the rect it would take if
     /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`).
     ///
-    /// The rect is **output-local**; `Layout` does not know global space, so the caller adds the
-    /// output origin. `None` for the rect means the window has never floated (it opened straight
-    /// into maximize, say) and there is no remembered geometry to restore — the sizing mode is
-    /// still worth having.
+    /// The rect is **output-local**, which is also the frame the store keeps it in. `None` for the
+    /// rect means the window has never floated (it opened straight into maximize, say) and there
+    /// is no remembered geometry to restore — the sizing mode is still worth having.
     pub fn session_snapshot(
         &self,
         id: &W::Id,

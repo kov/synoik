@@ -68,6 +68,50 @@ to 3 seconds of state** — same as mutter.
 
 ---
 
+## A record is anchored to a display
+
+**Divergence from mutter, settled 2026-08-22.** Mutter stores rects in global coordinates and
+picks the monitor back out of them on restore (`determine_monitor_for_rect` →
+`meta_monitor_manager_get_logical_monitor_from_rect`). We store the display identity and rects
+**local to it**. `ToplevelRecord` therefore carries an `output` (the four `<monitorspec>` fields
+`monitors.xml` uses) and a `workspace-name` alongside the index, and the store is `version` 2.
+
+Two reasons, both of which mutter's design cannot answer:
+
+- **Restoring under a different monitor configuration is a requirement here.** There is no shared
+  global frame between a docked desk and a laptop on its own; a rect anchored to a display has a
+  meaning in both, a rect anchored to the desktop has one in neither.
+- **A global rect ratchets.** It is only correct while the origins hold still. Move them between
+  save and restore and every rect shifts by the difference — and that shifted rect is what gets
+  saved next time, so the error accumulates. Measured on the daily driver: a window sitting on one
+  display came back exactly one display-width to the right each session, because a hotplug had
+  moved that display's origin by 2048 after the record was written.
+
+Consequences, all of them deliberate:
+
+- **The display is matched by identity, not by geometry.** Connector-exact with the EDID fields as
+  a veto, the same rule `monitors.xml` matching uses. Matching a panel across a *renamed* connector
+  is deferred in both stores at once, so a session and its layout never disagree about which
+  display is which.
+- **No display, no position.** An unresolved identity drops the position and the output seed; the
+  size and window state still apply, and placement decides the rest. Replaying an output-local rect
+  onto some other monitor would be a guess wearing a memory's clothes.
+- **The position is constrained to where it lands.** The display it comes back on may be smaller
+  than the one it left, which is the whole point — so the rect is clamped into the working area, in
+  the spirit of `META_MOVE_RESIZE_CONSTRAIN`.
+- **A workspace name outranks the index, and the recorded display.** Workspaces here are dynamic
+  *and* per-monitor ([[docs/fork/dynamic-workspaces-divergence.md]] §4), so an index is an index
+  into a stack that grows and shrinks — approximate by construction. A name is the only handle that
+  survives a restart, so it is matched first, and matching it lets a window come back with a
+  workspace the user has since moved to another display. A name nothing answers to falls back to
+  the index rather than cancelling the placement: unlike the `open-on-workspace` rule, which is a
+  standing instruction where silence beats a guess, a record is a memory, and a stale one should
+  lose only the part it got wrong.
+- **v1 records keep their session and lose their geometry.** A v1 rect was global and a v1
+  workspace index named no display; neither can be recovered without the monitor layout that wrote
+  them, which was never stored. The session itself survives — the client still holds that id, and
+  dropping it would turn every `get_session` into a fresh one, which costs more than a position.
+
 ## What we can actually represent
 
 Mutter's per-toplevel record (`meta-wayland-xdg-session-state.c:32-57`):
@@ -162,14 +206,15 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
 3. **`send_initial_configure`** (`src/handlers/xdg_shell.rs`) — if the `Unmapped` carries a
    restore request *and* the store still has a record for that name, `resolve_session_restore`
    turns it into seeds:
-   - the output comes from the saved rect by largest overlap (mutter:
-     `meta_monitor_manager_get_logical_monitor_from_rect`), and is simply not seeded when the rect
-     lands on no connected output, so the normal monitor choice takes over;
+   - the output comes from the display **identity** the record names, and is simply not seeded
+     when that display is not connected, so the normal monitor choice takes over;
    - `open_fullscreen` / `open_maximized_to_edges` from the saved state;
-   - `default_width`/`default_height` and `default_floating_position` from the saved rect, the
-     position folded out of global into the workspace's working area;
-   - `workspace_idx` into `PlacementSeeds`, clamped to the monitor's last workspace — this seed
-     only picks a size to configure against; the real workspace is decided at map time;
+   - `default_width`/`default_height` from the saved rect always — a size does not depend on a
+     frame — and `default_floating_position` only when the display resolved, expressed relative to
+     the landing workspace's working area and constrained to it;
+   - the saved `workspace-name` into `PlacementSeeds::workspace_name` when some monitor still
+     answers to it, else `workspace_idx`, clamped to the monitor's last workspace — this seed only
+     picks a size to configure against; the real workspace is decided at map time;
    - `open_focused = false` for every reason but `launch` (see Policy below);
    - the payload is stashed in `InitialConfigureState::Configured` for the map step;
    - `xdg_toplevel_session_v1.restored` goes out **immediately before** `toplevel.send_configure()` —
@@ -407,8 +452,8 @@ placement picks. Without that pairing these are screenshots of a default.
    - **`rename` moves the stored record**, or a window unmapped before the rename would leave its
      state orphaned under a name nothing answers to. Only reachable once there is a record.
 
-   The rect is **global**; the workspace index is **per monitor**. The pair is deliberate: restore
-   resolves the output from the rect first, then indexes into that monitor's workspaces.
+   Every coordinate is **local to the display the record names**, and the workspace index is an
+   index into that monitor's stack — see "A record is anchored to a display" below.
 
    Which rect gets saved is the subtle part. In GNOME mode a maximizing tile stays in the floating
    layer, so its pre-maximize geometry goes to `Tile::tiled_restore_*`; `floating_*` is the same
@@ -421,9 +466,9 @@ placement picks. Without that pairing these are screenshots of a default.
    using animated sizes, so `window_offset` was split out to do it from the model ones. A window
    closed mid-animation must be remembered where the layout has it.
 
-   Conformance tests cover unmap-saves-state, the rect being global and clearing the panel strut,
-   a maximized window saving its pre-maximize rect, `remove_toplevel`-then-unmap saving nothing,
-   the shutdown sweep, and rename carrying the record.
+   Conformance tests cover unmap-saves-state, the rect being display-local and clearing the panel
+   strut, a maximized window saving its pre-maximize rect, `remove_toplevel`-then-unmap saving
+   nothing, the shutdown sweep, and rename carrying the record.
 4. **Restore — DONE.** The `Unmapped` → `send_initial_configure` → map pipeline, built as slice 0
    promised: restore is a **writer of seeds**, not a sixth copy of the placement chain. It fills in
    `ResolvedWindowRules` (`open_fullscreen`, `open_maximized_to_edges`, `default_width`/`_height`,
@@ -436,10 +481,9 @@ placement picks. Without that pairing these are screenshots of a default.
    takeover in between empties the previous holder's registrations, so a stale request simply fails
    to look up — inertness doing the work again, with no staleness bit.
 
-   **The output comes from the saved rect, by largest overlap** (mutter:
-   `meta_monitor_manager_get_logical_monitor_from_rect`). No overlap with any connected output —
-   the monitor is gone — and the seed is dropped, so the window falls through to the normal choice
-   and still maps.
+   **The output comes from the display identity in the record.** Not connected — the monitor is
+   gone — and both the output seed and the position are dropped, so the window falls through to
+   the normal choice and still maps at its saved size. See "A record is anchored to a display".
 
    **The workspace index grows the strip** until it exists (`Monitor::ensure_workspace_at`), capped
    at 36 — the range GNOME declares for `num-workspaces`, and the bound matters because the index

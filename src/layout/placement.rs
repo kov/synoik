@@ -46,8 +46,8 @@ pub struct PlacementSeeds<'a> {
     /// an index because workspace ids are runtime-only and meaningless across restarts.
     ///
     /// Unlike a name this does not pin the monitor: restore resolves the monitor from the saved
-    /// rect first, then indexes into it. Ignored when a name is also given — a name is the more
-    /// specific request.
+    /// display identity first, then indexes into it. Ignored when a name is also given — a name is
+    /// the more specific request, and the one that follows a workspace moved between displays.
     ///
     /// Clamped to the last workspace here, and *only* here. Placement resolution is `&self` and
     /// this seed is consulted to pick a size to configure against, which the clamp answers

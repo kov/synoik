@@ -736,6 +736,9 @@ pub struct SessionSnapshot<'a> {
     /// The rect the window would take if floating, **output-local**. `None` when it has never
     /// floated, so there is nothing remembered to restore it to.
     pub floating_rect: Option<Rectangle<f64, Logical>>,
+
+    /// The workspace's name, when the user gave it one. The only handle that outlives a restart.
+    pub workspace_name: Option<String>,
 }
 
 impl SizingMode {
@@ -6268,26 +6271,21 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// See [`Workspace::seed_unmaximize_geometry`]. `output_origin` converts the stored global
-    /// rect into the workspace's frame.
-    pub fn seed_unmaximize_geometry(
-        &mut self,
-        id: &W::Id,
-        rect: Rectangle<f64, Logical>,
-        output_origin: Point<f64, Logical>,
-    ) {
+    /// See [`Workspace::seed_unmaximize_geometry`]. The rect is output-local, as the store keeps
+    /// it, so nothing here converts frames.
+    pub fn seed_unmaximize_geometry(&mut self, id: &W::Id, rect: Rectangle<f64, Logical>) {
         for ws in self.workspaces_mut() {
-            if ws.seed_unmaximize_geometry(id, rect, output_origin) {
+            if ws.seed_unmaximize_geometry(id, rect) {
                 return;
             }
         }
     }
 
-    /// Everything the session store needs about `id`, other than the output origin.
+    /// Everything the session store needs about `id`.
     ///
-    /// The workspace index is **per monitor**, while the rect the caller composes is global. The
-    /// pair is deliberate: restore resolves the output from the rect first, then indexes into that
-    /// monitor's workspaces.
+    /// Every coordinate here is relative to `output`, and the workspace index is an index into
+    /// *that monitor's* stack — one frame of reference throughout, which is what lets a record be
+    /// replayed under a monitor configuration that shares nothing with the one that wrote it.
     pub fn session_snapshot(&self, id: &W::Id) -> Option<SessionSnapshot<'_>> {
         self.workspaces().find_map(|(monitor, idx, ws)| {
             let (sizing_mode, floating_rect) = ws.session_snapshot(id)?;
@@ -6296,6 +6294,7 @@ impl<W: LayoutElement> Layout<W> {
                 workspace_idx: idx,
                 sizing_mode,
                 floating_rect,
+                workspace_name: ws.name().cloned(),
             })
         })
     }

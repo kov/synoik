@@ -521,17 +521,11 @@ impl CompositorHandler for State {
                     // otherwise un-maximizing lands on a default size rather than the saved one.
                     // After auto-maximize, which is the other writer of this field.
                     if let Some([x, y, w, h]) = unmaximize_to {
-                        let origin = output
-                            .as_ref()
-                            .and_then(|output| self.synoik.global_space.output_geometry(output))
-                            .map_or_else(Point::default, |geo| geo.loc.to_f64());
                         let rect = Rectangle::new(
                             Point::from((f64::from(x), f64::from(y))),
                             Size::from((f64::from(w), f64::from(h))),
                         );
-                        self.synoik
-                            .layout
-                            .seed_unmaximize_geometry(&window, rect, origin);
+                        self.synoik.layout.seed_unmaximize_geometry(&window, rect);
                     }
 
                     if let Some(output) = output {
