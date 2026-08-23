@@ -1112,6 +1112,14 @@ impl<W: LayoutElement> Layout<W> {
                 // carry that monitor's options while belonging to nothing, and a later
                 // `update_config` is the only thing that would ever have corrected it.
                 ws.update_config(self.options.clone());
+
+                // And nothing can be scrolling it, for the same reason. A gesture parked with
+                // the workspace outlives the drag that started it — `dnd_end` walks the live
+                // workspaces, which a parked one is not in — and comes back on the replug next
+                // to the one the survivor started, which is one gesture too many.
+                ws.dnd_scroll_gesture_end();
+                ws.view_offset_gesture_end(None);
+
                 self.parked_workspaces.push(ws);
             }
             // A workspace with no windows and no home display has nothing to come back to, and
