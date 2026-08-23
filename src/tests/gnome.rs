@@ -30146,6 +30146,192 @@ fn a_user_maximize_over_a_displacement_survives_the_area_growing() {
     );
 }
 
+/// A right-click on a workspace thumbnail offers the workspace's own menu.
+///
+/// The divergence `docs/fork/multi-display.md` §6 asks for: gnome-shell has no workspace menu
+/// because it has nothing to put in one.
+#[test]
+fn a_right_click_on_a_thumbnail_opens_the_workspace_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let thumb = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("on a monitor")
+            .thumbnail_strip()
+            .expect("the strip is up")
+            .thumbs[0]
+    };
+    pointer_motion_to(&mut f, thumb.loc.x + 4., thumb.loc.y + 4.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let menu = f
+        .synoik()
+        .panel_popover
+        .workspace_menu()
+        .expect("a workspace menu");
+    assert_eq!(
+        menu.labels(),
+        vec!["Close"],
+        "one display, so there is nowhere to send it"
+    );
+    assert_eq!(
+        menu.disabled_labels(),
+        vec!["Close"],
+        "and the workspace it was summoned on holds a window, so it cannot be dismissed"
+    );
+
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    assert_eq!(
+        (loc.x, loc.y),
+        (thumb.loc.x + 4., thumb.loc.y + 4.),
+        "anchored at the click, like the window menu"
+    );
+}
+
+/// The menu's Close is the strip's close button by another route, so it obeys the same rule
+/// about which workspaces can go.
+#[test]
+fn the_workspace_menu_closes_an_empty_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    // A second desktop, so there is an empty one that is not the trailing pad.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let before = f.synoik().layout.workspaces().count();
+    let thumb = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("on a monitor")
+            .thumbnail_strip()
+            .expect("the strip is up")
+            .thumbs[0]
+    };
+    pointer_motion_to(&mut f, thumb.loc.x + 4., thumb.loc.y + 4.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let center = f
+        .synoik()
+        .panel_popover
+        .workspace_menu()
+        .expect("a menu")
+        .row_center("Close")
+        .expect("a Close row");
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let loc = f.synoik().panel_popover.content_location(&output);
+    pointer_motion_to(&mut f, loc.x + center.x, loc.y + center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.settle();
+
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        before - 1,
+        "the empty workspace the menu was summoned on is gone"
+    );
+}
+
+/// Send to <display> is what the cross-display drag says, said with the keyboard.
+#[test]
+fn the_workspace_menu_sends_a_workspace_to_another_display() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let output = f.synoik_output(1);
+    let other = f.synoik_output(2);
+    let thumb = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .thumbnail_strip()
+        .expect("the strip is up")
+        .thumbs[0];
+    pointer_motion_to(&mut f, thumb.loc.x + 4., thumb.loc.y + 4.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let labels: Vec<String> = f
+        .synoik()
+        .panel_popover
+        .workspace_menu()
+        .expect("a menu")
+        .labels()
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+    let send = labels
+        .iter()
+        .find(|l| l.starts_with("Send to "))
+        .cloned()
+        .expect("a row for the other display");
+
+    let center = f
+        .synoik()
+        .panel_popover
+        .workspace_menu()
+        .unwrap()
+        .row_center(&send)
+        .expect("the row");
+    let loc = f.synoik().panel_popover.content_location(&output);
+    pointer_motion_to(&mut f, loc.x + center.x, loc.y + center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.settle();
+
+    let landed = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_windows())
+        .and_then(|(mon, _, _)| mon.map(|m| m.output().clone()))
+        .expect("the window's workspace is still somewhere");
+    assert_eq!(
+        landed, other,
+        "the workspace the menu named moved to the display the row named"
+    );
+    assert!(
+        f.synoik().layout.windows().any(|(_, m)| m.window == win),
+        "with its window"
+    );
+}
+
+/// The menu is reachable without a pointer at all, which is the reason it exists.
+#[test]
+fn the_workspace_menu_opens_from_the_keyboard() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.settle();
+
+    f.synoik_state().do_action(Action::ShowWorkspaceMenu, false);
+    f.settle();
+
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the menu hangs off a thumbnail, so the strip had to come up"
+    );
+    assert!(
+        f.synoik().panel_popover.workspace_menu().is_some(),
+        "and the menu is up on the active workspace"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]

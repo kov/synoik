@@ -2254,6 +2254,18 @@ impl State {
                     mapped.toplevel().send_close();
                 }
             }
+            PopoverAction::WorkspaceClose(workspace) => {
+                if self.synoik.layout.close_workspace(workspace) {
+                    // The strip re-lays around the gap, so nothing is where the pointer left its
+                    // hovers — the same cleanup the close button's own path does.
+                    self.synoik.thumbnail_hovered = None;
+                    self.synoik.thumbnail_close_hovered = None;
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            PopoverAction::WorkspaceSendToDisplay { workspace, output } => {
+                self.move_workspace_to_display(workspace, &output);
+            }
         }
     }
 
@@ -5071,6 +5083,26 @@ impl State {
                 self.synoik.layout.toggle_overview();
                 self.synoik.queue_redraw_all();
             }
+            // The keyboard's route to the workspace menu. The menu hangs off a thumbnail, so the
+            // strip has to be on screen: opening the overview is part of the action rather than a
+            // precondition the user has to satisfy first.
+            Action::ShowWorkspaceMenu => {
+                if !self.synoik.layout.is_overview_open() {
+                    self.synoik.layout.toggle_overview();
+                }
+                if let Some(output) = self.synoik.layout.active_output().cloned() {
+                    let idx = self
+                        .synoik
+                        .layout
+                        .monitor_for_output(&output)
+                        .map(|mon| mon.active_workspace_idx());
+                    if let Some(idx) = idx {
+                        let at = self.workspace_menu_anchor(&output, idx);
+                        self.show_workspace_menu(&output, idx, at);
+                    }
+                }
+                self.synoik.queue_redraw_all();
+            }
             Action::ToggleApplicationView => self.toggle_apps_page(),
             Action::ToggleMessageTray => {
                 if let Some(output) = self.synoik.layout.active_output().cloned() {
@@ -6224,6 +6256,135 @@ impl State {
         let grab = ThumbGrab::new(start_data, output, idx);
         pointer.set_grab(self, grab, serial, Focus::Clear);
         true
+    }
+
+    /// Where a keyboard-summoned workspace menu hangs from: the thumbnail's bottom-left corner,
+    /// so the card drops out of the thumbnail the way it drops out of a right-click.
+    ///
+    /// The strip is laid out per frame, so a menu opened in the same call that opened the
+    /// overview may have no strip to measure yet; the output's centre is the fallback, which is
+    /// where the strip is about to appear anyway.
+    fn workspace_menu_anchor(&self, output: &Output, idx: usize) -> Point<f64, Logical> {
+        let thumb = self
+            .synoik
+            .layout
+            .monitor_for_output(output)
+            .and_then(|mon| mon.thumbnail_strip())
+            .and_then(|strip| strip.thumbs.get(idx).copied());
+        match thumb {
+            Some(thumb) => Point::from((thumb.loc.x, thumb.loc.y + thumb.size.h)),
+            None => {
+                let size = crate::utils::output_size(output);
+                Point::from((size.w / 2., size.h / 2.))
+            }
+        }
+    }
+
+    /// Open the workspace menu on the thumbnail under the pointer. Returns whether one opened —
+    /// a press that missed every thumbnail is not the strip's.
+    fn show_workspace_menu_under_pointer(&mut self) -> bool {
+        let pointer = self.synoik.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+        let Some((output, within, idx)) = self.synoik.thumbnail_under(location) else {
+            return false;
+        };
+        self.show_workspace_menu(&output, idx, within)
+    }
+
+    /// Open the workspace menu for the `idx`th workspace on `output`, anchored at the
+    /// output-local point `at` — the same zero-sized point anchor the window menu hangs from.
+    fn show_workspace_menu(
+        &mut self,
+        output: &Output,
+        idx: usize,
+        at: Point<f64, Logical>,
+    ) -> bool {
+        let Some(ctx) = self.workspace_menu_context(output, idx) else {
+            return false;
+        };
+        let anchor = Rectangle::new(at, Size::from((0., 0.)));
+        self.synoik
+            .panel_popover
+            .open_workspace_menu(output.clone(), anchor, &ctx);
+        self.synoik.queue_redraw_all();
+        true
+    }
+
+    /// Snapshot what the workspace menu needs to know about the `idx`th workspace on `output`.
+    fn workspace_menu_context(
+        &self,
+        output: &Output,
+        idx: usize,
+    ) -> Option<crate::ui::workspace_menu::WorkspaceMenuContext> {
+        use crate::ui::workspace_menu::{DisplayTarget, WorkspaceMenuContext};
+
+        let mon = self.synoik.layout.monitor_for_output(output)?;
+        let workspace = mon.workspace_at(idx)?.id();
+        let is_closable = mon.workspace_is_closable(idx);
+
+        // Every display but this one, in strip order. Labelled the way the display settings
+        // label them, so the row names what the user calls the monitor rather than its connector.
+        let ipc_outputs = self.backend.ipc_outputs();
+        let ipc_outputs = ipc_outputs.lock().unwrap();
+        let mut displays: Vec<DisplayTarget> = self
+            .synoik
+            .layout
+            .outputs()
+            .filter(|other| *other != output)
+            .map(|other| {
+                let connector = other.name();
+                let label = ipc_outputs
+                    .values()
+                    .find(|o| o.name == connector)
+                    .map(|o| {
+                        crate::utils::make_display_name(o, crate::utils::is_laptop_panel(&o.name))
+                    })
+                    .unwrap_or_else(|| connector.clone());
+                DisplayTarget {
+                    output: other.clone(),
+                    label,
+                }
+            })
+            .collect();
+        // Two of the same monitor produce the same display name, and "Send to Dell 27″" twice is
+        // no menu at all — so a label that is not unique earns its connector.
+        let counts: Vec<usize> = displays
+            .iter()
+            .map(|d| displays.iter().filter(|o| o.label == d.label).count())
+            .collect();
+        for (target, count) in displays.iter_mut().zip(counts) {
+            if count > 1 {
+                target.label = format!("{} ({})", target.label, target.output.name());
+            }
+        }
+
+        Some(WorkspaceMenuContext {
+            workspace,
+            is_closable,
+            displays,
+        })
+    }
+
+    /// Send a workspace to another display — what the workspace menu's Send to <display> row
+    /// does, and the keyboard's way to say what a cross-display thumbnail drag says.
+    ///
+    /// Goes through the same [`Layout::move_workspace_to_output_by_id`] the drop does, which is
+    /// where the home tag is rewritten and the target display becomes active when the workspace
+    /// was the one in use (`docs/fork/multi-display.md` §2, §6).
+    fn move_workspace_to_display(&mut self, workspace: WorkspaceId, output: &Output) {
+        let Some((idx, ws)) = self.synoik.layout.find_workspace_by_id(workspace) else {
+            return;
+        };
+        let Some(old_output) = ws.current_output().cloned() else {
+            return;
+        };
+        if old_output == *output {
+            return;
+        }
+        self.synoik
+            .layout
+            .move_workspace_to_output_by_id(idx, Some(old_output), output);
+        self.synoik.queue_redraw_all();
     }
 
     /// Activating a workspace by clicking it in the overview (gnome-shell's `Workspace`
@@ -8055,6 +8216,19 @@ impl State {
             self.synoik.tablet_cursor_location = None;
 
             let is_overview_open = self.synoik.layout.is_overview_open();
+
+            // A right press on a thumbnail is that workspace's context menu, the same place a
+            // right press on a titlebar is the window's. Before the overview pan grab below,
+            // which would otherwise swallow every right press in the overview — including the
+            // ones aimed at the strip, the way the peek's left press had to be taken first.
+            if is_overview_open
+                && !pointer.is_grabbed()
+                && button == Some(MouseButton::Right)
+                && self.show_workspace_menu_under_pointer()
+            {
+                self.synoik.suppressed_buttons.insert(button_code);
+                return;
+            }
 
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
                 if let Some((output, ws)) = self.synoik.workspace_under_cursor(true) {

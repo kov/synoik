@@ -42,6 +42,7 @@ pub mod thumbnail_chrome;
 pub mod widget;
 pub mod window_menu;
 pub mod window_preview;
+pub mod workspace_menu;
 
 /// GNOME authors font sizes in points; we size glyphs in logical pixels-per-em, so route every
 /// GNOME point size through [`pt_to_px`] instead of hardcoding a px (which drifted per-UI: 11pt

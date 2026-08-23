@@ -292,6 +292,11 @@ pub enum Action {
         reference: WorkspaceReference,
     },
     MoveWorkspaceToMonitor(String),
+    /// Pop the active workspace's own menu — rename, close, send to another display. The
+    /// keyboard's way to reach what a right-click on its thumbnail reaches
+    /// (`docs/fork/multi-display.md` §6); it opens the overview if it is not already up, since
+    /// the menu hangs off a thumbnail in the strip.
+    ShowWorkspaceMenu,
     SetWorkspaceName(String),
     SetWorkspaceNameByRef {
         name: String,

@@ -10793,7 +10793,13 @@ impl Synoik {
         // dismiss it.
         let overview_just_opened = overview_open && !self.overview_was_open;
         self.overview_was_open = overview_open;
-        if self.panel_popover.is_open() && (overview_just_opened || !self.layout.is_gnome_mode()) {
+        // A workspace menu is *of* the overview — it hangs off a thumbnail in the strip — so the
+        // overview coming up is not a reason to dismiss it, and the keyboard route opens both in
+        // one action.
+        let is_workspace_menu = self.panel_popover.workspace_menu().is_some();
+        if self.panel_popover.is_open()
+            && ((overview_just_opened && !is_workspace_menu) || !self.layout.is_gnome_mode())
+        {
             self.panel_popover.close();
         }
         // A menu whose bar is on its way out over a fullscreen window goes with it: the popover

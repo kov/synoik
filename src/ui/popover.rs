@@ -82,6 +82,7 @@ use crate::ui::panel::panel_height;
 use crate::ui::quick_settings::QuickSettings;
 use crate::ui::widget;
 use crate::ui::window_menu::{WindowMenu, WindowMenuContext};
+use crate::ui::workspace_menu::{WorkspaceMenu, WorkspaceMenuContext};
 use crate::utils::output_size;
 
 /// The Settings app's desktop id, which every quick-settings route into Settings resolves
@@ -287,6 +288,15 @@ pub enum PopoverAction {
     },
     /// The window menu's Close — `window.delete()` (`windowMenu.js:185-189`).
     WindowClose(crate::window::mapped::MappedId),
+    /// The workspace menu's Close — `Layout::close_workspace`, the same call the strip's own
+    /// close button makes.
+    WorkspaceClose(crate::layout::workspace::WorkspaceId),
+    /// The workspace menu's Send to <display> — the keyboard's way to say what the cross-display
+    /// thumbnail drag says, through the same move (`docs/fork/multi-display.md` §6).
+    WorkspaceSendToDisplay {
+        workspace: crate::layout::workspace::WorkspaceId,
+        output: Output,
+    },
     /// Flip one accessibility menu row: write the backing gsettings key and close the
     /// menu (`PopupSwitchMenuItem.activate`, `js/ui/popupMenu.js:539-550`).
     SetA11yToggle {
@@ -351,6 +361,8 @@ impl PopoverAction {
                 | PopoverAction::WindowMoveToWorkspace { .. }
                 | PopoverAction::WindowMoveToMonitor { .. }
                 | PopoverAction::WindowClose(_)
+                | PopoverAction::WorkspaceClose(_)
+                | PopoverAction::WorkspaceSendToDisplay { .. }
         )
     }
 }
@@ -368,6 +380,8 @@ pub enum PopoverContent {
     Indicator(Box<IndicatorMenu>),
     /// A window's own menu, summoned on its titlebar.
     Window(Box<WindowMenu>),
+    /// A workspace thumbnail's menu, summoned in the overview strip.
+    Workspace(Box<WorkspaceMenu>),
 }
 
 impl PopoverContent {
@@ -380,6 +394,7 @@ impl PopoverContent {
             PopoverContent::App(m) => m.logical_size(),
             PopoverContent::Indicator(m) => m.logical_size(),
             PopoverContent::Window(m) => m.logical_size(),
+            PopoverContent::Workspace(m) => m.logical_size(),
         }
     }
 
@@ -393,6 +408,7 @@ impl PopoverContent {
             PopoverContent::App(m) => m.corner_radius(),
             PopoverContent::Indicator(m) => m.corner_radius(),
             PopoverContent::Window(m) => m.corner_radius(),
+            PopoverContent::Workspace(m) => m.corner_radius(),
         }
     }
 }
@@ -518,6 +534,8 @@ impl PanelPopover {
             PopoverContent::App(_) => None,
             // Not a panel menu either: it hangs off a window, not off the bar.
             PopoverContent::Window(_) => None,
+            // Nor this one: it hangs off a thumbnail in the overview strip.
+            PopoverContent::Workspace(_) => None,
             // The indicator cluster is one panel item per icon, so the pressed-role highlight
             // would have to name *which* icon; it does not, and lighting the whole cluster would
             // be worse than lighting none of it.
@@ -807,6 +825,37 @@ impl PanelPopover {
         menu.focus_step(1);
         self.content = Some(PopoverContent::Window(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Open the workspace menu, anchored at a point in the overview strip like the window menu
+    /// is anchored at the point a client asked for.
+    pub fn open_workspace_menu(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        ctx: &WorkspaceMenuContext,
+    ) {
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Point;
+        let mut menu = WorkspaceMenu::new(ctx);
+        menu.set_max_height(Some(self.available_menu_height()));
+        // Opened with the first row focused, like the window menu, so Enter acts without an arrow
+        // key first — which is the whole point of this menu existing.
+        menu.focus_step(1);
+        self.content = Some(PopoverContent::Workspace(Box::new(menu)));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// The open workspace menu, if that is what is up — for the corpus, and for the paths that
+    /// have to take the menu down with the workspace it names.
+    pub fn workspace_menu(&self) -> Option<&WorkspaceMenu> {
+        match &self.content {
+            Some(PopoverContent::Workspace(m)) if self.open && !self.closing => Some(m),
+            _ => None,
+        }
     }
 
     /// The open window menu, if that is what is up — for the corpus, and for the unmap path that
@@ -1198,6 +1247,7 @@ impl PanelPopover {
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
             Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
             Some(PopoverContent::Window(m)) => m.pointer_hover(local),
+            Some(PopoverContent::Workspace(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -1336,6 +1386,7 @@ impl PanelPopover {
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
                 Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
                 Some(PopoverContent::Window(m)) => m.pointer_click(local),
+                Some(PopoverContent::Workspace(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -1491,6 +1542,7 @@ impl PanelPopover {
             Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::Workspace(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 
