@@ -4998,7 +4998,8 @@ impl State {
         // read as a bug twice — what a stale restore actually indicts is `froze N before session
         // end` above, which runs while the windows are still there.
         info!(
-            "session store: swept {saved} still-mapped toplevels at exit ({skipped} skipped);              zero here is normal — clients that exited cleanly already saved themselves"
+            "session store: swept {saved} still-mapped toplevels at exit ({skipped} skipped) \
+             — zero is normal here, clients that exited cleanly saved themselves"
         );
     }
 
