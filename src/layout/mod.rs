@@ -427,6 +427,9 @@ pub struct Layout<W: LayoutElement> {
     last_active_workspace_id: HashMap<String, WorkspaceId>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
+    /// A workspace in mid-air between two displays' strips. Set once a drag has actually crossed a
+    /// display boundary, and cleared when it lands.
+    thumb_carry: Option<ThumbCarry>,
     /// Ongoing drag-and-drop operation.
     dnd: Option<DndData<W>>,
     /// Clock for driving animations.
@@ -457,6 +460,24 @@ pub struct Layout<W: LayoutElement> {
     gnome_edge_tiling: bool,
     /// Configurable properties of the layout.
     options: Rc<Options>,
+}
+
+/// A workspace being carried from one display's strip to another's.
+///
+/// A crossing moves the workspace for real (`docs/fork/multi-display.md` §6), so that each row
+/// runs an ordinary within-display drag on it. That leaves two things to put right if the carry
+/// never lands, and this is what remembers them.
+#[derive(Debug)]
+struct ThumbCarry {
+    /// The display the workspace was picked up on, and the index it sat at. The overview closing
+    /// under a carried thumbnail puts it back here — a crossing is not a drop, and merely dragging
+    /// *over* another display must not move a desktop the user never let go of.
+    origin: (Output, usize),
+    /// How many workspaces each display the carry has left had, before it left. A display cannot
+    /// be left short — the trailing empty and `MIN_NUM_WORKSPACES` are restored the moment the
+    /// workspace goes — so without this a carry that wanders back and forth would hand out one
+    /// extra empty desktop per crossing.
+    counts: HashMap<String, usize>,
 }
 
 #[derive(Debug)]
@@ -956,6 +977,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            thumb_carry: None,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -985,6 +1007,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            thumb_carry: None,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -5801,12 +5824,119 @@ impl<W: LayoutElement> Layout<W> {
 
         for mon in monitors {
             mon.overview_open = self.overview_open;
-            if !self.overview_open {
-                // The strip is gone, so a reorder drag on it has nothing left to drop
-                // onto — it must not survive to be applied when the overview reopens.
-                mon.cancel_thumb_drag();
-            }
             mon.set_overview_progress(self.overview_progress.as_ref());
+        }
+
+        if !self.overview_open {
+            // The strip is gone, so a reorder drag on it has nothing left to drop onto — it must
+            // not survive to be applied when the overview reopens.
+            self.cancel_thumb_drags();
+        }
+    }
+
+    /// Carries a workspace being dragged on one display's strip over to another's.
+    ///
+    /// The crossing is a real move — the target display takes the workspace and runs an ordinary
+    /// within-display drag on it — because the alternative is rendering one display's workspace
+    /// inside another's row, at another scale. What it deliberately does *not* do is rewrite the
+    /// home tag or move focus: a crossing is not yet a move, and both of those are the drop's to
+    /// make (`docs/fork/multi-display.md` §6).
+    ///
+    /// Returns whether the workspace changed displays.
+    pub fn carry_dragged_workspace(&mut self, to: &Output, pos: Point<f64, Logical>) -> bool {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return false;
+        };
+
+        let Some(from_idx) = monitors.iter().position(|mon| mon.is_thumb_dragging()) else {
+            return false;
+        };
+        let Some(to_idx) = monitors.iter().position(|mon| &mon.output == to) else {
+            return false;
+        };
+        if from_idx == to_idx {
+            return false;
+        }
+
+        // Read before the removal, which is what pads the row back out.
+        let source_name = monitors[from_idx].output_name().clone();
+        let source_count = monitors[from_idx].n_workspaces();
+
+        let Some((ws, was_at, frac)) = monitors[from_idx].take_dragged_workspace() else {
+            return false;
+        };
+
+        // Only the *first* crossing sets the origin: it is where a cancelled carry has to put the
+        // workspace back, and that is where the user picked it up, not the last display it passed
+        // over. Every crossing records the count of the display it just left.
+        let carry = self.thumb_carry.get_or_insert_with(|| ThumbCarry {
+            origin: (monitors[from_idx].output.clone(), was_at),
+            counts: HashMap::new(),
+        });
+        carry.counts.entry(source_name).or_insert(source_count);
+
+        let target = &mut monitors[to_idx];
+        let drop_idx = target.thumb_drop_idx(pos);
+        let shed_to = carry.counts.get(target.output_name()).copied();
+        target.take_over_dragged_workspace(ws, drop_idx, frac, pos, shed_to);
+        true
+    }
+
+    /// Ends a thumbnail drag on the display currently carrying it, dropping the workspace where
+    /// the pointer let go.
+    ///
+    /// A drop on a display the drag did not start on is an **explicit move**, so this is where the
+    /// home tag is rewritten and where the display becomes active — the same rule a keybinding aim
+    /// follows (`docs/fork/multi-display.md` §4).
+    pub fn finish_thumb_drag_on(&mut self, output: &Output) -> bool {
+        let Some(mon) = self.monitor_for_output_mut(output) else {
+            return false;
+        };
+        let Some(idx) = mon.finish_thumb_drag() else {
+            return false;
+        };
+
+        let Some(carry) = self.thumb_carry.take() else {
+            return true;
+        };
+        if &carry.origin.0 == output {
+            return true;
+        }
+
+        if let Some(mon) = self.monitor_for_output_mut(output) {
+            mon.rehome_workspace(idx);
+        }
+        self.focus_output(output);
+        true
+    }
+
+    /// Puts a workspace carried across displays back where it was picked up, then drops every
+    /// thumbnail drag.
+    ///
+    /// The strip is going away (the overview closing, the peek retracting), so nothing can be
+    /// dropped onto it any more — and a crossing that never became a drop must not survive as one.
+    pub fn cancel_thumb_drags(&mut self) {
+        if let Some(carry) = self.thumb_carry.take() {
+            let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+                return;
+            };
+            let holder = monitors.iter().position(|mon| mon.is_thumb_dragging());
+            let home = monitors.iter().position(|mon| mon.output == carry.origin.0);
+            if let (Some(holder), Some(home)) = (holder, home) {
+                if holder != home {
+                    if let Some((ws, _, _)) = monitors[holder].take_dragged_workspace() {
+                        let shed_to = carry.counts.get(monitors[home].output_name()).copied();
+                        monitors[home].insert_workspace(ws, carry.origin.1, false);
+                        if let Some(n) = shed_to {
+                            monitors[home].shed_carry_padding_to(n);
+                        }
+                    }
+                }
+            }
+        }
+
+        for mon in self.monitors_mut() {
+            mon.cancel_thumb_drag();
         }
     }
 
@@ -5853,9 +5983,7 @@ impl<W: LayoutElement> Layout<W> {
         if !open {
             // The strip is on its way out, so a reorder drag on it has nothing left to drop
             // onto — the same reasoning as closing the overview.
-            for mon in self.monitors_mut() {
-                mon.cancel_thumb_drag();
-            }
+            self.cancel_thumb_drags();
         }
 
         let from = self.peek_value();

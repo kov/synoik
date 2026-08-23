@@ -10149,6 +10149,196 @@ fn thumbnail_close_press_beats_the_reorder_grab() {
     assert_eq!(mon.unwrap().workspace_count(), 2);
 }
 
+/// The center of thumbnail `idx` on display `n`'s strip, in **global** coordinates — which is what
+/// pointer input takes, and the only frame in which a drag can cross a display boundary at all.
+fn thumbnail_center_on(f: &mut Fixture, n: u8, idx: usize) -> (f64, f64) {
+    let output = f.synoik_output(n);
+    let origin = f
+        .synoik()
+        .global_space
+        .output_geometry(&output)
+        .unwrap()
+        .loc
+        .to_f64();
+    let rect = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .expect("the display must have a monitor")
+        .thumbnail_strip()
+        .expect("the thumbnails strip must be visible")
+        .thumbs[idx];
+    (
+        origin.x + rect.loc.x + rect.size.w / 2.,
+        origin.y + rect.loc.y + rect.size.h / 2.,
+    )
+}
+
+/// Which display the workspace holding `win` is on.
+fn window_workspace_output(f: &mut Fixture, win: &smithay::desktop::Window) -> String {
+    f.synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(win))
+        .and_then(|(mon, _, _)| mon)
+        .expect("the window must be on a workspace on a monitor")
+        .output()
+        .name()
+}
+
+/// A window on display 1, with the overview open on both displays.
+fn setup_one_window_in_overview_on_two_displays(f: &mut Fixture) -> smithay::desktop::Window {
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Outputs tile left to right, so this opens the window on display 1.
+    pointer_motion_to(f, 960., 540.);
+    let _surface = map_window_sized(f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(f, KEY_LEFTMETA);
+    f.settle();
+
+    win
+}
+
+/// A workspace can be carried off one display's strip and dropped on another's — the affordance
+/// per-monitor workspaces owe the user (`docs/fork/multi-display.md` §6). With one global workspace
+/// list, as mutter has, there is nothing to move a workspace *to*; with a stack per display, moving
+/// a desktop between displays is the natural operation and there was no way to say it.
+#[test]
+fn dragging_a_thumbnail_to_another_display_moves_the_workspace() {
+    let mut f = Fixture::new();
+    let win = setup_one_window_in_overview_on_two_displays(&mut f);
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+
+    let (from_x, from_y) = thumbnail_center_on(&mut f, 1, 0);
+    let (to_x, to_y) = thumbnail_center_on(&mut f, 2, 0);
+
+    pointer_motion_to(&mut f, from_x, from_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // Past the drag threshold on the way out, so the grab arms on its own display.
+    pointer_motion_to(&mut f, from_x + 20., from_y);
+    pointer_motion_to(&mut f, to_x, to_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-2",
+        "the workspace must land on the display it was dropped on"
+    );
+}
+
+/// A drop on a display the drag did not start on is an **explicit** move, so it re-homes the
+/// workspace: unplugging that display later must hand this workspace back to *it*, not to where it
+/// happened to be born (`docs/fork/multi-display.md` §2).
+#[test]
+fn dropping_a_workspace_on_another_display_rehomes_it() {
+    let mut f = Fixture::new();
+    let win = setup_one_window_in_overview_on_two_displays(&mut f);
+
+    let (from_x, from_y) = thumbnail_center_on(&mut f, 1, 0);
+    let (to_x, to_y) = thumbnail_center_on(&mut f, 2, 0);
+    pointer_motion_to(&mut f, from_x, from_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from_x + 20., from_y);
+    pointer_motion_to(&mut f, to_x, to_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    // Display 2 goes away. Its workspaces are evacuated to the primary, and an evacuation is
+    // exactly what does *not* rewrite the home tag — so bringing it back must reclaim this one.
+    let output2 = f.synoik_output(2);
+    f.remove_output(2);
+    f.settle();
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+
+    f.add_output(2, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        output2.name(),
+        "the drop must have made the display it landed on the workspace's home"
+    );
+}
+
+/// A crossing is not a drop. The overview closing under a carried thumbnail puts the workspace back
+/// where it was picked up — otherwise merely dragging *over* another display, then losing the
+/// strip, would have moved a desktop the user never let go of.
+#[test]
+fn a_cancelled_cross_display_drag_puts_the_workspace_back() {
+    let mut f = Fixture::new();
+    let win = setup_one_window_in_overview_on_two_displays(&mut f);
+
+    let (from_x, from_y) = thumbnail_center_on(&mut f, 1, 0);
+    let (to_x, to_y) = thumbnail_center_on(&mut f, 2, 0);
+    pointer_motion_to(&mut f, from_x, from_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from_x + 20., from_y);
+    pointer_motion_to(&mut f, to_x, to_y);
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-2",
+        "the crossing itself must hand the workspace over"
+    );
+
+    // The strip goes away under the drag.
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.settle();
+
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-1",
+        "a drag that never landed must leave the workspace where it was picked up"
+    );
+}
+
+/// Crossing back and forth without dropping leaves no residue. Each crossing removes a workspace
+/// from one row and inserts it into another, and both operations maintain the trailing empty and
+/// the workspace minimum — so a drag that wanders is exactly the shape that would silently
+/// accumulate desktops on both displays.
+#[test]
+fn crossing_between_displays_without_dropping_leaves_no_residue() {
+    let mut f = Fixture::new();
+    let win = setup_one_window_in_overview_on_two_displays(&mut f);
+
+    let counts = |f: &mut Fixture| {
+        let (out1, out2) = (f.synoik_output(1), f.synoik_output(2));
+        let layout = &f.synoik().layout;
+        (
+            layout.monitor_for_output(&out1).unwrap().n_workspaces(),
+            layout.monitor_for_output(&out2).unwrap().n_workspaces(),
+        )
+    };
+    let before = counts(&mut f);
+
+    let (from_x, from_y) = thumbnail_center_on(&mut f, 1, 0);
+    let (to_x, to_y) = thumbnail_center_on(&mut f, 2, 0);
+    pointer_motion_to(&mut f, from_x, from_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from_x + 20., from_y);
+    for _ in 0..3 {
+        pointer_motion_to(&mut f, to_x, to_y);
+        pointer_motion_to(&mut f, from_x, from_y);
+    }
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-1",
+        "a drag that came home must leave the workspace at home"
+    );
+    assert_eq!(
+        counts(&mut f),
+        before,
+        "wandering across the seam must not grow either display's stack"
+    );
+}
+
 /// **Divergence (approved 2026-07-28).** Dragging a *thumbnail* along the strip reorders
 /// the workspaces, macOS Mission Control style. gnome-shell's thumbnails never reorder — a
 /// drag there is only ever a window being moved — and that gesture is kept, because the two

@@ -32,6 +32,9 @@ const DRAG_THRESHOLD: f64 = 8.;
 
 pub struct ThumbGrab {
     start_data: PointerGrabStartData<State>,
+    /// The display currently carrying the thumbnail. Follows the pointer across displays: a
+    /// crossing hands the workspace to the display under the pointer, which then runs an ordinary
+    /// within-display drag on it (`docs/fork/multi-display.md` §6).
     output: Output,
     /// The workspace the press landed on, by index at press time.
     idx: usize,
@@ -54,12 +57,15 @@ impl ThumbGrab {
         let Some((output, pos_within_output)) = data.synoik.output_under(location) else {
             return;
         };
-        if *output != self.output {
-            return;
-        }
         let output = output.clone();
 
         if !self.armed {
+            // Arming is the press's own display's business: until the drag exists there is
+            // nothing to carry anywhere.
+            if output != self.output {
+                return;
+            }
+
             let c = location - self.start_data.location;
             if c.x * c.x + c.y * c.y < DRAG_THRESHOLD * DRAG_THRESHOLD {
                 return;
@@ -78,6 +84,17 @@ impl ThumbGrab {
                 .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
         }
 
+        if output != self.output
+            && data
+                .synoik
+                .layout
+                .carry_dragged_workspace(&output, pos_within_output)
+        {
+            // The display it came from has a gap to close.
+            data.synoik.queue_redraw(&self.output);
+            self.output = output.clone();
+        }
+
         if let Some(mon) = data.synoik.layout.monitor_for_output_mut(&output) {
             mon.update_thumb_drag(pos_within_output);
         }
@@ -86,9 +103,7 @@ impl ThumbGrab {
 
     fn on_ungrab(&mut self, data: &mut State) {
         if self.armed {
-            if let Some(mon) = data.synoik.layout.monitor_for_output_mut(&self.output) {
-                mon.finish_thumb_drag();
-            }
+            data.synoik.layout.finish_thumb_drag_on(&self.output);
             data.synoik
                 .cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());

@@ -2798,12 +2798,132 @@ impl<W: LayoutElement> Monitor<W> {
         let Some(rect) = strip.thumbs.get(idx) else {
             return false;
         };
+        let frac = (pos.x - rect.loc.x) / rect.size.w;
+        self.begin_thumb_drag_at(idx, pos, frac)
+    }
+
+    /// Picks the thumbnail at `idx` up with the pointer `frac` of the way across it.
+    ///
+    /// The fraction, rather than a pixel offset, is what a drag arriving from another display
+    /// carries: two displays' rows are different widths, so the same offset would land the pointer
+    /// somewhere else on the thumbnail, or clean off it.
+    fn begin_thumb_drag_at(&mut self, idx: usize, pos: Point<f64, Logical>, frac: f64) -> bool {
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return false;
+        };
+        let Some(rect) = strip.thumbs.get(idx) else {
+            return false;
+        };
         self.thumb_drag = Some(ThumbDrag {
             from: idx,
-            grab_offset: pos.x - rect.loc.x,
+            grab_offset: frac * rect.size.w,
             pos,
         });
         true
+    }
+
+    /// Where an incoming thumbnail would land in this row: past every thumbnail the pointer is
+    /// already beyond the middle of.
+    ///
+    /// Measured against the row **at rest**, the same reference
+    /// [`thumb_drag_target`] takes its answer by — the row as drawn is mid-slide half the time.
+    pub fn thumb_drop_idx(&self, pos: Point<f64, Logical>) -> usize {
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return 0;
+        };
+        strip
+            .thumbs
+            .iter()
+            .filter(|rect| pos.x >= rect.loc.x + rect.size.w / 2.)
+            .count()
+    }
+
+    /// Hands the carried thumbnail off to another display: takes its workspace out of this
+    /// monitor and ends the drag, leaving the row to close up behind it.
+    ///
+    /// Returns the workspace, the index it was carried from, and how far across the thumbnail the
+    /// pointer had hold of it.
+    pub fn take_dragged_workspace(&mut self) -> Option<(Workspace<W>, usize, f64)> {
+        let drag = self.thumb_drag?;
+        let frac = self
+            .thumbnail_strip_at_rest()
+            .and_then(|strip| {
+                strip
+                    .thumbs
+                    .get(drag.from)
+                    .map(|r| drag.grab_offset / r.size.w)
+            })
+            .unwrap_or(0.5);
+
+        let was = self.thumb_xs();
+        self.thumb_drag = None;
+        let ws = self.remove_workspace_by_idx(drag.from);
+        self.arm_row_slide_by_id(was);
+
+        Some((ws, drag.from, frac))
+    }
+
+    /// Takes over a workspace carried from another display, dropping it into the row at `idx` and
+    /// continuing the drag here.
+    /// `shed_to` is the count this display had before the carry last left it, if it has been here
+    /// before — see [`Self::shed_carry_padding_to`]. It is shed *before* the drag is re-armed, and
+    /// that order is the point: shedding renumbers the row, and a drag armed on a stale index
+    /// carries the wrong workspace.
+    pub fn take_over_dragged_workspace(
+        &mut self,
+        ws: Workspace<W>,
+        idx: usize,
+        frac: f64,
+        pos: Point<f64, Logical>,
+        shed_to: Option<usize>,
+    ) {
+        // `insert_workspace` refuses to put anything past the trailing empty, so the index it
+        // actually used has to be clamped the same way here.
+        let idx = idx.min(self.workspaces.len().saturating_sub(1));
+
+        let was = self.thumb_xs();
+        let id = ws.id();
+        self.insert_workspace(ws, idx, false);
+        if let Some(n) = shed_to {
+            self.shed_carry_padding_to(n);
+        }
+        self.arm_row_slide_by_id(was);
+
+        let Some(idx) = self.workspaces.iter().position(|ws| ws.id() == id) else {
+            return;
+        };
+        self.begin_thumb_drag_at(idx, pos, frac);
+    }
+
+    /// Sheds the empty desktops this display was padded with while a carried workspace was away,
+    /// back down to the `n` it had before the carry left it.
+    ///
+    /// A workspace leaving cannot leave the row short — [`Self::remove_workspace_by_idx`] restores
+    /// the trailing empty and `MIN_NUM_WORKSPACES` on the way out — so a carry that wanders across
+    /// a seam and comes back would otherwise hand the display an extra empty desktop per round
+    /// trip, which the user then has to close by hand.
+    ///
+    /// Never sheds more than was added, and never a desktop with windows or a name. *Which* empty
+    /// goes is not defined beyond that: empty unnamed desktops are indistinguishable, and the last
+    /// one that is not the trailing empty is the cheapest to take.
+    pub fn shed_carry_padding_to(&mut self, n: usize) {
+        while self.workspaces.len() > n.max(MIN_NUM_WORKSPACES) {
+            let Some(idx) = (0..self.workspaces.len() - 1)
+                .rev()
+                .find(|&i| !self.workspaces[i].has_windows_or_name())
+            else {
+                break;
+            };
+            self.remove_workspace_by_idx(idx);
+        }
+    }
+
+    /// Makes this monitor the workspace's home (niri's `original_output`), which is what an
+    /// **explicit** move means and an evacuation does not — `docs/fork/multi-display.md` §2.
+    pub fn rehome_workspace(&mut self, idx: usize) {
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            ws.original_output = OutputId::new(&self.output);
+        }
     }
 
     /// Follows the pointer, and eases the row apart when the carried thumbnail crosses a
@@ -2865,26 +2985,22 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// Ends the drag, reordering the workspaces to where the thumbnail was
     /// dropped. Returns whether anything moved.
-    pub fn finish_thumb_drag(&mut self) -> bool {
+    pub fn finish_thumb_drag(&mut self) -> Option<usize> {
         // Taken while the drag is still on, so the carried thumbnail's snapshot is the box
         // it was let go at: it flies from there into its slot rather than appearing in it.
         let was = self.thumb_xs();
 
-        let Some(drag) = self.thumb_drag.take() else {
-            return false;
-        };
-        let Some(strip) = self.thumbnail_strip_at_rest() else {
-            return false;
-        };
+        let drag = self.thumb_drag.take()?;
+        let strip = self.thumbnail_strip_at_rest()?;
         let target = thumb_drag_target(&strip, drag);
         if target == drag.from {
             // Nothing reordered, but the thumbnail is still out where the pointer left it.
             self.arm_row_slide_by_id(was);
-            return false;
+            return Some(target);
         }
         self.move_workspace_to_idx(drag.from, target);
         self.arm_row_slide_by_id(was);
-        true
+        Some(target)
     }
 
     /// Drops the drag without reordering (the overview closing under it, a

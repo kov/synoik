@@ -1,6 +1,7 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23, nothing built.** Approved by Gustavo. This is the plan the
+**Status: design agreed 2026-08-23. §4 and §6's drag are implemented; §1, §2, §3 and §5 are not.**
+Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
 
@@ -214,36 +215,52 @@ a one-line change to this predicate, kept known for later tuning.
 
 ## 6. Moving a workspace to another display
 
-**Dragging a workspace from one display's strip to another's** is the affordance per-monitor
-workspaces owe the user, and most of it is already in the tree:
+**Dragging a workspace from one display's strip to another's** is **implemented**. Most of the
+machinery was already in the tree:
 
-- `Layout::move_workspace_to_output_by_id` (`src/layout/mod.rs:4201`) is the model operation — it
-  removes the workspace, rewrites the home tag as an explicit move, and calls
-  `Monitor::insert_workspace(ws, idx, activate)`. It hardcodes `active_workspace_idx + 1` as the
-  destination index; taking a drop index is a parameter, not a design.
-- `ThumbGrab` already resolves `Synoik::output_under` on every motion and **declines** the case
-  where that is not the output the drag started on (`src/input/thumb_grab.rs:53-57`). The
-  cross-output drag is that branch, written.
+- `ThumbGrab` resolves `Synoik::output_under` on every motion and used to decline the case where
+  that was not the output the drag started on (`src/input/thumb_grab.rs`). That branch is now the
+  crossing.
+- `Monitor::insert_workspace` / `remove_workspace_by_idx` maintain the workspace-list invariants on
+  both sides, so a crossing cannot leave either row short.
 - The overview opens on every monitor (`overview_open` is a `Layout`-wide flag), so both strips are
   on screen for the whole drag. Without that there would be nothing to aim at.
 
-Three rules it has to keep.
+**A crossing moves the workspace for real.** The display under the pointer takes it and runs an
+ordinary within-display drag on it; the display it left closes its row up. The alternative — the
+source keeping the workspace while the target draws it — means rendering one display's workspace
+inside another display's row at another display's scale, and a workspace's render state is
+configured per monitor. Moving the model instead is also what the cross-output *window* drag does,
+and what Mission Control shows: the space transfers as you cross.
 
-**The carry hands off at the seam.** The layout does not know monitor positions
-(`src/layout/mod.rs:4887`, the same reason a cross-output *window* drag teleports instead of
-animating), so a single carried thumbnail cannot travel across the boundary. Instead the source
-monitor ends its drag and the target begins one at the same grab offset: the pointer is the anchor,
-so the motion is continuous, and the only visible artefact is the thumbnail resizing at the seam
-when the two displays' strips differ in scale. A genuinely animated carry lands with monitor
-positions, together with the window drag.
+Four rules it keeps, three of which are what the crossing costs:
 
-**The source row holds its gap open** until the drop, and closes it only then. Otherwise dragging
-back to where the workspace came from means aiming at a row that moved — the same rule that keeps
-the row still during a within-output drag (`dynamic-workspaces-divergence.md`, "The row must be
-still for the whole drag"), now across two rows.
+**A crossing is not a drop.** The home tag is left alone while the workspace is in mid-air, and the
+carried display does not become active. Both happen at the drop, which is an *explicit move*
+(§2) — and the display it lands on becomes active for the same reason a keybinding aim makes its
+display active (§4).
 
-**The source keeps its invariants.** A display cannot be dragged below `MIN_NUM_WORKSPACES` or lose
-its trailing empty; the last workspace is not draggable away.
+**A carry that never lands goes back.** `Layout::thumb_carry` remembers where the workspace was
+picked up, so the overview closing under a carried thumbnail returns it there. Merely dragging over
+another display must not move a desktop the user never let go of.
+
+**A carry that wanders leaves no residue.** A display cannot be left short — removing a workspace
+restores the trailing empty and `MIN_NUM_WORKSPACES` immediately — so without bookkeeping every
+round trip across the seam would hand out one extra empty desktop. `ThumbCarry::counts` records
+what each display had before the carry left it, and `Monitor::shed_carry_padding_to` gives back
+exactly that much, never a desktop with windows or a name. The shed runs **before** the drag is
+re-armed on the far side: it renumbers the row, and a drag armed on a stale index carries the wrong
+workspace.
+
+**The grab travels as a fraction, not an offset.** Two displays' rows are different widths, so
+carrying the pixel offset would land the pointer somewhere else on the thumbnail, or clean off it.
+
+Still deferred: the layout does not know monitor positions (`src/layout/mod.rs:4887`, the same
+reason a cross-output *window* drag teleports instead of animating), so the carried thumbnail is
+handed over at the seam rather than travelling across it. The pointer is the anchor, so the motion
+is continuous; the visible artefact is the thumbnail resizing at the boundary when the two
+displays' strips differ in scale. An animated carry lands with monitor positions, together with the
+window drag.
 
 **A workspace context menu** — rename, close, and **Send to \<display\>** — is the keyboard- and
 screen-reader-reachable way to express the same move, which a drag is not. Rename is the UI the
@@ -259,9 +276,9 @@ The two the seat wants first are also the two with no dependencies, so they lead
 work: the drop rewrites the home tag through the same call site the identity change will rename, and
 the drag does not widen the unplug/replug gaps below — it only makes them easier to reach.
 
-1. **The pointer-decides chooser** (§4), and the removal of niri's `*UnderMouse` actions. No
-   dependencies, and it gives the drag its "which strip is under the pointer" plumbing.
-2. **The cross-output workspace drag** (§6), with the seam hand-off.
+1. **The pointer-decides chooser** (§4), and the removal of niri's `*UnderMouse` actions —
+   LANDED.
+2. **The cross-output workspace drag** (§6) — LANDED.
 3. **Identity unification** (§1) — `OutputIdentity` becomes the layout's home tag. Everything below
    keys off it.
 4. **Home ordinal and parked empties** (§2) — the unplug/replug fidelity a daily dock cycle needs.
