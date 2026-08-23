@@ -27811,14 +27811,46 @@ fn saved_on(connector: &str) -> crate::session_state::OutputIdentity {
 /// Where a restored window ended up: its display, and its position local to it.
 fn restored_placement(f: &mut Fixture) -> (String, (i32, i32)) {
     let win = f.synoik().layout.focus().unwrap().window.clone();
+    let (output, pos, _) = placement_of(f, &win);
+    (output, pos)
+}
+
+/// Where a specific window ended up: display, position local to it, and workspace index.
+///
+/// Not via `focus()` — a window restored onto a workspace that is not the active one never takes
+/// focus, and reading the focus then measures whichever window came before it.
+fn placement_of(f: &mut Fixture, win: &smithay::desktop::Window) -> (String, (i32, i32), usize) {
     let synoik = f.synoik();
-    let snapshot = synoik.layout.session_snapshot(&win).unwrap();
+    let snapshot = synoik.layout.session_snapshot(win).unwrap();
     let rect = snapshot.floating_rect.expect("it has a rect");
     let output = snapshot.output.expect("mapped on an output").name();
     (
         output,
         (rect.loc.x.round() as i32, rect.loc.y.round() as i32),
+        snapshot.workspace_idx,
     )
+}
+
+/// Every window the layout holds, to diff a restore against.
+fn windows_now(f: &mut Fixture) -> Vec<smithay::desktop::Window> {
+    f.synoik()
+        .layout
+        .windows()
+        .map(|(_, mapped)| mapped.window.clone())
+        .collect()
+}
+
+/// The one window that appeared since `before` — the restore we just drove.
+fn window_added_since(
+    f: &mut Fixture,
+    before: &[smithay::desktop::Window],
+) -> smithay::desktop::Window {
+    let mut added: Vec<smithay::desktop::Window> = windows_now(f)
+        .into_iter()
+        .filter(|win| !before.contains(win))
+        .collect();
+    assert_eq!(added.len(), 1, "exactly one window must have been added");
+    added.remove(0)
 }
 
 /// A restored window lands at the exact position it was saved at, on the display its record names
@@ -28057,7 +28089,7 @@ fn a_restored_window_whose_workspace_name_is_gone_falls_back_to_the_index() {
 /// Undocking: of two displays only one comes back, and each record is judged on its own.
 ///
 /// The window whose display is still there is exact — position included. The one whose display is
-/// gone keeps its size and its workspace, and takes a placed position, on the display that is left.
+/// gone keeps its size and takes a placed position, on the display that is left.
 #[test]
 fn one_display_missing_leaves_the_other_display_s_windows_exact() {
     let mut f = Fixture::new();
@@ -28083,37 +28115,195 @@ fn one_display_missing_leaves_the_other_display_s_windows_exact() {
 
     let mut placed = Vec::new();
     for name in ["stays", "goes"] {
+        let before = windows_now(&mut f);
         let (surface, _handle) = restore_window(&mut f, id, &session, name);
         map_at_configured_size(&mut f, id, &surface);
         f.settle();
-        placed.push(restored_placement(&mut f));
+        let win = window_added_since(&mut f, &before);
+        placed.push(placement_of(&mut f, &win));
     }
 
+    let (output, pos, _) = &placed[0];
     assert_eq!(
-        placed[0],
-        ("headless-1".to_owned(), (500, 400)),
+        (output.as_str(), *pos),
+        ("headless-1", (500, 400)),
         "the display that came back must restore exactly"
     );
-    assert_eq!(
-        placed[1].0, "headless-1",
-        "the other window has nowhere else"
-    );
+
+    let (output, pos, _) = &placed[1];
+    assert_eq!(output, "headless-1", "the other window has nowhere else");
     assert_ne!(
-        placed[1].1,
+        *pos,
         (500, 400),
         "but its position was local to a display that is not here, so it is placed, not replayed"
     );
 }
 
-/// A record whose display is gone still takes its saved workspace on the display it lands on, and
-/// that display's strip grows to reach it.
+/// A display that did not come back has its workspaces **appended** to the primary's strip, not
+/// merged into it — the same thing a live unplug does (`Monitor::append_workspaces`).
 ///
-/// The position is dropped because it is meaningless without its display; the index is kept
-/// because it is *relative*, and keeping it is what stops a set of windows spread over four
-/// desktops from collapsing onto one. The cost is real and deliberate: restoring onto a single
-/// display can create workspaces there.
+/// So the saved index is an offset from where the primary's own workspaces end, never an index
+/// into them. Merging would drop an external display's windows on top of whatever the primary
+/// already had at that number.
 #[test]
-fn a_missing_display_still_places_the_window_on_its_saved_workspace() {
+fn a_missing_display_s_workspaces_are_appended_to_the_primary_s() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    // Two windows on the primary, on its workspaces 0 and 1, and two from a display that is gone,
+    // on *its* workspaces 0 and 2.
+    let records = [
+        ("home-0", "headless-1", 0u32),
+        ("home-1", "headless-1", 1),
+        ("away-0", "headless-9", 0),
+        ("away-2", "headless-9", 2),
+    ];
+    for (name, connector, workspace) in records {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(workspace),
+                output: Some(saved_on(connector)),
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut landed = Vec::new();
+    for (name, _, _) in records {
+        let before = windows_now(&mut f);
+        let (surface, _handle) = restore_window(&mut f, id, &session, name);
+        map_at_configured_size(&mut f, id, &surface);
+        f.settle();
+        let win = window_added_since(&mut f, &before);
+        let (_, _, idx) = placement_of(&mut f, &win);
+        landed.push((name, idx));
+    }
+
+    assert_eq!(
+        landed,
+        vec![("home-0", 0), ("home-1", 1), ("away-0", 2), ("away-2", 4)],
+        "the primary keeps 0 and 1; the absent display's stack starts at the first free one and \
+         keeps its own gaps"
+    );
+}
+
+/// The offset must not depend on the order the clients happen to restore in.
+///
+/// It is computed from the session's records, never from the live strip, precisely because the
+/// strip grows as the burst lands — reading it made every window offset further than the last.
+#[test]
+fn the_appended_numbering_does_not_depend_on_restore_order() {
+    let records = [
+        ("home-1", "headless-1", 1u32),
+        ("away-0", "headless-9", 0),
+        ("away-2", "headless-9", 2),
+    ];
+
+    let landed = |order: [usize; 3]| {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+        let id = f.add_client();
+        f.roundtrip(id);
+        let (session, session_id) = new_session(&mut f, id);
+        for (name, connector, workspace) in records {
+            remember(
+                &mut f,
+                &session_id,
+                name,
+                ToplevelRecord {
+                    state: Some(WindowState::Floating.as_raw()),
+                    floating_rect: Some([100, 100, 300, 200]),
+                    workspace: Some(workspace),
+                    output: Some(saved_on(connector)),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut out = Vec::new();
+        for i in order {
+            let (name, _, _) = records[i];
+            let before = windows_now(&mut f);
+            let (surface, _handle) = restore_window(&mut f, id, &session, name);
+            map_at_configured_size(&mut f, id, &surface);
+            f.settle();
+            let win = window_added_since(&mut f, &before);
+            let (_, _, idx) = placement_of(&mut f, &win);
+            out.push((name, idx));
+        }
+        out.sort_unstable();
+        out
+    };
+
+    assert_eq!(
+        landed([0, 1, 2]),
+        landed([2, 1, 0]),
+        "the same records must land on the same workspaces whichever client asks first"
+    );
+}
+
+/// Two displays gone at once stack one after the other rather than interleaving.
+#[test]
+fn two_missing_displays_do_not_interleave_on_the_primary() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let records = [
+        ("a-0", "headless-8", 0u32),
+        ("a-1", "headless-8", 1),
+        ("b-0", "headless-9", 0),
+    ];
+    for (name, connector, workspace) in records {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(workspace),
+                output: Some(saved_on(connector)),
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut landed = Vec::new();
+    for (name, _, _) in records {
+        let before = windows_now(&mut f);
+        let (surface, _handle) = restore_window(&mut f, id, &session, name);
+        map_at_configured_size(&mut f, id, &surface);
+        f.settle();
+        let win = window_added_since(&mut f, &before);
+        let (_, _, idx) = placement_of(&mut f, &win);
+        landed.push((name, idx));
+    }
+
+    // The primary's strip is empty, so `headless-8` takes 0 and 1, and `headless-9` starts after.
+    assert_eq!(
+        landed,
+        vec![("a-0", 0), ("a-1", 1), ("b-0", 2)],
+        "connector order decides which absent display goes first, and neither splits the other"
+    );
+}
+
+/// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
+/// edit, and the offset only makes a hostile one larger.
+#[test]
+fn an_absurd_saved_workspace_is_clamped_rather_than_grown_to() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
 
@@ -28126,44 +28316,23 @@ fn a_missing_display_still_places_the_window_on_its_saved_workspace() {
         "main",
         ToplevelRecord {
             state: Some(WindowState::Floating.as_raw()),
-            floating_rect: Some([500, 400, 300, 200]),
-            workspace: Some(3),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(u32::MAX),
             output: Some(saved_on("headless-9")),
             ..Default::default()
         },
     );
 
-    let before = f.synoik().layout.workspaces().count();
+    let before = windows_now(&mut f);
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
     f.settle();
 
-    let win = f
-        .synoik()
-        .layout
-        .windows()
-        .next()
-        .map(|(_, mapped)| mapped.window.clone())
-        .expect("the window must be in the layout");
-    let (idx, pos) = {
-        let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
-        (
-            snapshot.workspace_idx,
-            snapshot
-                .floating_rect
-                .map(|r| (r.loc.x as i32, r.loc.y as i32)),
-        )
-    };
-
-    assert_eq!(idx, 3, "the saved workspace still applies");
+    let win = window_added_since(&mut f, &before);
+    let (_, _, idx) = placement_of(&mut f, &win);
     assert!(
-        f.synoik().layout.workspaces().count() > before,
-        "and the strip grew to reach it"
-    );
-    assert_eq!(
-        pos,
-        Some((490, 276)),
-        "while the position is the placed one, not the saved one"
+        idx <= 36,
+        "the index must be capped at GNOME's num-workspaces range, got {idx}"
     );
 }
 
@@ -28192,11 +28361,13 @@ fn a_restored_window_whose_display_is_gone_is_placed_normally() {
         },
     );
 
+    let before = windows_now(&mut f);
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
     f.settle();
 
-    let (output, pos) = restored_placement(&mut f);
+    let win = window_added_since(&mut f, &before);
+    let (output, pos, _) = placement_of(&mut f, &win);
     assert_eq!(output, "headless-1", "the only display there is");
     assert_ne!(
         pos,

@@ -93,9 +93,25 @@ Consequences, all of them deliberate:
   a veto, the same rule `monitors.xml` matching uses. Matching a panel across a *renamed* connector
   is deferred in both stores at once, so a session and its layout never disagree about which
   display is which.
-- **No display, no position.** An unresolved identity drops the position and the output seed; the
-  size and window state still apply, and placement decides the rest. Replaying an output-local rect
-  onto some other monitor would be a guess wearing a memory's clothes.
+- **No display, no position.** An unresolved identity drops the position; the size and window state
+  still apply. Replaying an output-local rect onto some other monitor would be a guess wearing a
+  memory's clothes. (Richer handling — recomputing a sensible size and position for a display that
+  is not the one the window left, which the same machinery will want when a workspace is *moved*
+  between displays — is wanted and not built.)
+- **A homeless display's workspaces are appended to the primary's, not merged into them.** That is
+  what a live unplug already does (`Monitor::append_workspaces` inserts the removed stack before the
+  trailing empty workspace), so a restore that finds the display missing lands the same way: the
+  saved index becomes an offset past everything the primary's strip will hold, and several absent
+  displays stack in connector order rather than interleaving. The whole group is seeded onto the
+  primary for the same reason — per-window fallback through the pointer would scatter it and make
+  the numbering meaningless.
+
+  The offset is computed **from the session's records, never from the live strip**: the strip grows
+  as the restore burst lands, so reading it makes the answer depend on arrival order and drift
+  upward with every window. It is also scoped to one session — two apps restoring at once each
+  offset against the primary's own strip, so their absent-display windows can interleave with each
+  other's. Coordinating that would mean reading every other session in the store, stale ones
+  included.
 - **The position is constrained to where it lands.** The display it comes back on may be smaller
   than the one it left, which is the whole point — so the rect is clamped into the working area, in
   the spirit of `META_MOVE_RESIZE_CONSTRAIN`.

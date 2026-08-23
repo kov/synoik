@@ -1100,6 +1100,20 @@ impl<W: LayoutElement> Layout<W> {
     /// §4), primary is *only* the monitor that adopts workspaces orphaned by an unplug — it does
     /// not decide where workspace switching happens, since nothing global does. A no-op if the
     /// output has no monitor (it is not connected, or the layout has none yet).
+    /// The monitor an unplugged display's workspaces are appended to, and so where a session
+    /// record whose display did not come back belongs. `None` when there are no monitors.
+    pub fn primary_output(&self) -> Option<&Output> {
+        let MonitorSet::Normal {
+            monitors,
+            primary_idx,
+            ..
+        } = &self.monitor_set
+        else {
+            return None;
+        };
+        monitors.get(*primary_idx).map(|mon| mon.output())
+    }
+
     pub fn set_primary_output(&mut self, output: &Output) {
         let MonitorSet::Normal {
             monitors,

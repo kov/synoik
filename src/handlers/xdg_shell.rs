@@ -1015,9 +1015,17 @@ struct SessionRestore {
     handle: XdgToplevelSessionV1,
     /// Decides activation, and nothing else.
     reason: Reason,
+    /// The record as it will be replayed. Its `workspace` may have been offset — see
+    /// [`State::appended_workspace_offset`].
     record: ToplevelRecord,
-    /// The output the saved rect lands on, or `None` if that monitor is gone.
+    /// The output the record names, or `None` if that display is not connected.
+    ///
+    /// Gates the position: an output-local rect means nothing without its output.
     output: Option<Output>,
+    /// Where a record whose display is gone goes instead: the primary, matching what a live
+    /// unplug does with that display's workspaces. Deliberately *not* `output`, which would
+    /// unlock the position replay along with it.
+    fallback_output: Option<Output>,
 }
 
 impl State {
@@ -1061,10 +1069,29 @@ impl State {
             return None;
         };
 
+        let mut record = record;
         let output = record
             .output
             .as_ref()
             .and_then(|saved| self.output_matching_identity(saved));
+
+        // A display that did not come back sends its windows to the primary, where a live unplug
+        // would have appended its workspaces — so they append here too, after everything the
+        // primary's strip already holds, rather than interleaving with it.
+        // Only a record that *names* a display can be homeless: one with no display recorded (a
+        // v1 leftover, or a window that was never on an output) has no group to keep together and
+        // no strip to be appended after, so it takes the ordinary placement path unchanged.
+        let fallback_output = if output.is_some() || record.output.is_none() {
+            None
+        } else {
+            let primary = self.synoik.layout.primary_output().cloned();
+            if let Some((primary, idx)) = primary.as_ref().zip(record.workspace) {
+                let offset = self.appended_workspace_offset(session, primary, &record);
+                record.workspace = Some(idx.saturating_add(offset));
+            }
+            primary
+        };
+
         info!(
             "session restore: {}/{} replaying {:?} state {:?} workspace {:?}/{:?} onto {:?} (saved on {:?})",
             target.session_id,
@@ -1082,7 +1109,80 @@ impl State {
             reason: target.reason,
             record,
             output,
+            fallback_output,
         })
+    }
+
+    /// How far to push a record whose display is gone down the primary's strip.
+    ///
+    /// A live unplug appends the removed display's whole stack to the primary, before the trailing
+    /// empty workspace, with its internal order intact (`Monitor::append_workspaces`). A restore
+    /// that finds the display missing should land the same way, so an absent display's records are
+    /// shifted past everything the primary's strip will hold: the workspaces it already has, and
+    /// the ones this session's *present* records will grow it to. Absent displays then stack after
+    /// one another in connector order, so two of them do not interleave.
+    ///
+    /// Pure in (session records, connected outputs): every toplevel in a restore burst computes
+    /// the same answer whatever order they arrive in, which is what lets this stay per-request
+    /// with no session state carried across the idle.
+    ///
+    /// Scoped to one session on purpose. Two apps restoring at once each offset against the
+    /// primary's own strip, so their absent-display windows can interleave with each other's;
+    /// coordinating that would mean reading every other session in the store, including stale ones
+    /// whose windows will never come back.
+    fn appended_workspace_offset(
+        &self,
+        session: &crate::session_state::SessionRecord,
+        primary: &Output,
+        restoring: &ToplevelRecord,
+    ) -> u32 {
+        // One past the highest workspace a set of records asks for, or 0 for none at all.
+        let reach = |records: &mut dyn Iterator<Item = &ToplevelRecord>| {
+            records
+                .filter_map(|record| record.workspace)
+                .map(|idx| idx.saturating_add(1))
+                .max()
+                .unwrap_or(0)
+        };
+
+        // What the primary's strip will hold on its own account: this session's records anchored
+        // to a display that *is* connected and resolves to the primary.
+        //
+        // Read from the records, never from the live strip. The live count grows as the burst
+        // lands, so basing on it would make the offset depend on arrival order and drift upward
+        // with every window — the answer has to be the same for the first restore and the last.
+        let mut base = reach(&mut session.toplevels.values().filter(|record| {
+            record
+                .output
+                .as_ref()
+                .is_some_and(|saved| self.output_matching_identity(saved).as_ref() == Some(primary))
+        }));
+
+        // Then absent displays, in connector order, each after the last.
+        let mut absent: Vec<&str> = session
+            .toplevels
+            .values()
+            .filter_map(|record| record.output.as_ref())
+            .filter(|saved| self.output_matching_identity(saved).is_none())
+            .map(|saved| saved.connector.as_str())
+            .collect();
+        absent.sort_unstable();
+        absent.dedup();
+
+        let mine = restoring
+            .output
+            .as_ref()
+            .map(|saved| saved.connector.as_str());
+        for connector in absent {
+            if Some(connector) == mine {
+                return base;
+            }
+            base = base.saturating_add(reach(&mut session.toplevels.values().filter(|record| {
+                record.output.as_ref().map(|saved| saved.connector.as_str()) == Some(connector)
+            })));
+        }
+
+        base
     }
 
     /// The connected output a record was saved on, by identity.
@@ -1188,7 +1288,12 @@ impl State {
         let fullscreen_output = wants_fullscreen.as_ref().and_then(|x| x.as_ref());
         // A restore's saved rect names the output ahead of a rule, since it *is* where the window
         // was; the rule only ever described where it should open the first time.
-        let restore_output = restore.as_ref().and_then(|r| r.output.as_ref());
+        // The recorded display when it is here, else the primary — a homeless *group* has to land
+        // together for its appended workspace numbering to mean anything, and per-window fallback
+        // through the pointer or the active monitor would scatter it.
+        let restore_output = restore
+            .as_ref()
+            .and_then(|r| r.output.as_ref().or(r.fallback_output.as_ref()));
         let seed_output = [restore_output, rule_output, fullscreen_output]
             .into_iter()
             .flatten()
