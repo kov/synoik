@@ -29753,6 +29753,99 @@ fn a_user_maximized_window_is_not_un_maximized_by_a_bigger_display() {
     );
 }
 
+/// The *reason* a restored window is maximized outlives the logout too.
+///
+/// Without the mark in the record, a window restored maximized is indistinguishable from one the
+/// user maximized, and the bigger display would never give it its geometry back.
+#[test]
+fn a_maximize_the_display_forced_is_still_the_display_s_after_a_restart() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.add_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1000, 800);
+    w.set_min_size(900, 700);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let settle = |f: &mut Fixture, client: ClientId, surface: &WlSurface| {
+        f.double_roundtrip(client);
+        let win = f.client(client).window(surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(client);
+        f.settle();
+    };
+
+    // Nothing it could be resized to fits 700 rows of minimum, so it maximizes.
+    f.resize_output(1, Some((1024, 600)), None);
+    settle(&mut f, id, &surface);
+
+    let w = f.client(id).window(&surface);
+    w.attach_null_buffer();
+    w.commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .and_then(|session| session.toplevels.get("main"))
+        .cloned()
+        .expect("the unmap saved it");
+    assert!(record.auto_maximized, "the record says who maximized it");
+
+    drop(session);
+    let second = f.add_client();
+    f.roundtrip(second);
+    let session = f
+        .client(second)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+    map_at_configured_size(&mut f, second, &surface);
+    f.client(second).window(&surface).set_min_size(900, 700);
+    settle(&mut f, second, &surface);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let snapshot = |f: &mut Fixture| f.synoik().layout.session_snapshot(&win).unwrap().tile;
+    assert!(
+        snapshot(&mut f).sizing_mode.is_maximized(),
+        "it comes back maximized, as it was"
+    );
+
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f, second, &surface);
+
+    let tile = snapshot(&mut f);
+    assert!(
+        !tile.sizing_mode.is_maximized(),
+        "a display that can hold it releases a maximize the display forced"
+    );
+    let rect = tile.floating_rect.expect("it floats again");
+    assert_eq!(
+        (rect.size.w.round() as i32, rect.size.h.round() as i32),
+        (1000, 800),
+        "and it lands on the geometry it had before any display shrank it"
+    );
+}
+
 /// The geometry a small display overrode outlives a logout: the record carries it, and a restore
 /// on a display that can hold it puts the window back the way it was.
 ///
@@ -29857,6 +29950,58 @@ fn a_displaced_geometry_comes_back_from_the_session_store() {
         (rect.size.w.round() as i32, rect.size.h.round() as i32),
         (1000, 800),
         "the display that can hold it again gives the window its own geometry back"
+    );
+}
+
+/// A window the user maximized *while it was displaced* stays maximized when the area grows.
+///
+/// The case only the mark can answer: the overridden geometry is still on the tile, so the
+/// un-maximize has a rect to go back to — and must not use it, because the maximize is the user's.
+#[test]
+fn a_user_maximize_over_a_displacement_survives_the_area_growing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1000, 800), None);
+
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    // Displaced first: the work area can no longer hold 800 rows.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let is_maximized = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .sizing_mode
+            .is_maximized()
+    };
+    assert!(!is_maximized(&mut f), "displaced, not maximized");
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    settle(&mut f);
+    assert!(is_maximized(&mut f), "now the user has maximized it");
+
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f);
+    assert!(
+        is_maximized(&mut f),
+        "the area can hold the overridden geometry again, but the maximize is the user's"
     );
 }
 

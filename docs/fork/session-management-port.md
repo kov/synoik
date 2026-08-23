@@ -112,6 +112,14 @@ Consequences, all of them deliberate:
 - **The position is constrained to where it lands.** The display it comes back on may be smaller
   than the one it left, which is the whole point — so the rect is clamped into the working area, in
   the spirit of `META_MOVE_RESIZE_CONSTRAIN`.
+- **What a smaller display overrode is recorded next to what it overrode it with.** A window a
+  narrow work area shrank keeps its own geometry in `displaced-rect`, and one that could not be
+  shrunk at all — a minimum size larger than the area — is marked `auto-maximized`. Both are the
+  window's *desired* shape, not its live one, so a display that can hold it again hands it back
+  (`multi-display.md` §5). The two keys are gated differently on read: the rect is a position and
+  follows "no display, no position", while the mark is only *who* maximized the window and is read
+  back whatever display the window lands on — otherwise a restored auto-maximize would be
+  indistinguishable from the user's and could never be released.
 - **A workspace name outranks the index, and the recorded display.** Workspaces here are dynamic
   *and* per-monitor ([[docs/fork/dynamic-workspaces-divergence.md]] §4), so an index is an index
   into a stack that grows and shrinks — approximate by construction. A name is the only handle that
@@ -209,6 +217,8 @@ sessions:
       "<client-chosen name>":
         state: 1
         floating-rect: [x, y, w, h]
+        displaced-rect: [x, y, w, h]
+        auto-maximized: false
         workspace: 0
 ```
 
