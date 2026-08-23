@@ -11859,6 +11859,7 @@ impl Synoik {
                         buttons: &buttons,
                         names: &names,
                         entry,
+                        band: mon.thumbnail_band().unwrap_or_default(),
                     },
                 ) {
                     group.push(element.into());

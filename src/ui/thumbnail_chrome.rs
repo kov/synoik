@@ -17,8 +17,9 @@
 
 use std::cell::RefCell;
 
+use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Rectangle, Size};
+use smithay::utils::{Logical, Rectangle, Scale, Size};
 
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::TextureRenderElement;
@@ -56,6 +57,10 @@ pub struct StripChrome<'a> {
     pub names: &'a [ThumbnailName],
     /// The name entry, when a rename is in progress.
     pub entry: Option<ThumbnailEntry<'a>>,
+    /// The band the strip is clipped to, where it currently is. The chrome is clipped to the
+    /// same rect the thumbnails are: the row scrolls, so a label whose thumbnail has been
+    /// scrolled out of the band must go out with it rather than float over the picker.
+    pub band: Rectangle<f64, Logical>,
 }
 
 /// The name entry, while a workspace is being renamed.
@@ -113,6 +118,7 @@ impl ThumbnailChrome {
             buttons,
             names,
             entry,
+            band,
         } = chrome;
         let mut elements: Vec<ThumbnailChromeRenderElement> = Vec::new();
 
@@ -254,12 +260,23 @@ impl ThumbnailChrome {
             }
         }
 
+        let band = band.to_physical_precise_round(Scale::from(scale));
         elements
+            .into_iter()
+            .filter_map(|elem| match elem {
+                ThumbnailChromeRenderElement::Texture(elem) => {
+                    CropRenderElement::from_element(elem, Scale::from(scale), band)
+                        .map(ThumbnailChromeRenderElement::Cropped)
+                }
+                other => Some(other),
+            })
+            .collect()
     }
 }
 
 synoik_render_elements! {
     ThumbnailChromeRenderElement => {
         Texture = TextureRenderElement<VkTexture>,
+        Cropped = CropRenderElement<TextureRenderElement<VkTexture>>,
     }
 }

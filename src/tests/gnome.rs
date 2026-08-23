@@ -30649,6 +30649,48 @@ fn a_click_in_the_name_entry_keeps_the_rename() {
     );
 }
 
+/// The name label rides the strip's slide, so it leaves with the thumbnail it belongs to.
+///
+/// The strip slides out of the top of the screen when the overview closes; a rect computed at
+/// rest leaves the label sitting where the thumbnail *was*, at full size, attached to nothing.
+#[test]
+fn a_workspace_name_leaves_with_its_thumbnail() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName(String::from("Mail")), false);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let label_y = |f: &mut Fixture| -> f64 {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("on a monitor")
+            .thumbnail_names()
+            .first()
+            .expect("the name is on the strip")
+            .1
+            .loc
+            .y
+    };
+    let at_rest = label_y(&mut f);
+
+    // Frozen before the overview is dismissed, so the
+    // slide is sampled rather than run out.
+    f.freeze_clock();
+    tap(&mut f, KEY_LEFTMETA);
+    f.advance_clock(Duration::from_micros(16_667 * 3));
+    f.dispatch();
+    f.refresh();
+
+    let mid = label_y(&mut f);
+    assert!(
+        mid < at_rest,
+        "the label must travel with the strip on the way out: was {at_rest}, mid-slide {mid}"
+    );
+}
+
 /// A named workspace is always present: unplugging the display it belongs to moves it to the
 /// survivor rather than parking it, and plugging that display back in takes it home again.
 ///

@@ -1116,12 +1116,12 @@ impl<W: LayoutElement> Monitor<W> {
             return Vec::new();
         };
         let ramp = overview_layout::chrome_ramp(self.view_size);
+        let slide = self.strip_slide(&strip);
         zip(&self.workspaces, &strip.thumbs)
             .enumerate()
             .filter(|(idx, _)| self.workspace_is_closable(*idx))
             .map(|(idx, (ws, slot))| {
-                let thumb =
-                    thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), Point::default());
+                let thumb = thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), slide);
                 (ws.id(), thumbnails::close_rect(thumb, ramp))
             })
             .collect()
@@ -1136,12 +1136,12 @@ impl<W: LayoutElement> Monitor<W> {
         let Some(strip) = self.thumbnail_strip() else {
             return Vec::new();
         };
+        let slide = self.strip_slide(&strip);
         zip(&self.workspaces, &strip.thumbs)
             .enumerate()
             .filter_map(|(idx, (ws, slot))| {
                 let name = ws.name.clone()?;
-                let thumb =
-                    thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), Point::default());
+                let thumb = thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), slide);
                 Some((ws.id(), thumb, name))
             })
             .collect()
@@ -1156,7 +1156,7 @@ impl<W: LayoutElement> Monitor<W> {
         Some(thumbnail_drawn_rect(
             *slot,
             self.strip_render_scale(idx),
-            Point::default(),
+            self.strip_slide(&strip),
         ))
     }
 
@@ -3136,6 +3136,28 @@ impl<W: LayoutElement> Monitor<W> {
     /// Whether a reorder drag is under way.
     pub fn thumb_drag_active(&self) -> bool {
         self.thumb_drag.is_some()
+    }
+
+    /// How far the strip is displaced from its resting place by the overview transition — zero
+    /// once it is open, and what the row is drawn with while it slides in or out.
+    ///
+    /// Every rect the strip's *chrome* is placed by carries it too: a label or a close button
+    /// placed at rest while the thumbnail it belongs to slides away stays behind on screen, at
+    /// full size, attached to nothing.
+    fn strip_slide(&self, strip: &Strip) -> Point<f64, Logical> {
+        let Some(progress) = self.strip_progress() else {
+            return Point::default();
+        };
+        Point::from((0., self.thumbnail_slide_offset(strip, progress)))
+    }
+
+    /// The band the strip is clipped to, where it currently is. Everything the strip draws is
+    /// clipped to it, chrome included — a row scrolls, and a label whose thumbnail has been
+    /// scrolled out of the band must go with it.
+    pub fn thumbnail_band(&self) -> Option<Rectangle<f64, Logical>> {
+        let strip = self.thumbnail_strip()?;
+        let slide = self.strip_slide(&strip);
+        Some(Rectangle::new(strip.band.loc + slide, strip.band.size))
     }
 
     /// The strip slides in from above the screen with the overview
