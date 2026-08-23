@@ -3226,6 +3226,17 @@ impl State {
                 warn!("deadline dispatch is now {}", if on { "on" } else { "off" });
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugToggleOutput(connector) => {
+                let crate::backend::Backend::Headless(headless) = &mut self.backend else {
+                    warn!("debug-toggle-output only works on the headless backend");
+                    return;
+                };
+                if headless.toggle_output(&mut self.synoik, &connector) {
+                    warn!("toggled headless output {connector}");
+                } else {
+                    warn!("no output or unplugged output named {connector}");
+                }
+            }
             Action::DebugSetBattery(percentage, state, warning) => {
                 use crate::system_status::{BatteryState, BatteryStatus, BatteryWarning};
                 if state == "auto" {
@@ -10650,6 +10661,7 @@ fn is_debug_action(action: &Action) -> bool {
             | Action::DebugToggleDeadlineDispatch
             | Action::DebugSetRenderTimeMargin(_)
             | Action::DebugSetBattery(..)
+            | Action::DebugToggleOutput(_)
     )
 }
 

@@ -1119,6 +1119,17 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long, default_value = "none"))]
         warning: String,
     },
+    /// Unplug a headless display, or plug a previously unplugged one back in.
+    ///
+    /// A headless run has no cable to pull, and what a display going away and coming back costs
+    /// -- workspaces evacuating, parked empties, a home tag being honoured -- is the whole of
+    /// `docs/fork/multi-display.md`. Ignored on a real backend, where the kernel decides.
+    ///
+    /// The display comes back as the *same* display: same connector, mode and EDID serial.
+    DebugToggleOutput {
+        /// Connector name, e.g. `headless-2`.
+        connector: String,
+    },
     /// Move the focused window between the floating and the tiling layout.
     ToggleWindowFloating {
         /// Id of the window to move.

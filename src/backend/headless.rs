@@ -104,6 +104,18 @@ pub struct Headless {
     /// output and reads the mode through it, and smithay damages the whole output by itself when
     /// the size or transform changes.
     damage_trackers: HashMap<Output, OutputDamageTracker>,
+
+    /// Displays [unplugged](Self::unplug_output) at runtime, so the same panel can be plugged back
+    /// in. A headless run has no hardware to pull the cable on, and what a display going away and
+    /// coming back costs is the whole of `docs/fork/multi-display.md`.
+    unplugged: Vec<UnpluggedOutput>,
+}
+
+/// A display that was unplugged, kept so plugging it back in is the *same* display.
+struct UnpluggedOutput {
+    connector: String,
+    size: (u16, u16),
+    serial: String,
 }
 
 /// A test's hook into [`Headless::render`]: the renderer, the output, and the element list of a
@@ -129,7 +141,60 @@ impl Headless {
             #[cfg(test)]
             frame_sink: None,
             damage_trackers: HashMap::new(),
+            unplugged: Vec::new(),
         }
+    }
+
+    /// Pulls the cable on a connected display, or plugs a previously unplugged one back in.
+    ///
+    /// Returns whether anything happened. The display comes back as the *same* display — same
+    /// connector, same mode, same EDID serial — which is what makes it able to take its workspaces
+    /// back (`docs/fork/multi-display.md` §1).
+    pub fn toggle_output(&mut self, synoik: &mut Synoik, connector: &str) -> bool {
+        let connected = synoik
+            .global_space
+            .outputs()
+            .find(|output| output.name() == connector)
+            .cloned();
+        if let Some(output) = connected {
+            let mode = output.current_mode().expect("a live output has a mode");
+            let serial = output
+                .user_data()
+                .get::<OutputName>()
+                .and_then(|name| name.serial.clone())
+                .unwrap_or_default();
+            self.unplugged.push(UnpluggedOutput {
+                connector: connector.to_owned(),
+                size: (mode.size.w as u16, mode.size.h as u16),
+                serial,
+            });
+
+            self.ipc_outputs
+                .lock()
+                .unwrap()
+                .retain(|_, ipc| ipc.name != connector);
+            self.damage_trackers.remove(&output);
+            synoik.remove_output(&output);
+            return true;
+        }
+
+        let Some(idx) = self
+            .unplugged
+            .iter()
+            .position(|out| out.connector == connector)
+        else {
+            return false;
+        };
+        let out = self.unplugged.remove(idx);
+        let Some(n) = out
+            .connector
+            .strip_prefix("headless-")
+            .and_then(|n| n.parse().ok())
+        else {
+            return false;
+        };
+        self.add_output_with_serial(synoik, n, out.size, &out.serial);
+        true
     }
 
     /// A GBM device for screencast buffer allocation, opened on first use.

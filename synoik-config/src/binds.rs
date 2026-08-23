@@ -134,6 +134,7 @@ pub enum Action {
     DebugSetRenderTimeMargin(f64),
     /// Percentage, UPower state spelling, UPower warning-level spelling.
     DebugSetBattery(f64, String, String),
+    DebugToggleOutput(String),
     Spawn(Vec<String>),
     SpawnSh(String),
     DoScreenTransition(Option<u16>),
@@ -745,6 +746,9 @@ impl From<synoik_ipc::Action> for Action {
                 state,
                 warning,
             } => Self::DebugSetBattery(percentage, state, warning),
+            synoik_ipc::Action::DebugToggleOutput { connector } => {
+                Self::DebugToggleOutput(connector)
+            }
             synoik_ipc::Action::ToggleWindowFloating { id: None } => Self::ToggleWindowFloating,
             synoik_ipc::Action::ToggleWindowFloating { id: Some(id) } => {
                 Self::ToggleWindowFloatingById(id)

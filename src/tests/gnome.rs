@@ -10232,6 +10232,39 @@ fn dragging_a_thumbnail_to_another_display_moves_the_workspace() {
     );
 }
 
+/// The unplug a headless run has no cable for. Everything a display going away and coming back
+/// costs is only reachable with one, and the corpus's own `add_output`/`remove_output` do not go
+/// through the compositor's action path — this is what a live session is driven by.
+#[test]
+fn the_debug_unplug_takes_a_display_away_and_gives_the_same_one_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    pointer_motion_to(&mut f, 2880., 540.);
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-2");
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleOutput("headless-2".to_owned()), false);
+    f.settle();
+    assert_eq!(f.synoik().layout.monitors().count(), 1);
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleOutput("headless-2".to_owned()), false);
+    f.settle();
+    assert_eq!(
+        window_workspace_output(&mut f, &win),
+        "headless-2",
+        "the same display came back, so it took its workspace with it"
+    );
+}
+
 /// An empty desktop between two populated ones is part of the arrangement. It is parked while its
 /// display is away — never materialized on the survivor, where it would be an anonymous desktop
 /// the user never made — and comes back in its place, hole and all
