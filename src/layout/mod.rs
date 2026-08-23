@@ -1159,6 +1159,7 @@ impl<W: LayoutElement> Layout<W> {
                 // would come home wherever the evacuation had left it. The ordinals say where in
                 // *this* display's strip each one sat, and the sort is stable so anything that
                 // never got one keeps the order it was evacuated in.
+                Self::drop_displaced_empties(&mut workspaces);
                 workspaces.sort_by_key(|ws| ws.home_ordinal);
 
                 let ws_id_to_activate = self.take_last_active_workspace(&output);
@@ -1184,6 +1185,7 @@ impl<W: LayoutElement> Layout<W> {
             }
             MonitorSet::NoOutputs { mut workspaces } => {
                 workspaces.extend(self.take_parked_for(&output));
+                Self::drop_displaced_empties(&mut workspaces);
                 workspaces.sort_by_key(|ws| ws.home_ordinal);
 
                 let ws_id_to_activate = self.take_last_active_workspace(&output);
@@ -2403,6 +2405,23 @@ impl<W: LayoutElement> Layout<W> {
     ) -> Option<WorkspaceId> {
         let mon = self.monitor_for_output_mut(output)?;
         Some(mon.ensure_workspace_at(idx, block_start).id())
+    }
+
+    /// Drops the anonymous empties a returning display's own desktops have taken the rank of.
+    ///
+    /// Two workspaces can claim one ordinal, because a session restore stamps it from a *saved*
+    /// index and the strip the display had this run knows nothing about it (§3). An anonymous
+    /// empty gives way to a desktop with windows on it: it is filler either way — the strip makes
+    /// another the moment one is needed — and keeping it puts a blank desktop between two windows
+    /// that were side by side. A **named** empty is not filler and stays, at whatever rank the
+    /// sort gives it.
+    fn drop_displaced_empties(workspaces: &mut Vec<Workspace<W>>) {
+        let claimed: Vec<usize> = workspaces
+            .iter()
+            .filter(|ws| ws.has_windows())
+            .map(|ws| ws.home_ordinal)
+            .collect();
+        workspaces.retain(|ws| ws.has_windows_or_name() || !claimed.contains(&ws.home_ordinal));
     }
 
     /// Where the workspaces restored for absent displays begin on `output`'s strip.

@@ -143,7 +143,11 @@ ordinal, so plugging that display in reclaims it into the arrangement it was sav
 thing an unplug and a replug do for a workspace that never left (§2).
 
 Gaps do not survive a restart, unlike a live unplug and replug: nothing persists an empty
-workspace, so a desktop the user left empty is a desktop no record names.
+workspace, so a desktop the user left empty is a desktop no record names. For the same reason a
+restored ordinal can collide with one the display's *own* strip is already using this run — the
+saved index knows nothing about it. The anonymous empty gives way (`Layout::drop_displaced_empties`)
+rather than sitting between two desktops that were side by side; a **named** empty is not filler and
+stays.
 
 A workspace name still outranks the index when matching (`session-management-port.md`), which is
 what makes naming worth a UI (§6).

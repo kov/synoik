@@ -29449,6 +29449,72 @@ fn a_restored_workspace_goes_home_when_its_display_arrives() {
     );
 }
 
+/// A display coming back finds its restored desktops next to each other, not split by its own
+/// empties.
+///
+/// The home ordinal a restore stamps comes from a *saved* index, and the strip that display had
+/// this run knows nothing about it — so two workspaces can claim the same rank. The empty one
+/// loses: a blank desktop between two windows that were side by side is not the arrangement
+/// anybody saved.
+#[test]
+fn a_replug_does_not_split_restored_desktops_with_its_own_empties() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(9, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    for (name, workspace) in [("away-0", 0u32), ("away-1", 1)] {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(workspace),
+                output: Some(saved_on("headless-9")),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Away it goes, with the two empty desktops it had this run.
+    f.synoik_state()
+        .do_action(Action::DebugToggleOutput("headless-9".to_owned()), false);
+    f.settle();
+
+    let mut restored = Vec::new();
+    for name in ["away-0", "away-1"] {
+        let before = windows_now(&mut f);
+        let (surface, _handle) = restore_window(&mut f, id, &session, name);
+        map_at_configured_size(&mut f, id, &surface);
+        f.settle();
+        restored.push((name, window_added_since(&mut f, &before)));
+    }
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleOutput("headless-9".to_owned()), false);
+    f.settle();
+
+    let landed: Vec<_> = restored
+        .into_iter()
+        .map(|(name, win)| {
+            let (output, _, idx) = placement_of(&mut f, &win);
+            (name, output, idx)
+        })
+        .collect();
+    assert_eq!(
+        landed,
+        vec![
+            ("away-0", String::from("headless-9"), 0),
+            ("away-1", String::from("headless-9"), 1),
+        ],
+        "both went home, and next to each other"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]
