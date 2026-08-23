@@ -92,3 +92,9 @@ reference/history only — do not rebase/merge from them. Owned-render-stack dir
 and `cargo clippy --workspace --all-targets -- -D warnings`. It is not active until each clone
 opts in: `git config core.hooksPath .githooks` (per-clone local config, so a fresh checkout must
 re-run it). Always run `cargo fmt --all` before committing regardless.
+
+**Track CI's stable.** The clippy job installs whatever stable is current, so a Rust release is a
+gate change that shows up as a red `main` on code nobody touched. When CI's stable is ahead of the
+local one, `rustup update stable` and **fix the new lints — do not silence them**. The hook only
+means anything if the local stable is the runner's. Note `clippy --fix` may roll the whole crate
+back when one of its own edits fails to compile; apply from its JSON spans and hand-fix the rest.
