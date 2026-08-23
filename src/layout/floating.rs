@@ -427,8 +427,27 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let old_area = self.working_area;
         let tile = &self.tiles[idx];
 
-        // Only a plain floating window. Maximized, fullscreen and edge-tiled geometry is a
-        // function of the work area, and `refit_to_working_area` re-derives it.
+        // A window this maximized because nothing else fit comes back out when something does.
+        if tile.auto_maximized && tile.window().pending_sizing_mode().is_maximized() {
+            let desired = tile.displaced_rect?;
+            let restored = Rectangle::new(desired.loc + area.loc, desired.size);
+            if !area.contains_rect(restored) {
+                return None;
+            }
+            let id = tile.window().id().clone();
+            self.set_maximized(&id, false);
+            let tile = &mut self.tiles[idx];
+            tile.displaced_rect = None;
+            let win_size = Size::from((
+                tile.window_width_for_tile_width(desired.size.w).round() as i32,
+                tile.window_height_for_tile_height(desired.size.h).round() as i32,
+            ));
+            tile.window_mut().request_size_once(win_size, false);
+            return Some(restored.loc);
+        }
+
+        // Only a plain floating window otherwise. Maximized, fullscreen and edge-tiled geometry is
+        // a function of the work area, and `refit_to_working_area` re-derives it.
         if !tile.window().pending_sizing_mode().is_normal()
             || tile.window().edge_tiled_side().is_some()
         {
@@ -466,6 +485,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.tile_height_for_window_height(f64::from(win_size.h)),
         ));
         let fits = tile_size.w >= desired.size.w && tile_size.h >= desired.size.h;
+        // Whether the fit fits: a minimum size bigger than the area comes back out of the clamp
+        // unchanged, and no size we could ask for would help.
+        let fit_at_all = tile_size.w <= area.size.w && tile_size.h <= area.size.h;
 
         // Unanimated, for `refit_to_working_area`'s reason: the user did not ask for this, the
         // area moved underneath them, and mutter re-constrains such a window instantly.
@@ -477,9 +499,45 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return area.contains_rect(restored).then_some(restored.loc);
         }
 
-        tile.displaced_rect.get_or_insert(current);
-        tile.window_mut().request_size_once(win_size, false);
+        self.tiles[idx].displaced_rect.get_or_insert(current);
+
+        // Even at its minimum size the window does not fit. Maximizing is the honest "as large as
+        // we can give you", and it is what the user gets to come back from — `restore_normal`
+        // already carries the rect. Not the 0.8 area rule, deliberately: that is a *map-time*
+        // policy, and re-running it here would maximize a deliberately large window on every dock
+        // cycle (`docs/fork/multi-display.md` §5).
+        if !fit_at_all && self.can_auto_maximize(idx, area) {
+            let id = self.tiles[idx].window().id().clone();
+            self.set_maximized(&id, true);
+            self.tiles[idx].auto_maximized = true;
+            return None;
+        }
+
+        // A window that cannot be maximized either — its own maximum size is smaller than the work
+        // area, or the user turned auto-maximize off — is left at its minimum and overflows, which
+        // is what mutter does with every window that does not fit.
+        self.tiles[idx]
+            .window_mut()
+            .request_size_once(win_size, false);
         None
+    }
+
+    /// Whether this window may be maximized on the compositor's own initiative.
+    ///
+    /// mutter's `has_maximize_func` — a window whose own maximum size cannot cover the work area
+    /// must not be maximized — plus `org.gnome.mutter auto-maximize`, which a user who turned it
+    /// off should not meet here either. Only in GNOME mode: in niri's scrolling mode the scrolling
+    /// layout owns maximize and a tile here is plain floating.
+    fn can_auto_maximize(&self, idx: usize, area: Rectangle<f64, Logical>) -> bool {
+        if !self.options.gnome_auto_maximize
+            || self.options.layout.windowing_mode != WindowingMode::Floating
+        {
+            return false;
+        }
+
+        let max_size = self.tiles[idx].window().max_size();
+        !((max_size.w > 0 && f64::from(max_size.w) < area.size.w)
+            || (max_size.h > 0 && f64::from(max_size.h) < area.size.h))
     }
 
     /// Re-derive one tile's geometry from the current work area, for a window whose size is owned
@@ -1702,6 +1760,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
             return false;
         }
+
+        // The user's answer by default; the two automatic paths re-arm the mark after calling in.
+        self.tiles[idx].auto_maximized = false;
 
         if maximize {
             self.save_restore_rect(idx);

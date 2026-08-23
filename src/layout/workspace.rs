@@ -2247,12 +2247,14 @@ impl<W: LayoutElement> Workspace<W> {
             .find(|tile| tile.window().id() == window)
         {
             tile.tiled_restore_size = Some(restore);
+            tile.auto_maximized = true;
         } else if let Some(tile) = self
             .scrolling
             .tiles_mut()
             .find(|tile| tile.window().id() == window)
         {
             tile.floating_window_size = Some(restore);
+            tile.auto_maximized = true;
         }
         true
     }

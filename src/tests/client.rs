@@ -1093,6 +1093,11 @@ impl Window {
         self.xdg_toplevel.set_app_id(app_id.to_owned());
     }
 
+    /// `xdg_toplevel.set_min_size` — the floor a client puts under every configure it will honour.
+    pub fn set_min_size(&self, w: i32, h: i32) {
+        self.xdg_toplevel.set_min_size(w, h);
+    }
+
     pub fn recent_configures(&mut self) -> impl Iterator<Item = &Configure> {
         let start = self.configures_looked_at;
         self.configures_looked_at = self.configures_received.len();

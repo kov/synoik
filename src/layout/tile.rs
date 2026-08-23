@@ -85,6 +85,14 @@ pub struct Tile<W: LayoutElement> {
     /// the window starts out in the tiling layout.
     pub(super) floating_pos: Option<Point<f64, SizeFrac>>,
 
+    /// Whether the compositor maximized this window, rather than the user asking for it.
+    ///
+    /// Two paths set it: the map-time auto-maximize (mutter's `place.c` 80% rule) and a work area
+    /// too small for the window's minimum size, where maximizing is the honest "as large as we can
+    /// give you". Only an auto-maximized window is un-maximized when a bigger area comes along; a
+    /// window the user maximized stays maximized, because they asked for it.
+    pub(super) auto_maximized: bool,
+
     /// The geometry a work-area change overrode, relative to the work area's origin.
     ///
     /// mutter's `unconstrained_rect` in Wayland clothes. Mutter keeps the rect the user asked for
@@ -366,6 +374,7 @@ impl<W: LayoutElement> Tile<W> {
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
+            auto_maximized: false,
             displaced_rect: None,
             tiled_restore_size: None,
             tiled_restore_pos: None,

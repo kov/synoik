@@ -29647,6 +29647,112 @@ fn a_floating_window_is_fitted_to_a_smaller_area_and_restored_by_a_bigger_one() 
     );
 }
 
+/// A window whose *minimum* size does not fit the new work area is maximized instead of shrunk,
+/// and un-maximized again when an area that can hold it comes back.
+///
+/// Maximizing is the honest "as large as we can give you" when no size we could ask for would fit.
+/// Only a window the compositor maximized comes back out: one the user maximized stays maximized,
+/// because they asked for it (`docs/fork/multi-display.md` §5).
+#[test]
+fn a_window_that_cannot_be_shrunk_to_fit_is_maximized_instead() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1000, 800), None);
+    // Taller than the smaller work area will be, so no shrink can help.
+    f.client(id).window(&surface).set_min_size(900, 700);
+    f.double_roundtrip(id);
+
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let is_maximized = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .sizing_mode
+            .is_maximized()
+    };
+    assert!(!is_maximized(&mut f), "it maps floating");
+
+    f.resize_output(1, Some((1024, 600)), None);
+    settle(&mut f);
+    assert!(
+        is_maximized(&mut f),
+        "nothing it could be resized to fits 700 rows of minimum, so it maximizes"
+    );
+
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f);
+    assert!(
+        !is_maximized(&mut f),
+        "and it comes back out when the area can hold it again"
+    );
+}
+
+/// A window the *user* maximized stays maximized when the work area grows.
+///
+/// The un-maximize is for the compositor's own answer to a display too small to hold the window;
+/// the mark is what tells them apart (`Tile::auto_maximized`).
+#[test]
+fn a_user_maximized_window_is_not_un_maximized_by_a_bigger_display() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (600, 400), None);
+    f.settle();
+    f.synoik_state().do_action(Action::Maximize, false);
+
+    // Honour the configure like a real client, or the window never actually becomes maximized.
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let is_maximized = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .sizing_mode
+            .is_maximized()
+    };
+    assert!(is_maximized(&mut f), "the user asked for it");
+
+    f.resize_output(1, Some((1024, 600)), None);
+    settle(&mut f);
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f);
+
+    assert!(
+        is_maximized(&mut f),
+        "a trip through a smaller display does not un-maximize what the user maximized"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]
