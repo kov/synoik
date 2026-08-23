@@ -58,7 +58,7 @@
 //! - `clap`: derives the clap CLI parsing traits for some types. Used internally by synoik itself.
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -227,7 +227,12 @@ pub enum Response {
     /// Information about connected outputs.
     ///
     /// Map from output name to output info.
-    Outputs(HashMap<String, Output>),
+    /// Connected outputs by name.
+    ///
+    /// A `BTreeMap` so the JSON comes out in a stable order: a `HashMap` reserialized the same
+    /// unchanged state into a different key order on every call, which reads as churn to anything
+    /// diffing successive replies.
+    Outputs(BTreeMap<String, Output>),
     /// Information about workspaces.
     Workspaces(Vec<Workspace>),
     /// Information about open windows.
