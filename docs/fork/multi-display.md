@@ -1,6 +1,6 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §1, §4 and §6's drag are implemented; §2, §3 and §5 are not.**
+**Status: design agreed 2026-08-23. §1, §2, §4 and §6's drag are implemented; §3 and §5 are not.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -58,28 +58,46 @@ That is the semantics this design wants, and `Layout::add_output` already acts o
 display takes back every workspace on the primary whose tag matches (`src/layout/mod.rs:1038-1074`),
 and `last_active_workspace_id` restores which of them was active. Three things are missing.
 
-**A home ordinal.** The reclaim preserves the group's relative order but nothing pins *where* in the
-strip a workspace sat, so a reorder performed while the group was homeless is unrecoverable. Each
-workspace carries `(home: OutputIdentity, home_ordinal: usize)`, stamped at detach and re-stamped on
-an explicit move. Reclaim sorts by ordinal. A workspace the user moved while homeless keeps its new
-place because the move re-stamped it; everything else lands where it was.
+**A home ordinal.** Implemented. The reclaim preserved the group's relative order but nothing
+pinned *where* in the strip a workspace sat. Each workspace now carries a `home_ordinal` alongside
+its home tag, and the reclaim sorts by it (stably, so anything without one keeps evacuation order).
+
+`Monitor::stamp_home_ordinals` keeps them true, from `clean_up_workspaces` — the one place every
+reorder, insertion and removal funnels through — and from `into_workspaces`, the detach. It has two
+rules, because a strip holds two kinds of workspace:
+
+- **its own** get their rank among the own group: all of them are present, so rank *is* position;
+- **visitors**, evacuated from a display that is away, keep their *set* of ordinals and only permute
+  it into the order they are in now. Their group is incomplete — its empty members are parked, not
+  here — so re-ranking them would close the holes in the arrangement their display is coming back
+  to. Permuting honours a reorder the user makes while they are visiting without inventing
+  positions for the ones that are not here.
 
 Best-effort by construction, and deliberately not a snapshot of the whole arrangement. Keying the
 *configuration* the way `monitors.xml` does would restore a stale arrangement and fight the edits
 the user made in the meantime; per-workspace tags degrade one workspace at a time.
 
-**Empty workspaces survive.** This reverses the "Accepted losses" clause in
-`dynamic-workspaces-divergence.md`. `Monitor::into_workspaces` filters `has_windows_or_name()` at
-unplug and `Layout::add_output` filters again on reclaim, so a workspace emptied while homeless can
-never come home. The reversal keeps the reason the loss existed — anonymous empties must not pile up
-on the surviving display — by not putting them there in the first place:
+**Empty workspaces survive.** Implemented, reversing the "Accepted losses" clause in
+`dynamic-workspaces-divergence.md`. `Monitor::into_workspaces` used to filter `has_windows_or_name()`
+at unplug and `Layout::add_output` filtered again on reclaim, so a workspace emptied while homeless
+could never come home. Both filters are gone; the split is `Layout::park_empties`, on
+`has_windows()` alone. The reversal keeps the reason the loss existed — anonymous empties must not
+pile up on the surviving display — by not putting them there in the first place:
 
 > An absent display's **empty** workspaces are parked in `Layout`, keyed by identity, and never
 > materialize on the primary. Only its **windowed** workspaces are appended to the primary's strip.
 
 Nothing accumulates on the survivor, the strip stays honest, and an emptied homeless workspace still
-has a group to return to. Naming a homeless workspace does **not** re-home it: a name says "keep",
-not "move".
+has a group to return to. A **named** empty parks with the rest: a name says "keep", not "put this
+somewhere else", and materializing it on the survivor is how a strip grows a desktop the user never
+made. The cost is that a named empty workspace is unreachable while its display is away.
+
+Two things follow from parking, both wanted. `last_active_workspace_id` can now resolve to a parked
+empty, so a display that was showing an empty desktop comes back showing it — and it is keyed by
+identity rather than by connector name, so a different panel in the same socket cannot consume the
+entry. And a parked workspace is deliberately **invisible**: it is not in `Layout::workspaces()`, so
+IPC, a11y and every `find_workspace_by_*` are blind to it. `Layout::verify_invariants` walks the
+parked list explicitly, into the same id- and name-uniqueness sets.
 
 **A lifetime.** Parked groups live for the session and die with it. Nothing about a workspace is
 persisted on its own — across a restart, the saved application sessions are the only carriers (§3).
@@ -289,7 +307,7 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
    LANDED.
 2. **The cross-output workspace drag** (§6) — LANDED.
 3. **Identity unification** (§1) — LANDED.
-4. **Home ordinal and parked empties** (§2) — the unplug/replug fidelity a daily dock cycle needs.
+4. **Home ordinal and parked empties** (§2) — LANDED.
 5. **Derived restore ordering with lazy materialization** (§3) — kills the absent-display offset.
 6. **Displaced geometry** (§5) — the two-branch move, the per-axis shrink, `displaced_rect`, the
    auto-maximize mark.

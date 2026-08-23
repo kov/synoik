@@ -10232,6 +10232,220 @@ fn dragging_a_thumbnail_to_another_display_moves_the_workspace() {
     );
 }
 
+/// An empty desktop between two populated ones is part of the arrangement. It is parked while its
+/// display is away — never materialized on the survivor, where it would be an anonymous desktop
+/// the user never made — and comes back in its place, hole and all
+/// (`docs/fork/multi-display.md` §2).
+#[test]
+fn an_empty_desktop_between_two_populated_ones_survives_an_unplug() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // On display 2: a window, an empty desktop, a window.
+    pointer_motion_to(&mut f, 2880., 540.);
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+
+    // Push B down past the trailing empty, so an empty desktop sits between the two.
+    f.synoik_state().do_action(Action::MoveWorkspaceDown, false);
+    f.settle();
+
+    let idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, _)| idx)
+            .expect("the window must be on a workspace")
+    };
+    assert_eq!(
+        (idx_of(&mut f, &win_a), idx_of(&mut f, &win_b)),
+        (0, 2),
+        "precondition: an empty desktop between them"
+    );
+
+    let before = f.synoik().layout.monitors().count();
+    f.remove_output(2);
+    f.settle();
+    assert_eq!(f.synoik().layout.monitors().count(), before - 1);
+
+    f.add_output(2, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        (idx_of(&mut f, &win_a), idx_of(&mut f, &win_b)),
+        (0, 2),
+        "the hole between them is part of the arrangement"
+    );
+}
+
+/// Which desktop a display was showing survives the unplug even when it was an empty one. The id
+/// of the active workspace is recorded at unplug; before empties were parked it could name a
+/// workspace that no longer existed by the time the display came back, and the strip silently
+/// came up on its first desktop instead.
+#[test]
+fn a_display_showing_an_empty_desktop_comes_back_showing_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    pointer_motion_to(&mut f, 2880., 540.);
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.settle();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 2),
+        1,
+        "precondition: showing the empty desktop past the window"
+    );
+
+    f.remove_output(2);
+    f.settle();
+    f.add_output(2, (1920, 1080));
+    f.settle();
+
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 2),
+        1,
+        "the display comes back on the desktop it was showing"
+    );
+}
+
+/// A workspace the user emptied while its display was away still belongs to that display: it used
+/// to be dropped on the way home, so a dock cycle silently ate a desktop
+/// (`docs/fork/multi-display.md` §2).
+#[test]
+fn a_workspace_emptied_while_its_display_is_away_still_comes_home() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    pointer_motion_to(&mut f, 2880., 540.);
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+    let ws_id = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .map(|(_, _, ws)| ws.id())
+        .unwrap();
+
+    f.remove_output(2);
+    f.settle();
+
+    // The window goes away while the workspace is visiting the surviving display.
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+    f.settle();
+
+    f.add_output(2, (1920, 1080));
+    f.settle();
+
+    let home = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.id() == ws_id)
+        .and_then(|(mon, _, _)| mon)
+        .map(|mon| mon.output().name());
+    assert_eq!(
+        home.as_deref(),
+        Some("headless-2"),
+        "an empty workspace still has a display to go back to"
+    );
+}
+
+/// Where in its display's strip a workspace sat is part of its home, not just its order relative
+/// to its siblings: reordering it while that display is away has to survive the display coming
+/// back, or a dock cycle undoes the user's arrangement (`docs/fork/multi-display.md` §2).
+#[test]
+fn a_workspace_reordered_while_its_display_is_away_comes_home_reordered() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // On display 2: a window, an empty desktop, a window. Outputs tile left to right.
+    pointer_motion_to(&mut f, 2880., 540.);
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    f.settle();
+    f.synoik_state().do_action(Action::MoveWorkspaceDown, false);
+    f.settle();
+
+    let idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, _)| idx)
+            .expect("the window must be on a workspace")
+    };
+    assert_eq!(
+        (idx_of(&mut f, &win_a), idx_of(&mut f, &win_b)),
+        (0, 2),
+        "precondition: an empty desktop between them"
+    );
+
+    f.remove_output(2);
+    f.settle();
+
+    // On the display they are visiting, the user puts B's desktop above A's.
+    pointer_motion_to(&mut f, 960., 540.);
+    let b_ws = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win_b))
+        .map(|(_, _, ws)| ws.id().get())
+        .unwrap();
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Id(b_ws)),
+        false,
+    );
+    f.settle();
+    f.synoik_state().do_action(Action::MoveWorkspaceUp, false);
+    f.settle();
+    assert!(
+        idx_of(&mut f, &win_b) < idx_of(&mut f, &win_a),
+        "precondition: the reorder happened while the display was away"
+    );
+
+    f.add_output(2, (1920, 1080));
+    f.settle();
+    assert_eq!(
+        (idx_of(&mut f, &win_b), idx_of(&mut f, &win_a)),
+        (0, 2),
+        "the display coming back must not undo the reorder — and the two desktops swapped \
+         places, they did not close the empty one between them"
+    );
+}
+
 /// The home tag names a *display*, not a socket on the back of the machine. Plugging a different
 /// panel into the connector another one used must not hand it that display's workspaces
 /// (`docs/fork/multi-display.md` §1) — the two replugs below differ in nothing but the EDID serial.
@@ -21091,10 +21305,13 @@ fn monitors_xml_primary_adopts_orphaned_workspaces() {
     f.add_output(2, (1280, 1024));
     f.add_output(3, (1280, 1024));
 
-    // Name a workspace on headless-3, so it survives the migration (an unnamed empty one is
-    // dropped — see dynamic-workspaces-divergence.md "Accepted losses").
-    let output3 = f.synoik_output(3);
-    f.synoik().layout.focus_output(&output3);
+    // A *windowed* workspace on headless-3, since only those migrate: an empty one is parked
+    // until its own display comes back (`docs/fork/multi-display.md` §2). Named as well, so the
+    // assertions below can find it.
+    let id = f.add_client();
+    f.roundtrip(id);
+    pointer_motion_to(&mut f, 3200., 512.);
+    let _surface = map_window_sized(&mut f, id, (400, 300), None);
     f.synoik_state()
         .do_action(Action::SetWorkspaceName("orphan".to_owned()), false);
     assert_eq!(workspace_output(&mut f, "orphan"), "headless-3");

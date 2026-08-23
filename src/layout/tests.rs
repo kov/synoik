@@ -2152,6 +2152,12 @@ fn workspaces_update_original_output_on_moving_to_same_output() {
             new_ws_name: 1,
             ws_name: None,
         },
+        // A window, so the workspace migrates to output2 rather than being parked: only a
+        // display's *windowed* workspaces land on the survivor.
+        Op::AddWindowToNamedWorkspace {
+            params: TestWindowParams::new(1),
+            ws_name: 1,
+        },
         Op::AddOutput(2),
         Op::RemoveOutput(1),
         // The named workspace is spliced in below output2's own empties, so focus down
@@ -2178,6 +2184,11 @@ fn workspaces_update_original_output_on_moving_to_same_monitor() {
         Op::SetWorkspaceName {
             new_ws_name: 1,
             ws_name: None,
+        },
+        // See above: a windowed workspace is the one that migrates.
+        Op::AddWindowToNamedWorkspace {
+            params: TestWindowParams::new(1),
+            ws_name: 1,
         },
         Op::AddOutput(2),
         Op::RemoveOutput(1),
@@ -2375,8 +2386,11 @@ fn open_right_of_on_different_workspace() {
     );
 }
 
+/// An empty workspace does not go to the surviving display, but it is not lost either: it is
+/// parked until its own display comes back (`docs/fork/multi-display.md` §2). A name does not
+/// change that — a name says "keep", not "put this somewhere else".
 #[test]
-fn removing_all_outputs_preserves_empty_named_workspaces() {
+fn removing_all_outputs_parks_empty_named_workspaces() {
     let ops = [
         Op::AddOutput(1),
         Op::AddNamedWorkspace {
@@ -2394,11 +2408,23 @@ fn removing_all_outputs_preserves_empty_named_workspaces() {
 
     let layout = check_ops(ops);
 
-    let MonitorSet::NoOutputs { workspaces } = layout.monitor_set else {
+    let MonitorSet::NoOutputs { workspaces } = &layout.monitor_set else {
         unreachable!()
     };
 
-    assert_eq!(workspaces.len(), 2);
+    assert!(workspaces.is_empty(), "no windows, so nothing migrates");
+
+    let mut named: Vec<_> = layout
+        .parked_workspaces
+        .iter()
+        .filter_map(|ws| ws.name().cloned())
+        .collect();
+    named.sort();
+    assert_eq!(named, ["ws1", "ws2"]);
+    assert!(
+        layout.parked_workspaces.len() > named.len(),
+        "the strip's own empties park too, so the holes between them come back"
+    );
 }
 
 #[test]

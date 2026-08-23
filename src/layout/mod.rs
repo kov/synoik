@@ -418,16 +418,29 @@ pub struct Layout<W: LayoutElement> {
     /// This normally indicates that the layout has keyboard focus, but not always. E.g. when the
     /// screenshot UI is open, it keeps the layout drawing as active.
     is_active: bool,
-    /// Map from monitor name to id of its last active workspace.
+    /// Which workspace each absent display was showing, so reconnecting it comes back to that
+    /// desktop rather than the first one.
     ///
-    /// This data is stored upon monitor removal and is used to restore the active workspace when
-    /// the monitor is reconnected.
+    /// Keyed by display identity, not by connector name: a *different* panel plugged into the same
+    /// socket would otherwise consume the entry, and the display it belongs to would come back
+    /// having lost it. A `Vec` for the reason [`Self::parked_workspaces`] is one.
     ///
     /// The workspace id does not necessarily point to a valid workspace. If it doesn't, then it is
     /// simply ignored.
-    last_active_workspace_id: HashMap<String, WorkspaceId>,
+    last_active_workspace_id: Vec<(OutputIdentity, WorkspaceId)>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
+    /// Workspaces with no windows whose home display is away.
+    ///
+    /// They never materialize on the surviving display — nothing accumulates there, which is what
+    /// the old "an emptied workspace does not survive its output going away" loss was buying — and
+    /// they come back with their group, keeping the holes in it (`docs/fork/multi-display.md` §2).
+    /// Session-lived: nothing about a workspace is persisted on its own.
+    ///
+    /// A `Vec`, deliberately, not a map keyed by home: `OutputIdentity::matches` is
+    /// case-insensitive and tolerates a missing EDID field, so it is not an equivalence relation
+    /// any `Hash`/`Eq` could agree with. Each workspace carries its own home tag anyway.
+    parked_workspaces: Vec<Workspace<W>>,
     /// A workspace in mid-air between two displays' strips. Set once a drag has actually crossed a
     /// display boundary, and cleared when it lands.
     thumb_carry: Option<ThumbCarry>,
@@ -976,9 +989,10 @@ impl<W: LayoutElement> Layout<W> {
         Self {
             monitor_set: MonitorSet::NoOutputs { workspaces: vec![] },
             is_active: true,
-            last_active_workspace_id: HashMap::new(),
+            last_active_workspace_id: Vec::new(),
             interactive_move: None,
             thumb_carry: None,
+            parked_workspaces: Vec::new(),
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -1006,9 +1020,10 @@ impl<W: LayoutElement> Layout<W> {
         Self {
             monitor_set: MonitorSet::NoOutputs { workspaces },
             is_active: true,
-            last_active_workspace_id: HashMap::new(),
+            last_active_workspace_id: Vec::new(),
             interactive_move: None,
             thumb_carry: None,
+            parked_workspaces: Vec::new(),
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -1049,6 +1064,43 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Takes the workspace `output` was showing when it went away, if it is still remembered.
+    fn take_last_active_workspace(&mut self, output: &Output) -> Option<WorkspaceId> {
+        let idx = self
+            .last_active_workspace_id
+            .iter()
+            .position(|(id, _)| id.matches_output(output))?;
+        Some(self.last_active_workspace_id.remove(idx).1)
+    }
+
+    /// Splits a detached strip into what moves to the surviving display and what is parked.
+    ///
+    /// Only *windowed* workspaces move. A named-but-empty one parks with the rest: a name says
+    /// "keep", not "put this somewhere else", and materializing it on the survivor is how the
+    /// user's strip grows a desktop they never asked for.
+    fn park_empties(&mut self, workspaces: Vec<Workspace<W>>) -> Vec<Workspace<W>> {
+        let mut keep = Vec::with_capacity(workspaces.len());
+        for ws in workspaces {
+            if ws.has_windows() {
+                keep.push(ws);
+            } else if !ws.original_output.connector.is_empty() {
+                self.parked_workspaces.push(ws);
+            }
+            // A workspace with no windows and no home display has nothing to come back to, and
+            // the strip it landed in will grow its own trailing empty.
+        }
+        keep
+    }
+
+    /// Takes back the workspaces parked for `output` when it went away.
+    fn take_parked_for(&mut self, output: &Output) -> Vec<Workspace<W>> {
+        let (taken, kept) = mem::take(&mut self.parked_workspaces)
+            .into_iter()
+            .partition(|ws| ws.original_output.matches_output(output));
+        self.parked_workspaces = kept;
+        taken
+    }
+
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
         self.monitor_set = match mem::take(&mut self.monitor_set) {
             MonitorSet::Normal {
@@ -1074,12 +1126,10 @@ impl<W: LayoutElement> Layout<W> {
                         // for now.
                         primary.workspace_switch = None;
 
-                        // The user could've closed a window while remaining on this workspace, on
-                        // another monitor. However, we will add an empty workspace in the end
-                        // instead.
-                        if ws.has_windows_or_name() {
-                            workspaces.push(ws);
-                        }
+                        // A workspace emptied while it was homeless still belongs to this
+                        // display: dropping it here would lose the hole it left in the strip, and
+                        // its name with it.
+                        workspaces.push(ws);
 
                         if i <= primary.active_workspace_idx {
                             primary.active_workspace_idx =
@@ -1101,8 +1151,15 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 workspaces.reverse();
+                workspaces.extend(self.take_parked_for(&output));
 
-                let ws_id_to_activate = self.last_active_workspace_id.remove(&output.name());
+                // Relative order is not enough: a workspace reordered while its display was away
+                // would come home wherever the evacuation had left it. The ordinals say where in
+                // *this* display's strip each one sat, and the sort is stable so anything that
+                // never got one keeps the order it was evacuated in.
+                workspaces.sort_by_key(|ws| ws.home_ordinal);
+
+                let ws_id_to_activate = self.take_last_active_workspace(&output);
 
                 let mut monitor = Monitor::new(
                     output,
@@ -1123,8 +1180,11 @@ impl<W: LayoutElement> Layout<W> {
                     active_monitor_idx,
                 }
             }
-            MonitorSet::NoOutputs { workspaces } => {
-                let ws_id_to_activate = self.last_active_workspace_id.remove(&output.name());
+            MonitorSet::NoOutputs { mut workspaces } => {
+                workspaces.extend(self.take_parked_for(&output));
+                workspaces.sort_by_key(|ws| ws.home_ordinal);
+
+                let ws_id_to_activate = self.take_last_active_workspace(&output);
 
                 let mut monitor = Monitor::new(
                     output,
@@ -1195,12 +1255,14 @@ impl<W: LayoutElement> Layout<W> {
                     .expect("trying to remove non-existing output");
                 let monitor = monitors.remove(idx);
 
-                self.last_active_workspace_id.insert(
-                    monitor.output_name().clone(),
-                    monitor.workspaces[monitor.active_workspace_idx].id(),
-                );
+                let showing = monitor.workspaces[monitor.active_workspace_idx].id();
+                let identity = OutputIdentity::from_output(&monitor.output);
+                self.last_active_workspace_id
+                    .retain(|(id, _)| !id.matches(&identity));
+                self.last_active_workspace_id.push((identity, showing));
 
-                let mut workspaces = monitor.into_workspaces();
+                let workspaces = self.park_empties(monitor.into_workspaces());
+                let mut workspaces = workspaces;
 
                 if monitors.is_empty() {
                     // Removed the last monitor.
@@ -3103,6 +3165,41 @@ impl<W: LayoutElement> Layout<W> {
         let mut seen_workspace_id = HashSet::new();
         let mut seen_workspace_name = Vec::<String>::new();
 
+        for workspace in &self.parked_workspaces {
+            assert!(
+                !workspace.has_windows(),
+                "a windowed workspace goes to the surviving display, it is never parked"
+            );
+            assert!(
+                workspace.current_output().is_none(),
+                "a parked workspace is on no display"
+            );
+            assert!(
+                !workspace.original_output.connector.is_empty(),
+                "a parked workspace with no home has nothing to come back to"
+            );
+
+            assert_eq!(self.clock, workspace.clock);
+            assert_eq!(
+                workspace.base_options, self.options,
+                "workspace base options must be synchronized with layout"
+            );
+
+            assert!(
+                seen_workspace_id.insert(workspace.id()),
+                "workspace id must be unique"
+            );
+            if let Some(name) = &workspace.name {
+                assert!(
+                    !seen_workspace_name
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(name)),
+                    "workspace name must be unique"
+                );
+                seen_workspace_name.push(name.clone());
+            }
+        }
+
         let (monitors, &primary_idx, &active_monitor_idx) = match &self.monitor_set {
             MonitorSet::Normal {
                 monitors,
@@ -3185,7 +3282,7 @@ impl<W: LayoutElement> Layout<W> {
                     monitor
                         .workspaces
                         .iter()
-                        .any(|workspace| workspace.original_output.matches_output(&monitor.output)),
+                        .all(|workspace| workspace.original_output.matches_output(&monitor.output)),
                     "secondary monitor must not have any non-own workspaces"
                 );
             }
@@ -3751,6 +3848,11 @@ impl<W: LayoutElement> Layout<W> {
                     ws.update_config(options.clone());
                 }
             }
+        }
+
+        // Parked workspaces are on no display, but they come back onto one.
+        for ws in &mut self.parked_workspaces {
+            ws.update_config(options.clone());
         }
 
         self.options = options;

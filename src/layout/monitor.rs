@@ -600,8 +600,6 @@ impl<W: LayoutElement> Monitor<W> {
         let mut active_workspace_idx = 0;
 
         for (idx, ws) in workspaces.iter_mut().enumerate() {
-            assert!(ws.has_windows_or_name());
-
             ws.set_output(Some(output.clone()));
             ws.update_config(options.clone());
 
@@ -658,8 +656,13 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// The strip, detached: every workspace, in order, with no output.
+    ///
+    /// Which of them survive on another display and which are parked is
+    /// [`Layout::remove_output`](super::Layout::remove_output)'s call, not this one's.
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
-        self.workspaces.retain(|ws| ws.has_windows_or_name());
+        // The last chance to read the strip this display had; after this they are just a list.
+        self.stamp_home_ordinals();
 
         for ws in &mut self.workspaces {
             ws.set_output(None);
@@ -1080,6 +1083,10 @@ impl<W: LayoutElement> Monitor<W> {
         while self.workspaces.len() < MIN_NUM_WORKSPACES {
             self.add_workspace_bottom();
         }
+
+        // Every reorder, insertion and removal funnels through here, which makes it the one place
+        // the home ordinals can be kept true without enumerating them.
+        self.stamp_home_ordinals();
     }
 
     /// Every closable workspace's close-button rect, in view coordinates — the strip's
@@ -2924,6 +2931,60 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn rehome_workspace(&mut self, idx: usize) {
         if let Some(ws) = self.workspaces.get_mut(idx) {
             ws.original_output = OutputIdentity::from_output(&self.output);
+        }
+        self.stamp_home_ordinals();
+    }
+
+    /// Keeps every workspace's [home ordinal](Workspace::home_ordinal) true for this strip.
+    ///
+    /// Two rules, because a strip holds two kinds of workspace:
+    ///
+    /// - **This display's own** get their rank among the own group. All of them are here, so the
+    ///   rank is the position, and adding or reordering one is reflected immediately.
+    /// - **Visitors**, evacuated from a display that is away, keep their *set* of ordinals and only
+    ///   permute it to match the order they are in now. Their group is incomplete — the empties of
+    ///   it are parked, not here — so re-ranking them would close the holes in the arrangement
+    ///   their display is going to come back to. Permuting honours a reorder the user makes while
+    ///   they are visiting without inventing positions for the ones that are not here.
+    fn stamp_home_ordinals(&mut self) {
+        let mut own_rank = 0;
+        let mut visiting = Vec::new();
+        for idx in 0..self.workspaces.len() {
+            if self.workspaces[idx]
+                .original_output
+                .matches_output(&self.output)
+            {
+                self.workspaces[idx].home_ordinal = own_rank;
+                own_rank += 1;
+            } else {
+                visiting.push(idx);
+            }
+        }
+
+        let mut done = vec![false; visiting.len()];
+        for i in 0..visiting.len() {
+            if done[i] {
+                continue;
+            }
+
+            let group: Vec<usize> = (i..visiting.len())
+                .filter(|&j| {
+                    self.workspaces[visiting[j]]
+                        .original_output
+                        .matches(&self.workspaces[visiting[i]].original_output)
+                })
+                .collect();
+
+            let mut slots: Vec<usize> = group
+                .iter()
+                .map(|&j| self.workspaces[visiting[j]].home_ordinal)
+                .collect();
+            slots.sort_unstable();
+
+            for (&j, slot) in group.iter().zip(slots) {
+                self.workspaces[visiting[j]].home_ordinal = slot;
+                done[j] = true;
+            }
         }
     }
 

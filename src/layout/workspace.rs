@@ -106,6 +106,14 @@ pub struct Workspace<W: LayoutElement> {
     /// disconnection, it may remain pointing to the disconnected output.
     pub(super) original_output: OutputIdentity,
 
+    /// Where in its home display's strip this workspace sat.
+    ///
+    /// Relative order is all a reclaim could restore without this: a workspace reordered while its
+    /// display was away came back wherever the evacuation had left it. Best-effort by construction
+    /// — a homeless workspace's ordinal is an index into the display it is *visiting*, which is
+    /// the price of not snapshotting the whole arrangement (`docs/fork/multi-display.md` §2).
+    pub(super) home_ordinal: usize,
+
     /// Current output of this workspace.
     output: Option<Output>,
 
@@ -642,6 +650,7 @@ impl<W: LayoutElement> Workspace<W> {
             floating_is_active: FloatingActive::No,
             minimized: Vec::new(),
             original_output,
+            home_ordinal: 0,
             scale,
             transform: output.current_transform(),
             view_size,
@@ -718,6 +727,7 @@ impl<W: LayoutElement> Workspace<W> {
             scale,
             transform: Transform::Normal,
             original_output,
+            home_ordinal: 0,
             view_size,
             working_area,
             shadow: Shadow::new(shadow_config),
