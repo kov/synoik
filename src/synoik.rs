@@ -953,6 +953,16 @@ pub struct Synoik {
     pub hot_corner_barrier: Barrier,
     pub hot_corner_output: Option<Output>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
+    /// Whether a pointer has ever been driven on this seat.
+    ///
+    /// The seat always has a pointer (`seat.add_pointer()` is unconditional) and an unmoved one
+    /// sits at the global origin, so "where is the cursor" is not by itself a question with an
+    /// honest answer: on a keyboard-only seat it would silently hand every workspace action to
+    /// whichever display owns (0, 0). Set by the first real pointer, touchpad or tablet event, and
+    /// cleared again when the last pointer-capable device is unplugged.
+    ///
+    /// Read through [`Self::pointer_aim_output`]; see `docs/fork/multi-display.md` §4.
+    pub pointer_used: bool,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
     /// The same, for the app grid's own 1:1 page swipe — GNOME gives `AppDisplay` its own
@@ -7945,6 +7955,7 @@ impl Synoik {
             hot_corner_barrier: Barrier::hot_corner(),
             hot_corner_output: None,
             tablet_cursor_location: None,
+            pointer_used: false,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
             app_grid_scroll_swipe: ScrollSwipeGesture::new(),
@@ -9592,6 +9603,19 @@ impl Synoik {
     pub fn output_under_cursor(&self) -> Option<Output> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.global_space.output_under(pos).next().cloned()
+    }
+
+    /// The display a workspace-scoped action aims at, or `None` when the seat has no pointer to
+    /// aim with and the focused display should decide instead.
+    ///
+    /// `docs/fork/multi-display.md` §4: the pointer decides which display a workspace action acts
+    /// on, and focus is what keyboard-only navigation falls back to. Gated on
+    /// [`Self::pointer_used`] because an untouched pointer still reports a position.
+    pub fn pointer_aim_output(&self) -> Option<Output> {
+        if !self.pointer_used {
+            return None;
+        }
+        self.output_under_cursor()
     }
 
     pub fn output_left_of(&self, current: &Output) -> Option<Output> {

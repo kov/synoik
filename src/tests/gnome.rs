@@ -4675,6 +4675,137 @@ fn a_new_window_opens_on_the_monitor_under_the_pointer() {
     );
 }
 
+/// The display a workspace action lands on is the one under the **pointer**, not the one that
+/// happens to hold focus (`docs/fork/multi-display.md` §4). With per-monitor workspaces there is no
+/// global stack for a workspace keybinding to mean, so it has to mean *some* display's, and aiming
+/// by focus makes a mouse user hit whichever display they last clicked in.
+///
+/// GNOME has nothing to ground this against: mutter has one global workspace list and one
+/// `active_workspace` (`meta-workspace-manager-private.h:37-39`), so a switch there is not aimed at
+/// anything. This is our answer to a question its model cannot ask.
+#[test]
+fn a_workspace_switch_lands_on_the_display_under_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    // Focus display 1, then park the pointer on display 2 — outputs tile left to right, so
+    // display 2 spans x = 1920..3840. The two answers now disagree, which is the whole test.
+    f.synoik_focus_output(1);
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 2),
+        1,
+        "the switch must land on the display under the pointer"
+    );
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 1),
+        0,
+        "the focused display must be left alone"
+    );
+}
+
+/// Aiming a workspace action at a display *is* making that display active. The alternative —
+/// switching a workspace over there while the keyboard still talks to a window over here — is a
+/// state no user asked for, and it is what makes `Super+Page_Down` followed by typing coherent.
+#[test]
+fn aiming_a_workspace_action_makes_that_display_active() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    f.synoik_focus_output(1);
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+
+    let active = f.synoik().layout.active_output().cloned();
+    assert_eq!(
+        active.as_ref().map(|o| o.name()),
+        Some(f.synoik_output(2).name()),
+        "the display the action was aimed at must be the active one afterwards"
+    );
+}
+
+/// With no pointer on the seat, focus decides — which is the reason focus survives this change at
+/// all. A seat with no mouse still has to be able to say "switch this display's workspace", and
+/// the focused display is the only thing left that says which.
+///
+/// The pointer is never moved here, so `Synoik::pointer_used` stays false. That gate is
+/// load-bearing: the seat always *has* a pointer (`seat.add_pointer()` is unconditional) and an
+/// unmoved one reports the global origin, so without it every keyboard-only workspace action would
+/// silently aim at whichever display owns (0, 0).
+#[test]
+fn with_no_pointer_a_workspace_switch_follows_focus() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    // Display 2 is focused; the cursor has never moved, so it still reports the origin, which is
+    // inside display 1.
+    f.synoik_focus_output(2);
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 2),
+        1,
+        "with no pointer the focused display must take the switch"
+    );
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 1),
+        0,
+        "the display under the untouched cursor must not take it"
+    );
+}
+
+/// A window-scoped action follows the window, not the pointer: `MoveWindowToWorkspaceDown` moves
+/// the focused window, and the focused window is on the display it is on. Aiming it at the pointer
+/// would move a window the user is not looking at.
+#[test]
+fn a_window_action_is_not_aimed_at_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // The window opens on display 1, under the pointer; then the pointer leaves for display 2.
+    pointer_motion_to(&mut f, 960., 540.);
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 1),
+        1,
+        "the window must move on its own display"
+    );
+    assert_eq!(
+        monitor_active_workspace_index(&mut f, 2),
+        0,
+        "the display under the pointer must not have been touched"
+    );
+}
+
+/// The index of the active workspace on display `n`.
+fn monitor_active_workspace_index(f: &mut Fixture, n: u8) -> usize {
+    let output = f.synoik_output(n);
+    f.synoik()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .active_workspace_idx()
+}
+
 /// The monitor is decided **once**, at the initial configure, and a request
 /// that arrives before the window maps must not re-decide it. Re-consulting
 /// the pointer from a later request would let a window hop monitors merely

@@ -497,6 +497,10 @@ impl State {
             self.synoik.reset_pointer_inactivity_timer();
         }
 
+        if event_drives_pointer(&event) {
+            self.synoik.pointer_used = true;
+        }
+
         let hide_hotkey_overlay =
             self.synoik.hotkey_overlay.is_open() && should_hide_hotkey_overlay(&event);
 
@@ -599,6 +603,16 @@ impl State {
                 self.synoik.touch.remove(device);
                 self.synoik.tablets.remove(device);
                 self.synoik.devices.remove(device);
+
+                // Unplugging the last mouse hands workspace actions back to the focused display
+                // rather than leaving them aimed at wherever the cursor was abandoned
+                // (`docs/fork/multi-display.md` §4).
+                if !self.synoik.devices.iter().any(|device| {
+                    device.has_capability(input::DeviceCapability::Pointer)
+                        || device.has_capability(input::DeviceCapability::TabletTool)
+                }) {
+                    self.synoik.pointer_used = false;
+                }
             }
             _ => (),
         }
@@ -3149,6 +3163,16 @@ impl State {
             touch.cancel(self);
         }
 
+        // A workspace-scoped action acts on the display the pointer is on, not on the one that
+        // happens to hold focus (`docs/fork/multi-display.md` §4). Aiming *is* making that display
+        // active: the alternative — switching a workspace over there while the keyboard still talks
+        // to a window over here — is not a state the user asked for.
+        if action_aims_at_pointer(&action) {
+            if let Some(output) = self.synoik.pointer_aim_output() {
+                self.synoik.layout.focus_output(&output);
+            }
+        }
+
         match action {
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.synoik.exit_confirm_dialog.show() {
@@ -4086,32 +4110,12 @@ impl State {
                 // FIXME: granular
                 self.synoik.queue_redraw_all();
             }
-            Action::FocusWorkspaceDownUnderMouse => {
-                if let Some(output) = self.synoik.output_under_cursor() {
-                    if let Some(mon) = self.synoik.layout.monitor_for_output_mut(&output) {
-                        mon.switch_workspace_down();
-                        self.maybe_warp_cursor_to_focus();
-                        self.synoik.layer_shell_on_demand_focus = None;
-                        self.synoik.queue_redraw(&output);
-                    }
-                }
-            }
             Action::FocusWorkspaceUp => {
                 self.synoik.layout.switch_workspace_up();
                 self.maybe_warp_cursor_to_focus();
                 self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
                 self.synoik.queue_redraw_all();
-            }
-            Action::FocusWorkspaceUpUnderMouse => {
-                if let Some(output) = self.synoik.output_under_cursor() {
-                    if let Some(mon) = self.synoik.layout.monitor_for_output_mut(&output) {
-                        mon.switch_workspace_up();
-                        self.maybe_warp_cursor_to_focus();
-                        self.synoik.layer_shell_on_demand_focus = None;
-                        self.synoik.queue_redraw(&output);
-                    }
-                }
             }
             Action::FocusWorkspace(reference) => {
                 if let Some((mut output, index)) =
@@ -8483,11 +8487,11 @@ impl State {
                 let ticks = self.synoik.vertical_wheel_tracker.accumulate(vertical);
                 if ticks > 0 {
                     for _ in 0..ticks {
-                        self.do_action(Action::FocusWorkspaceDownUnderMouse, false);
+                        self.do_action(Action::FocusWorkspaceDown, false);
                     }
                 } else if ticks < 0 {
                     for _ in ticks..0 {
-                        self.do_action(Action::FocusWorkspaceUpUnderMouse, false);
+                        self.do_action(Action::FocusWorkspaceUp, false);
                     }
                 }
                 return;
@@ -8617,8 +8621,8 @@ impl State {
                                 == synoik_config::WindowingMode::Floating;
                             let (action_left, action_right, cooldown) = if gnome_mode {
                                 (
-                                    Action::FocusWorkspaceUpUnderMouse,
-                                    Action::FocusWorkspaceDownUnderMouse,
+                                    Action::FocusWorkspaceUp,
+                                    Action::FocusWorkspaceDown,
                                     Some(Duration::from_millis(50)),
                                 )
                             } else {
@@ -8695,7 +8699,7 @@ impl State {
                                 trigger: Trigger::WheelScrollUp,
                                 modifiers: Modifiers::empty(),
                             },
-                            action: Action::FocusWorkspaceUpUnderMouse,
+                            action: Action::FocusWorkspaceUp,
                             repeat: true,
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
@@ -8706,7 +8710,7 @@ impl State {
                                 trigger: Trigger::WheelScrollDown,
                                 modifiers: Modifiers::empty(),
                             },
-                            action: Action::FocusWorkspaceDownUnderMouse,
+                            action: Action::FocusWorkspaceDown,
                             repeat: true,
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
@@ -10508,6 +10512,57 @@ fn event_cancels_overlay_key<I: InputBackend>(event: &InputEvent<I>) -> bool {
             | InputEvent::PointerAxis { .. }
             | InputEvent::TouchDown { .. }
             | InputEvent::TouchUp { .. }
+    )
+}
+
+/// Whether this action acts on "the current display's workspaces" and so should be aimed at the
+/// display under the pointer rather than at the focused one (`docs/fork/multi-display.md` §4).
+///
+/// Three classes, and only the first is here:
+///
+/// - **workspace-scoped** — switching, reordering and naming a display's own stack;
+/// - **window-scoped** (`MoveWindowToWorkspace*`, maximize, close) — these follow the window, and
+///   the window is on the display it is on;
+/// - **display-scoped** (`FocusMonitor*`, every `*ByRef` / `*ById` form) — these name their target
+///   outright, so there is nothing to aim.
+fn action_aims_at_pointer(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::FocusWorkspaceDown
+            | Action::FocusWorkspaceUp
+            | Action::FocusWorkspace(_)
+            | Action::FocusWorkspacePrevious
+            | Action::MoveWorkspaceDown
+            | Action::MoveWorkspaceUp
+            | Action::MoveWorkspaceToIndex(_)
+            | Action::MoveWorkspaceToMonitor(_)
+            | Action::MoveWorkspaceToMonitorLeft
+            | Action::MoveWorkspaceToMonitorRight
+            | Action::MoveWorkspaceToMonitorDown
+            | Action::MoveWorkspaceToMonitorUp
+            | Action::MoveWorkspaceToMonitorPrevious
+            | Action::MoveWorkspaceToMonitorNext
+            | Action::SetWorkspaceName(_)
+            | Action::UnsetWorkspaceName
+    )
+}
+
+/// Whether this event means a pointer is actually being driven on this seat, which is what
+/// [`Synoik::pointer_used`] answers and `docs/fork/multi-display.md` §4 aims workspace actions by.
+///
+/// Touch is deliberately absent: a tap drives a finger, not a cursor, and it leaves nothing on
+/// screen for a later keybinding to be aimed at.
+fn event_drives_pointer<I: InputBackend>(event: &InputEvent<I>) -> bool {
+    matches!(
+        event,
+        InputEvent::PointerMotion { .. }
+            | InputEvent::PointerMotionAbsolute { .. }
+            | InputEvent::PointerButton { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TabletToolAxis { .. }
+            | InputEvent::TabletToolProximity { .. }
+            | InputEvent::TabletToolTip { .. }
+            | InputEvent::TabletToolButton { .. }
     )
 }
 
