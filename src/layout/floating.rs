@@ -367,6 +367,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // (`workspace.c:829`), which is where its maximized size comes from (`constraints.c:1326`).
         let area_changed = self.view_size != view_size || self.working_area != working_area;
 
+        // Before the move below, which has to see the size the window is going to end up with.
+        let restore_pos: Vec<Option<Point<f64, Logical>>> = if area_changed {
+            (0..self.tiles.len())
+                .map(|idx| self.fit_to_working_area(idx, working_area))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
@@ -385,6 +394,92 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 self.refit_to_working_area(idx);
             }
         }
+
+        // A window that got its overridden geometry back is put where it was, over the move's
+        // answer: the whole point of keeping the rect is that a workspace returning to the display
+        // it came from returns its windows to where they were, not merely to the same size.
+        for (idx, pos) in restore_pos.into_iter().enumerate() {
+            if let Some(pos) = pos {
+                self.data[idx].set_logical_pos(pos);
+            }
+        }
+    }
+
+    /// Sizes one plain floating window to a work area it may no longer fit, and gives it its own
+    /// geometry back when the area can hold it again.
+    ///
+    /// Mutter does not do this half: nothing there shrinks a normal window for a smaller monitor,
+    /// so it overflows with its titlebar kept reachable. We fit it instead, and pay for it with
+    /// [`Tile::displaced_rect`] — the rect we overrode, held until an area big enough for it comes
+    /// along. Each axis is clamped on its own: a window that is merely too tall must not also come
+    /// back narrower.
+    ///
+    /// Everything is derived from the *desired* rect, never from the current one, so a second
+    /// smaller display does not shrink an already-shrunk window and a dock cycle cannot ratchet.
+    ///
+    /// Returns the position to put the window back at, when it just got its rect back and the area
+    /// can hold it there.
+    fn fit_to_working_area(
+        &mut self,
+        idx: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let old_area = self.working_area;
+        let tile = &self.tiles[idx];
+
+        // Only a plain floating window. Maximized, fullscreen and edge-tiled geometry is a
+        // function of the work area, and `refit_to_working_area` re-derives it.
+        if !tile.window().pending_sizing_mode().is_normal()
+            || tile.window().edge_tiled_side().is_some()
+        {
+            return None;
+        }
+
+        let current = Rectangle::new(
+            self.data[idx].logical_pos - old_area.loc,
+            self.data[idx].size,
+        );
+        let desired = tile.displaced_rect.unwrap_or(current);
+
+        let win = tile.window();
+        let min_size = win.min_size();
+        let max_size = win.max_size();
+        let fit = |desired: f64, available: f64, min: i32, max: i32| {
+            ensure_min_max_size(f64::min(desired, available).round() as i32, min, max)
+        };
+        let win_size = Size::from((
+            fit(
+                tile.window_width_for_tile_width(desired.size.w),
+                tile.window_width_for_tile_width(area.size.w),
+                min_size.w,
+                max_size.w,
+            ),
+            fit(
+                tile.window_height_for_tile_height(desired.size.h),
+                tile.window_height_for_tile_height(area.size.h),
+                min_size.h,
+                max_size.h,
+            ),
+        ));
+        let tile_size = Size::<f64, Logical>::from((
+            tile.tile_width_for_window_width(f64::from(win_size.w)),
+            tile.tile_height_for_window_height(f64::from(win_size.h)),
+        ));
+        let fits = tile_size.w >= desired.size.w && tile_size.h >= desired.size.h;
+
+        // Unanimated, for `refit_to_working_area`'s reason: the user did not ask for this, the
+        // area moved underneath them, and mutter re-constrains such a window instantly.
+        let tile = &mut self.tiles[idx];
+        if fits {
+            let desired = tile.displaced_rect.take()?;
+            tile.window_mut().request_size_once(win_size, false);
+            let restored = Rectangle::new(desired.loc + area.loc, desired.size);
+            return area.contains_rect(restored).then_some(restored.loc);
+        }
+
+        tile.displaced_rect.get_or_insert(current);
+        tile.window_mut().request_size_once(win_size, false);
+        None
     }
 
     /// Re-derive one tile's geometry from the current work area, for a window whose size is owned
@@ -1204,6 +1299,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile = &mut self.tiles[idx];
         tile.floating_preset_width_idx = None;
+        // Resizing is the user saying this is the size now, so the geometry a
+        // displacement overrode stops being a thing to go back to.
+        tile.displaced_rect = None;
 
         let available_size = self.working_area.size.w;
         let win = tile.window();
@@ -1251,6 +1349,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile = &mut self.tiles[idx];
         tile.floating_preset_height_idx = None;
+        // Resizing is the user saying this is the size now, so the geometry a
+        // displacement overrode stops being a thing to go back to.
+        tile.displaced_rect = None;
 
         let available_size = self.working_area.size.h;
         let win = tile.window();
@@ -1417,6 +1518,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         };
         let idx = self.idx_of(id).unwrap();
+        // As with a resize: the user has put the window somewhere, so a stored geometry must not
+        // pull it back the next time a work area grows.
+        self.tiles[idx].displaced_rect = None;
 
         let mut pos = self.data[idx].logical_pos;
 

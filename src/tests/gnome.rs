@@ -29569,6 +29569,84 @@ fn a_floating_window_against_an_edge_stays_against_it_when_the_area_shrinks() {
     );
 }
 
+/// A floating window too big for a smaller work area is fitted to it, per axis, and gets its own
+/// geometry back when an area that can hold it comes along.
+///
+/// mutter does not do this half — nothing there shrinks a normal window for a smaller monitor, so
+/// it overflows with the titlebar kept reachable. The cost of doing better is
+/// `Tile::displaced_rect` (`docs/fork/multi-display.md` §5).
+#[test]
+fn a_floating_window_is_fitted_to_a_smaller_area_and_restored_by_a_bigger_one() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1000, 800), None);
+
+    // Honour the configure like a real client, or the tile keeps its mapped size and the test
+    // measures nothing.
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let size_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        let snapshot = f.synoik().layout.session_snapshot(win).unwrap();
+        let rect = snapshot.tile.floating_rect.expect("it floats");
+        (
+            rect.size.w.round() as i32,
+            rect.size.h.round() as i32,
+            rect.loc.x.round() as i32,
+            rect.loc.y.round() as i32,
+        )
+    };
+    let before = size_of(&mut f, &win);
+    assert_eq!((before.0, before.1), (1000, 800), "it maps at its own size");
+
+    // A shorter mode: the work area can no longer hold 800 rows, but 1000 columns still fit.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f);
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    let fitted = size_of(&mut f, &win);
+    assert_eq!(
+        (fitted.0, fitted.1),
+        (1000, area.size.h.round() as i32),
+        "only the axis that stopped fitting is clamped; the other keeps its size"
+    );
+
+    // Smaller again, so the second fit is measured against the rect the *first* one overrode. A
+    // fit that shrank what it found would ratchet the window down one dock cycle at a time.
+    f.resize_output(1, Some((1024, 600)), None);
+    settle(&mut f);
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    assert_eq!(
+        {
+            let f = size_of(&mut f, &win);
+            (f.0, f.1)
+        },
+        (1000, area.size.h.round() as i32),
+        "the height is measured from the original 800, not from the 688 the last fit left"
+    );
+
+    f.resize_output(1, Some((1920, 1080)), None);
+    settle(&mut f);
+
+    assert_eq!(
+        size_of(&mut f, &win),
+        before,
+        "an area that can hold it again gives back the geometry it had, position included"
+    );
+}
+
 /// An index no strip could ever reach is clamped, not applied — it comes out of a file a user can
 /// edit, and the offset only makes a hostile one larger.
 #[test]

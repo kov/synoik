@@ -5638,6 +5638,9 @@ impl<W: LayoutElement> Layout<W> {
                         // floating_pos; a picker drop keeps it.
                         if !keep_position {
                             tile.floating_pos = None;
+                            // Dropping a window is the user placing it, so a displaced geometry
+                            // stops being one to go back to — the same rule a resize follows.
+                            tile.displaced_rect = None;
 
                             match insert_ws {
                                 InsertWorkspace::Existing(_) => {

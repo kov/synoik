@@ -85,6 +85,17 @@ pub struct Tile<W: LayoutElement> {
     /// the window starts out in the tiling layout.
     pub(super) floating_pos: Option<Point<f64, SizeFrac>>,
 
+    /// The geometry a work-area change overrode, relative to the work area's origin.
+    ///
+    /// mutter's `unconstrained_rect` in Wayland clothes. Mutter keeps the rect the user asked for
+    /// and re-derives the visible one through the constraint system on every pass; here the client
+    /// owns its buffer, so fitting a window to a smaller display is a real configure and the rect
+    /// it overrode has to be kept on the side. Put back verbatim when a work area big enough for
+    /// it comes along — never re-derived by inverting the shrink, because rounding makes "a
+    /// recovered value is not the original" literally true — and dropped the moment the user
+    /// resizes or moves the window, which is them saying this is the geometry now.
+    pub(super) displaced_rect: Option<Rectangle<f64, Logical>>,
+
     /// The window size to restore when untiling (mutter's `saved_rect`).
     ///
     /// Kept separately from `floating_window_size`, which tracks the live
@@ -355,6 +366,7 @@ impl<W: LayoutElement> Tile<W> {
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
+            displaced_rect: None,
             tiled_restore_size: None,
             tiled_restore_pos: None,
             restore_in_flight: None,
