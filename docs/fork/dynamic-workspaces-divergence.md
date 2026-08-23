@@ -275,6 +275,35 @@ Two things it runs into, both already documented here and worth reading before s
   pointer (§ "The row opens for a new workspace *during* the drag"). Two rows, on two displays,
   both potentially reacting to one drag, makes that rule harder to keep, not easier.
 
+### Backlog: workspace state should survive an unplug and a replug
+
+**Wanted, not built.** Unplugging a display appends its workspaces to the primary
+(`Monitor::append_workspaces`); replugging it does not take them back. What comes back is a fresh
+empty strip, and the desktops that display owned are now scattered through the primary's. On a
+laptop that docks daily, that is the common case, not the corner one.
+
+What exists today is a shard of the answer: `Layout::last_active_workspace_id`
+(`src/layout/mod.rs:427`) remembers which workspace was *active* on an output, keyed by its name,
+and hands it back when that output returns. It remembers one id, not the stack, and a name is not
+an identity.
+
+The shape this wants is workspace state keyed the way display state already is — by monitor
+identity, or by the **whole configuration**, exactly as `monitors.xml` keys a layout by the set of
+connected monitors (`src/monitors_xml.rs`, "A configuration is a set, not a monitor"). Docked and
+undocked would then be two remembered arrangements rather than one arrangement being repeatedly
+destroyed and rebuilt.
+
+Two consumers, and they should not grow separate answers:
+
+- the **live** layout, which is what makes a replug restore the strip;
+- the **session store**, whose records already name a display
+  (`docs/fork/session-management-port.md`) but whose workspace index is only meaningful relative
+  to a stack nothing else remembers.
+
+Related and adjacent: a window whose display is gone currently keeps its size and loses its
+position. Recomputing a sensible size and position for a *substitute* display is wanted, and it is
+the same machinery a workspace moved between displays will need.
+
 ## Amendment 2026-08-13 — GNOME's drag & drop workspace concept: IGNORED
 
 The design team's *Shell Design Dreams* post (2026-08-11) revives a GNOME-40-era

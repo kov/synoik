@@ -699,6 +699,18 @@ Pinned by `tests::window_opening::maximize_after_the_initial_configure_keeps_the
 
 ## Open questions
 
+### Backlog: absent-display offsets do not coordinate across sessions
+
+**Wanted, not built.** The workspace offset an absent display's records get is computed per
+session (see "A record is anchored to a display"). Two applications restoring at once each measure
+against the primary's own strip, so their homeless windows can interleave with each other's — each
+group is internally correct and consistent, but they overlap.
+
+Coordinating them needs a base every session agrees on, which means reading the whole store rather
+than one session, and deciding what to do about sessions that will never be restored: a stale
+entry must not reserve workspaces for windows that are not coming back. That is the hard half —
+the arithmetic is trivial once there is a rule for who counts.
+
 ### Eviction — cap at 1000 sessions, most-recently-used
 
 Mutter records `last-used` but no code acts on it, so its store grows forever. We record it too
