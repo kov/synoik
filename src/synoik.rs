@@ -8210,6 +8210,27 @@ impl Synoik {
                 self.queue_redraw(&output);
             }
         }
+
+        // The saved layout also says which monitor is primary. With workspaces owned per monitor
+        // (`docs/fork/dynamic-workspaces-divergence.md` §4) that decides one thing only: where
+        // workspaces orphaned by an unplug are adopted. Left alone when nothing is saved, so the
+        // default stays "the first output added".
+        if let Some(primary) = saved_layout.and_then(|conf| {
+            conf.logical_monitors
+                .iter()
+                .filter(|lm| lm.primary)
+                .flat_map(|lm| &lm.monitors)
+                .find_map(|m| {
+                    self.global_space
+                        .outputs()
+                        .find(|o| {
+                            o.user_data().get::<OutputName>().unwrap().connector == m.connector
+                        })
+                        .cloned()
+                })
+        }) {
+            self.layout.set_primary_output(&primary);
+        }
     }
 
     /// Derives an output's scale and transform from the precedence chain described in

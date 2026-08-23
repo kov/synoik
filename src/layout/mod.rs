@@ -1091,6 +1091,27 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Make `output`'s monitor the primary one, as `monitors.xml`'s `<primary>` asks.
+    ///
+    /// Because every display owns its workspaces (`docs/fork/dynamic-workspaces-divergence.md`
+    /// §4), primary is *only* the monitor that adopts workspaces orphaned by an unplug — it does
+    /// not decide where workspace switching happens, since nothing global does. A no-op if the
+    /// output has no monitor (it is not connected, or the layout has none yet).
+    pub fn set_primary_output(&mut self, output: &Output) {
+        let MonitorSet::Normal {
+            monitors,
+            primary_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return;
+        };
+        let Some(idx) = monitors.iter().position(|mon| mon.output() == output) else {
+            return;
+        };
+        *primary_idx = idx;
+    }
+
     pub fn remove_output(&mut self, output: &Output) {
         self.monitor_set = match mem::take(&mut self.monitor_set) {
             MonitorSet::Normal {

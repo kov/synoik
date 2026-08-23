@@ -20678,6 +20678,74 @@ fn monitors_xml_layout_saved_for_another_mode_is_rejected() {
     assert_eq!(output_position(&mut f, 2), (1280, 0));
 }
 
+/// A saved layout for three monitors that names `headless-2` primary.
+fn monitors_xml_with_primary_on_two() -> String {
+    let spec = |n: u8, x: i32, primary: bool| {
+        format!(
+            r#"    <logicalmonitor>
+      <x>{x}</x><y>0</y><scale>1</scale>{}
+      <monitor><monitorspec>
+        <connector>headless-{n}</connector><product>headless</product><serial>{n}</serial>
+      </monitorspec></monitor>
+    </logicalmonitor>
+"#,
+            if primary {
+                "<primary>yes</primary>"
+            } else {
+                ""
+            }
+        )
+    };
+    format!(
+        "<monitors version=\"2\">\n  <configuration>\n{}{}{}  </configuration>\n</monitors>",
+        spec(1, 0, false),
+        spec(2, 1280, true),
+        spec(3, 2560, false),
+    )
+}
+
+/// The workspace `name` currently lives on, by output connector.
+fn workspace_output(f: &mut Fixture, name: &str) -> String {
+    f.synoik()
+        .layout
+        .monitors()
+        .find(|mon| {
+            mon.workspaces_ref()
+                .iter()
+                .any(|ws| ws.name().map(String::as_str) == Some(name))
+        })
+        .map(|mon| mon.output().name())
+        .expect("the named workspace is on some monitor")
+}
+
+/// `<primary>` decides which monitor adopts workspaces orphaned by an unplug — the one thing
+/// primary still means once every display owns its own workspaces.
+#[test]
+fn monitors_xml_primary_adopts_orphaned_workspaces() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_primary_on_two());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+    f.add_output(2, (1280, 1024));
+    f.add_output(3, (1280, 1024));
+
+    // Name a workspace on headless-3, so it survives the migration (an unnamed empty one is
+    // dropped — see dynamic-workspaces-divergence.md "Accepted losses").
+    let output3 = f.synoik_output(3);
+    f.synoik().layout.focus_output(&output3);
+    f.synoik_state()
+        .do_action(Action::SetWorkspaceName("orphan".to_owned()), false);
+    assert_eq!(workspace_output(&mut f, "orphan"), "headless-3");
+
+    f.remove_output(3);
+
+    assert_eq!(
+        workspace_output(&mut f, "orphan"),
+        "headless-2",
+        "the saved primary adopts it, not the first output added"
+    );
+}
+
 /// A saved monitors.xml scale is honored from the first frame (store > KDL > DPI guess).
 #[test]
 fn monitors_xml_scale_applies_at_startup() {
