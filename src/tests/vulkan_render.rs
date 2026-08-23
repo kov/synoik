@@ -2326,7 +2326,12 @@ fn vulkan_renders_the_top_panel() {
                 Size::<i32, Physical>::from((width, bar_h)),
                 scale,
             );
-            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 255)
+                .count()
         })
         .expect("vulkan renderer");
 
@@ -2409,7 +2414,12 @@ fn vulkan_fills_a_rect_that_overhangs_the_bake_buffer() {
                     Size::<i32, Physical>::from((BUF, BUF)),
                     scale,
                 );
-                pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] == 255)
+                    .count()
             })
             .expect("vulkan renderer");
 
@@ -2624,9 +2634,11 @@ fn vulkan_composites_the_workspace_dots() {
         let y = bar_h / 2;
         let row =
             &pixels[(y * width) as usize * 4..((y * width) as usize + dot_region as usize) * 4];
-        let bright = row.chunks_exact(4).filter(|p| p[0] > 200).count();
+        let bright = row.as_chunks::<4>().0.iter().filter(|p| p[0] > 200).count();
         let dim = row
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| (80..=200).contains(&p[0]))
             .count();
         (bright, dim)
@@ -2634,7 +2646,9 @@ fn vulkan_composites_the_workspace_dots() {
     let peak = |pixels: &[u8]| -> u8 {
         let y = bar_h / 2;
         pixels[(y * width) as usize * 4..((y * width) as usize + dot_region as usize) * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| p[0])
             .max()
             .unwrap_or(0)
@@ -2732,7 +2746,9 @@ fn vulkan_composites_a_recolored_icon() {
     .expect("render icon");
 
     let red = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > 120 && p[1] < 60 && p[2] < 60 && p[3] > 120)
         .count();
     assert!(
@@ -2909,7 +2925,7 @@ fn vulkan_menu_draws_an_expanded_submenus_children() {
             return 0;
         }
         let row = &pixels[(y * phys.w) as usize * 4..][..(phys.w as usize) * 4];
-        row.chunks_exact(4).filter(|p| p[3] > 40).count()
+        row.as_chunks::<4>().0.iter().filter(|p| p[3] > 40).count()
     };
 
     let shut = ink_at(&mut vk, &menu, child_at);
@@ -3059,7 +3075,12 @@ fn vulkan_renders_the_calendar_popover() {
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 400.);
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
-            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 255)
+                .count()
         })
         .expect("vulkan renderer");
 
@@ -3767,7 +3788,12 @@ fn vulkan_renders_the_quick_settings_popover() {
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 300.);
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
-            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 255)
+                .count()
         })
         .expect("vulkan renderer");
 
@@ -3829,7 +3855,12 @@ fn vulkan_renders_the_brightness_slider() {
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 300.);
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
-            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 255)
+                .count()
         })
         .expect("vulkan renderer");
 
@@ -3888,7 +3919,9 @@ fn vulkan_renders_the_a11y_switches() {
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 // Abgr8888 is byte-order R,G,B,A here: accent #3584e4 is blue-dominant.
                 pixels
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| p[3] == 255 && p[2] > 180 && u16::from(p[2]) > u16::from(p[0]) + 60)
                     .count()
             })
@@ -11971,7 +12004,7 @@ fn vulkan_renders_the_osd() {
                 let mut white = 0usize;
                 let mut red = 0usize;
                 let mut pill_bg = 0usize;
-                for (i, p) in pixels.chunks_exact(4).enumerate() {
+                for (i, p) in pixels.as_chunks::<4>().0.iter().enumerate() {
                     let y = i as i32 / w;
                     // Abgr8888 is byte-order R,G,B,A here.
                     if p[3] == 255 && p[0] > 40 && p[0] < 60 && p[2] > 44 && p[2] < 64 {
@@ -13445,8 +13478,10 @@ fn vulkan_draws_the_caps_lock_warning() {
 
     let (after, _, _) = render_output_vulkan(&mut f, &output);
     let differing = before
-        .chunks_exact(4)
-        .zip(after.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(
@@ -13629,8 +13664,10 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
         "the two frames must be comparable"
     );
     let differing = baseline
-        .chunks_exact(4)
-        .zip(pixels2.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(pixels2.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(
@@ -14109,7 +14146,9 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
     // Count opaque, strongly-green pixels. A window that failed to import composites as a hole in
     // the backdrop, which has no green of its own at this saturation.
     let green = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[1] > 200 && p[0] < 80 && p[2] < 80 && p[3] > 200)
         .count();
     assert!(
@@ -14195,8 +14234,10 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
 
     let [focused, unfocused] = shots;
     let differing = focused
-        .chunks_exact(4)
-        .zip(unfocused.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(unfocused.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
     // A whole bar, not a sliver: the caret rides the run's *pen*, which sits left of the ink by

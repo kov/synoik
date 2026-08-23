@@ -3205,7 +3205,7 @@ fn dump_scanout_png(buffer: &VulkanScanoutBuffer, output: &str) {
 
     // Our scanout format is Xrgb8888/Argb8888 — BGRA bytes in memory — and this path reads them
     // raw, so reorder here. (The client path asks the GPU for RGBA and needs no pass.)
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     write_scanout_png(width, height, pixels, output, "ours");
@@ -3221,7 +3221,7 @@ fn write_scanout_png(width: u32, height: u32, mut pixels: Vec<u8>, output: &str,
 
     // Alpha is undefined in an X format, and a PNG that decodes fully transparent looks exactly
     // like the black screen we are chasing. Force it opaque so the image cannot lie about that.
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         px[3] = 0xff;
     }
 

@@ -1324,7 +1324,7 @@ mod tests {
     fn noise(w: u32, h: u32) -> Vec<u8> {
         let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
         let mut state = 0x2545_f491_4f6c_dd1du64;
-        for px in out.chunks_exact_mut(4) {
+        for px in out.as_chunks_mut::<4>().0 {
             // xorshift64* — cheap, deterministic, and white enough that nothing
             // downstream can compress it.
             state ^= state >> 12;

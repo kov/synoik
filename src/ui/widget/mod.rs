@@ -4006,7 +4006,9 @@ pub fn assert_scale_correct(
         let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
         let count = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count() as u64;
         assert!(

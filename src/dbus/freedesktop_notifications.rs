@@ -235,7 +235,7 @@ impl Notifications {
         // a few spares survive for replaces).
         let mut has_default_action = false;
         let mut action_pairs = Vec::new();
-        for pair in actions.chunks_exact(2) {
+        for pair in actions.as_chunks::<2>().0 {
             if pair[0] == "default" {
                 has_default_action = true;
             } else if action_pairs.len() < 16 {

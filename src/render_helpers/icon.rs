@@ -691,7 +691,12 @@ pub fn rasterize_symbolic_bytes(
     // coverage and paint the target color through it.
     let src = pixmap.data();
     let mut out = vec![0u8; (px * px * 4) as usize];
-    for (dst, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (dst, s) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         let cov = f32::from(s[3]) / 255. * color[3];
         dst[0] = (color[0] * cov * 255.).round().clamp(0., 255.) as u8;
         dst[1] = (color[1] * cov * 255.).round().clamp(0., 255.) as u8;
@@ -1575,10 +1580,12 @@ mod tests {
         assert_eq!(buf.size().w, 32);
         let data = buf.data();
         // Some opaque coverage exists, and where covered it is red (R set, G/B ~0).
-        let covered = data.chunks_exact(4).filter(|p| p[3] > 40).count();
+        let covered = data.as_chunks::<4>().0.iter().filter(|p| p[3] > 40).count();
         assert!(covered > 20, "expected icon coverage, got {covered}");
         let reddish = data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 40 && p[0] > 40 && p[1] < 20 && p[2] < 20)
             .count();
         assert!(
@@ -1636,11 +1643,15 @@ mod tests {
     fn app_icon_svg_keeps_its_colors() {
         let rgba = render_app_svg(RED_BLUE_SVG, 32, ImageFit::Contain).expect("render app svg");
         let reddish = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 180 && p[2] < 60 && p[3] > 200)
             .count();
         let bluish = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[2] > 180 && p[0] < 60 && p[3] > 200)
             .count();
         assert!(reddish > 40, "expected red pixels, got {reddish}");
@@ -1663,7 +1674,9 @@ mod tests {
         let rgba = decode_raster(&png, 8, ImageFit::Contain).expect("decode raster");
         // Premultiplied red = 255 * 128/255 = 128; alpha kept at 128.
         let p = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .find(|p| p[3] > 0)
             .expect("some coverage");
         assert!(
@@ -1696,7 +1709,9 @@ mod tests {
         let covered = |fit| {
             decode_raster(&png, 16, fit)
                 .expect("decode raster")
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| p[3] > 200)
                 .count()
         };
@@ -1744,7 +1759,7 @@ mod tests {
         let out = decode_raster(&png, 160, ImageFit::Cover).expect("decode raster");
         assert_eq!(out.len(), 160 * 160 * 4);
         assert!(
-            out.chunks_exact(4).all(|p| p[3] > 200),
+            out.as_chunks::<4>().0.iter().all(|p| p[3] > 200),
             "cover must still fill the square"
         );
     }
@@ -1774,7 +1789,9 @@ mod tests {
                 .buffer(&source, fit, 16., 1.0)
                 .expect("decode")
                 .data()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| p[3] > 200)
                 .count()
         };
@@ -2065,7 +2082,13 @@ mod tests {
         };
         for scale in [1.0, 2.0] {
             let buf = cache.buffer(&icon, 48., scale).expect("decode");
-            let covered = buf.data().chunks_exact(4).filter(|p| p[3] > 40).count();
+            let covered = buf
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] > 40)
+                .count();
             assert!(covered > 50, "coverage at scale {scale}: {covered}");
             let logical = buf.logical_size();
             assert!(
@@ -2083,7 +2106,13 @@ mod tests {
         let cache = AppIconCache::new("Adwaita");
         match cache.buffer(&AppIconRef::Fallback, 32., 1.0) {
             Some(buf) => {
-                let covered = buf.data().chunks_exact(4).filter(|p| p[3] > 40).count();
+                let covered = buf
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] > 40)
+                    .count();
                 assert!(covered > 20, "fallback icon should have coverage");
             }
             None => eprintln!("skipping fallback coverage: application-x-executable not installed"),

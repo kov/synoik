@@ -890,7 +890,9 @@ mod tests {
 
                     // Bright glyph ink (title / labels).
                     let bright = pixels
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200)
                         .count();
                     assert!(bright > 40, "expected visible glyph ink, got {bright}");

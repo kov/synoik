@@ -363,7 +363,9 @@ fn vulkan_render_glyphs_rasterizes_coverage() {
     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
     let bright = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
         .count();
     eprintln!("render_glyphs bright pixels = {bright}");
@@ -4519,7 +4521,12 @@ fn runs_survive_an_atlas_growth() {
         .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
         .expect("copy_framebuffer");
     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
-    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 150).count();
+    let ink = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] > 150)
+        .count();
     assert!(
         ink > 0,
         "a run built before the atlas grew drew nothing afterwards"
@@ -4677,7 +4684,9 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
         let top = (4 + i as i32 * 24).max(0) as usize;
         let bottom = (top + 24).min(320);
         let ink = pixels[top * 64 * 4..bottom * 64 * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 128)
             .count();
         assert!(
@@ -5204,7 +5213,12 @@ fn a_deferred_frames_glyph_staging_outlives_it() {
         .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
         .expect("copy_framebuffer");
     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
-    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 128).count();
+    let ink = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[0] > 128)
+        .count();
     assert!(
         ink > 40,
         "only {ink} lit pixels — the glyph copy did not land, which is what a staging buffer \
@@ -5385,7 +5399,7 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
 
     let mut staging = synoik_vk::staging::HostStaging::new(vk.gpu(), (W * H * 4) as usize)
         .expect("host staging buffer");
-    for px in staging.as_mut_slice().chunks_exact_mut(4) {
+    for px in staging.as_mut_slice().as_chunks_mut::<4>().0 {
         px.copy_from_slice(&want);
     }
     // Held by an `Arc` from here on, as the wallpaper holds it: the copy is queued for the next

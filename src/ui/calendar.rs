@@ -4117,14 +4117,18 @@ run it with --features reference-env, as the fedora CI job does"
 
         // Bright glyph ink (day numbers / header).
         let bright = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 60, "expected visible day glyphs, got {bright}");
 
         // The today disc paints red (accent) pixels: high R, low G/B, opaque.
         let accent = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             // Abgr8888 in memory is [A,B,G,R]? render reads as RGBA; the readback
             // is Abgr8888 mapped to RGBA bytes, so p[0]=R here as elsewhere.
             .filter(|p| p[0] > 150 && p[1] < 80 && p[2] < 80 && p[3] > 150)

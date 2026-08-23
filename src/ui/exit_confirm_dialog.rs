@@ -425,13 +425,17 @@ mod tests {
 
         // A grey keycap pixel (~0x2C = 44) exists, distinctly darker than the 54 card bg.
         let keycap = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| (40..=48).contains(&p[0]) && (40..=48).contains(&p[1]));
         assert!(keycap, "expected a grey keycap patch (~0x2C)");
 
         // Bright glyph ink.
         let bright = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 40, "expected visible glyph ink, got {bright}");

@@ -391,7 +391,7 @@ pub fn pixmap_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Pixmap> 
 
     let mut rgba = Vec::with_capacity(expected);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-    for px in argb.chunks_exact(4) {
+    for px in argb.as_chunks::<4>().0 {
         let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
         // Premultiply: our compositing path takes premultiplied alpha, and the wire form is not.
         // Skipping this makes every translucent edge glow.

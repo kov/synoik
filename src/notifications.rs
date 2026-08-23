@@ -167,7 +167,7 @@ impl PixelIcon {
             if has_alpha {
                 rgba.extend_from_slice(row);
             } else {
-                for px in row.chunks_exact(3) {
+                for px in row.as_chunks::<3>().0 {
                     rgba.extend_from_slice(px);
                     rgba.push(255);
                 }

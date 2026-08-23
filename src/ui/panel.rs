@@ -3405,7 +3405,9 @@ mod tests {
 
         // Bright glyph ink somewhere (the clock text).
         let bright = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 40, "expected visible glyph ink, got {bright}");
@@ -3955,7 +3957,9 @@ mod tests {
             .expect("copy_framebuffer");
         let pill_px = vk.map_texture(&mapping).expect("map_texture").to_vec();
         let red = pill_px
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200)
             .count();
         assert!(red > 50, "expected a red recording pill, got {red} red px");
@@ -3984,7 +3988,7 @@ mod tests {
         // Readback is [R, G, B, A] per pixel.
         let mut ink = 0usize;
         let mut label_red = 0usize;
-        for p in pixels.chunks_exact(4) {
+        for p in pixels.as_chunks::<4>().0 {
             if p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200 {
                 label_red += 1;
             }

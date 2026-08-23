@@ -372,7 +372,9 @@ fn render_text(gpu: &Arc<Gpu>) -> Result<Vec<u8>> {
 /// The dark bg survives and we rasterized a plausible amount of bright glyph ink.
 fn assert_text(ours: &[u8]) -> Result<()> {
     let bright = ours
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
         .count();
     eprintln!("synoik-vk: text bright pixels = {bright}");

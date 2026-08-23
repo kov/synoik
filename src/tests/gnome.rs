@@ -22333,7 +22333,11 @@ fn changing_the_account_picture_in_place_replaces_it() {
         .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
         .expect("the first picture decodes");
     assert!(
-        red.data().chunks_exact(4).all(|p| p[0] > 150 && p[1] < 90),
+        red.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[0] > 150 && p[1] < 90),
         "the fixture decoded a red picture"
     );
 
@@ -22349,7 +22353,11 @@ fn changing_the_account_picture_in_place_replaces_it() {
         .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
         .expect("the new picture decodes");
     assert!(
-        now.data().chunks_exact(4).all(|p| p[1] > 150 && p[0] < 90),
+        now.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[1] > 150 && p[0] < 90),
         "the lock screen is still holding the previous picture"
     );
 

@@ -810,7 +810,7 @@ mod tests {
         let (cropped_size, cropped) = crop_rgba8(size, &pixels, area).expect("a crop");
 
         assert_eq!(cropped_size, Size::from((2, 2)));
-        let reds: Vec<u8> = cropped.chunks_exact(4).map(|p| p[0]).collect();
+        let reds: Vec<u8> = cropped.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
         assert_eq!(reds, vec![5, 6, 9, 10], "rows 1..3, columns 1..3");
     }
 
