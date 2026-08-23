@@ -1,6 +1,6 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §1, §2, §4 and §6's drag are implemented; §3 and §5 are not.**
+**Status: design agreed 2026-08-23. §1, §2, §3, §4 and §6's drag are implemented; §5 is not.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -54,6 +54,14 @@ ways a workspace changes display:
 - an **evacuation** (the display was unplugged) leaves the tag alone, so the workspace is homeless
   rather than re-homed.
 
+Putting a **window** on a workspace is neither, and no longer re-homes one. niri adopted any
+unnamed workspace into the monitor a window was added on (`Monitor::add_column` and its two
+neighbours), which took an evacuated workspace away from the display it was waiting for the moment
+the user opened something on it — the display then came back to less than it left. What the rule
+was actually good for is kept: a workspace that has no home at all (made while no display was
+connected) still takes the monitor's, and a home carrying a bare connector name still fills in its
+EDID. `Workspace::adopt_home`.
+
 That is the semantics this design wants, and `Layout::add_output` already acts on it: a returning
 display takes back every workspace on the primary whose tag matches (`src/layout/mod.rs:1038-1074`),
 and `last_active_workspace_id` restores which of them was active. Three things are missing.
@@ -102,24 +110,40 @@ parked list explicitly, into the same id- and name-uniqueness sets.
 **A lifetime.** Parked groups live for the session and die with it. Nothing about a workspace is
 persisted on its own — across a restart, the saved application sessions are the only carriers (§3).
 
-## 3. Restore derives the stack; it does not persist one
+## 3. Restore derives the stack; it does not persist one — *implemented*
 
-A session record already names a display and carries an output-local rect
-(`session-management-port.md`, "A record is anchored to a display"). What it cannot do today is say
-*where in that display's stack* its workspace was, because nothing remembers the stack — and the
-absent-display offset it falls back on is computed per session, so two applications restoring at
-once interleave their homeless windows.
+A session record names a display and carries an output-local rect (`session-management-port.md`,
+"A record is anchored to a display"). What it cannot say is *where in that display's stack* its
+workspace was, because nothing remembers the stack.
 
-The stack is **derived from the store, not persisted**:
+The stack is **derived from the store, not persisted**. `SessionStore::load` reads every session at
+once, so restore ranks the distinct `(connector, workspace index)` slots of every display that is
+**not connected**, displays in connector order and each display's slots in its own, and consults
+that ordering instead of counting workspaces. Two applications restoring at once therefore agree,
+which the per-session offset it replaces could not: each of them counted only its own records, so
+one app's homeless window landed on the workspace the other was about to be restored onto.
 
-- `SessionStore::load` reads every session at once (`src/session_state.rs:331`), so at startup the
-  whole record set is visible, not just the application currently restoring. Sort the distinct
-  `(display identity, workspace name or index)` slots per display into one **ordering**. Restore
-  consults that ordering instead of counting, so the result no longer depends on who restores first
-  and the interleave is gone.
-- The ordering **reserves nothing**. A workspace materializes only when a window actually restores
-  into its slot. That is the answer to "who counts": a stale session that never restores creates no
-  workspaces, however many it names.
+The ordering **reserves nothing**. A slot becomes a workspace only when a window actually restores
+into it, so a session that never comes back costs the ones that do nothing — not a workspace, and
+not a position. Distinct slots, so what it would cost is a rank per workspace it names rather than
+the number it names.
+
+Where the block goes is a **position, not an index**. A slot materializes above every materialized
+slot that ranks after it, and at the bottom of the strip when none of them is there yet — which is
+what makes the arrangement independent of who restores first. The bottom is the top of the strip's
+trailing run of empty, unclaimed workspaces, and one of those is taken over rather than added to: a
+strip holding nothing of its own is all trailing run, and a block inserted below it would leave the
+first desktop empty and push everything down one. A record whose display *is* connected keeps
+landing on its saved index literally, and the growth that reaches it inserts **above** the block
+rather than past it — the block floats at the bottom, so the same records land the same way whether
+it arrived first or last.
+
+What restore materializes is tagged as the absent display's, with the saved index as its home
+ordinal, so plugging that display in reclaims it into the arrangement it was saved in — the same
+thing an unplug and a replug do for a workspace that never left (§2).
+
+Gaps do not survive a restart, unlike a live unplug and replug: nothing persists an empty
+workspace, so a desktop the user left empty is a desktop no record names.
 
 A workspace name still outranks the index when matching (`session-management-port.md`), which is
 what makes naming worth a UI (§6).
@@ -314,7 +338,7 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 2. **The cross-output workspace drag** (§6) — LANDED.
 3. **Identity unification** (§1) — LANDED.
 4. **Home ordinal and parked empties** (§2) — LANDED.
-5. **Derived restore ordering with lazy materialization** (§3) — kills the absent-display offset.
+5. **Derived restore ordering with lazy materialization** (§3) — LANDED.
 6. **Displaced geometry** (§5) — the two-branch move, the per-axis shrink, `displaced_rect`, the
    auto-maximize mark.
 7. **The workspace context menu and naming UI** (§6) — any time after 2.

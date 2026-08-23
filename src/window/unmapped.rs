@@ -52,7 +52,17 @@ pub struct RestoreOnMap {
 
     /// Saved workspace index, resolved against the mapped monitor rather than pinned to an id at
     /// configure time: the monitor's workspaces can change in between.
+    ///
+    /// `None` for a record whose display is gone, which carries a [`RestoreOnMap::restore_slot`]
+    /// instead — its index belongs to a strip that is not here.
     pub workspace_idx: Option<usize>,
+
+    /// The slot of an absent display's strip this window was saved on.
+    ///
+    /// Resolved at the map, like the index and for the same reason, but against the ordering of
+    /// every absent slot in the store rather than against this monitor's strip — see
+    /// `State::materialize_restore_slot`.
+    pub restore_slot: Option<crate::protocols::session_management::RestoreSlot>,
 
     /// The rect to return to when un-maximized, in global coordinates.
     ///

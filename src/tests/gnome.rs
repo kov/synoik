@@ -29113,9 +29113,12 @@ fn one_display_missing_leaves_the_other_display_s_windows_exact() {
 /// A display that did not come back has its workspaces **appended** to the primary's strip, not
 /// merged into it — the same thing a live unplug does (`Monitor::append_workspaces`).
 ///
-/// So the saved index is an offset from where the primary's own workspaces end, never an index
-/// into them. Merging would drop an external display's windows on top of whatever the primary
+/// So the saved index is a slot in the absent display's own strip, never an index into the one it
+/// lands on. Merging would drop an external display's windows on top of whatever the primary
 /// already had at that number.
+///
+/// The absent display's *gaps* do not come back with it, unlike a live unplug and replug: nothing
+/// persists an empty workspace, so a desktop the user left empty is a desktop no record names.
 #[test]
 fn a_missing_display_s_workspaces_are_appended_to_the_primary_s() {
     let mut f = Fixture::new();
@@ -29148,29 +29151,33 @@ fn a_missing_display_s_workspaces_are_appended_to_the_primary_s() {
         );
     }
 
-    let mut landed = Vec::new();
+    let mut restored = Vec::new();
     for (name, _, _) in records {
         let before = windows_now(&mut f);
         let (surface, _handle) = restore_window(&mut f, id, &session, name);
         map_at_configured_size(&mut f, id, &surface);
         f.settle();
-        let win = window_added_since(&mut f, &before);
-        let (_, _, idx) = placement_of(&mut f, &win);
-        landed.push((name, idx));
+        restored.push((name, window_added_since(&mut f, &before)));
     }
+
+    // Read at the end, not as each one lands: the block finds its place among the workspaces it
+    // has already made, so a window that restores later can move an earlier one down.
+    let landed: Vec<_> = restored
+        .into_iter()
+        .map(|(name, win)| (name, placement_of(&mut f, &win).2))
+        .collect();
 
     assert_eq!(
         landed,
-        vec![("home-0", 0), ("home-1", 1), ("away-0", 2), ("away-2", 4)],
-        "the primary keeps 0 and 1; the absent display's stack starts at the first free one and \
-         keeps its own gaps"
+        vec![("home-0", 0), ("home-1", 1), ("away-0", 2), ("away-2", 3)],
+        "the primary keeps 0 and 1, and the absent display's stack follows it in its own order"
     );
 }
 
-/// The offset must not depend on the order the clients happen to restore in.
+/// The arrangement must not depend on the order the clients happen to restore in.
 ///
-/// It is computed from the session's records, never from the live strip, precisely because the
-/// strip grows as the burst lands — reading it made every window offset further than the last.
+/// It is derived from the records, never from the live strip, precisely because the strip grows as
+/// the burst lands — reading it made every window land further down than the last.
 #[test]
 fn the_appended_numbering_does_not_depend_on_restore_order() {
     let records = [
@@ -29200,17 +29207,24 @@ fn the_appended_numbering_does_not_depend_on_restore_order() {
             );
         }
 
-        let mut out = Vec::new();
+        let mut restored = Vec::new();
         for i in order {
             let (name, _, _) = records[i];
             let before = windows_now(&mut f);
             let (surface, _handle) = restore_window(&mut f, id, &session, name);
             map_at_configured_size(&mut f, id, &surface);
             f.settle();
-            let win = window_added_since(&mut f, &before);
-            let (_, _, idx) = placement_of(&mut f, &win);
-            out.push((name, idx));
+            restored.push((name, window_added_since(&mut f, &before)));
         }
+
+        // The arrangement once the burst is over, which is the thing that has to agree. Where a
+        // window sits *while* the burst is still landing does not: the block makes room for its
+        // own workspaces as they arrive, so an earlier one moves down when a later one ranks
+        // above it.
+        let mut out: Vec<_> = restored
+            .into_iter()
+            .map(|(name, win)| (name, placement_of(&mut f, &win).2))
+            .collect();
         out.sort_unstable();
         out
     };
@@ -29268,6 +29282,170 @@ fn two_missing_displays_do_not_interleave_on_the_primary() {
         landed,
         vec![("a-0", 0), ("a-1", 1), ("b-0", 2)],
         "connector order decides which absent display goes first, and neither splits the other"
+    );
+}
+
+/// Two *sessions* restoring at once agree on the arrangement, in either order.
+///
+/// The ordering is derived from the whole store for exactly this: a per-session answer had each
+/// app counting only its own records, so one app's window on a display that is gone landed on the
+/// workspace another app's window was about to be restored onto.
+#[test]
+fn two_sessions_restoring_at_once_do_not_land_on_each_other() {
+    // `alone` names a workspace on a display that is gone; `pair` names one on the primary at the
+    // same index, and a second on the absent display below it.
+    let landed = |first_alone: bool| {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+        // Two clients, because two sessions restoring at once is the case: one app's answer used
+        // to be computed from its own records alone.
+        let alone_client = f.add_client();
+        let pair_client = f.add_client();
+        f.roundtrip(alone_client);
+        f.roundtrip(pair_client);
+        let (alone, alone_id) = new_session(&mut f, alone_client);
+        let (pair, pair_id) = new_session(&mut f, pair_client);
+
+        let record = |connector: &str, workspace: u32| ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(workspace),
+            output: Some(saved_on(connector)),
+            ..Default::default()
+        };
+        remember(&mut f, &alone_id, "away-0", record("headless-9", 0));
+        remember(&mut f, &pair_id, "home-0", record("headless-1", 0));
+        remember(&mut f, &pair_id, "away-1", record("headless-9", 1));
+
+        let mut restored = Vec::new();
+        let mut handles = Vec::new();
+        let mut restore =
+            |f: &mut Fixture, id: ClientId, session: &XdgSessionV1, name: &'static str| {
+                let before = windows_now(f);
+                let (surface, handle) = restore_window(f, id, session, name);
+                map_at_configured_size(f, id, &surface);
+                f.settle();
+                restored.push((name, window_added_since(f, &before)));
+                handles.push(handle);
+            };
+
+        if first_alone {
+            restore(&mut f, alone_client, &alone, "away-0");
+            restore(&mut f, pair_client, &pair, "home-0");
+            restore(&mut f, pair_client, &pair, "away-1");
+        } else {
+            restore(&mut f, pair_client, &pair, "away-1");
+            restore(&mut f, pair_client, &pair, "home-0");
+            restore(&mut f, alone_client, &alone, "away-0");
+        }
+
+        let mut out: Vec<_> = restored
+            .into_iter()
+            .map(|(name, win)| (name, placement_of(&mut f, &win).2))
+            .collect();
+        out.sort_unstable();
+        out
+    };
+
+    assert_eq!(
+        landed(true),
+        vec![("away-0", 1), ("away-1", 2), ("home-0", 0)],
+        "the primary keeps its own workspace 0, and the two sessions' absent-display windows \
+         follow it one after the other rather than sharing a desktop"
+    );
+    assert_eq!(
+        landed(true),
+        landed(false),
+        "and which session asks first decides nothing"
+    );
+}
+
+/// A session that never comes back costs the ones that do nothing.
+///
+/// The saved index is a number read off disk, and the arrangement is derived from every session in
+/// the store — so a stale record naming desktop 30 would push a live window there, and grow a
+/// strip of empty desktops to reach it, if the ordering counted indices instead of ranking slots.
+#[test]
+fn a_session_that_never_restores_moves_nobody() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let record = |connector: &str, workspace: u32| ToplevelRecord {
+        state: Some(WindowState::Floating.as_raw()),
+        floating_rect: Some([100, 100, 300, 200]),
+        workspace: Some(workspace),
+        output: Some(saved_on(connector)),
+        ..Default::default()
+    };
+
+    // A session nothing will ask for, naming high desktops on the primary and on a third display.
+    remember(&mut f, "stale", "gone-home", record("headless-1", 20));
+    remember(&mut f, "stale", "gone-away", record("headless-7", 30));
+    remember(&mut f, &session_id, "away-0", record("headless-9", 0));
+
+    let before = windows_now(&mut f);
+    let (surface, _handle) = restore_window(&mut f, id, &session, "away-0");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+    let win = window_added_since(&mut f, &before);
+
+    assert_eq!(
+        placement_of(&mut f, &win).2,
+        0,
+        "the live window lands at the top of the strip, not past what a dead session named"
+    );
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        2,
+        "and no desktop was made to reach it"
+    );
+}
+
+/// A workspace restored for a display that was not here goes home when that display arrives.
+///
+/// The restore tags it as that display's, with the index it was saved at, so plugging the display
+/// in reclaims it — the same thing an unplug and a replug do for a workspace that never left.
+#[test]
+fn a_restored_workspace_goes_home_when_its_display_arrives() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    remember(
+        &mut f,
+        &session_id,
+        "away-0",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(0),
+            output: Some(saved_on("headless-9")),
+            ..Default::default()
+        },
+    );
+
+    let before = windows_now(&mut f);
+    let (surface, _handle) = restore_window(&mut f, id, &session, "away-0");
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+    let win = window_added_since(&mut f, &before);
+    assert_eq!(
+        placement_of(&mut f, &win).0,
+        "headless-1",
+        "with its display away it waits on the primary"
+    );
+
+    f.add_output(9, (1280, 720));
+    f.settle();
+    assert_eq!(
+        placement_of(&mut f, &win).0,
+        "headless-9",
+        "and follows its workspace home when the display turns up"
     );
 }
 

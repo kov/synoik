@@ -50,10 +50,12 @@ use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
 use crate::layout::placement::PlacementSeeds;
+use crate::layout::workspace::WorkspaceId;
 use crate::layout::ActivateWindow;
 use crate::output_identity::OutputIdentity;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
+use crate::protocols::session_management::RestoreSlot;
 use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::ui::window_menu::WindowMenuAnchor;
@@ -1016,9 +1018,13 @@ struct SessionRestore {
     handle: XdgToplevelSessionV1,
     /// Decides activation, and nothing else.
     reason: Reason,
-    /// The record as it will be replayed. Its `workspace` may have been offset — see
-    /// [`State::appended_workspace_offset`].
+    /// The record as it will be replayed, exactly as it was saved.
     record: ToplevelRecord,
+    /// Which slot of an absent display's strip this record asks for, when its display is gone.
+    ///
+    /// The record's own index means nothing on the strip it is landing on, so it is ranked
+    /// against every other absent slot in the store instead — see [`State::absent_restore_slots`].
+    slot: Option<RestoreSlot>,
     /// The output the record names, or `None` if that display is not connected.
     ///
     /// Gates the position: an output-local rect means nothing without its output.
@@ -1070,25 +1076,29 @@ impl State {
             return None;
         };
 
-        let mut record = record;
         let output = record
             .output
             .as_ref()
             .and_then(|saved| self.output_matching_identity(saved));
 
         // A display that did not come back sends its windows to the primary, where a live unplug
-        // would have appended its workspaces — so they append here too, after everything the
-        // primary's strip already holds, rather than interleaving with it.
+        // would have appended its workspaces — so they land there as a block too, below what the
+        // primary's strip holds on its own account, rather than interleaving with it.
         // Only a record that *names* a display can be homeless: one with no display recorded (a
         // v1 leftover, or a window that was never on an output) has no group to keep together and
         // no strip to be appended after, so it takes the ordinary placement path unchanged.
+        let mut slot = None;
         let fallback_output = if output.is_some() || record.output.is_none() {
             None
         } else {
             let primary = self.synoik.layout.primary_output().cloned();
-            if let Some((primary, idx)) = primary.as_ref().zip(record.workspace) {
-                let offset = self.appended_workspace_offset(session, primary, &record);
-                record.workspace = Some(idx.saturating_add(offset));
+            if primary.is_some() {
+                if let Some((identity, workspace)) = record.output.clone().zip(record.workspace) {
+                    slot = Some(RestoreSlot {
+                        identity,
+                        workspace,
+                    });
+                }
             }
             primary
         };
@@ -1109,81 +1119,105 @@ impl State {
             handle: target.handle,
             reason: target.reason,
             record,
+            slot,
             output,
             fallback_output,
         })
     }
 
-    /// How far to push a record whose display is gone down the primary's strip.
+    /// Every workspace the store asks for on a display that is not connected, in one order.
     ///
     /// A live unplug appends the removed display's whole stack to the primary, before the trailing
     /// empty workspace, with its internal order intact (`Monitor::append_workspaces`). A restore
-    /// that finds the display missing should land the same way, so an absent display's records are
-    /// shifted past everything the primary's strip will hold: the workspaces it already has, and
-    /// the ones this session's *present* records will grow it to. Absent displays then stack after
-    /// one another in connector order, so two of them do not interleave.
+    /// that finds the display missing lands the same way: the absent displays' workspaces form one
+    /// block below what the primary's strip holds on its own account, displays in connector order
+    /// and each display's workspaces in its own, so two of them do not interleave.
     ///
-    /// Pure in (session records, connected outputs): every toplevel in a restore burst computes
-    /// the same answer whatever order they arrive in, which is what lets this stay per-request
-    /// with no session state carried across the idle.
+    /// Read from the *whole store*, not from the session that happens to be restoring. Two apps
+    /// coming back at once name slots on the same absent display, and a per-session answer had
+    /// each of them counting only its own records — so their windows interleaved with each other's
+    /// (`docs/fork/multi-display.md` §3).
     ///
-    /// Scoped to one session on purpose. Two apps restoring at once each offset against the
-    /// primary's own strip, so their absent-display windows can interleave with each other's;
-    /// coordinating that would mean reading every other session in the store, including stale ones
-    /// whose windows will never come back.
-    fn appended_workspace_offset(
-        &self,
-        session: &crate::session_state::SessionRecord,
-        primary: &Output,
-        restoring: &ToplevelRecord,
-    ) -> u32 {
-        // One past the highest workspace a set of records asks for, or 0 for none at all.
-        let reach = |records: &mut dyn Iterator<Item = &ToplevelRecord>| {
-            records
-                .filter_map(|record| record.workspace)
-                .map(|idx| idx.saturating_add(1))
-                .max()
-                .unwrap_or(0)
-        };
-
-        // What the primary's strip will hold on its own account: this session's records anchored
-        // to a display that *is* connected and resolves to the primary.
-        //
-        // Read from the records, never from the live strip. The live count grows as the burst
-        // lands, so basing on it would make the offset depend on arrival order and drift upward
-        // with every window — the answer has to be the same for the first restore and the last.
-        let mut base = reach(&mut session.toplevels.values().filter(|record| {
-            record
-                .output
-                .as_ref()
-                .is_some_and(|saved| self.output_matching_identity(saved).as_ref() == Some(primary))
-        }));
-
-        // Then absent displays, in connector order, each after the last.
-        let mut absent: Vec<&str> = session
-            .toplevels
-            .values()
-            .filter_map(|record| record.output.as_ref())
-            .filter(|saved| self.output_matching_identity(saved).is_none())
-            .map(|saved| saved.connector.as_str())
+    /// Distinct slots, so what a session that never comes back costs is one rank per workspace it
+    /// names rather than the number it names. Nothing here reserves anything either: a slot
+    /// becomes a workspace only when a window actually restores into it, so a stale record naming
+    /// desktop 30 grows no strip.
+    fn absent_restore_slots(&self) -> Vec<RestoreSlot> {
+        let mut slots: Vec<RestoreSlot> = self
+            .synoik
+            .session_manager_state
+            .store
+            .records()
+            .filter_map(|record| Some((record.output.as_ref()?, record.workspace?)))
+            .filter(|(saved, _)| self.output_matching_identity(saved).is_none())
+            .map(|(saved, workspace)| RestoreSlot {
+                identity: saved.clone(),
+                workspace,
+            })
             .collect();
-        absent.sort_unstable();
-        absent.dedup();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
 
-        let mine = restoring
-            .output
-            .as_ref()
-            .map(|saved| saved.connector.as_str());
-        for connector in absent {
-            if Some(connector) == mine {
-                return base;
-            }
-            base = base.saturating_add(reach(&mut session.toplevels.values().filter(|record| {
-                record.output.as_ref().map(|saved| saved.connector.as_str()) == Some(connector)
-            })));
+    /// The workspaces materialized for absent displays so far, forgetting any that has gone away.
+    ///
+    /// A workspace under a slot is not forever: its display coming back takes it along. Pruning
+    /// here rather than at the removal keeps the block a derived fact, with one place to be wrong.
+    pub(super) fn materialized_restore_block(&mut self) -> Vec<WorkspaceId> {
+        let alive: Vec<WorkspaceId> = self
+            .synoik
+            .session_manager_state
+            .materialized_workspaces()
+            .filter(|id| self.synoik.layout.find_workspace_by_id(*id).is_some())
+            .collect();
+        self.synoik
+            .session_manager_state
+            .retain_materialized_workspaces(&alive);
+        alive
+    }
+
+    /// The workspace a slot means on `output`, making it if this is the first window to ask.
+    ///
+    /// Placed against the block's other workspaces rather than at an index, so the answer does not
+    /// depend on which window restored first: a slot goes above every materialized slot that ranks
+    /// after it, and at the bottom of the strip when none of them is here yet.
+    pub(super) fn materialize_restore_slot(
+        &mut self,
+        slot: &RestoreSlot,
+        output: &Output,
+    ) -> Option<WorkspaceId> {
+        let block = self.materialized_restore_block();
+        if let Some(id) = self
+            .synoik
+            .session_manager_state
+            .materialized_workspace(slot)
+        {
+            return Some(id);
         }
 
-        base
+        let order = self.absent_restore_slots();
+        let after = order
+            .iter()
+            .position(|known| known == slot)
+            .map_or(order.len(), |rank| rank + 1);
+        let before = order[after.min(order.len())..].iter().find_map(|known| {
+            self.synoik
+                .session_manager_state
+                .materialized_workspace(known)
+        });
+
+        let id = self.synoik.layout.insert_restore_workspace(
+            output,
+            before,
+            &block,
+            slot.identity.clone(),
+            slot.workspace as usize,
+        )?;
+        self.synoik
+            .session_manager_state
+            .set_materialized_workspace(slot.clone(), id);
+        Some(id)
     }
 
     /// The connected output a record was saved on, by identity.
@@ -1299,8 +1333,13 @@ impl State {
             .find(|o| self.synoik.layout.monitor_for_output(o).is_some());
 
         let parent = toplevel.parent();
+        // A record whose display is gone contributes no index here: its saved one is a position in
+        // *that* display's strip, and what it lands on is decided at the map, once the block it
+        // belongs to has somewhere to be. The configure loses nothing by it — a working area is
+        // per-monitor, so every workspace of the fallback output answers the same.
         let restore_workspace_idx = restore
             .as_ref()
+            .filter(|restore| restore.slot.is_none())
             .and_then(|restore| restore.record.workspace)
             .map(|idx| idx as usize);
 
@@ -1374,6 +1413,7 @@ impl State {
         let restore_on_map = restore.as_ref().map(|restore| RestoreOnMap {
             reason: restore.reason,
             workspace_idx: restore_workspace_idx,
+            restore_slot: restore.slot.clone(),
             // Only for a window that maps straight into maximized or fullscreen — anything else
             // gets its floating geometry from the configure and the position rule.
             unmaximize_to: restored_state

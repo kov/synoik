@@ -363,6 +363,17 @@ impl SessionStore {
         self.sessions.contains_key(id)
     }
 
+    /// Every toplevel record in the store, from every session.
+    ///
+    /// What the restore ordering is derived from: it has to see the whole store at once, because
+    /// two sessions restoring together name workspaces on the same absent display and only an
+    /// answer computed over both keeps their windows out of each other's.
+    pub fn records(&self) -> impl Iterator<Item = &ToplevelRecord> + '_ {
+        self.sessions
+            .values()
+            .flat_map(|session| session.toplevels.values())
+    }
+
     pub fn get(&self, id: &str) -> Option<&SessionRecord> {
         self.sessions.get(id)
     }

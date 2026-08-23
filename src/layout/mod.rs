@@ -42,7 +42,9 @@ use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
-use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
+use monitor::{
+    InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget, MAX_NUM_WORKSPACES,
+};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
@@ -2391,10 +2393,85 @@ impl<W: LayoutElement> Layout<W> {
 
     /// The workspace a restored window belongs on, growing the strip if the index is past the end.
     ///
-    /// See [`Monitor::ensure_workspace_at`] for why restore grows rather than clamps.
-    pub fn ensure_restore_workspace(&mut self, output: &Output, idx: usize) -> Option<WorkspaceId> {
+    /// See [`Monitor::ensure_workspace_at`] for why restore grows rather than clamps, and what
+    /// `block_start` keeps out of the way.
+    pub fn ensure_restore_workspace(
+        &mut self,
+        output: &Output,
+        idx: usize,
+        block_start: Option<usize>,
+    ) -> Option<WorkspaceId> {
         let mon = self.monitor_for_output_mut(output)?;
-        Some(mon.ensure_workspace_at(idx).id())
+        Some(mon.ensure_workspace_at(idx, block_start).id())
+    }
+
+    /// Where the workspaces restored for absent displays begin on `output`'s strip.
+    ///
+    /// Positional, not a remembered number: the block moves as the strip around it does, and the
+    /// question anyone asks about it is "what is above it", which only a position answers.
+    pub fn restore_block_start(&self, output: &Output, block: &[WorkspaceId]) -> Option<usize> {
+        let mon = self.monitor_for_output(output)?;
+        mon.workspaces
+            .iter()
+            .position(|ws| block.contains(&ws.id()))
+    }
+
+    /// Materializes one workspace of an absent display's restored block on `output`.
+    ///
+    /// Placed before `before` when that workspace is still there, else at the bottom of the strip.
+    /// A position relative to the block's other workspaces, never an index: the ordering the block
+    /// follows is the rank of its slots, and rank-relative insertion is what makes a burst of
+    /// restores land the same way whatever order the clients ask in. Nothing is reserved — a slot
+    /// no window restores into never becomes a workspace at all.
+    ///
+    /// The bottom is the top of the strip's trailing run of empty, unclaimed workspaces, and one
+    /// of those is taken over rather than added to: a strip that holds nothing of its own is all
+    /// trailing run, and a block that inserted below it would leave the first desktop empty and
+    /// push everything the user saved down one.
+    ///
+    /// The workspace is tagged as the absent display's, with the saved index as its home ordinal,
+    /// so plugging that display back in reclaims it into the arrangement it was saved in — the
+    /// same thing an unplug and a replug do for a workspace that never left
+    /// (`docs/fork/multi-display.md` §2, §3).
+    pub fn insert_restore_workspace(
+        &mut self,
+        output: &Output,
+        before: Option<WorkspaceId>,
+        block: &[WorkspaceId],
+        home: OutputIdentity,
+        home_ordinal: usize,
+    ) -> Option<WorkspaceId> {
+        let mon = self.monitor_for_output_mut(output)?;
+        let successor = before.and_then(|id| mon.workspaces.iter().position(|ws| ws.id() == id));
+
+        // The top of the trailing run of workspaces that are empty and not already a slot's.
+        let free = mon
+            .workspaces
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, ws)| !ws.has_windows_or_name() && !block.contains(&ws.id()))
+            .map(|(idx, _)| idx)
+            .last();
+
+        let idx = match (successor, free) {
+            (Some(idx), _) => idx,
+            // Nothing ranks after this one and the bottom is free: take it over.
+            (None, Some(idx)) => return Some(mon.workspaces[idx].claim_for(home, home_ordinal)),
+            // Nothing ranks after it and nothing is free either — every workspace down to the last
+            // is spoken for, so this one goes below them all.
+            (None, None) => mon.workspaces.len(),
+        };
+
+        // At the cap the block shares a workspace rather than growing the strip: the count is
+        // driven by a file, and a hostile one must not be able to inflate it.
+        if mon.workspaces.len() >= MAX_NUM_WORKSPACES {
+            let idx = idx.min(mon.workspaces.len() - 1);
+            return Some(mon.workspaces[idx].claim_for(home, home_ordinal));
+        }
+        mon.add_workspace_at(idx);
+
+        Some(mon.workspaces[idx].claim_for(home, home_ordinal))
     }
 
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {

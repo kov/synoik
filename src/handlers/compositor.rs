@@ -141,16 +141,32 @@ impl CompositorHandler for State {
                             .and_then(|n| self.synoik.layout.find_workspace_by_name(n))
                             .map(|(_, ws)| ws.id());
 
-                        // A restored window goes back to its saved workspace *index*, resolved
-                        // now rather than at configure time: the monitor's workspaces can have
-                        // changed in between. The strip grows if the index is past the end, so
-                        // that restoring a set of windows does not depend on the order the client
-                        // asks in — see `Monitor::ensure_workspace_at`.
-                        let workspace_id = workspace_id.or_else(|| {
-                            let idx = restore.as_ref()?.workspace_idx?;
-                            let output = output.as_ref()?;
-                            self.synoik.layout.ensure_restore_workspace(output, idx)
-                        });
+                        // A restored window goes back to its saved workspace, resolved now rather
+                        // than at configure time: the monitor's workspaces can have changed in
+                        // between. Either way the answer must not depend on the order the clients
+                        // happen to ask in — the strip grows for an index past the end
+                        // (`Monitor::ensure_workspace_at`), and a window whose display is gone
+                        // takes its place in the block of absent displays' workspaces instead
+                        // (`State::materialize_restore_slot`).
+                        let workspace_id = match (workspace_id, restore.as_ref(), output.as_ref()) {
+                            (Some(id), _, _) => Some(id),
+                            (None, Some(restore), Some(output)) => {
+                                let output = output.clone();
+                                if let Some(slot) = restore.restore_slot.clone() {
+                                    self.materialize_restore_slot(&slot, &output)
+                                } else if let Some(idx) = restore.workspace_idx {
+                                    let block = self.materialized_restore_block();
+                                    let start =
+                                        self.synoik.layout.restore_block_start(&output, &block);
+                                    self.synoik
+                                        .layout
+                                        .ensure_restore_workspace(&output, idx, start)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
 
                         let was_restored = restore.is_some();
                         let restore_reason = restore.as_ref().map(|restore| restore.reason);

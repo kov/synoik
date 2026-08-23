@@ -776,7 +776,12 @@ impl<W: LayoutElement> Monitor<W> {
     ///
     /// Past [`MAX_NUM_WORKSPACES`] the index is clamped instead: growth is driven by a number
     /// read off disk, and a corrupt record must not be able to inflate the strip without bound.
-    pub fn ensure_workspace_at(&mut self, idx: usize) -> &Workspace<W> {
+    ///
+    /// `block_start` is where the workspaces restored for a display that is *away* begin, when the
+    /// strip carries any (see [`Layout::insert_restore_workspace`]). Growth then inserts above
+    /// that boundary instead of appending past it, so this display's saved index keeps meaning the
+    /// same position whether the absent display's block landed before it or after.
+    pub fn ensure_workspace_at(&mut self, idx: usize, block_start: Option<usize>) -> &Workspace<W> {
         let idx = if idx < MAX_NUM_WORKSPACES {
             idx
         } else {
@@ -787,8 +792,19 @@ impl<W: LayoutElement> Monitor<W> {
             MAX_NUM_WORKSPACES - 1
         };
 
-        while self.workspaces.len() <= idx {
-            self.add_workspace_bottom();
+        match block_start {
+            // The block floats: everything this display owns stays above it.
+            Some(mut start) => {
+                while start <= idx {
+                    self.add_workspace_at(start);
+                    start += 1;
+                }
+            }
+            None => {
+                while self.workspaces.len() <= idx {
+                    self.add_workspace_bottom();
+                }
+            }
         }
 
         &self.workspaces[idx]
@@ -992,7 +1008,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputIdentity::from_output(&self.output);
+            workspace.adopt_home(&self.output);
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -1023,7 +1039,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputIdentity::from_output(&self.output);
+            workspace.adopt_home(&self.output);
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -1052,7 +1068,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputIdentity::from_output(&self.output);
+            workspace.adopt_home(&self.output);
         }
 
         // Since we're adding window to an existing column, the workspace isn't empty, and

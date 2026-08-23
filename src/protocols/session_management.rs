@@ -33,6 +33,8 @@ use super::raw::xdg_session_management::v1::server::xdg_session_v1::{self, XdgSe
 use super::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::{
     self, XdgToplevelSessionV1,
 };
+use crate::layout::workspace::WorkspaceId;
+use crate::output_identity::OutputIdentity;
 use crate::session_state::SessionStore;
 
 const VERSION: u32 = 1;
@@ -96,9 +98,65 @@ struct RegisteredToplevel {
 pub struct SessionManagerState {
     live: HashMap<String, LiveSession>,
 
+    /// Where each [`RestoreSlot`] materialized on the strip it landed on.
+    ///
+    /// Session-lived, and deliberately not persisted: the *ordering* of the slots is derived from
+    /// the store every time it is asked, but which workspace a slot became is a fact about this
+    /// run's strips, and a saved one would be an arrangement nobody could check.
+    ///
+    /// A `Vec`, scanned rather than a map: the key holds a connector, which is compared without
+    /// case, and a restore burst has a handful of slots at most.
+    restore_slots: Vec<(RestoreSlot, WorkspaceId)>,
+
     /// Everything we remember across restarts. A session id is "known" if it is in here, whether
     /// or not any client currently holds it.
     pub store: SessionStore,
+}
+
+/// One workspace of a display that is not connected, as the restore ordering sees it.
+///
+/// The saved index is an index into *that display's* strip, never into the one the window is
+/// landing on, so it is a slot to be ranked rather than a position to be used. Slots are ordered
+/// by connector and then by index, which is what lets every window in a restore burst agree on
+/// the arrangement whatever order the clients ask in.
+#[derive(Debug, Clone)]
+pub struct RestoreSlot {
+    /// The display the record named. Carried whole so the workspace this becomes can be tagged as
+    /// that display's, and reclaimed when it is plugged back in.
+    pub identity: OutputIdentity,
+    /// The workspace index the record saved.
+    pub workspace: u32,
+}
+
+impl RestoreSlot {
+    /// Identity and order in one: the connector without case, then the index.
+    ///
+    /// Only the connector, not the whole [`OutputIdentity`] — `matches` is not an equivalence
+    /// relation (a missing EDID field is not a mismatch), so it cannot order or de-duplicate
+    /// anything. Grouping absent displays by connector is what the offset it replaces did too.
+    fn key(&self) -> (String, u32) {
+        (self.identity.connector.to_ascii_lowercase(), self.workspace)
+    }
+}
+
+impl PartialEq for RestoreSlot {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for RestoreSlot {}
+
+impl PartialOrd for RestoreSlot {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RestoreSlot {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
 }
 
 /// User data on an [`XdgSessionV1`].
@@ -151,6 +209,33 @@ impl SessionManagerState {
             store,
             ..Self::default()
         }
+    }
+
+    /// The workspace a slot has already materialized into, if it has.
+    pub fn materialized_workspace(&self, slot: &RestoreSlot) -> Option<WorkspaceId> {
+        self.restore_slots
+            .iter()
+            .find(|(known, _)| known == slot)
+            .map(|(_, id)| *id)
+    }
+
+    /// Every workspace materialized for a restore so far, in no particular order.
+    pub fn materialized_workspaces(&self) -> impl Iterator<Item = WorkspaceId> + '_ {
+        self.restore_slots.iter().map(|(_, id)| *id)
+    }
+
+    /// Records where a slot materialized.
+    pub fn set_materialized_workspace(&mut self, slot: RestoreSlot, id: WorkspaceId) {
+        self.restore_slots.retain(|(known, _)| known != &slot);
+        self.restore_slots.push((slot, id));
+    }
+
+    /// Forgets every materialized workspace that is not in `alive`.
+    ///
+    /// A workspace can go away under a slot — its display coming back takes it along — and a stale
+    /// id would then place the rest of the block against a workspace that is not there.
+    pub fn retain_materialized_workspaces(&mut self, alive: &[WorkspaceId]) {
+        self.restore_slots.retain(|(_, id)| alive.contains(id));
     }
 
     /// The live session this object manages, or `None` if the object is inert.

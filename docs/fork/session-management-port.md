@@ -100,18 +100,15 @@ Consequences, all of them deliberate:
   between displays — is wanted and not built.)
 - **A homeless display's workspaces are appended to the primary's, not merged into them.** That is
   what a live unplug already does (`Monitor::append_workspaces` inserts the removed stack before the
-  trailing empty workspace), so a restore that finds the display missing lands the same way: the
-  saved index becomes an offset past everything the primary's strip will hold, and several absent
-  displays stack in connector order rather than interleaving. The whole group is seeded onto the
-  primary for the same reason — per-window fallback through the pointer would scatter it and make
-  the numbering meaningless.
+  trailing empty workspace), so a restore that finds the display missing lands the same way: its
+  workspaces form one block below what the primary's strip holds on its own account, and several
+  absent displays stack in connector order rather than interleaving. The whole group is seeded onto
+  the primary for the same reason — per-window fallback through the pointer would scatter it.
 
-  The offset is computed **from the session's records, never from the live strip**: the strip grows
-  as the restore burst lands, so reading it makes the answer depend on arrival order and drift
-  upward with every window. It is also scoped to one session — two apps restoring at once each
-  offset against the primary's own strip, so their absent-display windows can interleave with each
-  other's. Coordinating that would mean reading every other session in the store, stale ones
-  included.
+  The saved index is a **slot to be ranked**, not a position to be used: it indexes a strip that is
+  not here. Slots are ranked across the **whole store**, never one session's records and never the
+  live strip, and a slot becomes a workspace only when a window restores into it. See
+  `multi-display.md` §3 for the ordering and what it costs a session that never comes back.
 - **The position is constrained to where it lands.** The display it comes back on may be smaller
   than the one it left, which is the whole point — so the rect is clamped into the working area, in
   the spirit of `META_MOVE_RESIZE_CONSTRAIN`.
@@ -744,20 +741,6 @@ resolved earlier veto the output the client just asked for. The mapped path hono
 Pinned by `tests::window_opening::maximize_after_the_initial_configure_keeps_the_windows_workspace`.
 
 ## Open questions
-
-### Backlog: absent-display offsets do not coordinate across sessions
-
-**Designed, not built — `multi-display.md` §3.** The workspace offset an absent display's records
-get is computed per session (see "A record is anchored to a display"). Two applications restoring
-at once each measure against the primary's own strip, so their homeless windows can interleave with
-each other's — each group is internally correct and consistent, but they overlap.
-
-The offset goes away rather than getting coordinated. `SessionStore::load` already reads every
-session at once, so restore sorts the distinct `(display identity, workspace name or index)` slots
-across the whole store into **one ordering** and consults that instead of counting — the result no
-longer depends on who restores first. And the ordering **reserves nothing**: a workspace
-materializes only when a window actually restores into its slot, which is the rule for who counts.
-A stale entry that never restores creates no workspaces, however many it names.
 
 ### Eviction — cap at 1000 sessions, most-recently-used
 

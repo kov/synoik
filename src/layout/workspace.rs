@@ -751,6 +751,31 @@ impl<W: LayoutElement> Workspace<W> {
         Self::new_with_config_no_outputs(None, clock, options)
     }
 
+    /// Makes an unclaimed workspace this output's own, as putting a window on it does.
+    ///
+    /// A workspace *visiting* from a display that is away keeps the home it has: a window landing
+    /// on it is not an explicit move, and taking the workspace away from its display for it would
+    /// leave the display nothing to come back to (`docs/fork/multi-display.md` §2). What is left
+    /// is the workspace that never had a home — one made while no display was connected — and
+    /// filling in the EDID for one whose home is this display under a bare connector name.
+    pub(super) fn adopt_home(&mut self, output: &Output) {
+        if self.original_output.connector.is_empty() || self.original_output.matches_output(output)
+        {
+            self.original_output = OutputIdentity::from_output(output);
+        }
+    }
+
+    /// Makes this workspace `home`'s, at `home_ordinal` in its strip.
+    ///
+    /// Session restore's one caller: a workspace it materializes for a display that is not here
+    /// belongs to that display, so plugging the display in reclaims it, and the saved index it
+    /// carries is what tells the reclaim where in the arrangement it goes.
+    pub(super) fn claim_for(&mut self, home: OutputIdentity, home_ordinal: usize) -> WorkspaceId {
+        self.original_output = home;
+        self.home_ordinal = home_ordinal;
+        self.id()
+    }
+
     pub fn id(&self) -> WorkspaceId {
         self.id
     }
