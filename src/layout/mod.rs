@@ -1103,10 +1103,15 @@ impl<W: LayoutElement> Layout<W> {
     /// by that display's named empties, every dock cycle.
     fn park_empties(&mut self, workspaces: Vec<Workspace<W>>) -> Vec<Workspace<W>> {
         let mut keep = Vec::with_capacity(workspaces.len());
-        for ws in workspaces {
+        for mut ws in workspaces {
             if ws.has_windows_or_name() {
                 keep.push(ws);
             } else if !ws.original_output.connector.is_empty() {
+                // Off every display, so the layout's own options are the ones that apply: a
+                // workspace made on a monitor with a per-output layout config would otherwise
+                // carry that monitor's options while belonging to nothing, and a later
+                // `update_config` is the only thing that would ever have corrected it.
+                ws.update_config(self.options.clone());
                 self.parked_workspaces.push(ws);
             }
             // A workspace with no windows and no home display has nothing to come back to, and
