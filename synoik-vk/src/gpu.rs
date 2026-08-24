@@ -30,14 +30,17 @@ static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
 /// Serializes `vkCreateDevice`/`vkDestroyDevice` and every `vkGetDeviceProcAddr` this process
 /// makes, because the Vulkan loader does not.
 ///
-/// The loader keeps one **process-global** list of logical devices. `loader_get_icd_and_device`
-/// (`loader/loader.c`), which every `vkGetDeviceProcAddr` walks to map a `VkDevice` to its ICD,
-/// takes `loader_global_instance_list_lock` — but `loader_add_logical_device` and
-/// `loader_remove_logical_device`, which link and **free** those nodes, take nothing. Creating a
-/// device on one thread while another destroys one is therefore a use-after-free inside the loader,
-/// and separate `VkInstance`s do not help: the list it walks spans all of them. Reported upstream
-/// as <https://github.com/KhronosGroup/Vulkan-Loader/issues/2018>; this lock can come out once the
-/// loader locks its own list.
+/// The loader keeps one **process-global** list of logical devices. Up to v1.4.344,
+/// `loader_get_icd_and_device` (`loader/loader.c`), which every `vkGetDeviceProcAddr` walks to map
+/// a `VkDevice` to its ICD, took `loader_global_instance_list_lock`, while `vkCreateDevice` and
+/// `vkDestroyDevice` — which link and **free** those nodes — held `loader_lock`. Two different
+/// mutexes exclude nothing, so a thread resolving a proc address walks a list another thread is
+/// freeing from, and separate `VkInstance`s do not help: the list spans all of them.
+///
+/// Fixed upstream in v1.4.345 (`5ee27b30c`, KhronosGroup/Vulkan-Loader#1866, which deletes the
+/// second mutex and makes `loader_lock` recursive). Keep this until the loaders we run against
+/// have caught up: fedora 44 still ships 1.4.341, and a CI run with this workaround reverted
+/// faults there while 32 runs against loader `main` are clean.
 ///
 /// A session builds one device and never contends. The test binary builds over a hundred, several
 /// at a time, which is how this surfaced — a SIGSEGV at `loader_get_dispatch(obj=0xffffffff)`, the
