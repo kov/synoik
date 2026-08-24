@@ -446,7 +446,8 @@ impl PopoverContent {
                 m.nav(dir);
                 None
             }
-            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => None,
+            PopoverContent::QuickSettings(qs) => qs.nav(dir),
+            PopoverContent::Calendar(_) => None,
         }
     }
 
@@ -465,9 +466,8 @@ impl PopoverContent {
                 let (action, close) = m.activate_focused(via_space);
                 Activation { action, close }
             }
-            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => {
-                Activation::new(PopoverAction::Consumed)
-            }
+            PopoverContent::QuickSettings(qs) => Activation::new(qs.activate_focused()),
+            PopoverContent::Calendar(_) => Activation::new(PopoverAction::Consumed),
         }
     }
 
@@ -1187,7 +1187,8 @@ impl PanelPopover {
             PopoverContent::Indicator(m) => m.focused_label(),
             PopoverContent::Window(m) => m.focused_label(),
             PopoverContent::Workspace(m) => m.focused_label(),
-            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => None,
+            PopoverContent::QuickSettings(qs) => qs.focused_for_test(),
+            PopoverContent::Calendar(_) => None,
         }
     }
 
@@ -1457,6 +1458,38 @@ impl PanelPopover {
             self.pending_action = Some(activation.action);
         }
         true
+    }
+
+    /// Focus the open menu's first control — what a menu opened *by keybinding* owes, so Enter
+    /// acts without an arrow key first (`_toggleMenu` toggles and then
+    /// `navigate_focus(TAB_FORWARD)`, `panel.js:588-591`). A pointer-opened menu is left
+    /// unfocused, which is the other half of that split (`popupMenu.js:1507-1512`).
+    pub fn focus_first(&mut self) {
+        if !self.open || self.closing {
+            return;
+        }
+        match self.content.as_mut() {
+            Some(PopoverContent::QuickSettings(qs)) => qs.focus_first(),
+            Some(PopoverContent::App(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::Indicator(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::Window(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::Workspace(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::InputSources(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::A11y(m)) => {
+                m.nav(widget::Dir::Down);
+            }
+            Some(PopoverContent::Calendar(_)) | None => (),
+        }
     }
 
     /// Take the action a keyboard activation parked, if any. See [`Self::handle_key`].

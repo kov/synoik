@@ -5188,6 +5188,10 @@ impl State {
             Action::ToggleQuickSettings => {
                 if let Some(output) = self.synoik.layout.active_output().cloned() {
                     self.toggle_quick_settings_menu(output);
+                    // Opened by keybinding, so it comes up with its first control focused —
+                    // `_toggleMenu` navigates the focus in right after the toggle
+                    // (`panel.js:588-591`). A closing toggle no-ops.
+                    self.synoik.panel_popover.focus_first();
                 }
             }
             #[cfg(feature = "xdp-gnome-screencast")]

@@ -53,7 +53,8 @@ use crate::system_status::{
 };
 use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
 use crate::ui::widget::{
-    self, style, Align, Painter, ParagraphSpan, ShapedParagraph, ShapedText, TextShaper, TextStyle,
+    self, style, Align, Dir, Painter, ParagraphSpan, ShapedParagraph, ShapedText, TextShaper,
+    TextStyle,
 };
 use crate::utils::to_physical_precise_round;
 
@@ -480,6 +481,10 @@ enum Slider {
 
 /// The slider rows, top to bottom. Kept as an array so every draw/hit loop covers all of them.
 const SLIDERS: [Slider; 3] = [Slider::Output, Slider::Mic, Slider::Brightness];
+
+/// How far one Left/Right press moves a focused slider: a tenth of its range
+/// (`St.Slider._getMinimumIncrement`, `slider.js:206-208`; `_applyDelta(±0.1)`, `:175-184`).
+const SLIDER_KEY_STEP: f64 = 0.1;
 
 /// Which slider a drag is on. A card slider is per-connector, so it can't be named by the
 /// top-level [`Slider`] enum — but [`Layout`] stays `Copy` by only ever carrying the top-level
@@ -1160,6 +1165,25 @@ fn grid(show_bluetooth: bool, show_power_profile: bool, show_airplane: bool) -> 
     if show_airplane {
         tiles.push(GridTile::Airplane);
     }
+    debug_assert!(
+        matches!(tiles[0], GridTile::Network),
+        "Network leads the grid (network_index depends on it)"
+    );
+    debug_assert!(
+        tiles
+            .iter()
+            .position(|t| matches!(t, GridTile::Bluetooth))
+            .is_none_or(|i| i == bluetooth_index()),
+        "Bluetooth is the only INSERTED tile, always at slot 1 (right after Network)"
+    );
+    debug_assert!(
+        tiles
+            .iter()
+            .position(|t| matches!(t, GridTile::PowerProfile))
+            .is_none_or(|i| i == power_profile_index(show_bluetooth)),
+        "PowerProfile must be the FIRST appended tile (before Airplane) — \
+         power_profile_index(false)/anchor_row_bottom assume its position"
+    );
     tiles
 }
 
@@ -1398,6 +1422,9 @@ pub struct QuickSettings {
     expanded: Option<DetailOwner>,
     /// The control the pointer is hovering, highlighted on render.
     hovered: Option<QsHover>,
+    /// The control the keyboard focus is on, ringed on render. Separate from hover, and validated
+    /// against the live stops on every use — a tile can leave the grid while the menu is open.
+    focused: Option<QsStop>,
     /// The detail view's open/close animation state.
     expand: Expand,
     /// The dim wash's own bake (the menu's rounded shape in black), kept apart from the chrome
@@ -1578,6 +1605,30 @@ enum QsHover {
     DetailRow(usize),
 }
 
+/// One keyboard focus stop. Named by *what* it is, never by its grid index: the Bluetooth tile is
+/// **inserted** at slot 1 when its rfkill appears, shifting every later index — under an open menu
+/// that would silently move the focus to a different tile, the same trap `Menu::set_entries`
+/// guards against for menu rows.
+///
+/// The stops are gnome-shell's focusables, not a rectangle per widget: `QuickSlider` is
+/// `can_focus: false` and it is its *children* — the mute button, the slider, the device-picker
+/// button — that take focus (`quickSettings.js:268-351`), and a menu-bearing tile is likewise a
+/// focusable body plus a focusable arrow (`:166-193`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QsStop {
+    Pill,
+    Sys(SysButton),
+    Tile(GridTile),
+    TileArrow(GridTile),
+    SliderIcon(Slider),
+    SliderTrack(Slider),
+    SliderArrow(Slider),
+    /// A row of the open detail card, by position within the card. Safe as an index because the
+    /// card's row order is frozen when it opens, and the focus is revalidated against the live
+    /// stops on every step anyway.
+    DetailRow(usize),
+}
+
 struct TextureCache {
     context: Option<ContextId<VkTexture>>,
     textures: HashMap<NotNan<f64>, (u64, VkTexture, Option<VkTexture>)>,
@@ -1624,6 +1675,7 @@ impl QuickSettings {
             sliding: None,
             expanded: None,
             hovered: None,
+            focused: None,
             accent: widget::style::accent_rgba(accent),
             brightness,
             revision: 0,
@@ -1918,196 +1970,388 @@ impl QuickSettings {
     /// apply (or [`PopoverAction::Consumed`] for a click that hit nothing
     /// actionable but is still inside the menu). A tile click also flips the
     /// tile's own state so it updates before the gsettings write round-trips.
+    /// Handle a click at a menu-local logical position, returning the action to
+    /// apply (or [`PopoverAction::Consumed`] for a click that hit nothing
+    /// actionable but is still inside the menu). A tile click also flips the
+    /// tile's own state so it updates before the gsettings write round-trips.
+    ///
+    /// The click resolves to a [`QsStop`] and then runs [`Self::activate_stop`] — the same route
+    /// the keyboard takes, so the two cannot disagree about what a control does. What is genuinely
+    /// pointer-only stays here: a click on a slider track jumps the level to the clicked position
+    /// and begins a drag, where the keyboard nudges by a fixed step and drags nothing.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
         let layout = self.layout();
-        // An open detail view is topmost: a row runs its action (a `Spawn`, which closes the
-        // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
-        if let Some(owner) = self.expanded {
-            // Its rows only take clicks once the card has finished sliding out: mid-slide they are
-            // moving, half of them are still clipped away behind the owner's row, and a row you
-            // cannot see must not act. The gap still swallows the click below.
-            let rows = match self.expand.settled() {
-                true => self.detail_rows(owner),
-                false => Vec::new(),
-            };
-            for (k, row) in rows.into_iter().enumerate() {
-                let Some(rrect) = detail_row_rect(k, layout) else {
-                    continue;
-                };
-                if !rrect.contains(pos) {
+        let Some(stop) = self.stop_at(pos) else {
+            // Inside the menu but on nothing actionable — including the padding of an open detail
+            // card, which swallows its clicks rather than letting them through to the grid.
+            return PopoverAction::Consumed;
+        };
+        match stop {
+            QsStop::SliderTrack(slider) => {
+                self.sliding = Some((SliderId::Top(slider), self.device_count(slider)));
+                self.set_local_volume(slider, volume_from_x(slider, pos.x, layout))
+            }
+            QsStop::DetailRow(k) => match self.detail_row(k) {
+                // A card slider: jump to (and begin dragging toward) the clicked position, like
+                // the top-level tracks. Only the track band is reactive — in gnome-shell the menu
+                // item is `reactive: false` and only the `slider-bin` inside it takes the click
+                // (`brightness.js:23,29`), so a click on the item's padding must do nothing.
+                // Without this the clamp in `volume_from_track_x` would turn a near-miss into a
+                // slam to minimum (i.e. a dark panel).
+                Some(DetailRow::Slider { connector, .. }) => {
+                    let Some(rrect) = detail_row_rect(k, layout) else {
+                        return PopoverAction::Consumed;
+                    };
+                    let track = detail_slider_track_rect(rrect);
+                    if !track.contains(pos) {
+                        return PopoverAction::Consumed;
+                    }
+                    self.sliding =
+                        Some((SliderId::Monitor(connector.clone()), self.monitor_count()));
+                    let value = volume_from_track_x(track, pos.x);
+                    self.set_local_monitor(&connector, value)
+                }
+                _ => self.activate_stop(stop),
+            },
+            _ => self.activate_stop(stop),
+        }
+    }
+
+    /// Every keyboard focus stop with its rect, in visual order (top to bottom, then left to
+    /// right) — which is both the Tab chain and the input to the spatial step. Sorting by geometry
+    /// rather than keeping a hand-written chain means the detail card splices itself in at its
+    /// owner's row and every layout shift reorders for free, because the rects already carry
+    /// `shift_below`.
+    fn stops(&self) -> Vec<(QsStop, Rectangle<f64, Logical>)> {
+        self.stops_with(self.layout())
+    }
+
+    /// The stops as they fall in `layout` — the live one for input, the collapsed one for the grid
+    /// bake, which is drawn as if nothing were expanded.
+    fn stops_with(&self, layout: Layout) -> Vec<(QsStop, Rectangle<f64, Logical>)> {
+        let mut out = Vec::new();
+        if let Some(pill) = pill_rect(self.has_pill()) {
+            out.push((QsStop::Pill, pill));
+        }
+        for button in SYS_BUTTONS {
+            out.push((QsStop::Sys(button), sys_rect(button, self.has_pill())));
+        }
+        for (i, &item) in self.grid().iter().enumerate() {
+            out.push((QsStop::Tile(item), tile_body_rect(i, item, layout)));
+            if let Some(arrow) = tile_arrow_rect(i, item, layout) {
+                out.push((QsStop::TileArrow(item), arrow));
+            }
+        }
+        // A card mid-slide contributes no stops, for the reason its rows take no clicks: a row you
+        // cannot see must not act.
+        if self.expanded.is_some() && self.expand.settled() {
+            for k in 0..self.detail_row_count() {
+                // A name label is not reactive, so it is not a stop either.
+                if matches!(self.detail_row(k), Some(DetailRow::Label(_))) {
                     continue;
                 }
-                match row {
-                    DetailRow::Item(row) => {
-                        // A device-row click marks that row busy until the Connect/Disconnect
-                        // finishes (gnome-shell plays the spinner around the await,
-                        // `bluetooth.js:257-261`).
-                        if let PopoverAction::ConnectBluetoothDevice { path, .. } = &row.action {
-                            self.bt_busy = Some(path.clone());
-                            self.revision += 1;
-                        }
-                        return row.action;
+                if let Some(rect) = detail_row_rect(k, layout) {
+                    out.push((QsStop::DetailRow(k), rect));
+                }
+            }
+        }
+        for slider in SLIDERS {
+            if !layout.sliders.present(slider) {
+                continue;
+            }
+            if slider.icon_is_button() {
+                out.push((QsStop::SliderIcon(slider), slider_icon_rect(slider, layout)));
+            }
+            out.push((
+                QsStop::SliderTrack(slider),
+                slider_track_rect(slider, layout),
+            ));
+            if let Some(arrow) = slider_arrow_rect(slider, layout) {
+                out.push((QsStop::SliderArrow(slider), arrow));
+            }
+        }
+        out.sort_by(|(_, a), (_, b)| {
+            a.loc
+                .y
+                .total_cmp(&b.loc.y)
+                .then(a.loc.x.total_cmp(&b.loc.x))
+        });
+        out
+    }
+
+    /// The focused stop and its rect in `layout`, for the ring. `None` when nothing is focused,
+    /// or when the focused control does not appear in this layout (a card row, in the collapsed
+    /// layout the grid bakes in).
+    fn focus_rect(&self, layout: Layout) -> Option<(QsStop, Rectangle<f64, Logical>)> {
+        let stops = self.stops_with(layout);
+        let focused = self.live_focus(&stops)?;
+        stops.into_iter().find(|(s, _)| *s == focused)
+    }
+
+    /// The focus, dropped if the control it named has left the menu — a tile can appear or vanish
+    /// while the menu is open (Bluetooth's rfkill, a hot-plugged sink), and a focus pointing at
+    /// something that is no longer there must not be navigated from.
+    fn live_focus(&self, stops: &[(QsStop, Rectangle<f64, Logical>)]) -> Option<QsStop> {
+        self.focused.filter(|f| stops.iter().any(|(s, _)| s == f))
+    }
+
+    /// Take one keyboard navigation step, returning any action it produced — moving the focus
+    /// produces none, but a slider's Left/Right changes a value.
+    pub fn nav(&mut self, dir: Dir) -> Option<PopoverAction> {
+        let stops = self.stops();
+        let focused = self.live_focus(&stops);
+
+        // A focused slider owns Left/Right: `St.Slider` consumes them for its value
+        // (`slider.js:175-184`), a tenth of the range per press (`_getMinimumIncrement`).
+        if let (Some(stop), Some(step)) = (
+            focused,
+            match dir {
+                Dir::Right => Some(SLIDER_KEY_STEP),
+                Dir::Left => Some(-SLIDER_KEY_STEP),
+                _ => None,
+            },
+        ) {
+            if let Some(action) = self.nudge_slider(stop, step) {
+                return Some(action);
+            }
+        }
+
+        let rects: Vec<_> = stops.iter().map(|(_, r)| *r).collect();
+        let from = focused.and_then(|f| stops.iter().position(|(s, _)| *s == f));
+        let group = Rectangle::from_size(self.logical_size());
+        let next = widget::step_rects(&rects, group, from, dir)?;
+        self.focused = Some(stops[next].0);
+        self.revision += 1;
+        None
+    }
+
+    /// Move a focused slider's value by `step`, if the focus is on one. `None` when it is not, so
+    /// the caller falls through to navigating.
+    fn nudge_slider(&mut self, stop: QsStop, step: f64) -> Option<PopoverAction> {
+        match stop {
+            QsStop::SliderTrack(slider) => {
+                let value = (self.slider_value(slider) + step).clamp(0., 1.);
+                Some(self.set_local_volume(slider, value))
+            }
+            // The brightness card's per-monitor rows are sliders too, and take the same keys.
+            QsStop::DetailRow(k) => match self.detail_row(k)? {
+                DetailRow::Slider { connector, value } => {
+                    let value = (value + step).clamp(0., 1.);
+                    Some(self.set_local_monitor(&connector, value))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Focus the first stop — what a menu opened by keybinding owes, so Enter acts without an
+    /// arrow key first (`_toggleMenu` → `navigate_focus(TAB_FORWARD)`, `panel.js:588-591`).
+    pub fn focus_first(&mut self) {
+        let stops = self.stops();
+        if let Some((stop, _)) = stops.first() {
+            self.focused = Some(*stop);
+            self.revision += 1;
+        }
+    }
+
+    /// Activate the keyboard-focused control (Enter/Space).
+    pub fn activate_focused(&mut self) -> PopoverAction {
+        let stops = self.stops();
+        match self.live_focus(&stops) {
+            Some(stop) => self.activate_stop(stop),
+            None => PopoverAction::Consumed,
+        }
+    }
+
+    /// The focused control, named for a conformance test. Its `Debug` form is the assertion —
+    /// `Tile(Network)`, `SliderTrack(Output)` — so a test names the control, never a rect.
+    #[cfg(test)]
+    pub fn focused_for_test(&self) -> Option<String> {
+        let stops = self.stops();
+        self.live_focus(&stops).map(|s| format!("{s:?}"))
+    }
+
+    /// A slider's current level, the value its handle is drawn at.
+    fn slider_value(&self, slider: Slider) -> f64 {
+        match slider {
+            Slider::Output => self.audio.unwrap_or_default().volume,
+            Slider::Mic => self.mic.volume,
+            Slider::Brightness => self.brightness.global.unwrap_or_default(),
+        }
+    }
+
+    /// Which control a menu-local position lands on, in hit order: an open detail card is topmost,
+    /// then the tiles (a menu tile's arrow before its body — the arrow is carved out of the tile),
+    /// then the battery pill, the system buttons and the sliders (a slider's arrow before its
+    /// track, since the track is genuinely shortened to make room and `volume_from_x` would
+    /// otherwise run out of range).
+    fn stop_at(&self, pos: Point<f64, Logical>) -> Option<QsStop> {
+        let layout = self.layout();
+        if self.expanded.is_some() {
+            // Rows only take clicks once the card has finished sliding out: mid-slide they are
+            // moving, half of them are still clipped away behind the owner's row, and a row you
+            // cannot see must not act. The gap still swallows the click below.
+            if self.expand.settled() {
+                for k in 0..self.detail_row_count() {
+                    if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+                        return Some(QsStop::DetailRow(k));
                     }
-                    // A card slider: jump to (and begin dragging toward) the clicked position,
-                    // like the top-level tracks. Only the track band is reactive — in gnome-shell
-                    // the menu item is `reactive: false` and only the `slider-bin` inside it takes
-                    // the click (`brightness.js:23,29`), so a click on the item's padding must do
-                    // nothing. Without this the clamp in `volume_from_track_x` would turn a
-                    // near-miss into a slam to minimum (i.e. a dark panel).
-                    DetailRow::Slider { connector, .. } => {
-                        let track = detail_slider_track_rect(rrect);
-                        if !track.contains(pos) {
-                            return PopoverAction::Consumed;
-                        }
-                        self.sliding =
-                            Some((SliderId::Monitor(connector.clone()), self.monitor_count()));
-                        let value = volume_from_track_x(track, pos.x);
-                        return self.set_local_monitor(&connector, value);
-                    }
-                    // A non-reactive name label swallows its click.
-                    DetailRow::Label(_) => return PopoverAction::Consumed,
                 }
             }
             if detail_hit_rect(layout).is_some_and(|r| r.contains(pos)) {
-                return PopoverAction::Consumed;
+                return None;
             }
         }
-        let tiles = self.grid();
-        debug_assert!(
-            matches!(tiles[0], GridTile::Network),
-            "Network leads the grid (network_index depends on it)"
-        );
-        debug_assert!(
-            tiles
-                .iter()
-                .position(|t| matches!(t, GridTile::Bluetooth))
-                .is_none_or(|i| i == bluetooth_index()),
-            "Bluetooth is the only INSERTED tile, always at slot 1 (right after Network)"
-        );
-        debug_assert!(
-            tiles
-                .iter()
-                .position(|t| matches!(t, GridTile::PowerProfile))
-                .is_none_or(|i| i == power_profile_index(layout.show_bluetooth)),
-            "PowerProfile must be the FIRST appended tile (before Airplane) — \
-             power_profile_index(false)/anchor_row_bottom assume its position"
-        );
-        for (i, &item) in tiles.iter().enumerate() {
-            // A menu tile's arrow-half toggles its detail view (open, or close if already open —
-            // one at a time); the toggle-body keeps the tile's own behavior. A plain tile is all
-            // body.
+        for (i, &item) in self.grid().iter().enumerate() {
             if tile_arrow_rect(i, item, layout).is_some_and(|r| r.contains(pos)) {
-                let owner = item.detail_owner();
-                self.expanded = if self.expanded == owner { None } else { owner };
-                // Freeze the device-row order at open ("we don't reorder the list while the menu
-                // is open, so do it now", `bluetooth.js:326-331`).
-                if self.expanded == Some(DetailOwner::Bluetooth) {
-                    self.bt_row_order = self
-                        .bluetooth
-                        .visible_devices()
-                        .iter()
-                        .map(|d| d.path.clone())
-                        .collect();
-                }
-                self.revision += 1;
-                return PopoverAction::Consumed;
+                return Some(QsStop::TileArrow(item));
             }
             if tile_body_rect(i, item, layout).contains(pos) {
-                return match item {
-                    // Network body: open settings (the in-place enable/disable toggle is deferred);
-                    // the arrow opens the detail view.
-                    GridTile::Network => settings_panel("network"),
-                    GridTile::Toggle(tile) => {
-                        let on = !tile.is_on(self.toggles);
-                        self.set_tile(tile, on);
-                        self.revision += 1;
-                        tile.action(on)
-                    }
-                    // Airplane: a D-Bus write (not optimistic — the tile updates on the gsd echo,
-                    // like `SetDefaultSink`; a rejected/hw-blocked write has no corrective echo).
-                    // We target the negation of the last *echoed* state, so a rapid second click
-                    // before the echo re-sends the same value rather than toggling back
-                    // (gnome-shell reads its freshly-written cache and would
-                    // toggle back) — an accepted minor divergence for the
-                    // sub-round-trip double-click window.
-                    GridTile::Airplane => PopoverAction::SetAirplaneMode(!self.airplane.active),
-                    // Power Mode body: gnome-shell's `clicked` — toggle Balanced ↔ last-selected.
-                    // Which target that is depends on state the compositor owns (the last-selected
-                    // gsettings/memory), so we defer the choice to `apply_popover_action`. Also
-                    // echo-driven (no local flip).
-                    GridTile::PowerProfile => PopoverAction::TogglePowerProfile,
-                    // Bluetooth body: gnome-shell's `toggleActive` (`bluetooth.js:120-141`) — an
-                    // rfkill write plus (when off) powering the adapter, resolved in
-                    // `apply_popover_action`. Echo-driven for the real state, but the *icon*
-                    // optimistically shows the acquiring transition (the rfkill→adapter delay is
-                    // user-visible; `_predictedState`, `bluetooth.js:126-129`).
-                    GridTile::Bluetooth => {
-                        self.bt_predicted = Some(if self.bluetooth.powered {
-                            BtAdapterState::TurningOff
-                        } else {
-                            BtAdapterState::TurningOn
-                        });
-                        self.revision += 1;
-                        PopoverAction::ToggleBluetooth
-                    }
-                };
+                return Some(QsStop::Tile(item));
             }
         }
-        // The battery pill opens power settings (gnome-shell's PowerToggle).
-        if let Some(pill) = pill_rect(self.has_pill()) {
-            if pill.contains(pos) {
-                return settings_panel("power");
-            }
+        if pill_rect(self.has_pill()).is_some_and(|r| r.contains(pos)) {
+            return Some(QsStop::Pill);
         }
         for button in SYS_BUTTONS {
             if sys_rect(button, self.has_pill()).contains(pos) {
-                // The power button opens its session submenu (toggle, one detail at a time)
-                // instead of acting; the others run their action immediately.
-                if let Some(owner) = button.detail_owner() {
-                    self.expanded = if self.expanded == Some(owner) {
-                        None
-                    } else {
-                        Some(owner)
-                    };
-                    self.revision += 1;
-                    return PopoverAction::Consumed;
-                }
-                return button.action();
+                return Some(QsStop::Sys(button));
             }
         }
-        // The volume sliders (output, then mic): the icon toggles mute; the arrow (when >1 device)
-        // toggles the device picker; the track jumps to (and begins dragging toward) the clicked
-        // position. The arrow is tested BEFORE the track so an arrow click never starts a drag (the
-        // track is genuinely shortened to make room, so `volume_from_x` stays in range).
         for slider in SLIDERS {
             if !layout.sliders.present(slider) {
                 continue;
             }
             if slider_icon_rect(slider, layout).contains(pos) {
-                return match slider {
-                    Slider::Output => PopoverAction::ToggleMute,
-                    Slider::Mic => PopoverAction::ToggleInputMute,
-                    // Non-reactive icon: the click lands on the row, and stops there.
-                    Slider::Brightness => PopoverAction::Consumed,
-                };
+                return Some(QsStop::SliderIcon(slider));
             }
             if slider_arrow_rect(slider, layout).is_some_and(|r| r.contains(pos)) {
-                if let Some(owner) = slider.owner() {
-                    self.expanded = if self.expanded == Some(owner) {
-                        None
-                    } else {
-                        Some(owner)
-                    };
-                    self.revision += 1;
-                }
-                return PopoverAction::Consumed;
+                return Some(QsStop::SliderArrow(slider));
             }
             if slider_track_rect(slider, layout).contains(pos) {
-                self.sliding = Some((SliderId::Top(slider), self.device_count(slider)));
-                return self.set_local_volume(slider, volume_from_x(slider, pos.x, layout));
+                return Some(QsStop::SliderTrack(slider));
             }
         }
-        PopoverAction::Consumed
+        None
+    }
+
+    /// Run a control, however it was reached — a click, or Enter on the keyboard focus.
+    fn activate_stop(&mut self, stop: QsStop) -> PopoverAction {
+        match stop {
+            // The battery pill opens power settings (gnome-shell's PowerToggle).
+            QsStop::Pill => settings_panel("power"),
+            QsStop::Sys(button) => {
+                // The power button opens its session submenu (toggle, one detail at a time)
+                // instead of acting; the others run their action immediately.
+                match button.detail_owner() {
+                    Some(owner) => {
+                        self.toggle_detail(Some(owner));
+                        PopoverAction::Consumed
+                    }
+                    None => button.action(),
+                }
+            }
+            // A menu tile's arrow-half toggles its detail view (open, or close if already open —
+            // one at a time); the toggle-body keeps the tile's own behavior.
+            QsStop::TileArrow(item) => {
+                self.toggle_detail(item.detail_owner());
+                PopoverAction::Consumed
+            }
+            QsStop::Tile(item) => match item {
+                // Network body: open settings (the in-place enable/disable toggle is deferred);
+                // the arrow opens the detail view.
+                GridTile::Network => settings_panel("network"),
+                GridTile::Toggle(tile) => {
+                    let on = !tile.is_on(self.toggles);
+                    self.set_tile(tile, on);
+                    self.revision += 1;
+                    tile.action(on)
+                }
+                // Airplane: a D-Bus write (not optimistic — the tile updates on the gsd echo,
+                // like `SetDefaultSink`; a rejected/hw-blocked write has no corrective echo).
+                // We target the negation of the last *echoed* state, so a rapid second click
+                // before the echo re-sends the same value rather than toggling back
+                // (gnome-shell reads its freshly-written cache and would toggle back) — an
+                // accepted minor divergence for the sub-round-trip double-click window.
+                GridTile::Airplane => PopoverAction::SetAirplaneMode(!self.airplane.active),
+                // Power Mode body: gnome-shell's `clicked` — toggle Balanced ↔ last-selected.
+                // Which target that is depends on state the compositor owns (the last-selected
+                // gsettings/memory), so we defer the choice to `apply_popover_action`. Also
+                // echo-driven (no local flip).
+                GridTile::PowerProfile => PopoverAction::TogglePowerProfile,
+                // Bluetooth body: gnome-shell's `toggleActive` (`bluetooth.js:120-141`) — an
+                // rfkill write plus (when off) powering the adapter, resolved in
+                // `apply_popover_action`. Echo-driven for the real state, but the *icon*
+                // optimistically shows the acquiring transition (the rfkill→adapter delay is
+                // user-visible; `_predictedState`, `bluetooth.js:126-129`).
+                GridTile::Bluetooth => {
+                    self.bt_predicted = Some(if self.bluetooth.powered {
+                        BtAdapterState::TurningOff
+                    } else {
+                        BtAdapterState::TurningOn
+                    });
+                    self.revision += 1;
+                    PopoverAction::ToggleBluetooth
+                }
+            },
+            QsStop::SliderIcon(slider) => match slider {
+                Slider::Output => PopoverAction::ToggleMute,
+                Slider::Mic => PopoverAction::ToggleInputMute,
+                // Non-reactive icon: it is not a stop at all, and a click lands on the row and
+                // stops there.
+                Slider::Brightness => PopoverAction::Consumed,
+            },
+            QsStop::SliderArrow(slider) => {
+                self.toggle_detail(slider.owner());
+                PopoverAction::Consumed
+            }
+            // A slider itself has no activation: Enter on a focused `St.Slider` does nothing, and
+            // its keys are Left/Right (`slider.js:175-184`), taken in `nav`.
+            QsStop::SliderTrack(_) => PopoverAction::Consumed,
+            QsStop::DetailRow(k) => match self.detail_row(k) {
+                Some(DetailRow::Item(row)) => {
+                    // A device-row activation marks that row busy until the Connect/Disconnect
+                    // finishes (gnome-shell plays the spinner around the await,
+                    // `bluetooth.js:257-261`).
+                    if let PopoverAction::ConnectBluetoothDevice { path, .. } = &row.action {
+                        self.bt_busy = Some(path.clone());
+                        self.revision += 1;
+                    }
+                    row.action
+                }
+                // A name label is not reactive, and a card slider takes Left/Right, not Enter.
+                _ => PopoverAction::Consumed,
+            },
+        }
+    }
+
+    /// Open `owner`'s detail card, or close it if it is the one already open — gnome-shell keeps
+    /// at most one `QuickToggleMenu` open at a time (`_setOpenedSubMenu`, `popupMenu.js:989-994`).
+    fn toggle_detail(&mut self, owner: Option<DetailOwner>) {
+        self.expanded = if self.expanded == owner { None } else { owner };
+        // Freeze the device-row order at open ("we don't reorder the list while the menu is open,
+        // so do it now", `bluetooth.js:326-331`).
+        if self.expanded == Some(DetailOwner::Bluetooth) {
+            self.bt_row_order = self
+                .bluetooth
+                .visible_devices()
+                .iter()
+                .map(|d| d.path.clone())
+                .collect();
+        }
+        self.revision += 1;
+    }
+
+    /// How many rows the open detail card has (0 when collapsed).
+    fn detail_row_count(&self) -> usize {
+        self.expanded
+            .map_or(0, |owner| self.detail_rows(owner).len())
+    }
+
+    /// Row `k` of the open detail card.
+    fn detail_row(&self, k: usize) -> Option<DetailRow> {
+        self.detail_rows(self.expanded?).into_iter().nth(k)
     }
 
     /// The number of backlit monitors — the brightness card's row-pair count and its arrow gate
@@ -2905,6 +3149,19 @@ impl QuickSettings {
                     continue;
                 };
                 rrect.loc -= origin;
+                // The keyboard focus ring. A slider row rings its `.slider-bin`, fully rounded
+                // (`_quick-settings.scss:143-147`); every other row rings the item box the way a
+                // menu row does.
+                if self.focused == Some(QsStop::DetailRow(k)) {
+                    let (ring, radius) = match row_run {
+                        DetailRowRun::Slider { .. } => {
+                            let track = detail_slider_track_rect(rrect);
+                            (track, track.size.h / 2.)
+                        }
+                        _ => (rrect, 8.),
+                    };
+                    p.focus_ring(ring, radius, self.accent)?;
+                }
                 // A card slider row: the shared slider body, inset like a `%menuitem`. No
                 // separator, no hover (`brightness.js:29` is a non-reactive item), no text.
                 let row_run = match row_run {
@@ -3204,6 +3461,14 @@ impl QuickSettings {
                     volume,
                     fill_color,
                 )?;
+            }
+
+            // The keyboard focus ring, over whichever control has it. Every focusable here is a
+            // pill or a disc — quick toggles take `$forced_circular_radius`
+            // (`_quick-settings.scss:16`), the system buttons are circles, and `.slider-bin:focus`
+            // is fully rounded — so the ring's radius is the stop's own half-height.
+            if let Some((_, rect)) = self.focus_rect(layout) {
+                p.focus_ring(rect, rect.size.h / 2., self.accent)?;
             }
 
             Ok(())
@@ -4058,6 +4323,104 @@ run it with --features reference-env, as the fedora CI job does"
             crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         )
+    }
+
+    /// A focused slider takes Left/Right for its value — `St.Slider` consumes them and moves by a
+    /// tenth of the range (`slider.js:175-184`, `_getMinimumIncrement`) — while the same keys on a
+    /// tile move the focus instead.
+    #[test]
+    fn left_and_right_move_a_focused_slider_but_navigate_elsewhere() {
+        let mut qs = qs_with_sinks(1);
+        assert!(qs.set_audio(Some(AudioStatus {
+            volume: 0.5,
+            muted: false,
+        })));
+
+        // Walk to the output slider's track.
+        while qs.focused_for_test().as_deref() != Some("SliderTrack(Output)") {
+            assert!(
+                qs.nav(Dir::TabForward).is_none(),
+                "tabbing round the chain must not act on anything"
+            );
+        }
+
+        let action = qs.nav(Dir::Right).expect("Right moves the slider");
+        match action {
+            PopoverAction::SetVolume(v) => assert!(
+                (v - 0.6).abs() < 1e-9,
+                "one press is a tenth of the range, got {v}"
+            ),
+            other => panic!("expected a volume change, got {other:?}"),
+        }
+        assert_eq!(
+            qs.focused_for_test().as_deref(),
+            Some("SliderTrack(Output)"),
+            "and the focus stays on the slider it moved"
+        );
+        assert!(matches!(
+            qs.nav(Dir::Left),
+            Some(PopoverAction::SetVolume(_))
+        ));
+
+        // A tile does not consume the horizontal keys: they navigate.
+        while !qs
+            .focused_for_test()
+            .is_some_and(|f| f.starts_with("Tile("))
+        {
+            qs.nav(Dir::TabForward);
+        }
+        let before = qs.focused_for_test();
+        assert!(qs.nav(Dir::Right).is_none(), "a tile's Right is navigation");
+        assert_ne!(qs.focused_for_test(), before);
+    }
+
+    /// The focus names a *control*, not a grid slot. Bluetooth is **inserted** at slot 1 when its
+    /// rfkill appears, which shifts every later tile — a focus stored as an index would silently
+    /// land on a different tile while the menu is open.
+    #[test]
+    fn a_tile_appearing_does_not_move_the_focus_to_another_tile() {
+        let mut qs = qs(NetworkStatus::default(), None);
+
+        while qs.focused_for_test().as_deref() != Some("Tile(Toggle(DarkStyle))") {
+            qs.nav(Dir::TabForward);
+        }
+
+        // The Bluetooth tile arrives and takes slot 1, pushing Dark Style along by one.
+        assert!(qs.set_bluetooth_rfkill(BluetoothRfkill {
+            has_airplane: true,
+            ..BluetoothRfkill::default()
+        }));
+        assert_eq!(
+            qs.focused_for_test().as_deref(),
+            Some("Tile(Toggle(DarkStyle))"),
+            "the focus follows its tile, not its slot"
+        );
+    }
+
+    /// A menu tile's arrow is its own focus stop (`quickSettings.js:186-193`), and activating it
+    /// opens the detail card — whose rows then join the focus chain, directly under their owner.
+    #[test]
+    fn activating_a_tile_arrow_opens_its_card_and_its_rows_join_the_chain() {
+        let mut qs = qs_with_sinks(2);
+
+        while qs.focused_for_test().as_deref() != Some("SliderArrow(Output)") {
+            qs.nav(Dir::TabForward);
+        }
+        assert_eq!(qs.activate_focused(), PopoverAction::Consumed);
+        assert_eq!(qs.expanded, Some(DetailOwner::Output));
+
+        // The card's rows are reachable now — and only because it has settled.
+        let mut rows = 0;
+        for _ in 0..40 {
+            qs.nav(Dir::TabForward);
+            if qs
+                .focused_for_test()
+                .is_some_and(|f| f.starts_with("DetailRow("))
+            {
+                rows += 1;
+            }
+        }
+        assert!(rows > 0, "the card's rows must be in the focus chain");
     }
 
     /// `n` output sinks with `sink0` the default, and a bound sink (so the slider — and thus the

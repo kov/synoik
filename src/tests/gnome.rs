@@ -3862,6 +3862,66 @@ fn super_a_toggles_the_app_grid() {
     );
 }
 
+/// `<Super>s` opens quick settings **with its first control focused**, so Enter acts without an
+/// arrow key first (`_toggleMenu` navigates the focus in right after the toggle,
+/// `panel.js:588-591`). Once in, the arrows move geometrically over the grid rather than down a
+/// list, because quick settings is a focus group navigated by `StFocusManager`, not a menu.
+#[test]
+fn super_s_focuses_quick_settings_and_the_arrows_walk_the_grid() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_S);
+    f.key_release(KEY_LEFTMETA);
+    let first = f
+        .synoik()
+        .panel_popover
+        .focused_row_label()
+        .expect("the keybinding-opened menu comes up focused");
+    assert!(
+        first.starts_with("Sys(") || first == "Pill",
+        "the focus lands in the top system row, got {first}"
+    );
+
+    // Down out of the system row reaches the tile grid; Right crosses to the second column.
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert_eq!(
+        f.synoik().panel_popover.focused_row_label().as_deref(),
+        Some("Tile(Network)"),
+        "Network leads the grid, in the top-left cell"
+    );
+    f.key_press(KEY_RIGHT);
+    f.key_release(KEY_RIGHT);
+    let right_of_network = f.synoik().panel_popover.focused_row_label().unwrap();
+    assert_ne!(
+        right_of_network, "Tile(Network)",
+        "Right crosses to the other column"
+    );
+    f.key_press(KEY_LEFT);
+    f.key_release(KEY_LEFT);
+    assert_eq!(
+        f.synoik().panel_popover.focused_row_label().as_deref(),
+        Some("Tile(Network)"),
+        "and Left comes back"
+    );
+
+    // Up from the top row of the grid returns to the system row; Up again stays put, because the
+    // arrows do not wrap (`StFocusManager` passes wrap_around = FALSE).
+    f.key_press(KEY_UP);
+    f.key_release(KEY_UP);
+    let top = f.synoik().panel_popover.focused_row_label().unwrap();
+    assert!(top.starts_with("Sys(") || top == "Pill", "got {top}");
+    f.key_press(KEY_UP);
+    f.key_release(KEY_UP);
+    assert_eq!(
+        f.synoik().panel_popover.focused_row_label(),
+        Some(top),
+        "Up at the top stays put — arrow navigation does not wrap"
+    );
+}
+
 /// `toggle-message-tray` (`<Super>v`, and `<Super>m` as its second accelerator)
 /// and `toggle-quick-settings` (`<Super>s`) open the panel menus, the same
 /// `Panel.toggleCalendar` / `toggleQuickSettings` the pointer reaches by
