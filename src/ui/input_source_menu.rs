@@ -27,7 +27,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{
-    self, style, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
+    self, style, Align, BakeCache, Dir, Painter, ShapedText, TextShaper, TextStyle,
 };
 
 const PAD: f64 = 8.;
@@ -82,6 +82,8 @@ pub struct InputSourceMenu {
     items: Vec<InputSourceItem>,
     active: usize,
     hovered: Option<usize>,
+    /// The keyboard-focused row, same indexing.
+    focused: Option<usize>,
     revision: u64,
     bg_cache: RefCell<BakeCache>,
 }
@@ -92,6 +94,7 @@ impl InputSourceMenu {
             items,
             active,
             hovered: None,
+            focused: None,
             revision: 0,
             bg_cache: RefCell::new(BakeCache::new()),
         }
@@ -163,20 +166,57 @@ impl InputSourceMenu {
         let width = self.logical_size().w;
         for k in 0..self.row_count() {
             if self.row_rect(k, width).contains(pos) {
-                return match self.row_kind(k) {
-                    RowKind::Layout(i) => PopoverAction::SetInputSource(i),
-                    // gnome-shell activates `org.gnome.Tecla.desktop` (`_showLayout`).
-                    RowKind::ShowLayout => {
-                        PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.Tecla".into()])
-                    }
-                    // `addSettingsAction(_('Keyboard Settings'), 'gnome-keyboard-panel.desktop')`.
-                    RowKind::Settings => {
-                        PopoverAction::Spawn(vec!["gnome-control-center".into(), "keyboard".into()])
-                    }
-                };
+                return self.row_action(k);
             }
         }
         PopoverAction::Consumed
+    }
+
+    /// What row `k` does, however it was reached.
+    fn row_action(&self, k: usize) -> PopoverAction {
+        match self.row_kind(k) {
+            RowKind::Layout(i) => PopoverAction::SetInputSource(i),
+            // gnome-shell activates `org.gnome.Tecla.desktop` (`_showLayout`).
+            RowKind::ShowLayout => {
+                PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.Tecla".into()])
+            }
+            // `addSettingsAction(_('Keyboard Settings'), 'gnome-keyboard-panel.desktop')`.
+            RowKind::Settings => {
+                PopoverAction::Spawn(vec!["gnome-control-center".into(), "keyboard".into()])
+            }
+        }
+    }
+
+    /// Take one keyboard navigation step. Returns whether the key was consumed.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        let Some(delta) = dir.row_delta() else {
+            return false;
+        };
+        let next = widget::step_rows(self.focused, self.row_count(), delta);
+        if next == self.focused {
+            return false;
+        }
+        self.focused = next;
+        self.revision += 1;
+        true
+    }
+
+    /// The keyboard-focused row's label, if any.
+    pub fn focused_label(&self) -> Option<&str> {
+        match self.row_kind(self.focused?) {
+            RowKind::Layout(i) => Some(self.items.get(i)?.display.as_str()),
+            RowKind::ShowLayout => Some("Show Keyboard Layout"),
+            RowKind::Settings => Some("Keyboard Settings"),
+        }
+    }
+
+    /// Activate the keyboard-focused row. Every row here acts and closes, so unlike the a11y
+    /// menu's switches there is nothing for Space to keep open.
+    pub fn activate_focused(&mut self) -> PopoverAction {
+        let Some(k) = self.focused else {
+            return PopoverAction::Consumed;
+        };
+        self.row_action(k)
     }
 
     /// Update the hovered row from a menu-local pointer position (`None` clears).
@@ -251,7 +291,8 @@ impl InputSourceMenu {
 
         for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
             let rrect = self.row_rect(k, size.w);
-            if self.hovered == Some(k) {
+            // Keyboard focus draws the same wash as hover, as GNOME's menus do.
+            if self.hovered == Some(k) || self.focused == Some(k) {
                 p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
             }
             // Layout rows reserve the ornament column; trailing items don't.
@@ -377,6 +418,40 @@ mod tests {
         assert!(
             matches!(hit(&mut m, 3), PopoverAction::Spawn(c) if c == ["gnome-control-center", "keyboard"])
         );
+    }
+
+    /// Up and Down walk every row and wrap at both ends, entering from whichever end the first
+    /// key came from (`popupMenu.js:171-177`, wrapping navigation).
+    #[test]
+    fn keyboard_navigation_walks_every_row_and_wraps() {
+        let mut m = menu(2, 0);
+        assert_eq!(m.focused_label(), None, "nothing is focused until a key");
+
+        assert!(m.nav(Dir::Down));
+        assert_eq!(m.focused_label(), Some("Layout 0"));
+        assert!(m.nav(Dir::Down));
+        assert!(m.nav(Dir::Down));
+        assert_eq!(m.focused_label(), Some("Show Keyboard Layout"));
+        assert_eq!(m.activate_focused(), m.row_action(2));
+
+        assert!(m.nav(Dir::Down));
+        assert!(m.nav(Dir::Down));
+        assert_eq!(m.focused_label(), Some("Layout 0"), "Down wraps to the top");
+        assert!(m.nav(Dir::Up));
+        assert_eq!(
+            m.focused_label(),
+            Some("Keyboard Settings"),
+            "and Up wraps to the bottom"
+        );
+
+        // Horizontal keys are not this menu's: an unconsumed Left/Right is the panel's to use.
+        assert!(!m.nav(Dir::Left));
+        assert!(!m.nav(Dir::Right));
+        assert_eq!(m.focused_label(), Some("Keyboard Settings"));
+
+        // Enter on a layout row is the same action a click on it produces.
+        assert!(m.nav(Dir::Down));
+        assert_eq!(m.activate_focused(), PopoverAction::SetInputSource(0));
     }
 
     #[test]

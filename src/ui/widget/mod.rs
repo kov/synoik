@@ -121,6 +121,24 @@ pub enum Dir {
     TabBackward,
 }
 
+/// Step a focus index over `count` linear rows by `delta`, wrapping at both ends and entering
+/// from the top on a forward step / the bottom on a backward one — the wrap GNOME's menus do
+/// (`popupMenu.js:171-177`, `navigate_focus(..., wrap_around = true)`).
+///
+/// For a list whose rows are all focusable; a list with unfocusable rows in it wants
+/// [`Menu::focus_step`], which skips them.
+pub fn step_rows(focused: Option<usize>, count: usize, delta: isize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let n = count as isize;
+    Some(match focused {
+        Some(cur) => (((cur as isize + delta) % n + n) % n) as usize,
+        None if delta >= 0 => 0,
+        None => count - 1,
+    })
+}
+
 impl Dir {
     /// The row delta this direction means to a **linear** list of rows: a menu treats Tab exactly
     /// as Down, which is what `StFocusManager` produces for a single-column focus chain.

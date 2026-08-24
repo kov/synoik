@@ -387,6 +387,22 @@ pub enum PopoverContent {
     Workspace(Box<WorkspaceMenu>),
 }
 
+/// What activating the keyboard focus produced: the action, and whether the menu goes away with
+/// it. The two are usually the same question — [`PopoverAction::closes_menu`] answers it — but a
+/// switch row toggled with Space is the case where they part.
+struct Activation {
+    action: PopoverAction,
+    close: bool,
+}
+
+impl Activation {
+    /// The ordinary case: the action decides.
+    fn new(action: PopoverAction) -> Self {
+        let close = action.closes_menu();
+        Self { action, close }
+    }
+}
+
 impl PopoverContent {
     fn logical_size(&self) -> Size<f64, Logical> {
         match self {
@@ -422,24 +438,36 @@ impl PopoverContent {
                 m.nav(dir);
                 None
             }
-            PopoverContent::Calendar(_)
-            | PopoverContent::QuickSettings(_)
-            | PopoverContent::InputSources(_)
-            | PopoverContent::A11y(_) => None,
+            PopoverContent::InputSources(m) => {
+                m.nav(dir);
+                None
+            }
+            PopoverContent::A11y(m) => {
+                m.nav(dir);
+                None
+            }
+            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => None,
         }
     }
 
-    /// Activate whatever the keyboard focus is on (Enter/Space).
-    fn activate_focused(&mut self) -> PopoverAction {
+    /// Activate whatever the keyboard focus is on. `via_space` carries which key did it: Space
+    /// and Enter differ on a switch row, which Space toggles *without* closing the menu
+    /// ("we allow pressing space to toggle the switch without closing the menu",
+    /// `popupMenu.js:544-549`).
+    fn activate_focused(&mut self, via_space: bool) -> Activation {
         match self {
-            PopoverContent::App(m) => m.activate_focused(),
-            PopoverContent::Indicator(m) => m.activate_focused(),
-            PopoverContent::Window(m) => m.activate_focused(),
-            PopoverContent::Workspace(m) => m.activate_focused(),
-            PopoverContent::Calendar(_)
-            | PopoverContent::QuickSettings(_)
-            | PopoverContent::InputSources(_)
-            | PopoverContent::A11y(_) => PopoverAction::Consumed,
+            PopoverContent::App(m) => Activation::new(m.activate_focused()),
+            PopoverContent::Indicator(m) => Activation::new(m.activate_focused()),
+            PopoverContent::Window(m) => Activation::new(m.activate_focused()),
+            PopoverContent::Workspace(m) => Activation::new(m.activate_focused()),
+            PopoverContent::InputSources(m) => Activation::new(m.activate_focused()),
+            PopoverContent::A11y(m) => {
+                let (action, close) = m.activate_focused(via_space);
+                Activation { action, close }
+            }
+            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => {
+                Activation::new(PopoverAction::Consumed)
+            }
         }
     }
 
@@ -1148,6 +1176,21 @@ impl PanelPopover {
         }
     }
 
+    /// The label of the keyboard-focused row of whatever menu is up, if it has one. Test-only —
+    /// how the corpus names the focus without arithmetic over each menu's box model.
+    #[cfg(test)]
+    pub fn focused_row_label(&self) -> Option<String> {
+        match self.content.as_ref()? {
+            PopoverContent::A11y(m) => m.focused_label().map(str::to_owned),
+            PopoverContent::InputSources(m) => m.focused_label().map(str::to_owned),
+            PopoverContent::App(m) => m.focused_label(),
+            PopoverContent::Indicator(m) => m.focused_label(),
+            PopoverContent::Window(m) => m.focused_label(),
+            PopoverContent::Workspace(m) => m.focused_label(),
+            PopoverContent::Calendar(_) | PopoverContent::QuickSettings(_) => None,
+        }
+    }
+
     /// Open the brightness card on an open quick-settings popover. Test-only: the real path is a
     /// click on the slider's picker arrow, whose position the render tests would have to
     /// re-derive.
@@ -1406,12 +1449,12 @@ impl PanelPopover {
         if mods.ctrl || mods.alt || mods.shift || mods.logo {
             return true;
         }
-        if let Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) = raw {
-            let action = content.activate_focused();
-            if action.closes_menu() {
+        if let Some(key @ (Keysym::Return | Keysym::KP_Enter | Keysym::space)) = raw {
+            let activation = content.activate_focused(key == Keysym::space);
+            if activation.close {
                 self.close();
             }
-            self.pending_action = Some(action);
+            self.pending_action = Some(activation.action);
         }
         true
     }

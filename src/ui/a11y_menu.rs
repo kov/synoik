@@ -34,7 +34,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{
-    self, style, Align, BakeCache, Painter, ShapedText, Switch, TextShaper, TextStyle,
+    self, style, Align, BakeCache, Dir, Painter, ShapedText, Switch, TextShaper, TextStyle,
 };
 
 const PAD: f64 = 8.;
@@ -75,6 +75,9 @@ enum RowKind {
 pub struct A11yMenu {
     settings: A11ySettings,
     hovered: Option<usize>,
+    /// The keyboard-focused row, same indexing. Distinct from hover: GNOME's menus track both,
+    /// and the pointer moving must not steal what the keyboard is on.
+    focused: Option<usize>,
     revision: u64,
     accent: [f32; 4],
     bg_cache: RefCell<BakeCache>,
@@ -87,6 +90,7 @@ impl A11yMenu {
         Self {
             settings,
             hovered: None,
+            focused: None,
             revision: 0,
             accent: widget::style::accent_rgba(accent),
             bg_cache: RefCell::new(BakeCache::new()),
@@ -213,6 +217,56 @@ impl A11yMenu {
         PopoverAction::Consumed
     }
 
+    /// Take one keyboard navigation step. Returns whether the key was consumed — the horizontal
+    /// directions are not this menu's, so an unconsumed Left/Right can mean something to the
+    /// panel above it.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        let Some(delta) = dir.row_delta() else {
+            return false;
+        };
+        let next = widget::step_rows(self.focused, self.row_count(), delta);
+        if next == self.focused {
+            return false;
+        }
+        self.focused = next;
+        self.revision += 1;
+        true
+    }
+
+    /// The keyboard-focused row's label, if any.
+    pub fn focused_label(&self) -> Option<&str> {
+        match self.row_kind(self.focused?) {
+            RowKind::Toggle(toggle) => Some(toggle.label()),
+            RowKind::Settings => Some(SETTINGS_LABEL),
+        }
+    }
+
+    /// Activate the keyboard-focused row. `via_space` carries which key did it: a switch row
+    /// toggled with **Space** stays open, where Enter closes the menu like a click
+    /// ("we allow pressing space to toggle the switch without closing the menu",
+    /// `popupMenu.js:544-549`).
+    pub fn activate_focused(&mut self, via_space: bool) -> (PopoverAction, bool) {
+        let Some(k) = self.focused else {
+            return (PopoverAction::Consumed, false);
+        };
+        match self.row_kind(k) {
+            RowKind::Toggle(toggle) => (
+                PopoverAction::SetA11yToggle {
+                    toggle,
+                    on: !self.settings.get(toggle),
+                },
+                !via_space,
+            ),
+            RowKind::Settings => (
+                PopoverAction::Spawn(vec![
+                    "gtk-launch".into(),
+                    "gnome-universal-access-panel".into(),
+                ]),
+                true,
+            ),
+        }
+    }
+
     /// Update the hovered row from a menu-local pointer position (`None` clears).
     /// Returns whether it changed (so the caller can redraw).
     pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
@@ -273,7 +327,9 @@ impl A11yMenu {
 
         for (k, run) in row_runs.iter().enumerate() {
             let rrect = self.row_rect(k, size.w);
-            let hovered = self.hovered == Some(k);
+            // Keyboard focus draws the same wash as hover: GNOME's menus give the focused item
+            // the `:hover`-alike `.selected` state rather than a separate ring.
+            let hovered = self.hovered == Some(k) || self.focused == Some(k);
             if hovered {
                 p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
             }

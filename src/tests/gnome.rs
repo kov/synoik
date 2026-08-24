@@ -22469,6 +22469,81 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     );
 }
 
+/// The a11y menu takes the keyboard, and **Space** is not Enter on a switch row: it toggles and
+/// leaves the menu open, so several switches can be flipped in one visit ("we allow pressing space
+/// to toggle the switch without closing the menu", `popupMenu.js:544-549`). Enter toggles and
+/// closes, like a click.
+#[test]
+fn space_toggles_an_a11y_switch_without_closing_the_menu() {
+    use crate::gnome::A11yToggle;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    let mut a11y = f.synoik().gnome_settings.a11y;
+    a11y.always_show = true;
+    f.synoik().gnome_settings.a11y = a11y;
+    f.synoik().panel.set_a11y(a11y);
+
+    let anchor = f.synoik().panel.a11y_rect(ow).expect("indicator present");
+    pointer_motion_to(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.loc.y + anchor.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().panel_popover.focused_row_label(), None);
+
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert_eq!(
+        f.synoik().panel_popover.focused_row_label().as_deref(),
+        Some("High Contrast"),
+        "the first Down enters the list at its top row (`accessibility.js:45-46`)"
+    );
+
+    f.key_press(KEY_SPACE);
+    f.key_release(KEY_SPACE);
+    assert!(
+        f.synoik().gnome_settings.a11y.get(A11yToggle::HighContrast),
+        "Space flips the backing state"
+    );
+    assert!(
+        f.synoik().panel_popover.grabs_input(),
+        "and the menu is still up, still holding its grab"
+    );
+    assert_eq!(
+        f.synoik().panel_popover.a11y_row_state(0),
+        Some(true),
+        "the switch it left behind shows the new position"
+    );
+
+    // A second switch in the same visit — the point of Space keeping the menu open.
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.key_press(KEY_SPACE);
+    f.key_release(KEY_SPACE);
+    assert!(
+        f.synoik().gnome_settings.a11y.get(A11yToggle::Zoom),
+        "the second row flips too, without reopening the menu"
+    );
+
+    // Enter is the click: toggle, then close.
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert!(
+        !f.synoik().gnome_settings.a11y.get(A11yToggle::Zoom),
+        "Enter toggles the focused row back"
+    );
+    f.settle();
+    assert!(
+        !f.synoik().panel_popover.is_open(),
+        "and Enter closes the menu, like a click"
+    );
+}
+
 /// Clicking the accessibility indicator opens its menu, and clicking a switch row flips
 /// the backing state **and closes the menu** — `PopupSwitchMenuItem.activate` toggles
 /// and then falls through to `super.activate` for a pointer event
