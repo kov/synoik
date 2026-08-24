@@ -14,6 +14,7 @@ use smithay::reexports::rustix::process::getpid;
 use smithay::reexports::rustix::{self};
 
 pub mod satellite;
+pub mod selection;
 
 const TMP_UNIX_DIR: &str = "/tmp";
 const X11_TMP_UNIX_DIR: &str = "/tmp/.X11-unix";

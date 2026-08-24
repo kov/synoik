@@ -19778,12 +19778,17 @@ fn ctrl_tap(f: &mut Fixture, key: u32) {
 }
 
 /// What the compositor currently owns the clipboard with, as text — `None` when a client owns
-/// it or it is empty.
+/// it, an X11 client owns it, or it is empty.
 fn clipboard_text(f: &mut Fixture) -> Option<String> {
     use smithay::wayland::selection::data_device::current_data_device_selection_userdata;
 
-    let bytes = current_data_device_selection_userdata(&f.synoik().seat)?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    use crate::clipboard::SelectionData;
+
+    let data = current_data_device_selection_userdata(&f.synoik().seat)?;
+    match &*data {
+        SelectionData::Shell(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        SelectionData::X11(_) => None,
+    }
 }
 
 /// Put text on the clipboard the way a copy does, so a paste has something to find.

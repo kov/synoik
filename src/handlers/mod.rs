@@ -12,7 +12,6 @@ mod xdg_shell;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -80,6 +79,7 @@ use smithay::{
     delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation,
 };
 
+use crate::clipboard::SelectionData;
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::ActivateWindow;
@@ -297,35 +297,62 @@ delegate_keyboard_shortcuts_inhibit!(State);
 delegate_virtual_keyboard_manager!(State);
 
 impl SelectionHandler for State {
-    type SelectionUserData = Arc<[u8]>;
+    type SelectionUserData = SelectionData;
 
     /// Remember what the new clipboard owner offers.
     ///
     /// Smithay tracks the selection but has no accessor for its mime types, and a paste into
     /// one of the compositor's own entries has to pick one *before* it can ask for the data.
     /// `None` is a clear, which leaves nothing to paste.
+    /// A *client* took (or dropped) a selection.
+    ///
+    /// Smithay does not call this for the ones the compositor sets itself, which is what keeps
+    /// the X11 bridge from chasing its own tail: an import publishes a selection here without
+    /// coming back round as something to export.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
+        let mime_types = source.map(|s| s.mime_types());
+
         if ty == SelectionTarget::Clipboard {
-            self.synoik.clipboard_mime_types = source.map(|s| s.mime_types()).unwrap_or_default();
+            self.synoik.clipboard_mime_types = mime_types.clone().unwrap_or_default();
+        }
+
+        // Hand it to X11 as well, so an X client (spice-vdagent, and through it the host) can
+        // paste what a Wayland client just copied.
+        if let Some(bridge) = &self.synoik.x_selection {
+            match mime_types {
+                Some(mime_types) => bridge.offer(ty, mime_types),
+                None => bridge.clear(ty),
+            }
         }
     }
 
     fn send_selection(
         &mut self,
         _ty: SelectionTarget,
-        _mime_type: String,
+        mime_type: String,
         fd: OwnedFd,
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
         let _span = tracy_client::span!("send_selection");
 
-        let buf = user_data.clone();
+        let buf = match user_data {
+            SelectionData::Shell(buf) => buf.clone(),
+            SelectionData::X11(target) => {
+                // The bytes are an X11 conversion away. Dropping `fd` on a missing bridge is the
+                // right answer: the pasting client sees an empty read rather than a hang.
+                if let Some(bridge) = &self.synoik.x_selection {
+                    bridge.fetch(*target, mime_type, fd);
+                }
+                return;
+            }
+        };
+
         thread::spawn(move || {
             // Clear O_NONBLOCK, otherwise File::write_all() will stop halfway.
             if let Err(err) = fcntl_setfl(&fd, OFlags::empty()) {

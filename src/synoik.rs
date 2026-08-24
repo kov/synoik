@@ -102,6 +102,7 @@ use smithay::wayland::selection::primary_selection::{
     clear_primary_selection, PrimarySelectionState,
 };
 use smithay::wayland::selection::wlr_data_control::DataControlState as WlrDataControlState;
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState, SessionLocker};
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
 use smithay::wayland::shell::wlr_layer::{self, Layer, WlrLayerShellState};
@@ -130,6 +131,7 @@ use crate::animation::{Animation, Clock};
 use crate::app_system::AppIconRef;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
+use crate::clipboard::SelectionData;
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 use crate::dbus::freedesktop_locale1::Locale1ToSynoik;
 use crate::dbus::freedesktop_login1::Login1ToSynoik;
@@ -209,6 +211,7 @@ use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::xwayland::satellite::Satellite;
+use crate::utils::xwayland::selection::Bridge as XSelectionBridge;
 use crate::utils::{
     center, center_f64, crop_rgba8, expand_home, get_monotonic_time, ipc_transform_to_smithay,
     is_laptop_panel, is_mapped, logical_output, make_display_name, make_screenshot_path,
@@ -551,6 +554,9 @@ pub struct Synoik {
     /// One at a time: a held `Ctrl-v` would otherwise stack an fd source and a timer per key
     /// repeat, every one of them inserting into the same field when it lands.
     pub clipboard_paste_pending: bool,
+    /// The X11 selection bridge, once satellite has been spawned and the bridge could reach its
+    /// display. See [`crate::utils::xwayland::selection`].
+    pub x_selection: Option<XSelectionBridge>,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
     pub ext_data_control_state: ExtDataControlState,
@@ -7905,6 +7911,7 @@ impl Synoik {
             data_device_state,
             clipboard_mime_types: Vec::new(),
             clipboard_paste_pending: false,
+            x_selection: None,
             primary_selection_state,
             wlr_data_control_state,
             ext_data_control_state,
@@ -8146,7 +8153,7 @@ impl Synoik {
         synoik
     }
 
-    pub fn insert_client(&mut self, client: NewClient) {
+    pub fn insert_client(&mut self, client: NewClient) -> Option<Client> {
         let NewClient {
             client,
             restricted,
@@ -8162,8 +8169,12 @@ impl Synoik {
             credentials_unknown,
         });
 
-        if let Err(err) = self.display_handle.insert_client(client, data) {
-            warn!("error inserting client: {err}");
+        match self.display_handle.insert_client(client, data) {
+            Ok(client) => Some(client),
+            Err(err) => {
+                warn!("error inserting client: {err}");
+                None
+            }
         }
     }
 
@@ -9925,7 +9936,18 @@ impl Synoik {
     /// [`Self::clipboard_mime_types`] in step, which is what a later paste consults to decide
     /// whether there is any *text* to paste.
     pub fn set_clipboard(&mut self, mime_types: Vec<String>, bytes: Arc<[u8]>) {
-        set_data_device_selection(&self.display_handle, &self.seat, mime_types.clone(), bytes);
+        set_data_device_selection(
+            &self.display_handle,
+            &self.seat,
+            mime_types.clone(),
+            SelectionData::Shell(bytes),
+        );
+        // Smithay does not route a compositor-set selection through `new_selection`, so the two
+        // things that hang off one -- the mime list a paste consults, and the X11 side -- are
+        // this function's to keep in step.
+        if let Some(bridge) = &self.x_selection {
+            bridge.offer(SelectionTarget::Clipboard, mime_types.clone());
+        }
         self.clipboard_mime_types = mime_types;
     }
 

@@ -5,7 +5,7 @@
 // Modified for synoik in 2026.
 
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,10 +15,11 @@ use calloop::channel::Sender;
 use calloop::generic::Generic;
 use calloop::{Interest, Mode, PostAction, RegistrationToken};
 use smithay::reexports::rustix::io::{fcntl_setfd, FdFlags};
+use smithay::wayland::selection::data_device::set_selection_excluded_client;
 
-use crate::synoik::State;
+use crate::synoik::{NewClient, State};
 use crate::utils::expand_home;
-use crate::utils::xwayland::X11Connection;
+use crate::utils::xwayland::{selection, X11Connection};
 
 pub struct Satellite {
     x11: X11Connection,
@@ -35,6 +36,36 @@ impl Satellite {
     pub fn display_name(&self) -> &str {
         &self.x11.display_name
     }
+}
+
+/// Hand satellite a Wayland connection we made ourselves, and bar it from selections.
+///
+/// Two reasons for the socketpair rather than letting it dial `WAYLAND_DISPLAY`: we get its
+/// [`Client`](smithay::reexports::wayland_server::Client) *before* it exists, with no pid
+/// matching and no race against its first request, and that is what
+/// [`set_selection_excluded_client`] needs. The compositor bridges X11 selections itself (see
+/// [`crate::utils::xwayland::selection`]); a satellite that also bridged them would re-export
+/// every selection back the way it came, and the second export cancels the first source.
+///
+/// Returns the fd to hand the child, or `None` if we could not make one — in which case
+/// satellite falls back to `WAYLAND_DISPLAY` and its own bridge fights ours.
+fn wayland_socket_for_satellite(state: &mut State) -> Option<OwnedFd> {
+    let (ours, theirs) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!("error creating a socket pair for xwayland-satellite: {err}");
+            return None;
+        }
+    };
+
+    let client = state.synoik.insert_client(NewClient {
+        client: ours,
+        restricted: false,
+        credentials_unknown: false,
+    })?;
+    set_selection_excluded_client(&state.synoik.seat, Some(client));
+
+    Some(OwnedFd::from(theirs))
 }
 
 pub fn setup(state: &mut State) {
@@ -154,9 +185,16 @@ fn clear_out_pending_connections(fd: OwnedFd) -> OwnedFd {
 }
 
 fn setup_watch(state: &mut State) {
-    let Some(satellite) = state.synoik.satellite.as_mut() else {
+    if state.synoik.satellite.is_none() {
         return;
-    };
+    }
+
+    // We only get here with no satellite running -- at startup, or after one died. Neither the
+    // bridge (its display went with it) nor the selection bar (its client did) outlives that.
+    stop_selection_bridge(state);
+    set_selection_excluded_client(&state.synoik.seat, None);
+
+    let satellite = state.synoik.satellite.as_mut().unwrap();
 
     let event_loop = &state.synoik.event_loop;
 
@@ -184,9 +222,8 @@ fn setup_watch(state: &mut State) {
                     satellite.abstract_token = None;
 
                     debug!("connection to X11 abstract socket; spawning xwayland-satellite");
-                    let path = state.synoik.config.borrow().xwayland_satellite.path.clone();
-                    spawn(path, satellite);
                 }
+                spawn(state);
                 Ok(PostAction::Remove)
             })
             .unwrap();
@@ -207,17 +244,21 @@ fn setup_watch(state: &mut State) {
                 satellite.unix_token = None;
 
                 debug!("connection to X11 unix socket; spawning xwayland-satellite");
-                let path = state.synoik.config.borrow().xwayland_satellite.path.clone();
-                spawn(path, satellite);
             }
+            spawn(state);
             Ok(PostAction::Remove)
         })
         .unwrap();
     satellite.unix_token = Some(token);
 }
 
-fn spawn(path: String, xwl: &Satellite) {
+/// Start xwayland-satellite, and the compositor's own X11 selection bridge alongside it.
+fn spawn(state: &mut State) {
     let _span = tracy_client::span!("satellite::spawn");
+
+    let Some(xwl) = &state.synoik.satellite else {
+        return;
+    };
 
     let abstract_fd = xwl
         .x11
@@ -226,9 +267,10 @@ fn spawn(path: String, xwl: &Satellite) {
         .map(|fd| fd.try_clone().unwrap());
     let unix_fd = xwl.x11.unix_fd.try_clone().unwrap();
     let to_main = xwl.to_main.clone();
+    let display_name = xwl.x11.display_name.clone();
 
     // Expand `~` at the start.
-    let mut path = PathBuf::from(path);
+    let mut path = PathBuf::from(state.synoik.config.borrow().xwayland_satellite.path.clone());
     let expanded = expand_home(&path);
     match expanded {
         Ok(Some(expanded)) => path = expanded,
@@ -238,8 +280,10 @@ fn spawn(path: String, xwl: &Satellite) {
         }
     }
 
+    let wayland_fd = wayland_socket_for_satellite(state);
+
     let mut process = Command::new(&path);
-    process.arg(&xwl.x11.display_name).env_remove("DISPLAY");
+    process.arg(&display_name).env_remove("DISPLAY");
 
     // We don't want it spamming the synoik output.
     process
@@ -252,11 +296,13 @@ fn spawn(path: String, xwl: &Satellite) {
 
     unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
 
+    start_selection_bridge(state, display_name);
+
     // Spawning and waiting takes some milliseconds, so do it in a thread.
     let res = thread::Builder::new()
         .name("Xwl-s Spawner".to_owned())
         .spawn(move || {
-            spawn_and_wait(&path, process, abstract_fd, unix_fd);
+            spawn_and_wait(&path, process, abstract_fd, unix_fd, wayland_fd);
 
             // Once xwayland-satellite crashes or fails to spawn, re-establish our X11 socket watch
             // to try again next time.
@@ -265,8 +311,63 @@ fn spawn(path: String, xwl: &Satellite) {
 
     if let Err(err) = res {
         warn!("error spawning a thread to spawn xwayland-satellite: {err:?}");
-        let _ = xwl.to_main.send(ToMain::SetupWatch);
+        let _ = state
+            .synoik
+            .satellite
+            .as_ref()
+            .map(|xwl| xwl.to_main.send(ToMain::SetupWatch));
     }
+}
+
+/// Tear down the X11 selection bridge, if there is one.
+///
+/// Dropping the [`Bridge`] closes the channel its thread is watching, which is how the thread
+/// learns to exit; the event source has to come out by hand or every satellite restart leaks one.
+fn stop_selection_bridge(state: &mut State) {
+    let Some(bridge) = state.synoik.x_selection.take() else {
+        return;
+    };
+    if let Some(token) = bridge.token {
+        state.synoik.event_loop.remove(token);
+    }
+}
+
+/// Bring up the compositor-side X11 selection bridge for `display_name`.
+///
+/// Started here rather than at compositor startup on purpose: opening an X connection is what
+/// *triggers* satellite's on-demand spawn, so dialling the display before there is a satellite
+/// would defeat the whole point of the lazy start.
+fn start_selection_bridge(state: &mut State, display_name: String) {
+    stop_selection_bridge(state);
+
+    let (bridge, channel) = match selection::start(display_name) {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!("error starting the X11 selection bridge: {err}");
+            return;
+        }
+    };
+
+    let res = state
+        .synoik
+        .event_loop
+        .insert_source(channel, move |event, _, state| match event {
+            calloop::channel::Event::Msg(msg) => state.on_x_selection_event(msg),
+            // The X thread only ends when its connection does, which means the display we were
+            // bridging is gone. Anything still routed there would hang a paste.
+            calloop::channel::Event::Closed => stop_selection_bridge(state),
+        });
+    let token = match res {
+        Ok(token) => token,
+        Err(err) => {
+            warn!("error hooking up the X11 selection bridge: {err}");
+            return;
+        }
+    };
+
+    let mut bridge = bridge;
+    bridge.token = Some(token);
+    state.synoik.x_selection = Some(bridge);
 }
 
 fn spawn_and_wait(
@@ -274,14 +375,22 @@ fn spawn_and_wait(
     mut process: Command,
     abstract_fd: Option<OwnedFd>,
     unix_fd: OwnedFd,
+    wayland_fd: Option<OwnedFd>,
 ) {
     let abstract_raw = abstract_fd.as_ref().map(|fd| fd.as_raw_fd());
     let unix_raw = unix_fd.as_raw_fd();
+    let wayland_raw = wayland_fd.as_ref().map(|fd| fd.as_raw_fd());
 
     process.arg("-listenfd").arg(unix_raw.to_string());
 
     if let Some(abstract_raw) = abstract_raw {
         process.arg("-listenfd").arg(abstract_raw.to_string());
+    }
+
+    // `wayland-client` reads this instead of dialling `WAYLAND_DISPLAY`, and unsets it before
+    // satellite's own children (Xwayland) could inherit it.
+    if let Some(wayland_raw) = wayland_raw {
+        process.env("WAYLAND_SOCKET", wayland_raw.to_string());
     }
 
     unsafe {
@@ -296,6 +405,11 @@ fn spawn_and_wait(
             if let Some(abstract_raw) = abstract_raw {
                 let abstract_fd = BorrowedFd::borrow_raw(abstract_raw);
                 fcntl_setfd(abstract_fd, FdFlags::empty())?;
+            }
+
+            if let Some(wayland_raw) = wayland_raw {
+                let wayland_fd = BorrowedFd::borrow_raw(wayland_raw);
+                fcntl_setfd(wayland_fd, FdFlags::empty())?;
             }
 
             Ok(())
@@ -316,6 +430,7 @@ fn spawn_and_wait(
     // The process spawned, we can drop our fds.
     drop(abstract_fd);
     drop(unix_fd);
+    drop(wayland_fd);
 
     let status = match child.wait() {
         Ok(status) => status,

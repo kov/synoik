@@ -32,7 +32,10 @@
 //! glues words together, and a single-line field cannot show the difference.
 
 use std::cell::{Cell, RefCell};
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use smithay::input::keyboard::Keysym;
 use smithay::reexports::calloop::generic::Generic;
@@ -41,13 +44,19 @@ use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
 use smithay::reexports::rustix::io::Errno;
 use smithay::reexports::rustix::pipe::{pipe_with, PipeFlags};
 use smithay::wayland::selection::data_device::{
-    current_data_device_selection_userdata, request_data_device_client_selection,
-    SelectionRequestError,
+    clear_data_device_selection, current_data_device_selection_userdata,
+    request_data_device_client_selection, set_data_device_selection, SelectionRequestError,
 };
+use smithay::wayland::selection::primary_selection::{
+    clear_primary_selection, current_primary_selection_userdata, request_primary_client_selection,
+    set_primary_selection,
+};
+use smithay::wayland::selection::SelectionTarget;
 
 use crate::input_method::{ShellEntry, ShellKey};
 use crate::synoik::State;
 use crate::ui::text_edit::EditMods;
+use crate::utils::xwayland::selection::FromX;
 
 /// The most a single paste may bring in, in bytes.
 ///
@@ -69,6 +78,22 @@ const PASTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// GNOME's own list, `st/st-clipboard.c:49-53` (`supported_mimetypes`, consumed in order by
 /// `pick_mimetype`).
 pub const TEXT_MIME_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+
+/// What the compositor put on a selection, and how to get the bytes back.
+///
+/// Smithay hands this back to [`SelectionHandler::send_selection`] when a client pastes a
+/// selection the *compositor* owns, which is both of the ways we own one.
+///
+/// [`SelectionHandler::send_selection`]: smithay::wayland::selection::SelectionHandler::send_selection
+#[derive(Debug, Clone)]
+pub enum SelectionData {
+    /// The shell copied it out of one of its own entries; we hold the bytes.
+    Shell(Arc<[u8]>),
+    /// An X11 client owns it; the bytes live over there and are fetched on demand through the
+    /// bridge. Nothing is converted until someone actually pastes — see
+    /// [`crate::utils::xwayland::selection`].
+    X11(SelectionTarget),
+}
 
 /// One of the three clipboard bindings, recognised from a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +206,139 @@ impl State {
         );
     }
 
+    /// Act on something the X11 selection bridge saw.
+    ///
+    /// The other direction — a Wayland selection reaching X11 — is pushed from
+    /// [`SelectionHandler::new_selection`] and [`Synoik::set_clipboard`], so it is not here.
+    ///
+    /// [`SelectionHandler::new_selection`]: smithay::wayland::selection::SelectionHandler::new_selection
+    /// [`Synoik::set_clipboard`]: crate::synoik::Synoik::set_clipboard
+    pub fn on_x_selection_event(&mut self, event: FromX) {
+        match event {
+            FromX::Offer { target, mime_types } => self.publish_x_selection(target, mime_types),
+            FromX::Cleared { target } => self.clear_x_selection(target),
+            FromX::Request {
+                target,
+                id,
+                mime_type,
+            } => self.serve_x_selection_request(target, id, mime_type),
+        }
+    }
+
+    /// An X11 client owns `target`: publish what it offers, fetching nothing yet.
+    fn publish_x_selection(&mut self, target: SelectionTarget, mime_types: Vec<String>) {
+        let dh = &self.synoik.display_handle;
+        match target {
+            SelectionTarget::Clipboard => {
+                set_data_device_selection(
+                    dh,
+                    &self.synoik.seat,
+                    mime_types.clone(),
+                    SelectionData::X11(target),
+                );
+                self.synoik.clipboard_mime_types = mime_types;
+            }
+            SelectionTarget::Primary => {
+                set_primary_selection(
+                    dh,
+                    &self.synoik.seat,
+                    mime_types,
+                    SelectionData::X11(target),
+                );
+            }
+        }
+    }
+
+    /// Nothing owns `target` on X11 any more.
+    ///
+    /// Only clears what *we* published from X11: between the X owner going away and this landing,
+    /// a Wayland client may have taken the selection, and wiping that would lose a live clipboard.
+    fn clear_x_selection(&mut self, target: SelectionTarget) {
+        let ours = match target {
+            SelectionTarget::Clipboard => matches!(
+                current_data_device_selection_userdata(&self.synoik.seat).as_deref(),
+                Some(SelectionData::X11(_))
+            ),
+            SelectionTarget::Primary => matches!(
+                current_primary_selection_userdata(&self.synoik.seat).as_deref(),
+                Some(SelectionData::X11(_))
+            ),
+        };
+        if !ours {
+            return;
+        }
+
+        let dh = &self.synoik.display_handle;
+        match target {
+            SelectionTarget::Clipboard => {
+                clear_data_device_selection(dh, &self.synoik.seat);
+                self.synoik.clipboard_mime_types.clear();
+            }
+            SelectionTarget::Primary => clear_primary_selection(dh, &self.synoik.seat),
+        }
+    }
+
+    /// An X11 client is pasting what a Wayland client copied: get it the bytes.
+    ///
+    /// Every request must be answered, including with `None` — an X client blocks until its
+    /// `SelectionNotify` arrives.
+    fn serve_x_selection_request(&mut self, target: SelectionTarget, id: u64, mime_type: String) {
+        let fd = self.x_selection_bytes(target, mime_type);
+        if let Some(bridge) = &self.synoik.x_selection {
+            bridge.answer(id, fd);
+        }
+    }
+
+    /// The read end of a pipe the current owner of `target` is filling with `mime_type`.
+    fn x_selection_bytes(&mut self, target: SelectionTarget, mime_type: String) -> Option<OwnedFd> {
+        let (read, write) = match pipe_with(PipeFlags::CLOEXEC) {
+            Ok(pair) => pair,
+            Err(err) => {
+                warn!("error creating a pipe for an X11 paste: {err:?}");
+                return None;
+            }
+        };
+
+        // The shell's own selection: we have the bytes, so hand them over on a thread rather
+        // than round-tripping through a client that is not there.
+        let own = match target {
+            SelectionTarget::Clipboard => current_data_device_selection_userdata(&self.synoik.seat)
+                .and_then(|data| match &*data {
+                    SelectionData::Shell(bytes) => Some(bytes.clone()),
+                    SelectionData::X11(_) => None,
+                }),
+            SelectionTarget::Primary => current_primary_selection_userdata(&self.synoik.seat)
+                .and_then(|data| match &*data {
+                    SelectionData::Shell(bytes) => Some(bytes.clone()),
+                    SelectionData::X11(_) => None,
+                }),
+        };
+        if let Some(bytes) = own {
+            std::thread::spawn(move || {
+                if let Err(err) = std::io::Write::write_all(&mut File::from(write), &bytes) {
+                    debug!("error writing the shell selection to X11: {err}");
+                }
+            });
+            return Some(read);
+        }
+
+        // The two protocols have their own identically-shaped error type, so the arms report
+        // rather than return.
+        let ok = match target {
+            SelectionTarget::Clipboard => {
+                request_data_device_client_selection(&self.synoik.seat, mime_type, write)
+                    .inspect_err(|err| debug!("no clipboard to hand X11: {err}"))
+                    .is_ok()
+            }
+            SelectionTarget::Primary => {
+                request_primary_client_selection(&self.synoik.seat, mime_type, write)
+                    .inspect_err(|err| debug!("no primary selection to hand X11: {err}"))
+                    .is_ok()
+            }
+        };
+        ok.then_some(read)
+    }
+
     /// Start a paste into `entry`.
     ///
     /// The clipboard owner is another client, so the data arrives over a pipe *later*; this
@@ -196,11 +354,26 @@ impl State {
         };
         let mime = (*mime).to_owned();
 
-        // Our own selection: no round trip, and no fd source to leak.
-        let own = current_data_device_selection_userdata(&self.synoik.seat)
-            .map(|bytes| paste_text(&bytes));
+        // The shell's own selection: no round trip, and no fd source to leak.
+        let own = current_data_device_selection_userdata(&self.synoik.seat).and_then(|data| {
+            match &*data {
+                SelectionData::Shell(bytes) => Some(paste_text(bytes)),
+                // An X11 client owns it; the bytes are over there. Falls through to the pipe.
+                SelectionData::X11(_) => None,
+            }
+        });
         if let Some(text) = own {
             self.type_into_shell_entry(entry, &text);
+            return;
+        }
+
+        // Where the data has to come from. Read before the pipe so a missing bridge costs
+        // nothing.
+        let from_x = match current_data_device_selection_userdata(&self.synoik.seat).as_deref() {
+            Some(SelectionData::X11(target)) => Some(*target),
+            _ => None,
+        };
+        if from_x.is_some() && self.synoik.x_selection.is_none() {
             return;
         }
 
@@ -224,17 +397,26 @@ impl State {
             return;
         }
 
-        match request_data_device_client_selection(&self.synoik.seat, mime, write) {
-            Ok(()) => (),
-            // Both mean the selection changed between the mime-type check above and now.
-            Err(
-                err @ (SelectionRequestError::NoSelection
-                | SelectionRequestError::InvalidMimetype
-                | SelectionRequestError::ServerSideSelection),
-            ) => {
-                debug!("no clipboard text to paste: {err}");
-                return;
+        match from_x {
+            // An X11 client owns it: the bridge converts the selection and fills the pipe. It is
+            // compositor-owned as far as smithay is concerned, so the request below would only
+            // ever come back `ServerSideSelection`.
+            Some(target) => {
+                let bridge = self.synoik.x_selection.as_ref().unwrap();
+                bridge.fetch(target, mime, write);
             }
+            None => match request_data_device_client_selection(&self.synoik.seat, mime, write) {
+                Ok(()) => (),
+                // All three mean the selection changed between the mime-type check above and now.
+                Err(
+                    err @ (SelectionRequestError::NoSelection
+                    | SelectionRequestError::InvalidMimetype
+                    | SelectionRequestError::ServerSideSelection),
+                ) => {
+                    debug!("no clipboard text to paste: {err}");
+                    return;
+                }
+            },
         }
 
         let paste = Rc::new(RefCell::new(Paste {
