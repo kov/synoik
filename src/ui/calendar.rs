@@ -1546,10 +1546,10 @@ impl CalendarMessageList {
             content_h,
             off_y: LIST_PAD - scroll,
             scroll,
-            viewport: Rectangle::new(
-                Point::from((LIST_PAD, LIST_PAD)),
-                Size::from((list_w(), vh)),
-            ),
+            // x stays 0: this rect is also where the scrolled content *texture* is placed, and
+            // that texture is baked in popover-x space — the cards sit at `LIST_PAD` inside it.
+            // Moving it to `LIST_PAD` shifts the whole list right by that much.
+            viewport: Rectangle::new(Point::from((0., LIST_PAD)), Size::from((list_w(), vh))),
         }
     }
 
@@ -4805,6 +4805,36 @@ run it with --features reference-env, as the fedora CI job does"
         assert!(
             thumb_left + SCROLLBAR_W <= LIST_PAD + list_w(),
             "and it stays inside the list content"
+        );
+    }
+
+    /// On the overflow path the list is baked into one texture and presented at the viewport's
+    /// origin, while a card's own rect — what the focus ring is drawn at, and what hit-testing
+    /// resolves against — is popover-local. The two agree only while the viewport's x is 0, so a
+    /// "tidy-up" that moves it to `LIST_PAD` shifts every card right by 10 and leaves the ring
+    /// behind. Pinned because the symptom (rings offset from their bubbles) reads as a focus bug
+    /// rather than a placement one.
+    #[test]
+    fn the_scrolled_list_is_presented_where_its_cards_are_measured() {
+        let groups: Vec<_> = (1..=10).map(|i| single_group(sample_card(i))).collect();
+        let list = CalendarMessageList::new(groups);
+        let h = 346.;
+        let p = list.placed(h);
+        assert!(p.overflowing());
+        assert_eq!(
+            p.viewport.loc.x, 0.,
+            "the content texture is baked in popover-x space and presented at this x"
+        );
+
+        let (_, card) = list
+            .stops(h)
+            .into_iter()
+            .find(|(hit, _)| matches!(hit, ListHit::Body { .. }))
+            .expect("a card stop");
+        assert_eq!(
+            card.loc.x,
+            p.viewport.loc.x + LIST_PAD,
+            "a card lands at the same x whether it is measured or presented"
         );
     }
 
