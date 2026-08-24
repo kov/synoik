@@ -382,7 +382,9 @@ impl Headless {
                 is_custom_mode: true,
                 vrr_supported: false,
                 vrr_enabled: false,
-                logical: Some(logical_output(&output)),
+                // Not in the layout yet (`add_output` is below), so it cannot be primary here;
+                // `State::refresh_ipc_outputs` is the one writer that resolves this for real.
+                logical: Some(logical_output(&output, false)),
                 max_bpc: None,
             },
         );

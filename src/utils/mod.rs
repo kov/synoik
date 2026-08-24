@@ -210,7 +210,7 @@ pub fn output_size(output: &Output) -> Size<f64, Logical> {
     output_transform.transform_size(logical_size)
 }
 
-pub fn logical_output(output: &Output) -> synoik_ipc::LogicalOutput {
+pub fn logical_output(output: &Output, is_primary: bool) -> synoik_ipc::LogicalOutput {
     let loc = output.current_location();
     let size = output_size(output);
     let transform = match output.current_transform() {
@@ -230,6 +230,7 @@ pub fn logical_output(output: &Output) -> synoik_ipc::LogicalOutput {
         height: size.h as u32,
         scale: output.current_scale().fractional_scale(),
         transform,
+        is_primary,
     }
 }
 

@@ -332,6 +332,50 @@ fn hot_corner_honors_enable_hot_corners() {
     );
 }
 
+/// **Our divergence.** gnome-shell skips the hot corner on a non-primary monitor whose top-left
+/// is interior — the secondary of a side-by-side pair gets none at all (`layout.js:452-490`). We
+/// keep one on every output, so the overview is reachable from the monitor the pointer is on.
+///
+/// The interior *left* edge still builds nothing: the pointer crosses it onto the neighbour
+/// instead of being clamped, so there is no discarded motion. The top edge is on the boundary of
+/// the global space, and that is what trips it.
+#[test]
+fn every_output_has_a_hot_corner() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+
+    // headless-2's own top-left corner, which sits directly right of headless-1.
+    pointer_motion_to(&mut f, 1920., 0.);
+    for _ in 0..10 {
+        f.pointer_motion(0., -20.);
+    }
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the secondary output's corner must open the overview"
+    );
+}
+
+/// Pushing *left* at that same interior corner cannot trip it: the pointer walks onto the
+/// neighbour rather than being clamped, so no pressure accumulates.
+#[test]
+fn an_interior_edge_builds_no_pressure() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+
+    pointer_motion_to(&mut f, 1920., 0.);
+    for _ in 0..10 {
+        f.pointer_motion(-20., 0.);
+    }
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "pushing through an interior edge must not open the overview"
+    );
+}
+
 /// The dock — **our divergence**, not GNOME (`docs/fork/dock-divergence.md`). Pushing into the
 /// bottom edge slides the dash out; touching the edge does not.
 #[test]
@@ -21170,17 +21214,20 @@ fn output_scale(f: &Fixture) -> f64 {
 }
 
 /// The `ApplyMonitorsConfig` config for headless-1 at `scale`, the way the DBus handler builds it.
-fn dbus_scale_config(scale: f64) -> HashMap<String, Option<synoik_config::Output>> {
-    HashMap::from([(
-        "headless-1".to_owned(),
-        Some(synoik_config::Output {
-            off: false,
-            name: "headless-1".to_owned(),
-            scale: Some(synoik_config::FloatOrInt(scale)),
-            position: Some(synoik_config::Position { x: 0, y: 0 }),
-            ..Default::default()
-        }),
-    )])
+fn dbus_scale_config(scale: f64) -> crate::dbus::mutter_display_config::AppliedConfig {
+    crate::dbus::mutter_display_config::AppliedConfig {
+        outputs: HashMap::from([(
+            "headless-1".to_owned(),
+            Some(synoik_config::Output {
+                off: false,
+                name: "headless-1".to_owned(),
+                scale: Some(synoik_config::FloatOrInt(scale)),
+                position: Some(synoik_config::Position { x: 0, y: 0 }),
+                ..Default::default()
+            }),
+        )]),
+        primary: None,
+    }
 }
 
 /// A saved two-monitor layout, with the positions deliberately *reversed* from the name order the
@@ -21320,6 +21367,31 @@ fn monitors_xml_with_primary_on_two() -> String {
     )
 }
 
+/// The same pair, primary on headless-1 — what a live apply has to outrank.
+fn monitors_xml_with_primary_on_one() -> String {
+    let spec = |n: u8, x: i32, primary: bool| {
+        format!(
+            r#"    <logicalmonitor>
+      <x>{x}</x><y>0</y><scale>1</scale>{}
+      <monitor><monitorspec>
+        <connector>headless-{n}</connector><product>headless</product><serial>{n}</serial>
+      </monitorspec></monitor>
+    </logicalmonitor>
+"#,
+            if primary {
+                "<primary>yes</primary>"
+            } else {
+                ""
+            }
+        )
+    };
+    format!(
+        "<monitors version=\"2\">\n  <configuration>\n{}{}  </configuration>\n</monitors>",
+        spec(1, 0, true),
+        spec(2, 1280, false),
+    )
+}
+
 /// The workspace `name` currently lives on, by output connector.
 fn workspace_output(f: &mut Fixture, name: &str) -> String {
     f.synoik()
@@ -21362,6 +21434,85 @@ fn monitors_xml_primary_adopts_orphaned_workspaces() {
         workspace_output(&mut f, "orphan"),
         "headless-2",
         "the saved primary adopts it, not the first output added"
+    );
+}
+
+/// The `ApplyMonitorsConfig` config that names `connector` primary, leaving both outputs
+/// otherwise as they are.
+fn dbus_primary_config(connector: &str) -> crate::dbus::mutter_display_config::AppliedConfig {
+    let output = |name: &str, x: i32| {
+        (
+            name.to_owned(),
+            Some(synoik_config::Output {
+                off: false,
+                name: name.to_owned(),
+                position: Some(synoik_config::Position { x, y: 0 }),
+                ..Default::default()
+            }),
+        )
+    };
+    crate::dbus::mutter_display_config::AppliedConfig {
+        outputs: HashMap::from([output("headless-1", 0), output("headless-2", 1280)]),
+        primary: Some(connector.to_owned()),
+    }
+}
+
+/// `is_primary` as the IPC output model reports it, by connector — the same value
+/// `org.gnome.Mutter.DisplayConfig`'s `GetCurrentState` hands GNOME Settings.
+fn ipc_primary(f: &mut Fixture) -> Vec<String> {
+    let state = f.synoik_state();
+    state.refresh_ipc_outputs();
+    let outputs = state.backend.ipc_outputs();
+    let outputs = outputs.lock().unwrap();
+    let mut names: Vec<String> = outputs
+        .values()
+        .filter(|o| o.logical.is_some_and(|l| l.is_primary))
+        .map(|o| o.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Setting the primary monitor from GNOME Settings must both take effect and *read back*: the
+/// panel re-fetches `GetCurrentState` right after applying, and a readback that always said "not
+/// primary" made the choice look like it had reverted while the compositor had in fact taken it.
+///
+/// A TEMPORARY apply is the case that matters — it never writes `monitors.xml`, so primary has to
+/// ride the apply itself.
+#[test]
+fn settings_primary_apply_takes_effect_and_reads_back() {
+    // The store names headless-1 primary, so the reload below has something to resurrect.
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_primary_on_one());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 1024));
+    f.add_output(2, (1280, 1024));
+    assert_eq!(
+        ipc_primary(&mut f),
+        ["headless-1"],
+        "the stored primary applies"
+    );
+
+    f.synoik_state()
+        .apply_display_config(dbus_primary_config("headless-2"));
+    assert_eq!(
+        f.synoik().layout.primary_output().map(|o| o.name()),
+        Some("headless-2".to_owned()),
+        "the applied primary takes effect"
+    );
+    assert_eq!(
+        ipc_primary(&mut f),
+        ["headless-2"],
+        "and reads back, so Settings does not redraw the old choice"
+    );
+
+    // A later reload must not resurrect the previous primary from the store, the same way a
+    // live-applied scale survives one.
+    f.synoik_state().reload_output_config();
+    assert_eq!(
+        ipc_primary(&mut f),
+        ["headless-2"],
+        "a reload must not resurrect the stored primary"
     );
 }
 

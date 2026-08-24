@@ -835,10 +835,14 @@ fn print_output(output: Output) -> anyhow::Result<()> {
             height,
             scale,
             transform,
+            is_primary,
         } = logical;
         println!("  Logical position: {x}, {y}");
         println!("  Logical size: {width}x{height}");
         println!("  Scale: {scale}");
+        if is_primary {
+            println!("  Primary: yes");
+        }
 
         let transform = match transform {
             Transform::Normal => "normal",

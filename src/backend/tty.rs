@@ -2231,7 +2231,9 @@ impl Tty {
                         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
                         tty_state.node == *node && tty_state.crtc == crtc
                     })
-                    .map(logical_output);
+                    .map(|output| {
+                        logical_output(output, synoik.layout.primary_output() == Some(output))
+                    });
 
                 let id = device.known_crtcs.get(&crtc).map(|info| info.id);
                 let id = id.unwrap_or_else(|| {

@@ -1188,6 +1188,14 @@ pub struct Synoik {
     /// startup/hotplug) — never re-read to override a live apply.
     pub applied_display_config: HashMap<String, AppliedDisplayConfig>,
 
+    /// The primary monitor named by the live-applied display config, outranking `monitors.xml`
+    /// for the same reason [`Self::applied_display_config`] does.
+    ///
+    /// `ApplyMonitorsConfig` carries the primary flag on every method, but only a PERSISTENT
+    /// apply reaches the store — so without this a TEMPORARY apply (what GNOME Settings sends
+    /// while its confirmation countdown runs) would leave primary where it was.
+    pub applied_primary: Option<AppliedPrimary>,
+
     pub satellite: Option<Satellite>,
 
     #[cfg(feature = "xdp-gnome-screencast")]
@@ -1285,6 +1293,31 @@ pub struct AppliedDisplayConfig {
 impl AppliedDisplayConfig {
     /// Whether this override still describes the display now on that connector.
     pub fn applies_to(&self, name: &OutputName) -> bool {
+        match &self.identity {
+            Some(identity) => identity.eq_ignore_ascii_case(&name.format_make_model_serial()),
+            None => true,
+        }
+    }
+}
+
+/// The primary monitor of a display config applied live this session (see
+/// [`Synoik::applied_primary`]).
+#[derive(Debug, Clone)]
+pub struct AppliedPrimary {
+    /// Connector the request named as primary.
+    pub connector: String,
+    /// The identity of the display that was on it, as `make model serial`. Same guard as
+    /// [`AppliedDisplayConfig::identity`]: a connector is not a display, so a virtual connector
+    /// that later carries a different panel must not inherit primary from this one.
+    pub identity: Option<String>,
+}
+
+impl AppliedPrimary {
+    /// Whether this still names the display now on that connector.
+    pub fn applies_to(&self, name: &OutputName) -> bool {
+        if name.connector != self.connector {
+            return false;
+        }
         match &self.identity {
             Some(identity) => identity.eq_ignore_ascii_case(&name.format_make_model_serial()),
             None => true,
@@ -4297,8 +4330,18 @@ impl State {
     /// resurrected the previous value).
     pub fn apply_display_config(
         &mut self,
-        new_conf: HashMap<String, Option<synoik_config::Output>>,
+        applied: crate::dbus::mutter_display_config::AppliedConfig,
     ) {
+        let crate::dbus::mutter_display_config::AppliedConfig {
+            outputs: new_conf,
+            primary,
+        } = applied;
+        // Primary is a property of the request as a whole, so a request that names none clears
+        // the override and lets the `monitors.xml` store speak again.
+        self.synoik.applied_primary = primary.map(|connector| AppliedPrimary {
+            identity: self.synoik.output_identity(&connector),
+            connector,
+        });
         for (name, conf) in new_conf {
             match &conf {
                 Some(output) => {
@@ -4335,13 +4378,14 @@ impl State {
 
         let _span = tracy_client::span!("State::refresh_ipc_outputs");
 
+        let primary = self.synoik.layout.primary_output().cloned();
         for ipc_output in self.backend.ipc_outputs().lock().unwrap().values_mut() {
             let logical = self
                 .synoik
                 .global_space
                 .outputs()
                 .find(|output| output.name() == ipc_output.name)
-                .map(logical_output);
+                .map(|output| logical_output(output, primary.as_ref() == Some(output)));
             ipc_output.logical = logical;
         }
 
@@ -8141,6 +8185,7 @@ impl Synoik {
             ipc_server,
             ipc_outputs_changed: false,
             applied_display_config: HashMap::new(),
+            applied_primary: None,
 
             satellite: None,
 
@@ -8426,25 +8471,38 @@ impl Synoik {
             }
         }
 
-        // The saved layout also says which monitor is primary. With workspaces owned per monitor
+        // Which monitor is primary. With workspaces owned per monitor
         // (`docs/fork/dynamic-workspaces-divergence.md` §4) that decides one thing only: where
-        // workspaces orphaned by an unplug are adopted. Left alone when nothing is saved, so the
-        // default stays "the first output added".
-        if let Some(primary) = saved_layout.and_then(|conf| {
-            conf.logical_monitors
-                .iter()
-                .filter(|lm| lm.primary)
-                .flat_map(|lm| &lm.monitors)
-                .find_map(|m| {
-                    self.global_space
-                        .outputs()
-                        .find(|o| {
-                            o.user_data().get::<OutputName>().unwrap().connector == m.connector
-                        })
-                        .cloned()
-                })
-        }) {
-            self.layout.set_primary_output(&primary);
+        // workspaces orphaned by an unplug are adopted. A live apply outranks the store, the same
+        // way `applied_display_config` does; left alone when neither says anything, so the default
+        // stays "the first output added".
+        let output_named = |connector: &str| {
+            self.global_space
+                .outputs()
+                .find(|o| o.user_data().get::<OutputName>().unwrap().connector == connector)
+                .cloned()
+        };
+        let applied_primary = self.applied_primary.as_ref().and_then(|applied| {
+            self.global_space
+                .outputs()
+                .find(|o| applied.applies_to(o.user_data().get::<OutputName>().unwrap()))
+                .cloned()
+        });
+        let primary = applied_primary.or_else(|| {
+            saved_layout.and_then(|conf| {
+                conf.logical_monitors
+                    .iter()
+                    .filter(|lm| lm.primary)
+                    .flat_map(|lm| &lm.monitors)
+                    .find_map(|m| output_named(&m.connector))
+            })
+        });
+        if let Some(primary) = primary {
+            if self.layout.primary_output() != Some(&primary) {
+                self.layout.set_primary_output(&primary);
+                // Primary is part of the IPC output model, so moving it is an output change.
+                self.ipc_outputs_changed = true;
+            }
         }
     }
 
@@ -8955,25 +9013,24 @@ impl Synoik {
     /// coordinates: `panel_height` px down the left edge and the same along the top
     /// (`HotCorner.setBarrierSize`, `layout.js:1195-1233`, sized from `panelBox.height`).
     ///
-    /// gnome-shell gives the top-left corner of every monitor a hot corner (top-right under RTL,
-    /// which we do not implement yet), skipping a non-primary monitor whose corner is *interior* —
-    /// another monitor sits directly above it or to its left (`layout.js:452-490`). We skip any
-    /// interior corner, the primary's included: mutter holds the pointer at an interior edge with
-    /// a real barrier until it pushes through, and we have none. Our pressure is the motion the
-    /// output clamp discards, and the clamp only bites at the outer edge of the global space.
+    /// **Divergence — every output gets one.** gnome-shell gives the top-left corner of every
+    /// monitor a hot corner (top-right under RTL, which we do not implement yet), but skips a
+    /// *non-primary* monitor whose corner is interior: another monitor sits directly above it or
+    /// to its left (`layout.js:452-490`). We keep the corner on every output, so the overview is
+    /// always reachable from the monitor the pointer is already on — on a side-by-side pair
+    /// gnome-shell's rule leaves the secondary with no corner at all.
+    ///
+    /// This costs nothing at an interior edge, because pressure is the motion the output clamp
+    /// discards and the clamp only bites at the outer edge of the global space: an interior edge
+    /// never accumulates any, so an interior corner is tripped only by pushing whichever of its
+    /// two edges *is* on that boundary. [`Self::touch_hot_corner`] has no such qualifier, so an
+    /// absolute pointer crossing the seam at the corner pixel does trigger it.
     pub fn hot_corner_segments(&self, output: &Output) -> Option<[Segment; 2]> {
         if !self.gnome_settings.enable_hot_corners {
             return None;
         }
 
-        let geom = self.global_space.output_geometry(output)?;
-        let corner = geom.loc.to_f64();
-
-        // Interior corner: some other output owns the pixel just left of, or just above, ours.
-        let outside = |p: Point<f64, Logical>| self.global_space.output_under(p).next().is_none();
-        if !outside(corner - Point::new(1., 0.)) || !outside(corner - Point::new(0., 1.)) {
-            return None;
-        }
+        self.global_space.output_geometry(output)?;
 
         let size = crate::ui::panel::panel_height();
         Some([

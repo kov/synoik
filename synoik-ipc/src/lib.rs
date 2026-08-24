@@ -1621,6 +1621,14 @@ pub struct LogicalOutput {
     pub scale: f64,
     /// Transform.
     pub transform: Transform,
+    /// Whether this is the primary logical output.
+    ///
+    /// With workspaces owned per monitor this decides one thing in the compositor — where
+    /// workspaces orphaned by an unplug are adopted — but it is also what
+    /// `org.gnome.Mutter.DisplayConfig` reports back to GNOME Settings, so it must be part of the
+    /// inspectable output model rather than derived at the D-Bus edge.
+    #[serde(default)]
+    pub is_primary: bool,
 }
 
 /// Output transform, which goes counter-clockwise.

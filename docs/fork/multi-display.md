@@ -186,6 +186,28 @@ niri's `FocusWorkspaceDownUnderMouse` / `FocusWorkspaceUpUnderMouse` (`src/input
 are niri's way of offering this as a *separate binding*. They go: the behavior becomes the default,
 and a second set of actions for it is exactly the niri-shaped duplication the fork tenet drops.
 
+### Every display has a hot corner — *implemented*
+
+gnome-shell gives a hot corner only to the primary monitor and to those whose top-left is not
+covered by a neighbour (`layout.js:452-490`), so on a side-by-side pair the secondary has none.
+We keep one on every display (`Synoik::hot_corner_segments`), which follows from §4: the overview
+belongs to the display the pointer is on, and reaching it should not mean crossing to another one.
+
+An interior edge costs nothing to leave armed. Our pressure is the motion the output clamp
+discarded and the clamp only bites at the outer edge of the global space, so the edge the pointer
+simply walks across never accumulates any — an interior corner is tripped by whichever of its two
+edges *is* on that boundary. The exception is the absolute-pointer fallback
+(`Synoik::touch_hot_corner`), which has no push to qualify it and does fire when the pointer
+crosses the seam on the corner pixel.
+
+### Primary
+
+Primary decides one thing — which display adopts workspaces orphaned by an unplug (§2). It is set
+by `ApplyMonitorsConfig`, carried on the apply itself as well as through `monitors.xml` (a
+TEMPORARY apply never writes the store), lives on as `Synoik::applied_primary` outranking the
+store, and is reported back through `LogicalOutput::is_primary` — GNOME Settings re-reads
+`GetCurrentState` right after applying and redraws whatever it says.
+
 ## 5. A workspace whose work area changed — *implemented*
 
 This applies to any change of the work area — a display swapped underneath a workspace, a workspace

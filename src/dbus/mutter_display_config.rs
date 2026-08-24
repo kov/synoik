@@ -21,8 +21,20 @@ use crate::utils::scale::supported_scales;
 use crate::utils::{is_laptop_panel, make_display_name};
 
 pub struct DisplayConfig {
-    to_niri: calloop::channel::Sender<HashMap<String, Option<synoik_config::Output>>>,
+    to_niri: calloop::channel::Sender<AppliedConfig>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+}
+
+/// One `ApplyMonitorsConfig` on its way to the compositor.
+///
+/// Primary rides along rather than only reaching the compositor through the `monitors.xml` write,
+/// because that write only happens on a PERSISTENT apply — a TEMPORARY one (GNOME Settings'
+/// confirmation countdown) would otherwise leave primary behind.
+pub struct AppliedConfig {
+    /// Per connector: the requested configuration, or `None` to disable it.
+    pub outputs: HashMap<String, Option<synoik_config::Output>>,
+    /// Connector of the logical monitor flagged primary, if the request named one.
+    pub primary: Option<String>,
 }
 
 #[derive(Serialize, Type)]
@@ -159,7 +171,7 @@ impl DisplayConfig {
                     y: logical.y,
                     scale: logical.scale,
                     transform,
-                    is_primary: false,
+                    is_primary: logical.is_primary,
                     monitors: vec![names.clone()],
                     properties: HashMap::new(),
                 });
@@ -189,6 +201,7 @@ impl DisplayConfig {
     ) -> fdo::Result<()> {
         let current_conf = self.ipc_outputs.lock().unwrap();
         let mut new_conf = HashMap::new();
+        let mut primary = None;
         // Collected in parallel for persistence (method == PERSISTENT): the full monitorspec + mode
         // per logical monitor, so we can write `monitors.xml` the way mutter does.
         let mut write_lms: Vec<crate::monitors_xml::WriteLogicalMonitor> = Vec::new();
@@ -200,6 +213,9 @@ impl DisplayConfig {
             }
             let mut write_monitors = Vec::new();
             for (connector, mode, _props) in requested_config.monitors {
+                if requested_config.is_primary {
+                    primary = Some(connector.clone());
+                }
                 let Some(output) = current_conf.values().find(|o| o.name == connector) else {
                     return Err(zbus::fdo::Error::Failed(format!(
                         "Connector '{connector}' not found",
@@ -279,7 +295,10 @@ impl DisplayConfig {
             // 0 means "verify", so don't actually apply here
             return Ok(());
         }
-        if let Err(err) = self.to_niri.send(new_conf) {
+        if let Err(err) = self.to_niri.send(AppliedConfig {
+            outputs: new_conf,
+            primary,
+        }) {
             warn!("error sending message to synoik: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
@@ -326,7 +345,7 @@ impl DisplayConfig {
 
 impl DisplayConfig {
     pub fn new(
-        to_niri: calloop::channel::Sender<HashMap<String, Option<synoik_config::Output>>>,
+        to_niri: calloop::channel::Sender<AppliedConfig>,
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     ) -> Self {
         Self {

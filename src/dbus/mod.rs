@@ -149,8 +149,8 @@ impl DBusServers {
             synoik
                 .event_loop
                 .insert_source(from_display_config, move |event, _, state| match event {
-                    calloop::channel::Event::Msg(new_conf) => {
-                        state.apply_display_config(new_conf);
+                    calloop::channel::Event::Msg(applied) => {
+                        state.apply_display_config(applied);
                     }
                     calloop::channel::Event::Closed => (),
                 })
