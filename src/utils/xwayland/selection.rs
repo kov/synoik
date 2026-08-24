@@ -143,7 +143,9 @@ enum ToX {
 
 /// The compositor's handle on the bridge.
 ///
-/// Dropping it drops the channel, which is how the X thread learns to exit.
+/// Dropping it ends the X thread: the channel closes and the [`Drop`] below wakes the thread to
+/// notice. Closing the channel alone would not -- the thread keeps a write end of the wake pipe
+/// for its helpers, so the pipe never hangs up and the poll never returns.
 pub struct Bridge {
     to_x: Sender<ToX>,
     /// Written to after every send: the X thread is parked in `poll`, not on the channel.
@@ -184,6 +186,14 @@ impl Bridge {
     /// Answer a [`FromX::Request`].
     pub fn answer(&self, id: u64, fd: Option<OwnedFd>) {
         self.send(ToX::Data { id, fd });
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        // The channel is about to close; wake the thread so it sees that rather than sitting in
+        // `poll` until its X connection happens to die.
+        let _ = retry_on_intr(|| write(&self.wake, &[0]));
     }
 }
 
@@ -686,6 +696,10 @@ impl XState {
             serving.target
         };
 
+        // One shot, no INCR on this side: with BIG-REQUESTS a property runs to the server's
+        // maximum request size, ~16 MiB on Xwayland, which is far past any clipboard anyone
+        // means. Past it the ChangeProperty fails asynchronously and the requestor reads an
+        // empty property. `TRANSFER_LIMIT` is the memory ceiling, not this one.
         self.conn.change_property8(
             PropMode::REPLACE,
             serving.requestor,
