@@ -2118,6 +2118,38 @@ pub fn bake_card_border(
     )
 }
 
+/// Bake (cached by `(scale, size, revision)`) a keyboard-focus ring as a transparent texture the
+/// size of the focused control, to be composited **over** it.
+///
+/// For a focusable whose surface is baked somewhere the ring cannot reach — a notification card,
+/// which is its own cached texture composited into a scrolling list — where threading a focus flag
+/// through the card's bake and its cache key would mean re-baking the card's whole content on
+/// every focus step. The ring is the same [`Painter::focus_ring`] every other surface draws.
+pub fn bake_focus_ring(
+    renderer: &mut VulkanRenderer,
+    cache: &mut BakeCache,
+    scale: f64,
+    revision: u64,
+    size: Size<f64, Logical>,
+    radius: f64,
+    base: Rgba,
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
+    bake(
+        renderer,
+        cache,
+        scale,
+        size,
+        revision,
+        |_| Ok(()),
+        |frame, phys, ()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(style::TRANSPARENT)?;
+            p.focus_ring(Rectangle::from_size(size), radius, base)?;
+            Ok(())
+        },
+    )
+}
+
 /// Bake (cached by `(scale, size, revision)`) a card's rounded `.popup-menu-content` background
 /// fill into its own texture — a `fill_rounded_full` at `radius`, `color`. Composited BEHIND the
 /// content and ABOVE the drop shadow, this is the single home for the panel-popover box bg so the

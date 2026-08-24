@@ -1200,6 +1200,10 @@ pub struct CalendarMessageList {
     group_expanded: Option<SourceKey>,
     /// The control the pointer is hovering, highlighted on render.
     hovered: Option<ListHover>,
+    /// The control the keyboard focus is on, ringed on render. Held as the [`ListHit`] it means,
+    /// so the identity is a notification id or a source key — never a position in the list, which
+    /// re-orders as notifications arrive and expire.
+    focused: Option<ListHit>,
     /// Bumped whenever the snapshot changes, to invalidate cached textures
     /// (cache keys carry the revision in their high 32 bits).
     revision: u64,
@@ -1235,6 +1239,7 @@ impl CalendarMessageList {
             body_expanded: HashSet::new(),
             group_expanded: None,
             hovered: None,
+            focused: None,
             revision: 0,
             scroll_y: 0.,
             cache: RefCell::new(CardCache::new()),
@@ -1608,6 +1613,129 @@ impl CalendarMessageList {
             id: content.id,
             has_default: content.has_default_action,
         }
+    }
+
+    /// Every keyboard focus stop in the list, with its popover-local rect — **including** what is
+    /// scrolled out of view, since the focus is what scrolls the list to it.
+    ///
+    /// A notification is **one** stop: `Message extends St.Button` with `can_focus: true`
+    /// (`messageList.js:445-451`), and a `can_focus` container "will only take up a single slot on
+    /// the focus chain as a whole" (`st_widget_navigate_focus` docs, `st-widget.c:2195-2199`). Its
+    /// close ×, expand caret, action pills and media transport buttons set no `can_focus`
+    /// (`messageList.js:376-389,606,752,926`), so the keyboard does not reach them at all — only
+    /// the pointer does. The stops are that set plus the Clear button (`calendar.js:829`).
+    fn stops(&self, height: f64) -> Vec<(ListHit, Rectangle<f64, Logical>)> {
+        let mut out = Vec::new();
+        if self.can_clear() {
+            out.push((ListHit::Clear, self.clear_rect(height)));
+        }
+        let p = self.placed(height);
+        let shift = Point::from((0., p.off_y));
+        for m in &p.media {
+            out.push((
+                ListHit::MediaBody(self.players[m.player].bus_name.clone()),
+                Rectangle::new(m.origin + shift, m.layout.size),
+            ));
+        }
+        for gl in &p.layouts {
+            let group = &self.groups[gl.group];
+            match &gl.kind {
+                GroupKind::Single { origin, layout } => out.push((
+                    ListHit::Body {
+                        id: group.cards[0].id,
+                        has_default: group.cards[0].has_default_action,
+                    },
+                    Rectangle::new(*origin + shift, layout.size),
+                )),
+                // A collapsed stack is one target: anything on it but the top card's close
+                // expands the group.
+                GroupKind::Collapsed { .. } => out.push((
+                    ListHit::ExpandGroup(group.key.clone()),
+                    p.to_popover(gl.bounds),
+                )),
+                GroupKind::Expanded { cards, .. } => {
+                    for (ci, origin, layout) in cards {
+                        out.push((
+                            ListHit::Body {
+                                id: group.cards[*ci].id,
+                                has_default: group.cards[*ci].has_default_action,
+                            },
+                            Rectangle::new(*origin + shift, layout.size),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the keyboard can hold this control. The pointer reaches a card's close ×, its
+    /// caret and its action pills; the keyboard does not (see [`stops`](Self::stops)), so a click
+    /// on one of those leaves the focus on the card itself.
+    fn is_focusable(&self, hit: &ListHit) -> bool {
+        matches!(
+            hit,
+            ListHit::Clear | ListHit::Body { .. } | ListHit::ExpandGroup(_) | ListHit::MediaBody(_)
+        )
+    }
+
+    /// Put the keyboard focus on `hit` (or clear it). Returns whether it changed.
+    ///
+    /// No revision bump: the ring is composited as its own element rather than baked into the
+    /// card, so moving the focus must not invalidate the list's content texture — that would
+    /// re-bake every visible card on each arrow press.
+    fn set_focus(&mut self, hit: Option<ListHit>) -> bool {
+        let changed = self.focused != hit;
+        self.focused = hit;
+        changed
+    }
+
+    /// The focused stop's rect, if it is still in the list.
+    fn focus_rect(&self, height: f64) -> Option<Rectangle<f64, Logical>> {
+        let focused = self.focused.as_ref()?;
+        self.stops(height)
+            .into_iter()
+            .find(|(hit, _)| hit == focused)
+            .map(|(_, rect)| rect)
+    }
+
+    /// The rect a focus ring should be drawn at: the focused control, clipped to the scroll
+    /// viewport so a card taller than the list cannot ring outside it. `None` when nothing in the
+    /// list is focused, or when the focused control is scrolled entirely away.
+    fn focus_ring_rect(&self, height: f64) -> Option<(Rectangle<f64, Logical>, f64)> {
+        let rect = self.focus_rect(height)?;
+        match self.focused {
+            // The Clear pill lives outside the viewport, in the fixed controls row, and is a pill
+            // rather than a card.
+            Some(ListHit::Clear) => Some((rect, CLEAR_H / 2.)),
+            _ => rect
+                .intersection(self.placed(height).viewport)
+                .map(|r| (r, CARD_RADIUS)),
+        }
+    }
+
+    /// Scroll the least that brings the focused card fully into the viewport — focus that lands
+    /// off-screen is focus the user cannot see. Returns whether the list moved.
+    fn scroll_focus_into_view(&mut self, height: f64) -> bool {
+        // Clear sits in the fixed controls row, below the viewport, and never scrolls.
+        if matches!(self.focused, None | Some(ListHit::Clear)) {
+            return false;
+        }
+        let Some(rect) = self.focus_rect(height) else {
+            return false;
+        };
+        let viewport = self.placed(height).viewport;
+        let (top, bottom) = (rect.loc.y, rect.loc.y + rect.size.h);
+        let (vtop, vbottom) = (viewport.loc.y, viewport.loc.y + viewport.size.h);
+        let delta = if top < vtop {
+            top - vtop
+        } else if bottom > vbottom {
+            // A card taller than the viewport aligns its top rather than chasing its bottom.
+            (bottom - vbottom).min(top - vtop)
+        } else {
+            return false;
+        };
+        self.scroll_by(delta, height)
     }
 
     /// Hit-test a click at popover-local `pos` inside the list column.
@@ -2661,6 +2789,8 @@ pub struct DateMenu {
     /// The events card is an `St.Button` (`%card:hover` + click launches the
     /// calendar app); tracks its hover wash and revision bit.
     events_button: widget::CardButton,
+    /// The focus ring drawn over a focused notification card, baked once per size.
+    focus_ring_cache: RefCell<widget::BakeCache>,
     /// The keyboard-focused control. The calendar column's half is mirrored into the calendar
     /// itself, which paints its own ring; this stays the single writer.
     focused: Option<DateStop>,
@@ -2712,17 +2842,15 @@ fn world_clocks_action() -> PopoverAction {
 /// for the calendar column, `:829` for Clear) — there is no bespoke key handling in `calendar.js`
 /// at all beyond Escape, so the arrows moving a day sideways and a week vertically is the grid's
 /// geometry, not date arithmetic.
-///
-/// **Not yet stops:** the notification cards and their close / expand / action buttons. They live
-/// in a scrolling list, so reaching them by keyboard owes a scroll-into-view the list does not
-/// have yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DateStop {
     /// A zone of the calendar column: the today card, a month arrow, or a day cell.
     Cal(CalHover),
     Events,
     WorldClocks,
-    Clear,
+    /// A control in the notification list, named by what activating it does. Clear is one of
+    /// these.
+    List(ListHit),
 }
 
 impl DateMenu {
@@ -2739,6 +2867,7 @@ impl DateMenu {
             events: EventsSectionModel::default(),
             events_rev: 0,
             events_button: widget::CardButton::default(),
+            focus_ring_cache: RefCell::new(widget::BakeCache::new()),
             focused: None,
             events_cache: RefCell::new(TextureCache {
                 context: None,
@@ -2966,42 +3095,53 @@ impl DateMenu {
         self.list.note_art_decoded(source)
     }
 
+    /// What a list control does, however it was reached — a click, or Enter on the keyboard focus.
+    fn list_action(&mut self, hit: ListHit) -> PopoverAction {
+        match hit {
+            ListHit::Close(id) => PopoverAction::CloseNotification(id),
+            ListHit::ToggleExpand(id) => {
+                // Pure UI state: expand/collapse the body in place.
+                self.list.toggle_body_expanded(id);
+                PopoverAction::Consumed
+            }
+            ListHit::Action { id, key } => PopoverAction::InvokeNotificationAction { id, key },
+            ListHit::Body { id, has_default } => {
+                PopoverAction::ActivateNotification { id, has_default }
+            }
+            ListHit::ExpandGroup(key) => {
+                // Fan the stack open (pure UI state, popover stays).
+                self.list.toggle_group(key);
+                PopoverAction::Consumed
+            }
+            ListHit::CollapseGroup => {
+                self.list.collapse_group();
+                PopoverAction::Consumed
+            }
+            ListHit::CloseGroup(ids) => PopoverAction::CloseNotificationGroup(ids),
+            ListHit::Clear => PopoverAction::ClearNotifications,
+            ListHit::MediaControl { bus_name, control } => {
+                PopoverAction::MediaControl { bus_name, control }
+            }
+            ListHit::MediaBody(bus_name) => PopoverAction::RaiseMediaPlayer(bus_name),
+        }
+    }
+
     /// Route a click at content-local `pos`: list hits map to notification
     /// actions; everything else goes to the calendar (all consumed — the
     /// popover stays open, like gnome-shell's grab).
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
         let size = self.logical_size();
         if pos.x < calendar_col_x() {
-            return match self.list.hit(pos, size.h) {
-                Some(ListHit::Close(id)) => PopoverAction::CloseNotification(id),
-                Some(ListHit::ToggleExpand(id)) => {
-                    // Pure UI state: expand/collapse the body in place.
-                    self.list.toggle_body_expanded(id);
-                    PopoverAction::Consumed
-                }
-                Some(ListHit::Action { id, key }) => {
-                    PopoverAction::InvokeNotificationAction { id, key }
-                }
-                Some(ListHit::Body { id, has_default }) => {
-                    PopoverAction::ActivateNotification { id, has_default }
-                }
-                Some(ListHit::ExpandGroup(key)) => {
-                    // Fan the stack open (pure UI state, popover stays).
-                    self.list.toggle_group(key);
-                    PopoverAction::Consumed
-                }
-                Some(ListHit::CollapseGroup) => {
-                    self.list.collapse_group();
-                    PopoverAction::Consumed
-                }
-                Some(ListHit::CloseGroup(ids)) => PopoverAction::CloseNotificationGroup(ids),
-                Some(ListHit::Clear) => PopoverAction::ClearNotifications,
-                Some(ListHit::MediaControl { bus_name, control }) => {
-                    PopoverAction::MediaControl { bus_name, control }
-                }
-                Some(ListHit::MediaBody(bus_name)) => PopoverAction::RaiseMediaPlayer(bus_name),
-                None => PopoverAction::Consumed,
+            let Some(hit) = self.list.hit(pos, size.h) else {
+                return PopoverAction::Consumed;
             };
+            // A click takes the keyboard focus with it — but only to something the keyboard can
+            // hold: a card's close × or an action pill is pointer-only, and clicking one leaves
+            // the focus on the card it belongs to.
+            if self.list.is_focusable(&hit) {
+                self.set_focus(Some(DateStop::List(hit.clone())));
+            }
+            return self.list_action(hit);
         }
         // A click anywhere on the Events card launches the calendar app and closes
         // the popover (`EventsSection.vfunc_clicked`, `dateMenu.js:300-310`).
@@ -3029,10 +3169,12 @@ impl DateMenu {
     /// Every focus stop with its popover-local rect, in visual order. The calendar column's
     /// zones come from the calendar itself, shifted into popover coordinates.
     fn stops(&self) -> Vec<(DateStop, Rectangle<f64, Logical>)> {
-        let mut out = Vec::new();
-        if let Some(clear) = self.clear_pill_rect() {
-            out.push((DateStop::Clear, clear));
-        }
+        let mut out: Vec<(DateStop, Rectangle<f64, Logical>)> = self
+            .list
+            .stops(self.logical_size().h)
+            .into_iter()
+            .map(|(hit, rect)| (DateStop::List(hit), rect))
+            .collect();
         let shift = Point::from((calendar_col_x(), 0.));
         out.extend(self.calendar.zones().into_iter().map(|(zone, mut rect)| {
             rect.loc += shift;
@@ -3053,13 +3195,12 @@ impl DateMenu {
         out
     }
 
-    /// Put the focus on `stop`, pushing the calendar column's half down into the calendar so it
-    /// can ring the right zone. Returns whether anything changed.
+    /// Put the focus on `stop`, pushing each column's half down into the widget that paints it.
+    /// Returns whether anything changed.
     fn set_focus(&mut self, stop: Option<DateStop>) -> bool {
         let mut changed = self.focused != stop;
-        self.focused = stop;
-        changed |= self.calendar.set_focus(match stop {
-            Some(DateStop::Cal(zone)) => Some(zone),
+        changed |= self.calendar.set_focus(match &stop {
+            Some(DateStop::Cal(zone)) => Some(*zone),
             _ => None,
         });
         changed |= self
@@ -3068,34 +3209,54 @@ impl DateMenu {
         changed |= self
             .world_clocks_button
             .set_focused(stop == Some(DateStop::WorldClocks));
+        changed |= self.list.set_focus(match &stop {
+            Some(DateStop::List(hit)) => Some(hit.clone()),
+            _ => None,
+        });
+        self.focused = stop;
         changed
     }
 
     /// Take one keyboard navigation step.
     pub fn nav(&mut self, dir: Dir) -> bool {
         let stops = self.stops();
-        let focused = self.focused.filter(|f| stops.iter().any(|(s, _)| s == f));
+        let focused = self.live_focus(&stops);
         let rects: Vec<_> = stops.iter().map(|(_, r)| *r).collect();
-        let from = focused.and_then(|f| stops.iter().position(|(s, _)| *s == f));
+        let from = focused
+            .as_ref()
+            .and_then(|f| stops.iter().position(|(s, _)| s == f));
         let group = Rectangle::from_size(self.logical_size());
         let Some(next) = widget::step_rects(&rects, group, from, dir) else {
             return false;
         };
-        self.set_focus(Some(stops[next].0));
+        self.set_focus(Some(stops[next].0.clone()));
+        // A card the focus stepped onto may be scrolled out; the list follows it.
+        self.list.scroll_focus_into_view(self.logical_size().h);
         true
+    }
+
+    /// The focus, dropped if the control it named has left the menu — a notification can be
+    /// closed or expire while its card is focused.
+    fn live_focus(&self, stops: &[(DateStop, Rectangle<f64, Logical>)]) -> Option<DateStop> {
+        let focused = self.focused.as_ref()?;
+        stops
+            .iter()
+            .any(|(s, _)| s == focused)
+            .then(|| focused.clone())
     }
 
     /// Focus the first control — what a menu opened by keybinding owes.
     pub fn focus_first(&mut self) {
-        if let Some((stop, _)) = self.stops().first().copied() {
+        if let Some(stop) = self.stops().first().map(|(s, _)| s.clone()) {
             self.set_focus(Some(stop));
+            self.list.scroll_focus_into_view(self.logical_size().h);
         }
     }
 
     /// Activate the keyboard-focused control (Enter/Space).
     pub fn activate_focused(&mut self) -> PopoverAction {
         let stops = self.stops();
-        let Some(stop) = self.focused.filter(|f| stops.iter().any(|(s, _)| s == f)) else {
+        let Some(stop) = self.live_focus(&stops) else {
             return PopoverAction::Consumed;
         };
         match stop {
@@ -3105,7 +3266,7 @@ impl DateMenu {
             }
             DateStop::Events => events_action(),
             DateStop::WorldClocks => world_clocks_action(),
-            DateStop::Clear => PopoverAction::ClearNotifications,
+            DateStop::List(hit) => self.list_action(hit),
         }
     }
 
@@ -3113,9 +3274,7 @@ impl DateMenu {
     #[cfg(test)]
     pub fn focused_for_test(&self) -> Option<String> {
         let stops = self.stops();
-        self.focused
-            .filter(|f| stops.iter().any(|(s, _)| s == f))
-            .map(|s| format!("{s:?}"))
+        self.live_focus(&stops).map(|s| format!("{s:?}"))
     }
 
     /// The (year, month) the calendar is displaying. Test-only.
@@ -3639,6 +3798,33 @@ impl DateMenu {
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let mut elements = Vec::new();
         let size = self.logical_size();
+
+        // The keyboard focus ring over a focused list control, FIRST so it lands topmost — the
+        // cards below are cached textures of their own, and threading a focus flag through their
+        // bake would re-render a card's whole content on every arrow press.
+        if let Some((rect, radius)) = self.list.focus_ring_rect(size.h) {
+            let accent = self.calendar.accent();
+            let revision = widget::Revision::new().color(accent).px(radius).done();
+            match widget::bake_focus_ring(
+                renderer,
+                &mut self.focus_ring_cache.borrow_mut(),
+                scale,
+                revision,
+                rect.size,
+                radius,
+                accent,
+            ) {
+                Ok(buffer) => elements.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin + rect.loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )),
+                Err(err) => tracing::warn!("error baking the list focus ring: {err:#}"),
+            }
+        }
 
         // The message-list cards, or the placeholder icon when empty.
         if self.list.is_empty() {
@@ -4592,6 +4778,78 @@ run it with --features reference-env, as the fedora CI job does"
             !dm.set_notifications(vec![single_group(sample_card(1))]),
             "an identical snapshot must not invalidate the cards"
         );
+    }
+
+    /// A notification is **one** focus stop. `Message extends St.Button` with `can_focus: true`
+    /// (`messageList.js:445-451`), and a `can_focus` container takes a single slot on the focus
+    /// chain as a whole (`st-widget.c:2195-2199`); its close ×, caret and action pills set no
+    /// `can_focus` at all, so the keyboard never reaches them — only the pointer does.
+    #[test]
+    fn a_notification_is_one_focus_stop_and_its_buttons_are_pointer_only() {
+        let list = CalendarMessageList::new(vec![single_group(sample_card(1))]);
+        let h = 346.;
+
+        let stops = list.stops(h);
+        assert_eq!(
+            stops.len(),
+            2,
+            "one card and the Clear pill, and nothing else: {stops:?}"
+        );
+        assert!(stops
+            .iter()
+            .any(|(hit, _)| matches!(hit, ListHit::Body { id: 1, .. })));
+        assert!(stops.iter().any(|(hit, _)| *hit == ListHit::Clear));
+
+        // The pointer still reaches the close × — it is a hit, just not a stop.
+        assert!(!list.is_focusable(&ListHit::Close(1)));
+        assert!(!list.is_focusable(&ListHit::ToggleExpand(1)));
+        assert!(list.is_focusable(&ListHit::Body {
+            id: 1,
+            has_default: false
+        }));
+    }
+
+    /// Focus that lands off-screen is focus the user cannot see: stepping onto a card below the
+    /// fold scrolls the list the least that brings it fully into view.
+    #[test]
+    fn keyboard_focus_scrolls_the_notification_list() {
+        let groups: Vec<_> = (1..=10).map(|i| single_group(sample_card(i))).collect();
+        let mut list = CalendarMessageList::new(groups);
+        let h = 346.;
+        assert!(list.placed(h).overflowing(), "10 cards overflow");
+
+        // A card that is NOT visible at rest is still a stop — the focus is what scrolls to it.
+        let visible: Vec<u32> = list
+            .visible_interactive_cards(h)
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        let hidden = (1..=10u32)
+            .find(|id| !visible.contains(id))
+            .expect("some card is below the fold");
+        assert!(list
+            .stops(h)
+            .iter()
+            .any(|(hit, _)| matches!(hit, ListHit::Body { id, .. } if *id == hidden)));
+
+        list.set_focus(Some(ListHit::Body {
+            id: hidden,
+            has_default: false,
+        }));
+        assert!(
+            list.scroll_focus_into_view(h),
+            "the list must follow the focus"
+        );
+
+        let rect = list.focus_rect(h).expect("the focused card has a rect");
+        let viewport = list.placed(h).viewport;
+        assert!(
+            rect.loc.y >= viewport.loc.y - 0.01
+                && rect.loc.y + rect.size.h <= viewport.loc.y + viewport.size.h + 0.01,
+            "the focused card must be fully in view, got {rect:?} in {viewport:?}"
+        );
+        // Already in view: nothing more to do.
+        assert!(!list.scroll_focus_into_view(h));
     }
 
     #[test]
