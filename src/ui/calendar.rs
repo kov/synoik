@@ -73,7 +73,7 @@ use crate::ui::media_card;
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
 use crate::ui::theme_node::{Edges, ThemeNode};
-use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
+use crate::ui::widget::{self, Align, Dir, Painter, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px. Derived from `_calendar.scss` and pinned against a mapped actor dump of
@@ -243,6 +243,9 @@ pub struct Calendar {
     accent: [f32; 4],
     /// The region the pointer is hovering, highlighted in `draw`.
     hovered: Option<CalHover>,
+    /// The keyboard-focused zone, written by the [`DateMenu`] that owns the whole chain. Separate
+    /// from hover, and drawn as a ring rather than a wash.
+    focused: Option<CalHover>,
     /// Bumped on any content change to invalidate the rendered texture.
     revision: u64,
     cache: RefCell<TextureCache>,
@@ -289,6 +292,7 @@ impl Calendar {
                 1.,
             ],
             hovered: None,
+            focused: None,
             revision: 0,
             cache: RefCell::new(TextureCache {
                 context: None,
@@ -342,34 +346,89 @@ impl Calendar {
     /// hit something (so the caller keeps the popover open on any interior click).
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> bool {
         let layout = Layout::new(self.show_week_numbers);
-        // The today card: snap the selection back to today (matching gnome-shell's TodayButton).
-        // Unlike gnome-shell, paging keeps the selection put (`shift_month`), so `selected` can
-        // still be today while a different month is displayed — return-to-today must also snap the
-        // *view* back, so we act whenever the selection OR the displayed month is off today.
-        if layout.today_button().contains(pos) {
-            let showing_today = self.year == self.today.year && self.month == self.today.month;
-            if self.selected != self.today || !showing_today {
-                self.select(self.today);
+        for (zone, rect) in self.zones() {
+            if !rect.contains(pos) {
+                continue;
             }
+            // A click takes the keyboard focus with it, so the arrows carry on from the day that
+            // was clicked.
+            self.set_focus(Some(zone));
+            self.activate_zone(zone);
             return true;
-        }
-        if layout.prev_arrow().contains(pos) {
-            self.shift_month(-1);
-            return true;
-        }
-        if layout.next_arrow().contains(pos) {
-            self.shift_month(1);
-            return true;
-        }
-        let grid = self.grid();
-        for (i, cell) in grid.iter().enumerate() {
-            if layout.cell(i / GRID_COLS, i % GRID_COLS).contains(pos) {
-                self.select(*cell);
-                return true;
-            }
         }
         // A click inside the box background is still "handled" (keeps it open).
         layout.bounds().contains(pos)
+    }
+
+    /// The accent, for a focus ring painted by whoever owns the surrounding chrome.
+    pub fn accent(&self) -> [f32; 4] {
+        self.accent
+    }
+
+    /// Every zone the keyboard can land on, in visual order: the today card, the month-nav
+    /// arrows, then the day cells row by row. gnome-shell makes each of these a `can_focus`
+    /// widget (`calendar.js:506-544,676`) and lets `StFocusManager` navigate between them, which
+    /// is why arrows over the grid move a day sideways and a week vertically without any
+    /// date arithmetic here: it falls out of the cells' geometry.
+    fn zones(&self) -> Vec<(CalHover, Rectangle<f64, Logical>)> {
+        let layout = Layout::new(self.show_week_numbers);
+        let mut out = vec![
+            (CalHover::Today, layout.today_button()),
+            (CalHover::Prev, layout.prev_arrow()),
+            (CalHover::Next, layout.next_arrow()),
+        ];
+        out.extend(
+            (0..GRID_ROWS * GRID_COLS)
+                .map(|i| (CalHover::Cell(i), layout.cell(i / GRID_COLS, i % GRID_COLS))),
+        );
+        out
+    }
+
+    /// The (year, month) on display. Test-only.
+    #[cfg(test)]
+    pub fn shown_month(&self) -> (i32, u32) {
+        (self.year, self.month)
+    }
+
+    /// The zone a calendar-local position falls in.
+    fn zone_at(&self, pos: Point<f64, Logical>) -> Option<CalHover> {
+        self.zones()
+            .into_iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(zone, _)| zone)
+    }
+
+    /// Put the keyboard focus on `zone` (or clear it). Returns whether it changed.
+    fn set_focus(&mut self, zone: Option<CalHover>) -> bool {
+        if self.focused == zone {
+            return false;
+        }
+        self.focused = zone;
+        self.revision += 1;
+        true
+    }
+
+    /// Run a zone — what a click on it does, reached by Enter instead.
+    fn activate_zone(&mut self, zone: CalHover) {
+        match zone {
+            // The today card snaps the selection back to today (gnome-shell's `TodayButton`).
+            // Unlike gnome-shell, paging keeps the selection put (`shift_month`), so `selected`
+            // can still be today while a different month is displayed — returning to today must
+            // also snap the *view* back, so it acts whenever the selection OR the displayed month
+            // is off today.
+            CalHover::Today => {
+                let showing_today = self.year == self.today.year && self.month == self.today.month;
+                if self.selected != self.today || !showing_today {
+                    self.select(self.today);
+                }
+            }
+            CalHover::Prev => self.shift_month(-1),
+            CalHover::Next => self.shift_month(1),
+            CalHover::Cell(i) => {
+                let cell = self.grid()[i];
+                self.select(cell);
+            }
+        }
     }
 
     /// Update the hovered region from a calendar-local position (`None` clears
@@ -721,6 +780,9 @@ impl Calendar {
             if self.hovered == Some(CalHover::Today) {
                 p.fill_rounded(card, TODAY_RADIUS, HOVER_WASH)?;
             }
+            if self.focused == Some(CalHover::Today) {
+                p.focus_ring(card, TODAY_RADIUS, self.accent)?;
+            }
             // Inside the card's own border+padding, via `content_box` — so the labels follow the
             // reserved border rather than being placed at a hand-added inset.
             let today_content = today_card_node().content_box(card);
@@ -748,10 +810,16 @@ impl Calendar {
             if self.hovered == Some(CalHover::Prev) {
                 p.fill_rounded(disc_at(prev_c), DISC_DIAM / 2., HOVER_WASH)?;
             }
+            if self.focused == Some(CalHover::Prev) {
+                p.focus_ring(disc_at(prev_c), DISC_DIAM / 2., self.accent)?;
+            }
             p.text(&prev_run, prev_c, Align::CENTER, MUTED)?;
             let next_c = lc(layout.next_arrow());
             if self.hovered == Some(CalHover::Next) {
                 p.fill_rounded(disc_at(next_c), DISC_DIAM / 2., HOVER_WASH)?;
+            }
+            if self.focused == Some(CalHover::Next) {
+                p.focus_ring(disc_at(next_c), DISC_DIAM / 2., self.accent)?;
             }
             p.text(&next_run, next_c, Align::CENTER, MUTED)?;
             p.text(
@@ -810,6 +878,15 @@ impl Calendar {
                     if is_hovered {
                         p.fill_rounded(disc, DISC_DIAM / 2., HOVER_WASH)?;
                     }
+                }
+                // The focus ring rides the day's disc. Today's disc is accent-filled, so its ring
+                // takes `$accent_borders_color` for the same reason a checked quick toggle does.
+                if self.focused == Some(CalHover::Cell(i)) {
+                    let base = match is_today {
+                        true => widget::style::accent_borders(self.accent),
+                        false => self.accent,
+                    };
+                    p.focus_ring(disc_at(c), DISC_DIAM / 2., base)?;
                 }
                 // Color (gnome-shell `_calendar.scss:73-99`): today draws white on its accent
                 // disc; other-month days are dimmed (`.calendar-other-month`); in-month WEEKEND
@@ -2584,6 +2661,9 @@ pub struct DateMenu {
     /// The events card is an `St.Button` (`%card:hover` + click launches the
     /// calendar app); tracks its hover wash and revision bit.
     events_button: widget::CardButton,
+    /// The keyboard-focused control. The calendar column's half is mirrored into the calendar
+    /// itself, which paints its own ring; this stays the single writer.
+    focused: Option<DateStop>,
     /// The events-card texture, cached per scale.
     events_cache: RefCell<TextureCache>,
     /// The World Clocks section model (header + rows), formatted by the compositor
@@ -2606,6 +2686,45 @@ fn calendar_col_x() -> f64 {
     LIST_PAD + list_box_w() + column_gap()
 }
 
+/// The Events card's action: launch the calendar app and close the popover
+/// (`EventsSection.vfunc_clicked`, `dateMenu.js:300-310`).
+///
+/// **Divergence:** GNOME launches the default `text/calendar` handler resolved via the app system;
+/// lacking one, we launch GNOME Calendar (as world-clocks launches GNOME Clocks) and treat "has
+/// calendars" as implying it exists.
+fn events_action() -> PopoverAction {
+    PopoverAction::Spawn(vec![
+        "gtk-launch".to_string(),
+        "org.gnome.Calendar".to_string(),
+    ])
+}
+
+/// The World Clocks card's action (`WorldClocksSection.vfunc_clicked`, `dateMenu.js:376-382`).
+fn world_clocks_action() -> PopoverAction {
+    PopoverAction::Spawn(vec![
+        "gtk-launch".to_string(),
+        "org.gnome.clocks".to_string(),
+    ])
+}
+
+/// One keyboard focus stop in the date menu. gnome-shell makes every one of these a `can_focus`
+/// widget and lets `StFocusManager` navigate between them geometrically (`calendar.js:506-544,676`
+/// for the calendar column, `:829` for Clear) — there is no bespoke key handling in `calendar.js`
+/// at all beyond Escape, so the arrows moving a day sideways and a week vertically is the grid's
+/// geometry, not date arithmetic.
+///
+/// **Not yet stops:** the notification cards and their close / expand / action buttons. They live
+/// in a scrolling list, so reaching them by keyboard owes a scroll-into-view the list does not
+/// have yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateStop {
+    /// A zone of the calendar column: the today card, a month arrow, or a day cell.
+    Cal(CalHover),
+    Events,
+    WorldClocks,
+    Clear,
+}
+
 impl DateMenu {
     pub fn new(
         week_start: u8,
@@ -2620,6 +2739,7 @@ impl DateMenu {
             events: EventsSectionModel::default(),
             events_rev: 0,
             events_button: widget::CardButton::default(),
+            focused: None,
             events_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -2889,22 +3009,119 @@ impl DateMenu {
         // via the app system; lacking one, we launch GNOME Calendar (as world-clocks
         // launches GNOME Clocks) and treat "has calendars" as implying it exists.
         if self.events_rect().is_some_and(|r| r.contains(pos)) {
-            return PopoverAction::Spawn(vec![
-                "gtk-launch".to_string(),
-                "org.gnome.Calendar".to_string(),
-            ]);
+            self.set_focus(Some(DateStop::Events));
+            return events_action();
         }
         // A click anywhere on the World Clocks card launches GNOME Clocks and closes
         // the popover (`WorldClocksSection.vfunc_clicked`, `dateMenu.js:376-382`).
         if self.world_clocks_rect().is_some_and(|r| r.contains(pos)) {
-            return PopoverAction::Spawn(vec![
-                "gtk-launch".to_string(),
-                "org.gnome.clocks".to_string(),
-            ]);
+            self.set_focus(Some(DateStop::WorldClocks));
+            return world_clocks_action();
         }
-        self.calendar
-            .pointer_click(pos - Point::from((calendar_col_x(), 0.)));
+        let local = pos - Point::from((calendar_col_x(), 0.));
+        if let Some(zone) = self.calendar.zone_at(local) {
+            self.set_focus(Some(DateStop::Cal(zone)));
+        }
+        self.calendar.pointer_click(local);
         PopoverAction::Consumed
+    }
+
+    /// Every focus stop with its popover-local rect, in visual order. The calendar column's
+    /// zones come from the calendar itself, shifted into popover coordinates.
+    fn stops(&self) -> Vec<(DateStop, Rectangle<f64, Logical>)> {
+        let mut out = Vec::new();
+        if let Some(clear) = self.clear_pill_rect() {
+            out.push((DateStop::Clear, clear));
+        }
+        let shift = Point::from((calendar_col_x(), 0.));
+        out.extend(self.calendar.zones().into_iter().map(|(zone, mut rect)| {
+            rect.loc += shift;
+            (DateStop::Cal(zone), rect)
+        }));
+        if let Some(rect) = self.events_rect() {
+            out.push((DateStop::Events, rect));
+        }
+        if let Some(rect) = self.world_clocks_rect() {
+            out.push((DateStop::WorldClocks, rect));
+        }
+        out.sort_by(|(_, a), (_, b)| {
+            a.loc
+                .y
+                .total_cmp(&b.loc.y)
+                .then(a.loc.x.total_cmp(&b.loc.x))
+        });
+        out
+    }
+
+    /// Put the focus on `stop`, pushing the calendar column's half down into the calendar so it
+    /// can ring the right zone. Returns whether anything changed.
+    fn set_focus(&mut self, stop: Option<DateStop>) -> bool {
+        let mut changed = self.focused != stop;
+        self.focused = stop;
+        changed |= self.calendar.set_focus(match stop {
+            Some(DateStop::Cal(zone)) => Some(zone),
+            _ => None,
+        });
+        changed |= self
+            .events_button
+            .set_focused(stop == Some(DateStop::Events));
+        changed |= self
+            .world_clocks_button
+            .set_focused(stop == Some(DateStop::WorldClocks));
+        changed
+    }
+
+    /// Take one keyboard navigation step.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        let stops = self.stops();
+        let focused = self.focused.filter(|f| stops.iter().any(|(s, _)| s == f));
+        let rects: Vec<_> = stops.iter().map(|(_, r)| *r).collect();
+        let from = focused.and_then(|f| stops.iter().position(|(s, _)| *s == f));
+        let group = Rectangle::from_size(self.logical_size());
+        let Some(next) = widget::step_rects(&rects, group, from, dir) else {
+            return false;
+        };
+        self.set_focus(Some(stops[next].0));
+        true
+    }
+
+    /// Focus the first control — what a menu opened by keybinding owes.
+    pub fn focus_first(&mut self) {
+        if let Some((stop, _)) = self.stops().first().copied() {
+            self.set_focus(Some(stop));
+        }
+    }
+
+    /// Activate the keyboard-focused control (Enter/Space).
+    pub fn activate_focused(&mut self) -> PopoverAction {
+        let stops = self.stops();
+        let Some(stop) = self.focused.filter(|f| stops.iter().any(|(s, _)| s == f)) else {
+            return PopoverAction::Consumed;
+        };
+        match stop {
+            DateStop::Cal(zone) => {
+                self.calendar.activate_zone(zone);
+                PopoverAction::Consumed
+            }
+            DateStop::Events => events_action(),
+            DateStop::WorldClocks => world_clocks_action(),
+            DateStop::Clear => PopoverAction::ClearNotifications,
+        }
+    }
+
+    /// The focused control, named for a conformance test.
+    #[cfg(test)]
+    pub fn focused_for_test(&self) -> Option<String> {
+        let stops = self.stops();
+        self.focused
+            .filter(|f| stops.iter().any(|(s, _)| s == f))
+            .map(|s| format!("{s:?}"))
+    }
+
+    /// The (year, month) the calendar is displaying. Test-only.
+    #[cfg(test)]
+    pub fn shown_month(&self) -> (i32, u32) {
+        self.calendar.shown_month()
     }
 
     /// Update the hovered element from a popover-local pointer position (`None`
@@ -3186,6 +3403,8 @@ impl DateMenu {
 
         let card_h = self.events_card_h();
         let hovered = self.events_button.hovered();
+        let focused = self.events_button.focused();
+        let accent = self.calendar.accent();
         widget::bake_uncached_sized(renderer, phys, move |frame| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(TRANSPARENT)?;
@@ -3198,6 +3417,7 @@ impl DateMenu {
             p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
+            widget::CardButton::paint_focus(&mut p, focused, card, EVENTS_CARD_RADIUS, accent)?;
 
             // Through `content_box`, so the text starts inside the border the card now
             // reserves (13 in, not 12) — the same 1px the height grew by.
@@ -3325,6 +3545,8 @@ impl DateMenu {
         let header_color = if self.world_clocks.empty { TEXT } else { MUTED };
         let card_h = self.world_clocks_card_h();
         let hovered = self.world_clocks_button.hovered();
+        let focused = self.world_clocks_button.focused();
+        let accent = self.calendar.accent();
         widget::bake_uncached_sized(renderer, phys, move |frame| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(TRANSPARENT)?;
@@ -3336,6 +3558,7 @@ impl DateMenu {
             p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
+            widget::CardButton::paint_focus(&mut p, focused, card, EVENTS_CARD_RADIUS, accent)?;
 
             // Through `content_box`, so the columns start inside the border the card now
             // reserves (see `display_card_node`).
@@ -3842,6 +4065,7 @@ mod tests {
             show_week_numbers: false,
             accent: [0., 0., 0., 1.],
             hovered: None,
+            focused: None,
             revision: 0,
             cache: RefCell::new(TextureCache {
                 context: None,
@@ -4016,6 +4240,56 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
+    /// The day grid needs no date arithmetic to navigate: gnome-shell makes each day a
+    /// `can_focus` button (`calendar.js:676`) and lets `StFocusManager` move between them
+    /// geometrically, so Right is the next column (a day) and Down the next row (a week) purely
+    /// because that is where the cells are.
+    #[test]
+    fn arrows_over_the_day_grid_move_a_day_sideways_and_a_week_down() {
+        let mut cal = Calendar::new(0, false, [0, 0, 0]);
+        let layout = Layout::new(false);
+
+        // Land on a cell in the middle of the grid by clicking it.
+        let start = 2 * GRID_COLS + 3;
+        let r = layout.cell(start / GRID_COLS, start % GRID_COLS);
+        assert!(cal.pointer_click(Point::from((
+            r.loc.x + r.size.w / 2.,
+            r.loc.y + r.size.h / 2.
+        ))));
+        assert_eq!(
+            cal.focused,
+            Some(CalHover::Cell(start)),
+            "the click focused the day it hit"
+        );
+
+        let step = |cal: &mut Calendar, dir: Dir| {
+            let zones = cal.zones();
+            let rects: Vec<_> = zones.iter().map(|(_, r)| *r).collect();
+            let from = zones.iter().position(|(z, _)| Some(*z) == cal.focused);
+            let group = Rectangle::from_size(cal.logical_size());
+            let next = widget::step_rects(&rects, group, from, dir).expect("a next zone");
+            cal.set_focus(Some(zones[next].0));
+        };
+
+        step(&mut cal, Dir::Right);
+        assert_eq!(cal.focused, Some(CalHover::Cell(start + 1)), "a day right");
+        step(&mut cal, Dir::Down);
+        assert_eq!(
+            cal.focused,
+            Some(CalHover::Cell(start + 1 + GRID_COLS)),
+            "a week down"
+        );
+        step(&mut cal, Dir::Left);
+        step(&mut cal, Dir::Up);
+        assert_eq!(cal.focused, Some(CalHover::Cell(start)), "and back again");
+
+        // Enter on a focused day selects it, exactly as clicking it would.
+        let before = cal.selected;
+        cal.activate_zone(CalHover::Cell(start + 1));
+        assert_ne!(cal.selected, before);
+        assert_eq!(cal.selected, cal.grid()[start + 1]);
+    }
+
     #[test]
     fn today_button_returns_to_today_only_when_off_today() {
         // A fresh calendar is already on today: clicking the card is a no-op (no revision bump).
@@ -4025,11 +4299,15 @@ run it with --features reference-env, as the fedora CI job does"
         let card = layout.today_button();
         let center = Point::from((card.loc.x + card.size.w / 2., card.loc.y + card.size.h / 2.));
         assert!(cal.pointer_click(center), "the card is a hit region");
+        assert_eq!(cal.selected, cal.today);
+        // The first click does bump the revision — it moved the keyboard focus onto the card, and
+        // the ring has to be drawn. A second click, with nothing left to change, must not.
+        let settled = cal.revision;
+        assert!(cal.pointer_click(center));
         assert_eq!(
-            cal.revision, 0,
+            cal.revision, settled,
             "clicking the card while on today's month changes nothing"
         );
-        assert_eq!(cal.selected, cal.today);
 
         // Page away WITHOUT selecting another day: `selected` stays today but the view shows a
         // different month (our divergence — paging keeps the selection). Clicking the card must

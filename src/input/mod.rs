@@ -5183,6 +5183,8 @@ impl State {
             Action::ToggleMessageTray => {
                 if let Some(output) = self.synoik.layout.active_output().cloned() {
                     self.toggle_date_menu(output);
+                    // Opened by keybinding, so it comes up focused (`panel.js:588-591`).
+                    self.synoik.panel_popover.focus_first();
                 }
             }
             Action::ToggleQuickSettings => {

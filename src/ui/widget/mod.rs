@@ -3347,11 +3347,23 @@ pub struct BarLevelStyle {
 #[derive(Default)]
 pub struct CardButton {
     hovered: bool,
+    focused: bool,
 }
 
 impl CardButton {
     pub fn hovered(&self) -> bool {
         self.hovered
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Set the keyboard-focus state; returns whether it changed.
+    pub fn set_focused(&mut self, focused: bool) -> bool {
+        let changed = self.focused != focused;
+        self.focused = focused;
+        changed
     }
 
     /// Set the hover state from whether the pointer is over the card; returns
@@ -3362,11 +3374,14 @@ impl CardButton {
         changed
     }
 
-    /// Pack a texture-cache revision: the content revision in the low 31 bits, the
-    /// hover bit at bit 31, and a physical clip-height key in the high 32 — so a
-    /// re-cap OR a hover toggle re-bakes with/without the wash (mirrors `bg_texture`).
+    /// Pack a texture-cache revision: the content revision in the low 30 bits, the focus bit at
+    /// 30, the hover bit at 31, and a physical clip-height key in the high 32 — so a re-cap OR a
+    /// hover OR a focus change re-bakes with/without its wash and ring (mirrors `bg_texture`).
     pub fn revision(&self, content_rev: u64, height_key: u64) -> u64 {
-        (content_rev & 0x7FFF_FFFF) | ((self.hovered as u64) << 31) | (height_key << 32)
+        (content_rev & 0x3FFF_FFFF)
+            | ((self.focused as u64) << 30)
+            | ((self.hovered as u64) << 31)
+            | (height_key << 32)
     }
 
     /// Paint the `%card:hover` lighten wash over the card when `hovered` — call
@@ -3380,6 +3395,21 @@ impl CardButton {
     ) -> anyhow::Result<()> {
         if hovered {
             painter.fill_rounded(card, radius, style::HOVER_WASH)?;
+        }
+        Ok(())
+    }
+
+    /// Paint the keyboard-focus ring over the card when `focused` — call right after
+    /// [`paint_hover`](Self::paint_hover). Takes the bool explicitly for the same reason.
+    pub fn paint_focus(
+        painter: &mut Painter,
+        focused: bool,
+        card: Rectangle<f64, Logical>,
+        radius: f64,
+        accent: Rgba,
+    ) -> anyhow::Result<()> {
+        if focused {
+            painter.focus_ring(card, radius, accent)?;
         }
         Ok(())
     }

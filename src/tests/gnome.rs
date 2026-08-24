@@ -3862,6 +3862,49 @@ fn super_a_toggles_the_app_grid() {
     );
 }
 
+/// `<Super>v` opens the date menu focused too, and Enter runs the focused control — here the
+/// month-forward arrow, which pages the calendar without closing the menu.
+#[test]
+fn super_v_focuses_the_date_menu_and_enter_runs_the_focused_control() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_V);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_DATE_MENU),
+    );
+
+    let month_before = f.synoik().panel_popover.date_menu_month();
+    // Walk to the month-forward arrow and page with Enter.
+    for _ in 0..40 {
+        if f.synoik().panel_popover.date_menu_focus() == Some("Cal(Next)".to_owned()) {
+            break;
+        }
+        f.key_press(KEY_TAB);
+        f.key_release(KEY_TAB);
+    }
+    assert_eq!(
+        f.synoik().panel_popover.date_menu_focus().as_deref(),
+        Some("Cal(Next)"),
+        "the month-forward arrow is in the focus chain"
+    );
+
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert_ne!(
+        f.synoik().panel_popover.date_menu_month(),
+        month_before,
+        "Enter on the arrow pages the calendar"
+    );
+    assert!(
+        f.synoik().panel_popover.grabs_input(),
+        "and paging does not close the menu"
+    );
+}
+
 /// `<Super>s` opens quick settings **with its first control focused**, so Enter acts without an
 /// arrow key first (`_toggleMenu` navigates the focus in right after the toggle,
 /// `panel.js:588-591`). Once in, the arrows move geometrically over the grid rather than down a

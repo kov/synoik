@@ -447,7 +447,10 @@ impl PopoverContent {
                 None
             }
             PopoverContent::QuickSettings(qs) => qs.nav(dir),
-            PopoverContent::Calendar(_) => None,
+            PopoverContent::Calendar(dm) => {
+                dm.nav(dir);
+                None
+            }
         }
     }
 
@@ -467,7 +470,7 @@ impl PopoverContent {
                 Activation { action, close }
             }
             PopoverContent::QuickSettings(qs) => Activation::new(qs.activate_focused()),
-            PopoverContent::Calendar(_) => Activation::new(PopoverAction::Consumed),
+            PopoverContent::Calendar(dm) => Activation::new(dm.activate_focused()),
         }
     }
 
@@ -1176,6 +1179,24 @@ impl PanelPopover {
         }
     }
 
+    /// The date menu's focused control, named by its `Debug` form. Test-only.
+    #[cfg(test)]
+    pub fn date_menu_focus(&self) -> Option<String> {
+        match self.content.as_ref()? {
+            PopoverContent::Calendar(dm) => dm.focused_for_test(),
+            _ => None,
+        }
+    }
+
+    /// The month the date menu's calendar is showing. Test-only.
+    #[cfg(test)]
+    pub fn date_menu_month(&self) -> Option<(i32, u32)> {
+        match self.content.as_ref()? {
+            PopoverContent::Calendar(dm) => Some(dm.shown_month()),
+            _ => None,
+        }
+    }
+
     /// The label of the keyboard-focused row of whatever menu is up, if it has one. Test-only —
     /// how the corpus names the focus without arithmetic over each menu's box model.
     #[cfg(test)]
@@ -1488,7 +1509,8 @@ impl PanelPopover {
             Some(PopoverContent::A11y(m)) => {
                 m.nav(widget::Dir::Down);
             }
-            Some(PopoverContent::Calendar(_)) | None => (),
+            Some(PopoverContent::Calendar(dm)) => dm.focus_first(),
+            None => (),
         }
     }
 
