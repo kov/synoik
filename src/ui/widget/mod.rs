@@ -139,6 +139,84 @@ pub fn step_rows(focused: Option<usize>, count: usize, delta: isize) -> Option<u
     })
 }
 
+/// Move the focus one step over a set of rects, reproducing `st_widget_navigate_focus`
+/// (`st-widget.c:2086-2169`) for a flat, untransformed focus chain — which is what every popover
+/// content is.
+///
+/// `group` is the box the chain lives in, needed for the entering-from-nowhere case: with no
+/// current focus, `StWidget` collapses the *group's* box onto the edge the direction comes from
+/// and sorts against that (`st-widget.c:2127-2150`), so Down enters at the top and Right at the
+/// left rather than at some arbitrary first child.
+///
+/// The arrows do **not** wrap: `StFocusManager` passes `wrap_around = FALSE` for them
+/// (`st-focus-manager.c:82-96`), so Down at the bottom of a grid stays put. Tab does wrap. A menu
+/// is the deliberate exception — its items re-navigate their own group with wrap on
+/// (`popupMenu.js:171-177`) — which is why [`Menu::focus_step`] wraps and this does not.
+pub fn step_rects(
+    rects: &[Rectangle<f64, Logical>],
+    group: Rectangle<f64, Logical>,
+    from: Option<usize>,
+    dir: Dir,
+) -> Option<usize> {
+    if rects.is_empty() {
+        return None;
+    }
+    if let Dir::TabForward | Dir::TabBackward = dir {
+        let delta = if dir == Dir::TabForward { 1 } else { -1 };
+        return step_rows(from, rects.len(), delta);
+    }
+
+    // The box to measure from: the focused rect, or the group collapsed onto the edge this
+    // direction enters from.
+    let src = match from {
+        Some(i) => *rects.get(i)?,
+        None => {
+            let (loc, size) = (group.loc, group.size);
+            let (loc, size) = match dir {
+                Dir::Down => (loc, Size::from((size.w, 0.))),
+                Dir::Up => (
+                    Point::from((loc.x, loc.y + size.h)),
+                    Size::from((size.w, 0.)),
+                ),
+                Dir::Right => (loc, Size::from((0., size.h))),
+                Dir::Left => (
+                    Point::from((loc.x + size.w, loc.y)),
+                    Size::from((0., size.h)),
+                ),
+                Dir::TabForward | Dir::TabBackward => unreachable!("handled above"),
+            };
+            Rectangle::new(loc, size)
+        }
+    };
+
+    // "an actor is down (etc.) from another actor even if it overlaps it by up to 0.1 pixels"
+    // (`filter_by_position`, `st-widget.c:1950-1975`).
+    const SLACK: f64 = 0.1;
+    let past = |r: &Rectangle<f64, Logical>| match dir {
+        Dir::Up => r.loc.y + r.size.h <= src.loc.y + SLACK,
+        Dir::Down => r.loc.y >= src.loc.y + src.size.h - SLACK,
+        Dir::Left => r.loc.x + r.size.w <= src.loc.x + SLACK,
+        Dir::Right => r.loc.x >= src.loc.x + src.size.w - SLACK,
+        Dir::TabForward | Dir::TabBackward => unreachable!("handled above"),
+    };
+    let mid = |r: &Rectangle<f64, Logical>| (r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.);
+    let (sx, sy) = mid(&src);
+    // Squared midpoint distance — `get_distance` (`st-widget.c:1999-2017`), "not the exact
+    // distance, but good enough to sort by".
+    rects
+        .iter()
+        .enumerate()
+        .filter(|&(i, r)| Some(i) != from && past(r))
+        .min_by(|&(_, a), &(_, b)| {
+            let d = |r: &Rectangle<f64, Logical>| {
+                let (x, y) = mid(r);
+                (x - sx) * (x - sx) + (y - sy) * (y - sy)
+            };
+            d(a).total_cmp(&d(b))
+        })
+        .map(|(i, _)| i)
+}
+
 impl Dir {
     /// The row delta this direction means to a **linear** list of rows: a menu treats Tab exactly
     /// as Down, which is what `StFocusManager` produces for a single-column focus chain.
@@ -3002,8 +3080,7 @@ impl Painter<'_, '_, '_> {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
         }
         if b.focused {
-            let ring_color = [accent[0], accent[1], accent[2], 0.8];
-            self.stroke_rounded(b.rect, radius, 2., ring_color)?;
+            self.focus_ring(b.rect, radius, accent)?;
         }
         Ok(())
     }
@@ -3819,6 +3896,23 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// The focus ring is GNOME's inset 2px accent stroke ([`stroke_rounded`](Self::stroke_rounded))
     /// on the button's own rect, drawn over the fill — faithful, and correct over a translucent
     /// [`ButtonStyle::Dialog`] fill with no masking.
+    /// The keyboard-focus ring: a 2px inset stroke in the accent at 80%
+    /// (`@include focus_ring()` → `box-shadow: inset 0 0 0 2px st-transparentize($accent, .2)`,
+    /// `_drawing.scss:56-66,309-311`).
+    ///
+    /// A verb rather than each caller's own stroke, because every focusable surface in the shell
+    /// owes the same ring — a button, a quick-settings tile, a slider — and a ring that differs
+    /// per surface reads as a different kind of focus.
+    pub fn focus_ring(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        radius: f64,
+        accent: Rgba,
+    ) -> anyhow::Result<()> {
+        let ring = [accent[0], accent[1], accent[2], 0.8];
+        self.stroke_rounded(rect, radius, 2., ring)
+    }
+
     pub fn button(&mut self, b: &Button, label: &ShapedText, accent: Rgba) -> anyhow::Result<()> {
         let radius = b.style.radius();
         self.fill_rounded(b.rect, radius, b.style.bg(accent))?;
@@ -4088,10 +4182,85 @@ mod tests {
     use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
 
     use super::{
-        bake_uncached_sized, ellipsized_line, tile_label_lines, Painter, Revision, TileMetrics,
-        TILE_LABEL_EXPAND_LINES, TILE_LABEL_LINES,
+        bake_uncached_sized, ellipsized_line, step_rects, tile_label_lines, Dir, Painter, Revision,
+        TileMetrics, TILE_LABEL_EXPAND_LINES, TILE_LABEL_LINES,
     };
     use crate::render_helpers::vulkan::VulkanRenderer;
+
+    /// A 2x2 grid of 40x20 cells with a full-width row beneath it — the shape of a quick-settings
+    /// menu in miniature.
+    fn grid_rects() -> Vec<Rectangle<f64, Logical>> {
+        let cell = |x: f64, y: f64, w: f64, h: f64| {
+            Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+        };
+        vec![
+            cell(0., 0., 40., 20.),   // 0: top-left
+            cell(50., 0., 40., 20.),  // 1: top-right
+            cell(0., 30., 40., 20.),  // 2: bottom-left
+            cell(50., 30., 40., 20.), // 3: bottom-right
+            cell(0., 60., 90., 20.),  // 4: the full-width row
+        ]
+    }
+
+    fn group() -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((0., 0.)), Size::from((90., 80.)))
+    }
+
+    /// Entering from nowhere measures against the **group's** edge, not against some first child:
+    /// Down enters at the top, Up at the bottom, Right at the left (`st-widget.c:2127-2150`).
+    #[test]
+    fn spatial_navigation_enters_from_the_edge_the_direction_comes_from() {
+        let r = grid_rects();
+        // Down from nowhere: the top row, and of it the one nearest the group's horizontal centre.
+        let first = step_rects(&r, group(), None, Dir::Down).unwrap();
+        assert!(
+            first == 0 || first == 1,
+            "Down enters at the top, got {first}"
+        );
+        assert_eq!(
+            step_rects(&r, group(), None, Dir::Up),
+            Some(4),
+            "Up enters at the bottom"
+        );
+    }
+
+    /// The arrows move geometrically and do **not** wrap; Tab walks the chain in order and does.
+    #[test]
+    fn arrows_step_geometrically_and_only_tab_wraps() {
+        let r = grid_rects();
+        let g = group();
+        assert_eq!(step_rects(&r, g, Some(0), Dir::Right), Some(1));
+        assert_eq!(step_rects(&r, g, Some(0), Dir::Down), Some(2));
+        assert_eq!(step_rects(&r, g, Some(1), Dir::Left), Some(0));
+        assert_eq!(step_rects(&r, g, Some(2), Dir::Down), Some(4));
+
+        assert_eq!(
+            step_rects(&r, g, Some(4), Dir::Down),
+            None,
+            "Down at the bottom stays put — StFocusManager passes wrap_around = FALSE for arrows"
+        );
+        assert_eq!(step_rects(&r, g, Some(0), Dir::Up), None);
+        assert_eq!(step_rects(&r, g, Some(0), Dir::Left), None);
+
+        assert_eq!(
+            step_rects(&r, g, Some(4), Dir::TabForward),
+            Some(0),
+            "Tab wraps"
+        );
+        assert_eq!(step_rects(&r, g, Some(0), Dir::TabBackward), Some(4));
+    }
+
+    /// A candidate that merely overlaps the source is not "past" it: the filter wants the whole
+    /// box beyond the source's edge, give or take 0.1px (`st-widget.c:1950-1975`).
+    #[test]
+    fn a_merely_overlapping_rect_is_not_in_that_direction() {
+        let r = vec![
+            Rectangle::new(Point::from((0., 0.)), Size::from((40., 20.))),
+            // Starts inside the first row's band: not "below" it.
+            Rectangle::new(Point::from((0., 10.)), Size::from((40., 20.))),
+        ];
+        assert_eq!(step_rects(&r, group(), Some(0), Dir::Down), None);
+    }
 
     /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so its **width**
     /// follows the *content height* — icon + spacing + one caption line
