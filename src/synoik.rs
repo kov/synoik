@@ -922,6 +922,12 @@ pub struct Synoik {
     /// [`crate::input::keyboard_window_grab`].
     pub keyboard_window_grab: Option<KeyboardWindowGrab>,
     pub grab_repeat_timer: Option<RegistrationToken>,
+    /// The key held down over one of the compositor's own surfaces — a shell text entry or the
+    /// panel popover — and the timer re-delivering it. Wayland hands a compositor one press per
+    /// physical key and leaves repeats to the client; nothing behind these surfaces is a client,
+    /// so the repeat has to be ours. See [`crate::input::RepeatKey`].
+    pub key_repeat: Option<(Keycode, crate::input::RepeatKey)>,
+    pub key_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -8057,6 +8063,8 @@ impl Synoik {
             bind_repeat_timer: Option::default(),
             keyboard_window_grab: Option::default(),
             grab_repeat_timer: Option::default(),
+            key_repeat: None,
+            key_repeat_timer: None,
             presentation_state,
             security_context_state,
             gamma_control_manager_state,

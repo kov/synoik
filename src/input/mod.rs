@@ -245,6 +245,27 @@ fn edit_mods(mods: &ModifiersState) -> crate::ui::text_edit::EditMods {
     }
 }
 
+/// A key held down over one of the compositor's own surfaces, remembered so the repeat timer can
+/// deliver it again.
+///
+/// A Wayland compositor is told about one press per physical key and leaves the repeating to the
+/// client (`wl_keyboard.repeat_info`). That works for windows and for nothing else: a shell text
+/// entry and the panel popover are drawn by us, so a held Backspace deletes one character and a
+/// held Down steps one row unless we repeat the key ourselves. GNOME gets these for free — every
+/// one of those surfaces is a `ClutterText`/`StWidget` on the stage, and Clutter synthesises the
+/// repeats (`clutter-seat.c`'s `repeat_key`) before the actor ever sees them.
+#[derive(Debug, Clone, Copy)]
+pub enum RepeatKey {
+    /// A key that went to a compositor text entry, re-delivered through
+    /// [`State::deliver_shell_key`] — the same call the synchronous path made.
+    Shell(crate::input_method::ShellKey),
+    /// A key that drove the panel popover's keyboard navigation.
+    Popover {
+        raw: Option<Keysym>,
+        mods: ModifiersState,
+    },
+}
+
 impl State {
     /// Route one key to a compositor entry: through the engine if it wants it, else straight in.
     ///
@@ -260,6 +281,7 @@ impl State {
         keysym: u32,
         keycode: Keycode,
         pressed: bool,
+        repeats: bool,
     ) {
         let key = crate::input_method::ShellKey {
             entry,
@@ -271,6 +293,12 @@ impl State {
         };
         if !self.im_offer_shell_key(key, keysym, keycode) {
             self.deliver_shell_key(key);
+            // Only the key the engine declined arms a repeat. A key it *took* is part of a
+            // composition in flight, and repeating it here would push raw keysyms past the
+            // engine and into the entry behind its preedit.
+            if pressed && repeats {
+                self.arm_key_repeat(keycode, RepeatKey::Shell(key));
+            }
         }
     }
 
@@ -824,7 +852,20 @@ impl State {
             if let Some(token) = self.synoik.grab_repeat_timer.take() {
                 self.synoik.event_loop.remove(token);
             }
+            // Keyed on the keycode, unlike the two above: the shell entries repeat printable
+            // keys, and a Shift tapped mid-word must not stop the letter being held.
+            if self
+                .synoik
+                .key_repeat
+                .is_some_and(|(held, _)| held == event.key_code())
+            {
+                self.stop_key_repeat();
+            }
         }
+
+        // Asked before the filter, not inside it: the filter closure runs with the keyboard's
+        // state locked, and reading the keymap takes the same lock.
+        let key_repeats = pressed && self.key_repeats(event.key_code());
 
         if pressed {
             self.hide_cursor_if_needed();
@@ -967,6 +1008,7 @@ impl State {
                             modified.raw(),
                             key_code,
                             pressed,
+                            key_repeats,
                         );
                     }
 
@@ -1109,6 +1151,7 @@ impl State {
                         modified.raw(),
                         key_code,
                         pressed,
+                        key_repeats,
                     );
 
                     if pressed {
@@ -1160,6 +1203,7 @@ impl State {
                         modified.raw(),
                         key_code,
                         pressed,
+                        key_repeats,
                     );
 
                     if pressed {
@@ -1260,6 +1304,9 @@ impl State {
                     }
 
                     this.synoik.panel_popover.handle_key(raw, mods, pressed);
+                    if pressed && key_repeats {
+                        this.arm_key_repeat(key_code, RepeatKey::Popover { raw, mods: *mods });
+                    }
                     this.synoik.queue_redraw_all();
 
                     if pressed {
@@ -1413,6 +1460,19 @@ impl State {
                             match outcome {
                                 RenameKey::Ignored => {}
                                 RenameKey::Took => {
+                                    if key_repeats {
+                                        this.arm_key_repeat(
+                                            key_code,
+                                            RepeatKey::Shell(crate::input_method::ShellKey {
+                                                entry: ShellEntry::WorkspaceRename,
+                                                raw,
+                                                text,
+                                                mods: edit_mods(mods),
+                                                theme,
+                                                pressed,
+                                            }),
+                                        );
+                                    }
                                     this.synoik.suppressed_keys.insert(key_code);
                                     this.synoik.queue_redraw_all();
                                     return FilterResult::Intercept(None);
@@ -1475,6 +1535,19 @@ impl State {
                             ) {
                                 RenameKey::Ignored => {}
                                 RenameKey::Took => {
+                                    if key_repeats {
+                                        this.arm_key_repeat(
+                                            key_code,
+                                            RepeatKey::Shell(crate::input_method::ShellKey {
+                                                entry: ShellEntry::FolderRename,
+                                                raw,
+                                                text,
+                                                mods: edit_mods(mods),
+                                                theme,
+                                                pressed,
+                                            }),
+                                        );
+                                    }
                                     this.synoik.suppressed_keys.insert(key_code);
                                     this.synoik.queue_redraw_all();
                                     return FilterResult::Intercept(None);
@@ -1546,6 +1619,19 @@ impl State {
                             // Ignored = a key the search doesn't handle (bare modifier, F-key);
                             // let it fall through to the hardcoded overview binds, unconsumed.
                             if !matches!(outcome, SearchOutcome::Ignored) {
+                                if key_repeats {
+                                    this.arm_key_repeat(
+                                        key_code,
+                                        RepeatKey::Shell(crate::input_method::ShellKey {
+                                            entry: ShellEntry::OverviewSearch,
+                                            raw,
+                                            text,
+                                            mods: edit_mods(mods),
+                                            theme,
+                                            pressed,
+                                        }),
+                                    );
+                                }
                                 match outcome {
                                     SearchOutcome::Handled | SearchOutcome::Ignored => {}
                                     SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
@@ -1736,6 +1822,113 @@ impl State {
             .unwrap();
 
         self.synoik.bind_repeat_timer = Some(token);
+    }
+
+    /// Whether the keymap says this key repeats at all.
+    ///
+    /// The same question Clutter asks before arming its own repeat: modifiers, locks and Compose
+    /// carry `repeat = false` in the keymap, and a hand-written list of keysyms would get that
+    /// nearly right and be wrong for somebody's layout. Asking the keymap also keeps a modifier
+    /// tapped mid-hold from stealing the repeat of the key actually being held.
+    fn key_repeats(&mut self, keycode: Keycode) -> bool {
+        let keyboard = self.synoik.seat.get_keyboard().unwrap();
+        keyboard.with_xkb_state(self, |context| {
+            let xkb = context.xkb().lock().unwrap();
+            // SAFETY: the keymap reference does not outlive the `Xkb` it came from — it is
+            // consumed inside this expression, with the guard still alive.
+            unsafe { xkb.keymap() }.key_repeats(keycode)
+        })
+    }
+
+    /// Start repeating `key` while `keycode` is held. Replaces whatever was repeating before.
+    fn arm_key_repeat(&mut self, keycode: Keycode, key: RepeatKey) {
+        self.stop_key_repeat();
+
+        let (repeat_rate, repeat_delay) = {
+            let config = self.synoik.config.borrow();
+            let config = &config.input.keyboard;
+            (config.repeat_rate, config.repeat_delay)
+        };
+        // `org.gnome.desktop.peripherals.keyboard repeat = false` arrives here as a zero rate,
+        // the same spelling `wl_keyboard.repeat_info` uses for "no repeat".
+        if repeat_rate == 0 {
+            return;
+        }
+        let period = Duration::from_secs_f64(1. / f64::from(repeat_rate));
+
+        let timer = Timer::from_duration(Duration::from_millis(u64::from(repeat_delay)));
+        let token = self
+            .synoik
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                if !state.deliver_repeat_key() {
+                    // The surface went away under the held key. Drop the source rather than
+                    // removing its token: calloop is running it.
+                    state.synoik.key_repeat = None;
+                    state.synoik.key_repeat_timer = None;
+                    return TimeoutAction::Drop;
+                }
+                TimeoutAction::ToDuration(period)
+            })
+            .unwrap();
+
+        self.synoik.key_repeat = Some((keycode, key));
+        self.synoik.key_repeat_timer = Some(token);
+    }
+
+    /// Stop repeating, if anything was.
+    fn stop_key_repeat(&mut self) {
+        self.synoik.key_repeat = None;
+        if let Some(token) = self.synoik.key_repeat_timer.take() {
+            self.synoik.event_loop.remove(token);
+        }
+    }
+
+    /// Deliver one repeat. Returns whether the repeat should carry on — a surface that closed
+    /// under the held key takes no more of it.
+    fn deliver_repeat_key(&mut self) -> bool {
+        let Some((_, key)) = self.synoik.key_repeat else {
+            return false;
+        };
+        match key {
+            RepeatKey::Shell(key) => {
+                if !self.shell_entry_takes_keys(key.entry) {
+                    return false;
+                }
+                self.deliver_shell_key(key);
+            }
+            RepeatKey::Popover { raw, mods } => {
+                if !self.synoik.panel_popover.grabs_input() {
+                    return false;
+                }
+                self.synoik.panel_popover.handle_key(raw, &mods, true);
+                // The synchronous path drains this after the keyboard filter returns; here
+                // nothing holds the keyboard, so it drains right away.
+                if let Some(action) = self.synoik.panel_popover.take_pending_action() {
+                    self.apply_popover_action(action);
+                }
+                self.synoik.queue_redraw_all();
+            }
+        }
+        true
+    }
+
+    /// Whether the entry a repeat is aimed at is still up and still holds the key focus — the
+    /// same gates the keyboard filter passed before the key was delivered the first time.
+    fn shell_entry_takes_keys(&self, entry: crate::input_method::ShellEntry) -> bool {
+        use crate::input_method::ShellEntry;
+        match entry {
+            ShellEntry::Shield => self.synoik.screen_shield.is_active(),
+            ShellEntry::Polkit => self.synoik.polkit_is_open(),
+            ShellEntry::RunDialog => self.synoik.run_dialog.is_open(),
+            ShellEntry::FolderRename => self.synoik.folder_dialog.is_renaming(),
+            ShellEntry::WorkspaceRename => self.synoik.workspace_rename.is_some(),
+            ShellEntry::OverviewSearch => {
+                self.synoik.keyboard_focus.is_overview()
+                    && (self.synoik.overview_search.is_active()
+                        || self.synoik.overview_search.is_expanded())
+            }
+        }
     }
 
     fn hide_cursor_if_needed(&mut self) {

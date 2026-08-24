@@ -4030,6 +4030,139 @@ fn super_s_focuses_quick_settings_and_the_arrows_walk_the_grid() {
     );
 }
 
+/// Turn key repeat on and make it fast, so a held key repeats inside a test's patience.
+///
+/// Goes through `apply_peripherals`, the real hand-off from `org.gnome.desktop.peripherals`, so
+/// the repeat timer reads the value the same way it does on a live seat.
+#[cfg(test)]
+fn set_key_repeat(f: &mut Fixture, delay_ms: u16, rate: u8) {
+    let p = &mut f.synoik().gnome_settings.peripherals;
+    p.repeat_delay = delay_ms;
+    p.repeat_rate = rate;
+    f.synoik_state().apply_peripherals();
+}
+
+/// A key held over one of the compositor's own text entries repeats.
+///
+/// Wayland tells a compositor about one press per physical key and leaves the repeating to the
+/// client, so a shell entry — which is not a client — gets one character per hold unless the
+/// compositor repeats the key itself. GNOME never has to think about it: its entries are
+/// `ClutterText` actors on the stage, and Clutter synthesises repeats before the actor is
+/// reached.
+///
+/// Counted loosely (**at least** three characters) rather than exactly: the timer runs on real
+/// wall-clock, and this VM cannot wake a thread closer than about a millisecond, so an exact
+/// count would flake.
+#[test]
+fn a_held_key_repeats_into_a_shell_entry() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    set_key_repeat(&mut f, 1, 100);
+
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.key_press(KEY_Z);
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "z",
+        "the press itself types once"
+    );
+
+    assert!(
+        f.dispatch_until(Duration::from_secs(3), |state| {
+            state.synoik.run_dialog.entry().chars().count() >= 3
+        }),
+        "holding the key must keep typing it, got {:?}",
+        f.synoik().run_dialog.entry()
+    );
+
+    // The release stops it, and nothing arrives afterwards.
+    f.key_release(KEY_Z);
+    let settled = f.synoik().run_dialog.entry().chars().count();
+    assert!(
+        !f.dispatch_until(Duration::from_millis(200), |state| {
+            state.synoik.run_dialog.entry().chars().count() > settled
+        }),
+        "the release must stop the repeat"
+    );
+}
+
+/// The same for the panel popovers: a held arrow keeps stepping the focus, so walking a long
+/// quick-settings grid does not mean tapping Down twelve times.
+#[test]
+fn a_held_arrow_repeats_in_a_panel_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    set_key_repeat(&mut f, 1, 100);
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_S);
+    f.key_release(KEY_LEFTMETA);
+
+    f.key_press(KEY_DOWN);
+    assert_eq!(
+        f.synoik().panel_popover.focused_row_label().as_deref(),
+        Some("Tile(Network)"),
+        "the press itself steps out of the system row"
+    );
+    assert!(
+        f.dispatch_until(Duration::from_secs(3), |state| {
+            state.synoik.panel_popover.focused_row_label().as_deref() != Some("Tile(Network)")
+        }),
+        "holding Down must keep stepping"
+    );
+
+    f.key_release(KEY_DOWN);
+    let settled = f.synoik().panel_popover.focused_row_label();
+    assert!(
+        !f.dispatch_until(Duration::from_millis(200), |state| {
+            state.synoik.panel_popover.focused_row_label() != settled
+        }),
+        "the release must stop the repeat"
+    );
+}
+
+/// `org.gnome.desktop.peripherals.keyboard repeat = false` reaches us as a zero rate — the same
+/// spelling `wl_keyboard.repeat_info` uses — and it means no repeat at all, not a slow one.
+#[test]
+fn key_repeat_turned_off_never_repeats() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    set_key_repeat(&mut f, 1, 0);
+
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.key_press(KEY_Z);
+    assert!(
+        !f.dispatch_until(Duration::from_millis(200), |state| {
+            state.synoik.run_dialog.entry().chars().count() > 1
+        }),
+        "a zero repeat rate must type exactly once"
+    );
+    f.key_release(KEY_Z);
+}
+
+/// A modifier tapped while a letter is held must not steal its repeat. The keymap carries a
+/// `repeat` flag per key and says no for modifiers, locks and Compose; that is the flag Clutter
+/// consults, and a hand-written list of keysyms would be wrong for somebody's layout.
+#[test]
+fn a_modifier_tapped_mid_hold_does_not_stop_the_repeat() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    set_key_repeat(&mut f, 1, 100);
+
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.key_press(KEY_Z);
+    tap(&mut f, KEY_LEFTSHIFT);
+
+    assert!(
+        f.dispatch_until(Duration::from_secs(3), |state| {
+            state.synoik.run_dialog.entry().chars().count() >= 3
+        }),
+        "Shift neither repeats itself nor stops the key being held, got {:?}",
+        f.synoik().run_dialog.entry()
+    );
+    f.key_release(KEY_Z);
+}
+
 /// `toggle-message-tray` (`<Super>v`, and `<Super>m` as its second accelerator)
 /// and `toggle-quick-settings` (`<Super>s`) open the panel menus, the same
 /// `Panel.toggleCalendar` / `toggleQuickSettings` the pointer reaches by
