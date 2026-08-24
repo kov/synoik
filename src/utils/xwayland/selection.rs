@@ -389,20 +389,6 @@ fn connect(display_name: &str) -> Option<(RustConnection, usize)> {
     None
 }
 
-/// Ask the server what time it is, the only way X offers: make it stamp an event.
-fn seed_server_time(conn: &RustConnection, window: Window, prop: Atom) -> anyhow::Result<u32> {
-    conn.change_property8(PropMode::APPEND, window, prop, AtomEnum::STRING, &[])?;
-    conn.flush()?;
-    loop {
-        if let Event::PropertyNotify(event) = conn.wait_for_event()? {
-            if event.window == window && event.atom == prop {
-                conn.delete_property(window, prop)?;
-                return Ok(event.time);
-            }
-        }
-    }
-}
-
 /// Log what one message or event went wrong with, and carry on.
 ///
 /// A malformed request from one X client, or a window that died mid-transfer, is that client's
@@ -453,15 +439,19 @@ impl XState {
         }
         conn.flush()?;
 
-        // ICCCM wants a real timestamp for `SetSelectionOwner`, and the only way to ask the
-        // server for one is to make it stamp something: a zero-length append to a property of
-        // our own, whose `PropertyNotify` carries the current server time. Blocking for it is
-        // fine here -- the connection is ours alone and nothing else is in flight yet.
-        let last_time =
-            seed_server_time(&conn, window, atoms._SYNOIK_SELECTION).unwrap_or_else(|err| {
-                debug!("X11 selection bridge: no server timestamp ({err}), using CurrentTime");
-                CURRENT_TIME
-            });
+        // ICCCM wants a real timestamp for `SetSelectionOwner`, and the only way to ask X for one
+        // is to make it stamp something: a zero-length append to a property of our own, whose
+        // `PropertyNotify` carries the server time. Fire and forget -- the reply lands in the
+        // event loop like any other and `handle_event` picks the timestamp up on the way past.
+        // Waiting for it here instead is a startup that hangs on one missing event, which is
+        // exactly what it did.
+        conn.change_property8(
+            PropMode::APPEND,
+            window,
+            atoms._SYNOIK_SELECTION,
+            AtomEnum::STRING,
+            &[],
+        )?;
 
         let (to_helpers, from_helpers) = std::sync::mpsc::channel();
 
@@ -478,7 +468,7 @@ impl XState {
             from_helpers,
             to_helpers,
             helper_wake: Arc::new(helper_wake),
-            last_time,
+            last_time: CURRENT_TIME,
         })
     }
 

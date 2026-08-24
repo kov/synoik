@@ -313,8 +313,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup xwayland-satellite integration. Not headless: the X11 sockets live in the *shared*
     // `/tmp/.X11-unix`, so concurrent headless instances (and the developer's own session) would
     // be competing for display numbers, and the satellite is a child process a test rig would
-    // then have to reap. A headless run has no X11 clients to serve.
-    if !cli.headless {
+    // then have to reap. A headless run has no X11 clients to serve -- unless someone is driving
+    // one by hand, which is the only way to exercise the X11 selection bridge without a seat.
+    if !cli.headless || state.synoik.config.borrow().debug.xwayland_in_headless {
         xwayland::satellite::setup(&mut state);
     }
     if let Some(satellite) = &state.synoik.satellite {

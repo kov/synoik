@@ -5,7 +5,7 @@
 // Modified for synoik in 2026.
 
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,11 +15,12 @@ use calloop::channel::Sender;
 use calloop::generic::Generic;
 use calloop::{Interest, Mode, PostAction, RegistrationToken};
 use smithay::reexports::rustix::io::{fcntl_setfd, FdFlags};
+use smithay::reexports::wayland_server::Client;
 use smithay::wayland::selection::data_device::set_selection_excluded_client;
 
-use crate::synoik::{NewClient, State};
-use crate::utils::expand_home;
+use crate::synoik::State;
 use crate::utils::xwayland::{selection, X11Connection};
+use crate::utils::{expand_home, get_credentials_for_client};
 
 pub struct Satellite {
     x11: X11Connection,
@@ -38,34 +39,28 @@ impl Satellite {
     }
 }
 
-/// Hand satellite a Wayland connection we made ourselves, and bar it from selections.
+/// Bar satellite from taking part in selections.
 ///
-/// Two reasons for the socketpair rather than letting it dial `WAYLAND_DISPLAY`: we get its
-/// [`Client`](smithay::reexports::wayland_server::Client) *before* it exists, with no pid
-/// matching and no race against its first request, and that is what
-/// [`set_selection_excluded_client`] needs. The compositor bridges X11 selections itself (see
-/// [`crate::utils::xwayland::selection`]); a satellite that also bridged them would re-export
-/// every selection back the way it came, and the second export cancels the first source.
+/// The compositor bridges X11 selections itself (see [`crate::utils::xwayland::selection`]); a
+/// satellite that also bridged them would re-export every selection back the way it came, and the
+/// second export cancels the first source.
 ///
-/// Returns the fd to hand the child, or `None` if we could not make one — in which case
-/// satellite falls back to `WAYLAND_DISPLAY` and its own bridge fights ours.
-fn wayland_socket_for_satellite(state: &mut State) -> Option<OwnedFd> {
-    let (ours, theirs) = match UnixStream::pair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            warn!("error creating a socket pair for xwayland-satellite: {err}");
-            return None;
-        }
+/// Matching on the pid is safe *because* the spawn happens on the main thread: satellite cannot
+/// reach the Wayland socket until we return to the event loop, so its pid is always recorded
+/// before its client exists. Handing it a socket we made and `WAYLAND_SOCKET` would name the
+/// client outright, but satellite spawns Xwayland before it connects (`src/lib.rs:96` vs
+/// `src/server/mod.rs:499`) and Xwayland would inherit the variable and steal the connection --
+/// two clients on one socket, which hangs the display.
+pub fn exclude_from_selections_if_satellite(state: &mut State, client: &Client) {
+    let Some(pid) = state.synoik.satellite_pid else {
+        return;
     };
-
-    let client = state.synoik.insert_client(NewClient {
-        client: ours,
-        restricted: false,
-        credentials_unknown: false,
-    })?;
-    set_selection_excluded_client(&state.synoik.seat, Some(client));
-
-    Some(OwnedFd::from(theirs))
+    let dh = state.synoik.display_handle.clone();
+    if get_credentials_for_client(&dh, client).map(|c| c.pid) != Some(pid) {
+        return;
+    }
+    debug!("barring xwayland-satellite (pid {pid}) from selections");
+    set_selection_excluded_client(&state.synoik.seat, Some(client.clone()));
 }
 
 pub fn setup(state: &mut State) {
@@ -193,6 +188,7 @@ fn setup_watch(state: &mut State) {
     // bridge (its display went with it) nor the selection bar (its client did) outlives that.
     stop_selection_bridge(state);
     set_selection_excluded_client(&state.synoik.seat, None);
+    state.synoik.satellite_pid = None;
 
     let satellite = state.synoik.satellite.as_mut().unwrap();
 
@@ -280,8 +276,6 @@ fn spawn(state: &mut State) {
         }
     }
 
-    let wayland_fd = wayland_socket_for_satellite(state);
-
     let mut process = Command::new(&path);
     process.arg(&display_name).env_remove("DISPLAY");
 
@@ -298,11 +292,24 @@ fn spawn(state: &mut State) {
 
     start_selection_bridge(state, display_name);
 
-    // Spawning and waiting takes some milliseconds, so do it in a thread.
+    // Fork here rather than on the waiter thread, even though it costs a few milliseconds of the
+    // frame this lands in: we are inside the event loop, so no client can be inserted until we
+    // return, which makes the pid we record below strictly earlier than satellite's connection.
+    // That is what `exclude_from_selections_if_satellite` relies on.
+    let child = match spawn_child(&path, process, abstract_fd, unix_fd) {
+        Some(child) => child,
+        None => {
+            let _ = to_main.send(ToMain::SetupWatch);
+            return;
+        }
+    };
+    state.synoik.satellite_pid = Some(child.id() as i32);
+
+    // Reaping is the part that takes a whole session, so that does go on a thread.
     let res = thread::Builder::new()
-        .name("Xwl-s Spawner".to_owned())
+        .name("Xwl-s Reaper".to_owned())
         .spawn(move || {
-            spawn_and_wait(&path, process, abstract_fd, unix_fd, wayland_fd);
+            wait_for_child(child);
 
             // Once xwayland-satellite crashes or fails to spawn, re-establish our X11 socket watch
             // to try again next time.
@@ -310,12 +317,7 @@ fn spawn(state: &mut State) {
         });
 
     if let Err(err) = res {
-        warn!("error spawning a thread to spawn xwayland-satellite: {err:?}");
-        let _ = state
-            .synoik
-            .satellite
-            .as_ref()
-            .map(|xwl| xwl.to_main.send(ToMain::SetupWatch));
+        warn!("error spawning a thread to reap xwayland-satellite: {err:?}");
     }
 }
 
@@ -370,27 +372,19 @@ fn start_selection_bridge(state: &mut State, display_name: String) {
     state.synoik.x_selection = Some(bridge);
 }
 
-fn spawn_and_wait(
+fn spawn_child(
     path: &Path,
     mut process: Command,
     abstract_fd: Option<OwnedFd>,
     unix_fd: OwnedFd,
-    wayland_fd: Option<OwnedFd>,
-) {
+) -> Option<std::process::Child> {
     let abstract_raw = abstract_fd.as_ref().map(|fd| fd.as_raw_fd());
     let unix_raw = unix_fd.as_raw_fd();
-    let wayland_raw = wayland_fd.as_ref().map(|fd| fd.as_raw_fd());
 
     process.arg("-listenfd").arg(unix_raw.to_string());
 
     if let Some(abstract_raw) = abstract_raw {
         process.arg("-listenfd").arg(abstract_raw.to_string());
-    }
-
-    // `wayland-client` reads this instead of dialling `WAYLAND_DISPLAY`, and unsets it before
-    // satellite's own children (Xwayland) could inherit it.
-    if let Some(wayland_raw) = wayland_raw {
-        process.env("WAYLAND_SOCKET", wayland_raw.to_string());
     }
 
     unsafe {
@@ -407,22 +401,17 @@ fn spawn_and_wait(
                 fcntl_setfd(abstract_fd, FdFlags::empty())?;
             }
 
-            if let Some(wayland_raw) = wayland_raw {
-                let wayland_fd = BorrowedFd::borrow_raw(wayland_raw);
-                fcntl_setfd(wayland_fd, FdFlags::empty())?;
-            }
-
             Ok(())
         })
     };
 
-    let mut child = {
+    let child = {
         let _span = tracy_client::span!();
         match process.spawn() {
             Ok(child) => child,
             Err(err) => {
                 warn!("error spawning {path:?}: {err:?}");
-                return;
+                return None;
             }
         }
     };
@@ -430,8 +419,11 @@ fn spawn_and_wait(
     // The process spawned, we can drop our fds.
     drop(abstract_fd);
     drop(unix_fd);
-    drop(wayland_fd);
 
+    Some(child)
+}
+
+fn wait_for_child(mut child: std::process::Child) {
     let status = match child.wait() {
         Ok(status) => status,
         Err(err) => {

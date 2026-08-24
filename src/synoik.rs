@@ -557,6 +557,9 @@ pub struct Synoik {
     /// The X11 selection bridge, once satellite has been spawned and the bridge could reach its
     /// display. See [`crate::utils::xwayland::selection`].
     pub x_selection: Option<XSelectionBridge>,
+    /// The pid of the running xwayland-satellite, so its Wayland client can be recognised as it
+    /// connects. See `xwayland::satellite::exclude_from_selections_if_satellite`.
+    pub satellite_pid: Option<i32>,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
     pub ext_data_control_state: ExtDataControlState,
@@ -7738,11 +7741,18 @@ impl Synoik {
                 let socket_name = source.socket_name().to_os_string();
                 event_loop
                     .insert_source(source, move |client, _, state| {
-                        state.synoik.insert_client(NewClient {
+                        let client = state.synoik.insert_client(NewClient {
                             client,
                             restricted: false,
                             credentials_unknown: false,
                         });
+                        // The one client that must not take part in selections is
+                        // xwayland-satellite; this is where it arrives.
+                        if let Some(client) = client {
+                            crate::utils::xwayland::satellite::exclude_from_selections_if_satellite(
+                                state, &client,
+                            );
+                        }
                     })
                     .unwrap();
                 Some(socket_name)
@@ -7912,6 +7922,7 @@ impl Synoik {
             clipboard_mime_types: Vec::new(),
             clipboard_paste_pending: false,
             x_selection: None,
+            satellite_pid: None,
             primary_selection_state,
             wlr_data_control_state,
             ext_data_control_state,
