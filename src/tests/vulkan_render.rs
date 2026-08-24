@@ -3678,8 +3678,9 @@ fn vulkan_renders_the_scrolled_message_list() {
             // and the icons, and this ordering flips.
             let second = at(cx, list_pad + collapsed_card_h() + 5.);
             let lower = at(cx, list_pad + collapsed_card_h() + 13.5);
-            // The scrollbar thumb strip, near the viewport top (scroll at 0).
-            let thumb = at(list_w - 7., list_pad + 12.);
+            // The scrollbar thumb strip, near the viewport top (scroll at 0). It sits in the
+            // gutter the list reserves right of the cards — popover-local, so past `list_pad`.
+            let thumb = at(list_pad + list_w - 7., list_pad + 12.);
             (card, second, lower, thumb)
         })
         .expect("vulkan renderer");
