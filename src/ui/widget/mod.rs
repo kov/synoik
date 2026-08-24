@@ -317,6 +317,14 @@ pub mod style {
         shift_lightness(c, amount)
     }
 
+    /// `$accent_borders_color` — the accent lightened 30% on a dark theme
+    /// (`_colors.scss:70`). It is the focus-ring color for a button whose fill is *already* the
+    /// accent (`@include focus_ring($fc: $accent_borders_color)` on the `default` style,
+    /// `_drawing.scss:313-316`): the plain accent ring would vanish into an accent-filled button.
+    pub fn accent_borders(accent: Rgba) -> Rgba {
+        lighten(accent, 0.30)
+    }
+
     /// SCSS `darken($c, n%)`, `amount` in 0..=1.
     pub fn darken(c: Rgba, amount: f32) -> Rgba {
         shift_lightness(c, -amount)
@@ -2543,6 +2551,16 @@ impl ButtonStyle {
         }
     }
 
+    /// What the focus ring is drawn from. A [`Suggested`](Self::Suggested) button is
+    /// `%default_button`, whose fill *is* the accent, so its ring swaps to
+    /// `$accent_borders_color` (`_drawing.scss:313-316`) rather than disappearing into it.
+    fn focus_ring_base(self, accent: Rgba) -> Rgba {
+        match self {
+            ButtonStyle::Suggested => style::accent_borders(accent),
+            _ => accent,
+        }
+    }
+
     /// Base (non-hovered) fill; `accent` is the system accent, used by [`Suggested`].
     fn bg(self, accent: Rgba) -> Rgba {
         match self {
@@ -3080,6 +3098,8 @@ impl Painter<'_, '_, '_> {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
         }
         if b.focused {
+            // An icon button's disc is the neutral button fill, never the accent, so the plain
+            // accent ring stands out on it.
             self.focus_ring(b.rect, radius, accent)?;
         }
         Ok(())
@@ -3896,9 +3916,14 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// The focus ring is GNOME's inset 2px accent stroke ([`stroke_rounded`](Self::stroke_rounded))
     /// on the button's own rect, drawn over the fill — faithful, and correct over a translucent
     /// [`ButtonStyle::Dialog`] fill with no masking.
-    /// The keyboard-focus ring: a 2px inset stroke in the accent at 80%
-    /// (`@include focus_ring()` → `box-shadow: inset 0 0 0 2px st-transparentize($accent, .2)`,
-    /// `_drawing.scss:56-66,309-311`).
+    /// The keyboard-focus ring: a 2px inset stroke in `base` at 80%
+    /// (`@include focus_ring($fc)` → `box-shadow: inset 0 0 0 2px st-transparentize($fc, .2)`,
+    /// `_drawing.scss:56-66`).
+    ///
+    /// `base` is the accent for an ordinary surface, and [`style::accent_borders`] for one whose
+    /// fill is already the accent — the same `$fc` swap the SCSS makes for the `default` button
+    /// style (`_drawing.scss:313-316`), without which a checked quick-settings tile shows an
+    /// accent ring on an accent fill and reads as unfocused.
     ///
     /// A verb rather than each caller's own stroke, because every focusable surface in the shell
     /// owes the same ring — a button, a quick-settings tile, a slider — and a ring that differs
@@ -3907,9 +3932,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         &mut self,
         rect: Rectangle<f64, Logical>,
         radius: f64,
-        accent: Rgba,
+        base: Rgba,
     ) -> anyhow::Result<()> {
-        let ring = [accent[0], accent[1], accent[2], 0.8];
+        let ring = [base[0], base[1], base[2], 0.8];
         self.stroke_rounded(rect, radius, 2., ring)
     }
 
@@ -3920,8 +3945,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
         }
         if b.focused {
-            let ring_color = [accent[0], accent[1], accent[2], 0.8];
-            self.stroke_rounded(b.rect, radius, 2., ring_color)?;
+            self.focus_ring(b.rect, radius, b.style.focus_ring_base(accent))?;
         }
         let center = Point::from((
             b.rect.loc.x + b.rect.size.w / 2.,

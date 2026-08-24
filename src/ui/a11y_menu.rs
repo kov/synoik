@@ -202,6 +202,13 @@ impl A11yMenu {
         let width = self.logical_size().w;
         for k in 0..self.row_count() {
             if self.row_rect(k, width).contains(pos) {
+                // A click takes the keyboard focus with it, so an arrow key afterwards continues
+                // from the row that was clicked (`popupMenu.js:200-207`, where a menu item taking
+                // the `active` state grabs the key focus).
+                if self.focused != Some(k) {
+                    self.focused = Some(k);
+                    self.revision += 1;
+                }
                 return match self.row_kind(k) {
                     RowKind::Toggle(toggle) => PopoverAction::SetA11yToggle {
                         toggle,

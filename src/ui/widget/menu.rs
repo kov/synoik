@@ -595,6 +595,14 @@ impl Menu {
                 return MenuHit::Nothing;
             }
             let (id, is_submenu) = (item.id, item.is_submenu());
+            // A click takes the keyboard focus with it, so an arrow key afterwards continues from
+            // the row the pointer was on. GNOME goes further and moves the focus on *hover*: a
+            // menu item's `active` setter calls `grab_key_focus` (`popupMenu.js:200-207`), and
+            // hovering sets `active`.
+            if self.focused != Some(k) {
+                self.focused = Some(k);
+                self.revision += 1;
+            }
             if is_submenu {
                 // A submenu row toggles rather than activates: it has no action of its own.
                 let now = !self.is_expanded(id);

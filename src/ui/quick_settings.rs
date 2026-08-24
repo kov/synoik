@@ -1986,6 +1986,18 @@ impl QuickSettings {
             // card, which swallows its clicks rather than letting them through to the grid.
             return PopoverAction::Consumed;
         };
+        // A click takes the keyboard focus with it, so an arrow key afterwards continues from what
+        // was clicked — click the power button and Down walks into the card it opened.
+        //
+        // **Divergence.** gnome-shell's quick toggles are `St.Button`s, which do not grab the key
+        // focus when clicked, so there the focus stays wherever it was and Down re-enters from the
+        // top. Its *menus* do move focus with the pointer (an item's `active` setter calls
+        // `grab_key_focus`, `popupMenu.js:200-207`), so this makes quick settings behave like the
+        // menus rather than like a page of buttons.
+        if self.focused != Some(stop) {
+            self.focused = Some(stop);
+            self.revision += 1;
+        }
         match stop {
             QsStop::SliderTrack(slider) => {
                 self.sliding = Some((SliderId::Top(slider), self.device_count(slider)));
@@ -2170,6 +2182,27 @@ impl QuickSettings {
     pub fn focused_for_test(&self) -> Option<String> {
         let stops = self.stops();
         self.live_focus(&stops).map(|s| format!("{s:?}"))
+    }
+
+    /// What the focus ring on `stop` is drawn from. A **checked** tile is filled with the accent
+    /// (a quick toggle's `:checked` is `%default_button`, `_quick-settings.scss:24`), and the
+    /// plain accent ring on an accent fill is invisible — so it takes `$accent_borders_color`,
+    /// the swap `_drawing.scss:313-316` makes for exactly this case.
+    fn focus_ring_base(&self, stop: QsStop) -> widget::Rgba {
+        let checked = match stop {
+            QsStop::Tile(item) | QsStop::TileArrow(item) => item.is_on(
+                self.toggles,
+                self.network,
+                self.airplane,
+                &self.power,
+                self.bluetooth.powered,
+            ),
+            _ => false,
+        };
+        match checked {
+            true => style::accent_borders(self.accent),
+            false => self.accent,
+        }
     }
 
     /// A slider's current level, the value its handle is drawn at.
@@ -3467,8 +3500,8 @@ impl QuickSettings {
             // pill or a disc — quick toggles take `$forced_circular_radius`
             // (`_quick-settings.scss:16`), the system buttons are circles, and `.slider-bin:focus`
             // is fully rounded — so the ring's radius is the stop's own half-height.
-            if let Some((_, rect)) = self.focus_rect(layout) {
-                p.focus_ring(rect, rect.size.h / 2., self.accent)?;
+            if let Some((stop, rect)) = self.focus_rect(layout) {
+                p.focus_ring(rect, rect.size.h / 2., self.focus_ring_base(stop))?;
             }
 
             Ok(())
@@ -4104,15 +4137,18 @@ run it with --features reference-env, as the fedora CI job does"
             crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
-        let before = qs.revision;
         // The tile center falls in the toggle-body (left of the arrow-half), which opens settings.
         let action = qs.pointer_click(center(tile_rect(0, lay(false))));
         match action {
             PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "network"),
             other => panic!("expected network settings, got {other:?}"),
         }
-        // Network is not a gsettings toggle: no local flip, so no chrome revision bump.
-        assert_eq!(qs.revision, before);
+        // Network is not a gsettings toggle: no local flip. The first click does bump the chrome
+        // revision, because it moved the keyboard focus onto the tile and the ring has to be
+        // redrawn — but a second click on the same tile changes nothing at all.
+        let settled = qs.revision;
+        qs.pointer_click(center(tile_rect(0, lay(false))));
+        assert_eq!(qs.revision, settled);
     }
 
     /// The screenshot button opens the UI; the settings button spawns its command.
@@ -4372,6 +4408,61 @@ run it with --features reference-env, as the fedora CI job does"
         let before = qs.focused_for_test();
         assert!(qs.nav(Dir::Right).is_none(), "a tile's Right is navigation");
         assert_ne!(qs.focused_for_test(), before);
+    }
+
+    /// A **checked** tile is filled with the accent, so an accent focus ring on it would be
+    /// invisible: gnome-shell swaps the ring to `$accent_borders_color` for the `default` button
+    /// style, which is what `:checked` extends (`_drawing.scss:313-316`,
+    /// `_quick-settings.scss:24`).
+    #[test]
+    fn a_checked_tile_rings_in_a_colour_that_shows_on_its_accent_fill() {
+        let mut qs = qs(NetworkStatus::default(), None);
+        let tile = GridTile::Toggle(Tile::DarkStyle);
+
+        assert_eq!(
+            qs.focus_ring_base(QsStop::Tile(tile)),
+            qs.accent,
+            "an unchecked tile is not accent-filled, so the plain accent ring shows"
+        );
+
+        qs.set_tile(Tile::DarkStyle, true);
+        let ring = qs.focus_ring_base(QsStop::Tile(tile));
+        assert_ne!(
+            ring, qs.accent,
+            "a checked tile must not ring in the colour it is filled with"
+        );
+        assert_eq!(ring, widget::style::accent_borders(qs.accent));
+        // The arrow half shares the tile's fill, so it shares the swap.
+        assert_eq!(qs.focus_ring_base(QsStop::TileArrow(tile)), ring);
+    }
+
+    /// A click leaves the keyboard focus on what it hit, so the arrows continue from there —
+    /// click the power button and Down walks into the card it opened, rather than re-entering the
+    /// menu from the top.
+    #[test]
+    fn a_click_takes_the_keyboard_focus_with_it() {
+        let mut qs = qs(NetworkStatus::default(), None);
+
+        let power = sys_rect(SysButton::Power, qs.has_pill());
+        let hit = power.loc + Point::from((power.size.w / 2., power.size.h / 2.));
+        assert_eq!(qs.pointer_click(hit), PopoverAction::Consumed);
+        assert_eq!(
+            qs.focused_for_test().as_deref(),
+            Some("Sys(Power)"),
+            "the click focused the button it hit"
+        );
+        assert_eq!(qs.expanded, Some(DetailOwner::Power));
+
+        // The card opened below the system row, so Down out of the button lands in it. (Nothing
+        // has advanced the expand animation, so it reads as settled and the rows are live.)
+        assert!(qs.expand.settled());
+        assert!(qs.nav(Dir::Down).is_none());
+        assert!(
+            qs.focused_for_test()
+                .is_some_and(|f| f.starts_with("DetailRow(")),
+            "Down after the click walks into the card, got {:?}",
+            qs.focused_for_test()
+        );
     }
 
     /// The focus names a *control*, not a grid slot. Bluetooth is **inserted** at slot 1 when its
