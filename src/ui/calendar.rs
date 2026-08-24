@@ -1019,7 +1019,7 @@ const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
 const SCROLLBAR_W: f64 = 6.;
 const SCROLLBAR_MIN_H: f64 = 24.;
 /// Between the handle and the column separator it sits against.
-const SCROLLBAR_EDGE_GAP: f64 = 1.;
+const SCROLLBAR_EDGE_GAP: f64 = 2.;
 const SCROLLBAR_THUMB: [f32; 4] = [0.45, 0.45, 0.47, 1.];
 
 /// A visible media card's `(bus name, card rect, control rects)`, popover-local (test hook).
