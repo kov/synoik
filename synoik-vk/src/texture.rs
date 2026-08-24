@@ -686,7 +686,7 @@ impl Texture {
 
         // Which of `usable` the driver actually picked. There is no other way to learn it, and the
         // dmabuf we hand KMS has to name it.
-        let ext_mod = ash::ext::image_drm_format_modifier::Device::new(&gpu.instance, device);
+        let ext_mod = gpu.drm_format_modifier()?;
         let mut props = vk::ImageDrmFormatModifierPropertiesEXT::default();
         unsafe { ext_mod.get_image_drm_format_modifier_properties(image, &mut props) }
             .context("vkGetImageDrmFormatModifierPropertiesEXT")?;
@@ -705,7 +705,7 @@ impl Texture {
             )
         };
 
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, device);
+        let ext_fd = gpu.external_memory()?;
         let get_fd = vk::MemoryGetFdInfoKHR::default()
             .memory(memory)
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
@@ -26,6 +26,35 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 /// Process-wide rather than per-`Gpu` because the messenger is per-instance while a test run builds
 /// well over a hundred of them, and an error is a defect wherever it surfaced.
 static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes `vkCreateDevice`/`vkDestroyDevice` and every `vkGetDeviceProcAddr` this process
+/// makes, because the Vulkan loader does not.
+///
+/// The loader keeps one **process-global** list of logical devices. `loader_get_icd_and_device`
+/// (`loader/loader.c`), which every `vkGetDeviceProcAddr` walks to map a `VkDevice` to its ICD,
+/// takes `loader_global_instance_list_lock` — but `loader_add_logical_device` and
+/// `loader_remove_logical_device`, which link and **free** those nodes, take nothing. Creating a
+/// device on one thread while another destroys one is therefore a use-after-free inside the loader,
+/// and separate `VkInstance`s do not help: the list it walks spans all of them. Reported upstream
+/// as <https://github.com/KhronosGroup/Vulkan-Loader/issues/2018>; this lock can come out once the
+/// loader locks its own list.
+///
+/// A session builds one device and never contends. The test binary builds over a hundred, several
+/// at a time, which is how this surfaced — a SIGSEGV at `loader_get_dispatch(obj=0xffffffff)`, the
+/// freed node's reused memory, with no test reporting a failure.
+///
+/// Every device-level `ash::…::Device::new` is a `vkGetDeviceProcAddr`, so all of them are built
+/// once here under this lock rather than lazily at their call sites.
+static DEVICE_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+/// Take [`DEVICE_LIFECYCLE`], ignoring poisoning: it guards no data, only ordering, so a panic
+/// while it was held leaves nothing to be inconsistent — and poisoning it would turn one failing
+/// test into a cascade across the rest of the run.
+fn device_lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
+    DEVICE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How many validation errors the layer has reported so far. Always 0 unless `SYNOIK_VK_VALIDATION`
 /// is set, since without it no layer is loaded and nothing reports.
@@ -156,6 +185,13 @@ pub struct Gpu {
     /// completion into a `sync_file` FD that KMS can take as `IN_FENCE_FD`. Measured
     /// pipelined on Venus — see `sync_spike`.
     external_fence: Option<ash::khr::external_fence_fd::Device>,
+    /// `VK_KHR_external_semaphore_fd`, `VK_KHR_external_memory_fd` and
+    /// `VK_EXT_image_drm_format_modifier`, when the device has them. Loaded here rather than at
+    /// their call sites because each `Device::new` is a `vkGetDeviceProcAddr` — see
+    /// [`DEVICE_LIFECYCLE`].
+    external_semaphore: Option<ash::khr::external_semaphore_fd::Device>,
+    external_memory: Option<ash::khr::external_memory_fd::Device>,
+    drm_format_modifier: Option<ash::ext::image_drm_format_modifier::Device>,
     // The validation layer's messenger, when `SYNOIK_VK_VALIDATION` is set. Destroyed before the
     // instance in `Drop`.
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -227,6 +263,9 @@ impl Gpu {
     /// driver's devices enumerate, so the choice is forced. Everything is logged so the run is
     /// self-documenting.
     pub fn with_selector(selector: DeviceSelector) -> Result<Self> {
+        // Held until the device and all its extension tables exist. See `DEVICE_LIFECYCLE`.
+        let _lifecycle = device_lifecycle_lock();
+
         let entry =
             unsafe { ash::Entry::load() }.context("loading the Vulkan loader (libvulkan)")?;
 
@@ -430,6 +469,15 @@ impl Gpu {
         let external_fence = enabled_cstr
             .contains(&c"VK_KHR_external_fence_fd")
             .then(|| ash::khr::external_fence_fd::Device::new(&instance, &device));
+        let external_semaphore = enabled_cstr
+            .contains(&c"VK_KHR_external_semaphore_fd")
+            .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
+        let external_memory = enabled_cstr
+            .contains(&c"VK_KHR_external_memory_fd")
+            .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        let drm_format_modifier = enabled_cstr
+            .contains(&c"VK_EXT_image_drm_format_modifier")
+            .then(|| ash::ext::image_drm_format_modifier::Device::new(&instance, &device));
 
         let order = has_timeline
             .then(|| {
@@ -469,6 +517,9 @@ impl Gpu {
             modifier_features: Mutex::new(HashMap::new()),
             order,
             external_fence,
+            external_semaphore,
+            external_memory,
+            drm_format_modifier,
             debug,
             instance,
             entry,
@@ -586,6 +637,34 @@ impl Gpu {
         self.enabled_extensions.iter().any(|e| e == ext)
     }
 
+    /// `VK_KHR_external_fence_fd`, or an error naming what is missing.
+    pub fn external_fence(&self) -> Result<&ash::khr::external_fence_fd::Device> {
+        self.external_fence
+            .as_ref()
+            .ok_or_else(|| anyhow!("no VK_KHR_external_fence_fd"))
+    }
+
+    /// `VK_KHR_external_semaphore_fd`, or an error naming what is missing.
+    pub fn external_semaphore(&self) -> Result<&ash::khr::external_semaphore_fd::Device> {
+        self.external_semaphore
+            .as_ref()
+            .ok_or_else(|| anyhow!("no VK_KHR_external_semaphore_fd"))
+    }
+
+    /// `VK_KHR_external_memory_fd`, or an error naming what is missing.
+    pub fn external_memory(&self) -> Result<&ash::khr::external_memory_fd::Device> {
+        self.external_memory
+            .as_ref()
+            .ok_or_else(|| anyhow!("no VK_KHR_external_memory_fd"))
+    }
+
+    /// `VK_EXT_image_drm_format_modifier`, or an error naming what is missing.
+    pub fn drm_format_modifier(&self) -> Result<&ash::ext::image_drm_format_modifier::Device> {
+        self.drm_format_modifier
+            .as_ref()
+            .ok_or_else(|| anyhow!("no VK_EXT_image_drm_format_modifier"))
+    }
+
     /// Pick a memory type satisfying `type_bits` (from a `*MemoryRequirements`) and `flags`.
     pub fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
         (0..self.mem_props.memory_type_count)
@@ -617,7 +696,7 @@ impl Gpu {
         fd: BorrowedFd<'_>,
         req: vk::MemoryRequirements,
     ) -> Result<u32> {
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+        let ext_fd = self.external_memory()?;
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
         // The query borrows the fd; it does NOT consume it (unlike the import that follows), so
         // pass a plain borrow — duping here would leak one fd per call, and this runs per bind.
@@ -717,10 +796,7 @@ impl Gpu {
     /// by [`Self::create_exportable_fence`] and already submitted — a `SYNC_FD` export needs a
     /// signal operation to be pending or complete.
     pub fn export_fence_sync_fd(&self, fence: vk::Fence) -> Result<OwnedFd> {
-        let ext = self
-            .external_fence
-            .as_ref()
-            .ok_or_else(|| anyhow!("no VK_KHR_external_fence_fd"))?;
+        let ext = self.external_fence()?;
         let raw = unsafe {
             ext.get_fence_fd(
                 &vk::FenceGetFdInfoKHR::default()
@@ -885,6 +961,9 @@ impl Drop for RunGuard<'_> {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        // `vkDestroyDevice` unlinks and frees the loader's node for this device. See
+        // `DEVICE_LIFECYCLE`.
+        let _lifecycle = device_lifecycle_lock();
         unsafe {
             let _ = self.device.device_wait_idle();
             if let Some(order) = self.order.as_ref() {

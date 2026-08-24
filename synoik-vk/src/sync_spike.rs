@@ -267,22 +267,22 @@ pub fn run_sync_spike(gpu: &Gpu) -> Result<SyncSpikeReport> {
         .context("open the DRM render node")?;
     let drm = drm.as_fd();
 
-    let ext_sem = ash::khr::external_semaphore_fd::Device::new(&gpu.instance, &gpu.device);
-    let ext_fence = ash::khr::external_fence_fd::Device::new(&gpu.instance, &gpu.device);
+    let ext_sem = gpu.external_semaphore()?;
+    let ext_fence = gpu.external_fence()?;
 
     let busy = BusyWork::new(gpu)?;
     let d = busy.calibrate()?;
 
     // Stage order matters only for readability; each submits its own busy-work.
     let stages = vec![
-        stage_semaphore(gpu, &busy, &ext_sem, d)?,
-        stage_fence(gpu, &busy, &ext_fence, d)?,
-        stage_syncobj_wait(gpu, &busy, &ext_fence, drm, d)?,
-        stage_timeline_transfer(gpu, &busy, &ext_fence, drm, d)?,
+        stage_semaphore(gpu, &busy, ext_sem, d)?,
+        stage_fence(gpu, &busy, ext_fence, d)?,
+        stage_syncobj_wait(gpu, &busy, ext_fence, drm, d)?,
+        stage_timeline_transfer(gpu, &busy, ext_fence, drm, d)?,
     ];
 
     let (neg_control_timed_out, pos_control_signaled) = controls(drm)?;
-    let (eventfd_supported, eventfd_fired) = eventfd_probe(gpu, &busy, &ext_fence, drm, d)?;
+    let (eventfd_supported, eventfd_fired) = eventfd_probe(gpu, &busy, ext_fence, drm, d)?;
 
     let device_is_cpu = gpu.device_type == vk::PhysicalDeviceType::CPU;
     Ok(SyncSpikeReport {
