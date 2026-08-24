@@ -3680,7 +3680,7 @@ fn vulkan_renders_the_scrolled_message_list() {
             let lower = at(cx, list_pad + collapsed_card_h() + 13.5);
             // The scrollbar thumb strip, near the viewport top (scroll at 0). It sits in the
             // gutter the list reserves right of the cards — popover-local, so past `list_pad`.
-            let thumb = at(list_pad + list_w - 7., list_pad + 12.);
+            let thumb = at(list_pad + list_w + 3., list_pad + 12.);
             (card, second, lower, thumb)
         })
         .expect("vulkan renderer");

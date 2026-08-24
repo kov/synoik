@@ -1018,7 +1018,8 @@ const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
 /// (`LIST_SCROLL_R`), a few px from the column edge.
 const SCROLLBAR_W: f64 = 6.;
 const SCROLLBAR_MIN_H: f64 = 24.;
-const SCROLLBAR_EDGE_GAP: f64 = 4.;
+/// Between the handle and the column separator it sits against.
+const SCROLLBAR_EDGE_GAP: f64 = 1.;
 const SCROLLBAR_THUMB: [f32; 4] = [0.45, 0.45, 0.47, 1.];
 
 /// A visible media card's `(bus name, card rect, control rects)`, popover-local (test hook).
@@ -2247,10 +2248,10 @@ impl CalendarMessageList {
         // above `vh` (a very short viewport must not make `min > max`).
         let thumb_h = (vh * vh / p.content_h).clamp(SCROLLBAR_MIN_H.min(vh), vh);
         let thumb_y = p.viewport.loc.y + (p.scroll / max_scroll) * (vh - thumb_h);
-        // Popover-local, like `thumb_y`: the list content starts at `LIST_PAD`, so leaving it out
-        // put the thumb 10px inside the cards instead of in the gutter `LIST_SCROLL_R` reserves
-        // for it right of them (`.message-view:ltr { margin-right: $base_margin * 3 }`).
-        let thumb_x = LIST_PAD + list_w() - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
+        // The handle rides the `.message-list` `padding-right` band, which the SCSS keeps clear
+        // "to account for scrollbar" (`_message-list.scss:10-11`) — so it sits against the column
+        // separator rather than against the cards. Popover-local, like `thumb_y`.
+        let thumb_x = LIST_PAD + list_w() + LIST_PAD_R - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
         let mut cache = self.cache.borrow_mut();
         let rev = self.revision & 0xffff_ffff;
         // A fixed key well above `render_groups`' running counter (which stays
@@ -4796,15 +4797,20 @@ run it with --features reference-env, as the fedora CI job does"
         let h = 346.;
         assert!(list.placed(h).overflowing(), "10 cards overflow");
 
-        let thumb_left = LIST_PAD + list_w() - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
+        let thumb_left = LIST_PAD + list_w() + LIST_PAD_R - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
         let card_right = LIST_PAD + card_w();
+        let separator = LIST_PAD + list_w() + LIST_PAD_R;
         assert!(
             thumb_left >= card_right,
             "the thumb starts at {thumb_left}, inside cards that end at {card_right}"
         );
         assert!(
-            thumb_left + SCROLLBAR_W <= LIST_PAD + list_w(),
-            "and it stays inside the list content"
+            thumb_left + SCROLLBAR_W <= separator,
+            "and it stays clear of the column separator at {separator}"
+        );
+        assert!(
+            thumb_left - card_right > separator - (thumb_left + SCROLLBAR_W),
+            "it rides the separator side of the gutter, not the cards' side"
         );
     }
 
