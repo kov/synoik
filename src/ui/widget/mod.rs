@@ -102,6 +102,38 @@ pub type Rgba = [f32; 4];
 pub mod menu;
 pub use menu::{Menu, MenuEntry, MenuHit, MenuItem, Ornament};
 
+/// A keyboard navigation step, as GNOME's `StDirectionType` reaches a widget through
+/// `StFocusManager` (`src/st/st-focus-manager.c:82-106`): the four arrows navigate within the
+/// focus group, and Tab / Shift-Tab step the chain with wrap-around.
+///
+/// Every popover content maps these onto its own rows or cells — there is no actor tree here for
+/// a stage-level focus manager to walk, so the focus state lives in each content, next to the
+/// rects it already computes for hit-testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Tab — a forward step through the focus chain.
+    TabForward,
+    /// Shift-Tab (`ISO_Left_Tab`) — a backward step.
+    TabBackward,
+}
+
+impl Dir {
+    /// The row delta this direction means to a **linear** list of rows: a menu treats Tab exactly
+    /// as Down, which is what `StFocusManager` produces for a single-column focus chain.
+    /// `None` for the horizontal directions, which a linear list does not consume.
+    pub fn row_delta(self) -> Option<isize> {
+        match self {
+            Dir::Down | Dir::TabForward => Some(1),
+            Dir::Up | Dir::TabBackward => Some(-1),
+            Dir::Left | Dir::Right => None,
+        }
+    }
+}
+
 pub mod style {
     use super::Rgba;
 

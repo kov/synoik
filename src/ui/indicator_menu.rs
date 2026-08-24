@@ -21,7 +21,7 @@ use crate::dbusmenu::{to_entries, MenuNode};
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{Menu, MenuHit};
+use crate::ui::widget::{Dir, Menu, MenuHit};
 
 pub struct IndicatorMenu {
     /// The indicator this menu belongs to — every action carries it back out, because the
@@ -91,8 +91,45 @@ impl IndicatorMenu {
     /// (`dbusMenu.js:664-673`). The row ids are the client's own node ids, carried through
     /// [`crate::dbusmenu`] as `u64` and named back to it as `i32`.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
+        let hit = self.menu.pointer_click(pos);
+        self.resolve(hit)
+    }
+
+    /// The keyboard-focused row's label, if any.
+    pub fn focused_label(&self) -> Option<String> {
+        self.menu.focused_label()
+    }
+
+    /// Take one keyboard navigation step. Returns whether the key was consumed.
+    ///
+    /// Expanding by keyboard owes the client the same `AboutToShow` a click does, so a Right that
+    /// opened a submenu is reported as an expand rather than swallowed.
+    pub fn nav(&mut self, dir: Dir) -> Option<PopoverAction> {
+        let before = self.menu.focused_id();
+        if !self.menu.nav(dir) {
+            return None;
+        }
+        // Right on a submenu row expanded it (and moved into it); that row's children are what
+        // the client is being asked to fill in.
+        let opened = before.filter(|&id| dir == Dir::Right && self.menu.is_expanded(id));
+        Some(match opened {
+            Some(node) => PopoverAction::IndicatorMenuExpand {
+                item_id: self.item_id.clone(),
+                node_id: node as i32,
+            },
+            None => PopoverAction::Consumed,
+        })
+    }
+
+    /// Activate the keyboard-focused row (Enter/Space).
+    pub fn activate_focused(&mut self) -> PopoverAction {
+        let hit = self.menu.activate_focused();
+        self.resolve(hit)
+    }
+
+    fn resolve(&self, hit: MenuHit) -> PopoverAction {
         let item_id = self.item_id.clone();
-        match self.menu.pointer_click(pos) {
+        match hit {
             MenuHit::Activated(id) => PopoverAction::IndicatorMenuActivate {
                 item_id,
                 node_id: id as i32,

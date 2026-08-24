@@ -41,7 +41,7 @@ use crate::app_system::{AppEntry, AppState, RunningWindow};
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem};
+use crate::ui::widget::{Dir, Menu, MenuEntry, MenuHit, MenuItem};
 use crate::window::mapped::MappedId;
 
 /// What activating a row does. The menu widget knows rows only by `u64`, so the mapping from row
@@ -212,7 +212,29 @@ impl AppMenu {
     /// content padding is consumed without doing anything, like gnome-shell's
     /// non-reactive separator items.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
-        let MenuHit::Activated(id) = self.menu.pointer_click(pos) else {
+        let hit = self.menu.pointer_click(pos);
+        self.resolve(hit)
+    }
+
+    /// The keyboard-focused row's label, if any.
+    pub fn focused_label(&self) -> Option<String> {
+        self.menu.focused_label()
+    }
+
+    /// Take one keyboard navigation step. Returns whether the key was consumed.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        self.menu.nav(dir)
+    }
+
+    /// Activate the keyboard-focused row (Enter/Space).
+    pub fn activate_focused(&mut self) -> PopoverAction {
+        let hit = self.menu.activate_focused();
+        self.resolve(hit)
+    }
+
+    /// Turn a widget hit into the action it means.
+    fn resolve(&self, hit: MenuHit) -> PopoverAction {
+        let MenuHit::Activated(id) = hit else {
             // This menu has no submenus, so `Toggled` cannot occur.
             return PopoverAction::Consumed;
         };

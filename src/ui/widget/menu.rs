@@ -38,7 +38,7 @@ use std::collections::HashSet;
 
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
-use super::{style, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle};
+use super::{style, Align, BakeCache, Dir, Painter, ShapedText, TextShaper, TextStyle};
 use crate::render_helpers::vulkan::{VulkanFrame, VulkanRenderer};
 
 /// `.popup-menu-content` padding — `$base_padding` (`_popovers.scss:28`).
@@ -630,6 +630,15 @@ impl Menu {
         self.focused.and_then(|k| self.row_id(k))
     }
 
+    /// The focused row's label, if any — how the corpus names the focus without arithmetic over
+    /// the box model.
+    pub fn focused_label(&self) -> Option<String> {
+        let k = self.focused?;
+        let rows = self.visible_rows();
+        self.item_at(&rows.get(k)?.path)
+            .map(|item| item.label.clone())
+    }
+
     /// Move the keyboard focus by `delta` rows, skipping anything that cannot take it (separators,
     /// headers, disabled rows) and wrapping at the ends, as GNOME's menus do.
     ///
@@ -708,6 +717,58 @@ impl Menu {
             self.scroll_focus_into_view();
         }
         changed
+    }
+
+    /// Take one navigation step, GNOME's item-level key handling for a menu
+    /// (`popupMenu.js:171-177` for the arrows, `1392-1404` for a submenu row).
+    ///
+    /// Returns whether the key was consumed. `false` means it was not a menu gesture — Left on a
+    /// top-level row, say — and the caller may do whatever it does with an unconsumed key.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        if let Some(delta) = dir.row_delta() {
+            return self.focus_step(delta);
+        }
+        match dir {
+            // `this.menu.actor.navigate_focus(null, DOWN, false)` right after opening
+            // (`popupMenu.js:1397`): Right opens the submenu *and* moves into it.
+            Dir::Right => {
+                if !self.focus_expand(true) {
+                    return false;
+                }
+                self.focus_step(1);
+                true
+            }
+            Dir::Left => self.focus_collapse(),
+            // `row_delta` covered the rest.
+            _ => false,
+        }
+    }
+
+    /// Left: close the focused submenu row, or — when the focus is already *inside* one — close
+    /// the parent and take the focus back to its row (`popupMenu.js:1265-1275`, where the
+    /// submenu's own key handler closes it and re-activates `sourceActor`).
+    pub fn focus_collapse(&mut self) -> bool {
+        if self.focus_expand(false) {
+            return true;
+        }
+        let Some(k) = self.focused else {
+            return false;
+        };
+        let rows = self.visible_rows();
+        let Some(path) = rows.get(k).map(|row| row.path.clone()) else {
+            return false;
+        };
+        if path.len() < 2 {
+            return false;
+        }
+        let Some(parent) = self.item_at(&path[..path.len() - 1]).map(|item| item.id) else {
+            return false;
+        };
+        self.set_expanded(parent, false);
+        self.focused = self.index_of(parent);
+        self.revision += 1;
+        self.scroll_focus_into_view();
+        true
     }
 
     /// Clear hover and focus — what closing and reopening a menu owes.

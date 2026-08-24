@@ -7770,6 +7770,83 @@ fn alt_space_pops_the_window_menu_and_the_keyboard_drives_it() {
     );
 }
 
+/// A menu takes a *bare* arrow only: "if user has a modifier down (except capslock and numlock)
+/// then don't handle the key press here" (`popupMenu.js:153-162`) — Ctrl+Down is somebody else's
+/// chord, and a menu that ate it as navigation would swallow the chord and move the focus.
+///
+/// Tab is the exception. `StFocusManager` maps it off the *stage*, ahead of any item's handler and
+/// its modifier guard (`st-focus-manager.c:96-105`), so Shift+Tab still steps the chain backwards.
+#[test]
+fn menu_navigation_ignores_modified_arrows_but_not_shift_tab() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    open_window_menu_at_corner(&mut f);
+
+    let labels: Vec<String> = f
+        .synoik()
+        .panel_popover
+        .window_menu()
+        .unwrap()
+        .labels()
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+    let first = labels.first().unwrap().clone();
+    let last = labels.last().unwrap().clone();
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .window_menu()
+            .unwrap()
+            .focused_label(),
+        Some(first.clone()),
+        "the keyboard-opened menu starts on its first row"
+    );
+
+    f.key_press(KEY_LEFTCTRL);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .window_menu()
+            .unwrap()
+            .focused_label(),
+        Some(first.clone()),
+        "a modified arrow is not menu navigation"
+    );
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_TAB);
+    f.key_release(KEY_TAB);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .window_menu()
+            .unwrap()
+            .focused_label(),
+        Some(last),
+        "Shift+Tab steps backwards, wrapping to the last row"
+    );
+
+    f.key_press(KEY_TAB);
+    f.key_release(KEY_TAB);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .window_menu()
+            .unwrap()
+            .focused_label(),
+        Some(first),
+        "and Tab steps forward again"
+    );
+}
+
 /// Escape dismisses the window menu, like every other popup menu.
 #[test]
 fn escape_dismisses_the_window_menu() {
@@ -27004,6 +27081,58 @@ fn click_first_indicator(f: &mut Fixture, button: u32) {
     f.pointer_button(button, ButtonState::Released);
 }
 
+/// A **pointer-opened** menu takes the keyboard too. gnome-shell's items handle the arrows the
+/// moment the menu is up, whatever summoned it; what a mouse-opened menu differs in is only the
+/// starting focus — nothing is focused, and the first Down enters the list
+/// (`popupMenu.js:1507-1512`), where a keybinding-opened one starts on row one
+/// (`panel.js:588-591`).
+#[test]
+fn a_right_clicked_app_menu_takes_the_keyboard() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    assert!(f.synoik().panel_popover.is_app_menu());
+    assert_eq!(
+        f.synoik().panel_popover.app_menu().unwrap().focused_label(),
+        None,
+        "a pointer-opened menu comes up with nothing focused"
+    );
+
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert_eq!(
+        f.synoik().panel_popover.app_menu().unwrap().focused_label(),
+        Some("New Window".to_owned()),
+        "the first Down enters the list at its top"
+    );
+
+    f.key_press(KEY_UP);
+    f.key_release(KEY_UP);
+    assert_eq!(
+        f.synoik().panel_popover.app_menu().unwrap().focused_label(),
+        Some("Unpin".to_owned()),
+        "and Up wraps to the last row"
+    );
+
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["b.desktop"],
+        "Enter runs the focused row"
+    );
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "and a row that acts closes the menu, like a clicked one"
+    );
+}
+
 /// A client's layout, as `GetLayout` would deliver it: a root whose children are the rows.
 #[cfg(test)]
 fn test_menu_layout() -> crate::dbusmenu::MenuNode {
@@ -27025,6 +27154,94 @@ fn test_menu_layout() -> crate::dbusmenu::MenuNode {
         ],
         ..MenuNode::new(0)
     }
+}
+
+/// Right opens the focused submenu and moves into it; Left closes it and takes the focus back to
+/// its row (`popupMenu.js:1392-1404` and `1265-1275`). Opening one by keyboard owes the client the
+/// same `AboutToShow` a click does — a submenu whose rows are never asked for comes up empty.
+#[test]
+fn the_keyboard_opens_and_closes_an_indicator_submenu() {
+    use crate::dbusmenu::MenuNode;
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
+    click_first_indicator(&mut f, BTN_LEFT);
+    f.synoik_state().reconcile_indicator_menu();
+
+    let row = |id: i32, label: &str| MenuNode {
+        label: label.to_owned(),
+        ..MenuNode::new(id)
+    };
+    f.synoik_state().on_status_notifier_msg(
+        crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
+            item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
+            root: Box::new(MenuNode {
+                children: vec![
+                    row(1, "Open"),
+                    MenuNode {
+                        label: "Recent".to_owned(),
+                        children: vec![row(3, "One"), row(4, "Two")],
+                        ..MenuNode::new(2)
+                    },
+                    row(5, "Quit"),
+                ],
+                ..MenuNode::new(0)
+            }),
+        },
+    );
+    while rx.try_recv().is_ok() {}
+
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .indicator_menu()
+            .unwrap()
+            .focused_label(),
+        Some("Recent".to_owned()),
+    );
+
+    f.key_press(KEY_RIGHT);
+    f.key_release(KEY_RIGHT);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .indicator_menu()
+            .unwrap()
+            .focused_label(),
+        Some("One".to_owned()),
+        "Right opens the submenu AND moves into it"
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(Req::MenuOpenSubmenu(2)),
+        "the client is asked to fill the submenu it just opened"
+    );
+
+    f.key_press(KEY_LEFT);
+    f.key_release(KEY_LEFT);
+    assert_eq!(
+        f.synoik()
+            .panel_popover
+            .indicator_menu()
+            .unwrap()
+            .focused_label(),
+        Some("Recent".to_owned()),
+        "Left from inside closes the submenu and returns to its row"
+    );
+    assert_eq!(
+        f.synoik().panel_popover.indicator_menu().unwrap().labels(),
+        vec!["Open", "Recent", "Quit"],
+        "and its children are gone with it"
+    );
 }
 
 /// Clicking an indicator opens its menu, which is **empty** until the client answers: a remote

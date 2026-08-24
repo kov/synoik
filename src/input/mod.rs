@@ -1259,7 +1259,7 @@ impl State {
                         }
                     }
 
-                    this.synoik.panel_popover.handle_key(raw, pressed);
+                    this.synoik.panel_popover.handle_key(raw, mods, pressed);
                     this.synoik.queue_redraw_all();
 
                     if pressed {
@@ -1674,8 +1674,9 @@ impl State {
             self.synoik.queue_redraw_switcher_output();
         }
 
-        // A window-menu row activated by Enter parks its action rather than applying it inside
-        // the keyboard filter, which still holds the keyboard borrowed. Drain it here.
+        // A menu row activated (or a submenu opened) by keyboard parks its action rather than
+        // applying it inside the keyboard filter, which still holds the keyboard borrowed.
+        // Drain it here.
         if let Some(action) = self.synoik.panel_popover.take_pending_action() {
             self.apply_popover_action(action);
             self.synoik.queue_redraw_all();

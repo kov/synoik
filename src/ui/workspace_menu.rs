@@ -22,7 +22,7 @@ use crate::layout::workspace::WorkspaceId;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem};
+use crate::ui::widget::{Dir, Menu, MenuEntry, MenuHit, MenuItem};
 
 /// What activating a row does. The menu widget knows rows only by `u64`, so the mapping from
 /// row id to action lives here — the id is this table's index.
@@ -173,6 +173,16 @@ impl WorkspaceMenu {
     /// Move the keyboard focus by `delta` rows. Returns whether it moved.
     pub fn focus_step(&mut self, delta: isize) -> bool {
         self.menu.focus_step(delta)
+    }
+
+    /// The keyboard-focused row's label, if any.
+    pub fn focused_label(&self) -> Option<String> {
+        self.menu.focused_label()
+    }
+
+    /// Take one keyboard navigation step. Returns whether the key was consumed.
+    pub fn nav(&mut self, dir: Dir) -> bool {
+        self.menu.nav(dir)
     }
 
     /// Activate the keyboard-focused row (Enter/Space).

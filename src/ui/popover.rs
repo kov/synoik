@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture as _;
-use smithay::input::keyboard::Keysym;
+use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use synoik_config::Config;
@@ -398,6 +398,48 @@ impl PopoverContent {
             PopoverContent::Indicator(m) => m.logical_size(),
             PopoverContent::Window(m) => m.logical_size(),
             PopoverContent::Workspace(m) => m.logical_size(),
+        }
+    }
+
+    /// Take one keyboard navigation step. Returns the action it produced, if any — most
+    /// navigation has no side effect outside the menu, but an indicator submenu opening owes its
+    /// client an `AboutToShow`.
+    ///
+    /// A content that has no focus model yet simply consumes the key: the popover holds a modal
+    /// grab either way, so an unhandled arrow must not fall through to the window beneath.
+    fn nav(&mut self, dir: widget::Dir) -> Option<PopoverAction> {
+        match self {
+            PopoverContent::App(m) => {
+                m.nav(dir);
+                None
+            }
+            PopoverContent::Indicator(m) => m.nav(dir),
+            PopoverContent::Window(m) => {
+                m.nav(dir);
+                None
+            }
+            PopoverContent::Workspace(m) => {
+                m.nav(dir);
+                None
+            }
+            PopoverContent::Calendar(_)
+            | PopoverContent::QuickSettings(_)
+            | PopoverContent::InputSources(_)
+            | PopoverContent::A11y(_) => None,
+        }
+    }
+
+    /// Activate whatever the keyboard focus is on (Enter/Space).
+    fn activate_focused(&mut self) -> PopoverAction {
+        match self {
+            PopoverContent::App(m) => m.activate_focused(),
+            PopoverContent::Indicator(m) => m.activate_focused(),
+            PopoverContent::Window(m) => m.activate_focused(),
+            PopoverContent::Workspace(m) => m.activate_focused(),
+            PopoverContent::Calendar(_)
+            | PopoverContent::QuickSettings(_)
+            | PopoverContent::InputSources(_)
+            | PopoverContent::A11y(_) => PopoverAction::Consumed,
         }
     }
 
@@ -1302,20 +1344,27 @@ impl PanelPopover {
         self.anim = None;
     }
 
-    /// Feed a key while the popover is open. Escape closes it; a window menu also takes the
-    /// arrows and Enter/Space, since it is the one popover with a keyboard way in
-    /// (`activate-window-menu`). Every other key is swallowed (a modal grab, like GNOME popup
-    /// menus). Returns whether the key was consumed. A closing (fading-out) popover no longer
-    /// grabs input.
+    /// Feed a key while the popover is open. Escape closes it; the arrows, Tab and Enter/Space
+    /// navigate and activate whatever content is up. Every other key is swallowed (a modal grab,
+    /// like GNOME popup menus). Returns whether the key was consumed. A closing (fading-out)
+    /// popover no longer grabs input.
+    ///
+    /// How the menu was summoned does not gate this: gnome-shell's items take the arrows the
+    /// moment the menu is open, whether a click or a keybinding opened it. What the two differ in
+    /// is the *starting* focus — a keyboard-opened menu lands on its first row
+    /// (`panel.js:588-591`), a pointer-opened one starts with nothing focused and the first Down
+    /// enters the list (`popupMenu.js:1507-1512`).
     ///
     /// An activated row's action is *parked* on [`Self::take_pending_action`] rather than
     /// returned: this runs inside smithay's keyboard filter, which holds the keyboard borrowed,
     /// and applying an action there would re-enter it. The caller drains it once `input()` is
     /// done.
-    ///
-    /// The pointer-summoned menus (app, indicator) have no key navigation because they have no
-    /// keyboard trigger to arrive from; they get it when they get one.
-    pub fn handle_key(&mut self, raw: Option<Keysym>, pressed: bool) -> bool {
+    pub fn handle_key(
+        &mut self,
+        raw: Option<Keysym>,
+        mods: &ModifiersState,
+        pressed: bool,
+    ) -> bool {
         if !self.open || self.closing {
             return false;
         }
@@ -1326,24 +1375,43 @@ impl PanelPopover {
             self.close();
             return true;
         }
-        let Some(PopoverContent::Window(menu)) = self.content.as_mut() else {
+        let Some(content) = self.content.as_mut() else {
             return true;
         };
-        match raw {
-            Some(Keysym::Down | Keysym::Tab) => {
-                menu.focus_step(1);
-            }
-            Some(Keysym::Up | Keysym::ISO_Left_Tab) => {
-                menu.focus_step(-1);
-            }
-            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
-                let action = menu.activate_focused();
-                if action.closes_menu() {
-                    self.close();
-                }
+
+        // Tab is a focus-chain step whatever else is held — `StFocusManager` runs it off the
+        // stage, before any item's own handler and its modifier guard
+        // (`st-focus-manager.c:96-105`).
+        let dir = match raw {
+            Some(Keysym::Tab) if mods.shift => Some(widget::Dir::TabBackward),
+            Some(Keysym::Tab) => Some(widget::Dir::TabForward),
+            Some(Keysym::ISO_Left_Tab) => Some(widget::Dir::TabBackward),
+            // "if user has a modifier down (except capslock and numlock) then don't handle the
+            // key press here" (`popupMenu.js:153-162`). Held down, an arrow is somebody else's
+            // chord, and the menu must not eat it as navigation.
+            _ if mods.ctrl || mods.alt || mods.shift || mods.logo => None,
+            Some(Keysym::Down) => Some(widget::Dir::Down),
+            Some(Keysym::Up) => Some(widget::Dir::Up),
+            Some(Keysym::Left) => Some(widget::Dir::Left),
+            Some(Keysym::Right) => Some(widget::Dir::Right),
+            _ => None,
+        };
+        if let Some(dir) = dir {
+            if let Some(action) = content.nav(dir) {
                 self.pending_action = Some(action);
             }
-            _ => (),
+            return true;
+        }
+
+        if mods.ctrl || mods.alt || mods.shift || mods.logo {
+            return true;
+        }
+        if let Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) = raw {
+            let action = content.activate_focused();
+            if action.closes_menu() {
+                self.close();
+            }
+            self.pending_action = Some(action);
         }
         true
     }
