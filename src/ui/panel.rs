@@ -1398,6 +1398,28 @@ impl Panel {
         })
     }
 
+    /// Every panel item that owns a menu, left to right — the chain Left/Right walks while one of
+    /// those menus is open (`panelMenu.js:153-164`, whose `get_group` resolves to the Panel
+    /// itself: `panel.js:469` registers it as a ctrl-alt-tab group, and that is what makes it a
+    /// focus group).
+    ///
+    /// **App indicators are deliberately absent.** GNOME's chain does include them, but a
+    /// left-click on one of ours may `Activate` the item rather than open a menu, and merely
+    /// stepping the focus past an icon must never activate it. They belong here once an
+    /// indicator's menu can be opened without going through its click.
+    pub fn menu_roles(&self, output_width: f64) -> Vec<(&'static str, Rectangle<f64, Logical>)> {
+        let mut out = vec![(ROLE_DATE_MENU, self.date_menu_rect(output_width))];
+        if let Some(rect) = self.a11y_rect(output_width) {
+            out.push((ROLE_A11Y, rect));
+        }
+        if let Some(rect) = self.keyboard_rect(output_width) {
+            out.push((ROLE_KEYBOARD, rect));
+        }
+        out.push((ROLE_QUICK_SETTINGS, self.quick_settings_rect(output_width)));
+        out.sort_by(|(_, a), (_, b)| a.loc.x.total_cmp(&b.loc.x));
+        out
+    }
+
     /// Which indicator sits at an output-local position.
     pub fn app_indicator_at(&self, pos: Point<f64, Logical>, output_width: f64) -> Option<&str> {
         self.app_indicator_hit(pos, output_width).map(|(id, _)| id)

@@ -2107,9 +2107,11 @@ impl QuickSettings {
         self.focused.filter(|f| stops.iter().any(|(s, _)| s == f))
     }
 
-    /// Take one keyboard navigation step, returning any action it produced — moving the focus
-    /// produces none, but a slider's Left/Right changes a value.
-    pub fn nav(&mut self, dir: Dir) -> Option<PopoverAction> {
+    /// Take one keyboard navigation step: `(consumed, action)`. Moving the focus produces no
+    /// action, but a slider's Left/Right changes a value. An **unconsumed** key is one this menu
+    /// had no use for — a Right with nothing to its right — which the caller may spend on the
+    /// panel chain instead.
+    pub fn nav(&mut self, dir: Dir) -> (bool, Option<PopoverAction>) {
         let stops = self.stops();
         let focused = self.live_focus(&stops);
 
@@ -2124,17 +2126,19 @@ impl QuickSettings {
             },
         ) {
             if let Some(action) = self.nudge_slider(stop, step) {
-                return Some(action);
+                return (true, Some(action));
             }
         }
 
         let rects: Vec<_> = stops.iter().map(|(_, r)| *r).collect();
         let from = focused.and_then(|f| stops.iter().position(|(s, _)| *s == f));
         let group = Rectangle::from_size(self.logical_size());
-        let next = widget::step_rects(&rects, group, from, dir)?;
+        let Some(next) = widget::step_rects(&rects, group, from, dir) else {
+            return (false, None);
+        };
         self.focused = Some(stops[next].0);
         self.revision += 1;
-        None
+        (true, None)
     }
 
     /// Move a focused slider's value by `step`, if the focus is on one. `None` when it is not, so
@@ -4375,12 +4379,12 @@ run it with --features reference-env, as the fedora CI job does"
         // Walk to the output slider's track.
         while qs.focused_for_test().as_deref() != Some("SliderTrack(Output)") {
             assert!(
-                qs.nav(Dir::TabForward).is_none(),
+                qs.nav(Dir::TabForward).1.is_none(),
                 "tabbing round the chain must not act on anything"
             );
         }
 
-        let action = qs.nav(Dir::Right).expect("Right moves the slider");
+        let action = qs.nav(Dir::Right).1.expect("Right moves the slider");
         match action {
             PopoverAction::SetVolume(v) => assert!(
                 (v - 0.6).abs() < 1e-9,
@@ -4394,7 +4398,7 @@ run it with --features reference-env, as the fedora CI job does"
             "and the focus stays on the slider it moved"
         );
         assert!(matches!(
-            qs.nav(Dir::Left),
+            qs.nav(Dir::Left).1,
             Some(PopoverAction::SetVolume(_))
         ));
 
@@ -4406,7 +4410,10 @@ run it with --features reference-env, as the fedora CI job does"
             qs.nav(Dir::TabForward);
         }
         let before = qs.focused_for_test();
-        assert!(qs.nav(Dir::Right).is_none(), "a tile's Right is navigation");
+        assert!(
+            qs.nav(Dir::Right).1.is_none(),
+            "a tile's Right is navigation"
+        );
         assert_ne!(qs.focused_for_test(), before);
     }
 
@@ -4456,7 +4463,7 @@ run it with --features reference-env, as the fedora CI job does"
         // The card opened below the system row, so Down out of the button lands in it. (Nothing
         // has advanced the expand animation, so it reads as settled and the rows are live.)
         assert!(qs.expand.settled());
-        assert!(qs.nav(Dir::Down).is_none());
+        assert!(qs.nav(Dir::Down).1.is_none());
         assert!(
             qs.focused_for_test()
                 .is_some_and(|f| f.starts_with("DetailRow(")),

@@ -1867,6 +1867,69 @@ impl State {
 
     /// `pub(crate)` so the corpus can drive an action straight in: several of them are
     /// only reachable through a click that would really launch something.
+    /// Open the panel menu `delta` places along from the one that is open, focused — the
+    /// Left/Right an open panel menu did not consume (`panelMenu.js:153-164`, then
+    /// `popupMenu.js:1474-1483` opening whichever menu the focus landed on).
+    ///
+    /// No wrap: `StFocusManager` navigates the arrows with `wrap_around = FALSE`, so the leftmost
+    /// menu's Left and the rightmost's Right do nothing.
+    fn step_panel_menu(&mut self, delta: i32) {
+        let Some(output) = self.synoik.panel_popover.output().cloned() else {
+            return;
+        };
+        let Some(role) = self.synoik.panel_popover.open_role() else {
+            return;
+        };
+        let output_w = output_size(&output).w;
+        let roles = self.synoik.panel.menu_roles(output_w);
+        let Some(from) = roles.iter().position(|(r, _)| *r == role) else {
+            return;
+        };
+        let Some(&(next_role, anchor)) = from
+            .checked_add_signed(delta as isize)
+            .and_then(|i| roles.get(i))
+        else {
+            return;
+        };
+        self.open_panel_menu(&output, next_role, anchor);
+        // Arriving by keyboard, so it comes up focused, like the keybinding-opened menus.
+        self.synoik.panel_popover.focus_first();
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Open (or toggle) the panel menu for `role`, anchored on its indicator. The one place that
+    /// knows which menu each panel role owns, so a click and the keyboard chain cannot disagree.
+    fn open_panel_menu(
+        &mut self,
+        output: &Output,
+        role: &'static str,
+        anchor: Rectangle<f64, Logical>,
+    ) {
+        match role {
+            crate::ui::panel::ROLE_DATE_MENU => self.toggle_date_menu(output.clone()),
+            crate::ui::panel::ROLE_QUICK_SETTINGS => {
+                self.toggle_quick_settings_menu(output.clone())
+            }
+            crate::ui::panel::ROLE_KEYBOARD => {
+                let (items, active) = self.input_source_menu_snapshot();
+                self.synoik.panel_popover.toggle_input_sources(
+                    output.clone(),
+                    anchor,
+                    items,
+                    active,
+                );
+            }
+            crate::ui::panel::ROLE_A11Y => {
+                let a11y = self.synoik.gnome_settings.a11y;
+                let accent = self.synoik.gnome_settings.accent_color;
+                self.synoik
+                    .panel_popover
+                    .toggle_a11y(output.clone(), anchor, a11y, accent);
+            }
+            _ => (),
+        }
+    }
+
     pub(crate) fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
         use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
 
@@ -1937,6 +2000,9 @@ impl State {
                     &item_id,
                     SynoikToStatusNotifier::MenuActivate { node_id, token },
                 );
+            }
+            PopoverAction::StepPanelMenu(delta) => {
+                self.step_panel_menu(delta);
             }
             PopoverAction::IndicatorMenuExpand { item_id, node_id } => {
                 self.send_indicator_menu_request(
@@ -8296,13 +8362,11 @@ impl State {
                                 self.do_action(Action::ToggleOverview, false);
                                 return;
                             }
-                            Some(crate::ui::panel::ROLE_DATE_MENU) => {
-                                self.toggle_date_menu(output);
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                return;
-                            }
-                            Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
-                                self.toggle_quick_settings_menu(output);
+                            Some(role @ crate::ui::panel::ROLE_DATE_MENU)
+                            | Some(role @ crate::ui::panel::ROLE_QUICK_SETTINGS) => {
+                                // Anchored by the role's own rect inside `open_panel_menu`; these
+                                // two ignore the anchor passed here.
+                                self.open_panel_menu(&output, role, Rectangle::default());
                                 self.synoik.suppressed_buttons.insert(button_code);
                                 return;
                             }
@@ -8314,28 +8378,21 @@ impl State {
                                 self.synoik.queue_redraw_all();
                                 return;
                             }
-                            Some(crate::ui::panel::ROLE_KEYBOARD) => {
+                            Some(role @ crate::ui::panel::ROLE_KEYBOARD) => {
                                 // Open the input-source (keyboard-layout) menu, anchored on the
                                 // indicator (gnome-shell's `InputSourceIndicator` popup).
                                 if let Some(anchor) = self.synoik.panel.keyboard_rect(output_w) {
-                                    let (items, active) = self.input_source_menu_snapshot();
-                                    self.synoik
-                                        .panel_popover
-                                        .toggle_input_sources(output, anchor, items, active);
+                                    self.open_panel_menu(&output, role, anchor);
                                 }
                                 self.synoik.suppressed_buttons.insert(button_code);
                                 self.synoik.queue_redraw_all();
                                 return;
                             }
-                            Some(crate::ui::panel::ROLE_A11Y) => {
+                            Some(role @ crate::ui::panel::ROLE_A11Y) => {
                                 // Open the accessibility menu, anchored on the indicator
                                 // (gnome-shell's `ATIndicator`).
                                 if let Some(anchor) = self.synoik.panel.a11y_rect(output_w) {
-                                    let a11y = self.synoik.gnome_settings.a11y;
-                                    let accent = self.synoik.gnome_settings.accent_color;
-                                    self.synoik
-                                        .panel_popover
-                                        .toggle_a11y(output, anchor, a11y, accent);
+                                    self.open_panel_menu(&output, role, anchor);
                                 }
                                 self.synoik.suppressed_buttons.insert(button_code);
                                 self.synoik.queue_redraw_all();

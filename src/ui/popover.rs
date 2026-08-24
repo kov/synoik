@@ -97,6 +97,10 @@ pub enum PopoverAction {
     /// The click was consumed but has no side effect (e.g. a calendar day, or a
     /// hit on empty menu space). The popover stays open.
     Consumed,
+    /// Move to the panel menu `delta` places along and open it: the Left/Right an open panel
+    /// menu did not consume. `-1` is left, `+1` right; it does not wrap, because
+    /// `StFocusManager` navigates arrows without wrap-around.
+    StepPanelMenu(i32),
     /// Activate an app by desktop id, presenting it if it is already running
     /// (`shell_app_activate`). What gnome-shell's own quick-settings items do — its
     /// `SettingsItem` looks `org.gnome.Settings.desktop` up and calls `activate()`
@@ -423,34 +427,19 @@ impl PopoverContent {
     ///
     /// A content that has no focus model yet simply consumes the key: the popover holds a modal
     /// grab either way, so an unhandled arrow must not fall through to the window beneath.
-    fn nav(&mut self, dir: widget::Dir) -> Option<PopoverAction> {
+    fn nav(&mut self, dir: widget::Dir) -> (bool, Option<PopoverAction>) {
         match self {
-            PopoverContent::App(m) => {
-                m.nav(dir);
-                None
-            }
-            PopoverContent::Indicator(m) => m.nav(dir),
-            PopoverContent::Window(m) => {
-                m.nav(dir);
-                None
-            }
-            PopoverContent::Workspace(m) => {
-                m.nav(dir);
-                None
-            }
-            PopoverContent::InputSources(m) => {
-                m.nav(dir);
-                None
-            }
-            PopoverContent::A11y(m) => {
-                m.nav(dir);
-                None
-            }
+            PopoverContent::App(m) => (m.nav(dir), None),
+            PopoverContent::Indicator(m) => match m.nav(dir) {
+                Some(action) => (true, Some(action)),
+                None => (false, None),
+            },
+            PopoverContent::Window(m) => (m.nav(dir), None),
+            PopoverContent::Workspace(m) => (m.nav(dir), None),
+            PopoverContent::InputSources(m) => (m.nav(dir), None),
+            PopoverContent::A11y(m) => (m.nav(dir), None),
             PopoverContent::QuickSettings(qs) => qs.nav(dir),
-            PopoverContent::Calendar(dm) => {
-                dm.nav(dir);
-                None
-            }
+            PopoverContent::Calendar(dm) => (dm.nav(dir), None),
         }
     }
 
@@ -1462,8 +1451,24 @@ impl PanelPopover {
             _ => None,
         };
         if let Some(dir) = dir {
-            if let Some(action) = content.nav(dir) {
+            let (consumed, action) = content.nav(dir);
+            if let Some(action) = action {
                 self.pending_action = Some(action);
+            }
+            // A Left/Right the content did not want walks to the next panel menu instead — the
+            // panel is the focus group a panel button's arrows navigate (`panelMenu.js:153-164`),
+            // and the menu manager opens whichever menu the focus lands on
+            // (`popupMenu.js:1474-1483`). A menu that DID consume it (a submenu opening, a slider
+            // moving) keeps it, which is the precedence `navigate_from_event` gives the item.
+            if !consumed && self.is_panel_menu() {
+                let delta = match dir {
+                    widget::Dir::Right => 1,
+                    widget::Dir::Left => -1,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    self.pending_action = Some(PopoverAction::StepPanelMenu(delta));
+                }
             }
             return true;
         }
@@ -1512,6 +1517,12 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) => dm.focus_first(),
             None => (),
         }
+    }
+
+    /// Whether what is up is one of the *panel's* menus — the ones the panel chain walks between.
+    /// A window menu or a dash icon's menu hangs off something else and has no neighbours.
+    fn is_panel_menu(&self) -> bool {
+        self.open_role().is_some()
     }
 
     /// Take the action a keyboard activation parked, if any. See [`Self::handle_key`].

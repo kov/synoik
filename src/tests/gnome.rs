@@ -3862,6 +3862,71 @@ fn super_a_toggles_the_app_grid() {
     );
 }
 
+/// A Left/Right the open menu has no use for walks to the **next panel menu** and opens it. In
+/// gnome-shell a panel button's arrows navigate the Panel — the focus group it becomes by being
+/// registered for ctrl-alt-tab (`panel.js:469`) — and the menu manager opens whichever menu the
+/// focus lands on (`panelMenu.js:153-164`, `popupMenu.js:1474-1483`).
+///
+/// The menu gets first refusal, which is what `navigate_from_event` gives it: a key the content
+/// consumed never reaches the panel.
+#[test]
+fn an_unconsumed_left_right_walks_to_the_next_panel_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Quick settings sits left of the clock in the panel, so Right off it reaches the date menu.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_S);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+    );
+
+    // A Right the grid CAN use just moves the focus inside quick settings.
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    let inside = f.synoik().panel_popover.focused_row_label();
+    f.key_press(KEY_RIGHT);
+    f.key_release(KEY_RIGHT);
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        "a Right the menu consumed must not leave it"
+    );
+    assert_ne!(f.synoik().panel_popover.focused_row_label(), inside);
+
+    // Walk to the right edge of the grid; the Right past it belongs to the panel.
+    for _ in 0..12 {
+        if f.synoik().panel_popover.open_role() != Some(crate::ui::panel::ROLE_QUICK_SETTINGS) {
+            break;
+        }
+        f.key_press(KEY_RIGHT);
+        f.key_release(KEY_RIGHT);
+    }
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_DATE_MENU),
+        "the Right nothing in quick settings wanted opens the menu to its right"
+    );
+    assert!(
+        f.synoik().panel_popover.date_menu_focus().is_some(),
+        "and it arrives focused, like a keybinding-opened menu"
+    );
+
+    // The date menu is the rightmost panel menu: a Right past it does nothing, because
+    // StFocusManager navigates the arrows without wrap-around.
+    for _ in 0..40 {
+        f.key_press(KEY_RIGHT);
+        f.key_release(KEY_RIGHT);
+    }
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_DATE_MENU),
+        "the chain does not wrap"
+    );
+}
+
 /// `<Super>v` opens the date menu focused too, and Enter runs the focused control — here the
 /// month-forward arrow, which pages the calendar without closing the menu.
 #[test]
