@@ -18,9 +18,8 @@ use std::path::Path;
 
 use gio::glib;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::Texture;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -31,9 +30,19 @@ use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagr
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Padding around the dialog text block, logical px.
-const PADDING: i32 = 16;
-/// Wrap width of the dialog text area, logical px.
-const WIDTH: i32 = 400;
+const PADDING: f64 = 16.;
+/// Width of the dialog's content column, logical px — what the title and description wrap to,
+/// and what the entry spans.
+const WIDTH: f64 = 400.;
+/// `.message-dialog-content { spacing: $base_padding * 3 }` (`_dialogs.scss:66-67`): the run
+/// dialog's title, entry and description are all children of that box.
+const SPACING: f64 = 18.;
+/// `%entry_common` is a 40px box at `$base_padding * 1.5` padding; `.run-dialog-entry` overrides
+/// the vertical padding to `$base_padding * 2` (`_dialogs.scss:90-92`), 3px more on each side.
+const ENTRY_H: f64 = widget::Entry::HEIGHT + 6.;
+/// Lines reserved for the description. Two, so the card does not change height — and the entry
+/// under the pointer does not move — when the hint is replaced by a longer error.
+const DESC_LINES: f64 = 2.;
 /// Base dialog font size (title + entry), GNOME body, GNOME points.
 const BASE_PT: f64 = 11.;
 /// Small (description/hint) font size, GNOME `%caption`, GNOME points.
@@ -56,9 +65,13 @@ pub struct RunDialog {
     /// Position in the history while browsing; `None` = at the fresh entry
     /// past the end.
     history_index: Option<usize>,
-    /// Bumped on every content change to invalidate rendered buffers.
+    /// Bumped on every content change — including a caret move, which the entry draws.
     revision: u64,
+    /// Bumped only when the description line changes. The card carries the title and that line
+    /// and nothing else, so typing must not re-bake it.
+    card_revision: u64,
     cache: RefCell<ContentCache>,
+    entry_cache: RefCell<widget::BakeCache>,
 }
 
 synoik_render_elements! {
@@ -88,7 +101,9 @@ impl RunDialog {
             esc_pressed: false,
             history_index: None,
             revision: 0,
+            card_revision: 0,
             cache: RefCell::new(ContentCache::new()),
+            entry_cache: RefCell::new(widget::BakeCache::new()),
         }
     }
 
@@ -101,6 +116,7 @@ impl RunDialog {
         self.esc_pressed = false;
         self.history_index = None;
         self.revision += 1;
+        self.card_revision += 1;
     }
 
     /// Show (or clear) the input method's in-progress composition in the entry.
@@ -134,6 +150,7 @@ impl RunDialog {
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
         self.revision += 1;
+        self.card_revision += 1;
     }
 
     /// Feed a key on the open dialog. `text` is the key's character, if any;
@@ -229,7 +246,9 @@ impl RunDialog {
     /// Any edit clears a stale error back to the hint text (gnome-shell resets
     /// the description on `notify::text`).
     fn entry_edited(&mut self) {
-        self.error = None;
+        if self.error.take().is_some() {
+            self.card_revision += 1;
+        }
         self.revision += 1;
     }
 
@@ -237,6 +256,7 @@ impl RunDialog {
         &self,
         renderer: &mut VulkanRenderer,
         output: &Output,
+        accent: [u8; 3],
         push: &mut dyn FnMut(RunDialogRenderElement),
     ) {
         if !self.open {
@@ -246,61 +266,93 @@ impl RunDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
+        let l = layout();
 
-        let texture = {
+        // Centred on the output, and pinned to a whole physical pixel so the entry composited
+        // on top lands on the same grid the card was baked on.
+        let origin = (output_size.to_point() - l.size.to_point()).downscale(2.);
+        let mut origin = origin.to_physical_precise_round(scale).to_logical(scale);
+        origin.x = f64::max(0., origin.x);
+        origin.y = f64::max(0., origin.y);
+
+        let card = {
             let mut cache = self.cache.borrow_mut();
-            // This dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`); a
-            // draw failure must never leave an invisible trap. On error we skip the
-            // box but still draw the backdrop below, so the modal stays visible.
-            let entry = self.entry.display(None);
-            let entry = entry.as_str();
             let error = self.error.as_deref();
-            match widget::bake_content(
+            widget::bake_content(
                 renderer,
                 &mut cache,
                 scale,
-                self.revision,
-                |renderer| prepare_dialog(renderer, scale, entry, error),
-                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
-            ) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    warn!("error rendering the run dialog: {err:#}");
-                    None
-                }
-            }
+                self.card_revision,
+                |renderer| prepare_dialog(renderer, scale, &l, error),
+                |frame, phys, prepared| paint_dialog(frame, phys, prepared, scale),
+            )
         };
 
-        if let Some(texture) = texture {
-            // Rounded corners → the card is not fully opaque; no opaque-region hint (its
-            // transparent corners must composite over the backdrop).
-            let tex_size = texture.size();
-            let buffer = TextureBuffer::from_texture(
-                renderer,
-                texture,
-                scale,
-                Transform::Normal,
-                Vec::new(),
-            );
+        // --- The entry, composited over the card. ---
+        //
+        // The shared `widget::Entry`, the same one the polkit dialog and the overview search
+        // draw: it owns the caret, the selection wash and the scroll that keeps a long command
+        // line's caret in view. The dialog used to append a U+258F bar to the text instead,
+        // which sat at the end of the line whatever the caret was doing.
+        match widget::Entry::bake(
+            renderer,
+            &mut self.entry_cache.borrow_mut(),
+            scale,
+            l.entry.size.w,
+            l.entry.size.h,
+            widget::EntryContent::of(&self.entry, "", true),
+            widget::EntryStyle::Dialog,
+            // The dialog is a modal keyboard grab and the entry is the only thing in it that
+            // takes a key, so it always has the focus.
+            true,
+            false,
+            widget::style::accent_rgba(accent),
+            widget::Revision::new()
+                .of(self.revision)
+                .of(accent)
+                .px(l.entry.size.w)
+                .px(l.entry.size.h)
+                .done(),
+        ) {
+            Ok(buffer) => push(RunDialogRenderElement::Texture(
+                TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin + l.entry.loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            )),
+            Err(err) => warn!("error drawing the run dialog entry: {err:#}"),
+        }
 
-            let size = Size::<f64, Logical>::from((
-                f64::from(tex_size.w) / scale,
-                f64::from(tex_size.h) / scale,
-            ));
-            let location = (output_size.to_point() - size.to_point()).downscale(2.);
-            let mut location = location.to_physical_precise_round(scale).to_logical(scale);
-            location.x = f64::max(0., location.x);
-            location.y = f64::max(0., location.y);
-
-            let elem = TextureRenderElement::from_texture_buffer(
-                buffer,
-                location,
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            );
-            push(RunDialogRenderElement::Texture(elem));
+        match card {
+            Ok(texture) => {
+                // Rounded corners → not fully opaque; no opaque-region hint (the transparent
+                // corners must composite over the backdrop).
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                push(RunDialogRenderElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        origin,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
+                ));
+            }
+            // This dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`); a draw failure
+            // must never leave an invisible trap. On error we skip the card but still draw the
+            // backdrop below, so the modal stays visible.
+            Err(err) => warn!("error rendering the run dialog: {err:#}"),
         }
 
         // Backdrop — always drawn while the dialog is open, even if the box failed to render, so
@@ -316,83 +368,103 @@ impl RunDialog {
     }
 }
 
+/// The dialog's geometry, card-local logical px.
+///
+/// Metrics only — no shaping — so the entry can be placed on top of the card without re-running
+/// the bake's prepare phase, which only runs on a cache miss. The same split
+/// [`crate::ui::polkit_dialog::layout`] makes, for the same reason.
+struct Layout {
+    size: Size<f64, Logical>,
+    title_y: f64,
+    entry: Rectangle<f64, Logical>,
+    description_y: f64,
+}
+
+fn layout() -> Layout {
+    let title_h = crate::ui::line_height_px(BASE_PT);
+    let desc_h = crate::ui::line_height_px(SMALL_PT) * DESC_LINES;
+
+    let mut y = PADDING;
+    let title_y = y;
+    y += title_h + SPACING;
+    let entry = Rectangle::new(Point::from((PADDING, y)), Size::from((WIDTH, ENTRY_H)));
+    y += ENTRY_H + SPACING;
+    let description_y = y;
+    y += desc_h;
+
+    Layout {
+        size: Size::from((WIDTH + PADDING * 2., y + PADDING)),
+        title_y,
+        entry,
+        description_y,
+    }
+}
+
 impl Default for RunDialog {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Draw the dialog box into an offscreen [`VkTexture`] on the GPU: clear the
-/// opaque dark background, then draw one center-aligned glyph paragraph — a bold
-/// "Run a Command" title, the monospace entry with a cursor bar, and a small
-/// description/hint line. The returned texture is `SHADER_READ_ONLY`
-/// (sampleable) so the caller composites it directly. No cairo/pango raster.
-///
-/// Unlike the old pango path (which ellipsized a too-long entry from the start),
-/// a long command now *wraps* to more lines and the box grows — acceptable, and
-/// keeps every glyph visible.
-/// The dialog box layout (fixed width `WIDTH`, content-sized height), produced by
-/// [`prepare_dialog`] and drawn by [`paint_dialog`] (the [`widget::bake_content`]
-/// phases).
-struct DialogLayout {
-    run: ShapedParagraph,
-    origin: Point<i32, Physical>,
+/// The card's shaped text — the title and the description/error line. The entry is not here:
+/// it is its own baked element, composited over the card by [`RunDialog::render`].
+struct Prepared {
+    title: ShapedParagraph,
+    title_origin: Point<i32, Physical>,
+    description: ShapedParagraph,
+    description_origin: Point<i32, Physical>,
 }
 
-/// Shape the title/entry/hint paragraph and size the box — the prepare phase for
-/// [`widget::bake_content`]. A long command wraps (the box grows in height) rather
-/// than ellipsizing, keeping every glyph visible.
+/// Shape the title and description — the prepare phase for [`widget::bake_content`]. Both wrap
+/// to the content column and are centred in it, which is what `build_glyph_paragraph` does.
 fn prepare_dialog(
     renderer: &mut VulkanRenderer,
     scale: f64,
-    entry: &str,
+    l: &Layout,
     error: Option<&str>,
-) -> anyhow::Result<(Size<i32, Physical>, DialogLayout)> {
+) -> anyhow::Result<(Size<i32, Physical>, Prepared)> {
     let _span = tracy_client::span!("run_dialog::prepare_dialog");
 
-    let padding = to_physical_precise_round::<i32>(scale, f64::from(PADDING)).max(0);
-    let wrap_px = to_physical_precise_round::<i32>(scale, f64::from(WIDTH)).max(1);
-
-    let description = error.unwrap_or("Press ESC to close");
-    // The entry line carries a trailing cursor bar (U+258F), like gnome-shell.
-    let entry_line = format!("{entry}\u{258f}");
-    let spans = [
-        ParagraphSpan::new("Run a Command", BASE_PT).bold(),
-        ParagraphSpan::new("\n\n", BASE_PT),
-        ParagraphSpan::new(&entry_line, BASE_PT).mono(),
-        ParagraphSpan::new("\n\n", SMALL_PT),
-        ParagraphSpan::new(description, SMALL_PT),
-    ];
     let mut shaper = TextShaper::new(renderer, scale);
-    let run = shaper.paragraph(&spans, f64::from(WIDTH), BASE_PT)?;
+    let title = shaper.paragraph(
+        &[ParagraphSpan::new("Run a Command", BASE_PT).bold()],
+        WIDTH,
+        BASE_PT,
+    )?;
+    let description = error.unwrap_or("Press ESC to close");
+    let description = shaper.paragraph(
+        &[ParagraphSpan::new(description, SMALL_PT)],
+        WIDTH,
+        SMALL_PT,
+    )?;
 
-    // The paragraph is laid out in a [0, wrap_px] frame; size the box to its ink
-    // plus padding and place the block at (padding, padding) (keeping the
-    // per-line centering intact).
-    let (_ix, iy, _iw, ih) = run.ink_bounds();
-    let text_h = ih.max(1);
-    let box_w = (wrap_px + padding * 2).max(1);
-    let box_h = (text_h + padding * 2).max(1);
-    let origin = Point::<i32, Physical>::from((padding, padding - iy));
-
-    let size = Size::<i32, Physical>::from((box_w, box_h));
-    Ok((size, DialogLayout { run, origin }))
+    let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+    let size = Size::<i32, Physical>::from((px(l.size.w).max(1), px(l.size.h).max(1)));
+    Ok((
+        size,
+        Prepared {
+            title,
+            title_origin: Point::from((px(PADDING), px(l.title_y))),
+            description,
+            description_origin: Point::from((px(PADDING), px(l.description_y))),
+        },
+    ))
 }
 
-/// Draw the dark box and the paragraph — the paint phase for
-/// [`widget::bake_content`].
+/// Draw the dark card and its two text blocks — the paint phase for [`widget::bake_content`].
 fn paint_dialog(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
-    layout: &DialogLayout,
+    prepared: &Prepared,
     scale: f64,
 ) -> anyhow::Result<()> {
     let mut p = Painter::new(frame, scale, phys);
-    // Rounded borderless card: transparent clear so the corners composite away, then
-    // the flat fill over the whole content-sized buffer.
+    // Rounded borderless card: transparent clear so the corners composite away, then the flat
+    // fill over the whole content-sized buffer.
     p.clear(widget::style::TRANSPARENT)?;
     p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
-    p.paragraph(&layout.run, layout.origin, TEXT)?;
+    p.paragraph(&prepared.title, prepared.title_origin, TEXT)?;
+    p.paragraph(&prepared.description, prepared.description_origin, TEXT)?;
     Ok(())
 }
 
@@ -496,15 +568,18 @@ mod tests {
         assert!(resolve_command_line("   ").is_err());
     }
 
-    /// Drive the GPU dialog box into an offscreen and read it back: it must have
-    /// an opaque dark background and bright glyph ink (the title/entry/hint), for
-    /// arbitrary entry/error text — including former markup metacharacters, which
-    /// are now just literal glyphs (there is no markup parser to escape). Skips
-    /// cleanly with no Vulkan device.
+    /// Drive the GPU dialog card into an offscreen and read it back: it must have an opaque
+    /// dark background, rounded (transparent) corners and bright glyph ink, for arbitrary
+    /// description text — including former markup metacharacters, which are now just literal
+    /// glyphs (there is no markup parser to escape). Skips cleanly with no Vulkan device.
+    ///
+    /// The entry is no longer part of this texture — it is a [`widget::Entry`] composited over
+    /// the card — so the long-command case that used to live here (a line long enough to
+    /// overflow the old fixed 256px glyph atlas at scale 2) belongs to that widget's own tests.
     #[test]
     fn draws_the_dialog_with_glyph_coverage() {
         use smithay::backend::allocator::Fourcc;
-        use smithay::backend::renderer::{Bind, ExportMem};
+        use smithay::backend::renderer::{Bind, ExportMem, Texture as _};
         use smithay::utils::{Buffer as BufferCoord, Rectangle};
 
         use crate::ui::widget::ContentCache;
@@ -517,17 +592,11 @@ mod tests {
             }
         };
 
-        // The last case is the pathological one from review: a long command at
-        // scale 2 that overflowed the old fixed 256px glyph atlas — it must draw,
-        // not error (an errored draw would leave the modal invisible mid-typing).
-        let long_entry = "firefox --new-window https://example.org/a/very/long/path\
-                          ?q=alpha+beta+gamma&x=1#anchor && echo done && ls -la /usr/bin"
-            .to_owned();
-        for (scale, entry, error) in [
-            (1., "", None),
-            (1., "echo <b>hi</b> & 'quotes'", None),
-            (1., "cat<", Some("error with <markup> & entities")),
-            (2., long_entry.as_str(), None),
+        let l = layout();
+        for (scale, error) in [
+            (1., None),
+            (1., Some("error with <markup> & entities")),
+            (2., Some("Command not found")),
         ] {
             let mut cache = ContentCache::new();
             let mut tex = widget::bake_content(
@@ -535,8 +604,8 @@ mod tests {
                 &mut cache,
                 scale,
                 0,
-                |r| prepare_dialog(r, scale, entry, error),
-                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
+                |r| prepare_dialog(r, scale, &l, error),
+                |frame, phys, prepared| paint_dialog(frame, phys, prepared, scale),
             )
             .expect("dialog texture");
             let size = tex.size();
@@ -578,9 +647,22 @@ mod tests {
                 .count();
             assert!(
                 bright > 40,
-                "expected visible glyph ink for {entry:?}, got {bright}"
+                "expected visible glyph ink for {error:?}, got {bright}"
             );
         }
+    }
+
+    /// The entry sits inside the card with the content column's margins, and the card is tall
+    /// enough for it — the two are laid out by one function, and a card that does not contain
+    /// its own entry is the shape of bug that only shows up on screen.
+    #[test]
+    fn the_entry_sits_inside_the_card() {
+        let l = layout();
+        assert!(l.entry.loc.x >= PADDING);
+        assert!(l.entry.loc.x + l.entry.size.w <= l.size.w - PADDING);
+        assert!(l.entry.loc.y > l.title_y);
+        assert!(l.entry.loc.y + l.entry.size.h < l.description_y);
+        assert!(l.description_y < l.size.h - PADDING);
     }
 
     #[test]

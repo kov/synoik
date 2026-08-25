@@ -425,7 +425,7 @@ impl PolkitDialogUi {
                         dialog.focus() == Focus::Entry,
                     ),
                 },
-                widget::EntryStyle::PromptDialog,
+                widget::EntryStyle::Dialog,
                 dialog.focus() == Focus::Entry,
                 false,
                 accent_rgba,

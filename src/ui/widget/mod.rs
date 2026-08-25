@@ -1411,11 +1411,14 @@ pub enum EntryStyle {
     /// `$base_padding * 1.5` padding and ordinary left-aligned text — **not** a pill, and not
     /// centred. Its placeholder is `transparentize($system_fg_color, 0.3)` (`:378`).
     Lockscreen,
-    /// `.prompt-dialog-password-entry` (`_dialogs.scss:119-122`) — the polkit dialog's password
-    /// box. An ordinary `%entry` on a *dialog* rather than over the wallpaper, so it takes
+    /// An ordinary `%entry` on a *dialog* rather than over the wallpaper, so it takes
     /// `_entries.scss`'s normal fill (`mix($fg_color, $bg_color, 9%)`, i.e. [`style::ENTRY_BG`])
     /// rather than the lock screen's translucent one, and its focus ring is the accent.
-    PromptDialog,
+    ///
+    /// Both dialogs that have an entry land here: `.prompt-dialog-password-entry`
+    /// (`_dialogs.scss:119-122`) and `.run-dialog-entry` (`:90-92`). Neither restyles the box —
+    /// the run dialog only overrides its padding, which is a height the caller passes in.
+    Dialog,
 }
 
 /// `%entry_common` `padding: $base_padding * 1.5` (`_common.scss:177`).
@@ -1431,7 +1434,7 @@ impl EntryStyle {
             EntryStyle::Search(appearance) => appearance.plate(),
             // `transparentize(white, .9)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.1],
-            EntryStyle::PromptDialog => style::ENTRY_BG,
+            EntryStyle::Dialog => style::ENTRY_BG,
         }
     }
 
@@ -1444,7 +1447,7 @@ impl EntryStyle {
             EntryStyle::Lockscreen => Some([1., 1., 1., 0.4]),
             // An ordinary entry on a dialog takes `focus_ring()`'s accent (`_drawing.scss:99-105`),
             // not the lock screen's white — that one exists because there is a wallpaper behind it.
-            EntryStyle::PromptDialog => Some(accent),
+            EntryStyle::Dialog => Some(accent),
         }
     }
 
@@ -1472,7 +1475,7 @@ impl EntryStyle {
     fn radius(self, height: f64) -> f64 {
         match self {
             EntryStyle::Search(_) => height / 2.,
-            EntryStyle::Lockscreen | EntryStyle::PromptDialog => 8.,
+            EntryStyle::Lockscreen | EntryStyle::Dialog => 8.,
         }
     }
 
@@ -1483,7 +1486,7 @@ impl EntryStyle {
             // `transparentize($system_fg_color, 0.3)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.7],
             // `$fg_color` at 70% — `%entry`'s placeholder (`_entries.scss:3`).
-            EntryStyle::PromptDialog => [1., 1., 1., 0.7],
+            EntryStyle::Dialog => [1., 1., 1., 0.7],
         }
     }
 }
