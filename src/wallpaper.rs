@@ -6,13 +6,16 @@
 //!
 //! Holds the decoded `org.gnome.desktop.background` picture (resolved in
 //! [`crate::gnome::BackgroundSettings`]) and hands out render elements for it:
-//! the CPU-side decode runs **on a worker thread** when the setting changes (a
-//! 4K JPEG-XL decode is far too slow to run on the main loop — it stalls the
-//! whole session for the duration, e.g. when the Dark Style toggle flips to the
-//! dark wallpaper variant), and the GPU upload happens lazily on first render.
-//! gnome-shell fits the picture with `picture-options`; we implement `zoom`
-//! (cover + center crop, the default) and draw every other mode the same way for
-//! now.
+//! the decode runs **on a worker thread** when the setting changes (a 4K
+//! picture takes ~100 ms end to end, far too long for the main loop — it would
+//! stall the whole session for the duration, e.g. when the Dark Style toggle
+//! flips to the dark wallpaper variant), and the GPU upload happens lazily on
+//! first render. gnome-shell fits the picture with `picture-options`; we
+//! implement `zoom` (cover + center crop, the default) and draw every other mode
+//! the same way for now.
+//!
+//! The pixels come from a **sandboxed glycin loader process** — see [`decode`] for what that
+//! costs us and buys us.
 //!
 //! The worker writes its pixels **straight into device-visible memory** when a device is
 //! available ([`synoik_vk::staging::HostStaging`]). Moving the decode off the main loop had left
@@ -26,13 +29,10 @@
 //! the same.
 
 use std::cell::RefCell;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use calloop::channel::Sender;
-use image::ImageReader;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
@@ -559,63 +559,159 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
     }
 }
 
+/// One decoded picture as the renderer wants it: tightly packed straight-alpha RGBA8 in sRGB.
+struct Decoded {
+    data: Vec<u8>,
+    size: Size<i32, Buffer>,
+    opaque: bool,
+}
+
+/// Why [`load`] had nothing to hand back.
+enum LoadError {
+    /// The loader process refused the file, or could not be started at all — a missing
+    /// `glycin-loaders` package and an unreadable path both land here.
+    Loader(Box<glycin::ErrorCtx>),
+    /// A frame with no pixels in it. Nothing downstream copes with a zero-sized picture, and the
+    /// row loop in `load` would chunk by its width.
+    Empty,
+}
+
+impl From<glycin::ErrorCtx> for LoadError {
+    fn from(err: glycin::ErrorCtx) -> Self {
+        Self::Loader(Box::new(err))
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loader(err) => write!(f, "{err:?}"),
+            Self::Empty => write!(f, "the loader returned an empty frame"),
+        }
+    }
+}
+
+/// Run `path` through a sandboxed glycin loader and normalise the frame into [`Decoded`].
+///
+/// The scale request is only sent for a picture that would otherwise need the CPU downscale in
+/// [`decode`]: it is advisory, and a loader that can honour it (SVG rasterises at the asked-for
+/// size; JPEG XL ignores it) saves both the decode and the resample. Asking unconditionally would
+/// mean asking a small picture to be *enlarged*.
+async fn load(path: &Path) -> Result<Decoded, LoadError> {
+    let mut loader = glycin::Loader::new(gio::File::for_path(path));
+    // Both, so the format we get back is the answer to "does this picture have alpha"; see the
+    // note on `decode`. Neither is premultiplied, which is what the texture upload expects.
+    loader.accepted_memory_formats(
+        glycin::MemoryFormatSelection::R8g8b8a8 | glycin::MemoryFormatSelection::R8g8b8,
+    );
+    let image = loader.load().await?;
+
+    let details = image.details();
+    let frame = if details.width() > MAX_TEXTURE_EDGE || details.height() > MAX_TEXTURE_EDGE {
+        let request = glycin::FrameRequest::new().scale(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE);
+        image.specific_frame(request).await?
+    } else {
+        image.next_frame().await?
+    };
+
+    let opaque = !frame.memory_format().has_alpha();
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    if w == 0 || h == 0 {
+        return Err(LoadError::Empty);
+    }
+    let stride = frame.stride() as usize;
+    let src = frame.buf_slice();
+
+    // The buffer is a mapping we do not own and its rows may be padded, so a copy is owed either
+    // way; widening the opaque case to RGBA here costs nothing on top of it.
+    let mut data = vec![0u8; w * h * 4];
+    for (row, dst_row) in data.chunks_exact_mut(w * 4).enumerate() {
+        if opaque {
+            let (dst_pixels, _) = dst_row.as_chunks_mut::<4>();
+            let src_row = &src[row * stride..row * stride + w * 3];
+            for (src_px, dst_px) in src_row.as_chunks::<3>().0.iter().zip(dst_pixels) {
+                dst_px[..3].copy_from_slice(src_px);
+                dst_px[3] = 255;
+            }
+        } else {
+            dst_row.copy_from_slice(&src[row * stride..row * stride + w * 4]);
+        }
+    }
+
+    if let glycin::ColorState::Cicp(cicp) = frame.color_state() {
+        to_srgb(cicp, &mut data);
+    }
+
+    Ok(Decoded {
+        data,
+        size: Size::new(w as i32, h as i32),
+        opaque,
+    })
+}
+
+/// Convert `data` (straight-alpha RGBA8 in `cicp`'s colour space) to sRGB in place.
+///
+/// A picture we cannot build a transform for is left as it decoded: wrong primaries are a tint,
+/// a missing wallpaper is a black screen.
+fn to_srgb(cicp: &glycin::Cicp, data: &mut [u8]) {
+    let _span = tracy_client::span!("wallpaper::to_srgb");
+
+    // Both sides speak H.273 code points, so the bytes are the conversion.
+    let [primaries, transfer, matrix, range] = cicp.to_bytes();
+    let (Ok(color_primaries), Ok(transfer_characteristics), Ok(matrix_coefficients)) = (
+        moxcms::CicpColorPrimaries::try_from(primaries),
+        moxcms::TransferCharacteristics::try_from(transfer),
+        moxcms::MatrixCoefficients::try_from(matrix),
+    ) else {
+        warn!("background picture has colour points we cannot convert ({cicp:?}); leaving it as decoded");
+        return;
+    };
+
+    let source = moxcms::ColorProfile::new_from_cicp(moxcms::CicpProfile {
+        color_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+        full_range: range == 1,
+    });
+    // In place: the picture is tens of megabytes, and a second copy of it is the one allocation
+    // on this path big enough to be worth avoiding.
+    let converted = source
+        .create_in_place_transform_8bit(
+            moxcms::Layout::Rgba,
+            &moxcms::ColorProfile::new_srgb(),
+            moxcms::TransformOptions::default(),
+        )
+        .and_then(|transform| transform.transform(data));
+    if let Err(err) = converted {
+        warn!("could not convert the background picture to sRGB ({err}); leaving it as decoded");
+    }
+}
+
 /// Decode `path` into RGBA8. With a `gpu`, the pixels are written straight into device-visible
 /// memory so the render thread never has to copy them; without one (no renderer yet, headless
 /// tests) they land on the heap and the upload copies them as before. A staging allocation that
 /// fails falls back to the heap rather than failing the decode — running with the old cost beats
 /// no wallpaper.
+///
+/// The decode itself happens in a **sandboxed loader process**, through glycin — the same
+/// mechanism mutter 50.3 loads backgrounds with (`src/compositor/meta-background-image.c`). That
+/// is what makes the format list GNOME's rather than ours: JPEG XL, HEIF and SVG come from the
+/// installed `glycin-loaders` package, not from a crate we picked. `bwrap` and those loaders are
+/// hard runtime dependencies; without them there is no wallpaper.
+///
+/// Two consequences worth knowing before touching this:
+///
+/// 1. **The frame is not sRGB.** GNOME's stock backgrounds are Display P3, and glycin reports that
+///    as [`glycin::ColorState::Cicp`] rather than converting — mutter carries the CICP into a
+///    `ClutterColorState` and converts while compositing. We composite sRGB only, so the conversion
+///    is [`to_srgb`], here on the worker.
+/// 2. **Ask for both RGB and RGBA.** The `alpha_channel` detail is `None` for JPEG XL and SVG, so
+///    the accepted-format set is what tells us whether the picture is opaque: a loader hands back
+///    `R8g8b8` exactly when there is no alpha to carry.
 fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
-    // The "a stock background takes SECONDS to decode" problem is **fixed, in Cargo.toml** —
-    // 2.42s to 0.28s for a 4096x4096 JPEG XL. It was never the decoder: jxl-oxide always did
-    // this file in ~0.24s in an optimized build, and what the dev binary the seat runs was
-    // missing is spelled out where the fix lives (`[profile.dev]`, and the two extra settings
-    // under `[profile.dev.package."*"]`). The short version is that a dependency's *generic*
-    // code is code-generated in the crate that instantiates it, so `image`'s and jxl-oxide's
-    // decode loops were built at our crate's opt-level, not theirs.
-    //
-    // Two things stay open, neither of them a stall:
-    //
-    // 1. **Our colours are not GNOME's colours.** `jxl_oxide::integration::JxlDecoder` does no
-    //    colour management and documents that the consumer must apply the ICC profile it returns
-    //    (`integration/image.rs:25-30`); we never do. Against libjxl through gdk-pixbuf, this path
-    //    has a mean absolute error of 10.6/255 (max 63) with only 8% of pixels within 2 — the stock
-    //    background's blue reads (16,48,125) here against (0,46,133) in GNOME. **Deferred by
-    //    Gustavo, 2026-07-26** (visually unobjectionable today). When it comes back: jxl-oxide's
-    //    native API with the pure-Rust `moxcms` feature costs ~19ms and cuts the mean to 3.1 but
-    //    does not match; libjxl's own pure-Rust decoder (the `jxl` crate, BSD-3) reproduces it
-    //    exactly (mean 0.30, max 1) at 0.51s single-threaded.
-    // 2. **Decoding to the output size** is still not worth it: jxl-oxide 0.12.6 exposes no
-    //    reduced-resolution render, and 4096² against a 3840x2160 screen that `zoom_crop` samples
-    //    nearly all of would save single digits even if it did.
-
-    let decoded = if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("jxl"))
-    {
-        // GNOME's stock backgrounds are JPEG XL, which the image crate doesn't
-        // cover; jxl-oxide plugs into it as an external decoder.
-        File::open(path)
-            .map_err(image::ImageError::IoError)
-            .and_then(|file| {
-                let decoder = jxl_oxide::integration::JxlDecoder::new(BufReader::new(file))
-                    .map_err(|err| {
-                        image::ImageError::Decoding(image::error::DecodingError::new(
-                            image::error::ImageFormatHint::Name("jxl".to_owned()),
-                            err,
-                        ))
-                    })?;
-                image::DynamicImage::from_decoder(decoder)
-            })
-    } else {
-        ImageReader::open(path)
-            .and_then(|reader| reader.with_guessed_format())
-            .map_err(image::ImageError::IoError)
-            .and_then(|reader| reader.decode())
-    };
-
-    let mut decoded = match decoded {
+    let decoded = match async_io::block_on(load(path)) {
         Ok(decoded) => decoded,
         Err(err) => {
             warn!("error decoding background picture {path:?}: {err}");
@@ -623,17 +719,26 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
         }
     };
 
-    if decoded.width() > MAX_TEXTURE_EDGE || decoded.height() > MAX_TEXTURE_EDGE {
-        decoded = decoded.resize(
-            MAX_TEXTURE_EDGE,
-            MAX_TEXTURE_EDGE,
-            image::imageops::FilterType::Triangle,
-        );
+    let Decoded {
+        mut data,
+        mut size,
+        opaque,
+    } = decoded;
+
+    if size.w > MAX_TEXTURE_EDGE as i32 || size.h > MAX_TEXTURE_EDGE as i32 {
+        // Only reachable for a loader that ignored the scale we asked for in `load`.
+        let full = image::RgbaImage::from_raw(size.w as u32, size.h as u32, data)?;
+        let scaled = image::DynamicImage::ImageRgba8(full)
+            .resize(
+                MAX_TEXTURE_EDGE,
+                MAX_TEXTURE_EDGE,
+                image::imageops::FilterType::Triangle,
+            )
+            .into_rgba8();
+        size = Size::new(scaled.width() as i32, scaled.height() as i32);
+        data = scaled.into_raw();
     }
 
-    let opaque = !decoded.color().has_alpha();
-    let size = Size::new(decoded.width() as i32, decoded.height() as i32);
-    let data = decoded.into_rgba8().into_raw();
     // On the worker, next to the decode that already owns these bytes: the main loop never sees
     // this downscale, and after it the legibility rule never touches the full picture again.
     let thumb = Thumb::from_rgba(&data, size.w as u32, size.h as u32);
@@ -1083,23 +1188,53 @@ mod tests {
         );
     }
 
+    /// Whether a glycin loader can actually run here: `bwrap` has to be installed *and* able to
+    /// create a user namespace, which it cannot inside an unprivileged container. Probing the
+    /// capability rather than the binary is the difference between a test that skips on a CI
+    /// runner and one that fails there.
+    fn sandbox_available() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            std::process::Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "--dev", "/dev", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
+    /// A stock background to decode, or `None` with the reason printed: these tests are the only
+    /// coverage the loader path has, so a skip has to say why it skipped.
+    fn stock_background(name: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(format!("/usr/share/backgrounds/gnome/{name}"));
+        if !path.exists() {
+            eprintln!("skipping: {name} is not installed (gnome-backgrounds)");
+            return None;
+        }
+        if !sandbox_available() {
+            eprintln!("skipping: bwrap cannot sandbox a glycin loader here");
+            return None;
+        }
+        Some(path)
+    }
+
     /// The picture that motivated the legibility rule, end to end through the real decode:
     /// `lcd-rainbow-l` is a near-white background, and GNOME's 0.65 leaves the curtain's white text
     /// at 2.93:1 over it — under WCAG AA — while its dark sibling is comfortably clear at the same
-    /// constant. Same ignore reason as [`decodes_a_stock_jxl_background`].
+    /// constant. Skips itself when the backgrounds are not installed.
     #[test]
-    #[ignore = "decodes an installed 4K background; run explicitly"]
     fn the_stock_light_rainbow_is_the_wallpaper_that_needs_dimming() {
         use crate::ui::lock_screen::{BLUR_BRIGHTNESS, BLUR_CONTRAST_TARGET};
 
         let load = |name: &str| {
-            let path = PathBuf::from(format!("/usr/share/backgrounds/gnome/{name}.jxl"));
-            path.exists().then(|| Wallpaper {
+            stock_background(name).map(|path| Wallpaper {
                 image: decode(&path, None),
                 ..Default::default()
             })
         };
-        let (Some(light), Some(dark)) = (load("lcd-rainbow-l"), load("lcd-rainbow-d")) else {
+        let (Some(light), Some(dark)) = (load("lcd-rainbow-l.jxl"), load("lcd-rainbow-d.jxl"))
+        else {
             return;
         };
 
@@ -1114,22 +1249,63 @@ mod tests {
         );
     }
 
-    /// GNOME's stock backgrounds are JPEG XL; decode one through the
-    /// jxl-oxide integration end-to-end. Ignored by default: it needs the
-    /// installed backgrounds and a debug-build 4K decode is slow.
+    /// GNOME's stock backgrounds are JPEG XL, a format we have no decoder for: it comes from the
+    /// installed glycin loaders, through a sandboxed process. Skips itself when the backgrounds
+    /// are not installed.
     #[test]
-    #[ignore = "decodes an installed 4K background; run explicitly"]
     fn decodes_a_stock_jxl_background() {
-        let path = Path::new("/usr/share/backgrounds/gnome/adwaita-l.jxl");
-        if !path.exists() {
+        let Some(path) = stock_background("adwaita-l.jxl") else {
             return;
-        }
-        let image = decode(path, None).unwrap();
+        };
+        let image = decode(&path, None).unwrap();
         assert!(image.size.w > 0 && image.size.h > 0);
         assert_eq!(
             image.pixels.len(),
             (image.size.w * image.size.h * 4) as usize
         );
+        assert!(image.opaque, "a stock background has no alpha to carry");
+    }
+
+    /// SVG is a stock background format too (`blobs-l.svg`), and one nothing in our own dependency
+    /// tree decodes into a picture — the loader rasterises it, at the size we ask for.
+    #[test]
+    fn decodes_a_stock_svg_background() {
+        let Some(path) = stock_background("blobs-l.svg") else {
+            return;
+        };
+        let image = decode(&path, None).unwrap();
+        assert!(image.size.w > 0 && image.size.h > 0);
+        assert_eq!(
+            image.pixels.len(),
+            (image.size.w * image.size.h * 4) as usize
+        );
+    }
+
+    /// The stock backgrounds are **Display P3**, and the loader hands the pixels over in that
+    /// space rather than converting (mutter carries the CICP into a `ClutterColorState` instead).
+    /// We composite sRGB only, so `decode` must convert: `adwaita-l`'s top-left blue is
+    /// (0, 46, 133) as it decodes and (0, 47, 138) in sRGB. Drawing the P3 numbers unconverted is
+    /// a picture that is quietly too saturated, which no other assertion here would notice.
+    #[test]
+    fn a_display_p3_background_is_converted_to_srgb() {
+        let Some(path) = stock_background("adwaita-l.jxl") else {
+            return;
+        };
+        let image = decode(&path, None).unwrap();
+        let Pixels::Host(data) = &image.pixels else {
+            unreachable!("no gpu was passed, so the pixels are on the heap");
+        };
+
+        let expected = [0, 47, 138];
+        for (channel, (got, want)) in data.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                got.abs_diff(*want) <= 1,
+                "channel {channel} of the converted top-left pixel is {got}, expected ~{want} \
+                 (the unconverted Display P3 value is {:?})",
+                [0, 46, 133],
+            );
+        }
+        assert_eq!(data[3], 255);
     }
 
     /// The upload is cached across frames, but it belongs to the renderer that made

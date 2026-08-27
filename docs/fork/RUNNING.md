@@ -253,15 +253,17 @@ neighbor.
 
 The **wallpaper** comes from `org.gnome.desktop.background`: `picture-uri`
 (or `picture-uri-dark` when `org.gnome.desktop.interface color-scheme` is
-`prefer-dark`) is decoded (PNG/JPEG/WebP via the image crate, GNOME's stock
-JPEG XL backgrounds via jxl-oxide) and drawn behind every workspace in GNOME
-windowing mode, live-updating with the settings. In the overview the
+`prefer-dark`) is decoded and drawn behind every workspace in GNOME
+windowing mode, live-updating with the settings. Decoding goes through
+**glycin**, the sandboxed loader processes mutter 50.3 uses for the same
+job, so the format list is whatever the `glycin-loaders` package installs —
+PNG, JPEG, WebP, JPEG XL, HEIF, SVG. That package and `bwrap` are runtime
+dependencies: without them there is no wallpaper. In the overview the
 workspace previews get gnome-shell's 30px rounded corners, growing with the
 open transition (`BACKGROUND_CORNER_RADIUS_PIXELS`). Divergences for now:
 every `picture-options` mode draws as `zoom` (cover + center crop, the
-default), SVG wallpapers aren't decoded, and `primary-color` isn't used as
-the no-picture fill — the configured solid background color backs those
-cases instead.
+default), and `primary-color` isn't used as the no-picture fill — the
+configured solid background color backs that case instead.
 
 The **thumbnails strip** (gnome-shell's ThumbnailsBox) appears above the
 workspace row once a second desktop is populated (dynamic workspaces with

@@ -86,13 +86,19 @@ gio = "0.22.8"
 gio-unix = { version = "0.22.8", features = ["v2_58"] }
 git-version = "0.3.9"
 glam = "0.32.1"
+# Image decoding, in the sandboxed external loader processes mutter 50.3 uses for backgrounds
+# (`src/compositor/meta-background-image.c`). Runtime dependency, not optional: the
+# `glycin-loaders` package and `bwrap` must be installed or there is no wallpaper.
+glycin = "3.1.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 input = { version = "0.10.0", features = ["libinput_1_21"] }
-jxl-oxide = { version = "0.12.6", features = ["image"] }
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.185"
 libdisplay-info = "0.3.0"
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
+# Colour management for the CICP frames glycin hands back (the stock backgrounds are Display P3);
+# our renderer composites sRGB only, so the conversion happens on the decode worker.
+moxcms = { version = "0.9.0", features = ["in_place"] }
 synoik-config = { version = "26.4.0", path = "synoik-config" }
 synoik-ipc = { version = "26.4.0", path = "synoik-ipc", features = ["clap"] }
 synoik-vk = { version = "0.0.0", path = "synoik-vk" }
@@ -218,26 +224,27 @@ lto = "thin"
 # 2.42s. Each was measured on 2026-07-26; none is folklore.
 #
 # Debugging that genuinely needs opt-level 0 can drop it here temporarily (Gustavo,
-# 2026-07-26: no session so far has). Note it would take the wallpaper stall back with it.
+# 2026-07-26: no session so far has). Note it would take a raft of CPU-side stalls with it.
 [profile.dev]
-# 2.42s -> 0.28s, and the dev loop did NOT get slower: a touch-rebuild of the synoik crate
-# went 6.1s -> 4.5s and `cargo test --workspace` stayed at ~17s (rustc emits far less code
-# for the linker to chew at -O3 than at -O0). The one-time full rebuild is ~50s.
+# The dev loop did NOT get slower for this: a touch-rebuild of the synoik crate went 6.1s ->
+# 4.5s and `cargo test --workspace` stayed at ~17s (rustc emits far less code for the linker
+# to chew at -O3 than at -O0). The one-time full rebuild is ~50s.
 #
-# Why this matters more than the dependency override below: a dependency's *generic* code
-# is code-generated in whichever crate instantiates it, at THAT crate's optimization level.
-# `image::DynamicImage::from_decoder` and `jxl_oxide::integration::JxlDecoder<R>` are
-# generic, so with our crates at opt-level 0 the decoder's hot loops were built unoptimized
-# no matter what the dependencies were compiled with. This line is what reaches them.
+# Why this matters more than the dependency override below: a dependency's *generic* code is
+# code-generated in whichever crate instantiates it, at THAT crate's optimization level. A
+# dependency compiled at -O3 therefore still hands us unoptimized hot loops wherever its API
+# is generic — `image::imageops::resize`, resvg's rasterizer, `glam`. This line is what
+# reaches them.
 opt-level = 3
 
 [profile.dev.package."*"]
-# Heavy decoders and rasterizers (jxl-oxide, resvg, image, ash/Vulkan) are painfully slow
+# Rasterizers and pixel pushers (resvg, image, moxcms, ash/Vulkan) are painfully slow
 # unoptimized, and only the first build after a dep change pays for this.
 opt-level = 3
 # `opt-level` alone still leaves dependencies with the dev profile's debug assertions and
-# overflow checks, which a decoder pays on every arithmetic op: 2.42s -> 1.62s on that same
-# wallpaper. Release turns both off anyway, so this only makes dev agree with what we ship.
+# overflow checks, which per-pixel code pays on every arithmetic op — measured at 1.5x on a
+# 4K decode back when we decoded in-process. Release turns both off anyway, so this only
+# makes dev agree with what we ship.
 debug-assertions = false
 overflow-checks = false
 

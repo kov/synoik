@@ -472,8 +472,9 @@ Everything here was measured. Re-deriving any of it costs a day.
   ordering and frames-in-flight are not urgent for that reason. Good hypothesis, measured, wrong.
 - **JPEG-XL wallpaper decode is not GPU-accelerable in any practical way.** No hardware JXL decode
   block exists anywhere, libjxl is CPU-SIMD only, and the entropy stage (ANS/prefix coding) is
-  inherently sequential. Fix it algorithmically — decode at/near target resolution (the 1:8 DC image
-  gives an instant preview) plus a variant cache. Make it decode *less*.
+  inherently sequential. Any further win is algorithmic — decode at/near target resolution plus a
+  variant cache; make it decode *less*. It is no longer urgent: the decode is glycin's sandboxed
+  libjxl loader, at ~90 ms for a 4096² background against 280 ms in-process, on a worker thread.
 
 ---
 

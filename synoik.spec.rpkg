@@ -80,9 +80,19 @@ BuildRequires:  cairo-gobject-devel
 BuildRequires:  clang
 # Needed for some tests with a surfaceless EGL renderer
 BuildRequires:  mesa-libEGL
+# glycin, which decodes the wallpaper
+BuildRequires:  lcms2-devel
+BuildRequires:  fontconfig-devel
+BuildRequires:  libseccomp-devel
 
 Requires:       mesa-dri-drivers
 Requires:       mesa-libEGL
+
+# The wallpaper is decoded in a sandboxed glycin loader process, the way mutter decodes it: the
+# loaders are the format support, and bwrap is what confines them. Without either there is no
+# wallpaper at all.
+Requires:       glycin-loaders
+Requires:       bubblewrap
 
 # Loaded through dlopen
 Requires:       libwayland-server
