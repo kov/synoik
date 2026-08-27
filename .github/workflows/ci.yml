@@ -24,13 +24,12 @@ env:
   # The fedora container ships only the C locale, but the app grid sorts names through
   # `g_utf8_collate_key`/`strcoll`, so glibc-langpack-en supplies the collation the order tests
   # assert on (see `pin_collation` in src/tests/fixture.rs). The ubuntu runners already have it.
-  # lcms2/fontconfig/seccomp are glycin's: the wallpaper is decoded by the sandboxed loader
-  # processes mutter uses (`src/wallpaper.rs`), so `bwrap` and the loaders are runtime
-  # dependencies of synoik, not build ones. Only Fedora gets them, and only Fedora gets
-  # gnome-backgrounds with them: the crate needs loaders with a `2+` API directory, and Ubuntu
-  # 24.04 still ships glycin-loaders 1.0.1. Installing the backgrounds without matching loaders
-  # would turn the wallpaper decode tests red rather than letting them skip.
-  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev liblcms2-dev libfontconfig-dev libseccomp-dev gsettings-desktop-schemas gnome-settings-daemon-common mesa-vulkan-drivers ffmpeg
+  # lcms2/fontconfig/seccomp are glycin's, and glycin-loaders/bubblewrap/gnome-backgrounds are
+  # what the wallpaper decode tests need: the picture is decoded by the sandboxed loader
+  # processes mutter uses (`src/wallpaper.rs`), so those two are runtime dependencies of synoik,
+  # not build ones. The loaders must expose a `2+` API directory — 26.04 ships 2.1.1 and Fedora
+  # 44 ships 2.1.5, while 24.04 was still on 1.0.1, which is part of why the runners moved.
+  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev liblcms2-dev libfontconfig-dev libseccomp-dev gsettings-desktop-schemas gnome-settings-daemon-common gnome-backgrounds glycin-loaders bubblewrap mesa-vulkan-drivers ffmpeg
   DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel lcms2-devel fontconfig-devel libseccomp-devel gsettings-desktop-schemas gnome-settings-daemon glibc-langpack-en ffmpeg-free glycin-loaders bubblewrap gnome-backgrounds
   # The `reference-env` tests measure shaped text, so the UI font stack is part of the fixture:
   # Adwaita Sans is what `font-name` resolves to at runtime (docs/fork/gnome-style-reference.md).
@@ -42,7 +41,7 @@ jobs:
       fail-fast: false
 
     name: test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v6
@@ -71,7 +70,7 @@ jobs:
       fail-fast: false
 
     name: check feature combinations
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v6
@@ -124,7 +123,7 @@ jobs:
       fail-fast: false
 
     name: randomized and slow tests
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     env:
       RUST_BACKTRACE: 1
@@ -160,7 +159,7 @@ jobs:
       fail-fast: false
 
     name: msrv
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v6
@@ -186,7 +185,7 @@ jobs:
       fail-fast: false
 
     name: clippy
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v6
@@ -208,7 +207,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   rustfmt:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - uses: actions/checkout@v6
@@ -229,7 +228,11 @@ jobs:
   # reference checkouts run, so this is the only runner where measured text geometry means
   # anything. It is therefore the one that turns on `reference-env` (see Cargo.toml).
   fedora:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    # The wallpaper decode tests skip themselves here: glycin decodes inside `bwrap`, and an
+    # unprivileged container cannot create the user namespace bwrap needs. `--privileged` would
+    # let them run, but the ubuntu runner decodes for real, so this job does not need the
+    # privilege to keep that covered.
     container: fedora:44
 
     steps:
@@ -251,7 +254,7 @@ jobs:
       - test
     permissions:
       contents: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
         with:
