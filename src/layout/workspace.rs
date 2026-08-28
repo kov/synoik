@@ -113,6 +113,8 @@ pub struct Workspace<W: LayoutElement> {
     /// — a homeless workspace's ordinal is an index into the display it is *visiting*, which is
     /// the price of not snapshotting the whole arrangement (`docs/fork/multi-display.md` §2).
     pub(super) home_ordinal: usize,
+    /// Whether session restore has spoken for this workspace ([`Self::claim_for`]).
+    pub(super) claimed: bool,
 
     /// Current output of this workspace.
     output: Option<Output>,
@@ -651,6 +653,7 @@ impl<W: LayoutElement> Workspace<W> {
             minimized: Vec::new(),
             original_output,
             home_ordinal: 0,
+            claimed: false,
             scale,
             transform: output.current_transform(),
             view_size,
@@ -728,6 +731,7 @@ impl<W: LayoutElement> Workspace<W> {
             transform: Transform::Normal,
             original_output,
             home_ordinal: 0,
+            claimed: false,
             view_size,
             working_area,
             shadow: Shadow::new(shadow_config),
@@ -770,10 +774,22 @@ impl<W: LayoutElement> Workspace<W> {
     /// Session restore's one caller: a workspace it materializes for a display that is not here
     /// belongs to that display, so plugging the display in reclaims it, and the saved index it
     /// carries is what tells the reclaim where in the arrangement it goes.
+    ///
+    /// Claiming also takes the workspace out of the strip's filler. It holds no window until the
+    /// one it was made for finishes mapping, and until then it is indistinguishable from an empty
+    /// the invariants grew — which would let the strip drop it, or sort it as if the desktop the
+    /// user saved were not spoken for.
     pub(super) fn claim_for(&mut self, home: OutputIdentity, home_ordinal: usize) -> WorkspaceId {
         self.original_output = home;
         self.home_ordinal = home_ordinal;
+        self.claimed = true;
         self.id()
+    }
+
+    /// Whether the strip means something by this workspace: a window, a name, or a saved record
+    /// whose window is still on its way. The rest is filler the invariants keep around.
+    pub(super) fn is_substantial(&self) -> bool {
+        self.has_windows_or_name() || self.claimed
     }
 
     pub fn id(&self) -> WorkspaceId {

@@ -1127,44 +1127,12 @@ impl State {
 
     /// Every workspace the store asks for on a display that is not connected, in one order.
     ///
-    /// A live unplug appends the removed display's whole stack to the primary, before the trailing
-    /// empty workspace, with its internal order intact (`Monitor::append_workspaces`). A restore
-    /// that finds the display missing lands the same way: the absent displays' workspaces form one
-    /// block below what the primary's strip holds on its own account, displays in connector order
-    /// and each display's workspaces in its own, so two of them do not interleave.
+    /// Forgets the slots whose workspace has gone away.
     ///
-    /// Read from the *whole store*, not from the session that happens to be restoring. Two apps
-    /// coming back at once name slots on the same absent display, and a per-session answer had
-    /// each of them counting only its own records — so their windows interleaved with each other's
-    /// (`docs/fork/multi-display.md` §3).
-    ///
-    /// Distinct slots, so what a session that never comes back costs is one rank per workspace it
-    /// names rather than the number it names. Nothing here reserves anything either: a slot
-    /// becomes a workspace only when a window actually restores into it, so a stale record naming
-    /// desktop 30 grows no strip.
-    fn absent_restore_slots(&self) -> Vec<RestoreSlot> {
-        let mut slots: Vec<RestoreSlot> = self
-            .synoik
-            .session_manager_state
-            .store
-            .records()
-            .filter_map(|record| Some((record.output.as_ref()?, record.workspace?)))
-            .filter(|(saved, _)| self.output_matching_identity(saved).is_none())
-            .map(|(saved, workspace)| RestoreSlot {
-                identity: saved.clone(),
-                workspace,
-            })
-            .collect();
-        slots.sort_unstable();
-        slots.dedup();
-        slots
-    }
-
-    /// The workspaces materialized for absent displays so far, forgetting any that has gone away.
-    ///
-    /// A workspace under a slot is not forever: its display coming back takes it along. Pruning
-    /// here rather than at the removal keeps the block a derived fact, with one place to be wrong.
-    pub(super) fn materialized_restore_block(&mut self) -> Vec<WorkspaceId> {
+    /// A workspace under a slot is not forever: its display coming back takes it along, and the
+    /// slot must then make a new one rather than answer with a dead id. Pruning on the way in
+    /// keeps that a derived fact, with one place to be wrong.
+    fn forget_dead_restore_slots(&mut self) {
         let alive: Vec<WorkspaceId> = self
             .synoik
             .session_manager_state
@@ -1174,20 +1142,19 @@ impl State {
         self.synoik
             .session_manager_state
             .retain_materialized_workspaces(&alive);
-        alive
     }
 
     /// The workspace a slot means on `output`, making it if this is the first window to ask.
     ///
-    /// Placed against the block's other workspaces rather than at an index, so the answer does not
-    /// depend on which window restored first: a slot goes above every materialized slot that ranks
-    /// after it, and at the bottom of the strip when none of them is here yet.
+    /// Sorted into place by the display it belongs to and the index it was saved at, so the answer
+    /// does not depend on which window restored first: the strip is a function of the set of slots
+    /// materialized so far, never of the order they arrived in.
     pub(super) fn materialize_restore_slot(
         &mut self,
         slot: &RestoreSlot,
         output: &Output,
     ) -> Option<WorkspaceId> {
-        let block = self.materialized_restore_block();
+        self.forget_dead_restore_slots();
         if let Some(id) = self
             .synoik
             .session_manager_state
@@ -1196,21 +1163,8 @@ impl State {
             return Some(id);
         }
 
-        let order = self.absent_restore_slots();
-        let after = order
-            .iter()
-            .position(|known| known == slot)
-            .map_or(order.len(), |rank| rank + 1);
-        let before = order[after.min(order.len())..].iter().find_map(|known| {
-            self.synoik
-                .session_manager_state
-                .materialized_workspace(known)
-        });
-
         let id = self.synoik.layout.insert_restore_workspace(
             output,
-            before,
-            &block,
             slot.identity.clone(),
             slot.workspace as usize,
         )?;

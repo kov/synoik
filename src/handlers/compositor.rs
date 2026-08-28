@@ -156,12 +156,7 @@ impl CompositorHandler for State {
                                 if let Some(slot) = restore.restore_slot.clone() {
                                     self.materialize_restore_slot(&slot, &output)
                                 } else if let Some(idx) = restore.workspace_idx {
-                                    let block = self.materialized_restore_block();
-                                    let start =
-                                        self.synoik.layout.restore_block_start(&output, &block);
-                                    self.synoik
-                                        .layout
-                                        .ensure_restore_workspace(&output, idx, start)
+                                    self.synoik.layout.ensure_restore_workspace(&output, idx)
                                 } else {
                                     None
                                 }

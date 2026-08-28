@@ -1,8 +1,7 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23. §1–§7 are implemented, except the block ordering in §2
-("The strip is blocks, in display order") and the §3 placement that follows from it, which are
-agreed and not yet built.**
+**Status: design agreed 2026-08-23. §1–§7 are implemented, except "A drag re-homes by which block
+it lands in" (§2), which is agreed and not yet built.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -121,11 +120,17 @@ restores records saved on a display that is not here. That strip is the concaten
 **contiguous block per home display**, and the blocks are ordered: the **primary** first, then the
 rest by logical position, left to right and then top to bottom.
 
-Read that order off the last configuration the ranked displays shared. `monitors.xml` already
-stores position and primacy per connected set (§1, `src/monitors_xml.rs`), so the arrangement two
-displays had while they were both attached is on disk and outlives either of them going away.
-Displays that were never attached together have no shared arrangement to read; rank them by
-connector.
+Read that order off `monitors.xml`, which already stores position and primacy per connected set
+(§1, `MonitorsConfig::display_order`): the arrangement two displays had while they were both
+attached is on disk and outlives either of them going away. Configurations are read most recent
+first and each contributes only the displays no later one covered, so the arrangement the user is
+living in now decides. Displays the store has never seen together have no shared arrangement to
+read; connector order ranks them, which is arbitrary but stable — and stable is the requirement,
+since two blocks sharing a rank interleave exactly as one ordinal space does.
+
+`Synoik::reposition_outputs` reads the order and pushes it into `Layout::set_display_order`,
+alongside the primary and by the same precedence: a live `ApplyMonitorsConfig` that moved primary
+moves the block it leads with it, without waiting for anything to be written.
 
 Primacy belongs to the connected *set*, not to a display. Unplugging the primary makes the survivor
 primary, and the survivor hosts everything. What survives the unplug is the block **order** the two
@@ -484,10 +489,6 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 6. **Displaced geometry** (§5) — LANDED.
 7. **The workspace context menu and naming UI** (§6) — LANDED.
 8. **Named workspaces are always present** (§7) — LANDED.
-9. **Display rank, and the `(display_rank, home_ordinal)` comparator** (§2) — the rank source
-   (`monitors.xml` primacy and positions for the last shared configuration, connector order as the
-   fallback), then every merging path: `Layout::add_output`, `Monitor::append_workspaces`, the
-   `MonitorSet::NoOutputs` round trip, and `Layout::drop_displaced_empties`.
-10. **Restore places within a block** (§3) — a saved index becomes a position in its display's own
-    block, and the block's range replaces the strip's bottom.
+9. **Display rank, and the `(display_rank, home_ordinal)` comparator** (§2) — LANDED.
+10. **Restore places within a block** (§3) — LANDED.
 11. **A drag re-homes by block** (§2) — the merged-strip case of the §6 drop.

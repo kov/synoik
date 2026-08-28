@@ -2046,11 +2046,10 @@ fn removing_output_must_keep_empty_focus_on_primary() {
         unreachable!()
     };
 
-    // The primary starts with MIN_NUM_WORKSPACES empties and the removed output's
-    // workspace is spliced in before the last one, so the empty workspace the user was on
-    // keeps both its index and the focus.
-    assert_eq!(monitors[0].active_workspace_idx, 0);
-    assert!(!monitors[0].workspaces[0].has_windows());
+    // The removed display's block ranks above the survivor's own, so the empty desktop the user
+    // was on is at 1 — and it is still the desktop they are on.
+    assert_eq!(monitors[0].active_workspace_idx, 1);
+    assert!(!monitors[0].workspaces[1].has_windows());
 }
 
 /// Moving the last window off a workspace used to reap it. It stays now — that is the
@@ -2082,15 +2081,16 @@ fn move_to_workspace_by_idx_leaves_the_emptied_workspace_in_place() {
     };
 
     let mon = &monitors[0];
-    // [output2's own window, the migrated workspace, the move target, trailing empty].
+    // [the migrated workspace, output2's own window, the move target, trailing empty] — output1's
+    // block ranks above output2's own.
     assert_eq!(mon.workspaces.len(), 4);
     assert!(
         mon.workspaces[2].has_windows(),
         "the window must land on the index it was sent to"
     );
     // …and the workspace it left is still there, empty, closable by hand.
-    assert!(!mon.workspaces[1].has_windows());
-    assert!(mon.workspace_is_closable(1));
+    assert!(!mon.workspaces[0].has_windows());
+    assert!(mon.workspace_is_closable(0));
 }
 
 #[test]
@@ -2160,9 +2160,8 @@ fn workspaces_update_original_output_on_moving_to_same_output() {
         },
         Op::AddOutput(2),
         Op::RemoveOutput(1),
-        // The named workspace is spliced in below output2's own empties, so focus down
-        // onto it.
-        Op::FocusWorkspaceDown,
+        // output1's block ranks above output2's own, so the named workspace is at the top.
+        Op::FocusWorkspace(0),
         Op::MoveWorkspaceToOutput(2),
         Op::AddOutput(1),
     ];
@@ -3894,6 +3893,147 @@ fn dropping_on_the_strip_thumbnail_of_a_culled_workspace() {
         ),
         "the strip should have taken the drop onto the culled workspace, got {:?}",
         mon.insert_hint,
+    );
+}
+
+/// Fills `count` consecutive desktops on output `id`, one window each, ids from `first_window`.
+fn fill_desktops(layout: &mut Layout<TestWindow>, id: usize, count: usize, first_window: usize) {
+    check_ops_on_layout(layout, [Op::FocusOutput(id), Op::FocusWorkspace(0)]);
+    for window in first_window..first_window + count {
+        check_ops_on_layout(
+            layout,
+            [
+                Op::AddWindow {
+                    params: TestWindowParams::new(window),
+                },
+                Op::FocusWorkspaceDown,
+            ],
+        );
+    }
+}
+
+/// The home display and ordinal of every workspace on `id`'s strip.
+fn strip_homes(layout: &Layout<TestWindow>, id: usize) -> Vec<(String, usize)> {
+    let name = format!("output{id}");
+    let mon = layout
+        .monitors()
+        .find(|mon| mon.output_name() == &name)
+        .expect("the output is connected");
+    mon.workspaces
+        .iter()
+        .map(|ws| (ws.original_output.connector.clone(), ws.home_ordinal))
+        .collect()
+}
+
+/// An evacuated display's workspaces make one contiguous block, and the blocks are in display
+/// order — they do not interleave, however many times the survivor's strip is re-sorted.
+///
+/// The regression: `home_ordinal` ranks a workspace *within its own display's strip*, so sorting a
+/// strip that holds two displays' workspaces by the ordinal alone zips the two groups one at a
+/// time. Deliberately asymmetric counts, three against five: equal ones make a zip and a correct
+/// ordering agree at half their positions, which is exactly where a wrong sort hides.
+#[test]
+fn an_evacuated_display_keeps_its_block() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(&mut layout, [Op::AddOutput(1), Op::AddOutput(2)]);
+    layout.set_display_order(vec![
+        OutputIdentity::from_connector("output2"),
+        OutputIdentity::from_connector("output1"),
+    ]);
+
+    fill_desktops(&mut layout, 1, 3, 1);
+    fill_desktops(&mut layout, 2, 5, 10);
+
+    check_ops_on_layout(&mut layout, [Op::RemoveOutput(2)]);
+
+    // What the seat actually does on an unplug: applying the layout for the new monitor set takes
+    // the surviving output down and brings it back, which runs the merged strip through
+    // `MonitorSet::NoOutputs` and into `add_output`'s sort.
+    check_ops_on_layout(&mut layout, [Op::RemoveOutput(1), Op::AddOutput(1)]);
+
+    let strip = strip_homes(&layout, 1);
+    let (blocks, trailing) = strip.split_at(strip.len() - 1);
+    assert_eq!(
+        blocks,
+        [
+            ("output2".to_owned(), 0),
+            ("output2".to_owned(), 1),
+            ("output2".to_owned(), 2),
+            ("output2".to_owned(), 3),
+            ("output2".to_owned(), 4),
+            ("output1".to_owned(), 0),
+            ("output1".to_owned(), 1),
+            ("output1".to_owned(), 2),
+        ],
+        "the higher-ranked display's block leads, and neither is interleaved",
+    );
+    assert_eq!(
+        trailing[0].0, "output1",
+        "the trailing empty is the strip's, at the bottom, and belongs to the display hosting it",
+    );
+}
+
+/// The same merge with no display order to read: the store has never seen these two displays
+/// together, so nothing ranks them — but they still have to make two blocks rather than one zip.
+#[test]
+fn displays_the_store_never_saw_together_still_block() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(&mut layout, [Op::AddOutput(1), Op::AddOutput(2)]);
+
+    fill_desktops(&mut layout, 1, 3, 1);
+    fill_desktops(&mut layout, 2, 5, 10);
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::RemoveOutput(2), Op::RemoveOutput(1), Op::AddOutput(1)],
+    );
+
+    let strip = strip_homes(&layout, 1);
+    let homes: Vec<&str> = strip.iter().map(|(home, _)| home.as_str()).collect();
+    assert_eq!(
+        homes,
+        [
+            "output1", "output1", "output1", "output2", "output2", "output2", "output2", "output2",
+            "output1"
+        ],
+        "connector order ranks them, and the trailing empty stays at the bottom",
+    );
+}
+
+/// A replug hands the display its own block back, in the order it left in.
+#[test]
+fn a_replug_takes_the_block_back() {
+    let mut layout = Layout::default();
+    check_ops_on_layout(&mut layout, [Op::AddOutput(1), Op::AddOutput(2)]);
+    layout.set_display_order(vec![
+        OutputIdentity::from_connector("output2"),
+        OutputIdentity::from_connector("output1"),
+    ]);
+
+    fill_desktops(&mut layout, 1, 3, 1);
+    fill_desktops(&mut layout, 2, 5, 10);
+
+    check_ops_on_layout(&mut layout, [Op::RemoveOutput(2), Op::AddOutput(2)]);
+
+    assert_eq!(
+        strip_homes(&layout, 2)
+            .iter()
+            .map(|(home, ordinal)| (home.as_str(), *ordinal))
+            .collect::<Vec<_>>(),
+        [
+            ("output2", 0),
+            ("output2", 1),
+            ("output2", 2),
+            ("output2", 3),
+            ("output2", 4),
+            ("output2", 5),
+        ],
+    );
+    assert!(
+        strip_homes(&layout, 1)
+            .iter()
+            .all(|(home, _)| home == "output1"),
+        "nothing of the returning display is left behind",
     );
 }
 

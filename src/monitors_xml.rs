@@ -42,6 +42,8 @@ use std::path::PathBuf;
 use smithay::utils::Transform;
 use synoik_config::OutputName;
 
+use crate::output_identity::OutputIdentity;
+
 /// One saved monitor flattened out of the `<logicalmonitor>`/`<monitor>` nesting: the scale and
 /// transform of the logical monitor it belonged to, plus the `<mode>` it was saved at.
 ///
@@ -380,6 +382,38 @@ impl MonitorsConfig {
             return None;
         }
         self.configurations.iter().rev().find(|c| c.key() == key)
+    }
+
+    /// The order the store puts displays in: primary first, then left to right and top to bottom.
+    ///
+    /// This is what ranks the per-display blocks of a shared workspace strip
+    /// (`docs/fork/multi-display.md` §2). A block's position has to survive its display being
+    /// unplugged, and the only thing that knows how two displays were arranged while they were
+    /// both attached is the configuration they were attached in — which is on disk here, keyed by
+    /// the set, and outlives either of them going away.
+    ///
+    /// Configurations are read most recent first and each contributes only the displays no later
+    /// one covered, so the arrangement the user is living in now decides, and a display it does
+    /// not mention still lands somewhere from the last arrangement that did.
+    pub fn display_order(&self) -> Vec<OutputIdentity> {
+        let mut order: Vec<OutputIdentity> = Vec::new();
+        for configuration in self.configurations.iter().rev() {
+            let mut logical: Vec<&SavedLogicalMonitor> =
+                configuration.logical_monitors.iter().collect();
+            logical.sort_by_key(|lm| (!lm.primary, lm.x, lm.y));
+            for monitor in logical.into_iter().flat_map(|lm| &lm.monitors) {
+                let identity = OutputIdentity {
+                    connector: monitor.connector.clone(),
+                    vendor: monitor.vendor.clone(),
+                    product: monitor.product.clone(),
+                    serial: monitor.serial.clone(),
+                };
+                if !order.iter().any(|known| known.matches(&identity)) {
+                    order.push(identity);
+                }
+            }
+        }
+        order
     }
 
     /// Every saved monitor in the store, flattened across configurations, as the per-monitor view

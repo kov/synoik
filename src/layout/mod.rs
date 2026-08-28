@@ -449,6 +449,15 @@ pub struct Layout<W: LayoutElement> {
     /// They are materialized wherever that is, tagged with the display they belong to, so a
     /// display arriving later reclaims its own through the same path a replug uses.
     pending_named: Vec<crate::workspace_names::NamedWorkspace>,
+    /// The order displays' workspace blocks take when they share one strip: primary first, then
+    /// left to right (`docs/fork/multi-display.md` §2).
+    ///
+    /// Pushed in from `Synoik::reposition_outputs`, which reads it out of `monitors.xml` alongside
+    /// the primary and by the same precedence, so the layout never touches the file. A display
+    /// missing from it ranks after every display in it — the store has nothing to say about a
+    /// panel it has never seen, and putting it last is the only answer that does not reorder the
+    /// ones it does know.
+    display_order: Vec<OutputIdentity>,
     /// A workspace in mid-air between two displays' strips. Set once a drag has actually crossed a
     /// display boundary, and cleared when it lands.
     thumb_carry: Option<ThumbCarry>,
@@ -1007,6 +1016,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: Vec::new(),
             interactive_move: None,
+            display_order: Vec::new(),
             thumb_carry: None,
             parked_workspaces: Vec::new(),
             pending_named: Vec::new(),
@@ -1039,6 +1049,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: Vec::new(),
             interactive_move: None,
+            display_order: Vec::new(),
             thumb_carry: None,
             parked_workspaces: Vec::new(),
             pending_named: Vec::new(),
@@ -1195,7 +1206,7 @@ impl<W: LayoutElement> Layout<W> {
                 // *this* display's strip each one sat, and the sort is stable so anything that
                 // never got one keeps the order it was evacuated in.
                 Self::drop_displaced_empties(&mut workspaces);
-                workspaces.sort_by_key(|ws| ws.home_ordinal);
+                Self::sort_into_blocks(&self.display_order, &mut workspaces);
 
                 let ws_id_to_activate = self.take_last_active_workspace(&output);
 
@@ -1221,7 +1232,11 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { mut workspaces } => {
                 workspaces.extend(self.take_parked_for(&output));
                 Self::drop_displaced_empties(&mut workspaces);
-                workspaces.sort_by_key(|ws| ws.home_ordinal);
+                Self::sort_into_blocks(&self.display_order, &mut workspaces);
+                Self::drop_host_trailing_filler(
+                    &OutputIdentity::from_output(&output),
+                    &mut workspaces,
+                );
 
                 let ws_id_to_activate = self.take_last_active_workspace(&output);
 
@@ -1264,22 +1279,18 @@ impl<W: LayoutElement> Layout<W> {
         let mut pending = mem::take(&mut self.pending_named);
         pending.sort_by_key(|ws| ws.ordinal);
 
-        let mut block: Vec<WorkspaceId> = Vec::with_capacity(pending.len());
         for entry in pending {
             // A name the layout already answers to is the store agreeing with the strip, not a
             // second workspace to make: names are unique, and `set_workspace_name` would refuse.
             if self.find_workspace_by_name(&entry.name).is_some() {
                 continue;
             }
-            let Some(id) =
-                self.insert_restore_workspace(output, None, &block, entry.home, entry.ordinal)
-            else {
+            let Some(id) = self.insert_restore_workspace(output, entry.home, entry.ordinal) else {
                 continue;
             };
             if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == id) {
                 ws.name = Some(entry.name);
             }
-            block.push(id);
         }
 
         // Materializing takes over the trailing empties, so the strip can come out of this with
@@ -1371,6 +1382,118 @@ impl<W: LayoutElement> Layout<W> {
         *primary_idx = idx;
     }
 
+    /// Tells the layout how displays' blocks rank when they share one strip
+    /// ([`Self::display_order`], `docs/fork/multi-display.md` §2).
+    pub fn set_display_order(&mut self, order: Vec<OutputIdentity>) {
+        self.display_order = order;
+    }
+
+    /// Where `home`'s block sits among the blocks of a shared strip.
+    ///
+    /// The other half of the sort key is [`Workspace::home_ordinal`], which ranks a workspace
+    /// *within* its own display's block and says nothing across displays: sorting a strip that
+    /// holds two displays' workspaces by the ordinal alone interleaves them one at a time, since
+    /// both blocks number from zero and a stable sort zips equal keys.
+    fn display_rank(order: &[OutputIdentity], home: &OutputIdentity) -> usize {
+        order
+            .iter()
+            .position(|known| known.matches(home))
+            .unwrap_or(order.len())
+    }
+
+    /// Puts a strip's workspaces into contiguous per-display blocks, blocks in display order.
+    ///
+    /// Called only where two displays' workspaces *become* one strip — an evacuation, and the
+    /// reclaim on the other side of it. Deliberately not from `clean_up_workspaces`, which every
+    /// reorder funnels through: sorting there would snap a workspace the user has just dragged
+    /// back to where its ordinal says it belongs, and where a drag lands is what decides its home
+    /// in the first place (§2).
+    fn sort_into_blocks(order: &[OutputIdentity], workspaces: &mut [Workspace<W>]) {
+        workspaces.sort_by_key(|ws| Self::block_key(order, ws));
+    }
+
+    /// Where a workspace sorts in a shared strip: its block, then its rank inside it.
+    fn block_key(order: &[OutputIdentity], ws: &Workspace<W>) -> (usize, String, usize) {
+        (
+            Self::display_rank(order, &ws.original_output),
+            // Two displays the store has never seen together share a rank, and leaving it at that
+            // would zip their blocks exactly as sorting on the ordinal alone does. The connector
+            // is arbitrary but it is *stable*, which is the whole requirement.
+            ws.original_output.connector.to_lowercase(),
+            ws.home_ordinal,
+        )
+    }
+
+    /// Drops the filler that trails the *hosting* display's block, once the strip is in blocks.
+    ///
+    /// A strip's trailing empty is the strip's, not any block's (§2): it is what the workspace-list
+    /// invariant keeps at the bottom, and `clean_up_workspaces` puts exactly one back there. Left
+    /// in the sort it settles at the end of the block that owns it, which is mid-strip as soon as
+    /// another block ranks after — and nothing would ever clear it, because empty workspaces here
+    /// are dismissed by hand, never reaped (`docs/fork/dynamic-workspaces-divergence.md`).
+    ///
+    /// Three things it deliberately leaves alone. An empty *between* two of the host's own
+    /// desktops is a hole in its arrangement, not filler. The host's own trailing empty when its
+    /// block is already last, which is the strip's trailing empty sitting exactly where it belongs.
+    /// And every *visiting* workspace, empty or not: a visitor's empties are the holes its display
+    /// parked to come back to, and a workspace a restore slot has just claimed holds no window
+    /// until the window it was made for finishes mapping.
+    fn drop_host_trailing_filler(host: &OutputIdentity, workspaces: &mut Vec<Workspace<W>>) {
+        let own: Vec<usize> = workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| host.matches(&ws.original_output))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Nothing to hold out of the way when the host's block already ends the strip — and
+        // nothing at all to do for a strip with no workspaces in it, which is a moment every
+        // rebuild passes through.
+        if workspaces.is_empty() || own.last() == Some(&(workspaces.len() - 1)) {
+            return;
+        }
+
+        let mut doomed = vec![false; workspaces.len()];
+        for &idx in own.iter().rev() {
+            if workspaces[idx].is_substantial() {
+                break;
+            }
+            doomed[idx] = true;
+        }
+
+        let mut idx = 0;
+        workspaces.retain(|_| {
+            let keep = !doomed[idx];
+            idx += 1;
+            keep
+        });
+    }
+
+    /// Re-blocks a monitor's strip after an evacuation landed on it.
+    ///
+    /// The active workspace is followed by id, not by index: it is very likely to have moved. If
+    /// it was the trailing empty it is gone, and the one `clean_up_workspaces` grows in its place
+    /// is the same desktop as far as the user is concerned.
+    fn reblock(order: &[OutputIdentity], mon: &mut Monitor<W>) {
+        let active = &mon.workspaces[mon.active_workspace_idx];
+        let active_id = active.id();
+        let active_was_filler = !active.has_windows_or_name();
+
+        Self::sort_into_blocks(order, &mut mon.workspaces);
+        Self::drop_host_trailing_filler(
+            &OutputIdentity::from_output(&mon.output),
+            &mut mon.workspaces,
+        );
+        Self::restore_strip_invariants(mon, active_id);
+
+        // The desktop the user was on was the strip's filler, and the filler is now the one
+        // `clean_up_workspaces` just grew at the bottom. As far as the user is concerned it is the
+        // same empty desktop.
+        if active_was_filler && !mon.workspaces.iter().any(|ws| ws.id() == active_id) {
+            mon.active_workspace_idx = mon.workspaces.len() - 1;
+        }
+    }
+
     pub fn remove_output(&mut self, output: &Output) {
         self.monitor_set = match mem::take(&mut self.monitor_set) {
             MonitorSet::Normal {
@@ -1417,6 +1540,7 @@ impl<W: LayoutElement> Layout<W> {
 
                     let primary = &mut monitors[primary_idx];
                     primary.append_workspaces(workspaces);
+                    Self::reblock(&self.display_order, primary);
 
                     MonitorSet::Normal {
                         monitors,
@@ -2518,20 +2642,6 @@ impl<W: LayoutElement> Layout<W> {
         })
     }
 
-    /// The workspace a restored window belongs on, growing the strip if the index is past the end.
-    ///
-    /// See [`Monitor::ensure_workspace_at`] for why restore grows rather than clamps, and what
-    /// `block_start` keeps out of the way.
-    pub fn ensure_restore_workspace(
-        &mut self,
-        output: &Output,
-        idx: usize,
-        block_start: Option<usize>,
-    ) -> Option<WorkspaceId> {
-        let mon = self.monitor_for_output_mut(output)?;
-        Some(mon.ensure_workspace_at(idx, block_start).id())
-    }
-
     /// Drops the anonymous empties a returning display's own desktops have taken the rank of.
     ///
     /// Two workspaces can claim one ordinal, because a session restore stamps it from a *saved*
@@ -2541,37 +2651,29 @@ impl<W: LayoutElement> Layout<W> {
     /// that were side by side. A **named** empty is not filler and stays, at whatever rank the
     /// sort gives it.
     fn drop_displaced_empties(workspaces: &mut Vec<Workspace<W>>) {
-        let claimed: Vec<usize> = workspaces
+        let claimed: Vec<(OutputIdentity, usize)> = workspaces
             .iter()
             .filter(|ws| ws.has_windows())
-            .map(|ws| ws.home_ordinal)
+            .map(|ws| (ws.original_output.clone(), ws.home_ordinal))
             .collect();
-        workspaces.retain(|ws| ws.has_windows_or_name() || !claimed.contains(&ws.home_ordinal));
-    }
-
-    /// Where the workspaces restored for absent displays begin on `output`'s strip.
-    ///
-    /// Positional, not a remembered number: the block moves as the strip around it does, and the
-    /// question anyone asks about it is "what is above it", which only a position answers.
-    pub fn restore_block_start(&self, output: &Output, block: &[WorkspaceId]) -> Option<usize> {
-        let mon = self.monitor_for_output(output)?;
-        mon.workspaces
-            .iter()
-            .position(|ws| block.contains(&ws.id()))
+        // A rank belongs to a display, so the collision is only ever with a desktop of the *same*
+        // display: an ordinal one display's workspace claims says nothing about another's empty.
+        // Matched pairwise rather than looked up, because `OutputIdentity::matches` tolerates a
+        // missing EDID field and is not the equivalence relation a set would need.
+        workspaces.retain(|ws| {
+            ws.has_windows_or_name()
+                || !claimed.iter().any(|(home, ordinal)| {
+                    *ordinal == ws.home_ordinal && home.matches(&ws.original_output)
+                })
+        });
     }
 
     /// Materializes one workspace of an absent display's restored block on `output`.
     ///
-    /// Placed before `before` when that workspace is still there, else at the bottom of the strip.
-    /// A position relative to the block's other workspaces, never an index: the ordering the block
-    /// follows is the rank of its slots, and rank-relative insertion is what makes a burst of
-    /// restores land the same way whatever order the clients ask in. Nothing is reserved — a slot
-    /// no window restores into never becomes a workspace at all.
-    ///
-    /// The bottom is the top of the strip's trailing run of empty, unclaimed workspaces, and one
-    /// of those is taken over rather than added to: a strip that holds nothing of its own is all
-    /// trailing run, and a block that inserted below it would leave the first desktop empty and
-    /// push everything the user saved down one.
+    /// Made at the end and then sorted into place by home and ordinal, which is what makes a burst
+    /// of restores land the same way whatever order the clients ask in: the strip that comes out
+    /// is a function of the *set* of slots materialized so far, never of the sequence. Nothing is
+    /// reserved — a slot no window restores into never becomes a workspace at all.
     ///
     /// The workspace is tagged as the absent display's, with the saved index as its home ordinal,
     /// so plugging that display back in reclaims it into the arrangement it was saved in — the
@@ -2580,42 +2682,136 @@ impl<W: LayoutElement> Layout<W> {
     pub fn insert_restore_workspace(
         &mut self,
         output: &Output,
-        before: Option<WorkspaceId>,
-        block: &[WorkspaceId],
         home: OutputIdentity,
         home_ordinal: usize,
     ) -> Option<WorkspaceId> {
-        let mon = self.monitor_for_output_mut(output)?;
-        let successor = before.and_then(|id| mon.workspaces.iter().position(|ws| ws.id() == id));
-
-        // The top of the trailing run of workspaces that are empty and not already a slot's.
-        let free = mon
-            .workspaces
-            .iter()
-            .enumerate()
-            .rev()
-            .take_while(|(_, ws)| !ws.has_windows_or_name() && !block.contains(&ws.id()))
-            .map(|(idx, _)| idx)
-            .last();
-
-        let idx = match (successor, free) {
-            (Some(idx), _) => idx,
-            // Nothing ranks after this one and the bottom is free: take it over.
-            (None, Some(idx)) => return Some(mon.workspaces[idx].claim_for(home, home_ordinal)),
-            // Nothing ranks after it and nothing is free either — every workspace down to the last
-            // is spoken for, so this one goes below them all.
-            (None, None) => mon.workspaces.len(),
+        let Self {
+            monitor_set: MonitorSet::Normal { monitors, .. },
+            display_order,
+            ..
+        } = self
+        else {
+            return None;
         };
+        let mon = monitors.iter_mut().find(|mon| &mon.output == output)?;
 
         // At the cap the block shares a workspace rather than growing the strip: the count is
         // driven by a file, and a hostile one must not be able to inflate it.
         if mon.workspaces.len() >= MAX_NUM_WORKSPACES {
-            let idx = idx.min(mon.workspaces.len() - 1);
-            return Some(mon.workspaces[idx].claim_for(home, home_ordinal));
+            let last = mon.workspaces.len() - 1;
+            return Some(mon.workspaces[last].claim_for(home, home_ordinal));
         }
-        mon.add_workspace_at(idx);
 
-        Some(mon.workspaces[idx].claim_for(home, home_ordinal))
+        let key = (
+            Self::display_rank(display_order, &home),
+            home.connector.to_lowercase(),
+            home_ordinal,
+        );
+        let idx = Self::restore_insertion_point(display_order, &mon.workspaces, key);
+
+        let id = if mon
+            .workspaces
+            .get(idx)
+            .is_some_and(|ws| !ws.is_substantial())
+        {
+            // The filler standing there is the strip's, and the slot is what the user saved.
+            mon.workspaces[idx].claim_for(home, home_ordinal)
+        } else {
+            mon.add_workspace_at(idx);
+            mon.workspaces[idx].claim_for(home, home_ordinal)
+        };
+
+        Self::settle_strip(display_order, mon);
+        Some(id)
+    }
+
+    /// Where a slot goes among the workspaces the strip *already means something by*.
+    ///
+    /// Anonymous empties are transparent to this: they are the strip's filler, they carry whatever
+    /// rank the invariants happened to stamp on them, and letting them decide a slot's position
+    /// would make the arrangement depend on how much filler was lying around when the slot
+    /// arrived. What ranks a slot is the desktops with windows and names on them.
+    fn restore_insertion_point(
+        order: &[OutputIdentity],
+        workspaces: &[Workspace<W>],
+        key: (usize, String, usize),
+    ) -> usize {
+        let substantial = || {
+            workspaces
+                .iter()
+                .enumerate()
+                .filter(|(_, ws)| ws.is_substantial())
+        };
+        if let Some((idx, _)) = substantial().find(|(_, ws)| Self::block_key(order, ws) >= key) {
+            return idx;
+        }
+        substantial().last().map_or(0, |(idx, _)| idx + 1)
+    }
+
+    /// Puts a strip back into blocks and back inside the workspace-list invariants.
+    fn settle_strip(order: &[OutputIdentity], mon: &mut Monitor<W>) {
+        let active_id = mon.workspaces[mon.active_workspace_idx].id();
+        Self::sort_into_blocks(order, &mut mon.workspaces);
+        Self::drop_host_trailing_filler(
+            &OutputIdentity::from_output(&mon.output),
+            &mut mon.workspaces,
+        );
+        Self::restore_strip_invariants(mon, active_id);
+    }
+
+    /// Follows the active workspace by id across a reorder and restores the list invariants.
+    fn restore_strip_invariants(mon: &mut Monitor<W>, active_id: WorkspaceId) {
+        mon.workspace_switch = None;
+        mon.active_workspace_idx = mon
+            .workspaces
+            .iter()
+            .position(|ws| ws.id() == active_id)
+            .unwrap_or(0);
+        mon.clean_up_workspaces();
+        if mon.active_workspace_idx >= mon.workspaces.len() {
+            mon.active_workspace_idx = mon.workspaces.len() - 1;
+        }
+    }
+
+    /// The workspace a restored window belongs on, growing this display's own block to reach it.
+    ///
+    /// A saved index counts the display's **own** desktops, not the strip's positions: another
+    /// display's block can be sitting above them (§2), and its size is not something a record
+    /// could have known when it was written. Growth fills the ranks below it, so a hole the user
+    /// left in their own arrangement comes back as a hole.
+    pub fn ensure_restore_workspace(&mut self, output: &Output, idx: usize) -> Option<WorkspaceId> {
+        let Self {
+            monitor_set: MonitorSet::Normal { monitors, .. },
+            display_order,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mon = monitors.iter_mut().find(|mon| &mon.output == output)?;
+        let home = OutputIdentity::from_output(&mon.output);
+
+        let idx = if idx < MAX_NUM_WORKSPACES {
+            idx
+        } else {
+            warn!(
+                "restoring a window to workspace {idx}, past the {MAX_NUM_WORKSPACES} cap; \
+                 clamping"
+            );
+            MAX_NUM_WORKSPACES - 1
+        };
+
+        while mon.own_workspace_count() <= idx && mon.workspaces.len() < MAX_NUM_WORKSPACES {
+            let ordinal = mon.own_workspace_count();
+            let at = mon.own_block_end();
+            mon.add_workspace_at(at);
+            mon.workspaces[at].claim_for(home.clone(), ordinal);
+        }
+
+        let at = mon.own_block_position(idx)?;
+        let id = mon.workspaces[at].claim_for(home, idx);
+        Self::settle_strip(display_order, mon);
+        Some(id)
     }
 
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {

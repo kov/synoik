@@ -622,7 +622,7 @@ impl<W: LayoutElement> Monitor<W> {
             workspaces.push(new_workspace());
         }
 
-        Self {
+        let mut monitor = Self {
             output_name: output.name(),
             output,
             scale,
@@ -653,7 +653,13 @@ impl<W: LayoutElement> Monitor<W> {
             base_options,
             options,
             layout_config,
-        }
+        };
+
+        // A strip is born with its ordinals true, like every other state it passes through. A
+        // monitor built short grows its trailing empty here, and an unranked workspace sorts to
+        // the top of its display's block the next time two displays share a strip.
+        monitor.stamp_home_ordinals();
+        monitor
     }
 
     /// The strip, detached: every workspace, in order, with no output.
@@ -748,6 +754,12 @@ impl<W: LayoutElement> Monitor<W> {
                 switch.offset(1);
             }
         }
+
+        // Every insertion funnels through here, and a workspace with no rank sorts to the top of
+        // its display's block the next time two displays share a strip. `clean_up_workspaces` also
+        // stamps, but not every caller goes through it — the trailing empty a window landing on
+        // the last desktop grows is added straight from here.
+        self.stamp_home_ordinals();
     }
 
     pub fn add_workspace_top(&mut self) {
@@ -777,37 +789,31 @@ impl<W: LayoutElement> Monitor<W> {
     /// Past [`MAX_NUM_WORKSPACES`] the index is clamped instead: growth is driven by a number
     /// read off disk, and a corrupt record must not be able to inflate the strip without bound.
     ///
-    /// `block_start` is where the workspaces restored for a display that is *away* begin, when the
-    /// strip carries any (see [`Layout::insert_restore_workspace`]). Growth then inserts above
-    /// that boundary instead of appending past it, so this display's saved index keeps meaning the
-    /// same position whether the absent display's block landed before it or after.
-    pub fn ensure_workspace_at(&mut self, idx: usize, block_start: Option<usize>) -> &Workspace<W> {
-        let idx = if idx < MAX_NUM_WORKSPACES {
-            idx
-        } else {
-            warn!(
-                "restoring a window to workspace {idx}, past the {MAX_NUM_WORKSPACES} cap; \
-                 clamping"
-            );
-            MAX_NUM_WORKSPACES - 1
-        };
+    /// How many workspaces on this strip are this display's own — the size of its block.
+    pub(super) fn own_workspace_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .filter(|ws| ws.original_output.matches_output(&self.output))
+            .count()
+    }
 
-        match block_start {
-            // The block floats: everything this display owns stays above it.
-            Some(mut start) => {
-                while start <= idx {
-                    self.add_workspace_at(start);
-                    start += 1;
-                }
-            }
-            None => {
-                while self.workspaces.len() <= idx {
-                    self.add_workspace_bottom();
-                }
-            }
-        }
+    /// One past this display's last own workspace: where its block ends, and so where growing it
+    /// inserts. Blocks are contiguous, so that position is still inside the block.
+    pub(super) fn own_block_end(&self) -> usize {
+        self.workspaces
+            .iter()
+            .rposition(|ws| ws.original_output.matches_output(&self.output))
+            .map_or(self.workspaces.len(), |idx| idx + 1)
+    }
 
-        &self.workspaces[idx]
+    /// Where this display's `idx`-th own workspace sits in the strip.
+    pub(super) fn own_block_position(&self, idx: usize) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| ws.original_output.matches_output(&self.output))
+            .map(|(pos, _)| pos)
+            .nth(idx)
     }
 
     pub fn activate_workspace(&mut self, idx: usize) {
@@ -1093,7 +1099,11 @@ impl<W: LayoutElement> Monitor<W> {
 
         // "If we don't have an empty workspace at the end, add one", then "enforce minimum
         // number of workspaces" (`windowManager.js:267-276`).
-        if self.workspaces.last().unwrap().has_windows_or_name() {
+        if self
+            .workspaces
+            .last()
+            .is_none_or(|ws| ws.has_windows_or_name())
+        {
             self.add_workspace_bottom();
         }
         while self.workspaces.len() < MIN_NUM_WORKSPACES {

@@ -8512,13 +8512,26 @@ impl Synoik {
                     .find_map(|m| output_named(&m.connector))
             })
         });
-        if let Some(primary) = primary {
+        if let Some(primary) = primary.clone() {
             if self.layout.primary_output() != Some(&primary) {
                 self.layout.set_primary_output(&primary);
                 // Primary is part of the IPC output model, so moving it is an output change.
                 self.ipc_outputs_changed = true;
             }
         }
+
+        // And in what order displays' workspace blocks share a strip when one of them is unplugged
+        // (`docs/fork/multi-display.md` §2). Read from the same store and by the same precedence as
+        // primary above, so the two cannot disagree: a live apply that moved primary moves the
+        // block it leads with it, without waiting for anything to be written.
+        let mut display_order = monitors_config
+            .map(|config| config.display_order())
+            .unwrap_or_default();
+        if let Some(primary) = primary.as_ref().and_then(OutputIdentity::try_from_output) {
+            display_order.retain(|known| !known.matches(&primary));
+            display_order.insert(0, primary);
+        }
+        self.layout.set_display_order(display_order);
     }
 
     /// Derives an output's scale and transform from the precedence chain described in
