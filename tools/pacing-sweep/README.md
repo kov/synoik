@@ -65,10 +65,25 @@ on@2.0ms  8       57506   26      0.000452  2.2x    3        15           0.036m
 on@4.0ms  8       57532   13      0.000226  1.09x   2        11           0.035ms    0.0
 ```
 
+**Read `held_frames` before reading the rate.** As the margin widens,
+`boundary − (estimate + margin)` lands at-or-before *now* more often, and those frames dispatch
+immediately — the feature turns itself off, reverting toward the `off` condition. Under a
+variable-cost load the held fraction fell 0.90 → 0.755 → 0.65 across 2/4/8 ms, so most of the
+apparent gain from a wider margin was self-disabling. A rate alone reads that as success. Attribute
+unheld frames the `off` rate and re-rate over held frames only before believing a dose-response.
+
 Parity with `off` is the best a margin can do. `docs/fork/foundation.md` §3 carries the standing
 result and what it means for shipping the feature; §4 carries the wake floor the margin is
 calibrated against, and `tools/timer-probe` re-measures that floor — **run it first** after any VMM,
 kernel or hardware change, because a floor that moves invalidates every margin taken against it.
+
+## The load decides the answer
+
+A constant-cost client (vkcube) is the render-time estimator's easiest case: frame cost never moves,
+so the margin only ever buys wake jitter, and parity arrives at 4 ms. Swing the cost — the overview
+toggled underneath, ~2 ms ↔ ~35 ms — and no margin up to 8 ms reaches parity, because the residual
+is estimate error rather than lateness. **State which load a result was taken under; a margin
+calibrated on one does not transfer to the other.**
 
 ## What this tool cannot tell you
 

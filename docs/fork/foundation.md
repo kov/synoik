@@ -283,7 +283,23 @@ vkcube as a continuous client, conditions interleaved in 60 s blocks; ~36 k fram
 | 2 ms | 2.0–3.0× | 2.2× |
 | 4 ms | 1.0× | 1.09× |
 
-Three readings, none of them free:
+That is measured against a **constant-cost** client, and it does not generalise. Repeating the
+sweep with the overview toggled underneath vkcube — frame cost swinging ~2 ms ↔ ~35 ms — **no margin
+up to 8 ms reaches parity**: 3.8× at 2 ms, 2.8× at 4 ms, 2.2× at 8 ms, after correcting for the
+confound below. The residual is not the wakeup: at 8 ms only 0.02% of held frames were released
+later than their margin, so the floor has been bought out entirely and what remains is **render-time
+estimate error**. The two-tier max rises at once and decays by halves once a second, which is wrong
+in both directions on content that swings by an order of magnitude. Widening the margin cannot fix
+that; a better cost estimator would.
+
+**Judge any such run on `held_frames`, never on the raw rate.** As the margin widens,
+`boundary − (estimate + margin)` lands at-or-before *now* more often and those frames dispatch
+immediately — the feature turns *itself* off. The held fraction fell 0.90 → 0.755 → 0.65 across the
+2/4/8 ms arms under variable cost (against 0.98/0.97 under constant cost), so most of the apparent
+improvement from a wider margin was self-disabling, i.e. reverting toward the `off` condition. A
+sweep that reports only the miss rate reads that as success.
+
+Three readings of the constant-cost table, none of them free:
 
 - **The parity point does not scale with the refresh interval.** 4 ms at both rates is what the
   margin paying for *wake jitter and estimate error* predicts — neither term knows the refresh rate.

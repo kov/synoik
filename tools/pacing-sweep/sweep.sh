@@ -88,20 +88,28 @@ fi
 # full set of plausible numbers and answers nothing.
 sleep 2
 snap2=$(perf)
-busiest=$(jq -n --argjson a "$snap2" --argjson b "$snap" '
+# -r on BOTH: without it the name arrives JSON-quoted, every comparison against it
+# fails, and these guards degrade to a warning and a shell error while the sweep runs
+# on regardless -- failing open is the one thing a guard must not do.
+busiest=$(jq -rn --argjson a "$snap2" --argjson b "$snap" '
   [ $a.outputs[] as $ao | ($b.outputs[]|select(.output==$ao.output)) as $bo
     | {output: $ao.output, d: ($ao.frames - $bo.frames)} ]
   | max_by(.d) | .output')
-busiest_d=$(jq -n --argjson a "$snap2" --argjson b "$snap" --arg o "$busiest" '
+busiest_d=$(jq -rn --argjson a "$snap2" --argjson b "$snap" --arg o "$busiest" '
   [ $a.outputs[] as $ao | ($b.outputs[]|select(.output==$ao.output)) as $bo
-    | select($ao.output==$o) | ($ao.frames - $bo.frames) ] | first')
+    | select($ao.output==$o) | ($ao.frames - $bo.frames) ] | first // 0')
 if [ -z "$OUTPUT" ]; then
   OUTPUT=$busiest
   echo "load output (autodetected): $OUTPUT"
+elif ! jq -e --arg o "$OUTPUT" 'any(.outputs[]; .output == $o)' <<<"$snap2" >/dev/null; then
+  echo "no output named $OUTPUT in that session; it has:" >&2
+  jq -r '.outputs[].output | "  " + .' <<<"$snap2" >&2
+  exit 2
 elif [ "$OUTPUT" != "$busiest" ]; then
   echo "WARNING: -o $OUTPUT, but $busiest is the busy one ($busiest_d frames in 2s)" >&2
 fi
-if [ "${busiest_d:-0}" -lt 30 ]; then
+case "${busiest_d:-0}" in ''|*[!0-9-]*) busiest_d=0 ;; esac
+if [ "$busiest_d" -lt 30 ]; then
   echo "no output is presenting continuously (busiest: ${busiest_d:-0} frames in 2s)." >&2
   echo "Deadline dispatch only engages on continuous frames -- start a client like vkcube." >&2
   exit 2
