@@ -5,24 +5,30 @@
 //! The desktop context menu — gnome-shell's `BackgroundMenu` (`js/ui/backgroundMenu.js`), the
 //! menu a right-click on the wallpaper raises.
 //!
-//! Three rows, in GNOME's order and grouping: "Change Background…", a separator, "Display
-//! Settings" and "Settings" (`backgroundMenu.js:13-16`). gnome-shell attaches it to every
-//! background actor (`layout.js:496-508`), which is the bottom-most thing on the stage — so the
-//! menu appears only where nothing else took the press.
+//! Two rows, in GNOME's order and grouping: "Change Background…", a separator, "Display
+//! Settings" (`backgroundMenu.js:13-16`). gnome-shell attaches it to every background actor
+//! (`layout.js:496-508`), which is the bottom-most thing on the stage — so the menu appears only
+//! where nothing else took the press.
+//!
+//! Both rows open a Settings *panel* rather than launching that panel's desktop file, which is
+//! the divergence [`PopoverAction::LaunchSettingsPanel`] documents.
+//!
+//! **Divergence — no plain "Settings" row.** GNOME's third row opens the Settings app at
+//! whatever panel it last showed (`backgroundMenu.js:16`). Ours already has that button in the
+//! quick-settings menu, where every other shell surface reaches it; a second copy on the
+//! wallpaper says nothing about the wallpaper. The two rows that remain are the two that act on
+//! what was clicked.
 //!
 //! **Divergence — no long-press.** GNOME also raises it on a primary-button long press, for
 //! touch (`backgroundMenu.js:40-50`). We have no long-press gesture anywhere yet (touch is
 //! deferred), so the right-click is the only way in.
-//!
-//! The first two rows open a Settings *panel* rather than launching that panel's desktop file,
-//! which is the divergence [`PopoverAction::LaunchSettingsPanel`] documents.
 
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Size};
 
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
+use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{Dir, Menu, MenuEntry, MenuHit, MenuItem};
 
 /// The desktop context menu's content.
@@ -40,7 +46,7 @@ impl Default for BackgroundMenu {
 
 impl BackgroundMenu {
     pub fn new() -> Self {
-        let rows: [(&str, PopoverAction); 3] = [
+        let rows: [(&str, PopoverAction); 2] = [
             (
                 "Change Background…",
                 PopoverAction::LaunchSettingsPanel {
@@ -55,17 +61,14 @@ impl BackgroundMenu {
                     args: Vec::new(),
                 },
             ),
-            (
-                "Settings",
-                PopoverAction::ActivateApp(SETTINGS_DESKTOP_ID.to_owned()),
-            ),
         ];
 
         let mut actions = Vec::new();
         let mut entries = Vec::new();
         for (index, (label, action)) in rows.into_iter().enumerate() {
-            // The separator sits after the first row only: gnome-shell adds it between "Change
-            // Background…" and the two settings rows (`backgroundMenu.js:14`).
+            // The separator sits after the first row: gnome-shell puts it between "Change
+            // Background…" and the settings rows below it (`backgroundMenu.js:14`), which is the
+            // split between acting on the thing that was clicked and acting on the session.
             if index == 1 {
                 entries.push(MenuEntry::Separator);
             }
@@ -180,12 +183,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_desktop_menu_is_gnomes_three_rows() {
+    fn the_desktop_menu_acts_on_the_desktop() {
         let menu = BackgroundMenu::new();
-        assert_eq!(
-            menu.labels(),
-            ["Change Background…", "Display Settings", "Settings"]
-        );
+        // GNOME's third row, a plain "Settings", is deliberately absent — see the module doc.
+        assert_eq!(menu.labels(), ["Change Background…", "Display Settings"]);
     }
 
     #[test]
@@ -203,13 +204,6 @@ mod tests {
                 }
                 other => panic!("{label} gave {other:?}"),
             }
-        }
-
-        let mut menu = BackgroundMenu::new();
-        let at = menu.row_center("Settings").unwrap();
-        match menu.pointer_click(at) {
-            PopoverAction::ActivateApp(id) => assert_eq!(id, SETTINGS_DESKTOP_ID),
-            other => panic!("Settings gave {other:?}"),
         }
     }
 }

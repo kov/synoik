@@ -36673,7 +36673,8 @@ fn an_element_appearing_in_front_does_not_repaint_the_background() {
 }
 
 /// The desktop context menu is gnome-shell's `BackgroundMenu` (`js/ui/backgroundMenu.js`): a
-/// right-click on the wallpaper, three rows, in GNOME's order.
+/// right-click on the wallpaper, GNOME's rows in GNOME's order, less the plain "Settings" one
+/// (divergence, `ui::background_menu`).
 ///
 /// It hangs off the background actor, the bottom-most thing on the stage (`layout.js:496-508`),
 /// so it answers only for a press nothing above it took — the panel strip and any window are the
@@ -36694,7 +36695,7 @@ fn a_right_click_on_the_wallpaper_opens_the_desktop_menu() {
         .expect("the wallpaper has a menu");
     assert_eq!(
         menu.labels(),
-        vec!["Change Background…", "Display Settings", "Settings"]
+        vec!["Change Background…", "Display Settings"]
     );
 
     // Nothing is focused on open: `backgroundMenu.js` has no `navigate_focus` call, unlike the
