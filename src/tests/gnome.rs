@@ -11463,6 +11463,10 @@ fn thumbnail_click_switches_workspace_and_stays() {
 /// Dropping a window preview on a strip thumbnail moves the window to that
 /// workspace, keeping its desktop position (gnome-shell's
 /// WorkspaceThumbnail.acceptDrop → moveWindowToMonitorAndWorkspace).
+///
+/// The thumbnail names a workspace and nothing else — where on it the pointer let go is not a
+/// position. Only the *arrival animation* is drawn from the thumbnail
+/// ([`a_strip_drop_arrives_from_where_the_window_already_is`]).
 #[test]
 fn thumbnail_drop_moves_window_keeping_position() {
     let mut f = Fixture::new();
@@ -35204,6 +35208,26 @@ fn drop_preview_on_thumbnail(f: &mut Fixture, win: &smithay::desktop::Window, id
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// Drag `win`'s preview out of the main view and drop it on the workspace peeking at the right
+/// edge — an in-picker drop, which still flies the tile across the view.
+///
+/// A *strip* drop deliberately does not: the window lands where the thumbnail put it and grows
+/// there rather than travelling (`Layout::interactive_move_end`). So a test that needs a move
+/// spring running has to use this one.
+fn drop_preview_on_the_peeking_neighbour(f: &mut Fixture, win: &smithay::desktop::Window) {
+    let rect = f.synoik().layout.expose_target_rect(win).unwrap();
+    let view = f.synoik().layout.active_workspace().unwrap().view_size();
+    pointer_motion_to(
+        f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(f, rect.loc.x + rect.size.w / 2., rect.loc.y + 10.);
+    pointer_motion_to(f, view.w - 20., view.h / 2.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+}
+
 /// An output whose scale makes a logical pixel land between physical ones.
 fn fractional_output(f: &mut Fixture) {
     f.add_output(1, (3840, 2160));
@@ -35228,7 +35252,7 @@ fn a_settled_position_does_not_move_while_the_window_animates() {
     // 801x601 centres at x = (3072 - 801) / 2 = 1135.5, which is 1419.375 physical: off the
     // grid, where the double rounding actually oscillates.
     let (_, _, win_c) = tied_previews_in_the_overview(&mut f, id, (801, 601));
-    drop_preview_on_thumbnail(&mut f, &win_c, 1);
+    drop_preview_on_the_peeking_neighbour(&mut f, &win_c);
 
     // The drop arms a move spring whose tail runs well past the 200ms slot slide. Sample the
     // window's drawn position alongside, since "it did not move" is only a claim about a
@@ -36802,4 +36826,169 @@ fn a_right_click_on_a_layer_surface_is_not_the_desktop_menu() {
     );
 
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}
+
+/// A strip drop's arrival picks up where the thumbnail left off.
+///
+/// It used to be drawn from where the pointer let go in *output* coordinates — which, on the
+/// strip, is the top of the screen, and a top corner once the row has scrolled: the window read
+/// as being thrown in from off-screen. What the eye had actually been reading, though, was a
+/// window sitting on a miniature of that desktop, at some place on it and at some size. So the
+/// arrival starts there: that place and that size, blown up by the miniature's own ratio, easing
+/// from there into the picker's slot.
+///
+/// The window's position on the desktop is not touched by any of this — see
+/// [`thumbnail_drop_moves_window_keeping_position`].
+#[test]
+fn a_strip_drop_arrives_from_where_it_was_dropped_on_the_thumbnail() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win, _other) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle();
+
+    // Dropped low and to the right on the thumbnail, so "where it was dropped" and "where the
+    // window lives on that desktop" are nowhere near each other.
+    let (frac_x, frac_y) = (0.75, 0.75);
+    let thumb = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("a monitor")
+            .thumbnail_strip()
+            .expect("the overview shows the strip")
+            .thumbs[1]
+    };
+    let view = f.synoik().layout.active_workspace().unwrap().view_size();
+
+    // The gesture, with the pickup spring allowed to settle before the drop: picking a preview
+    // up animates the tile to the pointer, and that spring is still running if the whole drag is
+    // played into one frame.
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, rect.loc.x + rect.size.w / 2., rect.loc.y + 10.);
+    pointer_motion_to(
+        &mut f,
+        thumb.loc.x + thumb.size.w * frac_x,
+        thumb.loc.y + thumb.size.h * frac_y,
+    );
+    // Not `settle`: an interactive move never settles, by construction.
+    f.run_frames_for(Duration::from_millis(1500));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let drawn = f
+        .synoik()
+        .layout
+        .expose_slot_anywhere(&win)
+        .expect("the window has a preview on its new workspace");
+    let settled = f
+        .synoik()
+        .layout
+        .expose_settled_rect(&win)
+        .expect("and a place on that desktop");
+
+    // The pointer held the window by its middle, so the preview's middle is the pointer — and
+    // where that sat on the thumbnail is where it must sit on the workspace.
+    let center = (
+        (drawn.loc.x + drawn.size.w / 2.) / view.w,
+        (drawn.loc.y + drawn.size.h / 2.) / view.h,
+    );
+    assert!(
+        (center.0 - frac_x).abs() <= 0.03 && (center.1 - frac_y).abs() <= 0.03,
+        "the arrival must start where the drop was on the thumbnail: {center:?} of the view, \
+         dropped at {frac_x},{frac_y} of the thumbnail",
+    );
+    assert!(
+        (drawn.loc.x - settled.loc.x).abs() > 50. || (drawn.loc.y - settled.loc.y).abs() > 50.,
+        "and not at the window's own place on the desktop: {drawn:?} vs {settled:?}",
+    );
+
+    // And it goes somewhere: an arrival that never moved would mean the ease was not armed.
+    let landed = f.sample_animation(Duration::from_millis(400), 40, |f| {
+        f.synoik().layout.expose_slot_anywhere(&win)
+    });
+    let last = landed.last().unwrap().expect("a preview at the end");
+    assert!(
+        (last.loc.x - drawn.loc.x).abs() > 20. || (last.loc.y - drawn.loc.y).abs() > 20.,
+        "the arrival must ease into the picker's slot: ended at {last:?}",
+    );
+}
+
+/// The arrival is armed for a workspace the picker is not currently drawing, too.
+///
+/// The strip can drop onto any workspace, including ones scrolled off the side of the output —
+/// which is exactly what the picker's render iteration culls. Looked up there, those drops armed
+/// no arrival at all: the window was simply already in its slot by the time it was scrolled to,
+/// and the gesture ended in nothing.
+#[test]
+fn a_strip_drop_onto_an_offscreen_workspace_still_arrives() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win, _other) = setup_two_desktops_in_overview(&mut f, id);
+    // Enough workspaces that the trailing ones are off the output, but all still on the strip.
+    for _ in 0..5 {
+        f.synoik_state().do_action(Action::MoveWorkspaceDown, false);
+    }
+    f.settle();
+
+    let last = f.synoik().layout.workspaces().count() - 1;
+    let rendered = |f: &mut Fixture, idx: usize| -> bool {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let mon = mon.expect("a monitor");
+        let id = mon.workspace_at(idx).expect("a workspace").id();
+        mon.workspaces_with_render_geo()
+            .any(|(ws, _)| ws.id() == id)
+    };
+    let target = (0..=last)
+        .find(|idx| !rendered(&mut f, *idx))
+        .expect("some workspace must be off the output for this to test anything");
+
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, rect.loc.x + rect.size.w / 2., rect.loc.y + 10.);
+    let (frac_x, frac_y) = (0.7, 0.7);
+    let (tx, ty) = thumbnail_center(&mut f, target);
+    pointer_motion_to(&mut f, tx, ty);
+    // The strip re-lays out under a drag hovering it, so the thumbnail's rect has to be read
+    // once it has stopped moving — before that it is aimed at where the row *was*.
+    f.run_frames_for(Duration::from_millis(1500));
+    let thumb = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("a monitor")
+            .thumbnail_strip()
+            .expect("the overview shows the strip")
+            .thumbs[target]
+    };
+    let view = f.synoik().layout.active_workspace().unwrap().view_size();
+    pointer_motion_to(
+        &mut f,
+        thumb.loc.x + thumb.size.w * frac_x,
+        thumb.loc.y + thumb.size.h * frac_y,
+    );
+    f.run_frames_for(Duration::from_millis(300));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let drawn = f
+        .synoik()
+        .layout
+        .expose_slot_anywhere(&win)
+        .expect("the window has a preview on its new workspace");
+    let center = (
+        (drawn.loc.x + drawn.size.w / 2.) / view.w,
+        (drawn.loc.y + drawn.size.h / 2.) / view.h,
+    );
+    assert!(
+        (center.0 - frac_x).abs() <= 0.03 && (center.1 - frac_y).abs() <= 0.03,
+        "the arrival must be armed off-screen too, from where the drop was: {center:?} of the \
+         view, dropped at {frac_x},{frac_y} of the thumbnail",
+    );
 }

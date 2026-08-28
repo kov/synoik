@@ -2855,7 +2855,13 @@ impl<W: LayoutElement> Workspace<W> {
 
     /// [`Self::settled_pos`] for one window, if it is here.
     pub(super) fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
-        self.expose_input(window).map(|(_, rect)| rect.loc)
+        self.expose_settled_rect(window).map(|rect| rect.loc)
+    }
+
+    /// Where the window actually sits on this desktop, at its own size — the rect the picker
+    /// lays a slot out *over*, before any expose scaling. What a thumbnail draws a miniature of.
+    pub(super) fn expose_settled_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.expose_input(window).map(|(_, rect)| rect)
     }
 
     /// The layout input list a decision is made over: one entry per window here, in stable

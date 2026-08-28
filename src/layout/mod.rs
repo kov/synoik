@@ -5643,12 +5643,13 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
-                let (mon, insert_ws, position, offset, zoom) = if let Some(mon) =
+                let (mon, insert_ws, position, offset, zoom, strip_thumb) = if let Some(mon) =
                     monitors.iter_mut().find(|mon| mon.output == move_.output)
                 {
                     let zoom = mon.overview_zoom();
 
                     let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+                    let mut strip_thumb = None;
                     let (position, offset) = match insert_ws {
                         InsertWorkspace::Existing(ws_id) => {
                             let ws_idx = mon
@@ -5660,6 +5661,14 @@ impl<W: LayoutElement> Layout<W> {
                             let pos_within_workspace =
                                 (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                             let ws = &mut mon.workspaces[ws_idx];
+
+                            // A strip drop is answered for by the thumbnail, so the arrival
+                            // below is drawn from it rather than from where the pointer let go.
+                            // `geo` is the thumbnail's own rect here, hence the guard on it
+                            // having one; the view size is what it is a miniature of.
+                            if via_strip && geo.size.w > 0. && geo.size.h > 0. {
+                                strip_thumb = Some((geo, ws.view_size()));
+                            }
                             // A picker drop re-adds the tile with its state
                             // untouched, whichever layer it came from.
                             let position = if move_.is_floating || keep_position {
@@ -5684,7 +5693,7 @@ impl<W: LayoutElement> Layout<W> {
                         }
                     };
 
-                    (mon, insert_ws, position, offset, zoom)
+                    (mon, insert_ws, position, offset, zoom, strip_thumb)
                 } else {
                     let mon = &mut monitors[*active_monitor_idx];
                     let zoom = mon.overview_zoom();
@@ -5699,7 +5708,7 @@ impl<W: LayoutElement> Layout<W> {
                     };
 
                     let insert_ws = InsertWorkspace::Existing(ws.id());
-                    (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                    (mon, insert_ws, position, Some(ws_geo.loc), zoom, None)
                 };
 
                 let win_id = move_.tile.window().id().clone();
@@ -5864,15 +5873,46 @@ impl<W: LayoutElement> Layout<W> {
                 if keep_position {
                     // In the target workspace's own coordinates: the picker's slots are
                     // workspace-local, the release rect is in view coordinates.
-                    let arriving = mon
-                        .workspaces_with_render_geo()
-                        .find(|(ws, _)| ws.has_window(&win_id))
-                        .map(|(_, geo)| {
-                            Rectangle::new(
-                                (released_rect.loc - geo.loc).downscale(zoom),
-                                released_rect.size.downscale(zoom),
-                            )
-                        });
+                    //
+                    // A strip drop is the exception, and it is why the arrival used to read as
+                    // disjointed: the release rect is up in the strip, so the window flew in
+                    // from the top edge — from a corner, once the row had scrolled — while what
+                    // the user had been looking at was a miniature of the workspace with the
+                    // window already in its place on it.
+                    //
+                    // So that is where the arrival starts: the window's own rect on the desktop
+                    // it just joined, at its own size — the very thing the thumbnail was drawing
+                    // small. The miniature becomes real where it was, and the picker's layout
+                    // then takes it to its slot. Where on the thumbnail the pointer let go does
+                    // not enter into it: a thumbnail names a workspace, never a position
+                    // (`WorkspaceThumbnail.acceptDrop`).
+                    let arriving = if let Some((thumb, view)) = strip_thumb {
+                        // The thumbnail is a miniature of the whole workspace, and the preview
+                        // was let go *on* it — at some position, at some size, both of which the
+                        // eye had just been reading as a window on that desktop. Blow that up by
+                        // the miniature's own ratio and the preview picks up exactly where the
+                        // thumbnail left off, then eases into its picker slot.
+                        //
+                        // Not the window's settled place on the desktop: that is where it *ends
+                        // up*, and starting there means the arrival ignores the drop entirely.
+                        let (sx, sy) = (view.w / thumb.size.w, view.h / thumb.size.h);
+                        Some(Rectangle::new(
+                            Point::from((
+                                (released_rect.loc.x - thumb.loc.x) * sx,
+                                (released_rect.loc.y - thumb.loc.y) * sy,
+                            )),
+                            Size::from((released_rect.size.w * sx, released_rect.size.h * sy)),
+                        ))
+                    } else {
+                        mon.workspaces_with_render_geo()
+                            .find(|(ws, _)| ws.has_window(&win_id))
+                            .map(|(_, geo)| {
+                                Rectangle::new(
+                                    (released_rect.loc - geo.loc).downscale(zoom),
+                                    released_rect.size.downscale(zoom),
+                                )
+                            })
+                    };
                     for ws in mon.workspaces.iter_mut() {
                         // A workspace the drop *created* has no entry: it had no previews
                         // to come from, only the arriving one.
@@ -5898,7 +5938,13 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
                 let new_tile_render_loc = ws_geo.loc + tile_offset.upscale(zoom);
 
-                tile.animate_move_from((tile_render_loc - new_tile_render_loc).downscale(zoom));
+                // Nothing to fly for a strip drop: the window never left its place on the
+                // desktop, and the arrival above starts it there. Sliding the tile as well would
+                // drag the real window in from the strip behind the preview, which is the travel
+                // this gesture is not supposed to have.
+                if strip_thumb.is_none() {
+                    tile.animate_move_from((tile_render_loc - new_tile_render_loc).downscale(zoom));
+                }
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 if workspaces.is_empty() {
@@ -7020,6 +7066,18 @@ impl<W: LayoutElement> Layout<W> {
     /// animates on its own account (a switch, a row that re-laid). Anything measuring how
     /// a *preview* moves wants this one, or it is reading two motions at once and cannot
     /// tell which it caught.
+    /// [`Self::expose_slot_local`] over **every** workspace, rendered or not — for the corpus,
+    /// which has to look at the arrival on a workspace the picker has scrolled off the output.
+    #[cfg(test)]
+    pub fn expose_slot_anywhere(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.monitors().find_map(|mon| {
+            mon.workspaces
+                .iter()
+                .find(|ws| ws.holds_window(window))
+                .and_then(|ws| ws.expose_slot(window))
+        })
+    }
+
     pub fn expose_slot_local(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         self.monitors().find_map(|mon| {
             mon.expose_progress()?;
@@ -7071,6 +7129,19 @@ impl<W: LayoutElement> Layout<W> {
     /// animation runs re-sorts the grid under it — and `compute_slots` breaks ties by
     /// input order, so a single pixel is enough to swap two previews. Exposed because
     /// that is the defect, and a slot only witnesses it once a tie actually flips.
+    /// Where the window sits on its desktop, at its own size — what the picker lays a slot out
+    /// over, and where a strip drop's arrival starts from.
+    pub fn expose_settled_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        // Every workspace, not the render iteration: where a window sits on its desktop is not a
+        // question about whether that desktop is currently on screen.
+        self.monitors().find_map(|mon| {
+            mon.workspaces
+                .iter()
+                .find(|ws| ws.holds_window(window))
+                .and_then(|ws| ws.expose_settled_rect(window))
+        })
+    }
+
     pub fn expose_settled_pos(&self, window: &W::Id) -> Option<Point<f64, Logical>> {
         self.monitors().find_map(|mon| {
             let (ws, _) = mon

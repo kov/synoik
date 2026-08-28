@@ -1,6 +1,8 @@
 # Multi-display: workspace groups, the display they belong to, and what moves when they move
 
-**Status: design agreed 2026-08-23; §1–§7 are implemented.**
+**Status: design agreed 2026-08-23. §1–§7 are implemented, except the block ordering in §2
+("The strip is blocks, in display order") and the §3 placement that follows from it, which are
+agreed and not yet built.**
 Approved by Gustavo. This is the plan the
 per-monitor-workspaces divergence (`dynamic-workspaces-divergence.md` §4) owes: what happens when a
 display goes away, comes back, or is a different size than the one a workspace grew up on.
@@ -14,7 +16,7 @@ because mutter has one global workspace list, this document says what ours is.
 
 1. One notion of display identity, shared by the live layout and the session store.
 2. A workspace's home display and its place in that display's strip, remembered across an unplug
-   and a restart.
+   and a restart — and the order the displays' groups take when they share one strip.
 3. Which display a keybinding or a gesture acts on: the one under the pointer, with focus as the
    keyboard-only fallback.
 4. Moving a workspace between displays, by drag and by menu.
@@ -112,7 +114,56 @@ parked list explicitly, into the same id- and name-uniqueness sets.
 persisted on its own — across a restart, the saved application sessions are the only carriers (§3).
 A named one is (§7).
 
-## 3. Restore derives the stack; it does not persist one — *implemented*
+### The strip is blocks, in display order
+
+More than one display's workspaces share a strip whenever a display is unplugged, or a session
+restores records saved on a display that is not here. That strip is the concatenation of one
+**contiguous block per home display**, and the blocks are ordered: the **primary** first, then the
+rest by logical position, left to right and then top to bottom.
+
+Read that order off the last configuration the ranked displays shared. `monitors.xml` already
+stores position and primacy per connected set (§1, `src/monitors_xml.rs`), so the arrangement two
+displays had while they were both attached is on disk and outlives either of them going away.
+Displays that were never attached together have no shared arrangement to read; rank them by
+connector.
+
+Primacy belongs to the connected *set*, not to a display. Unplugging the primary makes the survivor
+primary, and the survivor hosts everything. What survives the unplug is the block **order** the two
+displays had while they shared an arrangement — so the departed primary's block still leads, on the
+display that is now primary. That is the whole point of the rule: `Super+N` addresses the same
+desktop on the display the user switches workspaces on most, whether or not the other display is
+attached.
+
+The comparator is therefore `(display_rank, home_ordinal)`. **`home_ordinal` ranks a workspace
+within its own display's block and means nothing across displays**; used alone as a sort key it
+interleaves two blocks one workspace at a time, since both blocks number from zero and a stable sort
+zips equal keys. Every path that merges two displays' workspaces into one vector owes the full key —
+the reclaim in `Layout::add_output`, the append in `Monitor::append_workspaces`, the
+`MonitorSet::NoOutputs` round trip a layout reapply puts the surviving display through, and restore
+(§3). `Layout::drop_displaced_empties` compares ordinals for the same reason and owes it too: an
+ordinal claimed by one display's desktop says nothing about another display's empty.
+
+The strip's **trailing empty** is the strip's, not any block's. It sits at the absolute bottom
+whatever the block order, and is homed to the display whose strip it is.
+
+**The cost, and it is Gustavo's call:** the survivor's own desktops slide down by the size of every
+block that ranks above them, the moment a higher-ranked display is unplugged — so `Super+1` changes
+meaning on the display still in front of the user. Held anyway, because the primary's numbering is
+the one worth keeping steady: it is the display its user switches workspaces on most, and a dock
+cycle should not renumber it.
+
+### A drag re-homes by which block it lands in
+
+Contiguous blocks make the question positional. Dropping a workspace elsewhere **within its own
+block** is a reorder: it keeps its home tag, and permutes its block's ordinals as above. Dropping it
+**into another display's block** is an explicit move and re-homes it, restamping the ordinals of
+both blocks. That holds when the other display is absent too — a workspace dropped into an absent
+display's block travels home with that display when it is plugged back in.
+
+Homes are best effort throughout. A workspace has the home its last explicit move gave it, and
+nothing else infers one.
+
+## 3. Restore derives the stack; it does not persist one
 
 A session record names a display and carries an output-local rect (`session-management-port.md`,
 "A record is anchored to a display"). What it cannot say is *where in that display's stack* its
@@ -120,8 +171,8 @@ workspace was, because nothing remembers the stack.
 
 The stack is **derived from the store, not persisted**. `SessionStore::load` reads every session at
 once, so restore ranks the distinct `(connector, workspace index)` slots of every display that is
-**not connected**, displays in connector order and each display's slots in its own, and consults
-that ordering instead of counting workspaces. Two applications restoring at once therefore agree,
+**not connected** — the displays in the block order of §2, each display's slots in its own — and
+consults that ordering instead of counting workspaces. Two applications restoring at once therefore agree,
 which the per-session offset it replaces could not: each of them counted only its own records, so
 one app's homeless window landed on the workspace the other was about to be restored onto.
 
@@ -130,15 +181,21 @@ into it, so a session that never comes back costs the ones that do nothing — n
 not a position. Distinct slots, so what it would cost is a rank per workspace it names rather than
 the number it names.
 
-Where the block goes is a **position, not an index**. A slot materializes above every materialized
-slot that ranks after it, and at the bottom of the strip when none of them is there yet — which is
-what makes the arrangement independent of who restores first. The bottom is the top of the strip's
-trailing run of empty, unclaimed workspaces, and one of those is taken over rather than added to: a
-strip holding nothing of its own is all trailing run, and a block inserted below it would leave the
-first desktop empty and push everything down one. A record whose display *is* connected keeps
-landing on its saved index literally, and the growth that reaches it inserts **above** the block
-rather than past it — the block floats at the bottom, so the same records land the same way whether
-it arrived first or last.
+Where a slot goes is a **position, not an index**. A slot materializes above every materialized slot
+that ranks after it, and at the bottom of its own block when none of them is there yet. Ranking
+*every* slot of *every* display in one ordering — the connected display's own included — is what
+makes the arrangement independent of who restores first: a position among the workspaces already
+made cannot depend on how many are still to come.
+
+A record whose display **is** connected lands at its saved index within its own display's **block**,
+never at that index in the strip. A block ranking above it offsets every one of its workspaces by
+that block's size, a number the record cannot know and must not encode; the growth that reaches a
+slot inserts within its own block rather than past it.
+
+The strip's trailing empty is never a block member (§2). A slot materializing at the bottom of the
+last block takes it over rather than inserting below it, and the strip grows a fresh one — otherwise
+a strip that holds nothing of its own would leave its first desktop empty and push every restored
+one down.
 
 What restore materializes is tagged as the absent display's, with the saved index as its home
 ordinal, so plugging that display in reclaims it into the arrangement it was saved in — the same
@@ -147,7 +204,8 @@ thing an unplug and a replug do for a workspace that never left (§2).
 Gaps do not survive a restart, unlike a live unplug and replug: nothing persists an *unnamed* empty
 workspace, so a desktop the user left empty and unnamed is a desktop no record names. For the same reason a
 restored ordinal can collide with one the display's *own* strip is already using this run — the
-saved index knows nothing about it. The anonymous empty gives way (`Layout::drop_displaced_empties`)
+saved index knows nothing about it — a collision within one display's own block, which is the only
+kind `Layout::drop_displaced_empties` may act on. The anonymous empty gives way
 rather than sitting between two desktops that were side by side; a **named** empty is not filler and
 stays.
 
@@ -202,7 +260,8 @@ crosses the seam on the corner pixel.
 
 ### Primary
 
-Primary decides one thing — which display adopts workspaces orphaned by an unplug (§2). It is set
+Primary decides two things: which display adopts workspaces orphaned by an unplug, and which
+display's block leads the strip they land in (§2). It is set
 by `ApplyMonitorsConfig`, carried on the apply itself as well as through `monitors.xml` (a
 TEMPORARY apply never writes the store), lives on as `Synoik::applied_primary` outranking the
 store, and is reported back through `LogicalOutput::is_primary` — GNOME Settings re-reads
@@ -425,3 +484,10 @@ the drag does not widen the unplug/replug gaps below — it only makes them easi
 6. **Displaced geometry** (§5) — LANDED.
 7. **The workspace context menu and naming UI** (§6) — LANDED.
 8. **Named workspaces are always present** (§7) — LANDED.
+9. **Display rank, and the `(display_rank, home_ordinal)` comparator** (§2) — the rank source
+   (`monitors.xml` primacy and positions for the last shared configuration, connector order as the
+   fallback), then every merging path: `Layout::add_output`, `Monitor::append_workspaces`, the
+   `MonitorSet::NoOutputs` round trip, and `Layout::drop_displaced_empties`.
+10. **Restore places within a block** (§3) — a saved index becomes a position in its display's own
+    block, and the block's range replaces the strip's bottom.
+11. **A drag re-homes by block** (§2) — the merged-strip case of the §6 drop.
