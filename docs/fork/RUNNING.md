@@ -258,12 +258,18 @@ windowing mode, live-updating with the settings. Decoding goes through
 **glycin**, the sandboxed loader processes mutter 50.3 uses for the same
 job, so the format list is whatever the `glycin-loaders` package installs —
 PNG, JPEG, WebP, JPEG XL, HEIF, SVG. That package and `bwrap` are runtime
-dependencies: without them there is no wallpaper. In the overview the
+dependencies: without them there is no wallpaper. A `picture-uri` naming an
+XML file is a **time-of-day slideshow** (GNOME's `<starttime>` plus a
+repeating ring of `<static>` and `<transition>` slides): the wallpaper
+follows the hour, and a transition cross-fades in GNOME's own 4/255 opacity
+steps, which over a two-hour fade is a new picture every ~113 s. In the overview the
 workspace previews get gnome-shell's 30px rounded corners, growing with the
 open transition (`BACKGROUND_CORNER_RADIUS_PIXELS`). Divergences for now:
 every `picture-options` mode draws as `zoom` (cover + center crop, the
-default), and `primary-color` isn't used as the no-picture fill — the
-configured solid background color backs that case instead.
+default); `primary-color` isn't used as the no-picture fill — the
+configured solid background color backs that case instead; and a
+slideshow's per-monitor `<size>` variants are parsed but not chosen between
+(the first wins), since the wallpaper itself is not yet per-display.
 
 The **thumbnails strip** (gnome-shell's ThumbnailsBox) appears above the
 workspace row once a second desktop is populated (dynamic workspaces with

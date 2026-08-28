@@ -541,6 +541,10 @@ pub struct Synoik {
     /// 1 s repeating timer that ticks the R1 screen-recording indicator's `M:SS` label while any
     /// recording is live; `None` when nothing is recording.
     pub recording_tick: Option<RegistrationToken>,
+    /// Ticks a time-of-day wallpaper along its slideshow; `None` whenever `picture-uri` is an
+    /// ordinary picture, which must not cost a wake-up. See
+    /// [`refresh_wallpaper_timer`](Synoik::refresh_wallpaper_timer).
+    pub wallpaper_timer: Option<RegistrationToken>,
     pub data_device_state: DataDeviceState,
     /// Mime types whoever owns the clipboard right now is offering.
     ///
@@ -2119,6 +2123,7 @@ impl State {
                 .synoik
                 .wallpaper
                 .update(&state.synoik.gnome_settings.background, gpu.as_ref());
+            state.synoik.refresh_wallpaper_timer();
             state
                 .synoik
                 .panel
@@ -2154,6 +2159,7 @@ impl State {
                             .synoik
                             .wallpaper
                             .update(&settings.background, gpu.as_ref());
+                        state.synoik.refresh_wallpaper_timer();
                         state.synoik.panel.set_clock_format(settings.clock);
                         state.synoik.panel.set_quick_toggles(settings.quick_toggles);
                         state.synoik.panel.set_a11y(settings.a11y);
@@ -7967,6 +7973,7 @@ impl Synoik {
             end_session_timer: None,
             offline_update_tx: None,
             recording_tick: None,
+            wallpaper_timer: None,
             idle_inhibit_manager_state,
             data_device_state,
             clipboard_mime_types: Vec::new(),
@@ -10036,6 +10043,40 @@ impl Synoik {
         crate::ui::widget::style::Appearance::from_dark_style(
             self.gnome_settings.quick_toggles.dark_style,
         )
+    }
+
+    /// Keep the slideshow tick in step with the wallpaper setting.
+    ///
+    /// A time-of-day background has to be re-derived as the hour moves and nothing else in the
+    /// loop would ever ask, so it gets a timer; an ordinary picture never changes on its own and
+    /// must not cost a wake-up, so it gets none. Called after every `Wallpaper::update`, and
+    /// re-armed rather than left alone, because the interval belongs to whichever slide is
+    /// current.
+    pub fn refresh_wallpaper_timer(&mut self) {
+        if let Some(token) = self.wallpaper_timer.take() {
+            self.event_loop.remove(token);
+        }
+        let Some(delay) = self.wallpaper.slideshow_wakeup() else {
+            return;
+        };
+
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), |_, _, state| {
+                let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
+                // No redraw here: `refresh` only *asks* for a decode, and the tick that lands on
+                // the picture already up asks for nothing at all. The redraw rides the result.
+                state.synoik.wallpaper.refresh(gpu.as_ref());
+                match state.synoik.wallpaper.slideshow_wakeup() {
+                    Some(next) => TimeoutAction::ToDuration(next),
+                    None => {
+                        state.synoik.wallpaper_timer = None;
+                        TimeoutAction::Drop
+                    }
+                }
+            })
+            .unwrap();
+        self.wallpaper_timer = Some(token);
     }
 
     pub fn queue_redraw_all(&mut self) {

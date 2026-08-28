@@ -44,6 +44,9 @@ use crate::gnome::{BackgroundOptions, BackgroundSettings};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{GaussianBackdrop, VkTexture, VulkanRenderer};
+use crate::wallpaper::slideshow::Slideshow;
+
+mod slideshow;
 
 /// Larger pictures are downscaled to this bound before upload; it comfortably
 /// fits common GL max-texture-size limits.
@@ -51,16 +54,24 @@ const MAX_TEXTURE_EDGE: u32 = 8192;
 
 #[derive(Default)]
 pub struct Wallpaper {
-    /// The path of the currently displayed picture.
-    picture: Option<PathBuf>,
-    /// The path currently being decoded on the worker, if any. While a decode is
+    /// `picture-uri` as the setting gives it: a picture, or the XML of a slideshow.
+    setting: Option<PathBuf>,
+    /// The parsed slideshow, when `setting` is one.
+    ///
+    /// It lives on the main loop rather than the decode worker because it is what answers *what
+    /// now, and when next* — the decode is downstream of both. The file is a few kilobytes of
+    /// XML, read once per setting change.
+    slideshow: Option<Slideshow>,
+    /// What the displayed [`image`](Self::image) is: which picture, or which two mid-cross-fade.
+    shown: Option<Shown>,
+    /// The [`Shown`] currently being decoded on the worker, if any. While a decode is
     /// in flight the old `image` keeps showing, so the screen never blanks or
     /// freezes mid-change.
     ///
     /// A `RefCell` because [`render_vulkan`](Self::render_vulkan) — which only has `&self` — is
     /// where a device change is noticed, and staged pixels cannot outlive their device, so it has
     /// to be able to re-request the decode.
-    pending: RefCell<Option<PathBuf>>,
+    pending: RefCell<Option<Shown>>,
     image: Option<Image>,
     /// Lazily uploaded from `image`; the outer `Option` is "not tried yet", the inner one records
     /// a failed upload so we don't retry every frame.
@@ -92,9 +103,35 @@ pub struct Wallpaper {
 /// [`spawn_worker`](Wallpaper::spawn_worker), because the worker outlives any one renderer — a
 /// device that has been replaced must not be reused for the next decode.
 struct DecodeRequest {
-    path: PathBuf,
+    shown: Shown,
     gpu: Option<Arc<Gpu>>,
 }
+
+/// Exactly what a decode is asked to produce: one picture, or two blended at a point in a
+/// slideshow's cross-fade.
+///
+/// This is the wallpaper's *identity*, and every question about staleness and repetition turns on
+/// it. A slideshow asks for the same two files over and over across a transition, differing only
+/// in how far between them it is; and a result landing after the setting changed has to be
+/// recognised as superseded. Comparing paths alone answers both wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shown {
+    from: PathBuf,
+    /// The picture being faded in over `from`; `None` for a plain wallpaper, and for a
+    /// slideshow's static slides.
+    to: Option<PathBuf>,
+    /// How far into that fade, in 1/[`FADE_STEPS`]ths.
+    ///
+    /// Quantized *because* it is the cache key: a fade is a continuum, and at full float
+    /// precision every timer tick would be a different wallpaper and a fresh decode of two 4K
+    /// pictures. GNOME steps a cross-fade's opacity by 4/255 (`js/ui/background.js:426`), so 64
+    /// steps is its resolution too, and over Fedora's two-hour transition that is one decode
+    /// every ~113 s.
+    step: u8,
+}
+
+/// The number of distinct pictures a cross-fade is decoded at; see [`Shown::step`].
+const FADE_STEPS: u8 = 64;
 
 struct Image {
     /// RGBA8, tightly packed, either on the heap or already in device-visible memory.
@@ -192,7 +229,7 @@ impl Pixels {
 /// Opaque to the caller (which just routes it to [`Wallpaper::apply_decoded`]);
 /// `Send` because [`Image`] is plain data or a `Send` staging buffer.
 pub struct WallpaperDecoded {
-    path: PathBuf,
+    shown: Shown,
     image: Option<Image>,
 }
 
@@ -208,9 +245,9 @@ impl Wallpaper {
             .name("wallpaper-decode".to_owned())
             .spawn(move || {
                 // Ends when the request sender (held by `Wallpaper`) is dropped.
-                for DecodeRequest { path, gpu } in req_rx {
-                    let image = decode(&path, gpu.as_ref());
-                    if result_tx.send(WallpaperDecoded { path, image }).is_err() {
+                for DecodeRequest { shown, gpu } in req_rx {
+                    let image = decode(&shown, gpu.as_ref());
+                    if result_tx.send(WallpaperDecoded { shown, image }).is_err() {
                         break;
                     }
                 }
@@ -221,13 +258,11 @@ impl Wallpaper {
         }
     }
 
-    /// The picture we're heading toward: the in-flight decode if any, else the one
-    /// on screen. `update` compares against this so a repeated setting is a no-op.
-    fn target(&self) -> Option<PathBuf> {
-        self.pending
-            .borrow()
-            .clone()
-            .or_else(|| self.picture.clone())
+    /// The wallpaper we're heading toward: the in-flight decode if any, else the one
+    /// on screen. Everything that decides whether to decode compares against this, so a
+    /// slideshow tick that lands on the same picture and the same fade step is a no-op.
+    fn target(&self) -> Option<Shown> {
+        self.pending.borrow().clone().or_else(|| self.shown.clone())
     }
 
     /// Syncs with the current settings, decoding the picture if it changed. The
@@ -235,41 +270,19 @@ impl Wallpaper {
     /// previous wallpaper stays up until the new one is ready. Falls back to a
     /// synchronous decode when no worker is wired.
     pub fn update(&mut self, settings: &BackgroundSettings, gpu: Option<&Arc<Gpu>>) {
-        if settings.picture != self.target() {
-            match (&settings.picture, &self.decode_tx) {
-                // Async: keep the current image, ask the worker to decode the new one.
-                (Some(path), Some(tx)) => {
-                    *self.pending.borrow_mut() = Some(path.clone());
-                    let request = DecodeRequest {
-                        path: path.clone(),
-                        gpu: gpu.cloned(),
-                    };
-                    if tx.send(request).is_err() {
-                        // Worker gone; fall back to a synchronous decode.
-                        *self.pending.borrow_mut() = None;
-                        self.picture = Some(path.clone());
-                        self.image = decode(path, gpu);
-                        self.vk_texture.replace(None);
-                    }
-                }
-                // No worker (tests): decode inline.
-                (Some(path), None) => {
-                    *self.pending.borrow_mut() = None;
-                    self.picture = Some(path.clone());
-                    self.image = decode(path, gpu);
-                    self.vk_texture.replace(None);
-                }
-                // Cleared.
-                (None, _) => {
-                    *self.pending.borrow_mut() = None;
-                    self.picture = None;
-                    self.image = None;
-                    self.vk_texture.replace(None);
-                }
-            }
+        if settings.picture != self.setting {
+            self.setting = settings.picture.clone();
+            // The XML of a slideshow is not something a loader can decode; it is parsed here or
+            // there is no wallpaper at all — which is also what a slideshow we cannot read gets.
+            self.slideshow = match self.setting.as_deref() {
+                Some(path) if is_slideshow(path) => Slideshow::open(path),
+                _ => None,
+            };
         }
 
-        if self.target().is_some()
+        self.refresh(gpu);
+
+        if self.setting.is_some()
             && !matches!(
                 settings.options,
                 BackgroundOptions::Zoom | BackgroundOptions::None
@@ -282,14 +295,92 @@ impl Wallpaper {
         }
     }
 
+    /// Re-derive what should be on screen now and start a decode if it is not what we already
+    /// have or are already fetching.
+    ///
+    /// Called on every settings change and on every slideshow tick. For a plain picture the
+    /// answer never moves, so every call after the first does nothing.
+    pub fn refresh(&mut self, gpu: Option<&Arc<Gpu>>) {
+        let wanted = self.wanted(now());
+        if wanted == self.target() {
+            return;
+        }
+
+        match (wanted, &self.decode_tx) {
+            // Async: keep the current image, ask the worker to decode the new one.
+            (Some(shown), Some(tx)) => {
+                *self.pending.borrow_mut() = Some(shown.clone());
+                let request = DecodeRequest {
+                    shown: shown.clone(),
+                    gpu: gpu.cloned(),
+                };
+                if tx.send(request).is_err() {
+                    // Worker gone; fall back to a synchronous decode.
+                    *self.pending.borrow_mut() = None;
+                    self.image = decode(&shown, gpu);
+                    self.shown = Some(shown);
+                    self.vk_texture.replace(None);
+                }
+            }
+            // No worker (tests): decode inline.
+            (Some(shown), None) => {
+                *self.pending.borrow_mut() = None;
+                self.image = decode(&shown, gpu);
+                self.shown = Some(shown);
+                self.vk_texture.replace(None);
+            }
+            // Cleared, or a slideshow that would not parse.
+            (None, _) => {
+                *self.pending.borrow_mut() = None;
+                self.shown = None;
+                self.image = None;
+                self.vk_texture.replace(None);
+            }
+        }
+    }
+
+    /// What the settings and the clock say should be on screen at `now` (Unix seconds).
+    fn wanted(&self, now: f64) -> Option<Shown> {
+        let path = self.setting.as_deref()?;
+
+        let Some(show) = &self.slideshow else {
+            // An XML we could not parse is not a picture either — handing it to a loader would
+            // only produce a second complaint about a file `Slideshow::open` has already refused.
+            return (!is_slideshow(path)).then(|| Shown {
+                from: path.to_owned(),
+                to: None,
+                step: 0,
+            });
+        };
+
+        let slide = show.current(now);
+        Some(Shown {
+            from: slide.from.to_owned(),
+            to: slide.to.map(Path::to_owned),
+            step: match slide.to {
+                Some(_) => (slide.progress * f64::from(FADE_STEPS)).round() as u8,
+                // A static slide has nothing to fade. Carrying its position anyway would make
+                // every tick a different `Shown` and re-decode the same picture all day.
+                None => 0,
+            },
+        })
+    }
+
+    /// How long until [`refresh`](Self::refresh) could answer differently, or `None` when the
+    /// wallpaper is a picture and so has nothing to do with the clock.
+    pub fn slideshow_wakeup(&self) -> Option<std::time::Duration> {
+        let show = self.slideshow.as_ref()?;
+        Some(Slideshow::wakeup_interval(show.current(now()).duration))
+    }
+
     /// Adopt a finished decode from the worker. Ignores a stale result (a later
     /// change superseded it). Returns whether the displayed wallpaper changed, so
     /// the caller can queue a redraw.
     pub fn apply_decoded(&mut self, decoded: WallpaperDecoded) -> bool {
-        if self.pending.borrow().as_deref() != Some(decoded.path.as_path()) {
+        if self.pending.borrow().as_ref() != Some(&decoded.shown) {
             return false;
         }
-        self.picture = self.pending.borrow_mut().take();
+        self.shown = self.pending.borrow_mut().take();
         self.image = decoded.image;
         self.vk_texture.replace(None);
         true
@@ -488,13 +579,13 @@ impl Wallpaper {
         // nothing forever, and guard against asking once a frame while it runs.
         if let Pixels::Staged(staging) = &image.pixels {
             if !staging.belongs_to(renderer.gpu()) {
-                let path = self.picture.clone();
-                if path.is_some() && *self.pending.borrow() != path {
+                let shown = self.shown.clone();
+                if shown.is_some() && *self.pending.borrow() != shown {
                     warn!("wallpaper was staged on a device that is gone; decoding it again");
-                    if let (Some(tx), Some(path)) = (self.decode_tx.as_ref(), path) {
-                        *self.pending.borrow_mut() = Some(path.clone());
+                    if let (Some(tx), Some(shown)) = (self.decode_tx.as_ref(), shown) {
+                        *self.pending.borrow_mut() = Some(shown.clone());
                         let request = DecodeRequest {
-                            path,
+                            shown,
                             gpu: Some(renderer.gpu().clone()),
                         };
                         if tx.send(request).is_err() {
@@ -585,7 +676,17 @@ impl From<glycin::ErrorCtx> for LoadError {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Loader(err) => write!(f, "{err:?}"),
+            // Two of glycin's own messages append the entire loader config, kilobytes of it,
+            // to a one-line complaint. Both are worth saying plainly instead.
+            Self::Loader(err) => match err.error() {
+                glycin::Error::UnknownImageFormat(mime, _) => {
+                    write!(f, "no installed loader handles {mime}")
+                }
+                glycin::Error::NoLoadersConfigured(_) => f.write_str(
+                    "no image loaders are installed; glycin-loaders is a hard dependency",
+                ),
+                other => write!(f, "{other}{}", err.context()),
+            },
             Self::Empty => write!(f, "the loader returned an empty frame"),
         }
     }
@@ -708,9 +809,22 @@ fn to_srgb(cicp: &glycin::Cicp, data: &mut [u8]) {
 /// 2. **Ask for both RGB and RGBA.** The `alpha_channel` detail is `None` for JPEG XL and SVG, so
 ///    the accepted-format set is what tells us whether the picture is opaque: a loader hands back
 ///    `R8g8b8` exactly when there is no alpha to carry.
-fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
+fn decode(shown: &Shown, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
+    let mut pixels = decode_rgba(&shown.from)?;
+    if let Some(to) = &shown.to {
+        blend(
+            &mut pixels,
+            decode_rgba(to)?,
+            f64::from(shown.step) / f64::from(FADE_STEPS),
+        );
+    }
+    stage(pixels, gpu)
+}
+
+/// One picture, decoded and brought under [`MAX_TEXTURE_EDGE`].
+fn decode_rgba(path: &Path) -> Option<Decoded> {
     let decoded = match async_io::block_on(load(path)) {
         Ok(decoded) => decoded,
         Err(err) => {
@@ -739,6 +853,62 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
         data = scaled.into_raw();
     }
 
+    Some(Decoded { data, size, opaque })
+}
+
+/// Cross-fade `over` onto `under` in place: `progress` of the way from one to the other.
+///
+/// A slideshow's transition is blended **here**, on the decode worker, into the single `Image`
+/// the rest of this file already knows how to draw — not as two render elements with an alpha
+/// each. The whole render path (`render`, `render_blurred`, the thumbnails, the legibility rule,
+/// the blur cache) then needs no notion of a slideshow at all, and nothing extra stays resident:
+/// a fade costs a second decode every ~113 s rather than a second 4K texture for the two hours it
+/// lasts.
+///
+/// Both sides have already been converted to sRGB by [`load`], so a fade between pictures tagged
+/// in different colour spaces is right without either knowing about the other. It interpolates in
+/// sRGB rather than in light, which is what GNOME's own actor cross-fade does.
+fn blend(under: &mut Decoded, over: Decoded, progress: f64) {
+    let _span = tracy_client::span!("wallpaper::blend");
+
+    let Decoded {
+        mut data,
+        size,
+        opaque,
+    } = over;
+
+    if size != under.size {
+        // No stock slideshow pairs mismatched pictures, but a hand-written one may; without this
+        // the rows would shear against each other.
+        let Some(raw) = image::RgbaImage::from_raw(size.w as u32, size.h as u32, data) else {
+            return;
+        };
+        data = image::DynamicImage::ImageRgba8(raw)
+            .resize_exact(
+                under.size.w as u32,
+                under.size.h as u32,
+                image::imageops::FilterType::Triangle,
+            )
+            .into_rgba8()
+            .into_raw();
+    }
+
+    // Componentwise over straight alpha, which is only the same thing as a real composite while
+    // both sides are opaque — as every wallpaper GNOME ships is. The alpha channel is carried
+    // through the same lerp so a fade between an opaque and a transparent picture still ends up
+    // at the transparent one rather than jumping there.
+    let a = (progress.clamp(0., 1.) * 255.).round() as u32;
+    for (dst, src) in under.data.iter_mut().zip(&data) {
+        *dst = (((*dst as u32) * (255 - a) + (*src as u32) * a) / 255) as u8;
+    }
+    under.opaque &= opaque;
+}
+
+/// Hand finished pixels to the GPU's staging memory if there is a device, and build the CPU-side
+/// thumbnail the legibility rule reads.
+fn stage(decoded: Decoded, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
+    let Decoded { data, size, opaque } = decoded;
+
     // On the worker, next to the decode that already owns these bytes: the main loop never sees
     // this downscale, and after it the legibility rule never touches the full picture again.
     let thumb = Thumb::from_rgba(&data, size.w as u32, size.h as u32);
@@ -763,6 +933,20 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
         thumb,
         legible: RefCell::new(None),
     })
+}
+
+/// Wall-clock seconds since the epoch — what a slideshow's `<starttime>` is measured against.
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0., |since| since.as_secs_f64())
+}
+
+/// Whether `picture-uri` points at a slideshow rather than a picture. GNOME decides this the same
+/// way, on the extension alone (`gnome-bg.c`'s `gnome_bg_changes_with_time`).
+fn is_slideshow(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
 }
 
 impl Image {
@@ -1101,6 +1285,156 @@ mod tests {
         }
     }
 
+    /// A scratch directory for a test that has to put real files on disk.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("synoik-wallpaper-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A slideshow's XML is never handed to a loader: it names the pictures, and *those* are what
+    /// gets decoded — here, the two ends of a cross-fade and how far between them we are.
+    #[test]
+    fn a_slideshow_decodes_the_pictures_it_names_and_not_the_xml() {
+        let dir = scratch("slideshow-request");
+        let xml = dir.join("always-fading.xml");
+        // One transition filling the whole ring, so the answer does not depend on what time the
+        // suite runs at; which slide is current at which hour is pinned in `slideshow`'s own
+        // tests.
+        std::fs::write(
+            &xml,
+            r#"<background>
+                 <starttime><year>2024</year><month>1</month><day>1</day>
+                   <hour>0</hour><minute>0</minute><second>0</second></starttime>
+                 <transition><duration>86400.0</duration>
+                   <from>/a.png</from><to>/b.png</to></transition>
+               </background>"#,
+        )
+        .unwrap();
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let mut wp = Wallpaper {
+            decode_tx: Some(req_tx),
+            ..Default::default()
+        };
+        wp.update(
+            &BackgroundSettings {
+                picture: Some(xml.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let request = req_rx.try_recv().expect("a slideshow decodes something");
+        assert_eq!(request.shown.from, Path::new("/a.png"));
+        assert_eq!(request.shown.to.as_deref(), Some(Path::new("/b.png")));
+        assert!(request.shown.step <= FADE_STEPS);
+        assert!(
+            wp.slideshow_wakeup().is_some(),
+            "a slideshow that nothing ticks never advances"
+        );
+
+        // The same tick again asks for nothing: a decode of two 4K pictures may not repeat just
+        // because the timer fired.
+        wp.refresh(None);
+        assert!(req_rx.try_recv().is_err());
+
+        // A picture, and the slideshow — with its timer — is gone.
+        let picture = dir.join("plain.png");
+        wp.update(
+            &BackgroundSettings {
+                picture: Some(picture.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            req_rx.try_recv().map(|r| r.shown).ok(),
+            Some(just(&picture))
+        );
+        assert!(wp.slideshow_wakeup().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An XML we cannot parse leaves no wallpaper rather than a picture-decode of the XML: the
+    /// loaders would only refuse it a second time, and noisily.
+    #[test]
+    fn an_unreadable_slideshow_decodes_nothing() {
+        let dir = scratch("slideshow-broken");
+        let xml = dir.join("broken.xml");
+        std::fs::write(&xml, "<background><static/></background>").unwrap();
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let mut wp = Wallpaper {
+            decode_tx: Some(req_tx),
+            ..Default::default()
+        };
+        wp.update(
+            &BackgroundSettings {
+                picture: Some(xml),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(req_rx.try_recv().is_err());
+        assert!(wp.shown.is_none());
+        assert!(wp.pending.borrow().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cross-fade itself, on the pixels. Halfway between black and white is grey; the ends
+    /// are the pictures themselves, which is what makes a transition join its neighbouring
+    /// static slides without a jump.
+    #[test]
+    fn a_cross_fade_lands_between_the_two_pictures() {
+        let flat = |value: u8| Decoded {
+            data: vec![value; 4 * 4 * 4],
+            size: Size::new(4, 4),
+            opaque: true,
+        };
+        let faded = |progress: f64| {
+            let mut under = flat(0);
+            blend(&mut under, flat(255), progress);
+            under.data[0]
+        };
+
+        assert_eq!(
+            faded(0.),
+            0,
+            "a fade that has not started is the old picture"
+        );
+        assert_eq!(faded(1.), 255, "a finished fade is the new picture");
+        assert_eq!(faded(0.5), 128);
+
+        // A picture of a different size is resampled onto the one it is blending with, rather
+        // than shearing row by row across it.
+        let mut under = flat(0);
+        blend(
+            &mut under,
+            Decoded {
+                data: vec![255; 8 * 8 * 4],
+                size: Size::new(8, 8),
+                opaque: true,
+            },
+            1.,
+        );
+        assert_eq!(under.size, Size::new(4, 4));
+        assert!(under.data.iter().all(|&b| b == 255));
+    }
+
+    /// A plain, unfaded picture, as the decode path names one.
+    fn just(path: &Path) -> Shown {
+        Shown {
+            from: path.to_owned(),
+            to: None,
+            step: 0,
+        }
+    }
+
     /// A picture change decodes off-thread: the current wallpaper keeps showing
     /// until the new decode lands (no freeze/blank), and a stale result is ignored.
     #[test]
@@ -1120,40 +1454,40 @@ mod tests {
 
         // Requesting A leaves the display empty (nothing decoded yet), A pending.
         wp.update(&bg(&a), None);
-        assert_eq!(wp.pending.borrow().as_ref(), Some(&a));
-        assert!(wp.picture.is_none());
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&just(&a)));
+        assert!(wp.shown.is_none());
 
         // A lands → it's shown, nothing pending.
         assert!(wp.apply_decoded(WallpaperDecoded {
-            path: a.clone(),
+            shown: just(&a),
             image: None,
         }));
-        assert_eq!(wp.picture.as_ref(), Some(&a));
+        assert_eq!(wp.shown.as_ref(), Some(&just(&a)));
         assert!(wp.pending.borrow().is_none());
 
         // Switching to B keeps A on screen while B decodes.
         wp.update(&bg(&b), None);
-        assert_eq!(wp.pending.borrow().as_ref(), Some(&b));
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&just(&b)));
         assert_eq!(
-            wp.picture.as_ref(),
-            Some(&a),
+            wp.shown.as_ref(),
+            Some(&just(&a)),
             "A must stay up while B decodes — no mid-change freeze/blank"
         );
 
         // A late/stale result for A is ignored (B is what we're waiting for).
         assert!(!wp.apply_decoded(WallpaperDecoded {
-            path: a.clone(),
+            shown: just(&a),
             image: None,
         }));
-        assert_eq!(wp.pending.borrow().as_ref(), Some(&b));
-        assert_eq!(wp.picture.as_ref(), Some(&a));
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&just(&b)));
+        assert_eq!(wp.shown.as_ref(), Some(&just(&a)));
 
         // B lands → B is shown.
         assert!(wp.apply_decoded(WallpaperDecoded {
-            path: b.clone(),
+            shown: just(&b),
             image: None,
         }));
-        assert_eq!(wp.picture.as_ref(), Some(&b));
+        assert_eq!(wp.shown.as_ref(), Some(&just(&b)));
         assert!(wp.pending.borrow().is_none());
 
         // Re-applying the same setting is a no-op (no re-request, no flicker).
@@ -1229,7 +1563,7 @@ mod tests {
 
         let load = |name: &str| {
             stock_background(name).map(|path| Wallpaper {
-                image: decode(&path, None),
+                image: decode(&just(&path), None),
                 ..Default::default()
             })
         };
@@ -1257,7 +1591,7 @@ mod tests {
         let Some(path) = stock_background("adwaita-l.jxl") else {
             return;
         };
-        let image = decode(&path, None).unwrap();
+        let image = decode(&just(&path), None).unwrap();
         assert!(image.size.w > 0 && image.size.h > 0);
         assert_eq!(
             image.pixels.len(),
@@ -1273,7 +1607,7 @@ mod tests {
         let Some(path) = stock_background("blobs-l.svg") else {
             return;
         };
-        let image = decode(&path, None).unwrap();
+        let image = decode(&just(&path), None).unwrap();
         assert!(image.size.w > 0 && image.size.h > 0);
         assert_eq!(
             image.pixels.len(),
@@ -1291,7 +1625,7 @@ mod tests {
         let Some(path) = stock_background("adwaita-l.jxl") else {
             return;
         };
-        let image = decode(&path, None).unwrap();
+        let image = decode(&just(&path), None).unwrap();
         let Pixels::Host(data) = &image.pixels else {
             unreachable!("no gpu was passed, so the pixels are on the heap");
         };
@@ -1393,7 +1727,7 @@ mod tests {
 
         let (req_tx, req_rx) = std::sync::mpsc::channel();
         let wp = Wallpaper {
-            picture: Some(path.clone()),
+            shown: Some(just(&path)),
             image: Some(Image {
                 pixels: Pixels::Staged(Arc::new(staging)),
                 size: Size::from((8, 8)),
@@ -1425,11 +1759,11 @@ mod tests {
             "a renderer drew a wallpaper staged on a device it does not own"
         );
         assert_eq!(
-            req_rx.try_recv().map(|r| r.path).ok(),
-            Some(path.clone()),
+            req_rx.try_recv().map(|r| r.shown).ok(),
+            Some(just(&path)),
             "the wallpaper was dropped without being re-requested — it never comes back"
         );
-        assert_eq!(wp.pending.borrow().as_ref(), Some(&path));
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&just(&path)));
 
         // The decode is in flight now; further frames must not pile more requests onto it.
         assert!(render(&wp, &mut vk_b).is_none());
