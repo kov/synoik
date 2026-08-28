@@ -36671,3 +36671,134 @@ fn an_element_appearing_in_front_does_not_repaint_the_background() {
         "only the popup's own geometry should be damaged"
     );
 }
+
+/// The desktop context menu is gnome-shell's `BackgroundMenu` (`js/ui/backgroundMenu.js`): a
+/// right-click on the wallpaper, three rows, in GNOME's order.
+///
+/// It hangs off the background actor, the bottom-most thing on the stage (`layout.js:496-508`),
+/// so it answers only for a press nothing above it took — the panel strip and any window are the
+/// two that reach the same fall-through branch in our press handler.
+#[test]
+fn a_right_click_on_the_wallpaper_opens_the_desktop_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.settle();
+
+    pointer_motion_to(&mut f, 900., 600.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    let menu = f
+        .synoik()
+        .panel_popover
+        .background_menu()
+        .expect("the wallpaper has a menu");
+    assert_eq!(
+        menu.labels(),
+        vec!["Change Background…", "Display Settings", "Settings"]
+    );
+
+    // Nothing is focused on open: `backgroundMenu.js` has no `navigate_focus` call, unlike the
+    // window menu (`windowMenu.js:247`).
+    assert_eq!(f.synoik().panel_popover.focused_row_label(), None);
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}
+
+/// The panel is drawn over the background, and its buttons take left clicks only — so a right
+/// press on the strip would otherwise fall through to the wallpaper's menu.
+#[test]
+fn a_right_click_on_the_panel_is_not_the_desktop_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.settle();
+
+    pointer_motion_to(&mut f, 900., crate::ui::panel::panel_height() / 2.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    assert!(
+        f.synoik().panel_popover.background_menu().is_none(),
+        "the panel is over the wallpaper, so it eats the press"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}
+
+/// A window covers the background, so a plain right-click on it is the client's, not the shell's.
+#[test]
+fn a_right_click_on_a_window_is_not_the_desktop_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+
+    pointer_motion_to(&mut f, x + 400., y + 300.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    assert!(
+        f.synoik().panel_popover.background_menu().is_none(),
+        "the press belongs to the window under the pointer"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}
+
+/// The overview covers the wallpaper with its own chrome, and already owns the right button
+/// (the workspace menu and the pan grab).
+#[test]
+fn a_right_click_in_the_overview_is_not_the_desktop_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.settle();
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle();
+
+    pointer_motion_to(&mut f, 900., 600.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    assert!(
+        f.synoik().panel_popover.background_menu().is_none(),
+        "the overview's right button is its own"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}
+
+/// A layer-shell client covers the background too, and `window_under_cursor` does not answer for
+/// one — so without its own guard a right-click on a panel/wallpaper client would raise the
+/// shell's menu over it.
+#[test]
+fn a_right_click_on_a_layer_surface_is_not_the_desktop_menu() {
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let layer = f.client(id).create_layer(None, Layer::Top, "");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(crate::tests::client::LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top | Anchor::Bottom),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(1920, 1080);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    pointer_motion_to(&mut f, 900., 600.);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    assert!(
+        f.synoik().panel_popover.background_menu().is_none(),
+        "the press belongs to the layer client under the pointer"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+}

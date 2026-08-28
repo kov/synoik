@@ -9,6 +9,7 @@
 pub mod a11y_menu;
 pub mod app_grid;
 pub mod app_menu;
+pub mod background_menu;
 pub mod calendar;
 pub mod dash;
 pub mod dock;

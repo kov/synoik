@@ -6657,6 +6657,43 @@ impl State {
 
     /// Open the workspace menu on the thumbnail under the pointer. Returns whether one opened —
     /// a press that missed every thumbnail is not the strip's.
+    /// Raise the desktop context menu at the pointer, if this is a press the wallpaper owns.
+    ///
+    /// The guards are the actors gnome-shell has *above* the background and we do not check
+    /// anywhere else on this path: a layer-shell client (which `window_under_cursor` does not
+    /// answer for), the top panel's strip (whose buttons take left clicks only, so a right press
+    /// falls through it), the screenshot UI and the overview, both of which cover the wallpaper
+    /// and already own the right button. GNOME mode gates the whole thing — the menu is shell
+    /// chrome.
+    fn show_background_menu_under_pointer(&mut self, output: &Output) -> bool {
+        if !self.synoik.layout.is_gnome_mode()
+            || self.synoik.is_locked()
+            || self.synoik.screenshot_ui.is_open()
+            || self.synoik.layout.is_overview_open()
+        {
+            return false;
+        }
+
+        let location = self.synoik.seat.get_pointer().unwrap().current_location();
+        let Some((_, within)) = self.synoik.output_under(location) else {
+            return false;
+        };
+
+        if self.synoik.contents_under(location).layer.is_some() {
+            return false;
+        }
+
+        if self.synoik.panel_takes_input_on(output) && within.y < crate::ui::panel::panel_height() {
+            return false;
+        }
+
+        let anchor = Rectangle::new(within, Size::default());
+        self.synoik
+            .panel_popover
+            .open_background_menu(output.clone(), anchor);
+        true
+    }
+
     fn show_workspace_menu_under_pointer(&mut self) -> bool {
         let pointer = self.synoik.seat.get_pointer().unwrap();
         let location = pointer.current_location();
@@ -8858,6 +8895,21 @@ impl State {
                 self.activate_overview_workspace(&output, ws_id);
             } else if let Some(output) = self.synoik.output_under_cursor() {
                 self.synoik.layout.focus_output(&output);
+
+                // A right press on the wallpaper is the desktop context menu. gnome-shell hangs
+                // it off the background actor (`backgroundMenu.js`, `layout.js:496-508`), which
+                // is bottom-most on the stage — so it answers only for a press nothing else took.
+                // Everything drawn over it has already had its turn by here: the popover grab,
+                // the panel buttons, the dock's dash, the overview chrome and every window. The
+                // rest of that stack has no branch above, so it is excluded here.
+                if button == Some(MouseButton::Right)
+                    && !pointer.is_grabbed()
+                    && self.show_background_menu_under_pointer(&output)
+                {
+                    self.synoik.suppressed_buttons.insert(button_code);
+                    self.synoik.queue_redraw_all();
+                    return;
+                }
 
                 // FIXME: granular.
                 self.synoik.queue_redraw_all();

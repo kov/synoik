@@ -74,6 +74,7 @@ use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::a11y_menu::A11yMenu;
 use crate::ui::app_menu::AppMenu;
+use crate::ui::background_menu::BackgroundMenu;
 use crate::ui::calendar::DateMenu;
 use crate::ui::indicator_menu::IndicatorMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
@@ -389,6 +390,8 @@ pub enum PopoverContent {
     Window(Box<WindowMenu>),
     /// A workspace thumbnail's menu, summoned in the overview strip.
     Workspace(Box<WorkspaceMenu>),
+    /// The desktop context menu, summoned by a right-click on the wallpaper.
+    Background(Box<BackgroundMenu>),
 }
 
 /// What activating the keyboard focus produced: the action, and whether the menu goes away with
@@ -418,6 +421,7 @@ impl PopoverContent {
             PopoverContent::Indicator(m) => m.logical_size(),
             PopoverContent::Window(m) => m.logical_size(),
             PopoverContent::Workspace(m) => m.logical_size(),
+            PopoverContent::Background(m) => m.logical_size(),
         }
     }
 
@@ -436,6 +440,7 @@ impl PopoverContent {
             },
             PopoverContent::Window(m) => (m.nav(dir), None),
             PopoverContent::Workspace(m) => (m.nav(dir), None),
+            PopoverContent::Background(m) => (m.nav(dir), None),
             PopoverContent::InputSources(m) => (m.nav(dir), None),
             PopoverContent::A11y(m) => (m.nav(dir), None),
             PopoverContent::QuickSettings(qs) => qs.nav(dir),
@@ -453,6 +458,7 @@ impl PopoverContent {
             PopoverContent::Indicator(m) => Activation::new(m.activate_focused()),
             PopoverContent::Window(m) => Activation::new(m.activate_focused()),
             PopoverContent::Workspace(m) => Activation::new(m.activate_focused()),
+            PopoverContent::Background(m) => Activation::new(m.activate_focused()),
             PopoverContent::InputSources(m) => Activation::new(m.activate_focused()),
             PopoverContent::A11y(m) => {
                 let (action, close) = m.activate_focused(via_space);
@@ -474,6 +480,7 @@ impl PopoverContent {
             PopoverContent::Indicator(m) => m.corner_radius(),
             PopoverContent::Window(m) => m.corner_radius(),
             PopoverContent::Workspace(m) => m.corner_radius(),
+            PopoverContent::Background(m) => m.corner_radius(),
         }
     }
 }
@@ -601,6 +608,8 @@ impl PanelPopover {
             PopoverContent::Window(_) => None,
             // Nor this one: it hangs off a thumbnail in the overview strip.
             PopoverContent::Workspace(_) => None,
+            // Nor this one: it hangs off the wallpaper.
+            PopoverContent::Background(_) => None,
             // The indicator cluster is one panel item per icon, so the pressed-role highlight
             // would have to name *which* icon; it does not, and lighting the whole cluster would
             // be worse than lighting none of it.
@@ -914,6 +923,33 @@ impl PanelPopover {
         self.anim = Some(self.make_anim(0., 1.));
     }
 
+    /// Open the desktop context menu, anchored at the point that was right-clicked —
+    /// gnome-shell's `openMenu(x, y)`, which parks the dummy cursor there and opens downward
+    /// (`backgroundMenu.js:35-38`).
+    ///
+    /// Opens with **no row focused**, unlike the window and workspace menus: `backgroundMenu.js`
+    /// has no `navigate_focus` call, so the first Down is what lights a row.
+    pub fn open_background_menu(&mut self, output: Output, anchor: Rectangle<f64, Logical>) {
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Point;
+        let mut menu = BackgroundMenu::new();
+        menu.set_max_height(Some(self.available_menu_height()));
+        self.content = Some(PopoverContent::Background(Box::new(menu)));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// The open desktop context menu, if that is what is up — for the corpus.
+    #[cfg(test)]
+    pub fn background_menu(&self) -> Option<&BackgroundMenu> {
+        match &self.content {
+            Some(PopoverContent::Background(m)) if self.open && !self.closing => Some(m),
+            _ => None,
+        }
+    }
+
     /// The open workspace menu, if that is what is up — for the corpus, and for the paths that
     /// have to take the menu down with the workspace it names.
     pub fn workspace_menu(&self) -> Option<&WorkspaceMenu> {
@@ -1197,6 +1233,7 @@ impl PanelPopover {
             PopoverContent::Indicator(m) => m.focused_label(),
             PopoverContent::Window(m) => m.focused_label(),
             PopoverContent::Workspace(m) => m.focused_label(),
+            PopoverContent::Background(m) => m.focused_label(),
             PopoverContent::QuickSettings(qs) => qs.focused_for_test(),
             PopoverContent::Calendar(_) => None,
         }
@@ -1347,6 +1384,7 @@ impl PanelPopover {
             Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
             Some(PopoverContent::Window(m)) => m.pointer_hover(local),
             Some(PopoverContent::Workspace(m)) => m.pointer_hover(local),
+            Some(PopoverContent::Background(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -1508,6 +1546,9 @@ impl PanelPopover {
             Some(PopoverContent::Workspace(m)) => {
                 m.nav(widget::Dir::Down);
             }
+            Some(PopoverContent::Background(m)) => {
+                m.nav(widget::Dir::Down);
+            }
             Some(PopoverContent::InputSources(m)) => {
                 m.nav(widget::Dir::Down);
             }
@@ -1567,6 +1608,7 @@ impl PanelPopover {
                 Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
                 Some(PopoverContent::Window(m)) => m.pointer_click(local),
                 Some(PopoverContent::Workspace(m)) => m.pointer_click(local),
+                Some(PopoverContent::Background(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -1723,6 +1765,7 @@ impl PanelPopover {
             Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Workspace(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::Background(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 
