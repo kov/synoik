@@ -271,14 +271,46 @@ best to start working on the next update ASAP, this results in lowest average la
 user input."* A 3–10 cycle gap **is** that idle period.
 
 Deadline dispatch exists (`SYNOIK_DEADLINE_DISPATCH=1`, `debug-set-render-time-margin <ms>`) and
-**ships off**. A counterbalanced margin sweep found a dose-response reaching parity: 1 ms runs 8× the
-baseline drop rate (reproduced three times, on two hosts of different quietness), 2–4 ms sit ~3×,
-6–8 ms are indistinguishable from not holding the frame at all. The reason is not design: `tools/timer-probe`
-measured `clock_nanosleep` at mean 1.378 ms / worst 8.007 ms and calloop at 0.920 / 8.152 —
-**the raw kernel sleep is worse than calloop**, so neither a better timer source nor a bespoke event
-loop can move it. **This VM cannot wake a thread on time**; the margin buys VM scheduling jitter.
-Mutter's 1 ms is probably right on hardware that wakes in tens of microseconds. Re-run the sweep —
-and `timer-probe` *first* — before treating this as a verdict on the technique.
+**ships off — now for want of a benefit, not for cost.** A counterbalanced margin sweep finds a
+dose-response reaching parity at **4 ms**, at both 60 Hz and 120 Hz (measured 2026-08-28, gsrs seat,
+vkcube as a continuous client, conditions interleaved in 60 s blocks; ~36 k frames per condition at
+60 Hz and ~57.5 k at 120 Hz):
+
+| margin | 60 Hz | 120 Hz |
+|---|---|---|
+| off | 1.0× | 1.0× |
+| 1 ms | 3.7× | 3.0× |
+| 2 ms | 2.0–3.0× | 2.2× |
+| 4 ms | 1.0× | 1.09× |
+
+Three readings, none of them free:
+
+- **The parity point does not scale with the refresh interval.** 4 ms at both rates is what the
+  margin paying for *wake jitter and estimate error* predicts — neither term knows the refresh rate.
+- **4 ms does not degenerate at 120 Hz.** 86% of frames were genuinely held inside an 8.33 ms cycle,
+  the same share as at 1 ms, so the deadline stays reachable. But the margin is absolute while the
+  cycle halves, so the same slack is 24% of a 60 Hz cycle and 48% of a 120 Hz one: **at 120 Hz the
+  feature buys proportionally much less freshness for the same safety.**
+- **Deadline dispatch cannot beat immediate dispatch on drop rate**; by construction the best it can
+  do is cost nothing. What it buys — input and animation sampled closer to the photons — is real and
+  **not measurable with `frame-perf`**, so enabling it waits on an input-to-photon number (which
+  needs host-side timestamps we cannot fabricate in the guest), not on another drop-rate sweep.
+
+The margin is calibration against the machine's wake floor, so it is a dial, and the sweep is
+cheap: re-run it, and [`timer-probe`](../../tools/timer-probe) *first*, after any VMM, kernel or
+hardware change. The floor is not a property of this VM — it moved 19× on 2026-08-28 (see §4), and
+the earlier verdict here (1 ms at 8× baseline, parity only at 6–8 ms) was that older floor's.
+
+**Two traps this sweep walked into; both are cheap to avoid and neither is visible in the output.**
+First, the host imposes a *variance regime* that steps on its own schedule — scanout-wait p99 fell
+7–12 ms → 1.6–3.1 ms mid-run with our own GPU time flat — and at 5-minute-per-arm grain it lands on
+whichever arms straddle it: two arms of the **same** condition read 24 and 7 misses across one step.
+Interleave conditions in short blocks so every condition gets a share of every regime, and carry
+`over_budget` per block as a regime proxy so balance is *checked*, not assumed. Second, a whole
+30-minute run was void because the load never moved to the display under test: `msg action
+focus-window`/`move-window-to-monitor` take `--id`, a bare positional is a CLI error, and stderr was
+discarded — the idle output logged 1 frame per block, which reads as a row, not as an error. Verify
+**every** condition of an experiment with a readback, not just the one under test.
 
 The real bug in this population was the frame clock lying: `next_presentation_time` returned the next
 vblank unconditionally, so every missed frame sampled its animations ~16.67 ms stale. `FrameClock`
@@ -340,6 +372,31 @@ drop-in: `LimitMEMLOCK` is an rlimit and needs a **restart**, unlike `MemoryLow`
 | `SYNOIK_DEBUG_INSTANCES=1` | names the element whenever one drops an instance while a sibling stays put — the damage tracker's only under-report |
 | `debug-dump-scanout` | reads back the framebuffer we actually present (and the client's buffer when it owns the plane) |
 | `tools/timer-probe`, `tools/blur-probe` | isolate the VM's wakeup floor and blur cost from the compositor |
+
+**The wake floor is a measurement, not a property of the VM.** `timer-probe` asks for 60 Hz wakeups
+two ways — a calloop `Timer` and a raw absolute `clock_nanosleep` — so it separates the event loop
+from the kernel from the host in one self-controlled run. Its buckets match `FrameLog`'s
+release-lateness histogram, so probe and frame path read side by side.
+
+| measured | `clock_nanosleep` | calloop timer |
+|---|---|---|
+| 2026-08-12 | mean 1.378 ms / worst 8.007 | 0.920 / 8.152 |
+| **2026-08-28**, after limina's vCPU-thread QoS change | **mean 0.070–0.072 / worst 0.137–0.833** | **0.030–0.032 / 0.123–0.154** |
+
+Three concurring quiet runs; 3546/3600 raw wakeups land under 100 µs. Under 8 spinning threads on
+10 vCPUs the mean holds (0.110 / 0.069 ms, 99.1% under 1 ms) but a ~7 ms tail returns — that is
+oversubscription, a different mechanism from the floor. Confirmed on the real frame path, not just
+the probe's empty loop: `frame-perf` release lateness over 19 076 held frames reads mean 0.081 ms
+(75.6% under 100 µs, 98.4% under 250 µs) against the old mean 1.03 ms / p50 ~800 µs.
+
+**What holds across both readings: calloop rides slightly *ahead* of the raw syscall.** The event
+loop has never been a contributor at either floor, which retires "write our own event loop" *for
+timing reasons* — a bespoke loop cannot beat the kernel it calls. (A dedicated frame thread may
+still earn its place for other reasons.)
+
+Every timing verdict in this document is therefore dated, and a floor that moves 19× in sixteen days
+is the reason: **re-run `timer-probe` first** after any VMM, kernel or hardware change, before
+trusting a seat timing result or re-deriving anything in §3.
 
 **A capture cannot tell you what a screen was repainted with.** Every capture path re-renders the
 scene — a screenshot, a one-shot screencopy (`grim`), `render_for_screencopy_without_damage` — so a
@@ -644,9 +701,13 @@ ProMotion on the MacBook panels — no host hardware we own does 144), overlay p
 CALayer; we own both ends of the protocol extension), NV12/P010 on those planes with
 `COLOR_ENCODING`/`COLOR_RANGE`, and a cursor larger than 64×64.
 
-**Status (2026-08):** wave 4 closed; wave 1 parts 1–2 shipped. Next up are per-host-display,
-120 Hz/VRR, and overlay planes — so **overlay planes are not live yet**, and "when it lands" remains
-accurate for them, for NV12/P010-on-planes and for `COLOR_ENCODING`/`COLOR_RANGE`.
+**Status (2026-08-28):** wave 4 closed; wave 1 parts 1–2 shipped. **Per-hardware-display native
+refresh has landed** — the built-in panel now presents a `2048×1328@120.01` preferred mode and is
+the primary output (confirmed against `drm_info`, connector 1, which is ground truth for a mode;
+identity and modes arrive separately). A 120 Hz seat halves the frame budget, so it re-dates every
+pacing verdict taken at 60 Hz — §3's margin sweep is measured at both rates for that reason.
+Still outstanding: VRR, and overlay planes — so **overlay planes are not live yet**, and "when it
+lands" remains accurate for them, for NV12/P010-on-planes and for `COLOR_ENCODING`/`COLOR_RANGE`.
 
 **Hardware video has no date, and no partial support to discover.** Measured on the host side:
 `VK_KHR_video_*` appears **nowhere** in KosmicKrisp or vkr, and `kk_physical_device.c` builds exactly

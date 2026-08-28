@@ -15,9 +15,11 @@ use crate::utils::get_monotonic_time;
 /// Mutter also adds the display's vblank duration, which it gets from the DRM mode timings
 /// (`meta_calculate_drm_mode_vblank_duration_us`, `src/backends/native/meta-kms-crtc.c:891`), and
 /// arms a hardware deadline timer we do not have. Ours stands in for both, and 1 ms is measurably
-/// too thin on this stack (see the seat numbers in `docs/fork/foundation.md` §3) — which
-/// is why it is a dial rather than a constant: `SYNOIK_RENDER_TIME_MARGIN_MS` at startup,
-/// [`set_render_time_margin`] at runtime, so a calibration sweep costs no rebuild and no relogin.
+/// too thin on this stack — parity needs ~4 ms (see the sweep in `docs/fork/foundation.md` §3).
+/// It is a dial rather than a constant because it is calibration against the machine's wake floor,
+/// and that floor is a measurement, not a property: it moved 19× on 2026-08-28. So a re-calibration
+/// has to cost no rebuild and no relogin — `SYNOIK_RENDER_TIME_MARGIN_MS` at startup,
+/// [`set_render_time_margin`] at runtime, with `tools/timer-probe` run first.
 const RENDER_TIME_MARGIN_DEFAULT_US: u64 = 1000;
 
 static RENDER_TIME_MARGIN_US: AtomicU64 = AtomicU64::new(RENDER_TIME_MARGIN_DEFAULT_US);
@@ -53,13 +55,17 @@ pub fn render_time_margin_now() -> Duration {
 /// `SYNOIK_DEADLINE_DISPATCH=1` starts a session with it on, and [`set_deadline_dispatch`] flips it
 /// at runtime.
 ///
-/// **Off by default because it measured worse at the margin mutter uses.** On a seat under a
-/// continuous 60 fps client, at the 1 ms margin below, dropped frames ran 0.33% against a 0.042%
-/// baseline — reproduced three times, on two hosts. Widening the margin to 6–8 ms recovers it
-/// completely, but spends most of the latency the feature exists for, and what it buys — sampling
-/// input and animation closer to the photons — is real and *not* measurable with frame-perf. So
-/// turning this on is waiting on an input-to-photon number, not on another drop-rate sweep.
-/// `docs/fork/foundation.md` §3 has the margin sweep, and §4 the label-inversion trap.
+/// **Off by default for want of a measured benefit, not because it costs too much.** Against a
+/// continuous client the drop rate reaches parity with immediate dispatch at a **4 ms** margin, at
+/// both 60 Hz and 120 Hz; 1 ms still runs 3–3.7× the baseline. The parity point does not scale with
+/// the refresh interval, which is what a margin paying for wake jitter and estimate error should
+/// do. But the margin is absolute while the cycle is not, so 4 ms is 24% of a 60 Hz cycle and 48%
+/// of a 120 Hz one — at high refresh the feature buys proportionally little freshness for the same
+/// safety. And it can never *beat* immediate dispatch on drop rate; by construction the best it can
+/// do is cost nothing. What it buys — input and animation sampled closer to the photons — is real
+/// and *not* measurable with frame-perf, so turning this on waits on an input-to-photon number,
+/// which needs host-side timestamps. `docs/fork/foundation.md` §3 has the sweep and the two traps
+/// it walked into, and §4 the wake floor the margin is calibrated against.
 ///
 /// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
 /// session: comparing two logins compares two different sets of background work, and on the first
