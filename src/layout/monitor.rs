@@ -82,6 +82,11 @@ const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 /// WINDOW_REPOSITIONING_DELAY).
 const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 
+/// How long the row's scroll stays held after the pointer leaves its band — see
+/// [`StripFreeze`]. The same `WINDOW_REPOSITIONING_DELAY` the picker's close freeze runs on,
+/// because it is the same question about the same pointer.
+const STRIP_FREEZE_MS: u32 = 750;
+
 /// gnome-shell's `WORKSPACE_MIN_SPACING` / `WORKSPACE_MAX_SPACING`
 /// (`workspacesView.js:22-23`), the clamp on the overview row's inter-workspace
 /// gap.
@@ -199,6 +204,9 @@ pub struct Monitor<W: LayoutElement> {
     /// The strip closing the gap left by a workspace you dismissed — see
     /// [`Self::close_workspace`].
     thumb_close_slide: Option<CloseSlide>,
+    /// The row's scroll, held past a click on one of its own thumbnails — see
+    /// [`StripFreeze`].
+    thumb_scroll_freeze: Option<StripFreeze>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -356,6 +364,36 @@ struct RowSlide {
     from: Vec<f64>,
     /// 0 = that row, 1 = the row it is heading for.
     anim: Animation,
+}
+
+/// The row's scroll offset, held past a workspace activation made *on the strip itself*, so
+/// the thumbnails do not slide out from under a pointer that is still working in them.
+///
+/// This is the picker's [`Workspace`](super::workspace::Workspace) close freeze applied to the
+/// row: same problem, same 750ms, same two-stage hold. Activating a workspace recentres the row
+/// on it ([`center_on_focus`]), and with more workspaces than the band holds that moves every
+/// thumbnail — including the one the pointer is resting on, which the second click of "switch
+/// there, then leave the overview there" is aimed at. Without the hold that second click lands
+/// on whichever workspace the scroll brought under the pointer, and scrolls the row again.
+///
+/// **Divergence.** gnome-shell cannot have this: its row shrinks every thumbnail to fit
+/// instead of scrolling, so there is nothing to hold still
+/// (`docs/fork/dynamic-workspaces-divergence.md`).
+#[derive(Debug)]
+struct StripFreeze {
+    /// The fractional workspace index the row was scrolled to when the freeze was taken —
+    /// [`Monitor::workspace_render_idx`] from just before the activation. Frozen as the focus
+    /// rather than as an offset so it survives everything else the row re-lays around: a
+    /// reorder drag, a close slide, the phantom slot.
+    focus: f64,
+    /// `None` holds indefinitely — the pointer is in the row's band, where a thumbnail has to
+    /// stay put for a second click. Like the picker's, it deliberately claims no animation: the
+    /// hold lasts as long as the user leaves the pointer there, and pinning the frame loop for
+    /// that would cost 60fps of an unchanging picture.
+    ///
+    /// `Some` releases when it is done, and *does* claim one, which is what guarantees a frame
+    /// arrives to notice.
+    hold: Option<Animation>,
 }
 
 /// The row holding a slot open for a workspace that does not exist yet.
@@ -642,6 +680,7 @@ impl<W: LayoutElement> Monitor<W> {
             thumb_phantom: None,
             thumb_row_slide: None,
             thumb_close_slide: None,
+            thumb_scroll_freeze: None,
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
@@ -821,6 +860,33 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn activate_workspace_with_anim_config(
+        &mut self,
+        idx: usize,
+        config: Option<synoik_config::Animation>,
+    ) {
+        // Any other route to a workspace — a key, the wheel, a DnD edge scroll — is the user
+        // asking the row to move, so it lets go of a hold the strip took and eases the row to
+        // where the new active workspace puts it.
+        self.release_strip_freeze();
+        self.activate_workspace_inner(idx, config);
+    }
+
+    /// Activate the workspace a click on its own thumbnail picked, holding the row's scroll
+    /// still afterwards — see [`StripFreeze`].
+    pub fn activate_workspace_from_strip(&mut self, idx: usize) {
+        // Before the activation: this is the scroll that is on screen, and the one the pointer
+        // aimed at. A second click inside the hold shares the freeze and only re-arms it, the
+        // way a second removal shares the picker's — the focus already held is where the row
+        // *is*, a fresh one would be where it was going.
+        let focus = self.workspace_render_idx();
+        self.activate_workspace_inner(idx, None);
+        match &mut self.thumb_scroll_freeze {
+            Some(freeze) => freeze.hold = None,
+            None => self.thumb_scroll_freeze = Some(StripFreeze { focus, hold: None }),
+        }
+    }
+
+    fn activate_workspace_inner(
         &mut self,
         mut idx: usize,
         config: Option<synoik_config::Animation>,
@@ -1626,6 +1692,11 @@ impl<W: LayoutElement> Monitor<W> {
         self.activate_workspace(min(idx, self.workspaces.len() - 1));
     }
 
+    /// The same, for a click on the workspace's own thumbnail — see [`StripFreeze`].
+    pub fn switch_workspace_from_strip(&mut self, idx: usize) {
+        self.activate_workspace_from_strip(min(idx, self.workspaces.len() - 1));
+    }
+
     pub fn switch_workspace_auto_back_and_forth(&mut self, idx: usize) {
         let idx = min(idx, self.workspaces.len() - 1);
 
@@ -1722,6 +1793,15 @@ impl<W: LayoutElement> Monitor<W> {
         }
         if self.thumb_row_slide.is_some() {
             causes |= AnimCauses::THUMB_ROW_SLIDE;
+        }
+        // Only a hold that is running out needs frames to run out *on*; an indefinite one
+        // deliberately asks for none — see [`StripFreeze::hold`].
+        if self
+            .thumb_scroll_freeze
+            .as_ref()
+            .is_some_and(|f| f.hold.is_some())
+        {
+            causes |= AnimCauses::THUMB_SCROLL_FREEZE;
         }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
@@ -2396,6 +2476,16 @@ impl<W: LayoutElement> Monitor<W> {
         {
             self.thumb_row_slide = None;
         }
+        // The pointer has been away from the row long enough — see [`StripFreeze`]. Released
+        // here rather than only on motion, because a pointer that leaves the band and stops
+        // would otherwise hold the row for good.
+        if self
+            .thumb_scroll_freeze
+            .as_ref()
+            .is_some_and(|f| f.hold.as_ref().is_some_and(Animation::is_done))
+        {
+            self.release_strip_freeze();
+        }
     }
 
     /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
@@ -2634,8 +2724,9 @@ impl<W: LayoutElement> Monitor<W> {
         let lay = |n: usize, focus: f64| {
             thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, insert, focus)
         };
-        let strip = lay(self.workspaces.len(), self.workspace_render_idx());
-        Some(self.apply_close_slide(strip, &lay))
+        let focus = self.strip_focus();
+        let strip = lay(self.workspaces.len(), focus);
+        Some(self.apply_close_slide(strip, &lay, focus))
     }
 
     /// Eases the row from the positions it was drawn at when it last changed to the ones it
@@ -2680,10 +2771,96 @@ impl<W: LayoutElement> Monitor<W> {
         });
     }
 
+    /// The workspace index the row scrolls to follow: the live one, unless a click on the
+    /// strip is holding it — see [`StripFreeze`].
+    fn strip_focus(&self) -> f64 {
+        match &self.thumb_scroll_freeze {
+            Some(freeze) => freeze.focus,
+            None => self.workspace_render_idx(),
+        }
+    }
+
+    /// Let the row scroll again, easing it from where the freeze was holding it to where the
+    /// active workspace puts it. The ordinary row ease, not one of its own: what a release owes
+    /// is exactly what a drop or a reorder owes.
+    fn release_strip_freeze(&mut self) {
+        if self.thumb_scroll_freeze.is_none() {
+            return;
+        }
+        let from = self.thumb_positions_now();
+        self.thumb_scroll_freeze = None;
+        self.arm_row_slide(from);
+    }
+
+    /// Drop the hold outright, with no ease. For a visit boundary, where the row the freeze
+    /// was holding is not on screen to ease away from.
+    pub(super) fn clear_strip_freeze(&mut self) {
+        self.thumb_scroll_freeze = None;
+    }
+
+    /// The pointer moved; `pos_within_output` is where it is on this monitor, or `None` if it is
+    /// on another one. Returns whether the freeze state changed.
+    ///
+    /// The picker's counterpart ([`Workspace::expose_pointer_moved`](super::workspace::Workspace))
+    /// re-checks its own hover at expiry, because a close button can leave a hover behind with no
+    /// motion to clear it. Nothing here can: the pointer entering the band always arrives as a
+    /// motion, which puts the hold back to indefinite, so a hold that ran out is a pointer that
+    /// was last seen outside the row.
+    pub(super) fn strip_pointer_moved(
+        &mut self,
+        pos_within_output: Option<Point<f64, Logical>>,
+    ) -> bool {
+        let Some(freeze) = &self.thumb_scroll_freeze else {
+            return false;
+        };
+        // Laying the row out to answer this is only worth it once a freeze exists to answer for.
+        let over_band = pos_within_output.is_some_and(|pos| self.strip_band_contains(pos));
+        if over_band {
+            let changed = freeze.hold.is_some();
+            self.thumb_scroll_freeze.as_mut().unwrap().hold = None;
+            return changed;
+        }
+        if freeze.hold.is_some() {
+            return false;
+        }
+        let hold = Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            synoik_config::Animation {
+                off: self.options.animations.overview_open_close.0.off,
+                kind: synoik_config::animations::Kind::Easing(
+                    synoik_config::animations::EasingParams {
+                        duration_ms: STRIP_FREEZE_MS,
+                        curve: synoik_config::animations::Curve::Linear,
+                    },
+                ),
+            },
+        );
+        self.thumb_scroll_freeze.as_mut().unwrap().hold = Some(hold);
+        true
+    }
+
+    /// Whether this row's band covers the point.
+    fn strip_band_contains(&self, pos_within_output: Point<f64, Logical>) -> bool {
+        self.thumbnail_strip()
+            .is_some_and(|strip| strip.band.contains(pos_within_output))
+    }
+
     /// Eases the row from where it stood with a just-closed workspace still in it to where
     /// it stands without — see [`CloseSlide`]. The survivors keep their identity
     /// (`thumbs[i]` is still `workspaces[i]`); only their positions are interpolated.
-    fn apply_close_slide(&self, mut strip: Strip, lay: &dyn Fn(usize, f64) -> Strip) -> Strip {
+    ///
+    /// `focus` is the row's effective focus ([`Self::strip_focus`]), threaded in rather than
+    /// re-read: a close during a scroll freeze must lay its *before* row at the frozen scroll
+    /// too, or the survivors ease out of positions the row was never drawn at.
+    fn apply_close_slide(
+        &self,
+        mut strip: Strip,
+        lay: &dyn Fn(usize, f64) -> Strip,
+        focus: f64,
+    ) -> Strip {
         let Some(slide) = &self.thumb_close_slide else {
             return strip;
         };
@@ -2691,8 +2868,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // The row as it was: one more workspace, and the focus index shifted back up if the
         // closed one sat above the active workspace.
-        let focus_before =
-            self.workspace_render_idx() + f64::from(u8::from(slide.active_was_below));
+        let focus_before = focus + f64::from(u8::from(slide.active_was_below));
         let before = lay(self.workspaces.len() + 1, focus_before);
 
         for (i, rect) in strip.thumbs.iter_mut().enumerate() {

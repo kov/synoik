@@ -202,6 +202,25 @@ The workspace is *not* in the model while the slot is open — `Monitor::render_
 an empty desktop's chrome and nothing else, for the same reason `CloseSlide` keeps a removed
 workspace out of it.
 
+### The row's scroll is held under the pointer (2026-08-29)
+
+A scrolling row has a hazard gnome-shell's shrink-to-fit row cannot: activating a workspace
+recentres the row on it, which moves *every* thumbnail — the one under the pointer included. The
+gesture that suffers is the ordinary one: click a thumbnail to switch there, click again to leave
+the overview on it. The second click lands on whichever workspace the scroll brought under the
+pointer, and scrolls the row again.
+
+So a click on a thumbnail **holds the row's scroll** (`StripFreeze`, `layout/monitor.rs`): the
+focus the row is centred on is frozen at the value it had just before the activation, and stays
+frozen while the pointer is in the row's band. The pointer leaving starts a 750ms grace, after
+which the row eases to where the active workspace puts it — the ordinary `RowSlide`, not an
+animation of its own.
+
+This is the window picker's close freeze applied to the row, down to the constant: same
+`WINDOW_REPOSITIONING_DELAY`, same indefinite-while-hovered / timed-once-away hold, same reason.
+Only a click *on the strip* arms it — a key, the wheel or a DnD edge scroll is the user asking the
+row to move, and each of those releases a hold instead.
+
 ## Accepted losses
 
 **niri's `empty-workspace-above-first` is gone** (config field, ~50 special-case sites, its

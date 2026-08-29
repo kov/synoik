@@ -649,6 +649,8 @@ bitflags::bitflags! {
         const THUMB_ROW_SLIDE = 1 << 28;
         /// The workspace peek sliding the thumbnail strip onto the live desktop.
         const WORKSPACE_PEEK = 1 << 29;
+        /// The workspace row's scroll held past a click on one of its thumbnails, running out.
+        const THUMB_SCROLL_FREEZE = 1 << 30;
     }
 }
 
@@ -704,6 +706,7 @@ impl AnimCauses {
             (AnimCauses::INTERACTIVE_MOVE, "interactive-move"),
             (AnimCauses::THUMB_PHANTOM, "thumb-phantom"),
             (AnimCauses::THUMB_ROW_SLIDE, "thumb-row-slide"),
+            (AnimCauses::THUMB_SCROLL_FREEZE, "thumb-scroll-freeze"),
         ];
         TABLE
             .iter()

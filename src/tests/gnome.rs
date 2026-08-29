@@ -9426,6 +9426,98 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     );
 }
 
+/// Clicking a thumbnail on an overflowing row recentres the row on it, which moves every
+/// thumbnail — including the one under the pointer, which the *second* click of "switch there,
+/// then leave the overview there" is aimed at. The row holds its scroll still while the pointer
+/// stays in its band, exactly as the picker holds its layout past a close, so the second click
+/// lands on the workspace the first one picked.
+#[test]
+fn overview_thumbnail_strip_holds_its_scroll_under_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 12);
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+
+    let band = overview_controls(&mut f).workspace_row;
+    let xs = |f: &mut Fixture| -> Vec<f64> {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .thumbnail_strip()
+            .expect("many workspaces must show the strip")
+            .thumbs
+            .iter()
+            .map(|rect| rect.loc.x)
+            .collect()
+    };
+
+    let before = xs(&mut f);
+    {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert!(
+            strip.bounds().size.w > band.size.w,
+            "this test is vacuous unless the row overflows its band"
+        );
+    }
+
+    // A workspace far enough from the active one that recentring on it scrolls the row by more
+    // than a thumbnail's width — otherwise the second click would land right anyway.
+    let target = 8;
+    let (x, y) = thumbnail_center(&mut f, target);
+    pointer_motion_to(&mut f, x, y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    assert_eq!(
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        target,
+        "the click must switch to the workspace it landed on"
+    );
+    assert_eq!(
+        xs(&mut f),
+        before,
+        "the row must not scroll out from under the pointer that clicked it"
+    );
+    // Which is the whole point: the same pixel is still the same thumbnail, so the click that
+    // leaves the overview lands where it was aimed.
+    assert_eq!(
+        f.synoik().thumbnail_under((x, y).into()).map(|(_, _, i)| i),
+        Some(target),
+        "the second click must find the workspace the first one picked"
+    );
+
+    // The pointer leaving the band starts the 750ms grace, and the row catches up after it.
+    pointer_motion_to(&mut f, x, band.loc.y + band.size.h + 200.);
+    f.run_frames_for(Duration::from_millis(800));
+    f.settle();
+
+    let after = xs(&mut f);
+    assert_ne!(
+        after, before,
+        "once the pointer has left, the row must recentre on the active workspace"
+    );
+    let rect = f
+        .synoik()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .thumbnail_strip()
+        .expect("the strip must still be up")
+        .thumbs[target];
+    assert!(
+        rect.loc.x >= band.loc.x && rect.loc.x + rect.size.w <= band.loc.x + band.size.w,
+        "and land with the active thumbnail inside the band, at {rect:?}"
+    );
+}
+
 /// Past the point where the row fills its band, the strip scrolls to follow the
 /// active workspace instead of shrinking to fit (**divergence**, approved
 /// 2026-07-29 — gnome-shell's `vfunc_get_preferred_height` shrinks below

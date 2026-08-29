@@ -5729,7 +5729,11 @@ impl State {
         if self.synoik.layout.is_overview_open() || self.synoik.layout.is_peeking() {
             if let Some((output, p)) = self.synoik.output_under(pos) {
                 let output = output.clone();
-                if self.synoik.layout.picker_pointer_moved(&output, p) {
+                let mut changed = self.synoik.layout.picker_pointer_moved(&output, p);
+                // The row's scroll is held the same way after a click on one of its thumbnails
+                // (`StripFreeze`), and released by the pointer leaving its band.
+                changed |= self.synoik.layout.strip_pointer_moved(&output, p);
+                if changed {
                     self.synoik.queue_redraw_all();
                 }
             }
@@ -6858,6 +6862,21 @@ impl State {
     /// click rules): clicking the *active* workspace's empty area leaves the overview,
     /// clicking another one switches to it and stays.
     fn activate_overview_workspace(&mut self, output: &Output, ws_id: WorkspaceId) {
+        self.activate_overview_workspace_inner(output, ws_id, false)
+    }
+
+    /// The same, for a click on the workspace's own strip thumbnail: the switch holds the row's
+    /// scroll still so the click that follows it lands on the thumbnail it was aimed at.
+    fn activate_overview_workspace_from_strip(&mut self, output: &Output, ws_id: WorkspaceId) {
+        self.activate_overview_workspace_inner(output, ws_id, true)
+    }
+
+    fn activate_overview_workspace_inner(
+        &mut self,
+        output: &Output,
+        ws_id: WorkspaceId,
+        from_strip: bool,
+    ) {
         let Some((ws_idx, _)) = self.synoik.layout.find_workspace_by_id(ws_id) else {
             return;
         };
@@ -6872,7 +6891,11 @@ impl State {
             .active_workspace()
             .is_some_and(|active| active.id() == ws_id);
         if gnome_mode && !is_active {
-            self.synoik.layout.switch_workspace(ws_idx);
+            if from_strip {
+                self.synoik.layout.switch_workspace_from_strip(ws_idx);
+            } else {
+                self.synoik.layout.switch_workspace(ws_idx);
+            }
         } else if self.synoik.peek_up {
             // A peek's click on the *active* thumbnail does nothing. In the overview this is the
             // gesture that leaves it, landing on the workspace you clicked; here there is no
@@ -6898,7 +6921,7 @@ impl State {
         else {
             return;
         };
-        self.activate_overview_workspace(output, ws_id);
+        self.activate_overview_workspace_from_strip(output, ws_id);
     }
 
     fn update_folder_drop_target(&mut self) {

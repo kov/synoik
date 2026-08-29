@@ -3242,6 +3242,15 @@ impl<W: LayoutElement> Layout<W> {
         monitor.switch_workspace(idx);
     }
 
+    /// Switch to the workspace a click on its own strip thumbnail picked, which holds the row's
+    /// scroll still afterwards — see `StripFreeze`.
+    pub fn switch_workspace_from_strip(&mut self, idx: usize) {
+        let Some(monitor) = self.active_monitor() else {
+            return;
+        };
+        monitor.switch_workspace_from_strip(idx);
+    }
+
     pub fn switch_workspace_auto_back_and_forth(&mut self, idx: usize) {
         let Some(monitor) = self.active_monitor() else {
             return;
@@ -6586,6 +6595,11 @@ impl<W: LayoutElement> Layout<W> {
         for ws in self.workspaces_mut() {
             ws.forget_expose_layout();
         }
+        // The row's scroll freeze is bounded by the same visit, and for the same reason: the
+        // row it was holding is not on screen any more, so there is nothing to ease away from.
+        for mon in self.monitors_mut() {
+            mon.clear_strip_freeze();
+        }
     }
 
     /// Every preview's slot as drawn right now, per workspace — the `from` of a picker ease,
@@ -7190,6 +7204,25 @@ impl<W: LayoutElement> Layout<W> {
             for ws in mon.workspaces.iter_mut() {
                 changed |= ws.expose_pointer_moved(Some(ws.id()) == under);
             }
+        }
+        changed
+    }
+
+    /// The pointer moved over `output`; feed it to every thumbnail row's scroll freeze — see
+    /// `StripFreeze`. Returns whether anything changed.
+    pub fn strip_pointer_moved(
+        &mut self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> bool {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return false;
+        };
+
+        let mut changed = false;
+        for mon in monitors {
+            let here = (mon.output == *output).then_some(pos_within_output);
+            changed |= mon.strip_pointer_moved(here);
         }
         changed
     }
