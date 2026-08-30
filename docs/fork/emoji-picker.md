@@ -61,6 +61,11 @@ that one). The picker opens on the display owning the anchor.
 `zwp_text_input_v3` does not say *which* surface, so a text input on a popup or subsurface anchors
 as if it were on the toplevel. Every client in the coverage table puts its entries on the toplevel.
 
+The panel hangs below the anchor when it fits and above it when it does not, clamped to the
+output either way — the caret's own line stays visible. Its size is fixed (`EmojiPicker::WIDTH` /
+`HEIGHT`): a grid that resized as the search narrowed would move the cell under the pointer on
+every keystroke.
+
 ## The grab: keys without focus
 
 `text-input-v3` enter/leave rides `wl_keyboard` focus, and every shell-owned `KeyboardFocus` variant
@@ -99,20 +104,23 @@ no dead keys in the search box, which costs nothing for ASCII emoji names.
 outranked by the lock shield, the run/end-session/polkit dialogs, a keyboard move-resize grab and a
 panel popover without a single check of its own.
 
-**Key repeat inside the picker** (arrows and backspace in the search entry) comes with the UI:
-`arm_key_repeat` grows a `RepeatKey` variant then.
+Keys repeat through `RepeatKey::EmojiPicker`, the same route the shell's other own-drawn surfaces
+take: a Wayland compositor is told about one press per physical key and leaves repeating to the
+client, which does nothing for a surface we draw ourselves.
 
 ## Colour emoji: routing, then rasterization
 
 Emoji draw in colour through two pieces, both built.
 
-**Routing.** cosmic-text's Unix fallback list puts `Noto Color Emoji` *after* `DejaVu Sans`, which
-also covers the emoji block — so an emoji shaped with the UI face lands on DejaVu's monochrome
-outline, silently. Text known to be emoji asks for the face by name instead:
-`TextContext::shape_emoji` / `SpanFamily::Emoji` (`synoik-vk/src/text.rs`). Steering the *whole*
-UI's fallback would change how `☺`, `❤` and the other dual-presentation characters render in every
-existing label; getting that right needs per-character presentation itemization, and is not part
-of this feature. Emoji inside ordinary labels therefore stay monochrome for now.
+**Routing.** Text known to be emoji asks for the face **by name** rather than trusting the fallback
+chain: `TextContext::shape_emoji` / `SpanFamily::Emoji` (`synoik-vk/src/text.rs`), reached through
+`TextShaper::shape_emoji`. cosmic-text's Unix fallback list puts `Noto Color Emoji` *after*
+`DejaVu Sans`, which also covers part of the emoji block — measured, the picker's own cells come
+out in colour either way, because DejaVu has no U+1F600; asking by name is what keeps that from
+being a property of a list order that is not a contract. Steering the *whole* UI's fallback is a
+different matter: it would change how `☺`, `❤` and the other dual-presentation characters render
+in every existing label, which needs per-character presentation itemization and is not part of this
+feature. Emoji inside ordinary labels therefore stay monochrome for now.
 
 **Rasterization.** swash reads the COLR **v0** table only (`scale/color.rs`), and Fedora ships Noto
 Color Emoji as COLRv1 with no bitmap strikes — for U+1F600 it returns nothing from
@@ -165,7 +173,7 @@ overlay (`src/ui/hotkey_overlay.rs`).
 4. ~~**Caret anchor.**~~ `State::text_anchor_rect`, per the placement section above.
 5. ~~**The grab.**~~ `src/ui/emoji_picker.rs`, `Action::ToggleEmojiPicker`, and the filter arm
    described above.
-6. **UI.** Grid, category rail, search entry, hover/keyboard selection, tone popover; chrome from
-   `docs/fork/gnome-style-reference.md`.
+6. **UI.** ~~Panel, grid, search entry, hover/keyboard selection~~ (`src/ui/emoji_picker.rs`).
+   Left: category rail and tone popover.
 7. **Recents**, per the round-trip rule above.
 8. **Keybinding** + hotkey overlay.

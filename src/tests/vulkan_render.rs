@@ -14159,6 +14159,61 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
     );
 }
 
+/// The picker's grid draws its emoji **in colour**.
+///
+/// End to end: the COLRv1 rasterizer, the RGBA atlas beside the mask one, `text_color.frag`, and
+/// the push site that gets the panel into the frame. Asserted on saturation rather than on ink,
+/// because a grid of grey glyphs is exactly the failure — with `colr::rasterize` stubbed out this
+/// measures 0 where it measures ~30k.
+///
+/// It does **not** pin the font routing. Measured: shaping the same cells through the plain UI
+/// face still comes out in colour, because cosmic-text's fallback has no `DejaVu Sans` coverage
+/// for U+1F600 and reaches `Noto Color Emoji` anyway. `shape_emoji` asks for the face by name so
+/// that never depends on the fallback list's order, which is not a contract.
+#[test]
+fn vulkan_the_emoji_picker_grid_draws_in_colour() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.synoik_state()
+        .do_action(synoik_config::Action::ToggleEmojiPicker, false);
+    f.synoik_complete_animations();
+    f.settle();
+
+    let output = f.synoik_output(1);
+    let geo = f.synoik().emoji_picker.geometry().expect("picker is open");
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+
+    let scale = output.current_scale().fractional_scale();
+    let grid = Rectangle::new(
+        geo.loc + Point::from((12., 12. + crate::ui::widget::Entry::HEIGHT + 8.)),
+        Size::from((360., 240.)),
+    );
+    let x0 = (grid.loc.x * scale) as i32;
+    let y0 = (grid.loc.y * scale) as i32;
+    let x1 = ((grid.loc.x + grid.size.w) * scale) as i32;
+    let y1 = ((grid.loc.y + grid.size.h) * scale) as i32;
+
+    let px = pixels.as_chunks::<4>().0;
+    let mut saturated = 0usize;
+    for y in y0.max(0)..y1.min(h) {
+        for x in x0.max(0)..x1.min(w) {
+            let p = px[(y * w + x) as usize];
+            let (lo, hi) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+            // Anything the panel itself draws is grey; only a colour glyph has a channel spread.
+            if p[3] > 200 && hi as i32 - lo as i32 > 60 {
+                saturated += 1;
+            }
+        }
+    }
+
+    assert!(
+        saturated > 500,
+        "the grid must be in colour: {saturated} saturated pixels in the grid rect of {w}x{h} \
+         (a monochrome grid means the emoji were shaped against the UI fallback)"
+    );
+}
+
 /// A focused entry with nothing typed still draws its caret.
 ///
 /// An empty focused field is exactly where the caret is the only thing to see, and one showing

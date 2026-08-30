@@ -101,7 +101,7 @@ pub struct VulkanRenderer {
     text_ctx: synoik_vk::text::TextContext,
     /// Shaped single-line runs, keyed by `(text, px bits, bold)`. See
     /// [`Self::build_glyph_run_weighted`].
-    glyph_runs: HashMap<(String, u32, bool), GlyphRun>,
+    glyph_runs: HashMap<(String, u32, RunFace), GlyphRun>,
     /// The image behind [`text_ctx`](Self::text_ctx)'s residency index, `None` until the first
     /// run. See [`Self::absorb_glyphs`].
     glyph_atlas: Option<GlyphAtlasImage>,
@@ -423,6 +423,14 @@ const BACKDROP_BLUR_POOL_BYTES: u64 = 288 * 1024 * 1024;
 /// panel label, dash tooltip and app name at once is well under this. See
 /// [`VulkanRenderer::build_glyph_run_weighted`].
 const GLYPH_RUN_CACHE_CAP: usize = 256;
+
+/// Which face a cached [`GlyphRun`] was shaped against — part of its cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RunFace {
+    Sans,
+    Bold,
+    Emoji,
+}
 
 /// The persistent glyph-atlas image, paired with the generation of the residency index that
 /// describes it. Recreated (never resized in place) when that generation moves; runs built
@@ -977,14 +985,39 @@ impl VulkanRenderer {
         px: f32,
         bold: bool,
     ) -> Result<GlyphRun, VulkanError> {
+        let face = if bold { RunFace::Bold } else { RunFace::Sans };
+        self.build_glyph_run_face(text, px, face)
+    }
+
+    /// Shape `text` against the colour emoji face by name, so it rasterizes in colour.
+    ///
+    /// Asking for the family is the whole point: cosmic-text's Unix fallback list reaches
+    /// `DejaVu Sans` — which covers the emoji block with monochrome outlines — before it reaches
+    /// `Noto Color Emoji`. See `docs/fork/emoji-picker.md`.
+    pub(crate) fn build_glyph_run_emoji(
+        &mut self,
+        text: &str,
+        px: f32,
+    ) -> Result<GlyphRun, VulkanError> {
+        self.build_glyph_run_face(text, px, RunFace::Emoji)
+    }
+
+    fn build_glyph_run_face(
+        &mut self,
+        text: &str,
+        px: f32,
+        face: RunFace,
+    ) -> Result<GlyphRun, VulkanError> {
         // `px` by bits: it is a float only because font sizes scale, and two sizes
-        // that compare equal rasterize identically.
-        let key = (text.to_owned(), px.to_bits(), bold);
+        // that compare equal rasterize identically. The face is part of the key because the same
+        // string shaped against a different one is a different run — without it an emoji would
+        // serve a cached monochrome DejaVu run, or leak a colour one into a label.
+        let key = (text.to_owned(), px.to_bits(), face);
         if let Some(run) = self.glyph_runs.get(&key) {
             return Ok(run.clone());
         }
 
-        let (shaped, atlases) = self.shape_line(text, px, bold)?;
+        let (shaped, atlases) = self.shape_line(text, px, face)?;
         let run = GlyphRun::new(
             atlases.mask.0,
             atlases.mask.1,
@@ -1036,12 +1069,16 @@ impl VulkanRenderer {
         &mut self,
         text: &str,
         px: f32,
-        bold: bool,
+        face: RunFace,
     ) -> Result<(synoik_vk::text::ShapedRun, GlyphAtlases), VulkanError> {
         // Split the disjoint borrows: shaping needs `&mut text_ctx`, uploading needs `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
-        let (shaped, pending) = self.text_ctx.shape_line_weighted(text, px, bold)?;
+        let (shaped, pending) = match face {
+            RunFace::Emoji => self.text_ctx.shape_emoji(text, px)?,
+            RunFace::Bold => self.text_ctx.shape_line_weighted(text, px, true)?,
+            RunFace::Sans => self.text_ctx.shape_line_weighted(text, px, false)?,
+        };
         let atlas = self.absorb_glyphs(&gpu, pool, pending)?;
         Ok((shaped, atlas))
     }

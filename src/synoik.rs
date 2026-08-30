@@ -190,7 +190,7 @@ use crate::synoik_render_elements;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
 use crate::ui::dash::{Dash, DashEntry};
-use crate::ui::emoji_picker::EmojiPicker;
+use crate::ui::emoji_picker::{EmojiPicker, EmojiPickerRenderElement};
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -1022,6 +1022,9 @@ pub struct Synoik {
     /// `wl_keyboard` focus so its `text-input-v3` stays enabled, which is what the picker commits
     /// into. See [`crate::ui::emoji_picker`].
     pub emoji_picker: EmojiPicker,
+    /// Fractional rows of picker scroll not yet spent, so a touchpad's pixels accumulate into
+    /// whole rows instead of being rounded away one event at a time.
+    pub emoji_picker_scroll: f64,
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
@@ -8138,6 +8141,7 @@ impl Synoik {
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
             emoji_picker: EmojiPicker::default(),
+            emoji_picker_scroll: 0.,
             end_session_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),
@@ -11227,6 +11231,15 @@ impl Synoik {
 
         // Next, the run dialog.
         self.run_dialog.render(
+            ctx.renderer,
+            output,
+            self.gnome_settings.accent_color,
+            &mut |elem| push(elem.into()),
+        );
+
+        // Next, the emoji picker. Above the run dialog because it can be opened over one — the
+        // run dialog is a `ShellEntry`, which `insert_text` commits into.
+        self.emoji_picker.render(
             ctx.renderer,
             output,
             self.gnome_settings.accent_color,
@@ -16627,6 +16640,7 @@ synoik_render_elements! {
         Switcher = crate::ui::switcher::ui::SwitcherRenderElement,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
+        EmojiPicker = EmojiPickerRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,
         PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,

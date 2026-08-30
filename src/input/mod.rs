@@ -69,7 +69,7 @@ use crate::ui::app_grid::{
     FOLDER_PREVIEW_MS, PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
 };
 use crate::ui::dash::DashHit;
-use crate::ui::emoji_picker::PickerKey;
+use crate::ui::emoji_picker::KeyOutcome as PickerKey;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::folder_dialog::{DialogHit, POPDOWN_DIALOG_MS};
 use crate::ui::overview_search::SearchHit;
@@ -237,6 +237,10 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 
 /// The seat's modifier state as [`EditMods`](crate::ui::text_edit::EditMods) — the plain-data
 /// mirror every entry's key handler takes, so no UI module depends on smithay's type.
+/// Touchpad pixels per grid row of emoji-picker scroll, so a two-finger drag moves at roughly the
+/// rate the cells suggest.
+const EMOJI_SCROLL_PX: f64 = 40.;
+
 fn edit_mods(mods: &ModifiersState) -> crate::ui::text_edit::EditMods {
     crate::ui::text_edit::EditMods {
         ctrl: mods.ctrl,
@@ -264,6 +268,13 @@ pub enum RepeatKey {
     Popover {
         raw: Option<Keysym>,
         mods: ModifiersState,
+    },
+    /// A key that went to the emoji picker's search entry or grid navigation.
+    EmojiPicker {
+        raw: Option<Keysym>,
+        text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
+        theme: crate::ui::text_edit::KeyTheme,
     },
 }
 
@@ -1365,8 +1376,26 @@ impl State {
                     }
 
                     if pressed {
-                        if this.synoik.emoji_picker.handle_key(raw) == PickerKey::Close {
-                            this.synoik.queue_redraw_all();
+                        // The one text route into the picker: its search entry is a plain
+                        // `TextEdit`, deliberately not a `ShellEntry` — routing it through the
+                        // input method would move `ImFocus` off the client and reset the engine,
+                        // which is the focus the picker exists to protect.
+                        let text = modified
+                            .key_char()
+                            .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        let theme = this.synoik.gnome_settings.key_theme;
+                        let mods_edit = edit_mods(mods);
+                        this.emoji_picker_key(raw, text, mods_edit, theme);
+                        if this.synoik.emoji_picker.is_open() && key_repeats {
+                            this.arm_key_repeat(
+                                key_code,
+                                RepeatKey::EmojiPicker {
+                                    raw,
+                                    text,
+                                    mods: mods_edit,
+                                    theme,
+                                },
+                            );
                         }
                         this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
@@ -1887,6 +1916,35 @@ impl State {
         self.synoik.bind_repeat_timer = Some(token);
     }
 
+    /// Route one key to the open emoji picker, and act on what it asked for.
+    ///
+    /// The insert goes through the same `insert_text` seam the shell uses everywhere else: the
+    /// client's `zwp_text_input_v3` when it has one, a shell entry when one owns text, and the
+    /// clipboard plus an OSD when neither can take it.
+    fn emoji_picker_key(
+        &mut self,
+        raw: Option<Keysym>,
+        text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
+        theme: crate::ui::text_edit::KeyTheme,
+    ) {
+        match self
+            .synoik
+            .emoji_picker
+            .handle_key(raw, text, mods, theme, true)
+        {
+            PickerKey::Handled => {}
+            PickerKey::Close => {
+                self.synoik.emoji_picker.close();
+            }
+            PickerKey::Insert(text) => {
+                self.synoik.emoji_picker.close();
+                self.insert_text(&text);
+            }
+        }
+        self.synoik.queue_redraw_all();
+    }
+
     /// Whether the keymap says this key repeats at all.
     ///
     /// The same question Clutter asks before arming its own repeat: modifiers, locks and Compose
@@ -1959,6 +2017,19 @@ impl State {
                     return false;
                 }
                 self.deliver_shell_key(key);
+            }
+            RepeatKey::EmojiPicker {
+                raw,
+                text,
+                mods,
+                theme,
+            } => {
+                if !self.synoik.emoji_picker.is_open() {
+                    return false;
+                }
+                self.emoji_picker_key(raw, text, mods, theme);
+                // A repeat that closed the picker (Escape held) takes no more keys.
+                return self.synoik.emoji_picker.is_open();
             }
             RepeatKey::Popover { raw, mods } => {
                 if !self.synoik.panel_popover.grabs_input() {
@@ -5528,9 +5599,20 @@ impl State {
             }
             Action::ToggleEmojiPicker => {
                 if !self.synoik.emoji_picker.close() {
-                    // The anchor is read once, here: the caret as it was when the user asked.
+                    // Both are read once, here: the caret as it was when the user asked, and the
+                    // display owning it — which is the only moment either is decidable.
                     let anchor = self.text_anchor_rect();
-                    self.synoik.emoji_picker.open(anchor);
+                    let output = self
+                        .synoik
+                        .global_space
+                        .output_under(anchor.loc)
+                        .next()
+                        .or_else(|| self.synoik.layout.active_output())
+                        .cloned();
+                    if let Some(output) = output {
+                        let geo = self.synoik.global_space.output_geometry(&output).unwrap();
+                        self.synoik.emoji_picker.open(anchor, output, geo.to_f64());
+                    }
                 }
                 self.synoik.queue_redraw_all();
             }
@@ -5888,6 +5970,13 @@ impl State {
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
             }
+        }
+
+        // The emoji picker is not modal — it takes no pointer grab and the window under it keeps
+        // its focus — so this only lights the cell under the pointer. `pos` is global, which is
+        // the space the picker's geometry is in.
+        if self.synoik.emoji_picker.pointer_motion(pos) {
+            self.synoik.queue_redraw_all();
         }
 
         // A panel popover grabs input modally: no window under it receives pointer focus
@@ -8390,10 +8479,26 @@ impl State {
             return;
         }
 
-        // A click closes the emoji picker, and is then handled normally: it is a transient
-        // overlay, not a modal one, so clicking a window behind it does what clicking a window
-        // does. Slice 6 gives the picker geometry, and a click *inside* it will stop here instead.
-        if button_state == ButtonState::Pressed && self.synoik.emoji_picker.close() {
+        // The emoji picker. A click inside it picks and goes no further — both edges are
+        // swallowed, or the window underneath would get a button-up it never saw pressed. A click
+        // outside closes it and is then handled normally: it is a transient overlay, not a modal
+        // one, so clicking a window behind it does what clicking a window does.
+        if self.synoik.emoji_picker.is_open() && button_state == ButtonState::Pressed {
+            let pos = pointer.current_location();
+            if self.synoik.emoji_picker.contains(pos) {
+                // The matching release is claimed by the global `suppressed_buttons` check below,
+                // which is why this arm needs no release branch of its own — and must not have
+                // one: picking closes the picker, so by the time the release arrives this
+                // condition is already false.
+                self.synoik.suppressed_buttons.insert(button_code);
+                if let Some(text) = self.synoik.emoji_picker.pointer_click(pos) {
+                    self.synoik.emoji_picker.close();
+                    self.insert_text(&text);
+                }
+                self.synoik.queue_redraw_all();
+                return;
+            }
+            self.synoik.emoji_picker.close();
             self.synoik.queue_redraw_all();
         }
 
@@ -9121,6 +9226,26 @@ impl State {
         };
 
         let is_switcher_open = self.synoik.switcher.is_open();
+
+        // A scroll over the emoji picker's grid scrolls it, by whole rows — the grid has no
+        // sub-row position, so a touchpad's pixels accumulate into notches the same way a wheel's
+        // do. Consumed either way, so it never leaks to the window underneath.
+        if self.synoik.emoji_picker.is_open() {
+            let pos = pointer.current_location();
+            if self.synoik.emoji_picker.contains(pos) {
+                let step = vertical_amount_v120
+                    .map(|v| v / 120.)
+                    .or_else(|| event.amount(Axis::Vertical).map(|px| px / EMOJI_SCROLL_PX))
+                    .unwrap_or(0.);
+                self.synoik.emoji_picker_scroll += step;
+                let rows = self.synoik.emoji_picker_scroll.trunc();
+                self.synoik.emoji_picker_scroll -= rows;
+                if self.synoik.emoji_picker.scroll_rows(rows as isize) {
+                    self.synoik.queue_redraw_all();
+                }
+                return;
+            }
+        }
 
         // A scroll OVER an open panel popover is grabbed by it: the dateMenu
         // scrolls its message list (or pages the calendar month), gnome-shell's

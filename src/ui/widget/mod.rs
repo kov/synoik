@@ -2481,6 +2481,18 @@ impl<'a> TextShaper<'a> {
         Ok(ShapedText { run })
     }
 
+    /// Shape text known to be emoji, against the colour emoji face by name.
+    ///
+    /// `px` is a **logical** pixel em size rather than a point size: an emoji cell is sized in
+    /// pixels, not set in type. Asking for the family is what makes it draw in colour — see
+    /// `docs/fork/emoji-picker.md`.
+    pub fn shape_emoji(&mut self, text: &str, logical_px: f64) -> anyhow::Result<ShapedText> {
+        let run = self
+            .renderer
+            .build_glyph_run_emoji(text, (logical_px * self.scale) as f32)?;
+        Ok(ShapedText { run })
+    }
+
     /// Shape a wrapped, center-aligned, multi-span paragraph. `wrap` is the wrap
     /// width in **logical** px; `base_pt` is the line-height reference point size.
     /// Every span's pt is converted the same way as [`Self::shape`] — no call site

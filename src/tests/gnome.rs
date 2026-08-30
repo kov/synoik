@@ -6907,6 +6907,151 @@ fn the_picker_opens_at_the_caret_and_stays_there() {
     );
 }
 
+/// Move the pointer to a global position; the fixture's motion events are deltas.
+fn pointer_to(f: &mut Fixture, target: Point<f64, smithay::utils::Logical>) {
+    let cur = f.synoik().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(target.x - cur.x, target.y - cur.y);
+}
+
+/// The whole feature in one assertion: the picked emoji arrives at the client as a `text-input`
+/// commit, and not one key event goes with it.
+#[test]
+fn the_picker_commits_the_selected_emoji_and_no_keys() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.client(id).get_keyboard();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).text_input_events();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    // Two cells along the first row: the third emoji in the table.
+    f.key_press(KEY_RIGHT);
+    f.key_release(KEY_RIGHT);
+    f.key_press(KEY_RIGHT);
+    f.key_release(KEY_RIGHT);
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    f.double_roundtrip(id);
+
+    let expected = crate::emoji::table().entries()[2].ch.to_owned();
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some(expected.clone()))),
+        "expected a commit of {expected:?}, got: {events:?}"
+    );
+    assert!(
+        f.client(id).take_key_events().is_empty(),
+        "and no key events at all"
+    );
+    assert!(
+        !f.synoik().emoji_picker.is_open(),
+        "picking closes the picker"
+    );
+}
+
+/// Typing reaches the picker's search entry, which is a plain `TextEdit` and not a `ShellEntry` —
+/// so the client keeps the input method and the keys still never reach it.
+#[test]
+fn typing_narrows_the_grid_without_the_client_seeing_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.client(id).get_keyboard();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    for key in [KEY_H, KEY_A, KEY_T] {
+        f.key_press(key);
+        f.key_release(key);
+    }
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    f.double_roundtrip(id);
+
+    // Against the table's own search: what is being pinned here is that the three keystrokes
+    // reached the entry, not how `emoji::Table::search` ranks — its own tests own that.
+    let expected = crate::emoji::table().search("hat")[0].ch.to_owned();
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some(expected.clone()))),
+        "expected a commit of {expected:?}, got: {events:?}"
+    );
+    assert!(f.client(id).take_key_events().is_empty());
+}
+
+/// A click on a cell picks it, and the window underneath sees neither edge of that click — a
+/// button-up it never saw pressed would leave it thinking a drag was in flight.
+#[test]
+fn a_click_on_a_cell_picks_it_and_the_window_sees_nothing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.double_roundtrip(id);
+    let _ = f.client(id).text_input_events();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+    // The first cell's centre.
+    let cell = geo.loc + Point::from((12. + 20., 12. + 40. + 8. + 20.));
+    pointer_to(&mut f, cell);
+    assert_eq!(
+        f.synoik().emoji_picker.hovered_index(),
+        Some(0),
+        "the pointer lights the cell it is over"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+
+    let expected = crate::emoji::table().entries()[0].ch.to_owned();
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some(expected.clone()))),
+        "expected a commit of {expected:?}, got: {events:?}"
+    );
+    // The harness client binds no `wl_pointer`, so the compositor's own ledger is the
+    // observable: an empty one means the press was suppressed *and* its release was consumed as
+    // the matching half, rather than falling through to the window under the picker.
+    assert!(
+        f.synoik().suppressed_buttons.is_empty(),
+        "the click was swallowed as a pair"
+    );
+    assert!(!f.synoik().emoji_picker.is_open());
+}
+
+/// The picker opens below the caret, and flips above it when there is no room below.
+#[test]
+fn the_picker_flips_above_a_caret_near_the_bottom() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    f.client(id).set_cursor_rectangle(10, 10, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+    let caret = f.synoik_state().text_caret_rect().unwrap();
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+    assert!(
+        geo.loc.y > caret.loc.y,
+        "with room below, the picker hangs off the caret: {geo:?} vs {caret:?}"
+    );
+
+    // Close, then re-open against a caret near the bottom edge.
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    pointer_to(&mut f, Point::from((100., 1070.)));
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+    assert!(
+        geo.loc.y + geo.size.h <= 1080.,
+        "and flips above rather than off the screen: {geo:?}"
+    );
+}
+
 /// A floating window can sit partly off the working area, and the clipped rectangle's origin
 /// then sits at the working-area edge rather than at the window's. Mapping a caret through that
 /// origin puts it off by however much is cropped away — so the anchor uses the unclamped geometry.
