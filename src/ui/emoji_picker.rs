@@ -44,6 +44,33 @@ const PAD: f64 = 12.;
 const GAP: f64 = 8.;
 /// Panel background — the same card as the dialogs.
 const BG: widget::Rgba = widget::style::DIALOG_BG;
+/// Height of the category rail along the panel's bottom edge.
+const RAIL_H: f64 = 36.;
+/// The rail label's em size — smaller than a grid cell's, it is a tab not a choice.
+const RAIL_PX: f64 = 20.;
+/// Columns in the skin-tone popover. A one-person emoji has five spellings and fits one row; a
+/// two-person one has up to 25, which wrap into five.
+const TONE_COLS: usize = 5;
+/// Padding inside the tone popover.
+const TONE_PAD: f64 = 6.;
+
+/// One emoji per Unicode group, in group order — the rail's tabs.
+///
+/// GNOME picks the same nine for its on-screen keyboard's section keys
+/// (`EmojiSelection._sections`, `js/ui/keyboard.js:884-894`); we take its labels rather than
+/// inventing our own, and index them by position because our table's groups are Unicode's own
+/// order, which is the order that list is in.
+const RAIL_LABELS: [&str; 9] = [
+    "\u{1f642}",
+    "\u{1f44d}",
+    "\u{1f337}",
+    "\u{1f374}",
+    "\u{2708}\u{fe0f}",
+    "\u{1f3c3}",
+    "\u{1f514}",
+    "\u{2764}\u{fe0f}",
+    "\u{1f6a9}",
+];
 
 synoik_render_elements! {
     EmojiPickerRenderElement => {
@@ -84,8 +111,18 @@ pub struct EmojiPicker {
     hovered: Option<usize>,
     /// First visible row of the grid.
     first_row: usize,
+    /// The cell whose skin-tone popover is open, and the position selected inside it.
+    tone: Option<(usize, usize)>,
+    /// The tone last picked, applied to any toned emoji picked without opening the popover.
+    ///
+    /// GNOME's on-screen keyboard has no such memory, but every other picker does, and picking a
+    /// tone once and then having to pick it again for every emoji is the alternative. In memory
+    /// only for now: persisting it belongs with the recents, whose GTK records carry a modifier
+    /// field of their own.
+    default_tone: Option<usize>,
     revision: u64,
     cache: RefCell<ContentCache>,
+    tone_cache: RefCell<ContentCache>,
     entry_cache: RefCell<widget::BakeCache>,
 }
 
@@ -93,7 +130,8 @@ impl EmojiPicker {
     /// The panel's size, logical px. Fixed: a grid that resized as the search narrowed would move
     /// the cell under the pointer on every keystroke.
     pub const WIDTH: f64 = PAD * 2. + CELL * COLS as f64;
-    pub const HEIGHT: f64 = PAD * 2. + widget::Entry::HEIGHT + GAP + CELL * ROWS as f64;
+    pub const HEIGHT: f64 =
+        PAD * 2. + widget::Entry::HEIGHT + GAP + CELL * ROWS as f64 + GAP + RAIL_H;
 
     fn size() -> Size<f64, Logical> {
         Size::from((Self::WIDTH, Self::HEIGHT))
@@ -128,6 +166,7 @@ impl EmojiPicker {
         self.hovered = None;
         self.selected = 0;
         self.first_row = 0;
+        self.tone = None;
         self.rebuild_view();
         self.revision += 1;
     }
@@ -160,12 +199,30 @@ impl EmojiPicker {
         Some(Rectangle::new(loc, size))
     }
 
+    /// The entry the selection is on, as an index into the table.
+    pub fn selected_entry(&self) -> usize {
+        self.view.get(self.selected).copied().unwrap_or(0)
+    }
+
+    /// Whether the skin-tone popover is up.
+    pub fn tone_is_open(&self) -> bool {
+        self.tone.is_some()
+    }
+
+    /// The tone popover's rectangle and column count, for hit-testing from a test.
+    pub fn tone_geometry(&self) -> Option<(Rectangle<f64, Logical>, usize)> {
+        self.tone_rect()
+    }
+
     /// Which cell the pointer is over, if any — what the render lights.
     pub fn hovered_index(&self) -> Option<usize> {
         self.hovered
     }
 
     pub fn contains(&self, pos: Point<f64, Logical>) -> bool {
+        if self.tone_rect().is_some_and(|(rect, _)| rect.contains(pos)) {
+            return true;
+        }
         self.geometry().is_some_and(|geo| geo.contains(pos))
     }
 
@@ -223,6 +280,126 @@ impl EmojiPicker {
         self.revision += 1;
     }
 
+    /// The spellings the tone popover offers for a cell: the base first, then its variants, so
+    /// the popover can always put the plain form back.
+    fn tone_choices(&self, index: usize) -> Option<Vec<&'static str>> {
+        let emoji = self.at(index)?;
+        if !emoji.has_tones() {
+            return None;
+        }
+        Some(
+            std::iter::once(emoji.ch)
+                .chain(emoji.tones.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// What picking `index` inserts: the remembered tone when the emoji has one, else the base.
+    fn spelling_of(&self, index: usize) -> Option<String> {
+        let emoji = self.at(index)?;
+        let tone = self
+            .default_tone
+            .filter(|_| emoji.has_tones())
+            .and_then(|t| emoji.tones.get(t));
+        Some(tone.copied().unwrap_or(emoji.ch).to_owned())
+    }
+
+    /// Open the tone popover on a cell, if it has tones. Returns whether it opened.
+    fn open_tones(&mut self, index: usize) -> bool {
+        if self.tone_choices(index).is_none() {
+            return false;
+        }
+        // Start on the remembered tone, so the popover opens showing what a plain pick would do.
+        let at = self.default_tone.map_or(0, |t| t + 1);
+        self.tone = Some((index, at));
+        self.revision += 1;
+        true
+    }
+
+    /// The tone popover's rectangle in global coordinates, and how many columns it has.
+    fn tone_rect(&self) -> Option<(Rectangle<f64, Logical>, usize)> {
+        let (index, _) = self.tone?;
+        let choices = self.tone_choices(index)?;
+        let geo = self.geometry()?;
+        let cols = choices.len().min(TONE_COLS);
+        let rows = choices.len().div_ceil(TONE_COLS);
+        let size = Size::from((
+            cols as f64 * CELL + TONE_PAD * 2.,
+            rows as f64 * CELL + TONE_PAD * 2.,
+        ));
+
+        let cell = self.cell_global_rect(index)?;
+        // Centred over the cell, above it when there is room — the row being varied stays visible.
+        let mut loc = Point::from((
+            cell.loc.x + cell.size.w / 2. - size.w / 2.,
+            cell.loc.y - GAP - size.h,
+        ));
+        if loc.y < geo.loc.y {
+            loc.y = cell.loc.y + cell.size.h + GAP;
+        }
+        // Clamped to the panel horizontally: a popover hanging off the card reads as a glitch.
+        loc.x = loc.x.clamp(geo.loc.x, geo.loc.x + geo.size.w - size.w);
+        Some((Rectangle::new(loc, size), cols))
+    }
+
+    /// A visible cell's rectangle in global coordinates.
+    fn cell_global_rect(&self, index: usize) -> Option<Rectangle<f64, Logical>> {
+        let geo = self.geometry()?;
+        let slot = index.checked_sub(self.first_row * COLS)?;
+        if slot >= COLS * ROWS {
+            return None;
+        }
+        Some(Rectangle::new(
+            geo.loc + cell_rect(slot).loc,
+            (CELL, CELL).into(),
+        ))
+    }
+
+    /// The rail's rectangle in global coordinates.
+    fn rail_rect(&self, geo: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            geo.loc + Point::from((PAD, Self::HEIGHT - PAD - RAIL_H)),
+            Size::from((CELL * COLS as f64, RAIL_H)),
+        )
+    }
+
+    /// Jump the grid to a group. Clears the search, because the rail indexes the table's own
+    /// order and a search result is not in it.
+    fn go_to_group(&mut self, group: usize) {
+        let Some(group) = emoji::table().groups().get(group) else {
+            return;
+        };
+        let start = group.entries.start;
+        if !self.search.text().is_empty() {
+            self.search.clear();
+            self.rebuild_view();
+        }
+        self.selected = start.min(self.view.len().saturating_sub(1));
+        self.first_row = self.selected / COLS;
+        let max = self.rows().saturating_sub(ROWS);
+        self.first_row = self.first_row.min(max);
+        self.tone = None;
+        self.revision += 1;
+    }
+
+    /// Which group the rail latches: the one the selection is in.
+    ///
+    /// The selection rather than the first visible row, because a row straddles two groups
+    /// whenever a group's length is not a multiple of the column count — which is nearly always —
+    /// and a tab that lights up for the group you are *leaving* reads as a bug.
+    ///
+    /// `None` while searching: the view is not the table's order, so no tab describes it.
+    fn current_group(&self) -> Option<usize> {
+        if !self.search.text().is_empty() {
+            return None;
+        }
+        let at = *self.view.get(self.selected)?;
+        emoji::table()
+            .groups()
+            .iter()
+            .position(|g| g.entries.contains(&at))
+    }
+
     /// Feed a key to the open picker.
     pub fn handle_key(
         &mut self,
@@ -236,14 +413,60 @@ impl EmojiPicker {
             return KeyOutcome::Handled;
         }
 
+        // The tone popover is modal over the grid while it is up: it is a choice about one cell,
+        // so nothing behind it moves until it is answered or dismissed.
+        if let Some((index, at)) = self.tone {
+            let choices = self.tone_choices(index).unwrap_or_default();
+            let step = |at: usize, delta: isize| {
+                (at as isize + delta).clamp(0, choices.len() as isize - 1) as usize
+            };
+            match raw {
+                Some(Keysym::Escape) => {
+                    self.tone = None;
+                    self.revision += 1;
+                }
+                Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
+                    // Position 0 is the plain form, so picking it *forgets* the tone rather than
+                    // remembering one — otherwise there would be no way back to the base.
+                    self.default_tone = at.checked_sub(1);
+                    self.tone = None;
+                    return match choices.get(at) {
+                        Some(ch) => KeyOutcome::Insert((*ch).to_owned()),
+                        None => KeyOutcome::Handled,
+                    };
+                }
+                Some(Keysym::Left) => self.tone = Some((index, step(at, -1))),
+                Some(Keysym::Right) => self.tone = Some((index, step(at, 1))),
+                Some(Keysym::Up) => self.tone = Some((index, step(at, -(TONE_COLS as isize)))),
+                Some(Keysym::Down) => self.tone = Some((index, step(at, TONE_COLS as isize))),
+                _ => return KeyOutcome::Handled,
+            }
+            self.revision += 1;
+            return KeyOutcome::Handled;
+        }
+
         match raw {
             Some(Keysym::Escape) => return KeyOutcome::Close,
             Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
-                return match self.at(self.selected) {
-                    Some(emoji) => KeyOutcome::Insert(emoji.ch.to_owned()),
+                // Shift opens the variants instead of picking, the keyboard's answer to the
+                // secondary click — "the same thing, varied".
+                if mods.shift && self.open_tones(self.selected) {
+                    return KeyOutcome::Handled;
+                }
+                return match self.spelling_of(self.selected) {
+                    Some(ch) => KeyOutcome::Insert(ch),
                     // Nothing matched the search; Enter has nothing to insert and is not a close.
                     None => KeyOutcome::Handled,
                 };
+            }
+            Some(Keysym::Tab) => {
+                let group = self.current_group().unwrap_or(0);
+                let next = if mods.shift {
+                    group.saturating_sub(1)
+                } else {
+                    (group + 1).min(RAIL_LABELS.len() - 1)
+                };
+                self.go_to_group(next);
             }
             Some(Keysym::Left) => self.move_selection(-1),
             Some(Keysym::Right) => self.move_selection(1),
@@ -305,11 +528,70 @@ impl EmojiPicker {
         true
     }
 
+    /// Which position in the open tone popover a point falls on.
+    fn tone_at(&self, pos: Point<f64, Logical>) -> Option<usize> {
+        let (rect, cols) = self.tone_rect()?;
+        let inner = Rectangle::new(
+            rect.loc + Point::from((TONE_PAD, TONE_PAD)),
+            rect.size - Size::from((TONE_PAD * 2., TONE_PAD * 2.)),
+        );
+        if !inner.contains(pos) {
+            return None;
+        }
+        let col = ((pos.x - inner.loc.x) / CELL) as usize;
+        let row = ((pos.y - inner.loc.y) / CELL) as usize;
+        if col >= cols {
+            return None;
+        }
+        let at = row * TONE_COLS + col;
+        let (index, _) = self.tone?;
+        (at < self.tone_choices(index)?.len()).then_some(at)
+    }
+
     /// A click inside the picker. Returns the text to insert, if it landed on an emoji.
-    pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> Option<String> {
+    ///
+    /// `secondary` is the right button, which opens the skin-tone variants instead of picking —
+    /// the pointer's answer to Shift+Return, and what GNOME's on-screen keyboard reaches by a long
+    /// press (`Key._showSubkeys`, `js/ui/keyboard.js`). A long press is deferred.
+    pub fn pointer_click(&mut self, pos: Point<f64, Logical>, secondary: bool) -> Option<String> {
+        if self.tone.is_some() {
+            let at = self.tone_at(pos);
+            let (index, _) = self.tone?;
+            let Some(at) = at else {
+                // A click anywhere else dismisses the popover without picking.
+                self.tone = None;
+                self.revision += 1;
+                return None;
+            };
+            self.default_tone = at.checked_sub(1);
+            let ch = self.tone_choices(index)?.get(at).copied()?;
+            self.tone = None;
+            return Some(ch.to_owned());
+        }
+
+        if let Some(group) = self.rail_at(pos) {
+            self.go_to_group(group);
+            return None;
+        }
+
         let index = self.cell_at(pos)?;
         self.selected = index;
-        Some(self.at(index)?.ch.to_owned())
+        self.revision += 1;
+        if secondary && self.open_tones(index) {
+            return None;
+        }
+        self.spelling_of(index)
+    }
+
+    /// Which rail tab a point falls on.
+    fn rail_at(&self, pos: Point<f64, Logical>) -> Option<usize> {
+        let geo = self.geometry()?;
+        let rail = self.rail_rect(geo);
+        if !rail.contains(pos) {
+            return None;
+        }
+        let tab = ((pos.x - rail.loc.x) / CELL) as usize;
+        (tab < RAIL_LABELS.len()).then_some(tab)
     }
 
     /// Scroll the grid by whole rows. Returns whether anything moved.
@@ -354,12 +636,13 @@ impl EmojiPicker {
         let panel = {
             let mut cache = self.cache.borrow_mut();
             let cells = self.visible_cells();
+            let latched = self.current_group();
             widget::bake_content(
                 renderer,
                 &mut cache,
                 scale,
                 self.revision,
-                |renderer| prepare_panel(renderer, scale, &cells),
+                |renderer| prepare_panel(renderer, scale, &cells, latched),
                 |frame, phys, prepared| paint_panel(frame, phys, prepared, scale),
             )
         };
@@ -421,6 +704,44 @@ impl EmojiPicker {
             }
             Err(err) => warn!("error rendering the emoji picker: {err:#}"),
         }
+
+        // The tone popover last, so it draws over the panel it hangs off.
+        if let (Some((index, at)), Some((rect, cols))) = (self.tone, self.tone_rect()) {
+            let Some(choices) = self.tone_choices(index) else {
+                return;
+            };
+            let size = rect.size;
+            let tones = widget::bake_content(
+                renderer,
+                &mut self.tone_cache.borrow_mut(),
+                scale,
+                self.revision,
+                |renderer| prepare_tones(renderer, scale, &choices, at, size, cols),
+                |frame, phys, prepared| paint_tones(frame, phys, prepared, scale),
+            );
+            match tones {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    push(EmojiPickerRenderElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            rect.loc - open.output_geo.loc,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
+                Err(err) => warn!("error rendering the emoji picker tones: {err:#}"),
+            }
+        }
     }
 
     /// The cells the grid currently shows, with their state — the render's whole input.
@@ -462,12 +783,15 @@ fn cell_rect(slot: usize) -> Rectangle<f64, Logical> {
 struct Prepared {
     glyphs: Vec<(usize, ShapedText)>,
     cells: Vec<(usize, bool, bool)>,
+    rail: Vec<(usize, ShapedText)>,
+    rail_latched: Option<usize>,
 }
 
 fn prepare_panel(
     renderer: &mut VulkanRenderer,
     scale: f64,
     cells: &[Cell],
+    rail_latched: Option<usize>,
 ) -> anyhow::Result<(Size<i32, Physical>, Prepared)> {
     let _span = tracy_client::span!("emoji_picker::prepare_panel");
 
@@ -478,6 +802,14 @@ fn prepare_panel(
         match shaper.shape_emoji(cell.ch, GLYPH_PX) {
             Ok(shaped) => glyphs.push((cell.slot, shaped)),
             Err(err) => warn!("emoji {:?} did not shape: {err:#}", cell.ch),
+        }
+    }
+
+    let mut rail = Vec::with_capacity(RAIL_LABELS.len());
+    for (tab, label) in RAIL_LABELS.iter().enumerate() {
+        match shaper.shape_emoji(label, RAIL_PX) {
+            Ok(shaped) => rail.push((tab, shaped)),
+            Err(err) => warn!("rail label {label:?} did not shape: {err:#}"),
         }
     }
 
@@ -494,8 +826,18 @@ fn prepare_panel(
                 .iter()
                 .map(|c| (c.slot, c.selected, c.hovered))
                 .collect(),
+            rail,
+            rail_latched,
         },
     ))
+}
+
+/// A rail tab's rectangle, panel-local logical px.
+fn rail_tab_rect(tab: usize) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((PAD + tab as f64 * CELL, EmojiPicker::HEIGHT - PAD - RAIL_H)),
+        Size::from((CELL, RAIL_H)),
+    )
 }
 
 fn paint_panel(
@@ -525,6 +867,98 @@ fn paint_panel(
 
     for (slot, shaped) in &prepared.glyphs {
         let rect = cell_rect(*slot);
+        p.text(
+            shaped,
+            rect.loc + rect.size.to_point().downscale(2.),
+            Align::CENTER,
+            widget::style::TEXT,
+        )?;
+    }
+
+    // The rail, along the bottom edge: a hairline separating it from the grid, then the tabs.
+    let rail_top = EmojiPicker::HEIGHT - PAD - RAIL_H - GAP / 2.;
+    p.hairline(
+        Rectangle::new(
+            Point::from((PAD, rail_top)),
+            Size::from((CELL * COLS as f64, 1.)),
+        ),
+        widget::style::BORDERS,
+    )?;
+    for (tab, shaped) in &prepared.rail {
+        let rect = rail_tab_rect(*tab);
+        if prepared.rail_latched == Some(*tab) {
+            p.fill_rounded(rect, 8., widget::style::over(BG, widget::style::HOVER_WASH))?;
+        }
+        p.text(
+            shaped,
+            rect.loc + rect.size.to_point().downscale(2.),
+            Align::CENTER,
+            widget::style::TEXT,
+        )?;
+    }
+    Ok(())
+}
+
+/// The tone popover's shaped choices.
+struct PreparedTones {
+    glyphs: Vec<(usize, ShapedText)>,
+    selected: usize,
+    cols: usize,
+}
+
+fn prepare_tones(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    choices: &[&'static str],
+    selected: usize,
+    size: Size<f64, Logical>,
+    cols: usize,
+) -> anyhow::Result<(Size<i32, Physical>, PreparedTones)> {
+    let mut shaper = TextShaper::new(renderer, scale);
+    let mut glyphs = Vec::with_capacity(choices.len());
+    for (at, ch) in choices.iter().enumerate() {
+        match shaper.shape_emoji(ch, GLYPH_PX) {
+            Ok(shaped) => glyphs.push((at, shaped)),
+            Err(err) => warn!("tone {ch:?} did not shape: {err:#}"),
+        }
+    }
+    let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+    Ok((
+        Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1))),
+        PreparedTones {
+            glyphs,
+            selected,
+            cols,
+        },
+    ))
+}
+
+fn paint_tones(
+    frame: &mut VulkanFrame,
+    phys: Size<i32, Physical>,
+    prepared: &PreparedTones,
+    scale: f64,
+) -> anyhow::Result<()> {
+    let mut p = Painter::new(frame, scale, phys);
+    p.clear(widget::style::TRANSPARENT)?;
+    // A menu rather than a card: it hangs off a cell, so it takes the menu fill and a smaller
+    // radius than the panel it sits on.
+    p.fill_rounded_full(12., widget::style::MENU_BG)?;
+
+    for (at, shaped) in &prepared.glyphs {
+        let col = (at % prepared.cols) as f64;
+        let row = (at / prepared.cols) as f64;
+        let rect = Rectangle::new(
+            Point::from((TONE_PAD + col * CELL, TONE_PAD + row * CELL)),
+            Size::from((CELL, CELL)),
+        );
+        if *at == prepared.selected {
+            p.fill_rounded(
+                rect,
+                8.,
+                widget::style::over(widget::style::MENU_BG, [1., 1., 1., 0.18]),
+            )?;
+        }
         p.text(
             shaped,
             rect.loc + rect.size.to_point().downscale(2.),
@@ -593,6 +1027,135 @@ mod tests {
 
         picker.move_selection(isize::MAX / 2);
         assert_eq!(picker.selected, picker.view.len() - 1, "clamped to the end");
+    }
+
+    fn press(picker: &mut EmojiPicker, sym: Keysym, shift: bool) -> KeyOutcome {
+        picker.handle_key(
+            Some(sym),
+            None,
+            EditMods {
+                shift,
+                ..EditMods::default()
+            },
+            KeyTheme::Default,
+            true,
+        )
+    }
+
+    /// The first entry that takes skin tones, so the tone tests do not hardcode a table offset
+    /// that a Unicode bump would move.
+    fn first_toned(picker: &EmojiPicker) -> usize {
+        picker
+            .view
+            .iter()
+            .position(|i| emoji::table().entries()[*i].has_tones())
+            .expect("the table has toned emoji")
+    }
+
+    /// The rail indexes the table's own order, so a search result is not in it — clicking a tab
+    /// has to clear the search rather than jump to an index that means nothing.
+    #[test]
+    fn the_rail_jumps_to_a_group_clearing_the_search() {
+        let mut picker = picker();
+        picker.search.set_text("hat".to_owned());
+        picker.rebuild_view();
+        assert_eq!(picker.current_group(), None, "no tab describes a search");
+
+        picker.go_to_group(3);
+        assert_eq!(picker.search.text(), "");
+        assert_eq!(
+            picker.current_group(),
+            Some(3),
+            "and the tab it jumped to is the latched one"
+        );
+        let group = &emoji::table().groups()[3];
+        assert_eq!(
+            picker.selected, group.entries.start,
+            "landing on the group's first emoji"
+        );
+    }
+
+    /// The popover offers the plain form first, so there is a way back from a remembered tone.
+    /// Picking position 0 is what forgets it.
+    #[test]
+    fn the_tone_popover_leads_with_the_plain_form() {
+        let mut picker = picker();
+        picker.selected = first_toned(&picker);
+        let base = picker.at(picker.selected).unwrap();
+        let choices = picker.tone_choices(picker.selected).unwrap();
+        assert_eq!(choices[0], base.ch);
+        assert_eq!(choices.len(), base.tones.len() + 1);
+
+        assert_eq!(
+            press(&mut picker, Keysym::Return, true),
+            KeyOutcome::Handled
+        );
+        assert!(picker.tone.is_some(), "Shift+Return opens the variants");
+
+        // One right, then pick: the first tone.
+        press(&mut picker, Keysym::Right, false);
+        let picked = press(&mut picker, Keysym::Return, false);
+        assert_eq!(picked, KeyOutcome::Insert(base.tones[0].to_owned()));
+        assert_eq!(picker.default_tone, Some(0), "and it is remembered");
+        assert!(picker.tone.is_none());
+
+        // Back to the plain form forgets it again.
+        press(&mut picker, Keysym::Return, true);
+        press(&mut picker, Keysym::Left, false);
+        assert_eq!(
+            press(&mut picker, Keysym::Return, false),
+            KeyOutcome::Insert(base.ch.to_owned())
+        );
+        assert_eq!(picker.default_tone, None);
+    }
+
+    /// A remembered tone applies to the *next* emoji picked plainly — the whole reason to
+    /// remember one — and leaves emoji that take no tones alone.
+    #[test]
+    fn a_remembered_tone_applies_to_the_next_plain_pick() {
+        let mut picker = picker();
+        picker.default_tone = Some(2);
+
+        let toned = first_toned(&picker);
+        let base = picker.at(toned).unwrap();
+        picker.selected = toned;
+        assert_eq!(
+            press(&mut picker, Keysym::Return, false),
+            KeyOutcome::Insert(base.tones[2].to_owned())
+        );
+
+        let plain = picker
+            .view
+            .iter()
+            .position(|i| !emoji::table().entries()[*i].has_tones())
+            .unwrap();
+        picker.selected = plain;
+        let plain_ch = picker.at(plain).unwrap().ch.to_owned();
+        assert_eq!(
+            press(&mut picker, Keysym::Return, false),
+            KeyOutcome::Insert(plain_ch),
+            "an emoji with no tones is unaffected"
+        );
+    }
+
+    /// The popover is modal over the grid: a choice about one cell, so nothing behind it moves
+    /// until it is answered or dismissed.
+    #[test]
+    fn the_tone_popover_holds_the_grid_still() {
+        let mut picker = picker();
+        picker.selected = first_toned(&picker);
+        let selected = picker.selected;
+        press(&mut picker, Keysym::Return, true);
+
+        press(&mut picker, Keysym::Down, false);
+        assert_eq!(picker.selected, selected, "the grid did not move");
+
+        // `Handled`, not `Close`: Escape dismisses the popover and leaves the picker up.
+        assert_eq!(
+            press(&mut picker, Keysym::Escape, false),
+            KeyOutcome::Handled
+        );
+        assert!(picker.tone.is_none());
     }
 
     #[test]

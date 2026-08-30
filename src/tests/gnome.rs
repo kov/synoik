@@ -7023,6 +7023,68 @@ fn a_click_on_a_cell_picks_it_and_the_window_sees_nothing() {
     assert!(!f.synoik().emoji_picker.is_open());
 }
 
+/// The rail jumps the grid to a category, and a secondary click opens an emoji's skin tones —
+/// both through the real pointer path.
+#[test]
+fn the_rail_and_the_tone_popover_answer_the_pointer() {
+    use crate::ui::emoji_picker::EmojiPicker;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.double_roundtrip(id);
+    let _ = f.client(id).text_input_events();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+
+    // The second rail tab: People & Body, the first group whose emoji take skin tones.
+    let tab = geo.loc + Point::from((12. + 40. + 20., EmojiPicker::HEIGHT - 12. - 18.));
+    pointer_to(&mut f, tab);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        f.synoik().emoji_picker.is_open(),
+        "a rail click navigates, it does not pick"
+    );
+    let group = &crate::emoji::table().groups()[1];
+    assert_eq!(
+        f.synoik().emoji_picker.selected_entry(),
+        group.entries.start
+    );
+
+    // Secondary click on the first cell, which is now that group's first emoji.
+    let cell = geo.loc + Point::from((12. + 20., 12. + 40. + 8. + 20.));
+    pointer_to(&mut f, cell);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    f.double_roundtrip(id);
+    assert!(
+        f.synoik().emoji_picker.tone_is_open(),
+        "the secondary click opens the variants"
+    );
+    assert!(
+        f.client(id).text_input_events().is_empty(),
+        "and picks nothing yet"
+    );
+
+    // The second choice in the popover: the first skin tone.
+    let (tones, _) = f.synoik().emoji_picker.tone_geometry().unwrap();
+    let first_tone = tones.loc + Point::from((6. + 40. + 20., 6. + 20.));
+    pointer_to(&mut f, first_tone);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+
+    let expected = crate::emoji::table().entries()[group.entries.start].tones[0].to_owned();
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some(expected.clone()))),
+        "expected the toned spelling {expected:?}, got: {events:?}"
+    );
+    assert!(!f.synoik().emoji_picker.is_open());
+}
+
 /// The picker opens below the caret, and flips above it when there is no room below.
 #[test]
 fn the_picker_flips_above_a_caret_near_the_bottom() {

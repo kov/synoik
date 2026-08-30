@@ -8491,7 +8491,8 @@ impl State {
                 // one: picking closes the picker, so by the time the release arrives this
                 // condition is already false.
                 self.synoik.suppressed_buttons.insert(button_code);
-                if let Some(text) = self.synoik.emoji_picker.pointer_click(pos) {
+                let secondary = button == Some(MouseButton::Right);
+                if let Some(text) = self.synoik.emoji_picker.pointer_click(pos, secondary) {
                     self.synoik.emoji_picker.close();
                     self.insert_text(&text);
                 }
