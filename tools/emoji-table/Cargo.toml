@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+[package]
+name = "emoji-table"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# Deliberately NOT a member of the synoik workspace, like the other tools: it runs by hand when
+# Unicode or CLDR ship a new release, never as part of a build.
+# Run it: `cargo run --manifest-path tools/emoji-table/Cargo.toml -- <args>` (see README.md).
+[workspace]
+
+[dependencies]
+quick-xml = "0.42.0"
