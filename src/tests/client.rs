@@ -371,6 +371,13 @@ impl Client {
         ti.commit();
     }
 
+    /// `set_cursor_rectangle` + `commit` — surface-local, as the protocol has it.
+    pub fn set_cursor_rectangle(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.set_cursor_rectangle(x, y, w, h);
+        ti.commit();
+    }
+
     /// `set_surrounding_text` + `commit`.
     pub fn set_surrounding_text(&mut self, text: &str, cursor: i32, anchor: i32) {
         let ti = self.state.text_input.clone().expect("text input");

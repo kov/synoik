@@ -39,10 +39,11 @@ use std::time::Duration;
 
 use smithay::backend::input::KeyState;
 use smithay::input::keyboard::{Keycode, Keysym, ModifiersState};
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Rectangle, Serial, Size};
 use smithay::wayland::text_input::{TextInputEvent, TextInputSeat};
 
 use crate::dbus::ibus::{self, ImEvent, PreeditMode};
+use crate::layout::LayoutElement as _;
 use crate::synoik::State;
 
 /// How long a keystroke may sit waiting for the engine before we give up and deliver it.
@@ -483,6 +484,7 @@ impl State {
                 // client's declared type cannot outlive the input that declared it.
                 im.client_content_type = (ibus::purpose::FREE_FORM, 0);
                 self.synoik.im_surrounding = None;
+                self.synoik.im_cursor_rect = None;
                 self.sync_im_focus();
             }
             TextInputEvent::SurroundingText {
@@ -512,13 +514,76 @@ impl State {
                     im.send(ImRequest::ContentType { purpose, hints });
                 }
             }
+            // Not forwarded to IBus: the engine only needs this to place a candidate popup, which
+            // is the unported Panel surface. It is kept because the shell's own surfaces anchor at
+            // the caret. The surface is recorded alongside so a rectangle cannot outlive the field
+            // that described it.
+            TextInputEvent::CursorRectangle(rect) => {
+                self.synoik.im_cursor_rect = self
+                    .synoik
+                    .keyboard_focus
+                    .surface()
+                    .map(|surface| (surface.clone(), rect));
+            }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
-            // IBus has no matching "end of batch" call. The cursor rectangle is only needed to
-            // place a candidate popup, which is the unported Panel surface.
-            TextInputEvent::Done
-            | TextInputEvent::TextChangeCause(_)
-            | TextInputEvent::CursorRectangle(_) => {}
+            // IBus has no matching "end of batch" call.
+            TextInputEvent::Done | TextInputEvent::TextChangeCause(_) => {}
         }
+    }
+
+    /// The focused client's caret in global coordinates, or `None` when there is no usable one.
+    ///
+    /// Declines a rectangle whose surface no longer holds the keyboard, one from a client that
+    /// does not own the engine (a shell entry of ours does, and its caret is not this one), and
+    /// the degenerate `0,0,0,0` GTK sends before its first layout.
+    ///
+    /// The rectangle is surface-local, and `zwp_text_input_v3` does not say *which* surface when
+    /// the text input sits on a popup or a subsurface — so a caret inside a popover anchors as if
+    /// it were on the toplevel. Every client in the coverage table puts its entries on the
+    /// toplevel; fixing the rest needs the protocol to grow, not us.
+    pub fn text_caret_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let im = self.synoik.input_method.as_ref()?;
+        if im.focus != ImFocus::Client {
+            return None;
+        }
+
+        let (surface, rect) = self.synoik.im_cursor_rect.as_ref()?;
+        if rect.size.w <= 0 && rect.size.h <= 0 && rect.loc.x == 0 && rect.loc.y == 0 {
+            return None;
+        }
+        if self.synoik.keyboard_focus.surface() != Some(surface) {
+            return None;
+        }
+
+        let (window, output) = self.synoik.layout.find_window_and_output(surface)?;
+        let output = output?;
+        let monitor = self.synoik.layout.monitor_for_output(output)?;
+        // The window has to be the active one, because that is the only window whose position the
+        // layout will hand back; a caret on any other one has no rectangle to be relative to.
+        if monitor.active_window().map(|w| w.id()) != Some(window.id()) {
+            return None;
+        }
+        let window_rect = monitor.active_window_rectangle()?;
+        let output_geo = self.synoik.global_space.output_geometry(output)?;
+
+        // Surface-local → window-local is `buf_loc`, the negated geometry origin; then
+        // window-local → output-local → global.
+        let loc = window_rect.loc
+            + window.buf_loc().to_f64()
+            + rect.loc.to_f64()
+            + output_geo.loc.to_f64();
+        Some(Rectangle::new(loc, rect.size.to_f64()))
+    }
+
+    /// Where a shell surface that follows the text cursor anchors, in global coordinates.
+    ///
+    /// The caret when there is one, the pointer otherwise — a zero-sized rectangle either way is
+    /// enough for a popover, which only needs a point and a side to avoid.
+    pub fn text_anchor_rect(&self) -> Rectangle<f64, Logical> {
+        self.text_caret_rect().unwrap_or_else(|| {
+            let loc = self.synoik.seat.get_pointer().unwrap().current_location();
+            Rectangle::new(loc, Size::default())
+        })
     }
 
     /// Which of the compositor's own entries currently owns typed text, if any.

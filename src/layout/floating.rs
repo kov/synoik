@@ -681,17 +681,23 @@ impl<W: LayoutElement> FloatingSpace<W> {
         compute_toplevel_bounds(border_config, self.working_area.size)
     }
 
-    /// Returns the geometry of the active window relative to and clamped to the working area.
+    /// Returns the geometry of the active window relative to the working area, *unclamped*.
     ///
     /// During animations, assumes the final tile position.
-    pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
+    pub fn active_window_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
         let (tile, offset) = self.tiles_with_offsets().next()?;
 
         let window_pos = offset + tile.window_loc();
         let window_size = tile.window_size();
-        let window_rect = Rectangle::new(window_pos, window_size);
+        Some(Rectangle::new(window_pos, window_size))
+    }
 
-        self.working_area.intersection(window_rect)
+    /// Returns the geometry of the active window relative to and clamped to the working area.
+    ///
+    /// During animations, assumes the final tile position.
+    pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
+        self.working_area
+            .intersection(self.active_window_rectangle()?)
     }
 
     pub fn popup_target_rect(&self, id: &W::Id) -> Option<Rectangle<f64, Logical>> {

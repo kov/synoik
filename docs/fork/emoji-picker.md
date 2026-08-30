@@ -1,6 +1,6 @@
 # Emoji picker
 
-**Status: the data and the insertion seam are built; no UI yet.** A shell-owned emoji picker on
+**Status: the data, the insertion seam, colour glyphs and the caret anchor are built; no UI yet.** A shell-owned emoji picker on
 `<Control><Alt>space`, macOS style: it opens over whatever has focus, and picking inserts the
 character into that client without the client ever losing focus.
 
@@ -41,10 +41,25 @@ mid-keystroke; rejected.
 
 ## Placement
 
-Anchor at the caret, fall back to the pointer. `zwp_text_input_v3.set_cursor_rectangle` is currently
-discarded (`src/input_method/mod.rs:504`); store it, map surface-local → global through the window's
-location. Treat a degenerate or absent rect (clients send `0,0,0,0`, or never send one) as no
-anchor. The picker opens on the display owning the anchor.
+Anchor at the caret, fall back to the pointer: `State::text_anchor_rect`. The caret comes from
+`zwp_text_input_v3.set_cursor_rectangle`, which IBus has no use for — the engine only needs it to
+place a candidate popup, which is the unported Panel surface — so it is kept for us instead,
+surface-local, **with the surface that sent it**. Nothing in the protocol says a rectangle is gone,
+and only the recorded surface can tell that focus has moved off the field that described it.
+
+Mapping is surface-local → window-local (`LayoutElement::buf_loc`) → output-local
+(`Monitor::active_window_rectangle`) → global. That rectangle is the *unclamped* one on purpose:
+`active_window_visual_rectangle` moves its own origin to the view edge when the window is partly
+off-screen, which is exactly when a point mapped through it lands in the wrong place. Keeping the
+picker on-screen is placement policy and belongs to the picker.
+
+Declined, all falling back to the pointer: a client that never sent a rectangle, the degenerate
+`0,0,0,0` GTK sends before its first layout, a rectangle whose surface no longer holds the keyboard,
+and one from a client that does not own the engine (a shell entry of ours does, and its caret is not
+that one). The picker opens on the display owning the anchor.
+
+`zwp_text_input_v3` does not say *which* surface, so a text input on a popup or subsurface anchors
+as if it were on the toplevel. Every client in the coverage table puts its entries on the toplevel.
 
 ## The grab: keys without focus
 
@@ -141,7 +156,7 @@ overlay (`src/ui/hotkey_overlay.rs`).
    clipboard + OSD; driven by `debug-insert-text` and pinned by three conformance tests.
 3. ~~**Colour glyphs.**~~ `synoik-vk/src/colr.rs`, the RGBA atlas beside the mask one,
    `text_color.frag`, and `SpanFamily::Emoji` routing.
-4. **Caret anchor.** Store `CursorRectangle`, map to global, pointer fallback.
+4. ~~**Caret anchor.**~~ `State::text_anchor_rect`, per the placement section above.
 5. **The grab.** Open/close, the three key clauses above, no `KeyboardFocus` participation. Test that
    the client keeps focus, receives no printable keys, and is left with no stuck key or modifier.
 6. **UI.** Grid, category rail, search entry, hover/keyboard selection, tone popover; chrome from

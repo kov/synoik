@@ -2708,6 +2708,15 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// The active window's geometry in workspace coordinates, *unclamped*.
+    pub fn active_window_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
+        if self.floating_is_active.get() {
+            self.floating.active_window_rectangle()
+        } else {
+            self.scrolling.active_window_rectangle()
+        }
+    }
+
     pub fn popup_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         match self.home_of(window) {
             Some(Home::Floating) => self.floating.popup_target_rect(window),

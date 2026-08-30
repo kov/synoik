@@ -2170,6 +2170,19 @@ impl<W: LayoutElement> Monitor<W> {
         self.active_workspace_ref().active_window_visual_rectangle()
     }
 
+    /// Returns the geometry of the active window relative to the output, *unclamped*.
+    ///
+    /// Anything that maps a point *inside* the window has to use this one: the clamped rectangle
+    /// moves its own origin to the view edge when the window is partly scrolled out, which is
+    /// exactly when a point mapped through it lands in the wrong place.
+    pub fn active_window_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
+        if self.overview_open {
+            return None;
+        }
+
+        self.active_workspace_ref().active_window_rectangle()
+    }
+
     fn workspace_size(&self, zoom: f64) -> Size<f64, Logical> {
         let ws_size = self.view_size.upscale(zoom);
         let scale = self.scale.fractional_scale();

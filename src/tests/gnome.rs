@@ -6649,6 +6649,14 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
 /// is acting as the input method, so without it the client never enables and there is nothing to
 /// commit into.
 fn client_ready_for_text(f: &mut Fixture) -> super::client::ClientId {
+    client_ready_for_text_with_sink(f).0
+}
+
+/// The same, keeping the window and the sink so a test can keep feeding the client's text-input
+/// state through and measure against the surface that sent it.
+fn client_ready_for_text_with_sink(
+    f: &mut Fixture,
+) -> (super::client::ClientId, WlSurface, ImSink) {
     use std::sync::{Arc, Mutex};
 
     use smithay::wayland::text_input::TextInputSeat;
@@ -6668,7 +6676,7 @@ fn client_ready_for_text(f: &mut Fixture) -> super::client::ClientId {
         })));
 
     let id = f.add_client();
-    let _surface = map_focused_window(f, id);
+    let surface = map_focused_window(f, id);
     f.client(id).create_text_input();
     f.double_roundtrip(id);
     f.client(id).enable_text_input();
@@ -6679,7 +6687,153 @@ fn client_ready_for_text(f: &mut Fixture) -> super::client::ClientId {
         f.synoik_state().on_text_input_event(event);
     }
     let _ = f.client(id).text_input_events();
-    id
+    (id, surface, seen)
+}
+
+/// The focused window's geometry in global coordinates, the independent yardstick the caret
+/// tests measure against.
+fn focused_window_global_rect(f: &mut Fixture) -> Rectangle<f64, smithay::utils::Logical> {
+    let output = f.synoik().layout.active_output().unwrap().clone();
+    let out_geo = f.synoik().global_space.output_geometry(&output).unwrap();
+    let win = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .active_window_visual_rectangle()
+        .unwrap();
+    Rectangle::new(win.loc + out_geo.loc.to_f64(), win.size)
+}
+
+/// The picker anchors at the caret, so the client's surface-local rectangle has to arrive in
+/// global coordinates with its offset inside the window preserved exactly.
+#[test]
+fn the_caret_rectangle_maps_into_global_coordinates() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    f.client(id).set_cursor_rectangle(30, 40, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    let window = focused_window_global_rect(&mut f);
+    let caret = f
+        .synoik_state()
+        .text_caret_rect()
+        .expect("a client that offered a caret has one");
+
+    assert_eq!(
+        caret.loc - window.loc,
+        Point::from((30., 40.)),
+        "the caret keeps its offset inside the window"
+    );
+    assert_eq!(caret.size, Size::from((2., 20.)));
+    assert!(
+        window.contains_rect(caret),
+        "a caret inside a 100x100 window cannot land outside it: {caret:?} vs {window:?}"
+    );
+}
+
+/// A floating window can sit partly off the working area, and the clipped rectangle's origin
+/// then sits at the working-area edge rather than at the window's. Mapping a caret through that
+/// origin puts it off by however much is cropped away — so the anchor uses the unclamped geometry.
+#[test]
+fn a_caret_survives_the_window_hanging_off_the_screen() {
+    use synoik_ipc::PositionChange;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    f.synoik_state()
+        .do_action(Action::MoveWindowToFloating, false);
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            x: PositionChange::SetFixed(-40.),
+            y: PositionChange::SetFixed(-30.),
+        },
+        false,
+    );
+    f.double_roundtrip(id);
+    f.settle();
+
+    let output = f.synoik().layout.active_output().unwrap().clone();
+    let monitor = f.synoik().layout.monitor_for_output(&output).unwrap();
+    let full = monitor.active_window_rectangle().unwrap();
+    let clipped = monitor.active_window_visual_rectangle().unwrap();
+    assert_ne!(
+        full.loc, clipped.loc,
+        "the window has to actually be clipped for this test to test anything"
+    );
+
+    f.client(id).set_cursor_rectangle(30, 40, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    let out_geo = f.synoik().global_space.output_geometry(&output).unwrap();
+    let caret = f.synoik_state().text_caret_rect().unwrap();
+    assert_eq!(
+        caret.loc - out_geo.loc.to_f64() - full.loc,
+        Point::from((30., 40.)),
+        "the caret is relative to the window, not to the part of it that is on screen"
+    );
+}
+
+/// GTK sends `0,0,0,0` before its first layout, and a client may never send a rectangle at all.
+/// Neither is a place to open at, so both fall through to the pointer.
+#[test]
+fn a_degenerate_caret_falls_back_to_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    assert!(
+        f.synoik_state().text_caret_rect().is_none(),
+        "a client that never sent a rectangle has no caret"
+    );
+
+    f.client(id).set_cursor_rectangle(0, 0, 0, 0);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    assert!(
+        f.synoik_state().text_caret_rect().is_none(),
+        "0,0,0,0 is not a caret"
+    );
+    let pointer = f.synoik().seat.get_pointer().unwrap().current_location();
+    let anchor = f.synoik_state().text_anchor_rect();
+    assert_eq!(anchor.loc, pointer, "so the anchor is the pointer");
+    assert_eq!(anchor.size, Size::default());
+}
+
+/// A caret only describes the surface that sent it. Focus moving to another window must not leave
+/// the picker anchored at the old one — and nothing in `zwp_text_input_v3` says the rectangle is
+/// gone, so only the surface recorded with it can tell.
+#[test]
+fn a_caret_does_not_outlive_its_surface() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    f.client(id).set_cursor_rectangle(30, 40, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+    assert!(f.synoik_state().text_caret_rect().is_some());
+
+    let other = f.add_client();
+    let _surface = map_focused_window(&mut f, other);
+
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        crate::input_method::ImFocus::Client,
+        "the engine is still on a client, so the surface check is what has to catch this"
+    );
+    assert!(
+        f.synoik_state().text_caret_rect().is_none(),
+        "the caret belonged to the window that lost focus"
+    );
 }
 
 /// The seam the emoji picker will insert through: text goes to the focused client's text input,

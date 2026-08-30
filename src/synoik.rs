@@ -601,6 +601,12 @@ pub struct Synoik {
     /// Kept because `delete_surrounding_text` arrives in *characters* and goes out in bytes, so
     /// the conversion needs the text the client last told us about.
     pub im_surrounding: Option<(String, u32)>,
+    /// The focused client's caret rectangle, surface-local, and the surface that sent it.
+    ///
+    /// The surface travels with the rectangle because that is what makes it impossible to read a
+    /// stale one: a caret only means anything while the surface that described it still holds the
+    /// keyboard, and `zwp_text_input_v3` never says the rectangle is gone.
+    pub im_cursor_rect: Option<(WlSurface, Rectangle<i32, Logical>)>,
     /// Deadline for the oldest keystroke the engine has not answered for, so a wedged daemon
     /// cannot hold the keyboard indefinitely.
     pub im_key_timer: Option<RegistrationToken>,
@@ -7906,6 +7912,7 @@ impl Synoik {
         let mut synoik = Self {
             input_method: None,
             im_surrounding: None,
+            im_cursor_rect: None,
             im_key_timer: None,
             config,
             config_file_output_config,
