@@ -13,6 +13,7 @@
 //! English only for now. CLDR ships every locale, but one language is 148 KB and all of them are
 //! not; picking the session locale's file is a later slice, not a format change.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
@@ -53,6 +54,11 @@ pub struct Group {
 pub struct Table {
     entries: Vec<Emoji>,
     groups: Vec<Group>,
+    /// Every spelling the table can produce, mapped to the entry it belongs to and, for a skin
+    /// tone, that tone's position in the entry's `tones`. Tone spellings are not entries of their
+    /// own — `emoji-test.txt` qualifies them, but the generator folds them into their base's
+    /// `tones` column — so this is the only way back from a stored string to a cell.
+    spellings: HashMap<&'static str, (usize, Option<usize>)>,
 }
 
 /// The parsed table, built once on first use.
@@ -74,13 +80,19 @@ impl Table {
         &self.entries[group.entries.clone()]
     }
 
+    /// The entry a spelling belongs to, and which of its tones it is. `None` for anything the
+    /// table does not know — a recent picked from a newer Unicode than the vendored table.
+    pub fn resolve(&self, text: &str) -> Option<(usize, Option<usize>)> {
+        self.spellings.get(text).copied()
+    }
+
     /// Emoji matching every word of `query`, best first.
     ///
     /// Words are ANDed: "red heart" must not return every heart. Within a word a whole match
     /// outranks a prefix and a prefix outranks a substring, so "cat" leads with 🐈, whose name it
     /// is, not with the first of the fifty entries that merely contain those letters. Ties keep
     /// Unicode's order, which groups related emoji together and is the order the grid shows.
-    pub fn search(&self, query: &str) -> Vec<&Emoji> {
+    pub fn search_indices(&self, query: &str) -> Vec<usize> {
         let query = query.trim().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
         if words.is_empty() {
@@ -106,7 +118,16 @@ impl Table {
 
         // Descending score, then table order — `sort_by_key` is stable, so the second is free.
         hits.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        hits.into_iter().map(|(_, at)| &self.entries[at]).collect()
+        hits.into_iter().map(|(_, at)| at).collect()
+    }
+
+    /// [`search_indices`](Self::search_indices) as entries, for callers that want the emoji
+    /// rather than a place in the table.
+    pub fn search(&self, query: &str) -> Vec<&Emoji> {
+        self.search_indices(query)
+            .into_iter()
+            .map(|at| &self.entries[at])
+            .collect()
     }
 
     fn parse(source: &'static str) -> Table {
@@ -150,7 +171,19 @@ impl Table {
         if let Some(last) = groups.last_mut() {
             last.entries.end = entries.len();
         }
-        Table { entries, groups }
+
+        let mut spellings = HashMap::new();
+        for (at, emoji) in entries.iter().enumerate() {
+            spellings.insert(emoji.ch, (at, None));
+            for (tone, spelling) in emoji.tones.iter().enumerate() {
+                spellings.insert(*spelling, (at, Some(tone)));
+            }
+        }
+        Table {
+            entries,
+            groups,
+            spellings,
+        }
     }
 }
 

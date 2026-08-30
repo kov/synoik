@@ -115,8 +115,9 @@ One remembered tone plus a per-emoji popover, the shape `EmojiSelection` uses
 spellings; picking position 0 is what *forgets* a remembered tone, so there is always a way back to
 the base. A remembered tone applies to any toned emoji picked plainly afterwards and leaves the
 rest alone — GNOME's on-screen keyboard remembers nothing, but picking a tone once per emoji is the
-alternative. It lives in memory for now; persisting it belongs with the recents, whose GTK records
-carry a modifier field of their own.
+alternative. It lives in memory for now: a recent already carries the tone it was
+picked with, so the memory only affects the *next* new emoji, and persisting one more preference
+buys little.
 
 Opened by **Shift+Return** from the keyboard and by a **secondary click** from the pointer — "the
 same thing, varied", on both devices. A long press, which is how GNOME's on-screen keyboard and
@@ -125,10 +126,15 @@ cell, so nothing behind it moves until it is answered or dismissed with Escape.
 
 ## Category rail
 
-Nine tabs along the panel's bottom edge, one per Unicode group, labelled with the same nine emoji
-GNOME picks for its own section keys (`EmojiSelection._sections`, `js/ui/keyboard.js:884-894`) —
-our table's groups are Unicode's order, which is the order that list is in. Tab and Shift+Tab walk
-them from the keyboard.
+Ten tabs along the panel's bottom edge: the recents, then one per Unicode group, labelled with the
+same nine emoji GNOME picks for its own section keys (`EmojiSelection._sections`,
+`js/ui/keyboard.js:884-894`) — our table's groups are Unicode's order, which is the order that list
+is in. The recents tab is GTK's chooser's, which opens on it; GNOME's keyboard has no history to
+show. Tab and Shift+Tab walk them from the keyboard.
+
+The nine group tabs are positions *within* the table's order, so the rail derives them from the
+selection; the recents tab is a list of its own, so it is state. A search outranks either — it is
+how you leave a tab — and no tab latches while one is up.
 
 The rail indexes the table's own order, so a click **clears the search**: a search result is not in
 that order and an index into it would mean nothing. The latched tab follows the *selection*, not
@@ -176,11 +182,26 @@ global preference plus a per-emoji variant popover, as in `EmojiSelection`
 
 ## Recents
 
-Share GTK's history: `org.gtk.gtk4.Settings.EmojiChooser recently-used-emoji`, so our picker and
-every GTK app's `Ctrl+.` show the same emoji. The schema type `a((aussasasu)u)` is authoritative for
-shape only — field semantics are in `gtkemojichooser.c`, which is not on this machine. **Parse
-defensively, and only write back once a read→write round-trip of GTK's own data is byte-identical.**
-Until that is verified: import their recents, write ours to our own key.
+Newest first, no repeats, capped at 21 — GTK's own `MAX_RECENT` (`gtkemojichooser.c`). Stored as the
+strings the picker inserts, skin tone included, in `org.synoik.emoji recently-used-emoji`
+(`resources/schemas/`). A recent is a *spelling*, not a table index: `tools/emoji-table` folds a
+tone variant into its base's `tones` column rather than giving it an entry, so a cell carries a tone
+beside its index (`Slot`), and a recent the vendored table cannot spell drops out of the grid
+without leaving the history.
+
+**We read GTK's history and write our own.** `org.gtk.gtk4.Settings.EmojiChooser
+recently-used-emoji` seeds ours when ours is empty, so a fresh session starts with the emoji the
+user already reaches for; from the first pick the two diverge. Its type `a((aussasasu)u)` is
+authoritative for shape only, and `gtkemojichooser.c` for GTK 4 is not on this machine — the two
+fields the import needs come from the key's own `gsettings describe`: the inner tuple opens with the
+codepoints, and the trailing `u` is the Fitzpatrick modifier substituted for a placeholder (`0`, or
+U+1F3FB) among them. A placeholder left unsubstituted drops out; anything that does not decode skips
+its record, not the load.
+
+Writing GTK's key stays deferred behind a read→write round-trip of their own data coming back
+byte-identical, and **that cannot be demonstrated here**: the key is empty on this machine, and
+producing a value with GTK's chooser only proves we can reproduce what we just watched it write.
+It wants a machine with a real history in it.
 
 ## Keybinding
 
@@ -206,5 +227,5 @@ The `emoji-picker` key in `org.synoik.keybindings` (`resources/schemas/`, mirror
 5. ~~**The grab.**~~ `src/ui/emoji_picker.rs`, `Action::ToggleEmojiPicker`, and the filter arm
    described above.
 6. ~~**UI.**~~ `src/ui/emoji_picker.rs`.
-7. **Recents**, per the round-trip rule above.
-8. ~~**Keybinding**~~ + hotkey overlay.
+7. ~~**Recents.**~~ `org.synoik.emoji`, seeded from GTK's key; writing GTK's stays deferred.
+8. ~~**Keybinding** + hotkey overlay.~~ `emoji-picker`, `<Control><Alt>space`.

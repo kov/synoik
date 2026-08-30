@@ -24,6 +24,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::emoji::{self, Emoji};
+use crate::gnome::MAX_EMOJI_RECENTS;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::synoik_render_elements;
@@ -46,6 +47,9 @@ const GAP: f64 = 8.;
 const BG: widget::Rgba = widget::style::DIALOG_BG;
 /// Height of the category rail along the panel's bottom edge.
 const RAIL_H: f64 = 36.;
+/// A rail tab's width: the rail spans the grid, so ten tabs are narrower than nine cells.
+const TAB_W: f64 = CELL * COLS as f64 / RAIL_LABELS.len() as f64;
+
 /// The rail label's em size — smaller than a grid cell's, it is a tab not a choice.
 const RAIL_PX: f64 = 20.;
 /// Columns in the skin-tone popover. A one-person emoji has five spellings and fits one row; a
@@ -54,13 +58,15 @@ const TONE_COLS: usize = 5;
 /// Padding inside the tone popover.
 const TONE_PAD: f64 = 6.;
 
-/// One emoji per Unicode group, in group order — the rail's tabs.
+/// The rail's tabs: the recents first, then one emoji per Unicode group in group order.
 ///
-/// GNOME picks the same nine for its on-screen keyboard's section keys
+/// GNOME picks the same nine group labels for its on-screen keyboard's section keys
 /// (`EmojiSelection._sections`, `js/ui/keyboard.js:884-894`); we take its labels rather than
 /// inventing our own, and index them by position because our table's groups are Unicode's own
-/// order, which is the order that list is in.
-const RAIL_LABELS: [&str; 9] = [
+/// order, which is the order that list is in. The recents tab is GTK's chooser's, which opens on
+/// it (`emoji-recent-symbolic`, `gtkemojichooser.c`); GNOME's keyboard has no history to show.
+const RAIL_LABELS: [&str; 10] = [
+    "\u{1f552}",
     "\u{1f642}",
     "\u{1f44d}",
     "\u{1f337}",
@@ -100,12 +106,53 @@ struct Open {
     output_geo: Rectangle<f64, Logical>,
 }
 
+/// One place in the grid: an entry in the table, and which of its skin-tone spellings this place
+/// stands for.
+///
+/// The tone has to ride alongside the index because a tone spelling is not an entry of its own —
+/// `tools/emoji-table` folds it into its base's `tones` — and a recent is remembered as the text
+/// it inserted, tone included.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Slot {
+    at: usize,
+    tone: Option<usize>,
+}
+
+impl Slot {
+    fn plain(at: usize) -> Self {
+        Self { at, tone: None }
+    }
+
+    fn emoji(&self) -> &'static Emoji {
+        &emoji::table().entries()[self.at]
+    }
+
+    /// What this place draws and inserts. An explicit tone wins; otherwise the remembered one
+    /// applies to any emoji that takes tones.
+    fn text(&self, default_tone: Option<usize>) -> &'static str {
+        let emoji = self.emoji();
+        self.tone
+            .or(default_tone)
+            .and_then(|t| emoji.tones.get(t))
+            .copied()
+            .unwrap_or(emoji.ch)
+    }
+}
+
 #[derive(Default)]
 pub struct EmojiPicker {
     open: Option<Open>,
     search: TextEdit,
-    /// Indices into [`emoji::table`]'s entries, in display order.
-    view: Vec<usize>,
+    /// The grid's places, in display order.
+    view: Vec<Slot>,
+    /// The picker's history, newest first, as the strings it inserted — the shape
+    /// `org.synoik.emoji recently-used-emoji` stores and GTK's chooser history imports into.
+    recents: Vec<String>,
+    /// The recents tab is showing.
+    ///
+    /// The nine group tabs are positions *within* the table's order, so the rail derives them
+    /// from the selection; the recents tab is a list of its own and has to be state.
+    on_recents: bool,
     /// Position in `view`; meaningless when `view` is empty.
     selected: usize,
     hovered: Option<usize>,
@@ -167,8 +214,25 @@ impl EmojiPicker {
         self.selected = 0;
         self.first_row = 0;
         self.tone = None;
+        // On the recents when there are any, like GTK's chooser: what you picked last is what you
+        // are most likely to want, and it is one row rather than a scroll.
+        self.on_recents = !self.recents.is_empty();
         self.rebuild_view();
         self.revision += 1;
+    }
+
+    /// Seed the history from settings. Takes effect at the next [`open`](Self::open).
+    pub fn set_recents(&mut self, recents: Vec<String>) {
+        self.recents = recents;
+    }
+
+    /// Record a pick and return the history to persist: newest first, no repeats, capped where
+    /// GTK caps its own (`MAX_RECENT`, `gtkemojichooser.c`).
+    pub fn record_pick(&mut self, text: &str) -> Vec<String> {
+        self.recents.retain(|e| e != text);
+        self.recents.insert(0, text.to_owned());
+        self.recents.truncate(MAX_EMOJI_RECENTS);
+        self.recents.clone()
     }
 
     /// Closes, and says whether it was open — so a caller can skip the redraw when it was not.
@@ -201,7 +265,7 @@ impl EmojiPicker {
 
     /// The entry the selection is on, as an index into the table.
     pub fn selected_entry(&self) -> usize {
-        self.view.get(self.selected).copied().unwrap_or(0)
+        self.view.get(self.selected).map_or(0, |slot| slot.at)
     }
 
     /// Whether the skin-tone popover is up.
@@ -226,34 +290,43 @@ impl EmojiPicker {
         self.geometry().is_some_and(|geo| geo.contains(pos))
     }
 
-    /// The emoji at a position in `view`.
+    /// The emoji at a position in `view` — the base entry, whatever tone the place stands for.
     fn at(&self, index: usize) -> Option<&'static Emoji> {
-        Some(&emoji::table().entries()[*self.view.get(index)?])
+        Some(self.view.get(index)?.emoji())
     }
 
     fn rows(&self) -> usize {
         self.view.len().div_ceil(COLS)
     }
 
-    /// Rebuild the visible list from the search text.
+    /// Rebuild the visible list from the search text and the latched tab.
     ///
-    /// An empty search shows the whole table in Unicode order, which groups related emoji
-    /// together. Nothing is filtered out: Unicode's `Component` group — the bare skin-tone
-    /// swatches and hair components, which are modifiers rather than emoji anyone picks — carries
-    /// the status `component` rather than `fully-qualified`, so `tools/emoji-table` never wrote
-    /// them and the table has no such group at all.
+    /// A search outranks the tab — typing is how you leave one. An empty search on a group tab
+    /// shows the whole table in Unicode order, which groups related emoji together; the rail then
+    /// scrolls within it. Nothing is filtered out: Unicode's `Component` group — the bare
+    /// skin-tone swatches and hair components, which are modifiers rather than emoji anyone
+    /// picks — carries the status `component` rather than `fully-qualified`, so
+    /// `tools/emoji-table` never wrote them and the table has no such group at all.
+    ///
+    /// A recent the table cannot spell drops out of the grid rather than the history: it is an
+    /// emoji from a newer Unicode than the vendored table, and it comes back when the table does.
     fn rebuild_view(&mut self) {
         let table = emoji::table();
         let query = self.search.text().trim();
-        self.view = if query.is_empty() {
-            (0..table.entries().len()).collect()
-        } else {
-            let hits = table.search(query);
-            let base = table.entries().as_ptr();
-            // `search` returns borrows into the same static table, so their offsets are indices.
-            hits.into_iter()
-                .map(|e| (e as *const Emoji as usize - base as usize) / size_of::<Emoji>())
+        self.view = if !query.is_empty() {
+            table
+                .search_indices(query)
+                .into_iter()
+                .map(Slot::plain)
                 .collect()
+        } else if self.on_recents {
+            self.recents
+                .iter()
+                .filter_map(|text| table.resolve(text))
+                .map(|(at, tone)| Slot { at, tone })
+                .collect()
+        } else {
+            (0..table.entries().len()).map(Slot::plain).collect()
         };
         self.selected = 0;
         self.first_row = 0;
@@ -294,14 +367,14 @@ impl EmojiPicker {
         )
     }
 
-    /// What picking `index` inserts: the remembered tone when the emoji has one, else the base.
+    /// What `index` draws and inserts: the place's own tone if it has one (a recent carries the
+    /// tone it was picked with), else the remembered tone, else the base.
+    fn text_of(&self, index: usize) -> Option<&'static str> {
+        Some(self.view.get(index)?.text(self.default_tone))
+    }
+
     fn spelling_of(&self, index: usize) -> Option<String> {
-        let emoji = self.at(index)?;
-        let tone = self
-            .default_tone
-            .filter(|_| emoji.has_tones())
-            .and_then(|t| emoji.tones.get(t));
-        Some(tone.copied().unwrap_or(emoji.ch).to_owned())
+        Some(self.text_of(index)?.to_owned())
     }
 
     /// Open the tone popover on a cell, if it has tones. Returns whether it opened.
@@ -363,21 +436,28 @@ impl EmojiPicker {
         )
     }
 
-    /// Jump the grid to a group. Clears the search, because the rail indexes the table's own
-    /// order and a search result is not in it.
-    fn go_to_group(&mut self, group: usize) {
-        let Some(group) = emoji::table().groups().get(group) else {
+    /// Jump the rail to a tab: 0 is the recents, the rest are the Unicode groups in order.
+    ///
+    /// Clears the search, because the tabs index lists a search result is not in.
+    fn go_to_tab(&mut self, tab: usize) {
+        if tab >= RAIL_LABELS.len() {
             return;
-        };
-        let start = group.entries.start;
-        if !self.search.text().is_empty() {
+        }
+        let on_recents = tab == 0;
+        let stale = on_recents != self.on_recents || !self.search.text().is_empty();
+        self.on_recents = on_recents;
+        if stale {
             self.search.clear();
             self.rebuild_view();
         }
+        let start = match emoji::table().groups().get(tab.wrapping_sub(1)) {
+            Some(group) => group.entries.start,
+            // The recents tab, and any group the table does not have.
+            None => 0,
+        };
         self.selected = start.min(self.view.len().saturating_sub(1));
-        self.first_row = self.selected / COLS;
         let max = self.rows().saturating_sub(ROWS);
-        self.first_row = self.first_row.min(max);
+        self.first_row = (self.selected / COLS).min(max);
         self.tone = None;
         self.revision += 1;
     }
@@ -390,14 +470,26 @@ impl EmojiPicker {
     ///
     /// `None` while searching: the view is not the table's order, so no tab describes it.
     fn current_group(&self) -> Option<usize> {
-        if !self.search.text().is_empty() {
+        if !self.search.text().is_empty() || self.on_recents {
             return None;
         }
-        let at = *self.view.get(self.selected)?;
+        let at = self.view.get(self.selected)?.at;
         emoji::table()
             .groups()
             .iter()
             .position(|g| g.entries.contains(&at))
+    }
+
+    /// Which tab the rail latches — the recents when it is showing, else the selection's group.
+    fn current_tab(&self) -> Option<usize> {
+        // A search outranks the latched tab in the view, so it does in the rail too.
+        if !self.search.text().is_empty() {
+            return None;
+        }
+        if self.on_recents {
+            return Some(0);
+        }
+        self.current_group().map(|group| group + 1)
     }
 
     /// Feed a key to the open picker.
@@ -460,13 +552,15 @@ impl EmojiPicker {
                 };
             }
             Some(Keysym::Tab) => {
-                let group = self.current_group().unwrap_or(0);
+                // With no tab latched — mid-search — Shift+Tab walks back into the recents and
+                // Tab forward into the first group, from the notional place between them.
+                let tab = self.current_tab().unwrap_or(1);
                 let next = if mods.shift {
-                    group.saturating_sub(1)
+                    tab.saturating_sub(1)
                 } else {
-                    (group + 1).min(RAIL_LABELS.len() - 1)
+                    (tab + 1).min(RAIL_LABELS.len() - 1)
                 };
-                self.go_to_group(next);
+                self.go_to_tab(next);
             }
             Some(Keysym::Left) => self.move_selection(-1),
             Some(Keysym::Right) => self.move_selection(1),
@@ -569,8 +663,8 @@ impl EmojiPicker {
             return Some(ch.to_owned());
         }
 
-        if let Some(group) = self.rail_at(pos) {
-            self.go_to_group(group);
+        if let Some(tab) = self.rail_at(pos) {
+            self.go_to_tab(tab);
             return None;
         }
 
@@ -590,7 +684,7 @@ impl EmojiPicker {
         if !rail.contains(pos) {
             return None;
         }
-        let tab = ((pos.x - rail.loc.x) / CELL) as usize;
+        let tab = ((pos.x - rail.loc.x) / TAB_W) as usize;
         (tab < RAIL_LABELS.len()).then_some(tab)
     }
 
@@ -636,7 +730,7 @@ impl EmojiPicker {
         let panel = {
             let mut cache = self.cache.borrow_mut();
             let cells = self.visible_cells();
-            let latched = self.current_group();
+            let latched = self.current_tab();
             widget::bake_content(
                 renderer,
                 &mut cache,
@@ -750,7 +844,7 @@ impl EmojiPicker {
         let end = (start + COLS * ROWS).min(self.view.len());
         (start..end)
             .map(|index| Cell {
-                ch: emoji::table().entries()[self.view[index]].ch,
+                ch: self.view[index].text(self.default_tone),
                 slot: index - start,
                 selected: index == self.selected,
                 hovered: self.hovered == Some(index),
@@ -835,8 +929,8 @@ fn prepare_panel(
 /// A rail tab's rectangle, panel-local logical px.
 fn rail_tab_rect(tab: usize) -> Rectangle<f64, Logical> {
     Rectangle::new(
-        Point::from((PAD + tab as f64 * CELL, EmojiPicker::HEIGHT - PAD - RAIL_H)),
-        Size::from((CELL, RAIL_H)),
+        Point::from((PAD + tab as f64 * TAB_W, EmojiPicker::HEIGHT - PAD - RAIL_H)),
+        Size::from((TAB_W, RAIL_H)),
     )
 }
 
@@ -979,6 +1073,88 @@ mod tests {
         picker
     }
 
+    /// An open picker with a history, without an output to open on: `open` needs one, so the
+    /// tests that only care about the view drive its two effects directly.
+    fn picker_with_recents(recents: &[&str]) -> EmojiPicker {
+        let mut picker = EmojiPicker::default();
+        picker.set_recents(recents.iter().map(|s| (*s).to_owned()).collect());
+        picker.on_recents = !picker.recents.is_empty();
+        picker.rebuild_view();
+        picker
+    }
+
+    /// The history is newest-first with no repeats and a cap, the shape GTK's own chooser keeps
+    /// (`add_recent_item`, `gtkemojichooser.c`): re-picking something moves it to the front
+    /// rather than adding a second copy.
+    #[test]
+    fn a_pick_leads_the_history_without_repeating() {
+        let mut picker = picker_with_recents(&["\u{1f600}", "\u{1f601}"]);
+
+        assert_eq!(
+            picker.record_pick("\u{1f602}"),
+            ["\u{1f602}", "\u{1f600}", "\u{1f601}"],
+            "a new pick leads"
+        );
+        assert_eq!(
+            picker.record_pick("\u{1f600}"),
+            ["\u{1f600}", "\u{1f602}", "\u{1f601}"],
+            "an old one moves up rather than repeating"
+        );
+
+        for entry in emoji::table().entries().iter().take(MAX_EMOJI_RECENTS + 5) {
+            picker.record_pick(entry.ch);
+        }
+        assert_eq!(picker.recents.len(), MAX_EMOJI_RECENTS, "and it is capped");
+    }
+
+    /// A recent is remembered as the text it inserted, so a toned pick comes back toned — and a
+    /// tone spelling is not an entry of its own, which is the whole reason a cell carries a tone
+    /// beside its index.
+    #[test]
+    fn a_toned_recent_comes_back_with_its_tone() {
+        let toned = emoji::table()
+            .entries()
+            .iter()
+            .find(|e| e.has_tones())
+            .expect("the table has toned emoji")
+            .tones[2];
+
+        let picker = picker_with_recents(&[toned]);
+        assert_eq!(picker.view.len(), 1);
+        assert_eq!(picker.text_of(0), Some(toned));
+        assert_eq!(
+            picker.current_tab(),
+            Some(0),
+            "and the rail latches the recents"
+        );
+    }
+
+    /// A recent from a newer Unicode than the vendored table has no cell to draw, and drops out
+    /// of the grid — not out of the history, which is still what gets written back.
+    #[test]
+    fn a_recent_the_table_cannot_spell_drops_out_of_the_grid() {
+        let picker = picker_with_recents(&["\u{1f600}", "\u{10fffd}"]);
+        assert_eq!(picker.view.len(), 1, "one of the two has a cell");
+        assert_eq!(picker.text_of(0), Some("\u{1f600}"));
+        assert_eq!(picker.recents.len(), 2, "both are still the history");
+    }
+
+    /// Searching leaves the recents tab: a search result is not in either list's order, and the
+    /// rail latches nothing while one is up.
+    #[test]
+    fn a_search_leaves_the_recents_tab() {
+        let mut picker = picker_with_recents(&["\u{1f600}"]);
+        picker.search.insert_str("cat");
+        picker.rebuild_view();
+
+        assert!(picker.view.len() > 1, "the search is over the whole table");
+        assert_eq!(picker.current_tab(), None, "no tab describes a search");
+
+        picker.go_to_tab(0);
+        assert!(picker.search.text().is_empty(), "the tab clears the search");
+        assert_eq!(picker.view.len(), 1, "and the recents are back");
+    }
+
     /// A skin-tone swatch on its own is a modifier, not an emoji, and must never appear as a
     /// cell. It does not, because Unicode marks the whole `Component` group `component` rather
     /// than `fully-qualified` and the generator keeps only the latter — so this pins a property of
@@ -993,7 +1169,7 @@ mod tests {
         );
         assert_eq!(picker.view.len(), table.entries().len());
         for index in &picker.view {
-            let entry = &table.entries()[*index];
+            let entry = index.emoji();
             assert!(
                 !entry.name.ends_with("skin tone"),
                 "{:?} is a modifier, not an emoji",
@@ -1048,7 +1224,7 @@ mod tests {
         picker
             .view
             .iter()
-            .position(|i| emoji::table().entries()[*i].has_tones())
+            .position(|slot| slot.emoji().has_tones())
             .expect("the table has toned emoji")
     }
 
@@ -1061,7 +1237,7 @@ mod tests {
         picker.rebuild_view();
         assert_eq!(picker.current_group(), None, "no tab describes a search");
 
-        picker.go_to_group(3);
+        picker.go_to_tab(4);
         assert_eq!(picker.search.text(), "");
         assert_eq!(
             picker.current_group(),
@@ -1127,7 +1303,7 @@ mod tests {
         let plain = picker
             .view
             .iter()
-            .position(|i| !emoji::table().entries()[*i].has_tones())
+            .position(|slot| !slot.emoji().has_tones())
             .unwrap();
         picker.selected = plain;
         let plain_ch = picker.at(plain).unwrap().ch.to_owned();

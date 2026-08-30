@@ -7023,6 +7023,57 @@ fn a_click_on_a_cell_picks_it_and_the_window_sees_nothing() {
     assert!(!f.synoik().emoji_picker.is_open());
 }
 
+/// What you pick leads the picker the next time it opens, through the real settings model — the
+/// history a GTK app's own chooser shares.
+///
+/// The reopen is the point: the two pick routes (a key and a click) each update the history, and
+/// a test that only read it back off the picker would pass with the model never written.
+#[test]
+fn a_picked_emoji_leads_the_history_next_time() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.double_roundtrip(id);
+    let _ = f.client(id).text_input_events();
+
+    assert!(
+        f.synoik().gnome_settings.emoji_recents.is_empty(),
+        "a fresh fixture has no history"
+    );
+
+    // Pick the third cell, so the assertion cannot pass on the table's own leading entry.
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+    let cell = geo.loc + Point::from((12. + 40. * 2.5, 12. + 40. + 8. + 20.));
+    pointer_to(&mut f, cell);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let picked = crate::emoji::table().entries()[2].ch.to_owned();
+    assert_eq!(
+        f.synoik().gnome_settings.emoji_recents,
+        std::slice::from_ref(&picked),
+        "the pick entered the settings model, which is what gets persisted"
+    );
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    assert_eq!(
+        f.synoik().emoji_picker.selected_entry(),
+        2,
+        "the picker opens on the recents, led by what was just picked"
+    );
+
+    // And Enter on that cell inserts the recent, not whatever the table has in first place.
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some(picked.clone()))),
+        "expected a commit of {picked:?}, got: {events:?}"
+    );
+}
+
 /// The rail jumps the grid to a category, and a secondary click opens an emoji's skin tones —
 /// both through the real pointer path.
 #[test]
@@ -7038,8 +7089,10 @@ fn the_rail_and_the_tone_popover_answer_the_pointer() {
     f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
     let geo = f.synoik().emoji_picker.geometry().unwrap();
 
-    // The second rail tab: People & Body, the first group whose emoji take skin tones.
-    let tab = geo.loc + Point::from((12. + 40. + 20., EmojiPicker::HEIGHT - 12. - 18.));
+    // The third rail tab — the recents lead the rail, so tab 2 is the second Unicode group:
+    // People & Body, the first whose emoji take skin tones. Ten tabs span the nine-cell grid,
+    // so a tab is 36 wide, not 40.
+    let tab = geo.loc + Point::from((12. + 36. * 2.5, EmojiPicker::HEIGHT - 12. - 18.));
     pointer_to(&mut f, tab);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);

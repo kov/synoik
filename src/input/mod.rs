@@ -1937,12 +1937,23 @@ impl State {
             PickerKey::Close => {
                 self.synoik.emoji_picker.close();
             }
-            PickerKey::Insert(text) => {
-                self.synoik.emoji_picker.close();
-                self.insert_text(&text);
-            }
+            PickerKey::Insert(text) => self.emoji_picked(&text),
         }
         self.synoik.queue_redraw_all();
+    }
+
+    /// One emoji picked, from the keyboard or the pointer: it closes the picker, enters the
+    /// history (persisted to GSettings, like the run dialog's) and is inserted.
+    ///
+    /// Both routes come through here so neither can be the one that forgets the history.
+    fn emoji_picked(&mut self, text: &str) {
+        self.synoik.emoji_picker.close();
+        let recents = self.synoik.emoji_picker.record_pick(text);
+        self.synoik.gnome_settings.emoji_recents = recents.clone();
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
+            writer.set_emoji_recents(recents);
+        }
+        self.insert_text(text);
     }
 
     /// Whether the keymap says this key repeats at all.
@@ -5611,6 +5622,10 @@ impl State {
                         .cloned();
                     if let Some(output) = output {
                         let geo = self.synoik.global_space.output_geometry(&output).unwrap();
+                        // Read at every open: the history is settings, so a GTK app's chooser or
+                        // another session may have moved it since the last time.
+                        let recents = self.synoik.gnome_settings.emoji_recents.clone();
+                        self.synoik.emoji_picker.set_recents(recents);
                         self.synoik.emoji_picker.open(anchor, output, geo.to_f64());
                     }
                 }
@@ -8493,8 +8508,7 @@ impl State {
                 self.synoik.suppressed_buttons.insert(button_code);
                 let secondary = button == Some(MouseButton::Right);
                 if let Some(text) = self.synoik.emoji_picker.pointer_click(pos, secondary) {
-                    self.synoik.emoji_picker.close();
-                    self.insert_text(&text);
+                    self.emoji_picked(&text);
                 }
                 self.synoik.queue_redraw_all();
                 return;

@@ -72,6 +72,10 @@ pub struct GnomeSettings {
     /// [`adopted_wm_keybindings`] for the subset). One entry per adopted
     /// settings key, in table order — the input path returns the first match.
     pub keybindings: Vec<GnomeKeybinding>,
+    /// `org.synoik.emoji recently-used-emoji`: the emoji picker's history, newest first, as the
+    /// strings it inserts. Seeded from GTK's own chooser history the first time — see
+    /// [`decode_gtk_emoji_recents`].
+    pub emoji_recents: Vec<String>,
     /// `org.gnome.shell command-history`: the run dialog's persisted history,
     /// oldest first. gnome-shell caps it at 512 entries.
     pub command_history: Vec<String>,
@@ -403,6 +407,7 @@ impl Default for GnomeSettings {
         Self {
             overlay_keys: vec![Keysym::Super_L, Keysym::Super_R],
             keybindings: default_keybindings(),
+            emoji_recents: Vec::new(),
             command_history: Vec::new(),
             favorite_apps: Vec::new(),
             switchers: SwitcherSettings::default(),
@@ -570,6 +575,27 @@ impl GnomeSettings {
         if settings_has_key(mutter, "auto-maximize") {
             self.auto_maximize = mutter.boolean("auto-maximize");
         }
+    }
+
+    /// The picker's history: ours when we have one, else GTK's, imported once.
+    ///
+    /// Ours wins when it is non-empty, so the two histories diverge from the first pick. Keeping
+    /// them merged means writing GTK's key, which waits on the round trip described in
+    /// `docs/fork/emoji-picker.md`.
+    fn load_emoji(&mut self, ours: Option<&gio::Settings>, gtk: Option<&gio::Settings>) {
+        if let Some(ours) = ours.filter(|s| settings_has_key(s, "recently-used-emoji")) {
+            self.emoji_recents = ours
+                .strv("recently-used-emoji")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+        if self.emoji_recents.is_empty() {
+            if let Some(gtk) = gtk.filter(|s| settings_has_key(s, "recently-used-emoji")) {
+                self.emoji_recents = decode_gtk_emoji_recents(&gtk.value("recently-used-emoji"));
+            }
+        }
+        self.emoji_recents.truncate(MAX_EMOJI_RECENTS);
     }
 
     fn load_shell(&mut self, shell: &gio::Settings) {
@@ -958,6 +984,64 @@ fn read_source_tuples(value: &glib::Variant) -> Vec<(String, String)> {
     (0..value.n_children())
         .filter_map(|i| value.child_value(i).get::<(String, String)>())
         .collect()
+}
+
+/// The most recent emoji we keep, matching GTK's own cap (`MAX_RECENT`, `gtkemojichooser.c`).
+pub const MAX_EMOJI_RECENTS: usize = 21;
+
+/// Decode GTK's `a((aussasasu)u)` emoji history into the strings we store.
+///
+/// The schema type is authoritative for shape only; the field semantics come from the key's own
+/// description, which names the two we need — the inner tuple opens with the codepoints (`au`),
+/// and the trailing `u` is the Fitzpatrick modifier to substitute for a placeholder in them. A
+/// placeholder is `0` or U+1F3FB, and a placeholder left unsubstituted (modifier `0`) drops out,
+/// which is how an emoji with no tone applied is spelled.
+///
+/// Every failure skips its record rather than the load: this is someone else's key, written by
+/// versions of GTK we have not seen.
+fn decode_gtk_emoji_recents(value: &glib::Variant) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !value.type_().is_container() {
+        return out;
+    }
+    for record in (0..value.n_children()).map(|i| value.child_value(i)) {
+        if record.n_children() < 2 {
+            continue;
+        }
+        let item = record.child_value(0);
+        let Some(modifier) = record.child_value(1).get::<u32>() else {
+            continue;
+        };
+        if item.n_children() == 0 {
+            continue;
+        }
+        let Some(codes) = item.child_value(0).get::<Vec<u32>>() else {
+            continue;
+        };
+        let mut text = String::new();
+        for code in codes {
+            let code = match code {
+                0 => modifier,
+                0x1f3fb if modifier != 0 => modifier,
+                code => code,
+            };
+            if code == 0 {
+                continue;
+            }
+            match char::from_u32(code) {
+                Some(c) => text.push(c),
+                // A codepoint that is not a character makes the whole spelling meaningless.
+                None => {
+                    text.clear();
+                    break;
+                }
+            }
+        }
+        if !text.is_empty() && !out.contains(&text) {
+            out.push(text);
+        }
+    }
+    out
 }
 
 /// One GNOME keybinding we honor: a semantic action and the accelerators
@@ -1596,6 +1680,25 @@ impl GnomeSettingsWriter {
                         let history: Vec<&str> = history.iter().map(String::as_str).collect();
                         if let Err(err) = shell.set_strv("command-history", history) {
                             warn!("error writing org.gnome.shell command-history: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Persist the emoji picker's history to `org.synoik.emoji recently-used-emoji`. Missing
+    /// store or key is a no-op, like [`set_command_history`](Self::set_command_history).
+    pub fn set_emoji_recents(&self, recents: Vec<String>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(emoji) = &s.synoik_emoji {
+                    if settings_has_key(emoji, "recently-used-emoji") {
+                        let recents: Vec<&str> = recents.iter().map(String::as_str).collect();
+                        if let Err(err) = emoji.set_strv("recently-used-emoji", recents) {
+                            warn!("error writing org.synoik.emoji recently-used-emoji: {err}");
                         }
                     }
                 }
@@ -2479,6 +2582,11 @@ struct Stores {
     /// actions GNOME has no key for. `None` until the schema is installed, which
     /// leaves the compiled-in defaults in charge.
     synoik_keybindings: Option<gio::Settings>,
+    /// `org.synoik.emoji` — the emoji picker's history.
+    synoik_emoji: Option<gio::Settings>,
+    /// `org.gtk.gtk4.Settings.EmojiChooser` — GTK's own history, read to seed ours and never
+    /// written. Installed by GTK itself, so `None` on a machine without it.
+    gtk_emoji_chooser: Option<gio::Settings>,
     shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
@@ -2545,6 +2653,8 @@ impl Stores {
             mutter_keybindings: gsettings("org.gnome.mutter.keybindings", b),
             wayland_keybindings: gsettings("org.gnome.mutter.wayland.keybindings", b),
             synoik_keybindings: gsettings("org.synoik.keybindings", b),
+            synoik_emoji: gsettings("org.synoik.emoji", b),
+            gtk_emoji_chooser: gsettings("org.gtk.gtk4.Settings.EmojiChooser", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
@@ -2590,6 +2700,7 @@ impl Stores {
             "notifications" => self.notifications.as_ref(),
             "color" => self.color.as_ref(),
             "shell" => self.shell.as_ref(),
+            "synoik-emoji" => self.synoik_emoji.as_ref(),
             "input-sources" => self.input_sources.as_ref(),
             "wm-preferences" => self.wm_preferences.as_ref(),
             "a11y-interface" => self.a11y_interface.as_ref(),
@@ -2605,6 +2716,8 @@ impl Stores {
             &self.mutter_keybindings,
             &self.wayland_keybindings,
             &self.synoik_keybindings,
+            &self.synoik_emoji,
+            &self.gtk_emoji_chooser,
             &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
@@ -2662,6 +2775,7 @@ impl Stores {
         if let Some(shell) = &self.shell {
             settings.load_shell(shell);
         }
+        settings.load_emoji(self.synoik_emoji.as_ref(), self.gtk_emoji_chooser.as_ref());
         settings.load_switchers(self.app_switcher.as_ref(), self.window_switcher.as_ref());
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
@@ -4728,6 +4842,84 @@ mod tests {
             }
             panic!("the real watcher never delivered {what}: {:?}", self.latest);
         }
+    }
+
+    /// GTK's history is someone else's key, in a type whose field semantics are documented
+    /// only by the key's own description. So the decoder is pinned on a synthetic value
+    /// covering every clause it has: a plain sequence, an explicit `0` placeholder, the
+    /// U+1F3FB placeholder, a record that decodes to something already seen, and a record
+    /// that is not text at all.
+    #[test]
+    fn gtk_emoji_recents_decode_defensively() {
+        let ty = glib::VariantTy::new("a((aussasasu)u)").unwrap();
+        let value = glib::Variant::parse(
+            Some(ty),
+            "[(([uint32 128077], 'thumbs up', ':+1:', ['hand'], [], uint32 1), uint32 0), \
+              (([uint32 128077, uint32 0], 'thumbs up', ':+1:', [], [], uint32 1), \
+                uint32 127997), \
+              (([uint32 128077, uint32 127995], 'thumbs up', ':+1:', [], [], uint32 1), \
+                uint32 127999), \
+              (([uint32 128077, uint32 0], 'thumbs up', ':+1:', [], [], uint32 1), uint32 0), \
+              (([uint32 55296], 'lone surrogate', '', [], [], uint32 0), uint32 0)]",
+        )
+        .expect("the type is the one gsettings describes for the key");
+
+        assert_eq!(
+            decode_gtk_emoji_recents(&value),
+            ["\u{1f44d}", "\u{1f44d}\u{1f3fd}", "\u{1f44d}\u{1f3ff}"],
+            "a `0` and a U+1F3FB both take the modifier; an unmodified `0` drops out, so the \
+             fourth record repeats the first and is deduplicated; a surrogate is not a character"
+        );
+
+        assert!(
+            decode_gtk_emoji_recents(&glib::Variant::from("not a container")).is_empty(),
+            "a key holding something else entirely reads as no history, not a panic"
+        );
+    }
+
+    /// The import runs through the **real** `Stores::read`, on a private backend: a test that
+    /// only called the decoder would still pass with the store missing from `Stores::open`.
+    ///
+    /// `org.synoik.emoji` is not installed on a dev checkout, which is exactly the case the
+    /// import exists for — nothing of ours to read, so GTK's history is what shows.
+    #[test]
+    fn a_fresh_session_starts_from_gtks_emoji_history() {
+        if !schema_available(
+            "org.gtk.gtk4.Settings.EmojiChooser",
+            Some("recently-used-emoji"),
+        ) {
+            return;
+        }
+
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let stores = Rc::new(Stores::open(SettingsStore::Memory));
+            assert!(
+                stores.read().emoji_recents.is_empty(),
+                "a pristine store has no history on either side"
+            );
+
+            let ty = glib::VariantTy::new("a((aussasasu)u)").unwrap();
+            let value = glib::Variant::parse(
+                Some(ty),
+                "[(([uint32 128077, uint32 0], 'thumbs up', ':+1:', [], [], uint32 1), \
+                 uint32 127997)]",
+            )
+            .unwrap();
+            stores
+                .gtk_emoji_chooser
+                .as_ref()
+                .expect("GTK's schema is installed, we just checked")
+                .set("recently-used-emoji", value)
+                .unwrap();
+
+            assert_eq!(
+                stores.read().emoji_recents,
+                ["\u{1f44d}\u{1f3fd}"],
+                "with nothing of ours to read, GTK's history is the picker's"
+            );
+        })
+        .unwrap();
     }
 
     /// Whether a schema (and optionally a key) is installed on this host; these tests skip

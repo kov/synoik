@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The emoji picker's own state. Only what has to survive a session: the picker
+  itself is drawn from the vendored table in resources/emoji-table.txt.
+
+  The history is stored as the plain strings we insert, one per entry, newest
+  first. GTK's own chooser keeps the same list in
+  org.gtk.gtk4.Settings.EmojiChooser recently-used-emoji under the far richer
+  type a((aussasasu)u) — codepoints plus name, keywords and a separate skin-tone
+  modifier. We *read* that key so a fresh session starts with the emoji the user
+  already reaches for, and write here, because writing theirs means reproducing
+  fields whose semantics are not documented anywhere we can check. See
+  docs/fork/emoji-picker.md.
+-->
+<schemalist>
+  <schema id="org.synoik.emoji" path="/org/synoik/emoji/">
+
+    <key name="recently-used-emoji" type="as">
+      <default>[]</default>
+      <summary>Recently picked emoji, newest first</summary>
+      <description>
+        Each entry is the text the picker inserts, skin tone included.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>
