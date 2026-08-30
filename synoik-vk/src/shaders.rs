@@ -43,6 +43,9 @@ pub const CLIPPED_TEX_FRAG: &[u8] =
 /// and binds no sampler.
 pub const CLIPPED_SOLID_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/clipped_solid.frag.spv"));
+/// Colour-glyph fragment stage (sample the premultiplied-RGBA colour atlas; the tint contributes
+/// only its alpha). Shares `TextPush` and the pipeline layout with `TEXT_FRAG`.
+pub const TEXT_COLOR_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text_color.frag.spv"));
 /// Border material vertex + fragment stages (angled gradient clipped to a rounded-rect ring —
 /// niri's `BorderRenderElement`). Both stages declare the `BorderPush` block; the fragment outputs
 /// premultiplied color.

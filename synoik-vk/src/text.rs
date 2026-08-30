@@ -31,12 +31,15 @@ use swash::zeno::{Format, Vector};
 
 use crate::gpu::Gpu;
 use crate::render::{as_bytes, load_module, TextPush};
-use crate::shaders::{TEXT_FRAG, TEXT_VERT};
+use crate::shaders::{TEXT_COLOR_FRAG, TEXT_FRAG, TEXT_VERT};
 use crate::texture::{CoverageRegion, Texture};
 
 /// One placed glyph: where it goes on screen (run-local, top-left) and its slot in the atlas.
 #[derive(Clone, Copy, Debug)]
 pub struct PlacedGlyph {
+    /// Whether the glyph lives in the colour atlas rather than the coverage one. The two are
+    /// separate images with separate slot coordinates, so this picks which to sample.
+    pub color: bool,
     pub x: i32,
     pub y: i32,
     pub w: u32,
@@ -116,6 +119,12 @@ impl GlyphAtlasIndex {
         }
     }
 
+    /// Whether any glyph has ever been placed here. The colour atlas's image is not worth
+    /// creating until one has.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Side length of the atlas image this index describes.
     pub fn side(&self) -> u32 {
         self.side
@@ -163,6 +172,11 @@ impl GlyphAtlasIndex {
     /// each side is a bleed guard, so NEAREST sampling at the slot edge cannot pick up a
     /// neighbour.
     fn allocate(&mut self, key: CacheKey, raster: &GlyphRaster) -> Option<GlyphSlot> {
+        debug_assert_eq!(
+            raster.data.len(),
+            (raster.w * raster.h * raster.texel_bytes()) as usize,
+            "a raster whose bytes do not match its size would upload into the wrong slots"
+        );
         let alloc = self
             .allocator
             .allocate(size2(raster.w as i32 + 1, raster.h as i32 + 1))?;
@@ -179,13 +193,31 @@ impl GlyphAtlasIndex {
     }
 }
 
-/// One glyph's hinted R8 coverage bitmap, as swash rasterized it.
+/// An atlas ran out of room mid-resolution; `color` says which one.
+struct AtlasFull {
+    color: bool,
+}
+
+/// One glyph's rasterized bitmap: hinted R8 coverage from swash, or premultiplied RGBA from
+/// [`crate::colr`] when the glyph is a colour one.
 struct GlyphRaster {
+    /// R8 coverage, or premultiplied RGBA when `color`.
     data: Vec<u8>,
     w: u32,
     h: u32,
     left: i32,
     top: i32,
+    color: bool,
+}
+
+impl GlyphRaster {
+    fn texel_bytes(&self) -> u32 {
+        if self.color {
+            4
+        } else {
+            1
+        }
+    }
 }
 
 /// A glyph that just became resident and still has to reach the atlas image. The caller uploads
@@ -195,7 +227,10 @@ pub struct PendingGlyph {
     pub y: u32,
     pub w: u32,
     pub h: u32,
+    /// R8 coverage, or premultiplied RGBA when `color` — and so which of the two atlas images
+    /// this belongs in.
     pub coverage: Vec<u8>,
+    pub color: bool,
 }
 
 impl PendingGlyph {
@@ -207,6 +242,7 @@ impl PendingGlyph {
             w: self.w,
             h: self.h,
             coverage: &self.coverage,
+            texel_bytes: if self.color { 4 } else { 1 },
         }
     }
 }
@@ -674,6 +710,10 @@ fn ellipsize_to_fit(
 pub struct TextContext {
     scale: ScaleContext,
     atlas: GlyphAtlasIndex,
+    /// Residency for the colour half. Separate index *and* separate image: a slot coordinate only
+    /// means anything in the atlas that issued it, so one map covering both would hand a mask
+    /// lookup a colour glyph's rectangle.
+    color_atlas: GlyphAtlasIndex,
 }
 
 impl Default for TextContext {
@@ -687,6 +727,7 @@ impl TextContext {
         TextContext {
             scale: ScaleContext::new(),
             atlas: GlyphAtlasIndex::new(INITIAL_ATLAS_SIDE),
+            color_atlas: GlyphAtlasIndex::new(INITIAL_ATLAS_SIDE),
         }
     }
 
@@ -716,6 +757,26 @@ impl TextContext {
             let mut b = buffer.borrow_with(&mut fonts);
             b.set_size(None, None);
             let attrs = sans_label_attrs(bold);
+            b.set_text(text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(false);
+        }
+        self.resolve(&mut fonts, &buffer)
+    }
+
+    /// Shape `text` as colour emoji at `px` pixels-per-em — [`SpanFamily::Emoji`] rather than the
+    /// UI face, so a COLRv1 glyph reaches [`crate::colr`] instead of a monochrome fallback.
+    ///
+    /// For text that is *known* to be emoji, which today means the emoji picker's cells. Mixed
+    /// text keeps the UI face and its fallback.
+    pub fn shape_emoji(&mut self, text: &str, px: f32) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
+        let _timed = crate::stats::shape();
+        let mut fonts = fonts();
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
+        buffer.set_hinting(Hinting::Enabled);
+        {
+            let mut b = buffer.borrow_with(&mut fonts);
+            b.set_size(None, None);
+            let attrs = Attrs::new().family(Family::Name(EMOJI_FAMILY));
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
@@ -764,6 +825,16 @@ impl TextContext {
         &mut self.atlas
     }
 
+    /// The colour atlas's residency map. Its image is RGBA and is only worth creating once a
+    /// colour glyph has actually been resolved — [`GlyphAtlasIndex::is_empty`] answers that.
+    pub fn color_atlas(&self) -> &GlyphAtlasIndex {
+        &self.color_atlas
+    }
+
+    pub fn color_atlas_mut(&mut self) -> &mut GlyphAtlasIndex {
+        &mut self.color_atlas
+    }
+
     /// Resolve every glyph of an already-shaped `buffer` into the persistent atlas. Shared by
     /// [`Self::shape_line_weighted`] and [`Self::shape_paragraph`]; the placements it emits are
     /// buffer-local (top-left), spanning as many lines as the buffer holds.
@@ -784,22 +855,31 @@ impl TextContext {
         buffer: &Buffer,
     ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         loop {
-            if let Some(resolved) = self.resolve_once(fonts, buffer) {
-                return Ok(resolved);
-            }
-            if !self.atlas.grow() {
-                bail!("glyph atlas full at {MAX_ATLAS_SIDE}px");
+            match self.resolve_once(fonts, buffer) {
+                Ok(resolved) => return Ok(resolved),
+                Err(AtlasFull { color }) => {
+                    // Grow only the atlas that actually ran out: doubling both would throw away
+                    // the residency of every mask glyph because one emoji did not fit.
+                    let atlas = if color {
+                        &mut self.color_atlas
+                    } else {
+                        &mut self.atlas
+                    };
+                    if !atlas.grow() {
+                        bail!("glyph atlas full at {MAX_ATLAS_SIDE}px");
+                    }
+                }
             }
         }
     }
 
-    /// One resolution pass. `None` means the atlas ran out of room, which is the caller's cue to
-    /// grow and retry — not an error.
+    /// One resolution pass. [`AtlasFull`] means an atlas ran out of room, which is the caller's
+    /// cue to grow that one and retry — not an error.
     fn resolve_once(
         &mut self,
         fonts: &mut FontSystem,
         buffer: &Buffer,
-    ) -> Option<(ShapedRun, Vec<PendingGlyph>)> {
+    ) -> Result<(ShapedRun, Vec<PendingGlyph>), AtlasFull> {
         // Line-box metrics for baseline centering: the font's ascent/descent (px) at this size,
         // taken from the first line's first glyph, plus that line's baseline. Pango/St center a
         // single-line label on this box (ascent+descent) — reserving descent space — not on the
@@ -838,26 +918,43 @@ impl TextContext {
                 // size, weight, and subpixel bin), and now for the life of the atlas rather than
                 // of one run — so a repeated character, a repeated label, and the same digit next
                 // second all share the slot.
-                let slot = match self.atlas.slots.get(&key) {
-                    Some(cached) => *cached,
+                // A key lives in exactly one of the two atlases, so a hit in either settles both
+                // the slot and which image to sample.
+                let resident = self
+                    .atlas
+                    .slots
+                    .get(&key)
+                    .map(|slot| (*slot, false))
+                    .or_else(|| self.color_atlas.slots.get(&key).map(|slot| (*slot, true)));
+
+                let (slot, color) = match resident {
+                    Some(resident) => resident,
                     None => {
-                        let raster = Self::rasterize_glyph(fonts, &mut self.scale, key);
-                        match raster {
+                        match Self::rasterize_glyph(fonts, &mut self.scale, key) {
                             Some(raster) => {
-                                let slot = self.atlas.allocate(key, &raster)?;
+                                let color = raster.color;
+                                let atlas = if color {
+                                    &mut self.color_atlas
+                                } else {
+                                    &mut self.atlas
+                                };
+                                let Some(slot) = atlas.allocate(key, &raster) else {
+                                    return Err(AtlasFull { color });
+                                };
                                 pending.push(PendingGlyph {
                                     x: slot.atlas_x,
                                     y: slot.atlas_y,
                                     w: slot.w,
                                     h: slot.h,
                                     coverage: raster.data,
+                                    color,
                                 });
-                                Some(slot)
+                                (Some(slot), color)
                             }
                             None => {
                                 // Whitespace / missing glyph: no bitmap, pen still advances.
                                 self.atlas.slots.insert(key, None);
-                                None
+                                (None, false)
                             }
                         }
                     }
@@ -865,6 +962,7 @@ impl TextContext {
 
                 if let Some(slot) = slot {
                     glyphs.push(PlacedGlyph {
+                        color,
                         x: phys.x + slot.left,
                         y: line_baseline + phys.y - slot.top,
                         w: slot.w,
@@ -877,7 +975,7 @@ impl TextContext {
             }
         }
 
-        Some((
+        Ok((
             ShapedRun {
                 glyphs,
                 spans,
@@ -898,11 +996,32 @@ impl TextContext {
     ) -> Option<GlyphRaster> {
         // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
         let font = fonts.get_font(key.font_id, key.font_weight)?;
-        let mut scaler = ctx
-            .builder(font.as_swash())
-            .size(f32::from_bits(key.font_size_bits))
-            .hint(true)
-            .build();
+        let px = f32::from_bits(key.font_size_bits);
+
+        // Colour first: a COLRv1 glyph's *outline* is empty, so the mask path below would return
+        // nothing for it and the emoji would silently vanish. The foreground is a constant black
+        // and not the caller's text colour on purpose — the atlas keys on `CacheKey` alone, so a
+        // per-caller colour would poison the slot for every other one. Only a font that paints
+        // with palette index 0xFFFF is affected, which no emoji font does.
+        let swash = font.as_swash();
+        if let Some(raster) = crate::colr::rasterize(
+            font.data(),
+            crate::colr::face_index(font.data(), swash.offset),
+            key.glyph_id,
+            px,
+            [0, 0, 0, 255],
+        ) {
+            return Some(GlyphRaster {
+                data: raster.data,
+                w: raster.w,
+                h: raster.h,
+                left: raster.left,
+                top: raster.top,
+                color: true,
+            });
+        }
+
+        let mut scaler = ctx.builder(swash).size(px).hint(true).build();
 
         // Subpixel remainder from the cache key (0 once fully snapped).
         let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
@@ -922,6 +1041,7 @@ impl TextContext {
             h,
             left: image.placement.left,
             top: image.placement.top,
+            color: false,
         })
     }
 }
@@ -942,6 +1062,9 @@ pub struct TextSpan<'a> {
 /// **not** Cantarell, which it was several releases ago and which a long-lived profile still
 /// carries in dconf because an explicit value survives a default change.
 pub const DEFAULT_SANS_FAMILY: &str = "Adwaita Sans";
+
+/// The colour emoji face. See [`SpanFamily::Emoji`].
+pub const EMOJI_FAMILY: &str = "Noto Color Emoji";
 
 /// The realized sans family, i.e. the family half of `org.gnome.desktop.interface font-name`.
 ///
@@ -998,6 +1121,15 @@ fn sans_label_attrs(bold: bool) -> Attrs<'static> {
 pub enum SpanFamily {
     Sans,
     Mono,
+    /// The colour emoji face, for text that is emoji and nothing else.
+    ///
+    /// Named explicitly rather than left to fallback: cosmic-text's Unix fallback list puts
+    /// "Noto Color Emoji" *after* "DejaVu Sans", which also covers the emoji block, so an emoji
+    /// shaped with the UI font silently lands on DejaVu's monochrome outline. Steering the whole
+    /// UI's fallback instead would change how `☺`, `❤` and the other dual-presentation characters
+    /// render in every existing label, which needs per-character presentation itemization to get
+    /// right; asking for the face where the text is known to be emoji does not.
+    Emoji,
 }
 
 impl TextSpan<'_> {
@@ -1005,6 +1137,7 @@ impl TextSpan<'_> {
         let family = match self.family {
             SpanFamily::Sans => sans_family(),
             SpanFamily::Mono => Family::Monospace,
+            SpanFamily::Emoji => Family::Name(EMOJI_FAMILY),
         };
         let weight = if self.bold {
             Weight::BOLD
@@ -1044,12 +1177,17 @@ pub fn build_text(
     }
 }
 
-/// Graphics pipeline for glyph quads: `text.vert` + `text.frag`, alpha blending on, one sampler.
+/// Graphics pipelines for glyph quads: `text.vert` with `text.frag` over the R8 coverage atlas,
+/// and with `text_color.frag` over the premultiplied-RGBA colour atlas. Alpha blending on, one
+/// sampler; the two differ only in the fragment stage and the image bound to it, so they share the
+/// vertex module, the pipeline layout and `TextPush`.
 pub struct TextRenderer {
     pipeline: vk::Pipeline,
+    color_pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     vert: vk::ShaderModule,
     frag: vk::ShaderModule,
+    color_frag: vk::ShaderModule,
 }
 
 impl TextRenderer {
@@ -1062,6 +1200,7 @@ impl TextRenderer {
         let device = &gpu.device;
         let vert = load_module(device, TEXT_VERT)?;
         let frag = load_module(device, TEXT_FRAG)?;
+        let color_frag = load_module(device, TEXT_COLOR_FRAG)?;
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -1133,16 +1272,21 @@ impl TextRenderer {
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
-        let pipeline =
-            unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[ci], None) }
-                .map_err(|(_, e)| e)
-                .context("text pipeline")?[0];
+        let color_stages = [stages[0], stages[1].module(color_frag)];
+        let color_ci = ci.stages(&color_stages);
+        let pipelines = unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &[ci, color_ci], None)
+        }
+        .map_err(|(_, e)| e)
+        .context("text pipeline")?;
 
         Ok(TextRenderer {
-            pipeline,
+            pipeline: pipelines[0],
+            color_pipeline: pipelines[1],
             layout,
             vert,
             frag,
+            color_frag,
         })
     }
 
@@ -1161,10 +1305,55 @@ impl TextRenderer {
         target: [f32; 2],
         color: [f32; 4],
     ) {
+        self.draw_half(
+            gpu, cbuf, set, run, atlas_side, origin, target, color, false,
+        );
+    }
+
+    /// The colour half of [`Self::draw`]: the same run, the same push constants, but the glyphs
+    /// that live in the RGBA atlas, sampled by `text_color.frag`. Split rather than interleaved
+    /// because switching pipeline *and* descriptor set per glyph would cost more than the two
+    /// passes; a run's glyphs are independent, so drawing them out of order changes nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_color(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        run: &ShapedRun,
+        atlas_side: u32,
+        origin: (f32, f32),
+        target: [f32; 2],
+        color: [f32; 4],
+    ) {
+        self.draw_half(gpu, cbuf, set, run, atlas_side, origin, target, color, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_half(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        run: &ShapedRun,
+        atlas_side: u32,
+        origin: (f32, f32),
+        target: [f32; 2],
+        color: [f32; 4],
+        want_color: bool,
+    ) {
+        if !run.glyphs.iter().any(|g| g.color == want_color) {
+            return;
+        }
         let device = &gpu.device;
         let side = atlas_side as f32;
+        let pipeline = if want_color {
+            self.color_pipeline
+        } else {
+            self.pipeline
+        };
         unsafe {
-            device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cbuf,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1173,7 +1362,7 @@ impl TextRenderer {
                 &[set],
                 &[],
             );
-            for g in &run.glyphs {
+            for g in run.glyphs.iter().filter(|g| g.color == want_color) {
                 let push = TextPush {
                     origin: [origin.0 + g.x as f32, origin.1 + g.y as f32],
                     size: [g.w as f32, g.h as f32],
@@ -1203,9 +1392,11 @@ impl TextRenderer {
         unsafe {
             let d = &gpu.device;
             d.destroy_pipeline(self.pipeline, None);
+            d.destroy_pipeline(self.color_pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             d.destroy_shader_module(self.vert, None);
             d.destroy_shader_module(self.frag, None);
+            d.destroy_shader_module(self.color_frag, None);
         }
     }
 }
@@ -1369,6 +1560,73 @@ mod tests {
 
     /// GPU-free wrapping: short text passes through, long text wraps to width, a `max_lines`
     /// clamp ellipsizes the last line, and no line ever exceeds the wrap width.
+    /// An emoji reaches the *colour* atlas, in colour — the whole point of `colr.rs`.
+    ///
+    /// The trap this is written against: shaping "😀" with the UI face resolves through
+    /// cosmic-text's fallback to DejaVu Sans, which has a perfectly good monochrome outline for
+    /// it. A test that only asserted "the run has a glyph" would pass with no colour path
+    /// involved at all, which is why this asserts the atlas it landed in and the bytes in it.
+    #[test]
+    fn an_emoji_lands_in_the_colour_atlas_in_colour() {
+        let mut ctx = TextContext::new();
+        let Ok((run, pending)) = ctx.shape_emoji("\u{1f600}", 32.) else {
+            eprintln!("no emoji face installed; skipping");
+            return;
+        };
+        let Some(glyph) = run.glyphs.first() else {
+            eprintln!("no emoji face installed; skipping");
+            return;
+        };
+        assert!(glyph.color, "the emoji went to the coverage atlas");
+        assert!(!ctx.color_atlas().is_empty());
+        assert!(
+            ctx.atlas().is_empty(),
+            "nothing else should have been rasterized"
+        );
+
+        let colour = pending.iter().find(|p| p.color).expect("a colour upload");
+        assert_eq!(colour.coverage.len(), (colour.w * colour.h * 4) as usize);
+        assert_eq!(colour.region().texel_bytes, 4);
+        assert!(
+            colour
+                .coverage
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[0] != p[1] || p[1] != p[2]),
+            "the bitmap is grey, so it came from a mask and not from the paint graph"
+        );
+    }
+
+    /// The two atlases are separate images, so a slot in one must never answer for the other.
+    #[test]
+    fn the_two_atlases_keep_their_own_slots() {
+        let mut ctx = TextContext::new();
+        let (text, _) = ctx.shape_line("Hi", 32.).unwrap();
+        assert!(text.glyphs.iter().all(|g| !g.color));
+        let before = ctx.atlas().side();
+
+        let Ok((emoji, _)) = ctx.shape_emoji("\u{1f600}", 32.) else {
+            return;
+        };
+        if !emoji.glyphs.iter().any(|g| g.color) {
+            eprintln!("no emoji face installed; skipping");
+            return;
+        }
+        // Placing a colour glyph must not disturb the coverage atlas, and re-shaping the text
+        // must still hit the slots it already had.
+        assert_eq!(ctx.atlas().side(), before);
+        let (again, pending) = ctx.shape_line("Hi", 32.).unwrap();
+        assert!(pending.is_empty(), "the text glyphs were evicted");
+        let placed = |run: &ShapedRun| -> Vec<_> {
+            run.glyphs
+                .iter()
+                .map(|g| (g.color, g.atlas_x, g.atlas_y, g.w, g.h))
+                .collect()
+        };
+        assert_eq!(placed(&again), placed(&text));
+    }
+
     #[test]
     fn wrap_lines_wraps_and_ellipsizes() {
         let px = 15.0;

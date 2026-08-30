@@ -116,12 +116,12 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// rest from its own age-N-ago presentation. Empty (e.g. a clear-only frame that cleared
     /// nothing) falls back to a whole-frame blit. See [`Self::record_present_blit`].
     present_damage: Vec<vk::Rect2D>,
-    /// The staging buffer behind the glyph-atlas copies recorded into `cbuf` at `begin`, if this
-    /// frame carried any. Owned here so the branch `finish_internal` actually takes decides its
-    /// fate: into the in-flight record on the deferred path, dropped after the fence wait on the
-    /// synchronous one. Keying that on `fb.offscreen` instead would miss the KMS frame that falls
-    /// back to synchronous because no exportable fence could be made.
-    glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
+    /// The staging buffers behind the glyph-atlas copies recorded into `cbuf` at `begin` — one
+    /// per atlas that had anything queued. Owned here so the branch `finish_internal` actually
+    /// takes decides its fate: into the in-flight record on the deferred path, dropped after
+    /// the fence wait on the synchronous one. Keying that on `fb.offscreen` instead would miss
+    /// the KMS frame that falls back to synchronous because no exportable fence could be made.
+    glyph_staging: Vec<synoik_vk::texture::GlyphStaging>,
     /// The staged texture uploads whose copies this frame's command buffer carries. Held for the
     /// same reason as `glyph_staging`: the GPU reads the staging buffers long after `begin`
     /// returned, so they must survive to the submit's retirement.
@@ -967,50 +967,80 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             return Ok(());
         }
         let target = self.target_dims();
-        let side = run.side() as f32;
         self.retain(run.atlas());
-        let dev = &self.renderer.gpu.device;
-        let pipe = &self.renderer.text_pipeline;
-        let set = run.atlas().descriptor_set();
-        unsafe {
-            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
-            dev.cmd_bind_descriptor_sets(
-                self.cbuf,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipe.layout,
-                0,
-                std::slice::from_ref(&set),
-                &[],
-            );
-            for (i, g) in run.glyphs().iter().enumerate() {
-                let push = TextPush {
-                    origin: [(origin.x + g.x) as f32, (origin.y + g.y) as f32],
-                    size: [g.w as f32, g.h as f32],
-                    target,
-                    uv_origin: [g.atlas_x as f32 / side, g.atlas_y as f32 / side],
-                    uv_size: [g.w as f32 / side, g.h as f32 / side],
-                    _pad: [0.0, 0.0],
-                    // Toolkit colors are straight-alpha; the glyph material is premultiplied.
-                    color: premultiply(color_for(i)),
-                };
-                dev.cmd_push_constants(
+        if let Some((atlas, _)) = run.color_atlas() {
+            self.retain(&atlas.clone());
+        }
+        // Two passes over the run, one per atlas: a colour glyph samples a different image through
+        // a different fragment stage, and switching both per glyph would cost more than drawing
+        // the run twice. Glyph quads do not overlap, so the reordering is invisible.
+        for want_color in [false, true] {
+            if !run.glyphs().iter().any(|g| g.color == want_color) {
+                continue;
+            }
+            let (atlas, side) = match (want_color, run.color_atlas()) {
+                (false, _) => (run.atlas(), run.side()),
+                (true, Some((atlas, side))) => (atlas, side),
+                // A run cannot carry a colour glyph without the atlas it was placed in.
+                (true, None) => {
+                    debug_assert!(false, "a colour glyph with no colour atlas");
+                    continue;
+                }
+            };
+            let side = side as f32;
+            let dev = &self.renderer.gpu.device;
+            let pipe = if want_color {
+                &self.renderer.text_color_pipeline
+            } else {
+                &self.renderer.text_pipeline
+            };
+            let set = atlas.descriptor_set();
+            unsafe {
+                dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+                dev.cmd_bind_descriptor_sets(
                     self.cbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
                     pipe.layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    as_bytes(&push),
+                    std::slice::from_ref(&set),
+                    &[],
                 );
-                // One draw per damaged scissor rect: a glyph straddling two damage regions draws in
-                // each, matching the per-rect instancing the other materials do via `draw_quad`.
-                for s in &scissors {
-                    dev.cmd_set_scissor(self.cbuf, 0, std::slice::from_ref(s));
-                    dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
-                    // A glyph quad is far smaller than its scissor (which spans the whole run), so
-                    // the glyph's own area is what gets shaded.
-                    synoik_vk::stats::draw(
-                        synoik_vk::stats::DrawSite::Text,
-                        u64::from(g.w) * u64::from(g.h),
+                for (i, g) in run
+                    .glyphs()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.color == want_color)
+                {
+                    let push = TextPush {
+                        origin: [(origin.x + g.x) as f32, (origin.y + g.y) as f32],
+                        size: [g.w as f32, g.h as f32],
+                        target,
+                        uv_origin: [g.atlas_x as f32 / side, g.atlas_y as f32 / side],
+                        uv_size: [g.w as f32 / side, g.h as f32 / side],
+                        _pad: [0.0, 0.0],
+                        // Toolkit colors are straight-alpha; the glyph material is premultiplied.
+                        color: premultiply(color_for(i)),
+                    };
+                    dev.cmd_push_constants(
+                        self.cbuf,
+                        pipe.layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        as_bytes(&push),
                     );
+                    // One draw per damaged scissor rect: a glyph straddling two damage regions
+                    // draws in each, matching the per-rect instancing the other
+                    // materials do via `draw_quad`.
+                    for s in &scissors {
+                        dev.cmd_set_scissor(self.cbuf, 0, std::slice::from_ref(s));
+                        dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+                        // A glyph quad is far smaller than its scissor (which spans the whole run),
+                        // so the glyph's own area is what gets shaded.
+                        synoik_vk::stats::draw(
+                            synoik_vk::stats::DrawSite::Text,
+                            u64::from(g.w) * u64::from(g.h),
+                        );
+                    }
                 }
             }
         }
@@ -1959,7 +1989,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// this, a transient submit failure is *permanently* blank text — the cache key a widget would
     /// have to change to re-bake has no reason to change.
     fn abandon_glyph_copies(&mut self) {
-        if self.glyph_staging.take().is_some() {
+        if !std::mem::take(&mut self.glyph_staging).is_empty() {
             self.renderer.invalidate_glyphs();
         }
     }
@@ -2057,7 +2087,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 let targets = std::iter::once(self.fb.buffer.clone())
                     .chain(self.fb.present.clone())
                     .collect();
-                let glyph_staging = self.glyph_staging.take();
+                let glyph_staging = std::mem::take(&mut self.glyph_staging);
                 // The staging buffers whose copies this command buffer carries. On the
                 // synchronous path below they simply drop after the fence wait; here they have to
                 // outlive a submit nobody is waiting for.
@@ -2101,7 +2131,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&self.cbuf));
             // The wait above proves our recorded glyph copy has executed; the staging can go.
-            self.glyph_staging = None;
+            self.glyph_staging.clear();
         }
         // Reached only on the synchronous branch (the deferred one returned above): the fence is
         // signalled, so the queries are resolved and this does not block. A deferred frame's pair

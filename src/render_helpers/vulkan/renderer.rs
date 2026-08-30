@@ -27,8 +27,8 @@ use synoik_vk::render::{
 use synoik_vk::shaders::{
     BORDER_FRAG, BORDER_VERT, CLIPPED_SOLID_FRAG, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG,
     POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG,
-    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT,
-    TEX_FRAG,
+    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_COLOR_FRAG, TEXT_FRAG,
+    TEXT_VERT, TEX_FRAG,
 };
 use synoik_vk::texture::Texture as SynoikTexture;
 use tracing::warn;
@@ -92,6 +92,10 @@ pub struct VulkanRenderer {
     /// The glyph material (`text.vert`/`text.frag`): samples an R8 coverage atlas at set 0. Used
     /// only when rendering UI chrome into an offscreen (identity transform); see [`TEXT_VERT`].
     pub(super) text_pipeline: Pipeline,
+    /// The colour-glyph material (`text.vert`/`text_color.frag`): samples the premultiplied-RGBA
+    /// colour atlas at set 0, where COLRv1 emoji land. Same layout and push block as
+    /// [`Self::text_pipeline`]; only the fragment stage and the bound image differ.
+    pub(super) text_color_pipeline: Pipeline,
     /// The long-lived text stack (font system + scaler cache) behind [`Self::build_glyph_run`], so
     /// chrome redraws reshape a string without rescanning the system fonts each time.
     text_ctx: synoik_vk::text::TextContext,
@@ -101,6 +105,9 @@ pub struct VulkanRenderer {
     /// The image behind [`text_ctx`](Self::text_ctx)'s residency index, `None` until the first
     /// run. See [`Self::absorb_glyphs`].
     glyph_atlas: Option<GlyphAtlasImage>,
+    /// The colour atlas's image, `None` until the first colour glyph — an RGBA image of the same
+    /// side is four times the bytes, and a session that never shows an emoji should not pay it.
+    color_glyph_atlas: Option<GlyphAtlasImage>,
     /// Newly rasterized glyphs waiting to be copied into [`Self::glyph_atlas`], and the atlas
     /// generation they were placed in.
     ///
@@ -111,6 +118,10 @@ pub struct VulkanRenderer {
     /// coordinates only mean anything in the atlas it was placed in.
     pending_glyphs: Vec<synoik_vk::text::PendingGlyph>,
     pending_glyph_generation: u64,
+    /// The same queue for the colour atlas. Separate because the two images have separate
+    /// generations: growing one must not strand glyphs placed in the other.
+    pending_color_glyphs: Vec<synoik_vk::text::PendingGlyph>,
+    pending_color_glyph_generation: u64,
     /// Bumped whenever the glyph residency is thrown away after a failed upload. Anything holding
     /// a *baked* texture has to notice: a bake that drew blank glyphs is cached under a key its
     /// widget will not change (`ui::widget::BakeCache`), so without this the text stays blank for
@@ -422,6 +433,13 @@ struct GlyphAtlasImage {
     side: u32,
 }
 
+/// The images a shaped run resolved against: always the coverage atlas, plus the colour one when
+/// the run has (or the session has ever had) a colour glyph.
+struct GlyphAtlases {
+    mask: (VkTexture, u32),
+    color: Option<(VkTexture, u32)>,
+}
+
 /// A cached present-blit shadow plus the tick it was last used on (for LRU eviction).
 #[derive(Debug)]
 struct ShadowEntry {
@@ -572,6 +590,16 @@ impl VulkanRenderer {
             sampler,
             std::mem::size_of::<synoik_vk::render::TextPush>() as u32,
         )?;
+        // The colour-glyph material samples the RGBA atlas (set 0), which carries its own colours;
+        // only the tint's alpha applies.
+        let text_color_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            TEXT_VERT,
+            TEXT_COLOR_FRAG,
+            sampler,
+            std::mem::size_of::<synoik_vk::render::TextPush>() as u32,
+        )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(gpu.queue_family)
@@ -599,11 +627,15 @@ impl VulkanRenderer {
             postprocess_pipeline,
             resize_pipeline,
             text_pipeline,
+            text_color_pipeline,
             text_ctx: synoik_vk::text::TextContext::new(),
             glyph_runs: HashMap::new(),
             glyph_atlas: None,
+            color_glyph_atlas: None,
             pending_glyphs: Vec::new(),
             pending_glyph_generation: 0,
+            pending_color_glyphs: Vec::new(),
+            pending_color_glyph_generation: 0,
             text_epoch: 0,
             custom_resize: None,
             custom_close: None,
@@ -952,12 +984,13 @@ impl VulkanRenderer {
             return Ok(run.clone());
         }
 
-        let (shaped, atlas) = self.shape_line(text, px, bold)?;
+        let (shaped, atlases) = self.shape_line(text, px, bold)?;
         let run = GlyphRun::new(
-            atlas.0,
+            atlases.mask.0,
+            atlases.mask.1,
+            atlases.color,
             shaped.glyphs,
             shaped.spans,
-            atlas.1,
             (shaped.baseline, shaped.ascent, shaped.descent),
         );
 
@@ -986,24 +1019,25 @@ impl VulkanRenderer {
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
         let (shaped, pending) = self.text_ctx.shape_paragraph(spans, wrap_px, base_px)?;
-        let (atlas, side) = self.absorb_glyphs(&gpu, pool, pending)?;
+        let atlases = self.absorb_glyphs(&gpu, pool, pending)?;
         Ok(GlyphRun::new(
-            atlas,
+            atlases.mask.0,
+            atlases.mask.1,
+            atlases.color,
             shaped.glyphs,
             shaped.spans,
-            side,
             (shaped.baseline, shaped.ascent, shaped.descent),
         ))
     }
 
-    /// Shape one line and make sure its glyphs are in the atlas image, returning the run and the
-    /// `(atlas, side)` it resolved against.
+    /// Shape one line and make sure its glyphs are in the atlas images, returning the run and the
+    /// atlases it resolved against.
     fn shape_line(
         &mut self,
         text: &str,
         px: f32,
         bold: bool,
-    ) -> Result<(synoik_vk::text::ShapedRun, (VkTexture, u32)), VulkanError> {
+    ) -> Result<(synoik_vk::text::ShapedRun, GlyphAtlases), VulkanError> {
         // Split the disjoint borrows: shaping needs `&mut text_ctx`, uploading needs `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
@@ -1028,12 +1062,43 @@ impl VulkanRenderer {
         gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
         pending: Vec<synoik_vk::text::PendingGlyph>,
-    ) -> Result<(VkTexture, u32), VulkanError> {
-        let side = self.text_ctx.atlas().side();
-        let generation = self.text_ctx.atlas().generation();
+    ) -> Result<GlyphAtlases, VulkanError> {
+        let (color, mask): (Vec<_>, Vec<_>) = pending.into_iter().partition(|g| g.color);
+        let mask_atlas = self.absorb_glyphs_half(gpu, pool, mask, false)?;
+        // The colour image is only created once something is actually going into it.
+        let color_atlas = if color.is_empty() && self.text_ctx.color_atlas().is_empty() {
+            None
+        } else {
+            Some(self.absorb_glyphs_half(gpu, pool, color, true)?)
+        };
+        Ok(GlyphAtlases {
+            mask: mask_atlas,
+            color: color_atlas,
+        })
+    }
 
-        let stale = self
-            .glyph_atlas
+    /// One half of [`Self::absorb_glyphs`], for either atlas.
+    fn absorb_glyphs_half(
+        &mut self,
+        gpu: &Arc<Gpu>,
+        pool: vk::CommandPool,
+        pending: Vec<synoik_vk::text::PendingGlyph>,
+        color: bool,
+    ) -> Result<(VkTexture, u32), VulkanError> {
+        let index = if color {
+            self.text_ctx.color_atlas()
+        } else {
+            self.text_ctx.atlas()
+        };
+        let side = index.side();
+        let generation = index.generation();
+
+        let held = if color {
+            &self.color_glyph_atlas
+        } else {
+            &self.glyph_atlas
+        };
+        let stale = held
             .as_ref()
             .is_none_or(|atlas| atlas.generation != generation);
         if stale {
@@ -1048,12 +1113,16 @@ impl VulkanRenderer {
             // dropped on the way out, but its glyphs were recorded resident when they were
             // rasterized, so a retry finds them "already there", emits nothing to upload, and
             // draws blank once an image finally exists. Throw the residency away on the way out.
-            let made = SynoikTexture::new_coverage_atlas(gpu, pool, side)
-                .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))
-                .and_then(|texture| {
-                    let set = self.make_texture_set(&texture)?;
-                    Ok((texture, set))
-                });
+            let made = if color {
+                SynoikTexture::new_color_atlas(gpu, pool, side)
+            } else {
+                SynoikTexture::new_coverage_atlas(gpu, pool, side)
+            }
+            .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))
+            .and_then(|texture| {
+                let set = self.make_texture_set(&texture)?;
+                Ok((texture, set))
+            });
             let (texture, (desc_pool, set)) = match made {
                 Ok(made) => made,
                 Err(err) => {
@@ -1061,8 +1130,8 @@ impl VulkanRenderer {
                     return Err(err);
                 }
             };
-            // R8 coverage, only ever sampled (never scanned out or read back), so the fourcc is
-            // informational; R8 names the byte layout honestly.
+            // Only ever sampled (never scanned out or read back), so the fourcc is informational;
+            // these name the byte layout honestly.
             let texture = VkTexture::new(
                 gpu.clone(),
                 texture,
@@ -1070,31 +1139,50 @@ impl VulkanRenderer {
                 set,
                 side,
                 side,
-                Fourcc::R8,
+                if color { Fourcc::Abgr8888 } else { Fourcc::R8 },
                 false,
             );
-            self.glyph_atlas = Some(GlyphAtlasImage {
+            let image = Some(GlyphAtlasImage {
                 texture,
                 generation,
                 side,
             });
+            if color {
+                self.color_glyph_atlas = image;
+            } else {
+                self.glyph_atlas = image;
+            }
             // Cached runs stay *correct* — each holds the image it was built against — but
             // keeping them would pin the old atlas for as long as the cache lives. Dropping
             // them lets it go; they rebuild against the new one on demand.
             self.glyph_runs.clear();
         }
 
-        let atlas = self.glyph_atlas.as_ref().expect("just ensured");
+        let atlas = if color {
+            self.color_glyph_atlas.as_ref()
+        } else {
+            self.glyph_atlas.as_ref()
+        }
+        .expect("just ensured");
+        let atlas = (atlas.texture.clone(), atlas.side);
         if !pending.is_empty() {
+            let (queue, queued_generation) = if color {
+                (
+                    &mut self.pending_color_glyphs,
+                    &mut self.pending_color_glyph_generation,
+                )
+            } else {
+                (&mut self.pending_glyphs, &mut self.pending_glyph_generation)
+            };
             debug_assert!(
-                self.pending_glyphs.is_empty() || self.pending_glyph_generation == generation,
+                queue.is_empty() || *queued_generation == generation,
                 "queued glyphs from another atlas generation — their coordinates are meaningless \
                  in this image"
             );
-            self.pending_glyph_generation = generation;
-            self.pending_glyphs.extend(pending);
+            *queued_generation = generation;
+            queue.extend(pending);
         }
-        Ok((atlas.texture.clone(), atlas.side))
+        Ok(atlas)
     }
 
     /// Copy every queued glyph into the atlas image, in **one** submit, and clear the queue.
@@ -1113,7 +1201,7 @@ impl VulkanRenderer {
     /// Whether any glyph is queued but not yet in the atlas image. For the assertion in
     /// `render_glyphs_with` that nothing shaped text after this frame began.
     pub(super) fn has_pending_glyphs(&self) -> bool {
-        !self.pending_glyphs.is_empty()
+        !self.pending_glyphs.is_empty() || !self.pending_color_glyphs.is_empty()
     }
 
     /// See [`Self::text_epoch`](#structfield.text_epoch). Changes only when glyph residency was
@@ -1128,40 +1216,61 @@ impl VulkanRenderer {
     /// from them drew blanks.
     pub(super) fn invalidate_glyphs(&mut self) {
         self.text_ctx.atlas_mut().invalidate();
+        self.text_ctx.color_atlas_mut().invalidate();
         self.glyph_runs.clear();
         self.pending_glyphs.clear();
+        self.pending_color_glyphs.clear();
         self.text_epoch = self.text_epoch.wrapping_add(1);
     }
 
     pub(super) fn flush_glyph_uploads(&mut self) {
-        if self.pending_glyphs.is_empty() {
-            return;
+        // Both halves attempt their upload before either failure is acted on: `invalidate_glyphs`
+        // throws away the residency of *both* atlases, so bailing out after the first would leave
+        // the second's queue holding glyphs whose slots no longer exist.
+        let failed = [false, true].map(|color| self.flush_glyph_uploads_half(color).is_err());
+        if failed.iter().any(|f| *f) {
+            // The index still claims these glyphs are resident. Forget the lot: the next shape
+            // re-rasterizes them, the generation bump recreates the image, and the text that drew
+            // blank is re-baked rather than staying blank for the life of its cache entry.
+            self.invalidate_glyphs();
         }
-        let pending = std::mem::take(&mut self.pending_glyphs);
-        let Some(atlas) = self.glyph_atlas.as_ref() else {
+    }
+
+    fn flush_glyph_uploads_half(&mut self, color: bool) -> Result<(), ()> {
+        let Self {
+            gpu,
+            command_pool,
+            glyph_atlas,
+            color_glyph_atlas,
+            pending_glyphs,
+            pending_color_glyphs,
+            ..
+        } = self;
+        let (held, queue) = if color {
+            (&*color_glyph_atlas, pending_color_glyphs)
+        } else {
+            (&*glyph_atlas, pending_glyphs)
+        };
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(queue);
+        let Some(atlas) = held else {
             // Glyphs are only queued after the image is ensured, so this cannot happen; drop them
             // rather than panic, and rebuild the residency so nothing is silently missing.
             debug_assert!(false, "glyphs queued with no atlas image to put them in");
-            self.invalidate_glyphs();
-            return;
+            return Err(());
         };
 
         let regions: Vec<_> = pending
             .iter()
             .map(synoik_vk::text::PendingGlyph::region)
             .collect();
-        let result =
-            atlas
-                .texture
-                .inner()
-                .upload_coverage_regions(&self.gpu, self.command_pool, &regions);
-        if let Err(err) = result {
-            warn!("glyph atlas upload failed, rebuilding the atlas: {err:#}");
-            // The index still claims these glyphs are resident. Forget the lot: the next shape
-            // re-rasterizes them, the generation bump recreates the image, and the text that drew
-            // blank is re-baked rather than staying blank for the life of its cache entry.
-            self.invalidate_glyphs();
-        }
+        atlas
+            .texture
+            .inner()
+            .upload_coverage_regions(gpu, *command_pool, &regions)
+            .map_err(|err| warn!("glyph atlas upload failed, rebuilding the atlas: {err:#}"))
     }
 
     /// Fold the queued glyph copies into `cbuf` — a frame's own command buffer, before its render
@@ -1185,15 +1294,47 @@ impl VulkanRenderer {
     pub(super) fn record_pending_glyph_uploads(
         &mut self,
         cbuf: vk::CommandBuffer,
-    ) -> Option<synoik_vk::texture::GlyphStaging> {
-        if self.pending_glyphs.is_empty() {
-            return None;
+    ) -> Vec<synoik_vk::texture::GlyphStaging> {
+        let mut staged = Vec::new();
+        let mut failed = false;
+        for color in [false, true] {
+            match self.record_pending_glyph_uploads_half(cbuf, color) {
+                Ok(Some(one)) => staged.push(one),
+                Ok(None) => {}
+                Err(()) => failed = true,
+            }
         }
-        let pending = std::mem::take(&mut self.pending_glyphs);
-        let Some(atlas) = self.glyph_atlas.as_ref() else {
-            debug_assert!(false, "glyphs queued with no atlas image to put them in");
+        if failed {
             self.invalidate_glyphs();
-            return None;
+        }
+        staged
+    }
+
+    fn record_pending_glyph_uploads_half(
+        &mut self,
+        cbuf: vk::CommandBuffer,
+        color: bool,
+    ) -> Result<Option<synoik_vk::texture::GlyphStaging>, ()> {
+        let Self {
+            gpu,
+            glyph_atlas,
+            color_glyph_atlas,
+            pending_glyphs,
+            pending_color_glyphs,
+            ..
+        } = self;
+        let (held, queue) = if color {
+            (&*color_glyph_atlas, pending_color_glyphs)
+        } else {
+            (&*glyph_atlas, pending_glyphs)
+        };
+        if queue.is_empty() {
+            return Ok(None);
+        }
+        let pending = std::mem::take(queue);
+        let Some(atlas) = held else {
+            debug_assert!(false, "glyphs queued with no atlas image to put them in");
+            return Err(());
         };
 
         let regions: Vec<_> = pending
@@ -1201,20 +1342,15 @@ impl VulkanRenderer {
             .map(synoik_vk::text::PendingGlyph::region)
             .collect();
         let image = atlas.texture.inner().image;
-        match atlas
-            .texture
-            .inner()
-            .stage_coverage_regions(&self.gpu, &regions)
-        {
-            Ok(None) => None,
+        match atlas.texture.inner().stage_coverage_regions(gpu, &regions) {
+            Ok(None) => Ok(None),
             Ok(Some(staged)) => {
-                synoik_vk::texture::record_coverage_copy(&self.gpu.device, cbuf, image, &staged);
-                Some(staged)
+                synoik_vk::texture::record_coverage_copy(&gpu.device, cbuf, image, &staged);
+                Ok(Some(staged))
             }
             Err(err) => {
                 warn!("glyph atlas staging failed, rebuilding the atlas: {err:#}");
-                self.invalidate_glyphs();
-                None
+                Err(())
             }
         }
     }
@@ -1951,7 +2087,7 @@ struct InFlightSubmit {
     /// ([`VulkanRenderer::record_pending_glyph_uploads`]). Held for the same reason as everything
     /// else here — the copy reads it on the GPU long after the CPU has moved on. It frees itself
     /// when this record is dropped, so neither retirement path has to know it exists.
-    _glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
+    _glyph_staging: Vec<synoik_vk::texture::GlyphStaging>,
     /// The texture-upload staging buffers whose copies this command buffer carries
     /// ([`VulkanRenderer::record_pending_texture_uploads`]). Held for the same reason and freed
     /// the same way as `_glyph_staging`.
@@ -2109,7 +2245,7 @@ impl VulkanRenderer {
         fence: VkSubmitFence,
         held: Vec<VkTexture>,
         targets: Vec<VkTexture>,
-        glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
+        glyph_staging: Vec<synoik_vk::texture::GlyphStaging>,
         texture_staging: Vec<synoik_vk::texture::StagedTexture>,
         blur_chains: Vec<Arc<SharedBlurChain>>,
     ) {
@@ -2595,6 +2731,7 @@ impl Drop for VulkanRenderer {
             self.postprocess_pipeline.destroy(dev);
             self.resize_pipeline.destroy(dev);
             self.text_pipeline.destroy(dev);
+            self.text_color_pipeline.destroy(dev);
             // Custom pipelines' layouts reference the shared sampler set layout, so free them
             // first.
             for pipeline in [&self.custom_resize, &self.custom_close, &self.custom_open]

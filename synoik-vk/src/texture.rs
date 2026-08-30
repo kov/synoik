@@ -1402,8 +1402,22 @@ impl Texture {
         }
     }
 
-    /// A blank R8 coverage image of `side` × `side`, `SAMPLED | TRANSFER_DST` with a NEAREST
-    /// sampler, left in `SHADER_READ_ONLY_OPTIMAL` and zero-filled — the persistent glyph atlas.
+    /// A blank R8 coverage image of `side` × `side` — the persistent glyph atlas.
+    ///
+    /// See [`new_glyph_atlas`](Self::new_glyph_atlas), of which this is the mask half.
+    pub fn new_coverage_atlas(gpu: &Gpu, pool: vk::CommandPool, side: u32) -> Result<Self> {
+        Self::new_glyph_atlas(gpu, pool, side, vk::Format::R8_UNORM)
+    }
+
+    /// A blank premultiplied-RGBA image of `side` × `side` — the colour half of the glyph atlas,
+    /// where COLRv1 emoji land ([`crate::colr`]). Four times the bytes per texel, so it is created
+    /// only once a colour glyph actually appears.
+    pub fn new_color_atlas(gpu: &Gpu, pool: vk::CommandPool, side: u32) -> Result<Self> {
+        Self::new_glyph_atlas(gpu, pool, side, vk::Format::R8G8B8A8_UNORM)
+    }
+
+    /// A blank `side` × `side` glyph atlas in `format`, `SAMPLED | TRANSFER_DST` with a NEAREST
+    /// sampler, left in `SHADER_READ_ONLY_OPTIMAL` and zero-filled.
     ///
     /// Unlike [`from_coverage`](Self::from_coverage) this uploads nothing: glyphs are copied in
     /// afterwards, region by region, by [`upload_coverage_regions`](Self::upload_coverage_regions).
@@ -1413,14 +1427,19 @@ impl Texture {
     /// Zeroing is done with a clear rather than a host copy so no `side`-squared staging buffer is
     /// allocated (2048² would be a 4 MiB mappable blob, the allocation type that pressures the
     /// Venus host).
-    pub fn new_coverage_atlas(gpu: &Gpu, pool: vk::CommandPool, side: u32) -> Result<Self> {
+    fn new_glyph_atlas(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        side: u32,
+        format: vk::Format,
+    ) -> Result<Self> {
         let _timed = crate::stats::creating();
         let device = &gpu.device;
         let mut guard = UploadGuard::new(device);
 
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8_UNORM)
+            .format(format)
             .extent(vk::Extent3D {
                 width: side,
                 height: side,
@@ -1443,7 +1462,7 @@ impl Texture {
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8_UNORM)
+            .format(format)
             .components(vk::ComponentMapping::default())
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }.context("atlas view")?;
@@ -1590,8 +1609,8 @@ impl Texture {
             for r in regions {
                 debug_assert_eq!(
                     r.coverage.len(),
-                    (r.w * r.h) as usize,
-                    "coverage size does not match the region"
+                    (r.w * r.h * r.texel_bytes) as usize,
+                    "bitmap size does not match the region"
                 );
                 std::ptr::copy_nonoverlapping(
                     r.coverage.as_ptr(),
@@ -1637,15 +1656,20 @@ impl Texture {
     }
 }
 
-/// One glyph's coverage bitmap and where it goes in the atlas, for
+/// One glyph's bitmap and where it goes in the atlas, for
 /// [`Texture::upload_coverage_regions`].
 pub struct CoverageRegion<'a> {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// Tightly packed `w * h` R8 coverage.
+    /// Tightly packed `w * h * texel_bytes`: R8 coverage for a mask glyph, premultiplied RGBA for
+    /// a colour one.
     pub coverage: &'a [u8],
+    /// Bytes per texel of the atlas this region targets — 1 or 4. The copy itself counts in
+    /// texels, so this only has to agree with the image's format; it is what makes a region
+    /// destined for the wrong atlas fail here rather than upload garbage.
+    pub texel_bytes: u32,
 }
 
 /// A reusable `HOST_VISIBLE | HOST_COHERENT` staging buffer for repeated transfers, in either

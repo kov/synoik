@@ -443,6 +443,10 @@ impl Texture for VkTexture {
 #[derive(Clone)]
 pub(crate) struct GlyphRun {
     atlas: VkTexture,
+    /// The RGBA colour atlas, present only when the run's shaping had ever produced a colour
+    /// glyph. Glyphs marked `color` sample this one; the rest sample `atlas`.
+    color_atlas: Option<VkTexture>,
+    color_side: u32,
     glyphs: std::sync::Arc<[synoik_vk::text::PlacedGlyph]>,
     /// Source-span index of each glyph, parallel to `glyphs` (see
     /// [`synoik_vk::text::GlyphAtlas`]).
@@ -458,14 +462,21 @@ pub(crate) struct GlyphRun {
 impl GlyphRun {
     pub(crate) fn new(
         atlas: VkTexture,
+        side: u32,
+        color_atlas: Option<(VkTexture, u32)>,
         glyphs: Vec<synoik_vk::text::PlacedGlyph>,
         spans: Vec<u32>,
-        side: u32,
         line_box: (i32, f32, f32),
     ) -> Self {
         let (baseline, ascent, descent) = line_box;
+        let (color_atlas, color_side) = match color_atlas {
+            Some((texture, side)) => (Some(texture), side),
+            None => (None, 1),
+        };
         GlyphRun {
             atlas,
+            color_atlas,
+            color_side,
             glyphs: glyphs.into(),
             spans: spans.into(),
             side,
@@ -486,6 +497,11 @@ impl GlyphRun {
 
     pub(crate) fn atlas(&self) -> &VkTexture {
         &self.atlas
+    }
+
+    /// The colour atlas and its side, for the glyphs marked `color`.
+    pub(crate) fn color_atlas(&self) -> Option<(&VkTexture, u32)> {
+        self.color_atlas.as_ref().map(|t| (t, self.color_side))
     }
 
     pub(crate) fn glyphs(&self) -> &[synoik_vk::text::PlacedGlyph] {

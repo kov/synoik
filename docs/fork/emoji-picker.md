@@ -81,28 +81,30 @@ focus with no text target — switcher, screenshot UI, end-session. It stays liv
 entries (overview search, run dialog, folder/workspace rename), which work for free: `commit_text`
 already routes `ImFocus::Shell` to `commit_into_shell_entry`.
 
-## Emoji render in monochrome, and why color is two problems
+## Colour emoji: routing, then rasterization
 
-Measured 2026-08-30. Emoji do draw today: cosmic-text's fallback lands U+1F600 on **DejaVu Sans**,
-whose outline rasterizes to a 29×29 mask like any letter. What is missing is color, and it takes
-two separate things.
+Emoji draw in colour through two pieces, both built.
 
-**Routing.** `fc-list :charset=1f600` finds Noto Color Emoji, Noto Emoji, DejaVu and Symbola;
-cosmic-text picks DejaVu, and nothing in the shaping asks for an emoji font. Emoji-*presentation*
-sequences have to be steered to Noto Color Emoji — by presentation, not by codepoint range, or
-`☺` and `❣` change appearance in every existing label.
+**Routing.** cosmic-text's Unix fallback list puts `Noto Color Emoji` *after* `DejaVu Sans`, which
+also covers the emoji block — so an emoji shaped with the UI face lands on DejaVu's monochrome
+outline, silently. Text known to be emoji asks for the face by name instead:
+`TextContext::shape_emoji` / `SpanFamily::Emoji` (`synoik-vk/src/text.rs`). Steering the *whole*
+UI's fallback would change how `☺`, `❤` and the other dual-presentation characters render in every
+existing label; getting that right needs per-character presentation itemization, and is not part
+of this feature. Emoji inside ordinary labels therefore stay monochrome for now.
 
-**Rasterization.** Our atlas rasterizes `Source::Outline` into an alpha mask
-(`synoik-vk/src/text.rs:909`). For U+1F600 out of Fedora's `Noto-COLRv1.ttf`, swash 0.2.9 returns
-*nothing* from `Source::ColorOutline` or `Source::ColorBitmap` and a 0×0 mask from
-`Source::Outline` — a COLRv1 glyph's base outline is empty, swash reads the COLR **v0** table only
-(`scale/color.rs`), and Fedora ships no CBDT emoji font. So color means our own COLRv1 rasterizer:
-skrifa's paint traversal into a tiny-skia pixmap, premultiplied, cached in an RGBA atlas beside the
-mask one, with a per-glyph flag choosing the sampler in `text.frag`. tiny-skia has no sweep
-gradient; solid, linear and radial cover Noto, and a sweep falls back to a flat fill.
+**Rasterization.** swash reads the COLR **v0** table only (`scale/color.rs`), and Fedora ships Noto
+Color Emoji as COLRv1 with no bitmap strikes — for U+1F600 it returns nothing from
+`Source::ColorOutline`/`ColorBitmap` and a 0×0 mask from `Source::Outline`, because a COLRv1
+glyph's base outline is empty. So `synoik-vk/src/colr.rs` is ours: skrifa walks the paint graph,
+tiny-skia draws transforms, clip glyphs, clip boxes, layers with every COLR composite mode, and
+solid/linear/radial/sweep brushes into a premultiplied RGBA pixmap.
 
-This is a toolkit capability, not a picker feature: whatever pays for it, every surface that ever
-shows an emoji gets it.
+Those land in a **second atlas** beside the R8 coverage one — its own residency index, its own
+image, its own growth generation, created only once a colour glyph appears (RGBA is 4× the bytes).
+`PlacedGlyph::color` picks which one a glyph samples, and `text_color.frag` samples it: the glyph
+carries its own colours, so only the tint's *alpha* applies, which is what lets a fading label take
+its emoji with it.
 
 ## Data
 
@@ -137,7 +139,8 @@ overlay (`src/ui/hotkey_overlay.rs`).
    `src/emoji.rs`.
 2. ~~**Insertion seam.**~~ `State::insert_text` → shell entry, else the client's text input, else
    clipboard + OSD; driven by `debug-insert-text` and pinned by three conformance tests.
-3. **Color glyphs**, per above: the COLRv1 rasterizer, then the atlas and shader, then routing.
+3. ~~**Colour glyphs.**~~ `synoik-vk/src/colr.rs`, the RGBA atlas beside the mask one,
+   `text_color.frag`, and `SpanFamily::Emoji` routing.
 4. **Caret anchor.** Store `CursorRectangle`, map to global, pointer fallback.
 5. **The grab.** Open/close, the three key clauses above, no `KeyboardFocus` participation. Test that
    the client keeps focus, receives no printable keys, and is left with no stuck key or modifier.
