@@ -212,6 +212,13 @@
       <summary>Move the focus between the floating and tiling layers</summary>
     </key>
 
+    <!-- Shell UI. GNOME has no emoji picker of its own; the chord is macOS's,
+         and it shadows emacs' mark-sexp, which is why it is rebindable. -->
+    <key name="emoji-picker" type="as">
+      <default>['&lt;Control&gt;&lt;Alt&gt;space']</default>
+      <summary>Show the emoji picker</summary>
+    </key>
+
     <!-- Session. `quit` is the hard exit, distinct from the end-session dialog
          gnome-settings-daemon's logout key brings up. -->
     <key name="show-hotkey-overlay" type="as">

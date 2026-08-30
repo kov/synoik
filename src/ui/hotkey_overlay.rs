@@ -329,6 +329,7 @@ fn collect_actions(config: &Config, keybindings: &[GnomeKeybinding]) -> Vec<Acti
         Action::ToggleWindowFloating,
         Action::SwitchFocusBetweenFloatingAndTiling,
         Action::ToggleOverview,
+        Action::ToggleEmojiPicker,
     ]);
 
     // Screenshot is not as important, can omit if not bound.
@@ -569,6 +570,7 @@ fn action_name(action: &Action) -> String {
             String::from("Switch Focus Between Floating and Tiling")
         }
         Action::ToggleOverview => String::from("Open the Overview"),
+        Action::ToggleEmojiPicker => String::from("Show the Emoji Picker"),
         Action::Screenshot(_) => String::from("Take a Screenshot"),
         // Spawn actions are handled structurally in `action_label`; this is only a plain fallback.
         Action::Spawn(args) => {

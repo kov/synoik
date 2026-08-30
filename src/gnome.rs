@@ -2278,6 +2278,7 @@ fn adopted_synoik_keybindings() -> Vec<(String, Action, Vec<String>, Option<Dura
             SwitchFocusBetweenFloatingAndTiling,
             "<Super><Shift>g",
         ),
+        key("emoji-picker", ToggleEmojiPicker, "<Control><Alt>space"),
         key(
             "show-hotkey-overlay",
             ShowHotkeyOverlay,
