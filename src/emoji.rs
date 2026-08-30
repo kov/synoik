@@ -27,7 +27,9 @@ pub struct Emoji {
     pub name: &'static str,
     /// CLDR search keywords.
     pub keywords: Vec<&'static str>,
-    /// Skin-tone spellings, in Unicode's order (light → dark), empty when the emoji takes none.
+    /// Skin-tone spellings in Unicode's order, empty when the emoji takes none. A one-person
+    /// emoji has the five tones, light → dark; a two-person one has every combination of them,
+    /// up to 25.
     pub tones: Vec<&'static str>,
     /// `name` and `keywords` lowercased once, so a search never lowercases the table.
     name_lc: String,

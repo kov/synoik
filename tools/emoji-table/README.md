@@ -21,7 +21,13 @@ cargo run --manifest-path tools/emoji-table/Cargo.toml -- \
 cargo test --workspace emoji::
 ```
 
+`the_table_parses_whole` pins the entry and group counts, so a Unicode bump fails it by design:
+update the numbers in `src/emoji.rs` in the same commit as the regenerated file.
+
 The CLDR version is an argument because CLDR's own files carry `<version number="$Revision$"/>`.
+
+The generated file is a derivative of Unicode and CLDR data and carries their notice in its
+header: © Unicode, Inc., Unicode License v3 (SPDX `Unicode-3.0`).
 
 ## What it checks
 

@@ -76,6 +76,17 @@ fn main() -> ExitCode {
         text,
         "# <group> lines open a group; entries are char, name, keywords (|), tone variants ( )."
     );
+    // Unicode's license asks that the notice travel with derivative data files, and this file is
+    // one — Unicode's names and order, CLDR's keywords.
+    let _ = writeln!(
+        text,
+        "# Derived from Unicode emoji-test.txt and CLDR annotations."
+    );
+    let _ = writeln!(
+        text,
+        "# © Unicode, Inc. Licensed under the Unicode License v3 (SPDX: Unicode-3.0),"
+    );
+    let _ = writeln!(text, "# https://www.unicode.org/license.txt");
     let mut current = usize::MAX;
     for entry in &entries {
         if entry.group != current {
