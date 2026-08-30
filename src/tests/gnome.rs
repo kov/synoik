@@ -6735,6 +6735,178 @@ fn the_caret_rectangle_maps_into_global_coordinates() {
     );
 }
 
+/// A focused client with text input enabled, a `wl_keyboard`, and every event so far drained.
+///
+/// **No input method is connected on purpose.** With one, every key is held pending the engine's
+/// answer and none reach the client — which would make every assertion below pass vacuously. The
+/// grab is about what the client sees, so nothing may stand between the filter and the client.
+fn client_ready_for_picker(f: &mut Fixture) -> super::client::ClientId {
+    let id = f.add_client();
+    let _surface = map_focused_window(f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.client(id).get_keyboard();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).take_focus_events();
+    let _ = f.client(id).text_input_events();
+    id
+}
+
+/// The whole point of the grab: the picker takes keys **without taking focus**, because
+/// `text-input-v3` enter/leave rides `wl_keyboard` focus and every shell-owned `KeyboardFocus`
+/// variant has no surface. A picker that focused itself would disable the text input it exists to
+/// commit into.
+#[test]
+fn the_picker_takes_keys_without_taking_focus() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_picker(&mut f);
+    let focus_before = f.synoik().keyboard_focus.clone();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    f.double_roundtrip(id);
+
+    assert!(f.synoik().emoji_picker.is_open());
+    assert_eq!(
+        f.synoik().keyboard_focus,
+        focus_before,
+        "the client keeps keyboard focus"
+    );
+    assert!(
+        f.client(id).take_focus_events().is_empty(),
+        "and never sees a keyboard leave"
+    );
+    assert!(
+        f.client(id).text_input_events().is_empty(),
+        "so its text input is never left, and stays enabled"
+    );
+
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).take_key_events().is_empty(),
+        "a printable key belongs to the picker, both edges"
+    );
+}
+
+/// Modifier keys go both directions while the picker is up, unlike every other grab here. An
+/// intercepted press returns before `input_forward` and drops the modifier update with it — and
+/// since focus never moves, no keyboard leave will ever come along to clear it.
+#[test]
+fn modifiers_reach_the_client_while_the_picker_is_up() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_picker(&mut f);
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    f.key_press(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTCTRL);
+    f.double_roundtrip(id);
+
+    let keys = f.client(id).take_key_events();
+    assert_eq!(
+        keys,
+        vec![
+            (KEY_LEFTCTRL, WlKeyState::Pressed),
+            (KEY_LEFTCTRL, WlKeyState::Released),
+        ],
+        "Ctrl must not stick in the client, got: {keys:?}"
+    );
+}
+
+/// A key the client was already holding when the picker opened keeps its release. Without it a key
+/// autorepeating in a terminal would repeat forever, since Wayland clients repeat themselves.
+///
+/// No snapshot of the held keys is needed for this: `suppressed_keys` is the ledger of what the
+/// compositor swallowed, and a key pressed before the picker opened is not in it.
+#[test]
+fn a_key_held_when_the_picker_opens_still_gets_its_release() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_picker(&mut f);
+
+    f.key_press(KEY_A);
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+
+    let keys = f.client(id).take_key_events();
+    assert_eq!(
+        keys,
+        vec![(KEY_A, WlKeyState::Pressed), (KEY_A, WlKeyState::Released),],
+        "the client saw the press, so it gets the release, got: {keys:?}"
+    );
+}
+
+/// The mirror of the above: a key pressed *while* the picker is up must not leak its release
+/// afterwards, or the client gets a key-up it never saw pressed. Escape closes the picker.
+#[test]
+fn a_key_pressed_under_the_picker_leaks_no_release_after_it_closes() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_picker(&mut f);
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    f.key_press(KEY_A);
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(!f.synoik().emoji_picker.is_open(), "Escape closes it");
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).take_key_events().is_empty(),
+        "neither edge of a key the picker owned reaches the client"
+    );
+}
+
+/// A click closes the picker and is then handled normally — it is a transient overlay, not a modal
+/// one.
+#[test]
+fn a_click_closes_the_picker() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_picker(&mut f);
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    assert!(f.synoik().emoji_picker.is_open());
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+
+    assert!(!f.synoik().emoji_picker.is_open());
+}
+
+/// The picker opens at the anchor slice 4 computes, captured once — a client that keeps editing
+/// underneath must not drag it around.
+#[test]
+fn the_picker_opens_at_the_caret_and_stays_there() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, seen) = client_ready_for_text_with_sink(&mut f);
+
+    f.client(id).set_cursor_rectangle(30, 40, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+    let caret = f.synoik_state().text_caret_rect().unwrap();
+
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    assert_eq!(f.synoik().emoji_picker.anchor(), Some(caret));
+
+    f.client(id).set_cursor_rectangle(300, 400, 2, 20);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+    assert_eq!(
+        f.synoik().emoji_picker.anchor(),
+        Some(caret),
+        "the anchor is the caret as it was when the user asked"
+    );
+}
+
 /// A floating window can sit partly off the working area, and the clipped rectangle's origin
 /// then sits at the working-area edge rather than at the window's. Mapping a caret through that
 /// origin puts it off by however much is cropped away — so the anchor uses the unclamped geometry.

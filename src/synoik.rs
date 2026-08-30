@@ -190,6 +190,7 @@ use crate::synoik_render_elements;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
 use crate::ui::dash::{Dash, DashEntry};
+use crate::ui::emoji_picker::EmojiPicker;
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -1017,6 +1018,10 @@ pub struct Synoik {
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
     pub run_dialog: RunDialog,
+    /// The emoji picker's grab. It is deliberately absent from [`KeyboardFocus`]: the client keeps
+    /// `wl_keyboard` focus so its `text-input-v3` stays enabled, which is what the picker commits
+    /// into. See [`crate::ui::emoji_picker`].
+    pub emoji_picker: EmojiPicker,
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
@@ -8132,6 +8137,7 @@ impl Synoik {
             hotkey_overlay,
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
+            emoji_picker: EmojiPicker::default(),
             end_session_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),

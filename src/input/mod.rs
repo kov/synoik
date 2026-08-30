@@ -69,6 +69,7 @@ use crate::ui::app_grid::{
     FOLDER_PREVIEW_MS, PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
 };
 use crate::ui::dash::DashHit;
+use crate::ui::emoji_picker::PickerKey;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::folder_dialog::{DialogHit, POPDOWN_DIALOG_MS};
 use crate::ui::overview_search::SearchHit;
@@ -942,19 +943,7 @@ impl State {
                     // modifiers without accidentally leaking them to wl_keyboard.enter. So for now
                     // let's forward modifier releases to the clients here to deal with the most
                     // common case.
-                    if !pressed
-                        && matches!(
-                            modified,
-                            Keysym::Shift_L
-                                | Keysym::Shift_R
-                                | Keysym::Control_L
-                                | Keysym::Control_R
-                                | Keysym::Super_L
-                                | Keysym::Super_R
-                                | Keysym::Alt_L
-                                | Keysym::Alt_R
-                        )
-                    {
+                    if !pressed && is_modifier_keysym(modified) {
                         return FilterResult::Forward;
                     } else {
                         return FilterResult::Intercept(None);
@@ -1315,6 +1304,80 @@ impl State {
                     } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
+                        return FilterResult::Forward;
+                    }
+                }
+
+                // The emoji picker takes keys **without taking focus**: it is not a
+                // `KeyboardFocus` variant, so the client still holds `wl_keyboard` and its
+                // `text-input-v3` stays enabled, which is what the picker commits into. Everything
+                // modal above outranks it, which is what makes the bind inert while locked or
+                // under a dialog without a single check here.
+                if this.synoik.emoji_picker.is_open() {
+                    #[allow(non_upper_case_globals)]
+                    if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
+                        modified.raw()
+                    {
+                        if pressed {
+                            let vt = (modified.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
+                            this.backend.change_vt(vt);
+                            this.synoik.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(None);
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        } else {
+                            return FilterResult::Forward;
+                        }
+                    }
+
+                    // **Modifier keys go both directions**, unlike everywhere else here. An
+                    // `Intercept` returns before `input_forward` (smithay `input/keyboard/mod.rs`)
+                    // and so drops the *modifier update* along with the key — and since focus
+                    // never moves, no keyboard leave will ever come along to clear it. A client
+                    // that saw Ctrl go down and never saw it come up holds Ctrl forever.
+                    if is_modifier_keysym(modified) {
+                        return FilterResult::Forward;
+                    }
+
+                    let picker_bind = {
+                        let config = this.synoik.config.borrow();
+                        find_bind(
+                            &this.synoik.gnome_settings.keybindings,
+                            &this.synoik.accel_grabs,
+                            SwitcherGrab::Closed,
+                            key_code,
+                            modified,
+                            raw,
+                            *mods,
+                            config.input.disable_power_key_handling,
+                        )
+                        .filter(|bind| allowed_during_emoji_picker(&bind.action))
+                    };
+                    if let Some(bind) = picker_bind {
+                        if pressed {
+                            this.synoik.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(Some(bind));
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        } else {
+                            return FilterResult::Forward;
+                        }
+                    }
+
+                    if pressed {
+                        if this.synoik.emoji_picker.handle_key(raw) == PickerKey::Close {
+                            this.synoik.queue_redraw_all();
+                        }
+                        this.synoik.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // A key the client was already holding when the picker opened. It saw the
+                        // press, so it gets the release — otherwise a key autorepeating in a
+                        // terminal repeats there forever, since Wayland clients repeat themselves.
+                        // No snapshot of the held keys is needed: `suppressed_keys` is the ledger
+                        // of what *we* swallowed, and this key is not in it.
                         return FilterResult::Forward;
                     }
                 }
@@ -5463,6 +5526,14 @@ impl State {
                     self.synoik.panel_popover.focus_first();
                 }
             }
+            Action::ToggleEmojiPicker => {
+                if !self.synoik.emoji_picker.close() {
+                    // The anchor is read once, here: the caret as it was when the user asked.
+                    let anchor = self.text_anchor_rect();
+                    self.synoik.emoji_picker.open(anchor);
+                }
+                self.synoik.queue_redraw_all();
+            }
             #[cfg(feature = "xdp-gnome-screencast")]
             Action::ToggleScreenRecord => {
                 self.toggle_screen_record();
@@ -8317,6 +8388,13 @@ impl State {
                 self.on_shield_click(pos);
             }
             return;
+        }
+
+        // A click closes the emoji picker, and is then handled normally: it is a transient
+        // overlay, not a modal one, so clicking a window behind it does what clicking a window
+        // does. Slice 6 gives the picker geometry, and a click *inside* it will stop here instead.
+        if button_state == ButtonState::Pressed && self.synoik.emoji_picker.close() {
+            self.synoik.queue_redraw_all();
         }
 
         // A click ends a keyboard grab, and is then handled normally. mutter has no rule for
@@ -11386,6 +11464,45 @@ pub(crate) fn allowed_when_locked(action: &Action) -> bool {
 ///
 /// Without this the menus would be one-way: the grab swallows the key that opened
 /// them, so the *toggle* half of a toggle never arrives.
+/// The keysyms a modifier key produces, which are not modifiers themselves but the keys that set
+/// them — the distinction that matters when deciding whether a client may see a key.
+fn is_modifier_keysym(sym: Keysym) -> bool {
+    matches!(
+        sym,
+        Keysym::Shift_L
+            | Keysym::Shift_R
+            | Keysym::Control_L
+            | Keysym::Control_R
+            | Keysym::Super_L
+            | Keysym::Super_R
+            | Keysym::Alt_L
+            | Keysym::Alt_R
+    )
+}
+
+/// Binds that keep resolving over the emoji picker: the ones a user expects to work whatever is on
+/// screen — GNOME's `ActionMode.ALL` shape. Volume, media and brightness reach here as `Spawn`.
+///
+/// Deliberately *not* `allowed_during_popup`: opening the tray or quick settings over the picker
+/// would put two things on screen fighting for the same keys.
+pub(crate) fn allowed_during_emoji_picker(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Quit(_)
+            | Action::ChangeVt(_)
+            | Action::Suspend
+            | Action::PowerOffMonitors
+            | Action::PowerOnMonitors
+            | Action::Spawn(_)
+            | Action::SpawnSh(_)
+            | Action::ScreenBrightnessUp(_)
+            | Action::ScreenBrightnessDown(_)
+            | Action::ScreenBrightnessCycle(_)
+            // The bind that opened it closes it, as every other toggle does.
+            | Action::ToggleEmojiPicker
+    )
+}
+
 pub(crate) fn allowed_during_popup(action: &Action) -> bool {
     matches!(
         action,

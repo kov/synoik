@@ -1,7 +1,7 @@
 # Emoji picker
 
-**Status: the data, the insertion seam, colour glyphs and the caret anchor are built; no UI yet.** A shell-owned emoji picker on
-`<Control><Alt>space`, macOS style: it opens over whatever has focus, and picking inserts the
+**Status: everything but the UI, the recents and the keybinding is built.** A shell-owned emoji
+picker on `<Control><Alt>space`, macOS style: it opens over whatever has focus, and picking inserts the
 character into that client without the client ever losing focus.
 
 **This is an addition, not a port.** GNOME has no shell-level emoji picker and no such binding —
@@ -64,9 +64,9 @@ as if it were on the toplevel. Every client in the coverage table puts its entri
 ## The grab: keys without focus
 
 `text-input-v3` enter/leave rides `wl_keyboard` focus, and every shell-owned `KeyboardFocus` variant
-returns `surface() == None` (`src/synoik.rs:1781`). So the picker **must not appear in
+returns `surface() == None` (`src/synoik.rs:1781`). So the picker **does not appear in
 `update_keyboard_focus` at all**: the client keeps `wl_keyboard` focus, and the picker intercepts
-keys in the input filter instead.
+keys from the input filter instead (`src/input/mod.rs`, the arm after the panel popover's).
 
 `FilterResult::Intercept` returns before `input_forward` (smithay `input/keyboard/mod.rs:971`), so an
 intercepted key delivers neither the key *nor* the modifier update to the client. Three clauses keep
@@ -75,26 +75,32 @@ the client's view of the keyboard truthful:
 1. **Presses are intercepted** — the picker owns them.
 2. **Releases of keys the client already holds are forwarded.** A key held when the picker opens
    (autorepeating in a terminal) would otherwise repeat forever, since Wayland clients repeat
-   themselves. `forwarded_pressed_keys` is `pub(crate)` in smithay, so snapshot
-   `KeyboardHandle::pressed_keys()` minus `suppressed_keys` at open and forward releases for that
-   set.
-3. **Modifier keys are forwarded both directions**, so Ctrl/Alt never stick. The opening chord needs
-   no special case: the client saw the Ctrl/Alt presses before the bind fired, and clause 3 delivers
-   their releases.
+   themselves. This needs no snapshot of the held keys: `suppressed_keys` is the ledger of what the
+   compositor swallowed, so `pressed → insert` / `release found → intercept` / `release not found →
+   forward` — the idiom every modal arm here already uses — *is* the rule.
+3. **Modifier keys are forwarded both directions**, so Ctrl/Alt never stick. This is where the
+   picker differs from every other grab in the filter, which forward modifier releases only: those
+   move focus, and a keyboard leave releases every key client-side. Nothing moves focus here. The
+   opening chord needs no special case: the client saw the Ctrl/Alt presses before the bind fired,
+   and clause 3 delivers their releases.
 
-Bindings that make sense over a picker (volume, media, brightness) still resolve, through the
-existing `allowed_during_popup` filter shape (`src/input/mod.rs:1293`). A click on another window
-closes the picker and then proceeds normally.
+Bindings that make sense over a picker (volume, media, brightness — all `Spawn` here) still resolve,
+through `allowed_during_emoji_picker`, GNOME's `ActionMode.ALL` shape. Deliberately *not*
+`allowed_during_popup`: opening the tray or quick settings over the picker would put two things on
+screen fighting for the same keys. A click on another window closes the picker and then proceeds
+normally.
 
 **The search entry does not use the IM.** Routing it through `im_offer_shell_key` would make it a
 `ShellEntry`, and `sync_im_focus` (`mod.rs:578`) would move `ImFocus` off `Client` and reset the
 engine — the very focus we are protecting. Plain `key_char` editing over `ui::text_edit::TextEdit`;
 no dead keys in the search box, which costs nothing for ASCII emoji names.
 
-**Where the bind is inert:** while locked (`is_locked()`), and while any modal `KeyboardFocus` owns
-focus with no text target — switcher, screenshot UI, end-session. It stays live over the shell's own
-entries (overview search, run dialog, folder/workspace rename), which work for free: `commit_text`
-already routes `ImFocus::Shell` to `commit_into_shell_entry`.
+**Where the bind is inert:** every modal arm sits above the picker's in the filter, so the picker is
+outranked by the lock shield, the run/end-session/polkit dialogs, a keyboard move-resize grab and a
+panel popover without a single check of its own.
+
+**Key repeat inside the picker** (arrows and backspace in the search entry) comes with the UI:
+`arm_key_repeat` grows a `RepeatKey` variant then.
 
 ## Colour emoji: routing, then rasterization
 
@@ -157,8 +163,8 @@ overlay (`src/ui/hotkey_overlay.rs`).
 3. ~~**Colour glyphs.**~~ `synoik-vk/src/colr.rs`, the RGBA atlas beside the mask one,
    `text_color.frag`, and `SpanFamily::Emoji` routing.
 4. ~~**Caret anchor.**~~ `State::text_anchor_rect`, per the placement section above.
-5. **The grab.** Open/close, the three key clauses above, no `KeyboardFocus` participation. Test that
-   the client keeps focus, receives no printable keys, and is left with no stuck key or modifier.
+5. ~~**The grab.**~~ `src/ui/emoji_picker.rs`, `Action::ToggleEmojiPicker`, and the filter arm
+   described above.
 6. **UI.** Grid, category rail, search entry, hover/keyboard selection, tone popover; chrome from
    `docs/fork/gnome-style-reference.md`.
 7. **Recents**, per the round-trip rule above.

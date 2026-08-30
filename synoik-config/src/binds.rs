@@ -412,6 +412,9 @@ pub enum Action {
     /// GNOME's `toggle-quick-settings` (`<Super>s`): the quick settings menu
     /// (`Panel.toggleQuickSettings`, `js/ui/panel.js:607`).
     ToggleQuickSettings,
+    /// The emoji picker (`<Control><Alt>space`). An addition, not a port: GNOME has no
+    /// shell-level picker. See `docs/fork/emoji-picker.md`.
+    ToggleEmojiPicker,
     ToggleScreenRecord,
     OpenOverview,
     CloseOverview,
