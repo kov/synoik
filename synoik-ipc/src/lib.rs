@@ -1119,6 +1119,15 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long, default_value = "none"))]
         warning: String,
     },
+    /// Type text into whatever is focused, the way the emoji picker will.
+    ///
+    /// Drives the real insertion seam -- the focused shell entry, else the client's
+    /// `text-input-v3`, else the clipboard -- so what a test or a live probe exercises is the
+    /// path an emoji takes, without a picker existing yet. See `docs/fork/emoji-picker.md`.
+    DebugInsertText {
+        /// The text to insert, e.g. an emoji.
+        text: String,
+    },
     /// Unplug a headless display, or plug a previously unplugged one back in.
     ///
     /// A headless run has no cable to pull, and what a display going away and coming back costs

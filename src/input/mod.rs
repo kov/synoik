@@ -3573,6 +3573,14 @@ impl State {
                 warn!("deadline dispatch is now {}", if on { "on" } else { "off" });
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugInsertText(text) => match self.insert_text(&text) {
+                crate::input_method::TextInsertion::Committed => {
+                    warn!("inserted {text:?} into the focused text field")
+                }
+                crate::input_method::TextInsertion::Copied => {
+                    warn!("nothing focused can receive text; copied {text:?}")
+                }
+            },
             Action::DebugToggleOutput(connector) => {
                 let crate::backend::Backend::Headless(headless) = &mut self.backend else {
                     warn!("debug-toggle-output only works on the headless backend");

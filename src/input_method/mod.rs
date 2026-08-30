@@ -161,6 +161,22 @@ pub enum ImFocus {
     Shell(ShellEntry),
 }
 
+/// Where [`State::insert_text`] managed to put the text.
+///
+/// Not every client can be typed into: `text-input-v3` is a Wayland protocol the client has to
+/// implement and enable, and kitty, alacritty and every Xwayland client do not. There is no
+/// key-synthesis fallback that would reach them — mutter's virtual device resolves a keyval only
+/// to a keycode already in the keymap (`meta-virtual-input-device-native.c:468`), so GNOME's own
+/// emoji-to-X11 path drops the character rather than typing it. The clipboard is the honest
+/// second-best, and the caller says so out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextInsertion {
+    /// Typed into the focused client, or into the shell entry that had the key focus.
+    Committed,
+    /// Put on the clipboard, because nothing focused could receive text.
+    Copied,
+}
+
 /// Whether a keysym can *begin* a composition while producing no character of its own.
 ///
 /// This is the whole point of the feature and the easiest thing to miss: `dead_acute.key_char()`
@@ -1095,6 +1111,51 @@ impl State {
             crate::utils::get_monotonic_time().as_millis() as u32,
             false,
         );
+    }
+
+    /// Put `text` wherever the user is typing: the focused shell entry, else the focused client,
+    /// else the clipboard.
+    ///
+    /// The seam the emoji picker inserts through, and the reason it never takes keyboard focus —
+    /// `text-input-v3` enter/leave rides `wl_keyboard` focus, so a picker that focused itself
+    /// would have nothing left to commit into (`docs/fork/emoji-picker.md`).
+    ///
+    /// Shell entries come first because they hold the key focus while they are up, which is what
+    /// took it from the client in the first place.
+    pub fn insert_text(&mut self, text: &str) -> TextInsertion {
+        if text.is_empty() {
+            return TextInsertion::Committed;
+        }
+
+        if let Some(entry) = self.shell_im_entry() {
+            self.commit_into_shell_entry(entry, text);
+            return TextInsertion::Committed;
+        }
+
+        // Asking the same handle the commit goes through, rather than our own view of the
+        // client's state: `client_enabled` is only as fresh as the last `sync_im_focus`, and it
+        // is `None` altogether on a seat with no input method running.
+        let mut active = false;
+        self.synoik
+            .seat
+            .text_input()
+            .with_active_text_input(|_, _| active = true);
+        if active {
+            self.commit_text(text);
+            return TextInsertion::Committed;
+        }
+
+        self.set_clipboard_text(text.to_owned());
+        // No emoji in the label: our glyph atlas rasterizes outlines into an alpha mask, and
+        // Fedora's Noto Color Emoji is COLRv1, whose base outlines are empty — the label would
+        // render blank.
+        self.synoik.osd.show_all(
+            &["edit-copy-symbolic"],
+            Some("Copied to clipboard"),
+            crate::ui::osd::OsdLevel::none(),
+        );
+        self.synoik.queue_redraw_all();
+        TextInsertion::Copied
     }
 
     /// Send finished text to the focused client.

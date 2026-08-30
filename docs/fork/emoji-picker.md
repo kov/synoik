@@ -1,8 +1,8 @@
 # Emoji picker
 
-**Status: designed, nothing built.** A shell-owned emoji picker on `<Control><Alt>space`, macOS
-style: it opens over whatever has focus, and picking inserts the character into that client without
-the client ever losing focus.
+**Status: the data and the insertion seam are built; no UI yet.** A shell-owned emoji picker on
+`<Control><Alt>space`, macOS style: it opens over whatever has focus, and picking inserts the
+character into that client without the client ever losing focus.
 
 **This is an addition, not a port.** GNOME has no shell-level emoji picker and no such binding —
 GTK's `Ctrl+.` chooser is per-widget, inside the app. What we reuse from GNOME is the *delivery
@@ -81,15 +81,31 @@ focus with no text target — switcher, screenshot UI, end-session. It stays liv
 entries (overview search, run dialog, folder/workspace rename), which work for free: `commit_text`
 already routes `ImFocus::Shell` to `commit_into_shell_entry`.
 
+## Color emoji do not render yet
+
+Measured 2026-08-30: our glyph atlas rasterizes `Source::Outline` into an alpha mask
+(`synoik-vk/src/text.rs:909`), and for U+1F600 out of Fedora's `Noto-COLRv1.ttf` swash 0.2.9
+returns *nothing* from `Source::ColorOutline` or `Source::ColorBitmap`, and a 0×0 mask from
+`Source::Outline` — a COLRv1 glyph's base outline is empty. swash reads the COLR **v0** table only
+(`scale/color.rs`), and Fedora ships no CBDT emoji font. So the picker's grid draws blank today.
+
+The system's other emoji font, `NotoEmoji-Regular.ttf`, is monochrome outlines and rasterizes fine
+(33×34 mask at 32 px), so a monochrome grid needs no renderer work at all.
+
+Color needs a COLRv1 rasterizer feeding an RGBA glyph path — skrifa's paint traversal into a
+software rasterizer, cached in a color atlas beside the mask one. It is a toolkit capability, not a
+picker feature: whatever pays for it, every surface that ever shows an emoji gets it.
+
 ## Data
 
 A generated table, **vendored in-tree and never fetched at build time**, from Unicode's
 `emoji-test.txt` (order, groups, names) plus CLDR annotations (search keywords). The fetch is a
-manual `xtask` step, exactly as GNOME treats `data/update-osk-layouts.sh` — note GNOME's
-`emoji.json` is generated and not in its tree, so there is nothing to copy.
+manual step run by `tools/emoji-table`, exactly as GNOME treats `data/update-osk-layouts.sh` — note
+GNOME's `emoji.json` is generated and not in its tree, so there was nothing to copy.
 
-Keywords are the point: "party", "thumbs", "joy" must all hit. Skin tone is one global preference
-plus a per-emoji variant popover, as in `EmojiSelection` (`js/ui/keyboard.js:862`).
+Keywords are the point: "hello", "yay" and "lol" hit nothing in Unicode names. Skin tone is one
+global preference plus a per-emoji variant popover, as in `EmojiSelection`
+(`js/ui/keyboard.js:862`).
 
 ## Recents
 
@@ -109,15 +125,15 @@ overlay (`src/ui/hotkey_overlay.rs`).
 
 ## Slices
 
-1. **Data + generator.** `xtask` producing the vendored table; search index and its unit tests.
-2. **Insertion seam.** Public wrapper over `commit_text`, clipboard+OSD fallback, and a
-   `debug-emoji-insert <char>` IPC action. Conformance test: the test client asserts
-   `TextInputEvent::CommitString` (`src/tests/client.rs:1730`), and a second asserts the clipboard
-   path when no text input is active.
-3. **Caret anchor.** Store `CursorRectangle`, map to global, pointer fallback.
-4. **The grab.** Open/close, the three key clauses above, no `KeyboardFocus` participation. Test that
+1. ~~**Data + generator.**~~ `tools/emoji-table` and `resources/emoji-table.txt`, read by
+   `src/emoji.rs`.
+2. ~~**Insertion seam.**~~ `State::insert_text` → shell entry, else the client's text input, else
+   clipboard + OSD; driven by `debug-insert-text` and pinned by three conformance tests.
+3. **Color glyphs**, per above — or the decision to ship monochrome first.
+4. **Caret anchor.** Store `CursorRectangle`, map to global, pointer fallback.
+5. **The grab.** Open/close, the three key clauses above, no `KeyboardFocus` participation. Test that
    the client keeps focus, receives no printable keys, and is left with no stuck key or modifier.
-5. **UI.** Grid, category rail, search entry, hover/keyboard selection, tone popover; chrome from
+6. **UI.** Grid, category rail, search entry, hover/keyboard selection, tone popover; chrome from
    `docs/fork/gnome-style-reference.md`.
-6. **Recents**, per the round-trip rule above.
-7. **Keybinding** + hotkey overlay.
+7. **Recents**, per the round-trip rule above.
+8. **Keybinding** + hotkey overlay.

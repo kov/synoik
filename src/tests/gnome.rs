@@ -6641,6 +6641,120 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
     );
 }
 
+// ---- Inserting text without focus (`docs/fork/emoji-picker.md`) ----
+
+/// Give `f` a mapped, focused client whose text input is enabled and entered.
+///
+/// The internal input method has to exist first: a text input is only told `enter` when something
+/// is acting as the input method, so without it the client never enables and there is nothing to
+/// commit into.
+fn client_ready_for_text(f: &mut Fixture) -> super::client::ClientId {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::TextInputSeat;
+
+    let (to_worker, _requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(crate::input_method::InputMethod::new(to_worker));
+    f.synoik_state()
+        .on_im_update(crate::input_method::ImUpdate::Connected(true));
+
+    let seen: ImSink = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+
+    // Feed the client's state through, as the real sink would.
+    for event in seen.lock().unwrap().drain(..).collect::<Vec<_>>() {
+        f.synoik_state().on_text_input_event(event);
+    }
+    let _ = f.client(id).text_input_events();
+    id
+}
+
+/// The seam the emoji picker will insert through: text goes to the focused client's text input,
+/// as a commit, with no key event anywhere in it.
+///
+/// The picker cannot type its emoji as keys — mutter's own virtual device only resolves a keyval
+/// to a keycode already in the keymap, which no emoji is — so this path is the whole feature.
+#[test]
+fn inserted_text_reaches_the_focused_client_as_a_commit() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = client_ready_for_text(&mut f);
+
+    f.synoik_state()
+        .do_action(Action::DebugInsertText("\u{1f389}".to_owned()), false);
+    f.double_roundtrip(id);
+
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some("\u{1f389}".to_owned()))),
+        "the emoji must arrive as a commit, got: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(ClientEv::Done(_))),
+        "and be sealed with done, got: {events:?}"
+    );
+    assert!(
+        f.client(id).take_key_events().is_empty(),
+        "an insertion is not a keystroke"
+    );
+}
+
+/// A client with no text input cannot be typed into, so the text goes to the clipboard and the
+/// user is told — kitty, alacritty and every Xwayland client land here.
+#[test]
+fn inserted_text_falls_back_to_the_clipboard() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.double_roundtrip(id);
+
+    f.synoik_state()
+        .do_action(Action::DebugInsertText("\u{1f389}".to_owned()), false);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        clipboard_text(&mut f).as_deref(),
+        Some("\u{1f389}"),
+        "with nothing able to receive it, the text is copied"
+    );
+    assert!(
+        f.synoik().osd.is_visible(),
+        "and the fallback says so, or it looks like nothing happened"
+    );
+}
+
+/// A shell entry holding the key focus takes the text itself.
+///
+/// It has to: opening the overview moves keyboard focus off the client, and `text-input-v3`
+/// enter/leave rides that focus, so the client could not receive the commit even if we sent one.
+#[test]
+fn inserted_text_goes_into_a_focused_shell_entry() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    f.synoik_state()
+        .do_action(Action::DebugInsertText("\u{1f389}".to_owned()), false);
+
+    assert_eq!(
+        f.synoik().overview_search.query(),
+        "\u{1f389}",
+        "the overview search entry takes what is inserted while it has the focus"
+    );
+}
+
 /// What the client's committed text-input state lands in before it is pumped into the model.
 type ImSink = std::sync::Arc<std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>>;
 
