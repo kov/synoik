@@ -554,7 +554,7 @@ impl EmojiPicker {
             Some(Keysym::Tab) => {
                 // With no tab latched — mid-search — Shift+Tab walks back into the recents and
                 // Tab forward into the first group, from the notional place between them.
-                let tab = self.current_tab().unwrap_or(1);
+                let tab = self.current_tab().unwrap_or(0);
                 let next = if mods.shift {
                     tab.saturating_sub(1)
                 } else {
@@ -1150,6 +1150,17 @@ mod tests {
         assert!(picker.view.len() > 1, "the search is over the whole table");
         assert_eq!(picker.current_tab(), None, "no tab describes a search");
 
+        // Tab out of a search walks from the notional place before the first tab, so it lands
+        // on the first group and Shift+Tab on the recents — neither skips one.
+        press(&mut picker, Keysym::Tab, false);
+        assert_eq!(picker.current_tab(), Some(1));
+        picker.search.insert_str("cat");
+        picker.rebuild_view();
+        press(&mut picker, Keysym::Tab, true);
+        assert_eq!(picker.current_tab(), Some(0));
+
+        picker.search.insert_str("cat");
+        picker.rebuild_view();
         picker.go_to_tab(0);
         assert!(picker.search.text().is_empty(), "the tab clears the search");
         assert_eq!(picker.view.len(), 1, "and the recents are back");

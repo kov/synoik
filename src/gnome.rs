@@ -4988,6 +4988,26 @@ mod tests {
         );
     }
 
+    /// The emoji picker's history round-trips the real stack — and, where `org.synoik.emoji` is
+    /// installed, this is also what pins ours winning over the GTK import: the write lands in our
+    /// key, and the model that comes back is the one it wrote rather than GTK's.
+    ///
+    /// Skipped on a checkout that has not installed our schemas, which is why the import itself
+    /// is pinned separately (`a_fresh_session_starts_from_gtks_emoji_history`).
+    #[test]
+    fn writer_persists_emoji_recents() {
+        if !schema_available("org.synoik.emoji", Some("recently-used-emoji")) {
+            return;
+        }
+        let mut w = RealWatcher::start();
+        w.writer
+            .set_emoji_recents(vec!["\u{1f44d}\u{1f3fd}".to_owned()]);
+        w.settle(
+            |s| s.emoji_recents == ["\u{1f44d}\u{1f3fd}".to_owned()],
+            "recently-used-emoji",
+        );
+    }
+
     /// The dash's pinned apps round-trip the real stack.
     #[test]
     fn writer_persists_favorite_apps() {
