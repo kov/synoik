@@ -92,6 +92,15 @@ pub struct Headless {
     /// the real clock, on exactly the turns the redraw machinery decided to render.
     #[cfg(test)]
     pub(crate) frame_sink: Option<FrameSink>,
+    /// Where a test may record what the damage tracker asked for, frame by frame.
+    ///
+    /// The damage is otherwise dropped on the floor here — `render_element_states` wants the
+    /// [`RenderElementStates`] and nothing else. But *how much of the output a settled frame asks
+    /// to repaint* is a compositor behavior in its own right, and the only honest place to read it
+    /// is the tracker the compositor actually consulted: a probe that runs a tracker of its own is
+    /// asserting about its own copy. `Some` starts recording; frames append while it stays `Some`.
+    #[cfg(test)]
+    pub(crate) damage_log: Option<Vec<FrameDamage>>,
     /// One damage tracker per output, kept across frames.
     ///
     /// Headless discards the damage it computes — it runs the element pass for the
@@ -129,6 +138,31 @@ pub(crate) type FrameSink = Box<
     ),
 >;
 
+/// What one frame's damage tracker asked the screen to repaint, recorded by
+/// [`Headless::damage_log`].
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct FrameDamage {
+    pub output: String,
+    /// `None` when the tracker found nothing to repaint at all — the cheapest a frame can be, and
+    /// what a settled scene owes.
+    pub damage: Option<Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>>,
+}
+
+#[cfg(test)]
+impl FrameDamage {
+    /// Total damaged area in pixels, counting overlaps once each — the tracker's own rects, not a
+    /// union, because each rect is a repaint the screen is asked for.
+    pub fn area(&self) -> i64 {
+        self.damage.as_ref().map_or(0, |rects| {
+            rects
+                .iter()
+                .map(|r| i64::from(r.size.w) * i64::from(r.size.h))
+                .sum()
+        })
+    }
+}
+
 impl Headless {
     pub fn new() -> Self {
         Self {
@@ -140,6 +174,8 @@ impl Headless {
             dmabuf_global: None,
             #[cfg(test)]
             frame_sink: None,
+            #[cfg(test)]
+            damage_log: None,
             damage_trackers: HashMap::new(),
             unplugged: Vec::new(),
         }
@@ -462,7 +498,16 @@ impl Headless {
             .entry(output.clone())
             .or_insert_with(|| OutputDamageTracker::from_output(output));
         match damage_tracker.damage_output(1, &elements) {
-            Ok((_damage, states)) => states,
+            Ok((_damage, states)) => {
+                #[cfg(test)]
+                if let Some(log) = &mut self.damage_log {
+                    log.push(FrameDamage {
+                        output: output.name(),
+                        damage: _damage.cloned(),
+                    });
+                }
+                states
+            }
             Err(err) => {
                 warn!("error computing headless render element states: {err:?}");
                 RenderElementStates::default()

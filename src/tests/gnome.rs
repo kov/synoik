@@ -1563,7 +1563,7 @@ fn dropping_a_window_on_a_peeked_thumbnail_does_not_switch_to_it() {
 const SCREEN_BUFFERS: usize = 2;
 
 /// A render target that persists across frames, the way a real output's does.
-struct WarmTarget {
+pub(super) struct WarmTarget {
     tracker: smithay::backend::renderer::damage::OutputDamageTracker,
     /// One texture per buffer in the swapchain, drawn round-robin.
     ///
@@ -1578,7 +1578,7 @@ struct WarmTarget {
 }
 
 impl WarmTarget {
-    fn new(out: &Output, buffers: usize) -> Self {
+    pub(super) fn new(out: &Output, buffers: usize) -> Self {
         WarmTarget {
             tracker: smithay::backend::renderer::damage::OutputDamageTracker::from_output(out),
             textures: Vec::new(),
@@ -1607,7 +1607,7 @@ impl WarmTarget {
 /// validation layer sees. Frames that only need to advance the tracker must not copy, and a frame
 /// that does copy has to be healed (see [`probe_frame`]) before the next incremental one, or the
 /// probe reports its own contamination as a missing repaint.
-fn draw_into(
+pub(super) fn draw_into(
     renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
     target: &mut WarmTarget,
     size: Size<i32, Physical>,
@@ -11002,7 +11002,7 @@ fn setup_two_desktops_in_overview_on(
 ///
 /// The trigger is instant but the slide is not, and `run_frames_for` deliberately leaves the
 /// clock frozen — a test that reads geometry without waiting sees a strip at progress ~0.
-fn summon_peek(f: &mut Fixture) {
+pub(super) fn summon_peek(f: &mut Fixture) {
     f.key_press(KEY_LEFTMETA);
     f.key_press(KEY_LEFTSHIFT);
     f.run_frames_for(PEEK_SETTLE);

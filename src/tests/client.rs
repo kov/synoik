@@ -1006,7 +1006,30 @@ impl Window {
     /// runs — required to exercise resize/close animations and the shm texture cache. Uses `wl_shm`
     /// `Argb8888` (0xAARRGGBB little-endian ⇒ bytes `[B, G, R, A]`).
     pub fn attach_shm_buffer(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
-        self.attach_shm_buffer_with_format(w, h, [b, g, r, a], wl_shm::Format::Argb8888);
+        self.attach_shm_buffer_with_format(w, h, [b, g, r, a], wl_shm::Format::Argb8888, None);
+    }
+
+    /// As [`Self::attach_shm_buffer`], but with `rgba` as one array and reporting damage over
+    /// `damage` (`x, y, w, h` in buffer coordinates) instead of the whole surface.
+    ///
+    /// A client that repaints a corner of itself says so, and what the compositor does with that
+    /// is a behavior in its own right — a full-damage attach cannot tell a frame that repaints
+    /// what changed from one that repaints the screen. See [`super::peek_damage`].
+    pub fn attach_shm_buffer_damaging(
+        &self,
+        w: i32,
+        h: i32,
+        rgba: [u8; 4],
+        damage: (i32, i32, i32, i32),
+    ) {
+        let [r, g, b, a] = rgba;
+        self.attach_shm_buffer_with_format(
+            w,
+            h,
+            [b, g, r, a],
+            wl_shm::Format::Argb8888,
+            Some(damage),
+        );
     }
 
     /// As [`Self::attach_shm_buffer`], but a `wl_shm` `Abgr8888` buffer with `[R, G, B, A]` memory
@@ -1014,16 +1037,18 @@ impl Window {
     /// re-import: Argb/Abgr map to different VkFormats, so a wrong same-size cache reuse would
     /// sample the new bytes through the old view and swap R↔B (red would read back as blue).
     pub fn attach_shm_buffer_abgr(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
-        self.attach_shm_buffer_with_format(w, h, [r, g, b, a], wl_shm::Format::Abgr8888);
+        self.attach_shm_buffer_with_format(w, h, [r, g, b, a], wl_shm::Format::Abgr8888, None);
     }
 
     /// Attach a `w`×`h` shm buffer tiling the 4-byte `texel` (already in `format`'s memory order).
+    /// `damage` is the buffer-coordinate rect to report; `None` damages the whole buffer.
     fn attach_shm_buffer_with_format(
         &self,
         w: i32,
         h: i32,
         texel: [u8; 4],
         format: wl_shm::Format,
+        damage: Option<(i32, i32, i32, i32)>,
     ) {
         use std::io::Write as _;
         use std::os::fd::{AsFd, OwnedFd};
@@ -1045,7 +1070,8 @@ impl Window {
         let pool = shm.create_pool(fd.as_fd(), size as i32, &self.qh, ());
         let buffer = pool.create_buffer(0, w, h, stride, format, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, w, h);
+        let (dx, dy, dw, dh) = damage.unwrap_or((0, 0, w, h));
+        self.surface.damage_buffer(dx, dy, dw, dh);
         pool.destroy();
     }
 

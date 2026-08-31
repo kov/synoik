@@ -51,6 +51,7 @@ mod floating;
 mod fullscreen;
 mod gnome;
 mod layer_shell;
+mod peek_damage;
 mod perf_probe;
 mod producer_sync;
 mod remove_output;
