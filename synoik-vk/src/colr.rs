@@ -559,6 +559,11 @@ mod tests {
     /// Read straight off the filesystem rather than through fontconfig: these tests are about the
     /// rasterizer, and a runner whose `Noto Color Emoji` resolves to the monochrome face would
     /// otherwise report a font-packaging difference as a rasterizer bug.
+    ///
+    /// The `COLR` table is part of that test and not a formality. Debian and Ubuntu ship
+    /// `NotoColorEmoji.ttf` as embedded bitmaps (`CBDT`/`CBLC`) under the same name Fedora uses for
+    /// its COLRv1 build, so taking the first file that opens finds a font whose every glyph
+    /// rasterizes to nothing here — which reads exactly like the rasterizer being broken.
     fn emoji_font() -> Option<Vec<u8>> {
         [
             "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
@@ -566,7 +571,13 @@ mod tests {
             "/usr/share/fonts/noto/NotoColorEmoji.ttf",
         ]
         .into_iter()
-        .find_map(|path| std::fs::read(path).ok())
+        .filter_map(|path| std::fs::read(path).ok())
+        .find(|data| {
+            FontRef::new(data).is_ok_and(|font| {
+                font.table_data(skrifa::raw::types::Tag::new(b"COLR"))
+                    .is_some()
+            })
+        })
     }
 
     fn glyph_for(data: &[u8], ch: char) -> u16 {
