@@ -249,6 +249,11 @@ pub mod style {
     /// lighten-vs-darken *direction* is per-widget (read from the SCSS cascade); this
     /// is the standard lighten used by menu rows / QS tiles / calendar days.
     pub const HOVER_WASH: Rgba = [1., 1., 1., 0.1];
+    /// The stronger wash marking the one thing that is *current* — a selected grid cell, a
+    /// latched tab — where a hovered sibling right beside it carries [`HOVER_WASH`]. Both wash
+    /// the same direction, so selection has to read heavier than hover or the two are the same
+    /// highlight and the user cannot tell which cell Enter takes.
+    pub const SELECTED_WASH: Rgba = [1., 1., 1., 0.18];
     /// `$borders_color` = `transparentize($fg_color, 0.9)` (white @ 10%, dark theme) — the 1px
     /// rule color for the calendar column separator (`.message-list` border-right,
     /// `_message-list.scss:8`) and the QS group separators

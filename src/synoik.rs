@@ -1025,6 +1025,17 @@ pub struct Synoik {
     /// Fractional rows of picker scroll not yet spent, so a touchpad's pixels accumulate into
     /// whole rows instead of being rounded away one event at a time.
     pub emoji_picker_scroll: f64,
+    /// Whether the emoji picker is currently forcing the cursor to the arrow, i.e. the pointer
+    /// is over it.
+    pub emoji_picker_owns_cursor: bool,
+    /// The cursor image a client (or smithay's own leave-reset) last asked for, kept so it can
+    /// be put back when a shell overlay stops covering the pointer.
+    ///
+    /// Only the emoji picker needs this. Every other overlay suppresses the window beneath it in
+    /// `contents_under`, so the client sees a pointer leave and re-sets its own cursor on the way
+    /// back out; the picker takes no grab and the window keeps pointer focus, so the client never
+    /// learns the pointer left and would leave our arrow standing over its text field.
+    pub client_cursor_image: CursorImageStatus,
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
@@ -8142,6 +8153,8 @@ impl Synoik {
             run_dialog: RunDialog::new(),
             emoji_picker: EmojiPicker::default(),
             emoji_picker_scroll: 0.,
+            emoji_picker_owns_cursor: false,
+            client_cursor_image: CursorImageStatus::default_named(),
             end_session_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),

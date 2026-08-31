@@ -127,6 +127,15 @@ impl SeatHandler for State {
         if self.synoik.screenshot_ui.is_open() {
             image = CursorImageStatus::Named(self.synoik.screenshot_ui.cursor_icon());
         }
+        // Remembered before the picker's override, so leaving the picker puts back what the
+        // client actually wanted rather than the arrow we substituted for it.
+        self.synoik.client_cursor_image = image.clone();
+        // The emoji picker takes no pointer grab and the window under it keeps pointer focus, so
+        // unlike every other overlay the client can still write this slot while the pointer is
+        // over our panel — an I-beam over the emoji grid. While it owns the pointer, it wins.
+        if self.synoik.emoji_picker_owns_cursor {
+            image = CursorImageStatus::default_named();
+        }
         self.synoik.cursor_manager.set_cursor_image(image);
         // FIXME: more granular
         self.synoik.queue_redraw_all();

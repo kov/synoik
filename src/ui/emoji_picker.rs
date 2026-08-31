@@ -156,6 +156,9 @@ pub struct EmojiPicker {
     /// Position in `view`; meaningless when `view` is empty.
     selected: usize,
     hovered: Option<usize>,
+    /// The rail tab under the pointer. Its own field rather than part of `hovered`: a tab is not
+    /// a cell, and the two can never be hovered at once.
+    hovered_tab: Option<usize>,
     /// First visible row of the grid.
     first_row: usize,
     /// The cell whose skin-tone popover is open, and the position selected inside it.
@@ -211,6 +214,7 @@ impl EmojiPicker {
         });
         self.search.clear();
         self.hovered = None;
+        self.hovered_tab = None;
         self.selected = 0;
         self.first_row = 0;
         self.tone = None;
@@ -611,15 +615,22 @@ impl EmojiPicker {
         )
     }
 
-    /// Track the pointer over the grid. Returns whether anything changed.
+    /// Track the pointer over the grid and the rail. Returns whether anything changed.
     pub fn pointer_motion(&mut self, pos: Point<f64, Logical>) -> bool {
         let hovered = self.cell_at(pos);
-        if hovered == self.hovered {
+        let hovered_tab = self.rail_at(pos);
+        if hovered == self.hovered && hovered_tab == self.hovered_tab {
             return false;
         }
         self.hovered = hovered;
+        self.hovered_tab = hovered_tab;
         self.revision += 1;
         true
+    }
+
+    /// Which rail tab the pointer is over — what the render lights.
+    pub fn hovered_tab(&self) -> Option<usize> {
+        self.hovered_tab
     }
 
     /// Which position in the open tone popover a point falls on.
@@ -731,12 +742,13 @@ impl EmojiPicker {
             let mut cache = self.cache.borrow_mut();
             let cells = self.visible_cells();
             let latched = self.current_tab();
+            let rail_hovered = self.hovered_tab;
             widget::bake_content(
                 renderer,
                 &mut cache,
                 scale,
                 self.revision,
-                |renderer| prepare_panel(renderer, scale, &cells, latched),
+                |renderer| prepare_panel(renderer, scale, &cells, latched, rail_hovered),
                 |frame, phys, prepared| paint_panel(frame, phys, prepared, scale),
             )
         };
@@ -879,6 +891,7 @@ struct Prepared {
     cells: Vec<(usize, bool, bool)>,
     rail: Vec<(usize, ShapedText)>,
     rail_latched: Option<usize>,
+    rail_hovered: Option<usize>,
 }
 
 fn prepare_panel(
@@ -886,6 +899,7 @@ fn prepare_panel(
     scale: f64,
     cells: &[Cell],
     rail_latched: Option<usize>,
+    rail_hovered: Option<usize>,
 ) -> anyhow::Result<(Size<i32, Physical>, Prepared)> {
     let _span = tracy_client::span!("emoji_picker::prepare_panel");
 
@@ -922,6 +936,7 @@ fn prepare_panel(
                 .collect(),
             rail,
             rail_latched,
+            rail_hovered,
         },
     ))
 }
@@ -952,7 +967,7 @@ fn paint_panel(
         let rect = cell_rect(*slot);
         // Selection reads stronger than hover, and one cell can be both.
         let wash = if *selected {
-            widget::style::over(BG, [1., 1., 1., 0.18])
+            widget::style::over(BG, widget::style::SELECTED_WASH)
         } else {
             widget::style::over(BG, widget::style::HOVER_WASH)
         };
@@ -980,8 +995,17 @@ fn paint_panel(
     )?;
     for (tab, shaped) in &prepared.rail {
         let rect = rail_tab_rect(*tab);
-        if prepared.rail_latched == Some(*tab) {
-            p.fill_rounded(rect, 8., widget::style::over(BG, widget::style::HOVER_WASH))?;
+        // The latched tab reads stronger than a hovered one, and one tab can be both — the same
+        // rule the grid cells follow.
+        let wash = if prepared.rail_latched == Some(*tab) {
+            Some(widget::style::SELECTED_WASH)
+        } else if prepared.rail_hovered == Some(*tab) {
+            Some(widget::style::HOVER_WASH)
+        } else {
+            None
+        };
+        if let Some(wash) = wash {
+            p.fill_rounded(rect, 8., widget::style::over(BG, wash))?;
         }
         p.text(
             shaped,
@@ -1050,7 +1074,7 @@ fn paint_tones(
             p.fill_rounded(
                 rect,
                 8.,
-                widget::style::over(widget::style::MENU_BG, [1., 1., 1., 0.18]),
+                widget::style::over(widget::style::MENU_BG, widget::style::SELECTED_WASH),
             )?;
         }
         p.text(
@@ -1081,6 +1105,54 @@ mod tests {
         picker.on_recents = !picker.recents.is_empty();
         picker.rebuild_view();
         picker
+    }
+
+    /// The rail answers the pointer the way the grid does: the tab under it lights, and the
+    /// highlight follows or clears as the pointer moves off.
+    #[test]
+    fn the_rail_tracks_the_pointer() {
+        let mut picker = EmojiPicker::default();
+        picker.open(
+            Rectangle::new(Point::from((100., 100.)), Size::from((0., 0.))),
+            Output::new(
+                "rail".to_owned(),
+                smithay::output::PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: smithay::output::Subpixel::Unknown,
+                    make: String::new(),
+                    model: String::new(),
+                    serial_number: String::new(),
+                },
+            ),
+            Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.))),
+        );
+        let geo = picker.geometry().unwrap();
+        let tab_centre = |tab: usize| {
+            geo.loc
+                + Point::from((
+                    PAD + TAB_W * (tab as f64 + 0.5),
+                    EmojiPicker::HEIGHT - PAD - RAIL_H / 2.,
+                ))
+        };
+
+        assert!(picker.pointer_motion(tab_centre(3)));
+        assert_eq!(picker.hovered_tab(), Some(3));
+        assert_eq!(picker.hovered_index(), None, "a tab is not a cell");
+
+        assert!(!picker.pointer_motion(tab_centre(3)), "no move, no redraw");
+
+        assert!(picker.pointer_motion(tab_centre(4)));
+        assert_eq!(picker.hovered_tab(), Some(4));
+
+        // Into the grid: the tab lets go and a cell takes over.
+        let cell = geo.loc
+            + Point::from((
+                PAD + CELL / 2.,
+                PAD + widget::Entry::HEIGHT + GAP + CELL / 2.,
+            ));
+        assert!(picker.pointer_motion(cell));
+        assert_eq!(picker.hovered_tab(), None);
+        assert_eq!(picker.hovered_index(), Some(0));
     }
 
     /// The history is newest-first with no repeats and a cap, the shape GTK's own chooser keeps

@@ -104,6 +104,15 @@ no dead keys in the search box, which costs nothing for ASCII emoji names.
 outranked by the lock shield, the run/end-session/polkit dialogs, a keyboard move-resize grab and a
 panel popover without a single check of its own.
 
+**It owns the cursor while it covers the pointer**, and it is the only overlay that has to force
+that at the point of *write*. Every other one suppresses the window in `contents_under`, so the
+client gets a pointer leave and stops being able to set the cursor at all; here the window keeps
+pointer focus, so its I-beam would otherwise stand over the emoji grid. `SeatHandler::cursor_image`
+remembers what the client asked for and substitutes the arrow while
+`Synoik::emoji_picker_owns_cursor`; leaving the panel — or closing it under a parked pointer, which
+is why every close goes through `State::close_emoji_picker` — puts the client's own back, since the
+client never saw a leave and will not re-set it by itself.
+
 Keys repeat through `RepeatKey::EmojiPicker`, the same route the shell's other own-drawn surfaces
 take: a Wayland compositor is told about one press per physical key and leaves repeating to the
 client, which does nothing for a surface we draw ourselves.
@@ -135,6 +144,10 @@ show. Tab and Shift+Tab walk them from the keyboard.
 The nine group tabs are positions *within* the table's order, so the rail derives them from the
 selection; the recents tab is a list of its own, so it is state. A search outranks either — it is
 how you leave a tab — and no tab latches while one is up.
+
+A tab lights on hover and the latched one carries the heavier `style::SELECTED_WASH`, the same
+rule the grid cells follow: both wash the same direction, so the current one has to read heavier
+than a hovered neighbour or the user cannot tell which one Enter takes.
 
 The rail indexes the table's own order, so a click **clears the search**: a search result is not in
 that order and an index into it would mean nothing. The latched tab follows the *selection*, not

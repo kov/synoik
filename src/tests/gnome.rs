@@ -7023,6 +7023,78 @@ fn a_click_on_a_cell_picks_it_and_the_window_sees_nothing() {
     assert!(!f.synoik().emoji_picker.is_open());
 }
 
+/// The picker shows the arrow, not whatever the window underneath last asked for.
+///
+/// It is the one overlay that has to force this at the point of *write*: every other one
+/// suppresses the window in `contents_under`, so the client gets a pointer leave and stops being
+/// able to set the cursor at all. The picker takes no grab and the window keeps pointer focus, so
+/// the client is still a live writer of that slot — and never learns the pointer left, which is
+/// why leaving the panel has to put its cursor back explicitly.
+#[test]
+fn the_picker_takes_the_cursor_while_the_pointer_is_over_it() {
+    use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+    use smithay::input::SeatHandler;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let (id, _surface, _seen) = client_ready_for_text_with_sink(&mut f);
+    f.double_roundtrip(id);
+
+    // The client's own cursor, through the real handler a `wl_pointer.set_cursor` lands in.
+    let ibeam = CursorImageStatus::Named(CursorIcon::Text);
+    let beam = |f: &mut Fixture| {
+        let seat = f.synoik().seat.clone();
+        f.synoik_state().cursor_image(&seat, ibeam.clone());
+    };
+    beam(&mut f);
+    assert_eq!(*f.synoik().cursor_manager.cursor_image(), ibeam);
+
+    // The panel opens under the pointer: with no caret to anchor to, the pointer *is* the anchor.
+    pointer_to(&mut f, Point::from((400., 400.)));
+    f.synoik_state().do_action(Action::ToggleEmojiPicker, false);
+    let geo = f.synoik().emoji_picker.geometry().unwrap();
+    let cell = geo.loc + Point::from((12. + 20., 12. + 40. + 8. + 20.));
+    pointer_to(&mut f, cell);
+    assert_eq!(
+        *f.synoik().cursor_manager.cursor_image(),
+        CursorImageStatus::default_named(),
+        "an I-beam over the emoji grid is the bug"
+    );
+
+    // The window still has pointer focus, so it can still ask — and must not win.
+    beam(&mut f);
+    assert_eq!(
+        *f.synoik().cursor_manager.cursor_image(),
+        CursorImageStatus::default_named(),
+        "the client is a live writer of this slot; the picker owns it while it is covered"
+    );
+
+    // Off the panel, still open: the client never saw a leave, so nothing but us puts it back.
+    let outside = Point::from((geo.loc.x + geo.size.w + 80., geo.loc.y + 20.));
+    assert!(!f.synoik().emoji_picker.contains(outside));
+    pointer_to(&mut f, outside);
+    assert_eq!(
+        *f.synoik().cursor_manager.cursor_image(),
+        ibeam,
+        "leaving the panel hands the cursor back to the window under it"
+    );
+
+    // And a close with the pointer parked on the panel hands it back with no motion at all.
+    pointer_to(&mut f, cell);
+    assert_eq!(
+        *f.synoik().cursor_manager.cursor_image(),
+        CursorImageStatus::default_named()
+    );
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(!f.synoik().emoji_picker.is_open());
+    assert_eq!(
+        *f.synoik().cursor_manager.cursor_image(),
+        ibeam,
+        "closing under a parked pointer must not leave our arrow on the client's text field"
+    );
+}
+
 /// What you pick leads the picker the next time it opens, through the real settings model — the
 /// history a GTK app's own chooser shares.
 ///

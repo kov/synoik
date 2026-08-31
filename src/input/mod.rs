@@ -1935,11 +1935,39 @@ impl State {
         {
             PickerKey::Handled => {}
             PickerKey::Close => {
-                self.synoik.emoji_picker.close();
+                self.close_emoji_picker();
             }
             PickerKey::Insert(text) => self.emoji_picked(&text),
         }
         self.synoik.queue_redraw_all();
+    }
+
+    /// Take the cursor for the picker, or hand it back. A no-op unless the answer changed, so
+    /// this can be called from every motion.
+    fn set_emoji_picker_owns_cursor(&mut self, owns: bool) {
+        if self.synoik.emoji_picker_owns_cursor == owns {
+            return;
+        }
+        self.synoik.emoji_picker_owns_cursor = owns;
+        let image = if owns {
+            CursorImageStatus::default_named()
+        } else {
+            self.synoik.client_cursor_image.clone()
+        };
+        self.synoik.cursor_manager.set_cursor_image(image);
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Close the picker, handing the cursor back to whatever is under it. Returns whether it was
+    /// open.
+    ///
+    /// Every close goes through here: a picker that closes under a parked pointer gets no further
+    /// motion, so a close that only cleared the panel would leave our arrow standing on the
+    /// client's text field until the user moved the mouse.
+    fn close_emoji_picker(&mut self) -> bool {
+        let was_open = self.synoik.emoji_picker.close();
+        self.set_emoji_picker_owns_cursor(false);
+        was_open
     }
 
     /// One emoji picked, from the keyboard or the pointer: it closes the picker, enters the
@@ -1947,7 +1975,7 @@ impl State {
     ///
     /// Both routes come through here so neither can be the one that forgets the history.
     fn emoji_picked(&mut self, text: &str) {
-        self.synoik.emoji_picker.close();
+        self.close_emoji_picker();
         let recents = self.synoik.emoji_picker.record_pick(text);
         self.synoik.gnome_settings.emoji_recents = recents.clone();
         if let Some(writer) = &self.synoik.gnome_settings_writer {
@@ -5609,7 +5637,7 @@ impl State {
                 }
             }
             Action::ToggleEmojiPicker => {
-                if !self.synoik.emoji_picker.close() {
+                if !self.close_emoji_picker() {
                     // Both are read once, here: the caret as it was when the user asked, and the
                     // display owning it — which is the only moment either is decidable.
                     let anchor = self.text_anchor_rect();
@@ -5627,6 +5655,15 @@ impl State {
                         let recents = self.synoik.gnome_settings.emoji_recents.clone();
                         self.synoik.emoji_picker.set_recents(recents);
                         self.synoik.emoji_picker.open(anchor, output, geo.to_f64());
+                        // The panel can appear *under* a parked pointer — it always does when the
+                        // anchor is the pointer itself — and no motion follows to notice.
+                        let at = self
+                            .synoik
+                            .seat
+                            .get_pointer()
+                            .map(|pointer| pointer.current_location());
+                        let over = at.is_some_and(|at| self.synoik.emoji_picker.contains(at));
+                        self.set_emoji_picker_owns_cursor(over);
                     }
                 }
                 self.synoik.queue_redraw_all();
@@ -5988,10 +6025,19 @@ impl State {
         }
 
         // The emoji picker is not modal — it takes no pointer grab and the window under it keeps
-        // its focus — so this only lights the cell under the pointer. `pos` is global, which is
-        // the space the picker's geometry is in.
+        // its focus — so this only lights the cell or rail tab under the pointer. `pos` is global,
+        // which is the space the picker's geometry is in.
         if self.synoik.emoji_picker.pointer_motion(pos) {
             self.synoik.queue_redraw_all();
+        }
+        // And because the window keeps pointer focus, its cursor is still the live one: a
+        // terminal's or a text field's I-beam would stand over the emoji grid. Force the arrow
+        // while the pointer is over the panel, and put the client's own back on the way out —
+        // the client never saw a leave, so it will not re-set it by itself. Not while a grab owns
+        // the cursor: see `grabbed` above.
+        if !grabbed {
+            let over = self.synoik.emoji_picker.contains(pos);
+            self.set_emoji_picker_owns_cursor(over);
         }
 
         // A panel popover grabs input modally: no window under it receives pointer focus
@@ -8513,7 +8559,7 @@ impl State {
                 self.synoik.queue_redraw_all();
                 return;
             }
-            self.synoik.emoji_picker.close();
+            self.close_emoji_picker();
             self.synoik.queue_redraw_all();
         }
 
