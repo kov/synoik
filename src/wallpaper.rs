@@ -93,7 +93,14 @@ pub struct Wallpaper {
     /// view at construction: a cache kept across a wallpaper change would sample a dangling
     /// descriptor, and one rebuilt every frame would be the per-frame `VkTexture` churn that takes
     /// Venus down.
-    blur: RefCell<Option<(u64, GaussianBackdrop)>>,
+    /// The `TextureBuffer` wrapping the backdrop's output rides along, because a render element's
+    /// `Id` is an *identity*, not a handle: `TextureBuffer::from_texture` mints a fresh one, so
+    /// building it per frame told the damage tracker the old element was **gone** and a stranger
+    /// had arrived — full-output damage every frame, and `force_effect_redraw`, which makes every
+    /// framebuffer effect on the output re-capture and re-blur. The blur texture itself was cached
+    /// perfectly the whole time; only the wrapper churned. Same key, because the only thing that
+    /// invalidates either is a new upload.
+    blur: RefCell<Option<(u64, GaussianBackdrop, TextureBuffer<VkTexture>)>>,
     /// Bumped on every upload; see [`ensure_texture`](Self::ensure_texture).
     texture_generation: std::cell::Cell<u64>,
 }
@@ -509,41 +516,48 @@ impl Wallpaper {
 
         let key = self.texture_generation.get();
         let mut cache = self.blur.borrow_mut();
-        if cache.as_ref().is_none_or(|(cached, _)| *cached != key) {
+        if cache.as_ref().is_none_or(|(cached, ..)| *cached != key) {
             match GaussianBackdrop::new(renderer, &texture, texture_radius) {
-                Ok(backdrop) => *cache = Some((key, backdrop)),
+                Ok(backdrop) => {
+                    // Same geometry as the unblurred element, sampling the blurred copy instead —
+                    // including the opacity, which this used to drop on the floor.
+                    //
+                    // A blur of an opaque picture is opaque: the chain samples only that picture
+                    // and the brightness multiply does not touch alpha. Declaring nothing meant the
+                    // overview's full-screen blurred backdrop occluded nothing, so the full-output
+                    // `SolidColor` backdrop underneath it (`Synoik::render_output`'s
+                    // `push(backdrop)`) drew in full behind a layer hiding every pixel of it, on
+                    // every overview frame.
+                    //
+                    // Keyed on the *source* being opaque rather than on the blur output's format,
+                    // so a wallpaper with real transparency stays honest.
+                    let opaque_regions = if self.image.as_ref().is_some_and(|image| image.opaque) {
+                        vec![Rectangle::from_size(backdrop.output().size())]
+                    } else {
+                        Vec::new()
+                    };
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        backdrop.output().clone(),
+                        1.,
+                        Transform::Normal,
+                        opaque_regions,
+                    );
+                    *cache = Some((key, backdrop, buffer));
+                }
                 Err(err) => {
                     warn!("error building the wallpaper blur: {err}");
                     return None;
                 }
             }
         }
-        let (_, backdrop) = cache.as_mut()?;
+        let (_, backdrop, blurred) = cache.as_mut()?;
         if !backdrop.is_current(texture_radius, brightness) {
             backdrop.queue(renderer, &texture, texture_radius, brightness);
         }
 
-        // Same geometry as the unblurred element, sampling the blurred copy instead — including
-        // the opacity, which this used to drop on the floor.
-        //
-        // A blur of an opaque picture is opaque: the chain samples only that picture and the
-        // brightness multiply does not touch alpha. Declaring nothing meant the overview's
-        // full-screen blurred backdrop occluded nothing, so the full-output `SolidColor` backdrop
-        // underneath it (`Synoik::render_output`'s `push(backdrop)`) drew in full behind a layer
-        // hiding every pixel of it, on every overview frame.
-        //
-        // Keyed on the *source* being opaque rather than on the blur output's format, so a
-        // wallpaper with real transparency stays honest.
-        let output = backdrop.output().clone();
-        let opaque_regions = if self.image.as_ref().is_some_and(|image| image.opaque) {
-            vec![Rectangle::from_size(output.size())]
-        } else {
-            Vec::new()
-        };
-        let blurred =
-            TextureBuffer::from_texture(renderer, output, 1., Transform::Normal, opaque_regions);
         let elem = TextureRenderElement::from_texture_buffer(
-            blurred,
+            blurred.clone(),
             origin,
             1.,
             Some(src),

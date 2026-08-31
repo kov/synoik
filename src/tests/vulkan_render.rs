@@ -9949,6 +9949,39 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
         .expect("the fixture must have a Vulkan renderer")
 }
 
+/// [`element_ids`], each id prefixed by the element's variant name.
+///
+/// The id alone cannot say *what* churned, which is exactly what an anti-vacuity check needs: a
+/// guard that cannot see whether the element it watches is even in the scene is how the two churn
+/// guards above stayed green while the overview's blurred wallpaper minted a fresh id every frame.
+fn named_element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            use smithay::backend::renderer::element::Element as _;
+
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            synoik
+                .render_to_vec(ctx, output, false)
+                .iter()
+                .map(|e| {
+                    let debug = format!("{e:?}");
+                    let name = debug.split(['(', ' ']).next().unwrap_or("?").to_owned();
+                    format!("{name} {:?}", e.id())
+                })
+                .collect::<Vec<_>>()
+        })
+        .expect("the fixture must have a Vulkan renderer")
+}
+
 /// An element's geometry is its shaded area — which is what makes the scene breakdown honest.
 ///
 /// The frame line splits coverage into scene / blur / text, and once the answer is "the scene", the
@@ -14305,4 +14338,63 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
          expected a caret bar spanning most of a {}px-tall field",
         size.h
     );
+}
+
+/// Nor may one on a **settled overview over a real wallpaper** — the case both guards above miss.
+///
+/// Their fixture has no wallpaper, so `Wallpaper::render_blurred` never runs and the element it
+/// builds is never in the list. That element is the overview's full-screen blurred backdrop, and it
+/// was minting a fresh `TextureBuffer` — and so a fresh `Id` — on every single frame, over a
+/// perfectly cached blur texture. Measured live on the gsrs seat with
+/// `SYNOIK_DEBUG_DAMAGE_ATTRIB=1`, every overview frame read
+/// `RoundedTexture new 1.000x n=1, RoundedTexture gone 1.000x n=1`: full-output damage, forever,
+/// plus the `force_effect_redraw` that makes every other blur on the output re-capture too.
+///
+/// Settled rather than animating on purpose. The animation guard would have caught this only by
+/// accident, and the cost is not a transition artefact — it is what the overview costs while you
+/// sit in it.
+#[test]
+fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    // The real picture, decoded synchronously, exactly as `peek_damage`'s scenes do it.
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some(std::path::PathBuf::from(
+            "/usr/share/backgrounds/f34/default/f34-01-day.png",
+        )),
+        options: crate::gnome::BackgroundOptions::default(),
+    };
+    let gpu = f
+        .synoik_state()
+        .backend
+        .with_vulkan_renderer(|r| r.gpu().clone());
+    f.synoik().wallpaper.update(&settings, gpu.as_ref());
+
+    f.synoik().layout.toggle_overview();
+    f.synoik_complete_animations();
+    f.dispatch();
+    let _ = named_element_ids(&mut f, &output);
+
+    let first = named_element_ids(&mut f, &output);
+    // Anti-vacuity: without the wallpaper element in the list this test proves nothing, and that
+    // is exactly how the two guards above stayed green through this bug.
+    assert!(
+        first.iter().any(|id| id.contains("RoundedTexture")),
+        "no RoundedTexture element in the settled overview, so the wallpaper never rendered and \
+         this guard is measuring a scene without the element it exists to watch. Elements: {first:?}",
+    );
+    for frame in 1..4 {
+        let next = named_element_ids(&mut f, &output);
+        assert_eq!(
+            first, next,
+            "the element list changed identity on settled overview frame {frame}. An `Id` must be \
+             cached alongside whatever it names: `Wallpaper::render_blurred` keeps its \
+             `TextureBuffer` next to the `GaussianBackdrop` for this reason — building it per frame \
+             from a cached blur texture bakes nothing, and still hands the tracker a full-output \
+             stranger every frame, which throws away every backdrop blur on the output.",
+        );
+    }
 }

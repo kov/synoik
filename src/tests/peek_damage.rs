@@ -995,3 +995,49 @@ fn a_blur_recapture_does_not_cascade_to_the_blurs_behind_it() {
          behind the seed again"
     );
 }
+
+/// **The instrument for the mouse.** What does moving the pointer cost, per frame, in each scene?
+///
+/// Measured live on the gsrs seat: with the overview open, moving the pointer flips ~26% of frames
+/// from `blur 0.6x` to `blur 6.8x` — the scene term does not move, so it is blur alone, 11x. The
+/// desktop and the peek barely react. Frames are held equal here by driving them from a client
+/// repaint either way, so this reads the *cost* half; the seat adds frames on top.
+#[test]
+#[ignore = "instrument; run explicitly"]
+fn overview_mouse_what_does_the_pointer_cost() {
+    let scene = Scene {
+        wallpaper: true,
+        blur: true,
+    };
+    println!("\n== what does moving the pointer cost, per frame ==");
+    for (label, overview) in [("desktop", false), ("overview", true)] {
+        for (motion, moving) in [("still", false), ("moving", true)] {
+            let Some((mut f, at)) = build_scene_sized(4, scene, (WIN.0, 860)) else {
+                return;
+            };
+            if overview {
+                f.synoik_state().do_action(Action::OpenOverview, false);
+                f.synoik_complete_animations();
+                f.dispatch();
+            }
+            pointer_motion_to(&mut f, 700., 600.);
+            f.dispatch();
+            let _ = crate::render_helpers::background_effect::trace::take_settled();
+            let c = poke_nudging(&mut f, &at, 860, 30, |f| {
+                if moving {
+                    f.pointer_motion(20., 0.);
+                }
+            });
+            let settled = crate::render_helpers::background_effect::trace::take_settled();
+            let n = c.frames.max(1) as f64;
+            let blur = c.by_site[synoik_vk::stats::DrawSite::Blur as usize] / n;
+            let scene_site = c.by_site[synoik_vk::stats::DrawSite::Scene as usize] / n;
+            println!(
+                "  {label:<9} {motion:<7} {:3} frames   {:5.2}x total   scene {scene_site:5.2}x   blur {blur:5.2}x   {:4.1} captures/frame",
+                c.frames,
+                c.per_frame().1,
+                settled.len() as f64 / n,
+            );
+        }
+    }
+}
