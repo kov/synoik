@@ -1732,6 +1732,14 @@ pub struct Culprit {
     pub rects: usize,
     /// Their union area as a multiple of the output's area.
     pub share: f64,
+    /// Where it is (or was), in output physical px.
+    ///
+    /// Carried for `new`/`gone` only, and for one reason: [`kind`](Self::kind) is the element
+    /// enum's outer variant, so every panel indicator, label and icon reports as `Panel`. A
+    /// churning identity is then named but not *located*, and finding it means guessing which of a
+    /// dozen call sites it was. A rect at 1848,8 sized 32x32 is the quick-settings cluster's third
+    /// icon and nothing else.
+    pub at: Option<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
 }
 
 /// What one frame's inputs justify. Returned rather than logged so tests can assert on it —
@@ -1777,7 +1785,13 @@ impl FrameAttribution {
             .culprits
             .iter()
             .take(NAMED)
-            .map(|c| format!("{} {} {:.3}x n={}", c.kind, c.reason, c.share, c.rects))
+            .map(|c| {
+                let at = match c.at {
+                    Some(r) => format!(" @{}x{}+{}+{}", r.size.w, r.size.h, r.loc.x, r.loc.y),
+                    None => String::new(),
+                };
+                format!("{} {} {:.3}x n={}{at}", c.kind, c.reason, c.share, c.rects)
+            })
             .collect();
         let mut line = format!(
             "predicted {:.3}x over {} shaded ({} quiet) — {}",
@@ -1997,6 +2011,9 @@ impl DamageAttribution {
                 reason: reason.as_str(),
                 rects: rects.len(),
                 share: union_share(rects, output_px),
+                at: matches!(reason, Reason::New | Reason::Gone)
+                    .then(|| rects.first().copied())
+                    .flatten(),
             })
             .collect();
         culprits.sort_by(|a, b| {
@@ -5295,6 +5312,7 @@ mod tests {
             reason,
             rects: 1,
             share,
+            at: None,
         };
         // Eight culprits, descending, so two fall past the six the line names.
         let a = super::FrameAttribution {

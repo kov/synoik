@@ -140,6 +140,34 @@ struct Shown {
 /// The number of distinct pictures a cross-fade is decoded at; see [`Shown::step`].
 const FADE_STEPS: u8 = 64;
 
+/// Wraps a backdrop's output texture as a render-element buffer.
+///
+/// `opaque` is the *source* picture's opacity: a blur of an opaque picture is opaque, since the
+/// chain samples only that picture and the brightness multiply does not touch alpha. Declaring
+/// nothing meant the overview's full-screen blurred backdrop occluded nothing, so the full-output
+/// `SolidColor` backdrop underneath it (`Synoik::render_output`'s `push(backdrop)`) drew in full
+/// behind a layer hiding every pixel of it, on every overview frame. Keyed on the *source* being
+/// opaque rather than on the blur output's format, so a wallpaper with real transparency stays
+/// honest.
+fn blurred_buffer(
+    renderer: &VulkanRenderer,
+    backdrop: &GaussianBackdrop,
+    opaque: bool,
+) -> TextureBuffer<VkTexture> {
+    let opaque_regions = if opaque {
+        vec![Rectangle::from_size(backdrop.output().size())]
+    } else {
+        Vec::new()
+    };
+    TextureBuffer::from_texture(
+        renderer,
+        backdrop.output().clone(),
+        1.,
+        Transform::Normal,
+        opaque_regions,
+    )
+}
+
 struct Image {
     /// RGBA8, tightly packed, either on the heap or already in device-visible memory.
     pixels: Pixels,
@@ -515,34 +543,12 @@ impl Wallpaper {
         let texture_radius = radius / magnification.max(f64::EPSILON);
 
         let key = self.texture_generation.get();
+        let opaque = self.image.as_ref().is_some_and(|image| image.opaque);
         let mut cache = self.blur.borrow_mut();
         if cache.as_ref().is_none_or(|(cached, ..)| *cached != key) {
             match GaussianBackdrop::new(renderer, &texture, texture_radius) {
                 Ok(backdrop) => {
-                    // Same geometry as the unblurred element, sampling the blurred copy instead —
-                    // including the opacity, which this used to drop on the floor.
-                    //
-                    // A blur of an opaque picture is opaque: the chain samples only that picture
-                    // and the brightness multiply does not touch alpha. Declaring nothing meant the
-                    // overview's full-screen blurred backdrop occluded nothing, so the full-output
-                    // `SolidColor` backdrop underneath it (`Synoik::render_output`'s
-                    // `push(backdrop)`) drew in full behind a layer hiding every pixel of it, on
-                    // every overview frame.
-                    //
-                    // Keyed on the *source* being opaque rather than on the blur output's format,
-                    // so a wallpaper with real transparency stays honest.
-                    let opaque_regions = if self.image.as_ref().is_some_and(|image| image.opaque) {
-                        vec![Rectangle::from_size(backdrop.output().size())]
-                    } else {
-                        Vec::new()
-                    };
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        backdrop.output().clone(),
-                        1.,
-                        Transform::Normal,
-                        opaque_regions,
-                    );
+                    let buffer = blurred_buffer(renderer, &backdrop, opaque);
                     *cache = Some((key, backdrop, buffer));
                 }
                 Err(err) => {
@@ -554,6 +560,11 @@ impl Wallpaper {
         let (_, backdrop, blurred) = cache.as_mut()?;
         if !backdrop.is_current(texture_radius, brightness) {
             backdrop.queue(renderer, &texture, texture_radius, brightness);
+            // The new blur lands in the same `VkImage`, and a `TextureBuffer`'s element carries no
+            // commit counter — its contents changing is invisible to the damage tracker. So mint a
+            // fresh identity here: churning it *every frame* was the bug, churning it when the
+            // pixels genuinely change is the damage the screen is owed.
+            *blurred = blurred_buffer(renderer, backdrop, opaque);
         }
 
         let elem = TextureRenderElement::from_texture_buffer(

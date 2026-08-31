@@ -10153,6 +10153,52 @@ fn nothing_churns_its_element_id_per_frame() {
     }
 }
 
+/// The same rule, while the pointer moves.
+///
+/// A churn that only fires under motion is invisible to the idle guard above, and it is the worse
+/// one: a moving pointer is exactly when the compositor is already busy, and a churned `Id` sets
+/// `force_effect_redraw`, so every framebuffer effect on the output re-captures and re-blurs on
+/// every motion frame. Live, that read as `Panel gone` / `Panel new` once per frame and a
+/// `blur 6.3x` bill on frames where nothing but the cursor had moved.
+///
+/// The pointer is walked across open desktop, away from the panel and any window: crossing a
+/// hover target would re-bake that widget legitimately, and this test must not measure that.
+#[test]
+fn nothing_churns_its_element_id_while_the_pointer_moves() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("id churn probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size = output_size(&output);
+
+    // Well below the panel, well above the dash, and started from a settled position so the first
+    // sample is not the one that walks onto a new element.
+    let y = size.h / 2.;
+    let at = f.synoik().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(size.w * 0.25 - at.x, y - at.y);
+    f.dispatch();
+    let _ = named_element_ids(&mut f, &output);
+
+    let mut per_frame = Vec::new();
+    for _ in 0..5 {
+        f.pointer_motion(4., 0.);
+        f.dispatch();
+        per_frame.push(named_element_ids(&mut f, &output));
+    }
+
+    let first = &per_frame[0];
+    for (frame, next) in per_frame.iter().enumerate().skip(1) {
+        assert_eq!(
+            first, next,
+            "the element list changed identity on motion frame {frame} — the pointer moved and \
+             nothing else did.\n\
+             An `Id` must be cached alongside whatever it names; minting one per frame tells the \
+             damage tracker the old element is gone and a stranger has arrived, which forces \
+             every backdrop blur on the output to re-capture on every motion frame.",
+        );
+    }
+}
+
 /// Open the quick-settings popover on `output`, exactly as the panel indicator does.
 fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let output_w = output_size(output).w;
