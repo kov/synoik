@@ -729,6 +729,10 @@ pub struct FrameContext {
     pub animating: AnimCauses,
     /// Where the overview sits on its 0..2 state axis, if it is open at all.
     pub overview_state: Option<f64>,
+    /// The workspace peek's progress, when the strip is on the live desktop rather than in the
+    /// overview. Separate from `overview_state` because the two are different scenes with
+    /// different costs, and a settled peek stamps nothing else.
+    pub peek_state: Option<f64>,
     /// The output's physical area in pixels, to express shading as an overdraw multiple.
     pub output_px: u64,
 }
@@ -2800,6 +2804,9 @@ impl FrameLog {
         }
         if let Some(state) = ctx.overview_state {
             let _ = write!(line, ", overview {state:.2}");
+        }
+        if let Some(state) = ctx.peek_state {
+            let _ = write!(line, ", peek {state:.2}");
         }
         line
     }

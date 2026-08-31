@@ -2285,6 +2285,19 @@ impl<W: LayoutElement> Monitor<W> {
         (state > 0.).then_some(state)
     }
 
+    /// The peek's own progress, for instrumentation: `Some` only while the strip is on the live
+    /// desktop rather than inside the overview, so a log line can say "peek 1.00" or nothing.
+    ///
+    /// A *settled* peek animates nothing, so the frame line's `animating workspace-peek` tag is
+    /// gone by the time the peek is costing anything — which left a held peek stamping no field at
+    /// all, and a live dump with no way to say whether the peek was up. That is the state the whole
+    /// question is about.
+    pub fn peek_state_value(&self) -> Option<f64> {
+        self.strip_is_peek()
+            .then(|| self.strip_progress())
+            .flatten()
+    }
+
     /// The `HIDDEN` → `WINDOW_PICKER` leg of [`Self::overview_state`], which is what the
     /// zoom and the exposé spread ride: 0 on the desktop, 1 at the picker, and **1 for the
     /// whole app-grid leg above it**.
