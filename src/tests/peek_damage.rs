@@ -385,11 +385,9 @@ fn poke(f: &mut Fixture, p: &Poke, side: i32, times: usize) -> Cost {
 
 /// [`poke`], with `nudge` run each frame before the compositor gets its turn.
 ///
-/// Pointer motion has to be measured *here* rather than on a still scene: moving the pointer
-/// queues no redraw at all headless (pinned by [`the_control_pointer_motion_queues_no_redraw`]),
-/// so a still scene renders nothing to measure. This measures what motion does to the cost of a
-/// frame that was happening anyway — which is half the answer. A seat's software cursor also makes
-/// motion *add* frames, and that half is not visible from here.
+/// This measures what motion does to the cost of a frame that was happening anyway. The other half
+/// — motion *adding* frames, which is what a seat's software cursor does at the pointer's rate —
+/// is [`cursor_only`], which services the redraw queue itself.
 fn poke_nudging(
     f: &mut Fixture,
     p: &Poke,
@@ -423,6 +421,33 @@ fn poke_nudging(
             f.refresh();
         }
     })
+}
+
+/// Move the pointer `times` over, servicing the redraw queue each step, with no client committing.
+///
+/// This is the seat's cursor: `on_pointer_motion` queues a redraw unconditionally, and on a seat
+/// the event loop that delivered the motion drains it, so every motion event is a frame. That is
+/// the half of the live report the client-repaint arms cannot see — the mouse does not make a
+/// frame more expensive so much as it makes *more frames*, each paying whatever a frame costs.
+fn cursor_only(f: &mut Fixture, step: (f64, f64), times: usize) -> Cost {
+    const FRAME: Duration = Duration::from_micros(16_667);
+
+    measure(f, |f| {
+        f.freeze_clock();
+        for _ in 0..times {
+            f.pointer_motion(step.0, step.1);
+            f.advance_clock(FRAME);
+            f.dispatch();
+            f.service_redraws();
+        }
+    })
+}
+
+/// Put the pointer at `to`, absolutely, without measuring anything.
+fn warp_to(f: &mut Fixture, to: Point<f64, Logical>) {
+    let at = f.synoik().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(to.x - at.x, to.y - at.y);
+    f.dispatch();
 }
 
 /// Every thumbnail's rect on the peeked strip, in the strip's own order.
@@ -463,11 +488,14 @@ fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
 /// nothing), and no frame follows (which is why motion is measured on top of a client repaint, not
 /// on a still scene — see [`poke_nudging`]).
 ///
-/// A headless artifact, not a behavior to generalize from: the cursor is not in the element list
-/// this backend assembles, while a seat runs a **software cursor**, so there every motion event
-/// damages the cursor rect and queues a redraw. Motion on a seat therefore adds *frames* — up to
-/// the pointer's rate — each paying the peek's inflated per-frame cost. The arms here measure only
-/// the cost half of `frames x cost`; the frame half has to be answered on a seat.
+/// A harness artifact, not a property of the compositor. The cursor *is* in the element list this
+/// backend assembles — headless renders with `include_pointer = true`, exactly as the tty backend
+/// does — and `on_pointer_motion` ends in an unconditional `queue_redraw_all`. What is missing is
+/// the drain: the queue is serviced by `refresh_and_flush_clients`, which on a seat runs after
+/// every pass of the event loop that libinput events arrive through, and here runs only when the
+/// compositor's fd wakes. Synthetic input goes straight into `process_input_event`, so the queued
+/// redraw sits there. [`Fixture::service_redraws`] is the seat's pass, asked for by name; the arms
+/// that want the frames motion really costs use it.
 #[test]
 fn the_control_pointer_motion_queues_no_redraw() {
     let Some((mut f, _)) = build(4) else { return };
@@ -485,6 +513,26 @@ fn the_control_pointer_motion_queues_no_redraw() {
     assert_eq!(
         moved.frames, 0,
         "pointer motion now queues redraws ({} of them). That is a change in what this backend          costs while the mouse moves, and the motion arms in this file — which ride on a client's          frames precisely because motion produced none — are measuring something else now",
+        moved.frames,
+    );
+}
+
+/// **The third control.** Serviced motion renders, one frame per motion event.
+///
+/// The pair to [`the_control_pointer_motion_queues_no_redraw`], and the anti-vacuity guard for the
+/// cursor arms: those read `frames x cost`, and a harness that had quietly stopped draining would
+/// report the cursor as free rather than as broken.
+#[test]
+fn the_control_serviced_pointer_motion_renders_a_frame_each() {
+    let Some((mut f, _)) = build(4) else { return };
+
+    let moved = cursor_only(&mut f, (2., 0.), 12);
+
+    assert_eq!(
+        moved.frames, 12,
+        "12 serviced motion events rendered {} frames. A seat drains the redraw queue after every \
+         pass of the loop the motion arrived through, so each motion is a frame; the cursor arms \
+         measure `frames x cost` and are reading the frames half from here",
         moved.frames,
     );
 }
@@ -728,6 +776,40 @@ fn peek_damage_what_does_a_still_peek_repaint() {
     // where the element is drawn (`framebuffer_effect.rs`: "not dst.size"). So a window shown as a
     // postage-stamp thumbnail still blurs at its full on-screen size, and this is the table that
     // says so in numbers rather than by reading the code.
+    // The half the client-repaint arms cannot see. On a seat every motion event is a frame, so the
+    // mouse's contribution is `frames x cost` and the arms above only ever measured `cost`. It also
+    // gives the cursor a chance to be the cascade's seed the live scene was missing: the pointer is
+    // the topmost element there is, and dragging it across the dash damages under the dash.
+    println!("\n== what does the cursor alone cost ==");
+    let dash = Point::<f64, Logical>::from((1024., 1268.));
+    let open = Point::<f64, Logical>::from((1024., 700.));
+    for (label, peek, park) in [
+        ("peek down, over the desktop", false, open),
+        ("peek up,   over the desktop", true, open),
+        ("peek up,   over the dash", true, dash),
+    ] {
+        let Some((mut f, _)) = build_scene_sized(4, blur, (WIN.0, 860)) else {
+            break;
+        };
+        if peek {
+            summon_peek(&mut f);
+            f.synoik_complete_animations();
+            f.dispatch();
+        }
+        warp_to(&mut f, park);
+        let _ = crate::render_helpers::background_effect::trace::take_settled();
+        let c = cursor_only(&mut f, (2., 0.), 60);
+        let settled = crate::render_helpers::background_effect::trace::take_settled();
+        let n = c.frames.max(1) as f64;
+        let big = settled.iter().filter(|(w, _)| *w > 1000).count() as f64 / n;
+        println!(
+            "  {label:<28} {:3} frames   {:5.3}x damaged   {:5.2}x overdraw   {big:4.2} full-size chains/frame",
+            c.frames,
+            c.per_frame().0,
+            c.per_frame().1,
+        );
+    }
+
     println!("\n== who captures, and how big is their blur ==");
     let blur = Scene {
         wallpaper: true,

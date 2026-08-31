@@ -471,6 +471,17 @@ impl Fixture {
         self.synoik_state().process_input_event(event);
     }
 
+    /// Drain the redraw queue, the way a seat's event loop does after every batch of events.
+    ///
+    /// [`Self::dispatch`] pumps the *outer* loop, and the compositor's own loop only runs when its
+    /// fd is readable — so synthetic input, which goes straight into `process_input_event`, leaves
+    /// `RedrawState::Queued` sitting there with nothing to service it. On a seat, libinput events
+    /// arrive *through* that loop and every pass ends in this call, which is why moving the mouse
+    /// there produces frames. A test measuring what input costs has to ask for that explicitly.
+    pub fn service_redraws(&mut self) {
+        self.synoik_state().refresh_and_flush_clients();
+    }
+
     /// Inject relative pointer motion through the real input pipeline.
     pub fn pointer_motion(&mut self, dx: f64, dy: f64) {
         let event = InputEvent::<SyntheticInputBackend>::PointerMotion {
