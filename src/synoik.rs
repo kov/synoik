@@ -11468,11 +11468,14 @@ impl Synoik {
             let origin = Point::<f64, Logical>::from((0., slide));
             let blurred = self.wallpaper.render_blurred(
                 ctx.renderer,
-                origin,
-                size,
-                output_scale,
-                radius,
-                brightness,
+                &output.name(),
+                crate::wallpaper::BlurRequest {
+                    origin,
+                    view_size: size,
+                    scale: output_scale,
+                    radius,
+                    brightness,
+                },
             );
 
             match blurred {
@@ -12216,11 +12219,14 @@ impl Synoik {
                     let radius = OVERVIEW_BLUR_RADIUS * output_scale.x;
                     if let Some(elem) = self.wallpaper.render_blurred(
                         ctx.renderer,
-                        Default::default(),
-                        output_size(output),
-                        output_scale,
-                        radius,
-                        OVERVIEW_BLUR_BRIGHTNESS,
+                        &output.name(),
+                        crate::wallpaper::BlurRequest {
+                            origin: Default::default(),
+                            view_size: output_size(output),
+                            scale: output_scale,
+                            radius,
+                            brightness: OVERVIEW_BLUR_BRIGHTNESS,
+                        },
                     ) {
                         push(elem.into());
                     }

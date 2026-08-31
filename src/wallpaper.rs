@@ -29,6 +29,7 @@
 //! the same.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -87,20 +88,26 @@ pub struct Wallpaper {
     /// [`spawn_worker`]: Wallpaper::spawn_worker
     decode_tx: Option<std::sync::mpsc::Sender<DecodeRequest>>,
     /// The blurred copy [`render_blurred`](Self::render_blurred) hands out, and the identity of
-    /// the texture it was built over.
+    /// the texture it was built over — **one entry per consumer**, keyed by output name.
     ///
     /// Keyed by image handle rather than rebuilt per frame because the chain binds its source's
     /// view at construction: a cache kept across a wallpaper change would sample a dangling
     /// descriptor, and one rebuilt every frame would be the per-frame `VkTexture` churn that takes
     /// Venus down.
+    ///
     /// The `TextureBuffer` wrapping the backdrop's output rides along, because a render element's
     /// `Id` is an *identity*, not a handle: `TextureBuffer::from_texture` mints a fresh one, so
     /// building it per frame told the damage tracker the old element was **gone** and a stranger
     /// had arrived — full-output damage every frame, and `force_effect_redraw`, which makes every
-    /// framebuffer effect on the output re-capture and re-blur. The blur texture itself was cached
-    /// perfectly the whole time; only the wrapper churned. Same key, because the only thing that
-    /// invalidates either is a new upload.
-    blur: RefCell<Option<(u64, GaussianBackdrop, TextureBuffer<VkTexture>)>>,
+    /// framebuffer effect on the output re-capture and re-blur.
+    ///
+    /// Per output because the radius is the consumer's, both halves of it: it arrives scaled by
+    /// that output, and is then divided by the magnification, which is that output's view size
+    /// over the picture's crop. Two displays therefore want two different blurs of one picture,
+    /// and a single slot re-queued for whichever asked last — re-minting the identity with it,
+    /// since a re-blur has to move it — so the full-output element churned on every frame of both
+    /// displays. `nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper` is the guard.
+    blur: RefCell<HashMap<String, CachedBlur>>,
     /// Bumped on every upload; see [`ensure_texture`](Self::ensure_texture).
     texture_generation: std::cell::Cell<u64>,
 }
@@ -140,6 +147,22 @@ struct Shown {
 /// The number of distinct pictures a cross-fade is decoded at; see [`Shown::step`].
 const FADE_STEPS: u8 = 64;
 
+/// What one consumer wants blurred: where it draws, how big, and how hard.
+///
+/// A struct rather than five parameters because `radius` and `brightness` only mean anything
+/// against the `scale` and `view_size` they were derived for — see [`Wallpaper::blur`], which
+/// caches per consumer for exactly that reason.
+#[derive(Debug, Clone, Copy)]
+pub struct BlurRequest {
+    pub origin: Point<f64, Logical>,
+    pub view_size: Size<f64, Logical>,
+    pub scale: Scale<f64>,
+    /// In output physical px, the way gnome-shell's blur constants are written.
+    pub radius: f64,
+    /// The multiply the blur folds in, as `unlockDialog.js` does.
+    pub brightness: f32,
+}
+
 /// Wraps a backdrop's output texture as a render-element buffer.
 ///
 /// `opaque` is the *source* picture's opacity: a blur of an opaque picture is opaque, since the
@@ -166,6 +189,16 @@ fn blurred_buffer(
         Transform::Normal,
         opaque_regions,
     )
+}
+
+/// One output's blurred copy of the current wallpaper. See [`Wallpaper::blur`].
+struct CachedBlur {
+    /// The [`Wallpaper::texture_generation`] this was built over; anything else is a stale blur of
+    /// a picture that is gone.
+    generation: u64,
+    backdrop: GaussianBackdrop,
+    /// The element identity handed out for `backdrop`'s output texture.
+    buffer: TextureBuffer<VkTexture>,
 }
 
 struct Image {
@@ -521,12 +554,18 @@ impl Wallpaper {
     pub fn render_blurred(
         &self,
         renderer: &mut VulkanRenderer,
-        origin: Point<f64, Logical>,
-        view_size: Size<f64, Logical>,
-        scale: Scale<f64>,
-        radius: f64,
-        brightness: f32,
+        // Which consumer is asking: the blur is cached per output, because the radius it wants
+        // comes from that output's scale and view size. See [`Self::blur`].
+        for_output: &str,
+        req: BlurRequest,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
+        let BlurRequest {
+            origin,
+            view_size,
+            scale,
+            radius,
+            brightness,
+        } = req;
         // The upload (and its device-loss handling) is `render_vulkan`'s; go through it so a
         // blurred draw cannot diverge from a plain one about which texture is current.
         self.render_vulkan(renderer, origin, view_size, 0., scale, 1.)?;
@@ -542,14 +581,24 @@ impl Wallpaper {
         let magnification = view_size.w * scale.x / src.size.w;
         let texture_radius = radius / magnification.max(f64::EPSILON);
 
-        let key = self.texture_generation.get();
+        let generation = self.texture_generation.get();
         let opaque = self.image.as_ref().is_some_and(|image| image.opaque);
-        let mut cache = self.blur.borrow_mut();
-        if cache.as_ref().is_none_or(|(cached, ..)| *cached != key) {
+        let mut caches = self.blur.borrow_mut();
+        if caches
+            .get(for_output)
+            .is_none_or(|cached| cached.generation != generation)
+        {
             match GaussianBackdrop::new(renderer, &texture, texture_radius) {
                 Ok(backdrop) => {
                     let buffer = blurred_buffer(renderer, &backdrop, opaque);
-                    *cache = Some((key, backdrop, buffer));
+                    caches.insert(
+                        for_output.to_owned(),
+                        CachedBlur {
+                            generation,
+                            backdrop,
+                            buffer,
+                        },
+                    );
                 }
                 Err(err) => {
                     warn!("error building the wallpaper blur: {err}");
@@ -557,18 +606,20 @@ impl Wallpaper {
                 }
             }
         }
-        let (_, backdrop, blurred) = cache.as_mut()?;
-        if !backdrop.is_current(texture_radius, brightness) {
-            backdrop.queue(renderer, &texture, texture_radius, brightness);
+        let cached = caches.get_mut(for_output)?;
+        if !cached.backdrop.is_current(texture_radius, brightness) {
+            cached
+                .backdrop
+                .queue(renderer, &texture, texture_radius, brightness);
             // The new blur lands in the same `VkImage`, and a `TextureBuffer`'s element carries no
             // commit counter — its contents changing is invisible to the damage tracker. So mint a
             // fresh identity here: churning it *every frame* was the bug, churning it when the
             // pixels genuinely change is the damage the screen is owed.
-            *blurred = blurred_buffer(renderer, backdrop, opaque);
+            cached.buffer = blurred_buffer(renderer, &cached.backdrop, opaque);
         }
 
         let elem = TextureRenderElement::from_texture_buffer(
-            blurred.clone(),
+            cached.buffer.clone(),
             origin,
             1.,
             Some(src),
@@ -1288,8 +1339,17 @@ mod tests {
                 ..Default::default()
             };
 
-            let Some(elem) = wp.render_blurred(&mut vk, Default::default(), view, scale, 4., 1.)
-            else {
+            let Some(elem) = wp.render_blurred(
+                &mut vk,
+                "test",
+                BlurRequest {
+                    origin: Default::default(),
+                    view_size: view,
+                    scale,
+                    radius: 4.,
+                    brightness: 1.,
+                },
+            ) else {
                 panic!("the blurred wallpaper must build (opaque = {opaque})");
             };
 

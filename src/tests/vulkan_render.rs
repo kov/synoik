@@ -14488,6 +14488,9 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
     );
 }
 
+/// A real picture on disk, so the wallpaper decodes and uploads for real.
+const WALLPAPER_PICTURE: &str = "/usr/share/backgrounds/f34/default/f34-01-day.png";
+
 /// Nor may one on a **settled overview over a real wallpaper** — the case both guards above miss.
 ///
 /// Their fixture has no wallpaper, so `Wallpaper::render_blurred` never runs and the element it
@@ -14510,9 +14513,7 @@ fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
 
     // The real picture, decoded synchronously, exactly as `peek_damage`'s scenes do it.
     let settings = crate::gnome::BackgroundSettings {
-        picture: Some(std::path::PathBuf::from(
-            "/usr/share/backgrounds/f34/default/f34-01-day.png",
-        )),
+        picture: Some(std::path::PathBuf::from(WALLPAPER_PICTURE)),
         options: crate::gnome::BackgroundOptions::default(),
     };
     let gpu = f
@@ -14544,5 +14545,85 @@ fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
              from a cached blur texture bakes nothing, and still hands the tracker a full-output \
              stranger every frame, which throws away every backdrop blur on the output.",
         );
+    }
+}
+
+/// The same scene on two displays.
+///
+/// The blur radius `render_blurred` works in is the consumer's twice over: it arrives scaled by
+/// the output, and is then divided by the magnification, which is that output's view size over the
+/// picture's crop. So two displays want two different blurs of one picture, and a cache with a
+/// single slot serves whichever asked last — re-queueing the blur, and with it re-minting the
+/// identity, on every frame of both. Live, that was a full-output `RoundedTexture` going
+/// `gone`/`new` on every overview frame of a two-monitor seat as soon as anything moved:
+/// `8.1x the output [blur 6.3x]`, against `1.0x [blur 0.3x]` for the same scene standing still.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe")) else {
+        return;
+    };
+    f.add_output(2, (2560, 1440));
+    f.resize_output(2, None, Some(1.5));
+    f.settle();
+
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some(std::path::PathBuf::from(WALLPAPER_PICTURE)),
+        options: crate::gnome::BackgroundOptions::default(),
+    };
+    let gpu = f
+        .synoik_state()
+        .backend
+        .with_vulkan_renderer(|r| r.gpu().clone());
+    f.synoik().wallpaper.update(&settings, gpu.as_ref());
+
+    f.synoik().layout.toggle_overview();
+    f.synoik_complete_animations();
+    f.dispatch();
+
+    let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
+    assert_eq!(outputs.len(), 2, "the fixture must have two outputs");
+
+    let mut attribution: Vec<crate::frame_log::DamageAttribution> =
+        outputs.iter().map(|_| Default::default()).collect();
+    for (i, output) in outputs.iter().enumerate() {
+        let _ = attribution_for(&mut f, output, &mut attribution[i]);
+    }
+
+    let first: Vec<Vec<String>> = outputs
+        .iter()
+        .map(|o| named_element_ids(&mut f, o))
+        .collect();
+    // Anti-vacuity: with no wallpaper element in the list this proves nothing, which is exactly
+    // how the single-output guards stayed green through this bug.
+    for (i, output) in outputs.iter().enumerate() {
+        assert!(
+            first[i].iter().any(|id| id.contains("RoundedTexture")),
+            "no RoundedTexture element on {} — the wallpaper never rendered there, so this guard \
+             is watching a scene without the element it exists to watch: {:?}",
+            output.name(),
+            first[i],
+        );
+    }
+
+    for round in 1..4 {
+        for (i, output) in outputs.iter().enumerate() {
+            let a = attribution_for(&mut f, output, &mut attribution[i]);
+            assert_eq!(
+                a.predicted,
+                0.0,
+                "output {} justified damage on settled overview round {round}, with only the \
+                 *other* output rendering in between: {a:?}",
+                output.name(),
+            );
+            let next = named_element_ids(&mut f, output);
+            assert_eq!(
+                first[i],
+                next,
+                "output {} changed element identity on settled overview round {round}. A cache \
+                 serving every output needs one entry per output when what it holds depends on \
+                 the output — here the blur radius does.",
+                output.name(),
+            );
+        }
     }
 }
