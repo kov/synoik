@@ -850,8 +850,16 @@ pub struct Panel {
     /// transitions ease over 150ms instead of snapping.
     fills: HashMap<&'static str, FillFade>,
 
-    /// Cached GPU chrome, cleared whenever the drawn content changes.
-    cache: RefCell<BarCache>,
+    /// Cached GPU chrome, **one entry per output**, cleared whenever the drawn content changes.
+    ///
+    /// Per output because a `Panel` draws every screen and several of these slots hold exactly one
+    /// thing: the background wash's buffer is sized to the output, the battery bake is keyed by
+    /// scale, the workspace dots are a flat `Vec`. Shared, two outputs of different width or scale
+    /// evict each other on every frame — the wash resizes and reports its full panel width as
+    /// damage, the battery re-bakes and hands the tracker a fresh identity — and both screens then
+    /// re-capture every backdrop blur they have, forever, with nothing happening on either.
+    /// `nothing_churns_its_element_id_across_two_outputs` is the guard.
+    cache: RefCell<HashMap<String, BarCache>>,
 
     /// Identity of the bar's backdrop-blur element — see [`BAR_BG`]. It holds no pixels: the
     /// capture and the blur chain hang off this `Id` in whatever per-element state the render path
@@ -893,8 +901,15 @@ impl Panel {
             clock,
             config,
             fills,
-            cache: RefCell::new(BarCache::new()),
+            cache: RefCell::new(HashMap::new()),
             backdrop: FramebufferEffect::new(),
+        }
+    }
+
+    /// Drop every output's cached chrome. See [`Self::cache`].
+    fn clear_caches(&self) {
+        for cache in self.cache.borrow_mut().values_mut() {
+            cache.clear();
         }
     }
 
@@ -906,7 +921,7 @@ impl Panel {
             return false;
         }
         self.a11y = a11y;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -923,7 +938,7 @@ impl Panel {
             return false;
         }
         self.toggles = toggles;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -935,7 +950,7 @@ impl Panel {
             return false;
         }
         self.system_status = status;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -947,7 +962,7 @@ impl Panel {
             return false;
         }
         self.audio = audio;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -959,7 +974,7 @@ impl Panel {
             return false;
         }
         self.mic = mic;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -978,7 +993,7 @@ impl Panel {
                 label: format_recording(elapsed.as_secs()),
             }
         });
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -1011,7 +1026,7 @@ impl Panel {
             return false;
         }
         self.keyboard_layout = label;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -1432,7 +1447,7 @@ impl Panel {
             return false;
         }
         self.app_indicators = indicators;
-        self.cache.borrow_mut().clear();
+        self.clear_caches();
         true
     }
 
@@ -1589,7 +1604,10 @@ impl Panel {
             return Vec::new();
         };
 
-        let mut cache = self.cache.borrow_mut();
+        let mut bar_caches = self.cache.borrow_mut();
+        let cache = bar_caches
+            .entry(output.name())
+            .or_insert_with(BarCache::new);
 
         // The cached textures belong to one renderer context; drop them all if it changed.
         let context = renderer.context_id();
@@ -1603,7 +1621,7 @@ impl Panel {
         // The right-box status icons sit on top of the bar. Elements are pushed
         // first-topmost (the list is consumed in reverse). The workspace dots are now
         // drawn into the bar texture itself (rounded rects), not composited separately.
-        self.qs_indicator_elements(renderer, scale, width, &mut elements, icons, &mut cache);
+        self.qs_indicator_elements(renderer, scale, width, &mut elements, icons, cache);
         self.app_indicator_elements(renderer, scale, width, &mut elements, caches);
 
         // The screen-recording indicator's stop glyph, composited on top of its red pill
@@ -1747,7 +1765,7 @@ impl Panel {
                 .map(|(s, x)| (LabelSlot::Keyboard, s.as_str(), *x)),
         );
         for (slot, text, x) in labels {
-            match label_element(renderer, &mut cache, scale, scale_key, slot, text, x) {
+            match label_element(renderer, cache, scale, scale_key, slot, text, x) {
                 Ok(element) => elements.push(element),
                 Err(err) => {
                     tracing::error!("error drawing the panel {slot:?} label: {err:#}");

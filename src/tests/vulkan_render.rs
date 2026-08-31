@@ -9954,6 +9954,41 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
 /// The id alone cannot say *what* churned, which is exactly what an anti-vacuity check needs: a
 /// guard that cannot see whether the element it watches is even in the scene is how the two churn
 /// guards above stayed green while the overview's blurred wallpaper minted a fresh id every frame.
+/// Account one output's frame the way the live damage attribution does, rolling `state` forward.
+///
+/// Separate from [`named_element_ids`] because the two answer different questions: an identity
+/// that churns is one way to justify a repaint, and a cached buffer that is resized or redrawn in
+/// place is the other. A test that only compares ids reads the second as quiet.
+fn attribution_for(
+    f: &mut Fixture,
+    output: &Output,
+    state: &mut crate::frame_log::DamageAttribution,
+) -> crate::frame_log::FrameAttribution {
+    let scale = output.current_scale().fractional_scale();
+    let rect = Rectangle::from_size(
+        output
+            .current_mode()
+            .expect("the output must have a mode")
+            .size,
+    );
+    let state_ref = f.synoik_state();
+    let elements = state_ref
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state_ref.synoik;
+            synoik.update_render_elements(Some(output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            synoik.render_to_vec(ctx, output, false)
+        })
+        .expect("the fixture must have a Vulkan renderer");
+    state.frame(&elements, Scale::from(scale), rect)
+}
+
 fn named_element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
     let state = f.synoik_state();
     state
@@ -10150,6 +10185,73 @@ fn nothing_churns_its_element_id_per_frame() {
              but still churns the identity, and that forces every backdrop blur on the output to \
              re-capture every frame.",
         );
+    }
+}
+
+/// The same rule, with a second output of a different scale on the same panel.
+///
+/// One `Panel` draws every output, and its `BarCache` has single-slot entries — the background
+/// wash's `SolidColorBuffer`, the baked battery indicator, the workspace dots. A slot holds
+/// whatever the *last* output asked for, so two outputs of different width or scale evict each
+/// other on every frame: the battery re-bakes and hands the tracker a new identity, and the wash
+/// resizes and reports its full panel width as damage. Both outputs then pay a forced
+/// `force_effect_redraw`, i.e. every backdrop blur on both screens re-captures, forever, on a
+/// desktop where nothing at all is happening.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("id churn probe")) else {
+        return;
+    };
+    // A different size *and* scale, which is the normal laptop-plus-external case and the one
+    // that makes a shared cache slot thrash.
+    f.add_output(2, (2560, 1440));
+    f.resize_output(2, None, Some(1.5));
+    f.settle();
+
+    let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
+    assert_eq!(outputs.len(), 2, "the fixture must have two outputs");
+
+    // Warm both: a first composite allocates legitimately on each.
+    for output in &outputs {
+        let _ = named_element_ids(&mut f, output);
+    }
+
+    // Identity is only half of it: a shared slot that is *resized* rather than rebuilt keeps its
+    // `Id` and reports commit damage instead, which costs the same repaint. So each output gets
+    // its own attribution, and a settled frame has to justify nothing at all.
+    let mut attribution: Vec<crate::frame_log::DamageAttribution> =
+        outputs.iter().map(|_| Default::default()).collect();
+    for (i, output) in outputs.iter().enumerate() {
+        let _ = attribution_for(&mut f, output, &mut attribution[i]);
+    }
+
+    let first: Vec<Vec<String>> = outputs
+        .iter()
+        .map(|o| named_element_ids(&mut f, o))
+        .collect();
+    for round in 1..4 {
+        for (i, output) in outputs.iter().enumerate() {
+            let a = attribution_for(&mut f, output, &mut attribution[i]);
+            assert_eq!(
+                a.predicted,
+                0.0,
+                "output {} justified damage on round {round} with nothing happening — rendering \
+                 the *other* output in between is the only thing that took place: {a:?}",
+                output.name(),
+            );
+            let next = named_element_ids(&mut f, output);
+            assert_eq!(
+                first[i],
+                next,
+                "output {} changed element identity on round {round} with nothing happening — \
+                 rendering the *other* output in between is the only thing that took place.\n\
+                 A cache shared by every output must be keyed by output (or by whatever differs \
+                 between them); a single slot holding the last output's bake re-bakes on every \
+                 frame and churns the identity, which forces every backdrop blur on both screens \
+                 to re-capture.",
+                output.name(),
+            );
+        }
     }
 }
 
