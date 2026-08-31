@@ -693,24 +693,34 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         ("windows under the dash", (WIN.0, 1000)),
         ("windows clear of it", (WIN.0, 860)),
     ] {
-        let Some((mut f, at)) = build_scene_sized(4, blur, win) else {
+        // Both peek states, because the cascade is only half the question: what the peek costs a
+        // scene that never touches the dash is the other half, and it is the shape of kov's live
+        // report (a cube and a static terminal, the strip nowhere near either).
+        let arm = |peek: bool| {
+            let (mut f, at) = build_scene_sized(4, blur, win)?;
+            if peek {
+                summon_peek(&mut f);
+                f.synoik_complete_animations();
+                f.dispatch();
+            }
+            let _ = crate::render_helpers::background_effect::trace::take_settled();
+            let c = poke(&mut f, &at, win.0, 30);
+            let settled = crate::render_helpers::background_effect::trace::take_settled();
+            let n = c.frames.max(1) as f64;
+            let blur_site = c.by_site[synoik_vk::stats::DrawSite::Blur as usize] / n;
+            let big = settled.iter().filter(|(w, _)| *w > 1000).count() as f64 / n;
+            Some((blur_site, big, c.per_frame().1))
+        };
+        let (Some(down), Some(up)) = (arm(false), arm(true)) else {
             break;
         };
-        summon_peek(&mut f);
-        f.synoik_complete_animations();
-        f.dispatch();
-        let _ = crate::render_helpers::background_effect::trace::take_settled();
-        let c = poke(&mut f, &at, win.0, 30);
-        let settled = crate::render_helpers::background_effect::trace::take_settled();
-        let n = c.frames.max(1) as f64;
-        let blur_site = c.by_site[synoik_vk::stats::DrawSite::Blur as usize] / n;
-        let big = settled.iter().filter(|(w, _)| *w > 1000).count() as f64 / n;
-        println!(
-            "  {label:<24} {}x{} -> blur {blur_site:5.2}x/frame,              {big:4.2} full-size chains/frame, {:5.2}x total",
-            win.0,
-            win.1,
-            c.per_frame().1,
-        );
+        println!("  {label:<24} {}x{}", win.0, win.1);
+        for (state, (blur_site, big, total)) in [("down", down), ("up", up)] {
+            println!(
+                "      peek {state:<5} blur {blur_site:5.2}x/frame   {big:4.2} full-size chains/frame   {total:5.2}x total",
+            );
+        }
+        println!("      premium {:.2}x", up.2 / down.2.max(f64::EPSILON));
     }
 
     // Which effects capture, and at what resolution. The chain's cost is its *intermediate's*
