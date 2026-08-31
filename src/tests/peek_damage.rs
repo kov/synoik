@@ -863,3 +863,43 @@ fn peek_damage_what_does_a_still_peek_repaint() {
     }
     println!();
 }
+
+/// Pins the blur cascade shut. A framebuffer effect that recaptures pushes its own geometry onto
+/// the end of the tracker's damage list; those pushes land past every recorded per-element index,
+/// so without the watermark in the tracker's recapture test, every blur *behind* the seed sees them
+/// and recaptures at full resolution. One seed re-blurs the screen.
+///
+/// The seed here is the dash: bringing the peek up pokes it out, and a repainting window tall
+/// enough to reach under its backdrop is the one thing that forces a recapture. The two arms differ
+/// in window height and nothing else, so a difference between them is the cascade and not the
+/// strip's own contents. Pre-fix the tall arm ran 1.80 full-size chains per frame against the short
+/// arm's 0.00; the bound is loose because the gap is not.
+#[test]
+fn a_blur_recapture_does_not_cascade_to_the_blurs_behind_it() {
+    let scene = Scene {
+        wallpaper: true,
+        blur: true,
+    };
+    let mut chains = Vec::new();
+    for win in [(WIN.0, 1000), (WIN.0, 860)] {
+        // No renderer, no measurement: the arms are only comparable against each other.
+        let Some((mut f, at)) = build_scene_sized(4, scene, win) else {
+            return;
+        };
+        summon_peek(&mut f);
+        f.synoik_complete_animations();
+        f.dispatch();
+        let _ = crate::render_helpers::background_effect::trace::take_settled();
+        let c = poke(&mut f, &at, win.0, 30);
+        let settled = crate::render_helpers::background_effect::trace::take_settled();
+        let n = c.frames.max(1) as f64;
+        chains.push(settled.iter().filter(|(w, _)| *w > 1000).count() as f64 / n);
+    }
+    let (under_dash, clear_of_it) = (chains[0], chains[1]);
+    assert!(
+        under_dash < 0.5,
+        "a window reaching under the dash's blur seeds {under_dash:.2} full-size blur chains per \
+         frame (a window clear of it: {clear_of_it:.2}) — the recapture is cascading to the blurs \
+         behind the seed again"
+    );
+}
