@@ -223,6 +223,8 @@ mod vulkan_impl {
                     dst,
                     src: src_region,
                     intermediate: size,
+                    target: frame.output_size(),
+                    id: self.id.clone(),
                 },
             );
 

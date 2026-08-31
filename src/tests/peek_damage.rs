@@ -98,6 +98,8 @@ const STILL: Duration = Duration::from_secs(1);
 struct Poke {
     client: ClientId,
     surface: WlSurface,
+    /// The window's size, so a repaint attaches a buffer of the size the window actually has.
+    size: (i32, i32),
 }
 
 /// A scene with `windows` windows spread one per workspace, settled, with a renderer attached.
@@ -131,6 +133,11 @@ struct Scene {
 }
 
 fn build_scene(windows: usize, scene: Scene) -> Option<(Fixture, Poke)> {
+    build_scene_sized(windows, scene, WIN)
+}
+
+/// [`build_scene`] with the window size named, so an arm can put the windows clear of the dash.
+fn build_scene_sized(windows: usize, scene: Scene, win: (i32, i32)) -> Option<(Fixture, Poke)> {
     use synoik_config::{BackgroundEffectRule, Config, WindowRule};
 
     if let Err(e) = VulkanRenderer::new() {
@@ -170,8 +177,8 @@ fn build_scene(windows: usize, scene: Scene) -> Option<(Fixture, Poke)> {
         // A real shm buffer, not a solid: a solid never samples a texture, and a thumbnail is that
         // same texture minified — which is the shape the strip draws in.
         let window = f.client(id).window(&surface);
-        window.attach_shm_buffer(WIN.0, WIN.1, 200, 100, 50, 255);
-        window.set_size(WIN.0 as u16, WIN.1 as u16);
+        window.attach_shm_buffer(win.0, win.1, 200, 100, 50, 255);
+        window.set_size(win.0 as u16, win.1 as u16);
         window.ack_last_and_commit();
         f.double_roundtrip(id);
 
@@ -185,6 +192,7 @@ fn build_scene(windows: usize, scene: Scene) -> Option<(Fixture, Poke)> {
             poke = Some(Poke {
                 client: id,
                 surface,
+                size: win,
             });
         }
     }
@@ -233,6 +241,10 @@ struct Cost {
     /// and offscreen the frame actually went to. A total that moves without a site that moved is
     /// an attribution gap, not a finding.
     by_site: [f64; synoik_vk::stats::DrawSite::ALL.len()],
+    /// The tracker's own rects for the first few damaging frames — what the screen was actually
+    /// asked to repaint, not how much of it. A blur that recaptures pushes its whole geometry in
+    /// here, so this is where "who damaged what" is legible.
+    sample_rects: Vec<Vec<smithay::utils::Rectangle<i32, Physical>>>,
 }
 
 impl Cost {
@@ -248,6 +260,11 @@ impl Cost {
 /// tracker, which is what makes the fragment count mean anything: a full-output render every frame
 /// would report the same overdraw whatever the damage was, and the whole question is whether the
 /// peek is charging for pixels that did not change.
+/// Frames still owed an element dump. The scene the tracker actually saw — id, geometry and
+/// whether it is a framebuffer effect — is the only thing that says *which* element a blur
+/// recapture was triggered by, and no aggregate can be read back into it.
+static DUMP_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
     let output = f.synoik_output(1);
     let name = output.name();
@@ -260,6 +277,33 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
         let mut warm = WarmTarget::new(&output, 1);
         f.synoik_state().backend.headless().frame_sink =
             Some(Box::new(move |vk, _output, elements| {
+                use std::sync::atomic::Ordering;
+                if DUMP_FRAMES.load(Ordering::Relaxed) > 0 {
+                    DUMP_FRAMES.fetch_sub(1, Ordering::Relaxed);
+                    println!("        -- scene, front to back --");
+                    for (i, e) in elements.iter().enumerate() {
+                        use smithay::backend::renderer::element::Element as _;
+                        let g = e.geometry(smithay::utils::Scale::from(1.));
+                        let dup = elements[..i]
+                            .iter()
+                            .position(|p| p.id() == e.id())
+                            .map(|k| format!("dup-of-[{k}] "))
+                            .unwrap_or_default();
+                        println!(
+                            "        [{i:2}] {:>4}x{:<4}@{:>5},{:<5} fx={} c={:?} {dup}{}",
+                            g.size.w,
+                            g.size.h,
+                            g.loc.x,
+                            g.loc.y,
+                            u8::from(e.is_framebuffer_effect()),
+                            e.current_commit(),
+                            {
+                                let d = format!("{e:?}");
+                                d.chars().take(110).collect::<String>()
+                            },
+                        );
+                    }
+                }
                 let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
                 let site0 = synoik_vk::stats::shaded_by_site();
                 draw_into(vk, &mut warm, size, elements, false);
@@ -301,6 +345,12 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
         overdraw: shaded as f64 / out_px,
         draws,
         by_site: by_site.map(|n| n as f64 / out_px),
+        sample_rects: mine
+            .iter()
+            .filter(|d| d.area() > 0)
+            .take(3)
+            .map(|d| d.damage.clone().unwrap_or_default())
+            .collect(),
     }
 }
 
@@ -360,8 +410,8 @@ fn poke_nudging(
                 // damage at all and the measurement is of nothing.
                 let window = f.client(p.client).window(&p.surface);
                 window.attach_shm_buffer_damaging(
-                    WIN.0,
-                    WIN.1,
+                    p.size.0,
+                    p.size.1,
                     [200, 100, 50, 255],
                     (0, 0, side, side),
                 );
@@ -517,10 +567,34 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         else {
             break;
         };
+        if label.contains("blur") {
+            println!("        ==== PEEK DOWN ====");
+            DUMP_FRAMES.store(2, std::sync::atomic::Ordering::Relaxed);
+        }
         let d = poke(&mut down, &at_down, WIN.0, 30);
         summon_peek(&mut up);
         let _ = crate::render_helpers::background_effect::trace::take_settled();
         let _ = crate::render_helpers::background_effect::trace::take_captures();
+        if label.contains("blur") {
+            {
+                let output = up.synoik_output(1);
+                let mon = up
+                    .synoik()
+                    .layout
+                    .monitor_for_output(&output)
+                    .expect("a monitor");
+                for (i, (ws, geo)) in mon.workspaces_with_render_geo_idx().enumerate() {
+                    println!(
+                        "        ws[{i}] idx={} geo={:?} windows={}",
+                        ws.0,
+                        geo,
+                        ws.1.windows().count()
+                    );
+                }
+            }
+            println!("        ==== PEEK UP ====");
+            DUMP_FRAMES.store(2, std::sync::atomic::Ordering::Relaxed);
+        }
         let u = poke(&mut up, &at_up, WIN.0, 30);
         let settled = crate::render_helpers::background_effect::trace::take_settled();
         let caps = crate::render_helpers::background_effect::trace::take_captures();
@@ -555,14 +629,31 @@ fn peek_damage_what_does_a_still_peek_repaint() {
                 shown.join(", "),
             );
             let mut pairs: Vec<(String, usize)> = Vec::new();
+            let mut ids: Vec<smithay::backend::renderer::element::Id> = Vec::new();
             for (c, (w, h)) in caps.iter().zip(&settled) {
+                let slot = match ids.iter().position(|i| *i == c.id) {
+                    Some(i) => i,
+                    None => {
+                        ids.push(c.id.clone());
+                        ids.len() - 1
+                    }
+                };
                 let k = format!(
-                    "drawn {:4}x{:<4} -> blurs {w}x{h}",
-                    c.dst.size.w, c.dst.size.h
+                    "elem #{slot}  into {:4}x{:<4}  drawn {:4}x{:<4} -> blurs {w}x{h}",
+                    c.target.w, c.target.h, c.dst.size.w, c.dst.size.h
                 );
                 match pairs.iter_mut().find(|(p, _)| *p == k) {
                     Some((_, n)) => *n += 1,
                     None => pairs.push((k, 1)),
+                }
+            }
+            for (arm, c) in [("down", &d), ("up", &u)] {
+                for (i, rects) in c.sample_rects.iter().enumerate() {
+                    let shown: Vec<String> = rects
+                        .iter()
+                        .map(|r| format!("{}x{}@{},{}", r.size.w, r.size.h, r.loc.x, r.loc.y))
+                        .collect();
+                    println!("        damage {arm} f{i}: {}", shown.join(" "));
                 }
             }
             pairs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -581,6 +672,45 @@ fn peek_damage_what_does_a_still_peek_repaint() {
                 );
             }
         }
+    }
+
+    // **The cascade.** A blur that recaptures pushes its whole geometry onto the end of the
+    // tracker's damage list, and every blur processed after it sees that push — so one seeded
+    // recapture at the front of the scene forces a full-resolution recapture of every blurred
+    // window behind it. The peek supplies the seed by poking the dash out: the dash's backdrop
+    // overlaps the bottom sliver of a window, so that window's own repaint now lands *below* a
+    // blur, which is the one thing that forces one.
+    //
+    // The arm that says so varies exactly one thing — the window's height, so the same scene
+    // either reaches under the dash or clears it. If the cascade is the mechanism, the shorter
+    // windows cost the dash's own small chain and nothing else.
+    println!("\n== does the dash seed the blur cascade? ==");
+    let blur = Scene {
+        wallpaper: true,
+        blur: true,
+    };
+    for (label, win) in [
+        ("windows under the dash", (WIN.0, 1000)),
+        ("windows clear of it", (WIN.0, 860)),
+    ] {
+        let Some((mut f, at)) = build_scene_sized(4, blur, win) else {
+            break;
+        };
+        summon_peek(&mut f);
+        f.synoik_complete_animations();
+        f.dispatch();
+        let _ = crate::render_helpers::background_effect::trace::take_settled();
+        let c = poke(&mut f, &at, win.0, 30);
+        let settled = crate::render_helpers::background_effect::trace::take_settled();
+        let n = c.frames.max(1) as f64;
+        let blur_site = c.by_site[synoik_vk::stats::DrawSite::Blur as usize] / n;
+        let big = settled.iter().filter(|(w, _)| *w > 1000).count() as f64 / n;
+        println!(
+            "  {label:<24} {}x{} -> blur {blur_site:5.2}x/frame,              {big:4.2} full-size chains/frame, {:5.2}x total",
+            win.0,
+            win.1,
+            c.per_frame().1,
+        );
     }
 
     // Which effects capture, and at what resolution. The chain's cost is its *intermediate's*

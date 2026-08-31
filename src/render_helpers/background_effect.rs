@@ -300,11 +300,20 @@ pub mod trace {
     /// scale, not from `dst`. So a window drawn as a postage-stamp thumbnail still blurs at its
     /// full on-screen size, and `dst` alone cannot show that. See
     /// [`FramebufferEffectElement::capture_framebuffer`](super::super::framebuffer_effect).
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub struct CaptureSample {
         pub dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
         pub src: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
         pub intermediate: smithay::utils::Size<i32, smithay::utils::Buffer>,
+        /// The size of the framebuffer being rendered into. The output's own size means this
+        /// capture happened in the desktop pass; anything else means it happened *inside* an
+        /// offscreen — a thumbnail's own render, say — where the element is full-size and the
+        /// minification happens outside, beyond the reach of any dst- or region-based sizing.
+        pub target: smithay::utils::Size<i32, smithay::utils::Physical>,
+        /// The element's `Id`, as the tracker sees it. Two samples in one frame carrying the same
+        /// id are one element drawn twice — smithay force-captures every instance of a duplicated
+        /// framebuffer effect, because one cache cannot serve two geometries.
+        pub id: smithay::backend::renderer::element::Id,
     }
 
     thread_local! {
