@@ -17048,22 +17048,20 @@ fn resuming_starts_the_idle_clock_over() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    // Real elapsed time, because that is what the idle monitor measures — it is stamped from the
-    // monotonic clock by the handler under test, not from the animation clock.
-    std::thread::sleep(Duration::from_millis(60));
-    let idle_before = f
-        .synoik()
-        .idle_monitor
-        .idletime_ms(crate::utils::get_monotonic_time());
+    // The compositor's clock, advanced rather than slept through: every stamp the idle monitor
+    // takes and every read of it goes through `Clock`, including the D-Bus `GetIdletime` reply, so
+    // a test that measured real elapsed time would be comparing two different clocks.
+    f.advance_clock(Duration::from_millis(60));
+    let now = |f: &mut Fixture| f.synoik().clock.now_unadjusted();
+    let at = now(&mut f);
+    let idle_before = f.synoik().idle_monitor.idletime_ms(at);
     assert!(idle_before >= 50, "the seat has been idle since it started");
 
     f.synoik_state()
         .on_login1_msg(Login1ToSynoik::PrepareForSleep(false));
 
-    let idle_after = f
-        .synoik()
-        .idle_monitor
-        .idletime_ms(crate::utils::get_monotonic_time());
+    let at = now(&mut f);
+    let idle_after = f.synoik().idle_monitor.idletime_ms(at);
     assert!(
         idle_after < 50,
         "the resume did not restart the count: {idle_after} ms"
@@ -24633,6 +24631,11 @@ fn clicking_the_switch_user_button_cancels_the_prompt() {
         crate::unlock_dialog::Page::Prompt,
         "the fixture is on the prompt page"
     );
+
+    // The button is reactive on the prompt page's *progress* (`unlockDialog.js:811-821`), so the
+    // page transition has to have run. It used to run by itself, because the shield read the wall
+    // clock and every call sampled it afresh; on the compositor's clock a test has to say so.
+    f.settle_animations();
 
     let monitor = Rectangle::from_size(Size::from((1920., 1080.)));
     let rect = crate::ui::lock_screen::switch_user_rect(monitor);

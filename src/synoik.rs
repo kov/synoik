@@ -5630,7 +5630,7 @@ impl State {
             // handlers), and without `Unlock` a session unlocked from gdm's login screen switches
             // VT back and sits there still locked.
             Login1ToSynoik::SessionLock(lock) => {
-                let now = crate::utils::get_monotonic_time();
+                let now = self.synoik.shield_now();
                 let effects = if lock {
                     match self.synoik.screen_shield.lock(now, false) {
                         Ok(effects) => effects,
@@ -5665,7 +5665,7 @@ impl State {
             // delay inhibitor, and `apply_shield_effects` releases it once we have locked *and* the
             // curtain has reached the screen.
             Login1ToSynoik::PrepareForSleep(about_to_suspend) => {
-                let now = crate::utils::get_monotonic_time();
+                let now = self.synoik.shield_now();
                 // Armed before the lock, because that is when the question can still be asked: the
                 // curtain has to travel unless it is already down. Arming after would see the
                 // descent that `prepare_for_sleep` just started and never distinguish the two.
@@ -5844,7 +5844,7 @@ impl State {
     ) {
         use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
         let effects = match msg {
             ScreenSaverToSynoik::Lock(reply) => {
                 // A passwordless account gets a shield that covers the screen and never locks
@@ -5891,7 +5891,7 @@ impl State {
         if !self.synoik.screen_shield.is_active() {
             return;
         }
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
 
         if self.synoik.screen_shield.is_dismissible() {
             // A screensaver raises on anything. Bare modifiers included: GNOME's shield is not
@@ -5963,7 +5963,7 @@ impl State {
         if !self.synoik.screen_shield.is_active() {
             return;
         }
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
 
         if !self.synoik.screen_shield.is_dismissible() {
             self.synoik.lock_screen.note_activity(now);
@@ -6026,7 +6026,7 @@ impl State {
     /// against a lock screen nobody can get past. Cancelling becomes safe once there is a re-Begin;
     /// see `authenticator_lost`, which is the same fail-open instinct from the other direction.
     pub fn switch_user(&mut self) {
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
         let effects = self.synoik.unlock_dialog.cancel();
         self.apply_unlock_effects(effects);
         self.synoik.lock_screen.note_activity(now);
@@ -6099,7 +6099,7 @@ impl State {
             && !self.synoik.screen_shield.is_dismissible();
         self.synoik
             .lock_screen
-            .set_page(prompt, crate::utils::get_monotonic_time());
+            .set_page(prompt, self.synoik.shield_now());
     }
 
     /// The page and the caps warning move together: the warning belongs to the prompt page and to
@@ -6138,7 +6138,7 @@ impl State {
 
         // ...and the same funnel is where a fingerprint error becomes a wiggle.
         if self.synoik.unlock_dialog.take_wiggle() {
-            let now = crate::utils::get_monotonic_time();
+            let now = self.synoik.shield_now();
             self.synoik.lock_screen.start_wiggle(now);
             self.synoik.queue_redraw_all();
         }
@@ -6165,14 +6165,14 @@ impl State {
         let Some(deadline) = self.synoik.unlock_dialog.message_deadline() else {
             return;
         };
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
         let timer = calloop::timer::Timer::from_duration(deadline.saturating_sub(now));
         self.synoik.unlock_message_timer = self
             .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 state.synoik.unlock_message_timer = None;
-                let now = crate::utils::get_monotonic_time();
+                let now = state.synoik.shield_now();
                 let effects = state.synoik.unlock_dialog.tick(now);
                 // Re-arms through `apply_unlock_effects` if more is queued behind this one.
                 state.apply_unlock_effects(effects);
@@ -6303,7 +6303,7 @@ impl State {
             _ => (),
         }
 
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
         let effects = self.synoik.unlock_dialog.on_verifier_event(event, now);
         self.apply_unlock_effects(effects);
     }
@@ -6487,7 +6487,7 @@ impl State {
         }
 
         if effects.start_fade {
-            let now = crate::utils::get_monotonic_time();
+            let now = self.synoik.shield_now();
             self.synoik.lock_screen.light_on(now);
             self.arm_fade_timer();
             self.synoik.queue_redraw_all();
@@ -6563,7 +6563,7 @@ impl State {
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 state.synoik.fade_timer = None;
-                let now = crate::utils::get_monotonic_time();
+                let now = state.synoik.shield_now();
                 let effects = state.synoik.screen_shield.fade_complete(now);
                 state.apply_shield_effects(effects);
                 calloop::timer::TimeoutAction::Drop
@@ -6597,7 +6597,7 @@ impl State {
                     return calloop::timer::TimeoutAction::Drop;
                 }
 
-                let now = crate::utils::get_monotonic_time();
+                let now = state.synoik.shield_now();
                 match state.synoik.screen_shield.lock(now, false) {
                     Ok(effects) => state.apply_shield_effects(effects),
                     Err(crate::screen_shield::LockRefused::LockedDown) => {
@@ -6616,7 +6616,7 @@ impl State {
         use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToSynoik};
 
         let PresenceToSynoik::StatusChanged(status) = msg;
-        let now = crate::utils::get_monotonic_time();
+        let now = self.synoik.shield_now();
 
         let effects = match status {
             PresenceStatus::Idle => self.synoik.screen_shield.on_session_idle(now),
@@ -7913,7 +7913,7 @@ impl Synoik {
                     // which is the right trade for a timeout whose only job is to not leave a
                     // half-typed password on an unattended screen.
                     if state.synoik.unlock_dialog.is_waiting_to_escape() {
-                        let now = crate::utils::get_monotonic_time();
+                        let now = state.synoik.shield_now();
                         let effects = state.synoik.unlock_dialog.tick(now);
                         state.apply_unlock_effects(effects);
                     }
@@ -10692,7 +10692,7 @@ impl Synoik {
         // The clock↔prompt crossfade is the same story: it starts on a keypress and then owes
         // 300 ms of frames nothing else will ask for. So is the curtain's own slide, which
         // additionally runs *after* the shield is gone and so has nothing else to ask at all.
-        let now = crate::utils::get_monotonic_time();
+        let now = self.shield_now();
         causes.set(
             AnimCauses::LOCK_SCREEN,
             self.lock_screen.is_animating(now)
@@ -10867,9 +10867,27 @@ impl Synoik {
     ///
     /// A shield that stopped being active before it landed resolves too: the caller wanted to know
     /// the screen was covered, and the honest answer is that it is not going to be.
+    /// The timebase the lock subsystem stamps its transitions with and compares them against.
+    ///
+    /// One accessor for the whole subsystem because every one of those timestamps is only
+    /// meaningful against the others: a `Curtain::Showing(since)` compared to a `now` from a
+    /// different clock either completes instantly or never. It reads the compositor's clock rather
+    /// than `utils::get_monotonic_time()` — which is what it used to be, at twenty call sites —
+    /// so the shield can be *held still*. On the raw monotonic clock the curtain kept sliding
+    /// through a frozen fixture clock and `run_until_settled` returned true while it was still
+    /// moving, which made every settled-lock-screen render test a coin flip: one output rendered
+    /// twice in a row, clock frozen, moved its shield by 0.06 of the output between the two.
+    ///
+    /// Unadjusted, deliberately. The animation *rate* debug knob scales `Clock::now` onto its own
+    /// timeline, and several of these stamps arm calloop timers, which fire on real time — a fade
+    /// deadline on a scaled timeline would miss by whatever the rate is.
+    pub fn shield_now(&self) -> Duration {
+        self.clock.now_unadjusted()
+    }
+
     /// Whether the curtain is down and done moving.
     pub(crate) fn shield_curtain_landed(&self) -> bool {
-        let now = crate::utils::get_monotonic_time();
+        let now = self.shield_now();
         self.lock_screen.is_covering(now) && !self.lock_screen.is_sliding(now)
     }
 
@@ -11104,8 +11122,7 @@ impl Synoik {
 
         // Retire a finished curtain slide. Without this the state stays `Hiding` forever and the
         // *next* lock is told the curtain is already on its way, so it never descends.
-        self.lock_screen
-            .settle_curtain(crate::utils::get_monotonic_time());
+        self.lock_screen.settle_curtain(self.shield_now());
         self.settle_lock_replies();
         self.publish_shield_active();
 
@@ -11334,7 +11351,7 @@ impl Synoik {
         // Next, the screen shield's curtain. Below `ext-session-lock` above — that protocol is a
         // stronger claim on the screen and there is no sense in drawing both — but above
         // everything else, because the whole point is that the desktop is not visible.
-        let now = crate::utils::get_monotonic_time();
+        let now = self.shield_now();
         // Not `is_active`: the curtain outlives the shield by the length of its slide away, and
         // gating the draw on the model would turn unlocking into a hard cut.
         if self.lock_screen.is_covering(now) {

@@ -14766,80 +14766,52 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
     }
 }
 
-// The **lock screen** is deliberately not audited here, and the reason is a harness gap rather
-// than a judgement about the scene: its render reads `utils::get_monotonic_time()` directly rather
-// than the compositor clock, so the curtain keeps sliding on wall time through a frozen fixture
-// clock, and `run_until_settled` reports settled while it is still moving. Measured: one output
-// re-rendered four times with the clock frozen moved its shield by 0.06 of the output between two
-// of them. Its one shared cache — the wallpaper blur — is covered by the overview scene above,
-// which takes the same path.
-
-/// The app grid, on two displays.
+/// The lock screen, on two displays.
 ///
-/// It renders inside each output's own overview pass, so its `GridCache` — a bake per page, plus
-/// one-tile-worth hover, focus and drop rings — is asked for twice a frame.
+/// Every output gets its own shield, and the blur behind it is the same wallpaper path the
+/// overview takes — with a brightness *measured off the picture* against that output's text band,
+/// so the two screens genuinely ask for two different blurs.
+///
+/// This scene could not be written at all until the shield read the compositor clock: on
+/// `get_monotonic_time()` the curtain kept sliding through a frozen fixture clock, and
+/// `run_until_settled` returned true while it was still moving.
 #[test]
-fn nothing_churns_its_element_id_across_two_outputs_in_the_app_grid() {
-    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
-
+fn nothing_churns_its_element_id_across_two_outputs_on_the_lock_screen() {
     for pairing in [Pairing::Different, Pairing::Identical] {
-        let Some(mut f) = window_fixture_settled(GREEN, true, Some("app grid id churn probe"))
-        else {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("lock id churn probe")) else {
+            return;
+        };
+        let Some(picture) = wallpaper_picture() else {
+            eprintln!(
+                "skipping: no picture under /usr/share/backgrounds (install gnome-backgrounds)"
+            );
             return;
         };
         add_second_output(&mut f, pairing);
+        install_wallpaper(&mut f, picture);
 
-        let apps: Vec<AppEntry> = (0..24)
-            .map(|i| AppEntry::fake(&format!("app{i}.desktop"), &format!("Application {i:02}")))
-            .collect();
-        f.synoik().app_system = AppSystem::with_parts(
-            Box::new(FakeCatalog::new(apps)),
-            Box::new(RecordingLauncher::default()),
+        f.synoik_state().on_screen_saver_msg(
+            crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(None),
         );
-        assert!(f.synoik().sync_app_grid(), "the grid took no entries");
-
-        f.synoik().layout.toggle_overview();
-        f.settle_animations();
+        // The real frame loop: the shield *slides*, and a scene still moving justifies damage for
+        // honest reasons.
         assert!(
-            f.synoik().layout.toggle_app_grid(),
-            "the app grid did not open, so this scene proves nothing"
+            f.run_until_settled(240),
+            "the lock screen never settled, so this scene would measure its own animation"
         );
-        f.settle_animations();
-        f.dispatch();
 
-        assert_quiet_across_outputs(&mut f, &format!("app grid, {pairing:?} outputs"));
-    }
-}
-
-/// The screenshot UI, on two displays.
-///
-/// It renders through every output, and its `PanelCache` is a single slot with the scale it was
-/// baked at held beside the texture — the shape that made the other three instances of this bug.
-#[test]
-fn nothing_churns_its_element_id_across_two_outputs_in_the_screenshot_ui() {
-    for pairing in [Pairing::Different, Pairing::Identical] {
-        let Some(mut f) = window_fixture_settled(GREEN, true, Some("screenshot id churn probe"))
-        else {
-            return;
-        };
-        add_second_output(&mut f, pairing);
-
-        f.synoik_state().open_screenshot_ui(None);
-        settle_screenshot_ui_open(&mut f);
-        f.dispatch();
-
-        // Anti-vacuity: the UI has to actually be on both screens.
+        // Anti-vacuity: the shield has to be on both screens.
         let outs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
         for output in &outs {
             let ids = named_element_ids(&mut f, output);
             assert!(
-                ids.iter().any(|id| id.starts_with("ScreenshotUi")),
-                "no ScreenshotUi element on {}: {ids:?}",
+                ids.iter().any(|id| id.contains("RoundedTexture")),
+                "no blurred shield on {}: {ids:?}",
                 output.name(),
             );
         }
 
-        assert_quiet_across_outputs(&mut f, &format!("screenshot ui, {pairing:?} outputs"));
+        assert_quiet_across_outputs(&mut f, &format!("lock screen, {pairing:?} outputs"));
     }
 }
 
