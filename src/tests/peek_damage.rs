@@ -16,17 +16,42 @@
 //! changing. A frame that repaints a screen where nothing changed is a damage defect, not a price
 //! of translucency — and the peek being on screen is not a licence to charge for it.
 //!
-//! Two defects hide in one symptom, and they are separable:
+//! **It is not a damage defect.** Damage barely moves: 0.60x the output with the peek down,
+//! 0.70x with it up, on the scene that reproduces the cost. What moves is the **blur**, and it
+//! moves alone — per-site attribution on a wallpaper+blur scene, full-window client repaint:
 //!
-//! 1. **A redraw is queued at all.** Headless only renders when something damages the output — "a
-//!    redraw leaves the output `Idle` and only new damage brings it back"
-//!    ([`crate::backend::headless`]). So the frame count of a still second *is* the answer to "is
-//!    something asking for a repaint", with no instrument of its own.
-//! 2. **What a redraw costs once one is due.** Two quantities, and conflating them is the trap this
-//!    file was nearly built on: **damage** is the region the screen is asked to repaint,
-//!    **overdraw** is how many fragments get shaded inside it. The seat's 5.37x is overdraw. They
-//!    can move independently — 80 extra thumbnail elements shade the same damaged region over and
-//!    over — so both are reported, per frame, side by side.
+//! | | peek down | peek up | delta |
+//! |---|---|---|---|
+//! | scene | 2.86x | 3.18x | +0.32x |
+//! | **blur** | **0.02x** | **2.06x** | **+2.04x** |
+//! | total overdraw | 2.89x | 5.25x | +2.36x |
+//! | draws | 6 | 60 | +54 |
+//!
+//! 5.25x against the seat's 5.37x. With the peek down a blurred window shades essentially no blur
+//! fragments; with it up, a full-output gaussian chain runs — and it runs to serve thumbnails that
+//! are postage stamps. That is `perf_probe`'s standing finding reached by a new road: a blurred
+//! window's chain costs the **output**, "whether it is drawn full-size or as a postage stamp
+//! overview thumbnail", and the peek's cull-off (`strip_is_peek` in `monitor.rs`) is what puts
+//! every workspace's blurred windows on screen as thumbnails.
+//!
+//! The cost is **flat in workspace count** — 5.19x at two workspaces, 5.30x at eight, ~58 draws
+//! throughout. So it is one chain per frame, not one per blurred window, and adding workspaces to
+//! a reproduction buys nothing.
+//!
+//! Two things the probe reports as *absent*, which is the other half of the reading:
+//!
+//! 1. **Nothing redraws on its own.** A settled scene with the peek up renders zero frames.
+//!    Headless renders only on damage — "a redraw leaves the output `Idle` and only new damage
+//!    brings it back" ([`crate::backend::headless`]) — so the frame count of a still second is the
+//!    whole answer, with no instrument of its own. The seat's continuous frames come from clients
+//!    committing, not from the peek asking.
+//! 2. **The blur is invisible without blurred content.** A bare scene, or one with only a
+//!    wallpaper, prices the peek at 1.1x. Every early reading in this file was taken on flat shm
+//!    rectangles and said the peek was nearly free.
+//!
+//! Damage and overdraw are reported side by side throughout, because conflating them is the trap
+//! this was nearly built on: the seat's 5.37x is overdraw, and extra thumbnail elements can shade
+//! the same damaged region many times over without damaging more of it.
 //!
 //! Both are read off what the compositor actually did: the damage comes from the tracker
 //! `render_element_states` consulted (`Headless::damage_log`), and the fragments from a real
@@ -82,13 +107,51 @@ struct Poke {
 /// `None` when the machine has no Vulkan device — the element pass needs one
 /// (`render_element_states` returns early without it), so there is no frame to read.
 fn build(windows: usize) -> Option<(Fixture, Poke)> {
+    build_scene(windows, Scene::default())
+}
+
+/// What live ingredients a probe scene carries beyond bare windows, and the reason the bare scene
+/// is not the answer: this file's first reading was taken on flat shm rectangles and put the
+/// peek-*down* control at 0.04x the output against the seat's 0.92x. A comparison whose control
+/// end is 20x adrift cannot price the peek.
+#[derive(Clone, Copy, Default)]
+struct Scene {
+    /// Decode and upload the real `org.gnome.desktop.background` picture, so the backdrop is a
+    /// sampled 4K texture rather than a solid fill.
+    wallpaper: bool,
+    /// 85% opacity, no opaque border background, `background-effect blur`.
+    ///
+    /// The pre-registered guess for the seat's 5.37x. A blurred window's chain runs at *output*
+    /// resolution regardless of where it is drawn — `perf_probe`'s headline finding, "whether it
+    /// is drawn full-size or as a postage stamp overview thumbnail" — and the peek's cull-off is
+    /// exactly what puts every workspace's windows on screen as thumbnails. If that is the
+    /// mechanism, peek-up pays a full-resolution blur chain per blurred window that peek-down
+    /// never renders at all, and the premium is per blurred window rather than per workspace.
+    blur: bool,
+}
+
+fn build_scene(windows: usize, scene: Scene) -> Option<(Fixture, Poke)> {
+    use synoik_config::{BackgroundEffectRule, Config, WindowRule};
+
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
     }
     synoik_vk::stats::set_enabled(true);
 
-    let mut f = Fixture::new();
+    let mut config = Config::default();
+    if scene.blur {
+        config.window_rules.push(WindowRule {
+            opacity: Some(0.85),
+            draw_border_with_background: Some(false),
+            background_effect: BackgroundEffectRule {
+                blur: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    let mut f = Fixture::with_config(config);
     f.synoik_state()
         .backend
         .headless()
@@ -126,9 +189,27 @@ fn build(windows: usize) -> Option<(Fixture, Poke)> {
         }
     }
 
+    if scene.wallpaper {
+        // The real picture, decoded synchronously (no worker in the harness) and staged straight
+        // into device memory, exactly as the session does it. Slow in a debug build — it happens
+        // once per fixture, outside every measured frame.
+        let settings = crate::gnome::BackgroundSettings {
+            picture: Some(std::path::PathBuf::from(WALLPAPER)),
+            options: crate::gnome::BackgroundOptions::default(),
+        };
+        let gpu = f
+            .synoik_state()
+            .backend
+            .with_vulkan_renderer(|r| r.gpu().clone());
+        f.synoik().wallpaper.update(&settings, gpu.as_ref());
+    }
+
     f.settle();
     Some((f, poke.expect("at least one window")))
 }
+
+/// The gsrs session's wallpaper (`org.gnome.desktop.background picture-uri`).
+const WALLPAPER: &str = "/usr/share/backgrounds/f34/default/f34-01-day.png";
 
 /// A window big enough that its texture must be minified hard to fit a thumbnail.
 const WIN: (i32, i32) = (1600, 1000);
@@ -148,6 +229,10 @@ struct Cost {
     overdraw: f64,
     /// Draw calls issued.
     draws: u64,
+    /// Fragments shaded per [`DrawSite`], as multiples of the output — which of scene, blur, text
+    /// and offscreen the frame actually went to. A total that moves without a site that moved is
+    /// an attribution gap, not a finding.
+    by_site: [f64; synoik_vk::stats::DrawSite::ALL.len()],
 }
 
 impl Cost {
@@ -168,17 +253,23 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
     let name = output.name();
     let size: Size<i32, Physical> = output.current_mode().expect("the output has a mode").size;
 
-    let counted = Rc::new(RefCell::new((0u64, 0u64)));
+    const SITES: usize = synoik_vk::stats::DrawSite::ALL.len();
+    let counted = Rc::new(RefCell::new((0u64, 0u64, [0u64; SITES])));
     {
         let counted = counted.clone();
         let mut warm = WarmTarget::new(&output, 1);
         f.synoik_state().backend.headless().frame_sink =
             Some(Box::new(move |vk, _output, elements| {
                 let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
+                let site0 = synoik_vk::stats::shaded_by_site();
                 draw_into(vk, &mut warm, size, elements, false);
+                let site1 = synoik_vk::stats::shaded_by_site();
                 let mut c = counted.borrow_mut();
                 c.0 += synoik_vk::stats::draws() - d0;
                 c.1 += synoik_vk::stats::shaded() - s0;
+                for i in 0..SITES {
+                    c.2[i] += site1[i] - site0[i];
+                }
             }));
     }
     // Warm the pipelines and let the tracker take a first, necessarily-full frame, then start the
@@ -186,7 +277,7 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
     // otherwise be counted as the peek's doing.
     f.synoik().queue_redraw_all();
     f.dispatch();
-    *counted.borrow_mut() = (0, 0);
+    *counted.borrow_mut() = (0, 0, [0; SITES]);
     f.synoik_state().backend.headless().damage_log = Some(Vec::new());
 
     body(f);
@@ -199,7 +290,7 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
         .take()
         .expect("recording was started just above");
     f.synoik_state().backend.headless().frame_sink = None;
-    let (draws, shaded) = *counted.borrow();
+    let (draws, shaded, by_site) = *counted.borrow();
 
     let out_px = f64::from(OUT.0) * f64::from(OUT.1);
     let mine: Vec<&FrameDamage> = log.iter().filter(|d| d.output == name).collect();
@@ -209,6 +300,7 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
         damage: mine.iter().map(|d| d.area() as f64).sum::<f64>().max(0.) / out_px,
         overdraw: shaded as f64 / out_px,
         draws,
+        by_site: by_site.map(|n| n as f64 / out_px),
     }
 }
 
@@ -243,12 +335,11 @@ fn poke(f: &mut Fixture, p: &Poke, side: i32, times: usize) -> Cost {
 
 /// [`poke`], with `nudge` run each frame before the compositor gets its turn.
 ///
-/// Pointer motion has to be measured *here* rather than on a still scene, and the reason is a
-/// finding in its own right: moving the pointer queues no redraw at all (pinned by
-/// [`the_control_pointer_motion_queues_no_redraw`]). On a live seat that is invisible, because
-/// clients are committing and frames are coming anyway — so what motion actually does is make the
-/// frames that already exist more expensive. A still scene cannot show that; a scene with a client
-/// repainting can.
+/// Pointer motion has to be measured *here* rather than on a still scene: moving the pointer
+/// queues no redraw at all headless (pinned by [`the_control_pointer_motion_queues_no_redraw`]),
+/// so a still scene renders nothing to measure. This measures what motion does to the cost of a
+/// frame that was happening anyway — which is half the answer. A seat's software cursor also makes
+/// motion *add* frames, and that half is not visible from here.
 fn poke_nudging(
     f: &mut Fixture,
     p: &Poke,
@@ -322,10 +413,11 @@ fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
 /// nothing), and no frame follows (which is why motion is measured on top of a client repaint, not
 /// on a still scene — see [`poke_nudging`]).
 ///
-/// Not a defect. Nothing on screen has changed yet: the cursor is not in the element list this
-/// backend assembles, and the strip's hover chrome is recomputed when a frame is next built. On a
-/// seat, frames are always coming, so motion never has to ask for one. It only makes the frames
-/// that were coming anyway cost more, and that is the thing worth measuring.
+/// A headless artifact, not a behavior to generalize from: the cursor is not in the element list
+/// this backend assembles, while a seat runs a **software cursor**, so there every motion event
+/// damages the cursor rect and queues a redraw. Motion on a seat therefore adds *frames* — up to
+/// the pointer's rate — each paying the peek's inflated per-frame cost. The arms here measure only
+/// the cost half of `frames x cost`; the frame half has to be answered on a seat.
 #[test]
 fn the_control_pointer_motion_queues_no_redraw() {
     let Some((mut f, _)) = build(4) else { return };
@@ -393,6 +485,60 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         row("peek up, static", &still(&mut f, |_| {}));
     }
 
+    // Calibration, and the content ladder in one table. The seat's peek-*down* frame draws 0.92x
+    // the output; a row here whose peek-down column is far under that is not measuring the same
+    // frame, whatever its peek-up column says. So each row reports both ends, and the ingredient
+    // that brings peek-down to ~0.9x is the scene this file should be asking its questions on.
+    //
+    // vkcube repaints its whole window every frame, so the repaint is full-window here rather
+    // than the 64x64 corner below — a corner is the *other* question (what a small change costs),
+    // and mixing them is what put the control 20x adrift.
+    println!("\n== calibration: full-window repaint, x30, 4 workspaces ==");
+    println!("   (the live seat reads 0.92x overdraw peek down, 5.37x peek up — p95 10.5x)");
+    for (label, scene) in [
+        ("bare", Scene::default()),
+        (
+            "+ wallpaper",
+            Scene {
+                wallpaper: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "+ wallpaper + blur",
+            Scene {
+                wallpaper: true,
+                blur: true,
+            },
+        ),
+    ] {
+        let (Some((mut down, at_down)), Some((mut up, at_up))) =
+            (build_scene(4, scene), build_scene(4, scene))
+        else {
+            break;
+        };
+        let d = poke(&mut down, &at_down, WIN.0, 30);
+        summon_peek(&mut up);
+        let u = poke(&mut up, &at_up, WIN.0, 30);
+        let ((dd, od, ddr), (du, ou, dur)) = (d.per_frame(), u.per_frame());
+        println!(
+            "  {label:<20} down {od:5.2}x overdraw ({dd:5.3}x dmg, {ddr:3.0} draws)   \
+             up {ou:5.2}x ({du:5.3}x dmg, {dur:3.0} draws)   premium {:4.1}x",
+            ou / od.max(1e-9),
+        );
+        let n = |c: &Cost| c.frames.max(1) as f64;
+        for (i, site) in synoik_vk::stats::DrawSite::ALL.iter().enumerate() {
+            let (a, b) = (d.by_site[i] / n(&d), u.by_site[i] / n(&u));
+            if a > 0.005 || b > 0.005 {
+                println!(
+                    "      {:<10} down {a:5.2}x   up {b:5.2}x   {:+5.2}x",
+                    site.label(),
+                    b - a,
+                );
+            }
+        }
+    }
+
     // Defect 2: one window repaints a 64x64 corner of itself and *nothing else in the scene
     // changes*. What the screen is asked to repaint should be that corner, strip up or down.
     println!("\n== defect 2: one 64x64 client repaint, x60 ==");
@@ -422,19 +568,24 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         }
     }
 
-    // How the peek's premium scales with the strip's contents. The live seat's strip holds six
-    // workspaces of video call, Slack and live terminals; this one holds four flat rectangles, and
-    // it is the first thing to suspect when a headless row lands far under a seat's. If the
-    // premium is flat in workspace count, scene richness is not the missing variable and the gap
-    // is somewhere else entirely.
+    // How the peek's premium scales, on the scene that reproduces it. Each extra workspace is one
+    // more *blurred* window the peek brings on screen as a thumbnail — and a blurred window's
+    // chain runs at output resolution wherever it is drawn. So the prediction is a straight line
+    // in workspace count, at roughly the cost of a full-screen blur apiece. Flat would falsify it.
     println!("\n== the peek's premium vs the strip's contents ==");
+    let blur = Scene {
+        wallpaper: true,
+        blur: true,
+    };
     for n in [2usize, 4, 6, 8] {
-        let (Some((mut down, at_down)), Some((mut up, at_up))) = (build(n), build(n)) else {
+        let (Some((mut down, at_down)), Some((mut up, at_up))) =
+            (build_scene(n, blur), build_scene(n, blur))
+        else {
             break;
         };
-        let d = poke(&mut down, &at_down, 64, 30);
+        let d = poke(&mut down, &at_down, WIN.0, 30);
         summon_peek(&mut up);
-        let u = poke(&mut up, &at_up, 64, 30);
+        let u = poke(&mut up, &at_up, WIN.0, 30);
         let ((dd, od, _), (du, ou, _)) = (d.per_frame(), u.per_frame());
         println!(
             "  {n} workspaces: {du:6.3}x damaged ({:4.1}x)  {ou:6.2}x overdraw ({:4.1}x)               {:3.0} draws (vs {:3.0})",
