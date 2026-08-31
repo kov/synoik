@@ -294,10 +294,17 @@ pub mod trace {
     /// the sub-rectangle of the framebuffer that was blitted out of it. If the blur's *content*
     /// trails the window while its geometry tracks correctly, the disagreement has to show up
     /// between these two.
+    ///
+    /// `intermediate` is the size the blur chain will actually run at, which is the one that
+    /// decides what the effect *costs* — and it is derived from the surface's own geometry and
+    /// scale, not from `dst`. So a window drawn as a postage-stamp thumbnail still blurs at its
+    /// full on-screen size, and `dst` alone cannot show that. See
+    /// [`FramebufferEffectElement::capture_framebuffer`](super::super::framebuffer_effect).
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct CaptureSample {
         pub dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
         pub src: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+        pub intermediate: smithay::utils::Size<i32, smithay::utils::Buffer>,
     }
 
     thread_local! {
@@ -312,6 +319,28 @@ pub mod trace {
 
     pub(super) fn record(sample: EffectSample) {
         SAMPLES.with(|s| s.borrow_mut().push(sample));
+    }
+
+    thread_local! {
+        /// The intermediate size a capture *settled* on, recorded by
+        /// `VulkanFrame::capture_backdrop` after the region clamp, the moving cap and the ladder
+        /// have all had their say.
+        ///
+        /// Separate from [`CaptureSample::intermediate`], which is what the effect element
+        /// *asked* for, because the gap between the two is exactly what the sizing policy does —
+        /// and reading the ask while believing it is the outcome is how a clamp reads as inert
+        /// while it is working.
+        static SETTLED: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Drain the settled intermediate sizes recorded since the last call, in capture order.
+    pub fn take_settled() -> Vec<(u32, u32)> {
+        SETTLED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// See [`take_settled`].
+    pub fn record_settled(dims: (u32, u32)) {
+        SETTLED.with(|s| s.borrow_mut().push(dims));
     }
 
     /// Drain the captures recorded since the last call.

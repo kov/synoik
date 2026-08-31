@@ -222,6 +222,7 @@ mod vulkan_impl {
                 crate::render_helpers::background_effect::trace::CaptureSample {
                     dst,
                     src: src_region,
+                    intermediate: size,
                 },
             );
 

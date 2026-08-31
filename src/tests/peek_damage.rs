@@ -519,13 +519,57 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         };
         let d = poke(&mut down, &at_down, WIN.0, 30);
         summon_peek(&mut up);
+        let _ = crate::render_helpers::background_effect::trace::take_settled();
+        let _ = crate::render_helpers::background_effect::trace::take_captures();
         let u = poke(&mut up, &at_up, WIN.0, 30);
+        let settled = crate::render_helpers::background_effect::trace::take_settled();
+        let caps = crate::render_helpers::background_effect::trace::take_captures();
         let ((dd, od, ddr), (du, ou, dur)) = (d.per_frame(), u.per_frame());
         println!(
             "  {label:<20} down {od:5.2}x overdraw ({dd:5.3}x dmg, {ddr:3.0} draws)   \
              up {ou:5.2}x ({du:5.3}x dmg, {dur:3.0} draws)   premium {:4.1}x",
             ou / od.max(1e-9),
         );
+        {
+            let mut counts: Vec<((u32, u32), usize)> = Vec::new();
+            for dims in &settled {
+                match counts.iter_mut().find(|(d, _)| d == dims) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((*dims, 1)),
+                }
+            }
+            counts.sort_by_key(|((w, h), _)| std::cmp::Reverse(u64::from(*w) * u64::from(*h)));
+            let per_frame = u.frames.max(1);
+            let sum: f64 = settled
+                .iter()
+                .map(|(w, h)| f64::from(*w) * f64::from(*h))
+                .sum::<f64>()
+                / (f64::from(OUT.0) * f64::from(OUT.1) * per_frame as f64);
+            let shown: Vec<String> = counts
+                .iter()
+                .take(6)
+                .map(|((w, h), n)| format!("{w}x{h} x{:.1}", *n as f64 / per_frame as f64))
+                .collect();
+            println!(
+                "      intermediates/frame: {sum:5.3}x out total  [{}]",
+                shown.join(", "),
+            );
+            let mut pairs: Vec<(String, usize)> = Vec::new();
+            for (c, (w, h)) in caps.iter().zip(&settled) {
+                let k = format!(
+                    "drawn {:4}x{:<4} -> blurs {w}x{h}",
+                    c.dst.size.w, c.dst.size.h
+                );
+                match pairs.iter_mut().find(|(p, _)| *p == k) {
+                    Some((_, n)) => *n += 1,
+                    None => pairs.push((k, 1)),
+                }
+            }
+            pairs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            for (k, n) in pairs.iter().take(6) {
+                println!("        {k}   x{:.2}/frame", *n as f64 / per_frame as f64);
+            }
+        }
         let n = |c: &Cost| c.frames.max(1) as f64;
         for (i, site) in synoik_vk::stats::DrawSite::ALL.iter().enumerate() {
             let (a, b) = (d.by_site[i] / n(&d), u.by_site[i] / n(&u));
@@ -536,6 +580,49 @@ fn peek_damage_what_does_a_still_peek_repaint() {
                     b - a,
                 );
             }
+        }
+    }
+
+    // Which effects capture, and at what resolution. The chain's cost is its *intermediate's*
+    // area, and the intermediate comes from the surface's own geometry and scale rather than from
+    // where the element is drawn (`framebuffer_effect.rs`: "not dst.size"). So a window shown as a
+    // postage-stamp thumbnail still blurs at its full on-screen size, and this is the table that
+    // says so in numbers rather than by reading the code.
+    println!("\n== who captures, and how big is their blur ==");
+    let blur = Scene {
+        wallpaper: true,
+        blur: true,
+    };
+    for (label, up) in [("peek down", false), ("peek up", true)] {
+        let Some((mut f, at)) = build_scene(4, blur) else {
+            break;
+        };
+        if up {
+            summon_peek(&mut f);
+        }
+        let _ = crate::render_helpers::background_effect::trace::take_captures();
+        let _ = crate::render_helpers::background_effect::trace::take_settled();
+        poke(&mut f, &at, WIN.0, 2);
+        let caps = crate::render_helpers::background_effect::trace::take_captures();
+        let settled = crate::render_helpers::background_effect::trace::take_settled();
+        let out_px = f64::from(OUT.0) * f64::from(OUT.1);
+        println!("  {label}: {} captures over 2 frames", caps.len());
+        for (i, c) in caps.iter().enumerate().take(12) {
+            let (sw, sh) = settled.get(i).copied().unwrap_or((0, 0));
+            let inter = f64::from(sw) * f64::from(sh);
+            println!(
+                "     drawn {:4}x{:<4} ({:5.3}x out)   asked {:4}x{:<4}   blurs at {:4}x{:<4} \
+                 ({:5.3}x out)   {:5.1}x more pixels than it shows",
+                c.dst.size.w,
+                c.dst.size.h,
+                f64::from(c.dst.size.w) * f64::from(c.dst.size.h) / out_px,
+                c.intermediate.w,
+                c.intermediate.h,
+                sw,
+                sh,
+                inter / out_px,
+                inter / (f64::from(c.dst.size.w) * f64::from(c.dst.size.h)).max(1.),
+            );
         }
     }
 
@@ -573,10 +660,6 @@ fn peek_damage_what_does_a_still_peek_repaint() {
     // chain runs at output resolution wherever it is drawn. So the prediction is a straight line
     // in workspace count, at roughly the cost of a full-screen blur apiece. Flat would falsify it.
     println!("\n== the peek's premium vs the strip's contents ==");
-    let blur = Scene {
-        wallpaper: true,
-        blur: true,
-    };
     for n in [2usize, 4, 6, 8] {
         let (Some((mut down, at_down)), Some((mut up, at_up))) =
             (build_scene(n, blur), build_scene(n, blur))

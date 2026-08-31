@@ -1508,8 +1508,37 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         };
         let moving = still_for < REST_AFTER_STILL_FRAMES;
 
+        // The intermediate can never be worth more than the region that fills it.
+        //
+        // `capture_region` blits `src_region` across the whole capture texture, and
+        // `draw_backdrop` maps that whole extent back onto a destination the same size as the
+        // region — so an intermediate larger than `src_region` upsamples pixels that were never
+        // captured, gaussians the result, and downsamples it back. There is no detail in there to
+        // preserve, only fill rate to pay.
+        //
+        // It matters because the intermediate is derived from the *surface's* geometry and scale
+        // rather than from where the element lands (`framebuffer_effect.rs`: "not dst.size"), and
+        // the two part company whenever a surface is drawn small. A workspace-peek thumbnail is
+        // the sharpest case: measured at 1600x1000 blurred to be drawn at 148x93, 116x more pixels
+        // than it shows — which is what put a full-output gaussian chain in every peeked frame
+        // (`src/tests/peek_damage.rs`).
+        //
+        // Applied here rather than above `need`, for the same reason as the moving cap below it:
+        // `need` stays the geometry-derived size, so it still answers "is this effect's geometry
+        // moving", and the radius compensation still measures how far the intermediate ended up
+        // from what was asked for. Without that, clamping a 1600 px intermediate to 148 px would
+        // leave the radius in texels of the smaller one and the thumbnail's blur would come out
+        // ~10x wider on screen than the window's.
+        let fits_region = |size: Size<i32, BufferCoord>| {
+            Size::from((
+                size.w.min(src_region.size.w.max(1)),
+                size.h.min(src_region.size.h.max(1)),
+            ))
+        };
+
         let (size, radius) = match radius {
             Some(radius) => {
+                let size = fits_region(size);
                 // While moving, cap the intermediate's long axis, preserving aspect so the blur
                 // stays as isotropic as the ladder's own slack leaves it. This is what actually
                 // ends the rebuild churn rather than storing it: every rung above the cap collapses
@@ -1547,10 +1576,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     * (f64::from(quantized.h) / f64::from(need.1));
                 (quantized, Some(radius * ratio.sqrt()))
             }
-            None => (size, None),
+            None => (fits_region(size), None),
         };
 
         let dims = (size.w as u32, size.h as u32);
+        #[cfg(test)]
+        crate::render_helpers::background_effect::trace::record_settled(dims);
         // GNOME's cascade sizes the pyramid to the radius, so how many rungs the chain needs is
         // only knowable once the ladder has picked `dims` — which is also exactly the point at
         // which the radius has been rescaled into that intermediate's texels. `.max(1)`: the
