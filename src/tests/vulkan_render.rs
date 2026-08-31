@@ -10188,70 +10188,103 @@ fn nothing_churns_its_element_id_per_frame() {
     }
 }
 
-/// The same rule, with a second output of a different scale on the same panel.
+/// Render every output in `outputs` in turn, several times, and assert each one stays quiet.
 ///
-/// One `Panel` draws every output, and its `BarCache` has single-slot entries — the background
-/// wash's `SolidColorBuffer`, the baked battery indicator, the workspace dots. A slot holds
-/// whatever the *last* output asked for, so two outputs of different width or scale evict each
-/// other on every frame: the battery re-bakes and hands the tracker a new identity, and the wash
-/// resizes and reports its full panel width as damage. Both outputs then pay a forced
-/// `force_effect_redraw`, i.e. every backdrop blur on both screens re-captures, forever, on a
-/// desktop where nothing at all is happening.
-#[test]
-fn nothing_churns_its_element_id_across_two_outputs() {
-    let Some(mut f) = window_fixture_settled(GREEN, true, Some("id churn probe")) else {
-        return;
-    };
-    // A different size *and* scale, which is the normal laptop-plus-external case and the one
-    // that makes a shared cache slot thrash.
-    f.add_output(2, (2560, 1440));
-    f.resize_output(2, None, Some(1.5));
-    f.settle();
+/// This is the whole two-output cache audit in one place. A cache serving every screen has to be
+/// keyed by whatever differs between them, and two things differ: their **geometry** (a slot sized
+/// to the last asker resizes on every frame) and their **content** (a slot keyed only on what it
+/// drew re-bakes on every frame even when the outputs are identical). Both come out here as a
+/// settled frame that justifies damage.
+///
+/// Identity and attribution are both asserted, because a shared slot fails in two ways: rebuilt,
+/// it churns the element `Id` and the tracker sees a stranger; *resized* in place, it keeps the
+/// `Id` and reports commit damage instead. An id-only comparison reads the second as quiet — which
+/// is exactly how the panel's background wash hid.
+fn assert_quiet_across_outputs(f: &mut Fixture, scene: &str) {
+    // Frozen, because the question is what *the other output rendering* costs. A clock that keeps
+    // running between two renders lets a slide or a fade move in between, and that damage is
+    // honest — it would just be attributed here to the wrong thing.
+    f.freeze_clock();
 
     let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
-    assert_eq!(outputs.len(), 2, "the fixture must have two outputs");
+    assert!(
+        outputs.len() >= 2,
+        "{scene}: the fixture must have at least two outputs",
+    );
 
-    // Warm both: a first composite allocates legitimately on each.
-    for output in &outputs {
-        let _ = named_element_ids(&mut f, output);
-    }
-
-    // Identity is only half of it: a shared slot that is *resized* rather than rebuilt keeps its
-    // `Id` and reports commit damage instead, which costs the same repaint. So each output gets
-    // its own attribution, and a settled frame has to justify nothing at all.
+    // Warm every output: a first composite allocates legitimately on each.
     let mut attribution: Vec<crate::frame_log::DamageAttribution> =
         outputs.iter().map(|_| Default::default()).collect();
     for (i, output) in outputs.iter().enumerate() {
-        let _ = attribution_for(&mut f, output, &mut attribution[i]);
+        let _ = named_element_ids(f, output);
+        let _ = attribution_for(f, output, &mut attribution[i]);
     }
 
-    let first: Vec<Vec<String>> = outputs
-        .iter()
-        .map(|o| named_element_ids(&mut f, o))
-        .collect();
+    let first: Vec<Vec<String>> = outputs.iter().map(|o| named_element_ids(f, o)).collect();
     for round in 1..4 {
         for (i, output) in outputs.iter().enumerate() {
-            let a = attribution_for(&mut f, output, &mut attribution[i]);
+            let a = attribution_for(f, output, &mut attribution[i]);
             assert_eq!(
                 a.predicted,
                 0.0,
-                "output {} justified damage on round {round} with nothing happening — rendering \
-                 the *other* output in between is the only thing that took place: {a:?}",
+                "{scene}: {} justified damage on round {round}, and the only thing that happened \
+                 in between was the *other* output rendering: {a:?}",
                 output.name(),
             );
-            let next = named_element_ids(&mut f, output);
+            let next = named_element_ids(f, output);
             assert_eq!(
                 first[i],
                 next,
-                "output {} changed element identity on round {round} with nothing happening — \
-                 rendering the *other* output in between is the only thing that took place.\n\
-                 A cache shared by every output must be keyed by output (or by whatever differs \
-                 between them); a single slot holding the last output's bake re-bakes on every \
-                 frame and churns the identity, which forces every backdrop blur on both screens \
-                 to re-capture.",
+                "{scene}: {} changed element identity on round {round}, and the only thing that \
+                 happened in between was the *other* output rendering.\n\
+                 A cache serving every output must be keyed by what differs between them — the \
+                 geometry it was built for, and the content it drew.",
                 output.name(),
             );
         }
+    }
+}
+
+/// A second output beside the fixture's own: `Pairing::Different` is the laptop-plus-external
+/// case, `Pairing::Identical` two of the same monitor.
+///
+/// Both are needed and they fail differently. Different geometry evicts a slot sized or scaled to
+/// the last asker; identical geometry hits the *same* cache key from both screens, so a slot keyed
+/// only on the content it drew re-bakes on every frame while its `Id` never moves.
+#[derive(Debug, Clone, Copy)]
+enum Pairing {
+    Different,
+    Identical,
+}
+
+fn add_second_output(f: &mut Fixture, pairing: Pairing) {
+    match pairing {
+        Pairing::Different => {
+            f.add_output(2, (2560, 1440));
+            f.resize_output(2, None, Some(1.5));
+        }
+        Pairing::Identical => f.add_output(2, (OUT_W, OUT_H)),
+    }
+    f.settle();
+}
+
+/// A desktop, on two outputs.
+///
+/// One `Panel` draws every output, and its `BarCache` had single-slot entries — the background
+/// wash's `SolidColorBuffer`, the baked battery indicator, the workspace dots. A slot holds
+/// whatever the *last* output asked for, so two outputs of different width or scale evicted each
+/// other on every frame: the wash resized and reported its full panel width as damage, the battery
+/// re-baked and handed the tracker a new identity. Both outputs then paid a forced
+/// `force_effect_redraw` — every backdrop blur on both screens re-capturing, forever, on a desktop
+/// where nothing at all was happening.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs() {
+    for pairing in [Pairing::Different, Pairing::Identical] {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("id churn probe")) else {
+            return;
+        };
+        add_second_output(&mut f, pairing);
+        assert_quiet_across_outputs(&mut f, &format!("desktop, {pairing:?} outputs"));
     }
 }
 
@@ -14340,13 +14373,46 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
     );
 }
 
-/// Whether a colour emoji face is installed at all.
+/// Whether a colour emoji face this renderer can actually draw is installed.
 ///
-/// The grid draws through `RunFace::Emoji`, which asks fontconfig for the family by name; with no
-/// such face the shaper falls back to a monochrome outline font and every colour assertion below
-/// measures zero. That is indistinguishable from the rasterizer being broken, which is the failure
-/// this guard exists to catch — so say which one it is instead of blaming the renderer.
+/// Two things have to be true and they are not the same thing. The face has to exist — with none,
+/// the shaper falls back to a monochrome outline font and every colour assertion below measures
+/// zero. And it has to carry a `COLR` table: our rasterizer draws COLRv1 outlines, so a font whose
+/// colour lives in embedded bitmaps (`CBDT`/`CBLC`) shapes and draws nothing. Debian and Ubuntu's
+/// `fonts-noto-color-emoji` is the bitmap build; Fedora's `google-noto-color-emoji-fonts` is
+/// COLRv1.
+///
+/// Both cases are indistinguishable from the rasterizer being broken, which is the failure this
+/// guard exists to catch — so say which one it is rather than blaming the renderer. Matched on the
+/// path containing `emoji` rather than on a filename, because the two distros agree on neither:
+/// `NotoColorEmoji.ttf` against `google-noto-color-emoji-fonts/Noto-COLRv1.ttf`.
 fn colour_emoji_font_installed() -> bool {
+    /// Whether an sfnt file has a `COLR` table, read straight out of its table directory — the
+    /// header only, never the whole font.
+    fn has_colr(path: &std::path::Path) -> bool {
+        use std::io::Read as _;
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut header = [0u8; 12];
+        if file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let num_tables = u16::from_be_bytes([header[4], header[5]]) as usize;
+        // 16-byte records, each starting with its tag. A collection (`ttcf`) has a different
+        // layout and is not worth the parse: nothing ships emoji as one.
+        let mut directory = vec![0u8; num_tables * 16];
+        if file.read_exact(&mut directory).is_err() {
+            return false;
+        }
+        directory
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .any(|record| &record[..4] == b"COLR")
+    }
+
     fn scan(dir: &std::path::Path, depth: usize) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -14357,11 +14423,16 @@ fn colour_emoji_font_installed() -> bool {
                 if depth > 0 && scan(&path, depth - 1) {
                     return true;
                 }
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("NotoColorEmoji"))
-            {
+                continue;
+            }
+            let looks_like_emoji = path
+                .to_str()
+                .is_some_and(|p| p.to_ascii_lowercase().contains("emoji"));
+            let is_sfnt = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
+            if looks_like_emoji && is_sfnt && has_colr(&path) {
                 return true;
             }
         }
@@ -14390,7 +14461,7 @@ fn vulkan_the_emoji_picker_grid_draws_in_colour() {
         return;
     };
     if !colour_emoji_font_installed() {
-        eprintln!("skipping: no colour emoji font (install Noto Color Emoji)");
+        eprintln!("skipping: no COLRv1 colour emoji font (a CBDT bitmap build does not count)");
         return;
     }
     f.synoik_state()
@@ -14626,28 +14697,150 @@ fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
     }
 }
 
-/// The same scene on two displays.
+/// The overview, on two displays.
 ///
-/// The blur radius `render_blurred` works in is the consumer's twice over: it arrives scaled by
-/// the output, and is then divided by the magnification, which is that output's view size over the
-/// picture's crop. So two displays want two different blurs of one picture, and a cache with a
-/// single slot serves whichever asked last — re-queueing the blur, and with it re-minting the
-/// identity, on every frame of both. Live, that was a full-output `RoundedTexture` going
-/// `gone`/`new` on every overview frame of a two-monitor seat as soon as anything moved:
+/// The blur radius `Wallpaper::render_blurred` works in is the consumer's twice over: it arrives
+/// scaled by the output, and is then divided by the magnification, which is that output's view
+/// size over the picture's crop. So two displays want two different blurs of one picture, and a
+/// cache with a single slot served whichever asked last — re-queueing the blur, and with it
+/// re-minting the identity, on every frame of both. Live, that was a full-output `RoundedTexture`
+/// going `gone`/`new` on every overview frame of a two-monitor seat as soon as anything moved:
 /// `8.1x the output [blur 6.3x]`, against `1.0x [blur 0.3x]` for the same scene standing still.
 #[test]
 fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
-    let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe")) else {
-        return;
-    };
-    let Some(picture) = wallpaper_picture() else {
-        eprintln!("skipping: no picture under /usr/share/backgrounds (install gnome-backgrounds)");
-        return;
-    };
-    f.add_output(2, (2560, 1440));
-    f.resize_output(2, None, Some(1.5));
-    f.settle();
+    for pairing in [Pairing::Different, Pairing::Identical] {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe"))
+        else {
+            return;
+        };
+        let Some(picture) = wallpaper_picture() else {
+            eprintln!(
+                "skipping: no picture under /usr/share/backgrounds (install gnome-backgrounds)"
+            );
+            return;
+        };
+        add_second_output(&mut f, pairing);
+        install_wallpaper(&mut f, picture);
+        // A window on the second output too, so the overview bakes a preview and a chrome for
+        // *both* — with a window on one screen only, every per-window cache on the other is
+        // untouched and this scene would not exercise them.
+        f.synoik_state().do_action(Action::FocusMonitorRight, false);
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.set_title("id churn probe 2");
+        window.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+        window.set_size(WIN, WIN);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.synoik_complete_animations();
+        f.double_roundtrip(id);
 
+        f.synoik().layout.toggle_overview();
+        f.synoik_complete_animations();
+        f.dispatch();
+
+        // Anti-vacuity: with no wallpaper element in the list this proves nothing, which is
+        // exactly how the single-output guards stayed green through this bug.
+        let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
+        // Anti-vacuity: name the surfaces this scene is supposed to be watching, on *each*
+        // output. With none of them in the list the guard proves nothing, which is exactly how the
+        // single-output ones stayed green through the wallpaper bug — and with a window on only
+        // one screen, every per-window cache on the other stays untouched.
+        for output in &outputs {
+            let ids = named_element_ids(&mut f, output);
+            for want in ["RoundedTexture", "PreviewChrome", "Dash", "Panel"] {
+                assert!(
+                    ids.iter().any(|id| id.starts_with(want)),
+                    "no {want} element on {} — this guard is watching a scene without the \
+                     surfaces it exists to watch: {ids:?}",
+                    output.name(),
+                );
+            }
+        }
+
+        assert_quiet_across_outputs(&mut f, &format!("overview, {pairing:?} outputs"));
+    }
+}
+
+// The **lock screen** is deliberately not audited here, and the reason is a harness gap rather
+// than a judgement about the scene: its render reads `utils::get_monotonic_time()` directly rather
+// than the compositor clock, so the curtain keeps sliding on wall time through a frozen fixture
+// clock, and `run_until_settled` reports settled while it is still moving. Measured: one output
+// re-rendered four times with the clock frozen moved its shield by 0.06 of the output between two
+// of them. Its one shared cache — the wallpaper blur — is covered by the overview scene above,
+// which takes the same path.
+
+/// The app grid, on two displays.
+///
+/// It renders inside each output's own overview pass, so its `GridCache` — a bake per page, plus
+/// one-tile-worth hover, focus and drop rings — is asked for twice a frame.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs_in_the_app_grid() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    for pairing in [Pairing::Different, Pairing::Identical] {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("app grid id churn probe"))
+        else {
+            return;
+        };
+        add_second_output(&mut f, pairing);
+
+        let apps: Vec<AppEntry> = (0..24)
+            .map(|i| AppEntry::fake(&format!("app{i}.desktop"), &format!("Application {i:02}")))
+            .collect();
+        f.synoik().app_system = AppSystem::with_parts(
+            Box::new(FakeCatalog::new(apps)),
+            Box::new(RecordingLauncher::default()),
+        );
+        assert!(f.synoik().sync_app_grid(), "the grid took no entries");
+
+        f.synoik().layout.toggle_overview();
+        f.settle_animations();
+        assert!(
+            f.synoik().layout.toggle_app_grid(),
+            "the app grid did not open, so this scene proves nothing"
+        );
+        f.settle_animations();
+        f.dispatch();
+
+        assert_quiet_across_outputs(&mut f, &format!("app grid, {pairing:?} outputs"));
+    }
+}
+
+/// An OSD, on two displays.
+///
+/// gnome-shell shows the level popup on **every** monitor (`osdWindow.js`'s one manager per
+/// monitor), so its bake is asked for twice a frame with two different geometries.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs_with_an_osd_up() {
+    for pairing in [Pairing::Different, Pairing::Identical] {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("osd id churn probe")) else {
+            return;
+        };
+        add_second_output(&mut f, pairing);
+
+        let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
+        for output in &outputs {
+            f.synoik().osd.show_one(
+                output,
+                &["audio-volume-high-symbolic"],
+                None,
+                crate::ui::osd::OsdLevel::new(0.5, 1.),
+            );
+        }
+        f.settle_animations();
+        f.settle();
+
+        assert_quiet_across_outputs(&mut f, &format!("osd, {pairing:?} outputs"));
+    }
+}
+
+/// Install `picture` as the wallpaper, decoded synchronously.
+fn install_wallpaper(f: &mut Fixture, picture: std::path::PathBuf) {
     let settings = crate::gnome::BackgroundSettings {
         picture: Some(picture),
         options: crate::gnome::BackgroundOptions::default(),
@@ -14657,55 +14850,4 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
         .backend
         .with_vulkan_renderer(|r| r.gpu().clone());
     f.synoik().wallpaper.update(&settings, gpu.as_ref());
-
-    f.synoik().layout.toggle_overview();
-    f.synoik_complete_animations();
-    f.dispatch();
-
-    let outputs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
-    assert_eq!(outputs.len(), 2, "the fixture must have two outputs");
-
-    let mut attribution: Vec<crate::frame_log::DamageAttribution> =
-        outputs.iter().map(|_| Default::default()).collect();
-    for (i, output) in outputs.iter().enumerate() {
-        let _ = attribution_for(&mut f, output, &mut attribution[i]);
-    }
-
-    let first: Vec<Vec<String>> = outputs
-        .iter()
-        .map(|o| named_element_ids(&mut f, o))
-        .collect();
-    // Anti-vacuity: with no wallpaper element in the list this proves nothing, which is exactly
-    // how the single-output guards stayed green through this bug.
-    for (i, output) in outputs.iter().enumerate() {
-        assert!(
-            first[i].iter().any(|id| id.contains("RoundedTexture")),
-            "no RoundedTexture element on {} — the wallpaper never rendered there, so this guard \
-             is watching a scene without the element it exists to watch: {:?}",
-            output.name(),
-            first[i],
-        );
-    }
-
-    for round in 1..4 {
-        for (i, output) in outputs.iter().enumerate() {
-            let a = attribution_for(&mut f, output, &mut attribution[i]);
-            assert_eq!(
-                a.predicted,
-                0.0,
-                "output {} justified damage on settled overview round {round}, with only the \
-                 *other* output rendering in between: {a:?}",
-                output.name(),
-            );
-            let next = named_element_ids(&mut f, output);
-            assert_eq!(
-                first[i],
-                next,
-                "output {} changed element identity on settled overview round {round}. A cache \
-                 serving every output needs one entry per output when what it holds depends on \
-                 the output — here the blur radius does.",
-                output.name(),
-            );
-        }
-    }
 }

@@ -481,8 +481,6 @@ struct GridCache {
     /// Captions of the pages peeking in during a drag, one bake per page — dropped
     /// when the previews go away, since they exist only for the length of a drag.
     peek_bakes: std::collections::HashMap<usize, widget::BakeCache>,
-    /// Full-color icon uploads (shared key space with the dash's and search's).
-    icons: SharedAppIconUploads,
 }
 
 /// The app-grid model. Owned on `Synoik`; fed by `sync_app_grid`.
@@ -570,7 +568,17 @@ pub struct AppGrid {
     /// our divergence from GNOME's fixed page modes. See [`Self::fill_scale`].
     fill_available: bool,
     clock: Clock,
-    cache: RefCell<GridCache>,
+    /// Cached GPU chrome, **one entry per output**: several of these slots are page- or
+    /// tile-scoped and are pruned against the layout of whichever output is drawing —
+    /// `long_labels`, in particular, drops every caption that fits on *this* screen, which on a
+    /// second display of another width is every caption the first one baked. Shared, the two
+    /// evicted each other on every frame and handed the tracker 24 new identities a frame.
+    /// `nothing_churns_its_element_id_across_two_outputs_in_the_app_grid` is the guard.
+    cache: RefCell<std::collections::HashMap<String, GridCache>>,
+    /// Full-color icon uploads (shared key space with the dash's and search's), and deliberately
+    /// *not* per output: the point of the shared map is that an icon already on the GPU for
+    /// another surface is not uploaded again.
+    icons: RefCell<SharedAppIconUploads>,
 }
 
 /// A tile drawn as its own actor for a frame, because something about it is moving.
@@ -821,7 +829,8 @@ impl AppGrid {
             align,
             fill_available,
             clock,
-            cache: RefCell::new(GridCache::default()),
+            cache: RefCell::new(std::collections::HashMap::new()),
+            icons: RefCell::new(SharedAppIconUploads::default()),
         }
     }
 
@@ -910,24 +919,24 @@ impl AppGrid {
     /// Draw from `shared` instead of this surface's own upload map, so an icon already
     /// on the GPU for another surface is not uploaded again (see [`SharedAppIconUploads`]).
     pub fn share_icon_uploads(&self, shared: &SharedAppIconUploads) {
-        self.cache.borrow_mut().icons = shared.clone();
+        *self.icons.borrow_mut() = shared.clone();
     }
 
     /// The map this surface draws from.
     pub fn icon_uploads(&self) -> SharedAppIconUploads {
-        self.cache.borrow().icons.clone()
+        self.icons.borrow().clone()
     }
 
     /// Drop cached icon uploads (icon-theme / installed change).
     pub fn clear_icon_uploads(&self) {
-        self.cache.borrow_mut().icons.borrow_mut().clear();
+        self.icons.borrow().borrow_mut().clear();
     }
 
     /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
     /// decoded pixels — see [`widget::drop_app_icon_upload`].
     pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         crate::ui::widget::drop_app_icon_upload(
-            &mut self.cache.borrow_mut().icons.borrow_mut(),
+            &mut self.icons.borrow().borrow_mut(),
             icon,
             logical_px,
         );
@@ -2146,7 +2155,7 @@ impl AppGrid {
                 .collect();
             for (icon, px) in pending {
                 let key = (scale_key, icon.clone(), (px.round() as u16).max(1));
-                if cache.icons.borrow().contains_key(&key) || keys.contains(&key) {
+                if self.icons.borrow().borrow().contains_key(&key) || keys.contains(&key) {
                     continue;
                 }
                 if let Some(buf) = app_icons.buffer(icon, px, scale) {
@@ -2169,7 +2178,7 @@ impl AppGrid {
                                 buf.transform(),
                                 Vec::new(),
                             );
-                            cache.icons.borrow_mut().insert(key, tb);
+                            self.icons.borrow().borrow_mut().insert(key, tb);
                         }
                     }
                     Err(err) => tracing::error!("error batch-uploading app icons: {err:#}"),
@@ -2266,7 +2275,7 @@ impl AppGrid {
             for (icon, px, center) in icons {
                 if let Some(el) = widget::app_icon_element(
                     renderer,
-                    &mut cache.icons.borrow_mut(),
+                    &mut self.icons.borrow().borrow_mut(),
                     app_icons,
                     icon,
                     px,
@@ -2782,11 +2791,16 @@ impl AppGrid {
         let scale = output.current_scale().fractional_scale();
         let metrics = layout.metrics;
 
-        let mut cache = self.cache.borrow_mut();
+        let mut caches = self.cache.borrow_mut();
+        let cache = caches.entry(output.name()).or_default();
         let context = renderer.context_id();
         {
             let cache = &mut *cache;
-            crate::ui::widget::sync_icon_upload_context(&mut cache.context, &cache.icons, context);
+            crate::ui::widget::sync_icon_upload_context(
+                &mut cache.context,
+                &self.icons.borrow(),
+                context,
+            );
         }
 
         let mut elements = Vec::new();
@@ -2819,7 +2833,7 @@ impl AppGrid {
                 appearance,
                 alpha,
                 &page_layout,
-                &mut cache,
+                cache,
                 &mut elements,
             );
         }
@@ -2950,7 +2964,7 @@ impl AppGrid {
                     }
                     if let Some(el) = widget::app_icon_element(
                         renderer,
-                        &mut cache.icons.borrow_mut(),
+                        &mut self.icons.borrow().borrow_mut(),
                         app_icons,
                         &entry.icon,
                         metrics.icon_px,
