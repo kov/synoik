@@ -221,11 +221,7 @@ impl OutputName {
         }
 
         let rest = &rest[1..];
-        if !rest.eq_ignore_ascii_case(serial) {
-            return false;
-        }
-
-        true
+        rest.eq_ignore_ascii_case(serial)
     }
 
     // Similar in spirit to Ord, but I don't want to derive Eq to avoid mistakes (you should use

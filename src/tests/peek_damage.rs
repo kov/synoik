@@ -202,7 +202,7 @@ fn build_scene_sized(windows: usize, scene: Scene, win: (i32, i32)) -> Option<(F
         // into device memory, exactly as the session does it. Slow in a debug build — it happens
         // once per fixture, outside every measured frame.
         let settings = crate::gnome::BackgroundSettings {
-            picture: Some(std::path::PathBuf::from(WALLPAPER)),
+            picture: crate::tests::vulkan_render::wallpaper_picture(),
             options: crate::gnome::BackgroundOptions::default(),
         };
         let gpu = f
@@ -215,9 +215,6 @@ fn build_scene_sized(windows: usize, scene: Scene, win: (i32, i32)) -> Option<(F
     f.settle();
     Some((f, poke.expect("at least one window")))
 }
-
-/// The gsrs session's wallpaper (`org.gnome.desktop.background picture-uri`).
-const WALLPAPER: &str = "/usr/share/backgrounds/f34/default/f34-01-day.png";
 
 /// A window big enough that its texture must be minified hard to fit a thumbnail.
 const WIN: (i32, i32) = (1600, 1000);

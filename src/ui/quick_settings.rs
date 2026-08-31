@@ -4037,7 +4037,8 @@ run it with --features reference-env, as the fedora CI job does"
             crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
-        let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
+        let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night
+                                            // Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));

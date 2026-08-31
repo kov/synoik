@@ -714,8 +714,9 @@ impl Dash {
         let m = Self::metrics(area);
         let n = self.items.len();
         let count = n + 1; // + show-apps
-                           // The gap and the empty-dash target are modelled in GNOME's units (the animation
-                           // runs 0 ⇄ `PLACEHOLDER_W`), so they follow the icon down with everything else.
+                           // The gap and the empty-dash target are modelled in GNOME's units (the
+                           // animation runs 0 ⇄ `PLACEHOLDER_W`), so
+                           // they follow the icon down with everything else.
         let k = m.icon_px / ICON_PX;
         let gap = self.gap_w() * k;
         let empty_target = self.empty_drop_target_w() * k;

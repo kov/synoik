@@ -14340,6 +14340,39 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
     );
 }
 
+/// Whether a colour emoji face is installed at all.
+///
+/// The grid draws through `RunFace::Emoji`, which asks fontconfig for the family by name; with no
+/// such face the shaper falls back to a monochrome outline font and every colour assertion below
+/// measures zero. That is indistinguishable from the rasterizer being broken, which is the failure
+/// this guard exists to catch — so say which one it is instead of blaming the renderer.
+fn colour_emoji_font_installed() -> bool {
+    fn scan(dir: &std::path::Path, depth: usize) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth > 0 && scan(&path, depth - 1) {
+                    return true;
+                }
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("NotoColorEmoji"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    ["/usr/share/fonts", "/usr/local/share/fonts"]
+        .iter()
+        .any(|d| scan(std::path::Path::new(d), 4))
+}
+
 /// The picker's grid draws its emoji **in colour**.
 ///
 /// End to end: the COLRv1 rasterizer, the RGBA atlas beside the mask one, `text_color.frag`, and
@@ -14356,6 +14389,10 @@ fn vulkan_the_emoji_picker_grid_draws_in_colour() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
+    if !colour_emoji_font_installed() {
+        eprintln!("skipping: no colour emoji font (install Noto Color Emoji)");
+        return;
+    }
     f.synoik_state()
         .do_action(synoik_config::Action::ToggleEmojiPicker, false);
     f.synoik_complete_animations();
@@ -14488,8 +14525,45 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
     );
 }
 
-/// A real picture on disk, so the wallpaper decodes and uploads for real.
-const WALLPAPER_PICTURE: &str = "/usr/share/backgrounds/f34/default/f34-01-day.png";
+/// Any real picture on disk, so the wallpaper path decodes and uploads for real.
+///
+/// Found rather than named: `gnome-backgrounds` is installed everywhere these tests run, but the
+/// filenames carry the distro's release (`f34-01-day.png`), so a pinned path is a test that passes
+/// on the machine it was written on and fails on the next Fedora. `None` when the package is not
+/// installed at all, and the caller skips — a wallpaper test with no wallpaper measures a scene
+/// without the element it exists to watch.
+pub(crate) fn wallpaper_picture() -> Option<std::path::PathBuf> {
+    fn first_picture(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .collect();
+        // Sorted so two runs on one machine pick the same picture: the decode's cost and the
+        // element's opacity both depend on which one it is.
+        entries.sort_by_key(|e| e.path());
+        for entry in &entries {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("jpg"))
+            {
+                return Some(path);
+            }
+        }
+        if depth == 0 {
+            return None;
+        }
+        entries
+            .iter()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .find_map(|p| first_picture(&p, depth - 1))
+    }
+
+    first_picture(std::path::Path::new("/usr/share/backgrounds"), 3)
+}
 
 /// Nor may one on a **settled overview over a real wallpaper** — the case both guards above miss.
 ///
@@ -14509,11 +14583,15 @@ fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe")) else {
         return;
     };
+    let Some(picture) = wallpaper_picture() else {
+        eprintln!("skipping: no picture under /usr/share/backgrounds (install gnome-backgrounds)");
+        return;
+    };
     let output = f.synoik().global_space.outputs().next().unwrap().clone();
 
     // The real picture, decoded synchronously, exactly as `peek_damage`'s scenes do it.
     let settings = crate::gnome::BackgroundSettings {
-        picture: Some(std::path::PathBuf::from(WALLPAPER_PICTURE)),
+        picture: Some(picture),
         options: crate::gnome::BackgroundOptions::default(),
     };
     let gpu = f
@@ -14562,12 +14640,16 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("wallpaper id churn probe")) else {
         return;
     };
+    let Some(picture) = wallpaper_picture() else {
+        eprintln!("skipping: no picture under /usr/share/backgrounds (install gnome-backgrounds)");
+        return;
+    };
     f.add_output(2, (2560, 1440));
     f.resize_output(2, None, Some(1.5));
     f.settle();
 
     let settings = crate::gnome::BackgroundSettings {
-        picture: Some(std::path::PathBuf::from(WALLPAPER_PICTURE)),
+        picture: Some(picture),
         options: crate::gnome::BackgroundOptions::default(),
     };
     let gpu = f

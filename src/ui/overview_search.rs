@@ -1425,7 +1425,11 @@ mod tests {
     fn unhandled_key_is_ignored_not_consumed() {
         let mut s = OverviewSearch::new();
         s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default()); // active
-                                                                                 // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
+                                                                                 // F5 (no text, not
+                                                                                 // a nav key) must
+                                                                                 // be Ignored so
+                                                                                 // the caller
+                                                                                 // doesn't eat it.
         assert_eq!(
             s.handle_key(
                 Some(Keysym::F5),

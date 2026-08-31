@@ -29,11 +29,11 @@ env:
   # processes mutter uses (`src/wallpaper.rs`), so those two are runtime dependencies of synoik,
   # not build ones. The loaders must expose a `2+` API directory — 26.04 ships 2.1.1 and Fedora
   # 44 ships 2.1.5, while 24.04 was still on 1.0.1, which is part of why the runners moved.
-  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev liblcms2-dev libfontconfig-dev libseccomp-dev gsettings-desktop-schemas gnome-settings-daemon-common gnome-backgrounds glycin-loaders bubblewrap mesa-vulkan-drivers ffmpeg
+  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev liblcms2-dev libfontconfig-dev libseccomp-dev gsettings-desktop-schemas gnome-settings-daemon-common gnome-backgrounds glycin-loaders bubblewrap mesa-vulkan-drivers ffmpeg fonts-noto-color-emoji
   DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel lcms2-devel fontconfig-devel libseccomp-devel gsettings-desktop-schemas gnome-settings-daemon glibc-langpack-en ffmpeg-free glycin-loaders bubblewrap gnome-backgrounds
   # The `reference-env` tests measure shaped text, so the UI font stack is part of the fixture:
   # Adwaita Sans is what `font-name` resolves to at runtime (docs/fork/gnome-style-reference.md).
-  FONTS_DNF: adwaita-sans-fonts adwaita-mono-fonts abattis-cantarell-fonts
+  FONTS_DNF: adwaita-sans-fonts adwaita-mono-fonts abattis-cantarell-fonts google-noto-color-emoji-fonts
 
 jobs:
   test:
