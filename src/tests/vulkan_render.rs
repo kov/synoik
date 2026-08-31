@@ -14811,6 +14811,38 @@ fn nothing_churns_its_element_id_across_two_outputs_in_the_app_grid() {
     }
 }
 
+/// The screenshot UI, on two displays.
+///
+/// It renders through every output, and its `PanelCache` is a single slot with the scale it was
+/// baked at held beside the texture — the shape that made the other three instances of this bug.
+#[test]
+fn nothing_churns_its_element_id_across_two_outputs_in_the_screenshot_ui() {
+    for pairing in [Pairing::Different, Pairing::Identical] {
+        let Some(mut f) = window_fixture_settled(GREEN, true, Some("screenshot id churn probe"))
+        else {
+            return;
+        };
+        add_second_output(&mut f, pairing);
+
+        f.synoik_state().open_screenshot_ui(None);
+        settle_screenshot_ui_open(&mut f);
+        f.dispatch();
+
+        // Anti-vacuity: the UI has to actually be on both screens.
+        let outs: Vec<Output> = f.synoik().global_space.outputs().cloned().collect();
+        for output in &outs {
+            let ids = named_element_ids(&mut f, output);
+            assert!(
+                ids.iter().any(|id| id.starts_with("ScreenshotUi")),
+                "no ScreenshotUi element on {}: {ids:?}",
+                output.name(),
+            );
+        }
+
+        assert_quiet_across_outputs(&mut f, &format!("screenshot ui, {pairing:?} outputs"));
+    }
+}
+
 /// An OSD, on two displays.
 ///
 /// gnome-shell shows the level popup on **every** monitor (`osdWindow.js`'s one manager per
