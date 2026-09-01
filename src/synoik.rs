@@ -9377,11 +9377,7 @@ impl Synoik {
                 .is_some()
         };
 
-        if layer_popup_under(Layer::Bottom) || layer_popup_under(Layer::Background) {
-            return true;
-        }
-
-        false
+        layer_popup_under(Layer::Bottom) || layer_popup_under(Layer::Background)
     }
 
     /// Whether shell chrome drawn over the *live* desktop covers this point: a peeked

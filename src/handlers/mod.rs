@@ -907,11 +907,7 @@ impl XdgActivationHandler for State {
         }
 
         let pointer_last_enter = seat.get_pointer().unwrap().last_enter();
-        if pointer_last_enter.is_some_and(|last_enter| serial.is_no_older_than(&last_enter)) {
-            return true;
-        }
-
-        false
+        pointer_last_enter.is_some_and(|last_enter| serial.is_no_older_than(&last_enter))
     }
 
     fn request_activation(
