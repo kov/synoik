@@ -136,6 +136,31 @@ pub fn name_rect(
     )
 }
 
+/// The hairline marking the gap between two thumbnails, centred in the space that is
+/// actually visible — hence the rects **as drawn** rather than their slots: an inactive
+/// thumbnail is drawn inset inside its slot, and measuring from the slots leans the mark
+/// toward whichever neighbour is drawn at full size.
+///
+/// The outermost insertion points have a neighbour on one side only, and measure the gap off
+/// the one they have.
+pub fn hairline_rect(
+    left: Option<Rectangle<f64, Logical>>,
+    right: Option<Rectangle<f64, Logical>>,
+    gap: f64,
+) -> Option<Rectangle<f64, Logical>> {
+    let reference = right.or(left)?;
+    let start = left.map_or(reference.loc.x - gap, |r| r.loc.x + r.size.w);
+    let end = right.map_or(reference.loc.x + reference.size.w + gap, |r| r.loc.x);
+    let h = (reference.size.h * HAIRLINE_HEIGHT_FRAC).round();
+    Some(Rectangle::new(
+        Point::from((
+            ((start + end - HAIRLINE_WIDTH) / 2.).round(),
+            (reference.loc.y + (reference.size.h - h) / 2.).round(),
+        )),
+        Size::from((HAIRLINE_WIDTH, h)),
+    ))
+}
+
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {
@@ -147,13 +172,18 @@ pub struct Strip {
     pub thumbs: Vec<Rectangle<f64, Logical>>,
     /// The new-workspace drop placeholder pill, when a drag has lingered in an interior gap.
     pub placeholder: Option<Rectangle<f64, Logical>>,
-    /// The hairline marking the gap a drag is aiming at, before the linger promotes it to
-    /// [`Self::placeholder`]. Sits inside the gap, so it never widens [`Self::bounds`].
-    pub hairline: Option<Rectangle<f64, Logical>>,
+    /// The gap a drag is aiming at, before the linger promotes it to [`Self::placeholder`].
+    /// An index, not a rect: the mark is centred between the thumbnails **as drawn**, and
+    /// the shrink that insets a thumbnail inside its slot belongs to the monitor
+    /// (`Monitor::strip_hairline_rect`). It sits inside a gap that is already there, so it
+    /// never widens [`Self::bounds`].
+    pub hairline: Option<usize>,
     /// The slot held open for a workspace that does not exist yet, and how far open it is.
     pub phantom: Option<(Rectangle<f64, Logical>, Phantom)>,
     /// The band the strip was allocated: the row's viewport, and the clip.
     pub band: Rectangle<f64, Logical>,
+    /// The gap the row was laid with — what the space between two slots measures.
+    pub gap: f64,
 }
 
 /// Lays the row out inside its allocated `band`: `n` thumbnails one band tall, `gap` apart,
@@ -225,33 +255,6 @@ pub fn strip_geometry(
         rect.loc.x += x0;
     }
 
-    // The hairline is placed *after* the run is positioned and takes no part in it: it is
-    // centred in the gap that is already between two settled thumbnails, so aiming at a gap
-    // moves nothing. `n >= 1` always, so both ends have a thumbnail to measure from.
-    let hairline_rect = match insert {
-        Some(Insert::Hairline(idx)) => {
-            let (start, end) = if idx == 0 {
-                let first = thumbs[0];
-                (first.loc.x - gap, first.loc.x)
-            } else if idx >= n {
-                let last = thumbs[n - 1];
-                (last.loc.x + last.size.w, last.loc.x + last.size.w + gap)
-            } else {
-                let (prev, next) = (thumbs[idx - 1], thumbs[idx]);
-                (prev.loc.x + prev.size.w, next.loc.x)
-            };
-            let h = (thumb.h * HAIRLINE_HEIGHT_FRAC).round();
-            Some(Rectangle::new(
-                Point::from((
-                    ((start + end - HAIRLINE_WIDTH) / 2.).round(),
-                    y + ((thumb.h - h) / 2.).round(),
-                )),
-                Size::from((HAIRLINE_WIDTH, h)),
-            ))
-        }
-        _ => None,
-    };
-
     // The phantom is placed *after* the run is positioned, and takes no part in either the
     // centering or the scroll: one gap past the last thumbnail, growing rightwards from
     // nothing to a whole workspace. That is what keeps the row still while the drag is in
@@ -280,9 +283,13 @@ pub fn strip_geometry(
         scale: thumb.h / view_size.h,
         thumbs,
         placeholder: placeholder_rect,
-        hairline: hairline_rect,
+        hairline: match insert {
+            Some(Insert::Hairline(idx)) => Some(idx),
+            _ => None,
+        },
         phantom: phantom_rect,
         band,
+        gap,
     }
 }
 

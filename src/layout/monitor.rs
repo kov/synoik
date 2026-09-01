@@ -1948,7 +1948,7 @@ impl<W: LayoutElement> Monitor<W> {
                 );
             }
 
-            if let Some(rect) = strip.hairline {
+            if let Some(rect) = self.strip_hairline_rect(&strip) {
                 let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
                 self.thumb_hairline.update_render_elements(
                     rect.size,
@@ -2811,6 +2811,29 @@ impl<W: LayoutElement> Monitor<W> {
         let strip = self.lay_strip(self.thumb_phantom.as_ref().map(PhantomSlot::phantom))?;
         let strip = self.apply_thumb_drag(strip);
         Some(self.apply_row_slide(strip))
+    }
+
+    /// The hairline's box for a laid-out row, in the same coordinates as `strip.thumbs` (the
+    /// render's slide is added by the caller, as it is for the pill).
+    ///
+    /// Measured off the thumbnails **as drawn**: `strip.thumbs` are slots, and an inactive
+    /// thumbnail is drawn inset inside its slot ([`thumbnail_drawn_rect`]), so centring
+    /// between the slots leans the mark toward whichever neighbour is at full size.
+    fn strip_hairline_rect(&self, strip: &Strip) -> Option<Rectangle<f64, Logical>> {
+        let idx = strip.hairline?;
+        let drawn = |i: usize| {
+            strip.thumbs.get(i).map(|slot| {
+                thumbnail_drawn_rect(*slot, self.strip_render_scale(i), Point::default())
+            })
+        };
+        thumbnails::hairline_rect(idx.checked_sub(1).and_then(drawn), drawn(idx), strip.gap)
+    }
+
+    /// [`Self::strip_hairline_rect`] for the conformance corpus, which pins where in the gap
+    /// the mark lands.
+    #[cfg(test)]
+    pub fn strip_hairline_rect_for_test(&self, strip: &Strip) -> Option<Rectangle<f64, Logical>> {
+        self.strip_hairline_rect(strip)
     }
 
     /// The strip as laid out with neither the phantom slot nor a reorder drag applied.
@@ -4098,7 +4121,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // The hairline the same gap wears before the linger promotes it. Alternatives, never
         // both: `strip_geometry` takes one `Insert`.
-        if let Some(rect) = strip.hairline {
+        if let Some(rect) = self.strip_hairline_rect(&strip) {
             self.thumb_hairline.render(rect.loc + slide, &mut push_ring);
         }
 

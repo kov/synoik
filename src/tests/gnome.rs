@@ -12440,6 +12440,34 @@ fn thumbnail_gap_drop_inserts_workspace() {
         );
     }
 
+    // The mark goes in the middle of the space that is actually visible. `strip.thumbs` are
+    // slots, and an inactive thumbnail is drawn inset inside its slot — centring between the
+    // slots leaned the hairline toward whichever neighbour was drawn at full size.
+    {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let mon = mon.unwrap();
+        let strip = mon.thumbnail_strip().unwrap();
+        let idx = strip.hairline.expect("the gap must still be marked");
+        let drawn = |i: usize| {
+            let slot = strip.thumbs[i];
+            let shrink = mon.strip_render_scale(i);
+            let w = slot.size.w * shrink;
+            (slot.loc.x + (slot.size.w - w) / 2., w)
+        };
+        let (lx, lw) = drawn(idx - 1);
+        let (rx, _) = drawn(idx);
+        let rect = mon.strip_hairline_rect_for_test(&strip).unwrap();
+        let (start, end) = (lx + lw, rx);
+        assert!(
+            end > start,
+            "the two thumbnails must have a gap between them"
+        );
+        assert!(
+            ((rect.loc.x + rect.size.w / 2.) - (start + end) / 2.).abs() <= 1.,
+            "the hairline must sit in the middle of the {start}..{end} gap, got {rect:?}"
+        );
+    }
+
     let now = f.synoik().clock.now_unadjusted();
     f.synoik()
         .clock
