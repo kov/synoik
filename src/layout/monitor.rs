@@ -87,6 +87,11 @@ const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 /// because it is the same question about the same pointer.
 const STRIP_FREEZE_MS: u32 = 750;
 
+/// How long a drag has to linger in one strip gap before the row parts for it — see
+/// [`PlaceholderLinger`]. The same `WINDOW_REPOSITIONING_DELAY` every other
+/// hold-the-pointer-still answer on this row runs on.
+const PLACEHOLDER_LINGER_MS: u32 = 750;
+
 /// gnome-shell's `WORKSPACE_MIN_SPACING` / `WORKSPACE_MAX_SPACING`
 /// (`workspacesView.js:22-23`), the clamp on the overview row's inter-workspace
 /// gap.
@@ -194,6 +199,12 @@ pub struct Monitor<W: LayoutElement> {
     /// The strip's new-workspace drop placeholder pill (gnome-shell's
     /// `.placeholder`).
     thumb_placeholder: FocusRing,
+    /// The hairline marking the gap a drag is aiming at, before it has lingered there —
+    /// see [`PlaceholderLinger`].
+    thumb_hairline: FocusRing,
+    /// The strip gap a drag is currently aiming at, and the linger that promotes it from a
+    /// hairline to the row-parting pill.
+    thumb_placeholder_linger: Option<PlaceholderLinger>,
     /// A thumbnail being dragged along the strip to reorder the workspaces.
     thumb_drag: Option<ThumbDrag>,
     /// The slot the row holds open for a workspace a drop would create — see
@@ -299,6 +310,11 @@ pub(super) struct InsertHint {
 struct InsertHintRenderLoc {
     workspace: InsertWorkspace,
     location: Point<f64, Logical>,
+    /// The box the hint was sized to. Kept beside the location so the pair describes the
+    /// drawn rect on its own — the element itself does not report its size, and nothing on
+    /// the render path needs to ask (it draws from the element's own state).
+    #[cfg(test)]
+    size: Size<f64, Logical>,
 }
 
 #[derive(Debug)]
@@ -394,6 +410,29 @@ struct StripFreeze {
     /// `Some` releases when it is done, and *does* claim one, which is what guarantees a frame
     /// arrives to notice.
     hold: Option<Animation>,
+}
+
+/// A drag hovering one of the row's interior gaps, waiting to be taken seriously.
+///
+/// Aiming at a gap while carrying a window across the row is mostly *passing through* it, and
+/// the pill that marks a gap parts the row to make space — so opening it on the first frame
+/// the pointer is inside makes the whole row shuffle under a drag that was only travelling.
+/// Two stages instead: the gap gets a hairline immediately (which lays nothing out, see
+/// [`thumbnails::Insert::Hairline`]), and only a pointer that stays in the *same* gap for
+/// [`PLACEHOLDER_LINGER_MS`] promotes it to the pill.
+///
+/// **Divergence.** gnome-shell has no delay here — but it also never parts the row during a
+/// drag (`docs/fork/dynamic-workspaces-divergence.md`); our pill does, so it has to be asked
+/// for. Moving to a different gap re-arms from scratch, so sweeping across the row never
+/// promotes anything.
+#[derive(Debug)]
+struct PlaceholderLinger {
+    /// The insertion index the pointer is holding on. A change re-arms [`Self::hold`].
+    idx: usize,
+    /// Running: hairline. Done: pill. It claims a frame (see `Monitor::animation_causes`),
+    /// which is what guarantees a parked pointer is noticed at all — nothing else about a
+    /// still drag would draw the frame that promotes it.
+    hold: Animation,
 }
 
 /// The row holding a slot open for a workspace that does not exist yet.
@@ -676,6 +715,8 @@ impl<W: LayoutElement> Monitor<W> {
                 view_size,
             )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
+            thumb_hairline: FocusRing::new(thumbnail_hairline_config()),
+            thumb_placeholder_linger: None,
             thumb_drag: None,
             thumb_phantom: None,
             thumb_row_slide: None,
@@ -1794,6 +1835,15 @@ impl<W: LayoutElement> Monitor<W> {
         if self.thumb_row_slide.is_some() {
             causes |= AnimCauses::THUMB_ROW_SLIDE;
         }
+        // Only while it is still counting down: a promoted linger holds the pill up with no
+        // further frames of its own, exactly like a settled freeze.
+        if self
+            .thumb_placeholder_linger
+            .as_ref()
+            .is_some_and(|l| !l.hold.is_done())
+        {
+            causes |= AnimCauses::THUMB_PLACEHOLDER_LINGER;
+        }
         // Only a hold that is running out needs frames to run out *on*; an indefinite one
         // deliberately asks for none — see [`StripFreeze::hold`].
         if self
@@ -1897,6 +1947,20 @@ impl<W: LayoutElement> Monitor<W> {
                     1.,
                 );
             }
+
+            if let Some(rect) = strip.hairline {
+                let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
+                self.thumb_hairline.update_render_elements(
+                    rect.size,
+                    true,
+                    false,
+                    false,
+                    view_rect,
+                    CornerRadius::from((thumbnails::HAIRLINE_WIDTH / 2.) as f32),
+                    scale,
+                    1.,
+                );
+            }
         }
 
         let insert_hint_ws_id = self
@@ -1958,6 +2022,8 @@ impl<W: LayoutElement> Monitor<W> {
                             self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                                 workspace: hint.workspace,
                                 location: area.loc,
+                                #[cfg(test)]
+                                size: area.size,
                             });
                         }
                     } else {
@@ -1980,41 +2046,67 @@ impl<W: LayoutElement> Monitor<W> {
                     let hint_gap = round_logical_in_physical(scale, gap * 0.1);
                     let hint_thickness = gap - hint_gap * 2.;
 
-                    let next_ws_geo = self.workspaces_render_geo().nth(ws_idx).unwrap();
+                    // The bar goes in the middle of the gap **as drawn**, which is not the
+                    // middle of `gap`: `workspaces_render_geo` shrinks every inactive
+                    // workspace about its slot's centre (`workspace_render_scale`), so the
+                    // visible space between two neighbours is `gap` plus each one's share of
+                    // that shrink. Measuring from the following workspace's left edge alone
+                    // put the whole surplus on one side, which read as a bar glued to the
+                    // right-hand workspace on both sides of the active one.
+                    //
+                    // `workspaces_render_geo` yields one rect past the end, but that slot
+                    // holds no workspace, so the outermost insertion points measure the gap
+                    // off the one neighbour they do have.
+                    let n = self.workspaces.len();
+                    let next_ws_geo =
+                        (ws_idx < n).then(|| self.workspaces_render_geo().nth(ws_idx).unwrap());
+                    let prev_ws_geo = ws_idx
+                        .checked_sub(1)
+                        .map(|i| self.workspaces_render_geo().nth(i).unwrap());
+                    // A monitor always has at least one workspace, so at least one side is real.
+                    let ref_ws_geo = next_ws_geo.or(prev_ws_geo).unwrap();
+
                     // A bar across the gap: horizontal strips get a vertical
                     // bar, vertical strips a horizontal one.
-                    let (hint_loc_diff, hint_size) = if self.workspaces_horizontal() {
+                    let (hint_loc, hint_size) = if self.workspaces_horizontal() {
+                        let start =
+                            prev_ws_geo.map_or(ref_ws_geo.loc.x - gap, |g| g.loc.x + g.size.w);
+                        let end = next_ws_geo
+                            .map_or(ref_ws_geo.loc.x + ref_ws_geo.size.w + gap, |g| g.loc.x);
                         let hint_length =
-                            round_logical_in_physical(scale, next_ws_geo.size.h * 0.75);
-                        let hint_y = round_logical_in_physical(
-                            scale,
-                            (next_ws_geo.size.h - hint_length) / 2.,
-                        );
-                        (
-                            Point::from((hint_thickness + hint_gap, -hint_y)),
-                            Size::from((hint_thickness, hint_length)),
-                        )
+                            round_logical_in_physical(scale, ref_ws_geo.size.h * 0.75);
+                        let loc = Point::from((
+                            round_logical_in_physical(scale, (start + end - hint_thickness) / 2.),
+                            round_logical_in_physical(
+                                scale,
+                                ref_ws_geo.loc.y + (ref_ws_geo.size.h - hint_length) / 2.,
+                            ),
+                        ));
+                        (loc, Size::from((hint_thickness, hint_length)))
                     } else {
+                        let start =
+                            prev_ws_geo.map_or(ref_ws_geo.loc.y - gap, |g| g.loc.y + g.size.h);
+                        let end = next_ws_geo
+                            .map_or(ref_ws_geo.loc.y + ref_ws_geo.size.h + gap, |g| g.loc.y);
                         let hint_length =
-                            round_logical_in_physical(scale, next_ws_geo.size.w * 0.75);
-                        let hint_x = round_logical_in_physical(
-                            scale,
-                            (next_ws_geo.size.w - hint_length) / 2.,
-                        );
-                        (
-                            Point::from((-hint_x, hint_thickness + hint_gap)),
-                            Size::from((hint_length, hint_thickness)),
-                        )
+                            round_logical_in_physical(scale, ref_ws_geo.size.w * 0.75);
+                        let loc = Point::from((
+                            round_logical_in_physical(
+                                scale,
+                                ref_ws_geo.loc.x + (ref_ws_geo.size.w - hint_length) / 2.,
+                            ),
+                            round_logical_in_physical(scale, (start + end - hint_thickness) / 2.),
+                        ));
+                        (loc, Size::from((hint_length, hint_thickness)))
                     };
-                    let hint_loc = next_ws_geo.loc - hint_loc_diff;
 
                     // Sometimes the hint ends up 1 px wider than necessary and/or 1 px
                     // narrower than necessary. The values here seem correct. Might have to do with
                     // how zooming out currently doesn't round to output scale properly.
 
-                    // Compute view rect as if we're above the next workspace (rather than below
-                    // the previous one).
-                    let view_rect = Rectangle::new(hint_loc_diff, next_ws_geo.size);
+                    // Compute view rect as if we're above the reference workspace (rather than
+                    // below the previous one).
+                    let view_rect = Rectangle::new(ref_ws_geo.loc - hint_loc, ref_ws_geo.size);
 
                     // In GNOME windowing mode the bar reads as a drop
                     // placeholder: give it the pill shape.
@@ -2028,6 +2120,8 @@ impl<W: LayoutElement> Monitor<W> {
                     self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                         workspace: hint.workspace,
                         location: hint_loc,
+                        #[cfg(test)]
+                        size: hint_size,
                     });
                 }
             }
@@ -2733,11 +2827,14 @@ impl<W: LayoutElement> Monitor<W> {
         // The phantom wins where it is open: whichever gap it is holding needs no pill
         // marking it, it *is* the mark.
         let insert = phantom.map(thumbnails::Insert::Phantom).or_else(|| {
-            let hint = self.insert_hint.as_ref().filter(|hint| hint.via_strip)?;
-            match hint.workspace {
-                InsertWorkspace::NewAt(idx) => Some(thumbnails::Insert::Placeholder(idx)),
-                InsertWorkspace::Existing(_) => None,
-            }
+            let linger = self.thumb_placeholder_linger.as_ref()?;
+            // The pill only once the linger has run out; until then the gap is marked by a
+            // hairline, which takes no room and so leaves the row where the drag found it.
+            Some(if linger.hold.is_done() {
+                thumbnails::Insert::Placeholder(linger.idx)
+            } else {
+                thumbnails::Insert::Hairline(linger.idx)
+            })
         });
         let band = if self.strip_is_peek() {
             self.peek_band()
@@ -2832,6 +2929,44 @@ impl<W: LayoutElement> Monitor<W> {
     /// motion to clear it. Nothing here can: the pointer entering the band always arrives as a
     /// motion, which puts the hold back to indefinite, so a hold that ran out is a pointer that
     /// was last seen outside the row.
+    /// Point the strip's drop affordance at `idx`, or at nothing.
+    ///
+    /// Re-arms the linger whenever the gap changes, so a drag sweeping across the row leaves
+    /// a trail of hairlines and parts it nowhere. Called from every recomputation of the
+    /// insert hint, which is the one place that knows where the pointer is aiming.
+    pub(super) fn note_placeholder_linger(&mut self, idx: Option<usize>) {
+        let Some(idx) = idx else {
+            self.thumb_placeholder_linger = None;
+            return;
+        };
+        if self
+            .thumb_placeholder_linger
+            .as_ref()
+            .is_some_and(|l| l.idx == idx)
+        {
+            return;
+        }
+        let hold = Animation::new(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            synoik_config::Animation {
+                // Deliberately **not** the animation switch: this is a dwell, not a
+                // transition. Turning animations off must not make the row part the instant
+                // a drag crosses a gap — that is the behaviour the linger exists to stop.
+                off: false,
+                kind: synoik_config::animations::Kind::Easing(
+                    synoik_config::animations::EasingParams {
+                        duration_ms: PLACEHOLDER_LINGER_MS,
+                        curve: synoik_config::animations::Curve::Linear,
+                    },
+                ),
+            },
+        );
+        self.thumb_placeholder_linger = Some(PlaceholderLinger { idx, hold });
+    }
+
     pub(super) fn strip_pointer_moved(
         &mut self,
         pos_within_output: Option<Point<f64, Logical>>,
@@ -3873,6 +4008,15 @@ impl<W: LayoutElement> Monitor<W> {
         between * (1. - overview)
     }
 
+    /// The between-workspaces insert hint's box as drawn — for the conformance corpus,
+    /// which pins where in the gap it lands.
+    #[cfg(test)]
+    pub fn insert_hint_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let loc = self.insert_hint_render_loc.as_ref()?;
+        matches!(loc.workspace, InsertWorkspace::NewAt(_))
+            .then(|| Rectangle::new(loc.location, loc.size))
+    }
+
     pub fn render_insert_hint_between_workspaces(
         &self,
         push: &mut dyn FnMut(MonitorRenderElement),
@@ -3950,6 +4094,12 @@ impl<W: LayoutElement> Monitor<W> {
         if let Some(rect) = strip.placeholder {
             self.thumb_placeholder
                 .render(rect.loc + slide, &mut push_ring);
+        }
+
+        // The hairline the same gap wears before the linger promotes it. Alternatives, never
+        // both: `strip_geometry` takes one `Insert`.
+        if let Some(rect) = strip.hairline {
+            self.thumb_hairline.render(rect.loc + slide, &mut push_ring);
         }
 
         // A carried thumbnail is drawn first — first pushed = topmost — so it passes over
@@ -4967,6 +5117,22 @@ fn strip_transition_config(options: &Options) -> synoik_config::Animation {
 /// workspace goes (gnome-shell's workspace-placeholder asset).
 fn thumbnail_placeholder_config() -> synoik_config::FocusRing {
     let color = synoik_config::Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x66);
+    synoik_config::FocusRing {
+        off: false,
+        width: 0.,
+        active_color: color,
+        inactive_color: color,
+        urgent_color: color,
+        active_gradient: None,
+        inactive_gradient: None,
+        urgent_gradient: None,
+    }
+}
+
+/// The hairline that marks the gap a drag is aiming at before the linger promotes it to the
+/// pill — the same white, at the weight a hint rather than a placeholder deserves.
+fn thumbnail_hairline_config() -> synoik_config::FocusRing {
+    let color = synoik_config::Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x40);
     synoik_config::FocusRing {
         off: false,
         width: 0.,

@@ -12404,16 +12404,61 @@ fn thumbnail_gap_drop_inserts_workspace() {
     f.pointer_motion(0., 10.);
     pointer_motion_to(&mut f, gap.0, gap.1);
 
-    // While hovering the gap, the strip makes room for the drop placeholder
-    // (gnome-shell's placeholder affordance). The insert hint updates on
-    // render; drive that like a frame would.
+    // Aiming at the gap marks it with a hairline and moves nothing; only lingering there
+    // promotes it to the row-parting placeholder. The insert hint updates on render; drive
+    // that like a frame would.
+    f.synoik().layout.update_render_elements(None);
+    let at_rest = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert!(
+            strip.hairline.is_some(),
+            "aiming at a thumbnail gap must mark it with a hairline"
+        );
+        assert!(
+            strip.placeholder.is_none(),
+            "the placeholder must wait for the linger"
+        );
+        strip.thumbs.clone()
+    };
+
+    let now = f.synoik().clock.now_unadjusted();
+    f.synoik()
+        .clock
+        .set_unadjusted(now + Duration::from_millis(400));
+    f.synoik().layout.update_render_elements(None);
+    {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert!(
+            strip.placeholder.is_none(),
+            "half the linger is not the linger"
+        );
+        assert_eq!(
+            strip.thumbs, at_rest,
+            "the hairline must not move the row it marks a gap in"
+        );
+    }
+
+    let now = f.synoik().clock.now_unadjusted();
+    f.synoik()
+        .clock
+        .set_unadjusted(now + Duration::from_millis(400));
     f.synoik().layout.update_render_elements(None);
     {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon.unwrap().thumbnail_strip().unwrap();
         assert!(
             strip.placeholder.is_some(),
-            "hovering a thumbnail gap must show the drop placeholder"
+            "a drag that lingers in a gap must open the drop placeholder"
+        );
+        assert!(
+            strip.hairline.is_none(),
+            "the pill replaces the hairline, it does not join it"
+        );
+        assert_ne!(
+            strip.thumbs, at_rest,
+            "the placeholder must part the row it opens in"
         );
     }
 
@@ -12436,6 +12481,122 @@ fn thumbnail_gap_drop_inserts_workspace() {
         ws_idx, 1,
         "the window must land on the workspace inserted at the gap"
     );
+}
+
+/// Sweeping a drag across the row must not part it: each gap the pointer crosses re-arms the
+/// linger from scratch, so only a gap the pointer *stays* in ever gets the pill.
+#[test]
+fn sweeping_across_the_thumbnail_row_never_opens_the_placeholder() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let (win_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+    let (t2x, _) = thumbnail_center(&mut f, 2);
+    let gaps = [(t0x + t1x) / 2., (t1x + t2x) / 2.];
+
+    // Each gap is held for most of the linger, then left for the next one — a hand crossing
+    // the row, not a hand stopping in it. Over twice the linger in total.
+    for gap_x in gaps {
+        pointer_motion_to(&mut f, gap_x, t0y);
+        let now = f.synoik().clock.now_unadjusted();
+        f.synoik()
+            .clock
+            .set_unadjusted(now + Duration::from_millis(700));
+        f.synoik().layout.update_render_elements(None);
+
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert!(
+            strip.placeholder.is_none(),
+            "a gap the drag only passed through must not part the row"
+        );
+        assert!(
+            strip.hairline.is_some(),
+            "the gap being aimed at must still be marked"
+        );
+    }
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+}
+
+/// The between-workspaces bar goes in the middle of the gap **as drawn**. The row shrinks
+/// every inactive workspace about its slot's centre, so the visible gap is wider than the
+/// nominal one on the side away from the active workspace; measuring the bar off the
+/// following workspace alone put the whole surplus on one side and glued the bar to the
+/// right-hand neighbour in both gaps.
+#[test]
+fn the_between_workspaces_bar_is_centred_in_the_gap_it_is_drawn_in() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let (_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    // Centre the middle workspace, so both of its gaps are on screen: the bug was symmetric,
+    // and one gap alone cannot show that. B lives on it, so its preview is the one to grab —
+    // A's is off the left edge from here.
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+
+    // The gaps either side of the centred workspace, taken from the rects the row is
+    // actually drawn at — re-read each time, since grabbing a preview off a neighbouring
+    // workspace slides the row and the gap must be measured where it currently is.
+    let drawn_gap = |f: &mut Fixture, idx: usize| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let geo: Vec<_> = mon.unwrap().workspaces_render_geo().take(3).collect();
+        let (left, right) = (geo[idx - 1], geo[idx]);
+        (
+            left.loc.x + left.size.w,
+            right.loc.x,
+            geo[1].loc.y + geo[1].size.h / 2.,
+        )
+    };
+
+    for idx in [1, 2] {
+        let (start, end, mid_y) = drawn_gap(&mut f, idx);
+        assert!(
+            end > start,
+            "the two workspaces must have a gap between them"
+        );
+        pointer_motion_to(&mut f, (start + end) / 2., mid_y);
+        f.synoik().layout.update_render_elements(None);
+
+        // Re-read: the motion itself may have advanced a row slide the grab started.
+        let (start, end, _) = drawn_gap(&mut f, idx);
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let bar = mon
+            .unwrap()
+            .insert_hint_rect()
+            .expect("aiming at a gap between workspaces must draw the bar");
+        let bar_mid = bar.loc.x + bar.size.w / 2.;
+        let gap_mid = (start + end) / 2.;
+        assert!(
+            (bar_mid - gap_mid).abs() <= 1.,
+            "the bar must sit in the middle of the {start}..{end} gap, got {bar:?}"
+        );
+    }
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
 }
 
 /// An edge-tiled window's preview drag never touches the window: no

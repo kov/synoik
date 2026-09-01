@@ -651,6 +651,8 @@ bitflags::bitflags! {
         const WORKSPACE_PEEK = 1 << 29;
         /// The workspace row's scroll held past a click on one of its thumbnails, running out.
         const THUMB_SCROLL_FREEZE = 1 << 30;
+        /// A drag lingering in one of the workspace row's gaps, counting down to the pill.
+        const THUMB_PLACEHOLDER_LINGER = 1 << 31;
     }
 }
 
@@ -707,6 +709,10 @@ impl AnimCauses {
             (AnimCauses::THUMB_PHANTOM, "thumb-phantom"),
             (AnimCauses::THUMB_ROW_SLIDE, "thumb-row-slide"),
             (AnimCauses::THUMB_SCROLL_FREEZE, "thumb-scroll-freeze"),
+            (
+                AnimCauses::THUMB_PLACEHOLDER_LINGER,
+                "thumb-placeholder-linger",
+            ),
         ];
         TABLE
             .iter()

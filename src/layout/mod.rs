@@ -4117,6 +4117,10 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         if !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
+            // No drag, no gap being aimed at — and so no linger to keep counting.
+            for mon in self.monitors_mut() {
+                mon.note_placeholder_linger(None);
+            }
             return;
         }
         let Some(InteractiveMoveState::Moving(move_)) = self.interactive_move.take() else {
@@ -4133,6 +4137,16 @@ impl<W: LayoutElement> Layout<W> {
         // not when dragging within the overview.
         let edge_tiling = self.gnome_edge_tiling && !self.overview_open;
 
+        // The drag is on exactly one output; a gap another monitor's row was holding open is
+        // no longer being aimed at. Not folded into the `insert_hint` sweep above, which runs
+        // every recomputation — the linger has to *survive* those or it never counts down.
+        let dragged_output = move_.output.clone();
+        for mon in self.monitors_mut() {
+            if mon.output != dragged_output {
+                mon.note_placeholder_linger(None);
+            }
+        }
+
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
             // Note: the hint was cleared above, so this hit-tests the strip
@@ -4142,6 +4156,14 @@ impl<W: LayoutElement> Layout<W> {
                 .thumbnail_strip()
                 .is_some_and(|strip| strip.drop_target(move_.pointer_pos_within_output).is_some());
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+            // Which strip gap the drag is aiming at, if any — the row parts for it only once
+            // the linger has run out. Re-stated every recomputation, so it is armed by the
+            // frame the pointer enters a gap and dropped the frame it leaves one.
+            let linger_idx = match insert_ws {
+                InsertWorkspace::NewAt(idx) if via_strip => Some(idx),
+                _ => None,
+            };
+            mon.note_placeholder_linger(linger_idx);
             match insert_ws {
                 InsertWorkspace::Existing(ws_id) => {
                     let ws = mon

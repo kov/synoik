@@ -31,6 +31,15 @@ pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 /// `.placeholder`).
 pub const PLACEHOLDER_WIDTH: f64 = 18.;
 
+/// The width of the hairline that marks a gap before the drag has lingered in it long
+/// enough to open the [`PLACEHOLDER_WIDTH`] pill — see [`Insert::Hairline`].
+pub const HAIRLINE_WIDTH: f64 = 2.;
+
+/// How much of a thumbnail's height the hairline spans, centred on it. Shorter than the
+/// pill, which is full height: the hairline is a hint that a gap is *aimed at*, and reading
+/// as a lesser mark than the thing it turns into is the point.
+const HAIRLINE_HEIGHT_FRAC: f64 = 0.5;
+
 /// A workspace that is not in the model yet, holding open the slot it would take.
 ///
 /// gnome-shell's `collapse_fraction`, inverted so 1 reads as "there": a fully collapsed
@@ -68,8 +77,14 @@ pub struct Phantom {
 /// the phantom.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Insert {
+    /// A hairline in the gap before the thumbnail at this index, marking it as aimed at.
+    /// **Lays nothing out**: it is drawn inside the gap that is already there, so the row
+    /// does not move while the pointer is only passing through. The linger that promotes it
+    /// to [`Insert::Placeholder`] lives on the monitor
+    /// (`Monitor::thumb_placeholder_linger`).
+    Hairline(usize),
     /// The fixed-width drop pill, before the thumbnail at this index (gnome-shell's
-    /// `_dropPlaceholderPos`, `workspaceThumbnail.js:1352-1390`).
+    /// `_dropPlaceholderPos`, `workspaceThumbnail.js:1352-1390`). Parts the row.
     Placeholder(usize),
     /// A whole workspace's slot, opening.
     Phantom(Phantom),
@@ -130,8 +145,11 @@ pub struct Strip {
     /// scrolled row puts some of these partly or wholly outside [`Self::band`];
     /// they are clipped to it when drawn and are not hit-testable beyond it.
     pub thumbs: Vec<Rectangle<f64, Logical>>,
-    /// The new-workspace drop placeholder pill, when a drag hovers an interior gap.
+    /// The new-workspace drop placeholder pill, when a drag has lingered in an interior gap.
     pub placeholder: Option<Rectangle<f64, Logical>>,
+    /// The hairline marking the gap a drag is aiming at, before the linger promotes it to
+    /// [`Self::placeholder`]. Sits inside the gap, so it never widens [`Self::bounds`].
+    pub hairline: Option<Rectangle<f64, Logical>>,
     /// The slot held open for a workspace that does not exist yet, and how far open it is.
     pub phantom: Option<(Rectangle<f64, Logical>, Phantom)>,
     /// The band the strip was allocated: the row's viewport, and the clip.
@@ -207,6 +225,33 @@ pub fn strip_geometry(
         rect.loc.x += x0;
     }
 
+    // The hairline is placed *after* the run is positioned and takes no part in it: it is
+    // centred in the gap that is already between two settled thumbnails, so aiming at a gap
+    // moves nothing. `n >= 1` always, so both ends have a thumbnail to measure from.
+    let hairline_rect = match insert {
+        Some(Insert::Hairline(idx)) => {
+            let (start, end) = if idx == 0 {
+                let first = thumbs[0];
+                (first.loc.x - gap, first.loc.x)
+            } else if idx >= n {
+                let last = thumbs[n - 1];
+                (last.loc.x + last.size.w, last.loc.x + last.size.w + gap)
+            } else {
+                let (prev, next) = (thumbs[idx - 1], thumbs[idx]);
+                (prev.loc.x + prev.size.w, next.loc.x)
+            };
+            let h = (thumb.h * HAIRLINE_HEIGHT_FRAC).round();
+            Some(Rectangle::new(
+                Point::from((
+                    ((start + end - HAIRLINE_WIDTH) / 2.).round(),
+                    y + ((thumb.h - h) / 2.).round(),
+                )),
+                Size::from((HAIRLINE_WIDTH, h)),
+            ))
+        }
+        _ => None,
+    };
+
     // The phantom is placed *after* the run is positioned, and takes no part in either the
     // centering or the scroll: one gap past the last thumbnail, growing rightwards from
     // nothing to a whole workspace. That is what keeps the row still while the drag is in
@@ -235,6 +280,7 @@ pub fn strip_geometry(
         scale: thumb.h / view_size.h,
         thumbs,
         placeholder: placeholder_rect,
+        hairline: hairline_rect,
         phantom: phantom_rect,
         band,
     }
