@@ -1934,29 +1934,20 @@ impl<W: LayoutElement> Monitor<W> {
         if let Some(strip) = self.thumbnail_strip() {
             let scale = self.scale.fractional_scale();
 
-            if let Some(rect) = strip.placeholder {
+            if let Some((rect, is_pill)) = self.strip_gap_mark(&strip) {
                 let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
-                self.thumb_placeholder.update_render_elements(
+                let ring = if is_pill {
+                    &mut self.thumb_placeholder
+                } else {
+                    &mut self.thumb_hairline
+                };
+                ring.update_render_elements(
                     rect.size,
                     true,
                     false,
                     false,
                     view_rect,
-                    CornerRadius::from((thumbnails::PLACEHOLDER_WIDTH / 2.) as f32),
-                    scale,
-                    1.,
-                );
-            }
-
-            if let Some(rect) = self.strip_hairline_rect(&strip) {
-                let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
-                self.thumb_hairline.update_render_elements(
-                    rect.size,
-                    true,
-                    false,
-                    false,
-                    view_rect,
-                    CornerRadius::from((thumbnails::HAIRLINE_WIDTH / 2.) as f32),
+                    CornerRadius::from((rect.size.w / 2.) as f32),
                     scale,
                     1.,
                 );
@@ -2813,27 +2804,38 @@ impl<W: LayoutElement> Monitor<W> {
         Some(self.apply_row_slide(strip))
     }
 
-    /// The hairline's box for a laid-out row, in the same coordinates as `strip.thumbs` (the
-    /// render's slide is added by the caller, as it is for the pill).
+    /// The box of whichever mark the row is carrying in a gap — the drop pill, or the
+    /// hairline that precedes it — in the same coordinates as `strip.thumbs` (the render's
+    /// slide is added by the caller).
     ///
     /// Measured off the thumbnails **as drawn**: `strip.thumbs` are slots, and an inactive
     /// thumbnail is drawn inset inside its slot ([`thumbnail_drawn_rect`]), so centring
-    /// between the slots leans the mark toward whichever neighbour is at full size.
-    fn strip_hairline_rect(&self, strip: &Strip) -> Option<Rectangle<f64, Logical>> {
-        let idx = strip.hairline?;
+    /// between the slots leans the mark toward whichever neighbour is at full size. The pill
+    /// reserves a slot in the run all the same — that reservation is what parts the row, and
+    /// it is what [`Strip::bounds`] grows the drop region by; only the drawing is re-centred.
+    fn strip_gap_mark(&self, strip: &Strip) -> Option<(Rectangle<f64, Logical>, bool)> {
+        let (idx, width, is_pill) = match strip.insert? {
+            thumbnails::Insert::Hairline(idx) => (idx, thumbnails::HAIRLINE_WIDTH, false),
+            thumbnails::Insert::Placeholder(idx) => (idx, thumbnails::PLACEHOLDER_WIDTH, true),
+            thumbnails::Insert::Phantom(_) => return None,
+        };
         let drawn = |i: usize| {
             strip.thumbs.get(i).map(|slot| {
                 thumbnail_drawn_rect(*slot, self.strip_render_scale(i), Point::default())
             })
         };
-        thumbnails::hairline_rect(idx.checked_sub(1).and_then(drawn), drawn(idx), strip.gap)
+        let prev = idx.checked_sub(1);
+        let slot = *strip.thumbs.get(idx).or_else(|| strip.thumbs.get(prev?))?;
+        let rect =
+            thumbnails::gap_mark_rect(prev.and_then(drawn), drawn(idx), slot, strip.gap, width)?;
+        Some((rect, is_pill))
     }
 
-    /// [`Self::strip_hairline_rect`] for the conformance corpus, which pins where in the gap
-    /// the mark lands.
+    /// [`Self::strip_gap_mark`] for the conformance corpus, which pins where in the gap the
+    /// mark lands.
     #[cfg(test)]
-    pub fn strip_hairline_rect_for_test(&self, strip: &Strip) -> Option<Rectangle<f64, Logical>> {
-        self.strip_hairline_rect(strip)
+    pub fn strip_gap_mark_for_test(&self, strip: &Strip) -> Option<Rectangle<f64, Logical>> {
+        self.strip_gap_mark(strip).map(|(rect, _)| rect)
     }
 
     /// The strip as laid out with neither the phantom slot nor a reorder drag applied.
@@ -4112,17 +4114,16 @@ impl<W: LayoutElement> Monitor<W> {
             }
         };
 
-        // The new-workspace drop placeholder, while a drag hovers a gap. First pushed =
-        // topmost, and it belongs over the row it is parting.
-        if let Some(rect) = strip.placeholder {
-            self.thumb_placeholder
-                .render(rect.loc + slide, &mut push_ring);
-        }
-
-        // The hairline the same gap wears before the linger promotes it. Alternatives, never
-        // both: `strip_geometry` takes one `Insert`.
-        if let Some(rect) = self.strip_hairline_rect(&strip) {
-            self.thumb_hairline.render(rect.loc + slide, &mut push_ring);
+        // The mark on the gap a drag is aiming at — the hairline, or the placeholder pill
+        // once the linger has promoted it. First pushed = topmost, and it belongs over the
+        // row it is parting.
+        if let Some((rect, is_pill)) = self.strip_gap_mark(&strip) {
+            let ring = if is_pill {
+                &self.thumb_placeholder
+            } else {
+                &self.thumb_hairline
+            };
+            ring.render(rect.loc + slide, &mut push_ring);
         }
 
         // A carried thumbnail is drawn first — first pushed = topmost — so it passes over

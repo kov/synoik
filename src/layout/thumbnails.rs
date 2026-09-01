@@ -35,11 +35,6 @@ pub const PLACEHOLDER_WIDTH: f64 = 18.;
 /// enough to open the [`PLACEHOLDER_WIDTH`] pill — see [`Insert::Hairline`].
 pub const HAIRLINE_WIDTH: f64 = 2.;
 
-/// How much of a thumbnail's height the hairline spans, centred on it. Shorter than the
-/// pill, which is full height: the hairline is a hint that a gap is *aimed at*, and reading
-/// as a lesser mark than the thing it turns into is the point.
-const HAIRLINE_HEIGHT_FRAC: f64 = 0.5;
-
 /// A workspace that is not in the model yet, holding open the slot it would take.
 ///
 /// gnome-shell's `collapse_fraction`, inverted so 1 reads as "there": a fully collapsed
@@ -136,28 +131,30 @@ pub fn name_rect(
     )
 }
 
-/// The hairline marking the gap between two thumbnails, centred in the space that is
-/// actually visible — hence the rects **as drawn** rather than their slots: an inactive
-/// thumbnail is drawn inset inside its slot, and measuring from the slots leans the mark
-/// toward whichever neighbour is drawn at full size.
+/// A mark centred in the gap between two thumbnails **as drawn** — the drop placeholder pill
+/// and the hairline that precedes it, which differ only in width.
+///
+/// Takes the rects as drawn rather than their slots: an inactive thumbnail is drawn inset
+/// inside its slot, so the space actually visible between two neighbours is the slot gap plus
+/// each one's share of that inset, and centring between the slots leans the mark toward
+/// whichever neighbour is drawn at full size. `slot` gives the vertical extent, so a mark is
+/// a thumbnail tall whichever neighbours it sits between.
 ///
 /// The outermost insertion points have a neighbour on one side only, and measure the gap off
 /// the one they have.
-pub fn hairline_rect(
+pub fn gap_mark_rect(
     left: Option<Rectangle<f64, Logical>>,
     right: Option<Rectangle<f64, Logical>>,
+    slot: Rectangle<f64, Logical>,
     gap: f64,
+    width: f64,
 ) -> Option<Rectangle<f64, Logical>> {
     let reference = right.or(left)?;
     let start = left.map_or(reference.loc.x - gap, |r| r.loc.x + r.size.w);
     let end = right.map_or(reference.loc.x + reference.size.w + gap, |r| r.loc.x);
-    let h = (reference.size.h * HAIRLINE_HEIGHT_FRAC).round();
     Some(Rectangle::new(
-        Point::from((
-            ((start + end - HAIRLINE_WIDTH) / 2.).round(),
-            (reference.loc.y + (reference.size.h - h) / 2.).round(),
-        )),
-        Size::from((HAIRLINE_WIDTH, h)),
+        Point::from((((start + end - width) / 2.).round(), slot.loc.y)),
+        Size::from((width, slot.size.h)),
     ))
 }
 
@@ -172,12 +169,11 @@ pub struct Strip {
     pub thumbs: Vec<Rectangle<f64, Logical>>,
     /// The new-workspace drop placeholder pill, when a drag has lingered in an interior gap.
     pub placeholder: Option<Rectangle<f64, Logical>>,
-    /// The gap a drag is aiming at, before the linger promotes it to [`Self::placeholder`].
-    /// An index, not a rect: the mark is centred between the thumbnails **as drawn**, and
-    /// the shrink that insets a thumbnail inside its slot belongs to the monitor
-    /// (`Monitor::strip_hairline_rect`). It sits inside a gap that is already there, so it
-    /// never widens [`Self::bounds`].
-    pub hairline: Option<usize>,
+    /// What the row was laid for, echoed back: which gap a drag is aiming at, and which of
+    /// the two marks it has earned. The mark's own box is **not** here — it is centred
+    /// between the thumbnails as drawn, and the shrink that insets a thumbnail inside its
+    /// slot belongs to the monitor (`Monitor::strip_gap_mark`).
+    pub insert: Option<Insert>,
     /// The slot held open for a workspace that does not exist yet, and how far open it is.
     pub phantom: Option<(Rectangle<f64, Logical>, Phantom)>,
     /// The band the strip was allocated: the row's viewport, and the clip.
@@ -283,10 +279,7 @@ pub fn strip_geometry(
         scale: thumb.h / view_size.h,
         thumbs,
         placeholder: placeholder_rect,
-        hairline: match insert {
-            Some(Insert::Hairline(idx)) => Some(idx),
-            _ => None,
-        },
+        insert,
         phantom: phantom_rect,
         band,
         gap,

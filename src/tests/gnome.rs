@@ -12380,6 +12380,45 @@ fn thumbnail_drop_moves_window_keeping_position() {
     );
 }
 
+/// Asserts the mark on the aimed-at gap sits in the middle of the space that is actually
+/// visible, and is a whole thumbnail tall. Both stages answer to this: `strip.thumbs` are
+/// slots, and an inactive thumbnail is drawn inset inside its slot, so centring between the
+/// slots leans the mark toward whichever neighbour is drawn at full size — which is the active
+/// one, and so the lean flips sides as you cross the row.
+fn assert_gap_mark_centred(f: &mut Fixture, what: &str) {
+    use crate::layout::thumbnails::Insert;
+
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    let mon = mon.unwrap();
+    let strip = mon.thumbnail_strip().unwrap();
+    let idx = match strip.insert {
+        Some(Insert::Hairline(i) | Insert::Placeholder(i)) => i,
+        other => panic!("{what}: the gap must be marked, got {other:?}"),
+    };
+    let drawn = |i: usize| {
+        let slot = strip.thumbs[i];
+        let w = slot.size.w * mon.strip_render_scale(i);
+        (slot.loc.x + (slot.size.w - w) / 2., w)
+    };
+    let (lx, lw) = drawn(idx - 1);
+    let (start, end) = (lx + lw, drawn(idx).0);
+    assert!(
+        end > start,
+        "{what}: the two thumbnails must have a gap between them"
+    );
+
+    let rect = mon.strip_gap_mark_for_test(&strip).unwrap();
+    assert!(
+        ((rect.loc.x + rect.size.w / 2.) - (start + end) / 2.).abs() <= 1.,
+        "{what} must sit in the middle of the {start}..{end} gap, got {rect:?}"
+    );
+    assert_eq!(
+        (rect.loc.y, rect.size.h),
+        (strip.thumbs[idx].loc.y, strip.thumbs[idx].size.h),
+        "{what} must span a whole thumbnail's height"
+    );
+}
+
 /// Dropping a window preview into the gap between two thumbnails inserts a
 /// new workspace there and moves the window onto it (gnome-shell's
 /// drop-placeholder path: Main.wm.insertWorkspace).
@@ -12412,7 +12451,10 @@ fn thumbnail_gap_drop_inserts_workspace() {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon.unwrap().thumbnail_strip().unwrap();
         assert!(
-            strip.hairline.is_some(),
+            matches!(
+                strip.insert,
+                Some(crate::layout::thumbnails::Insert::Hairline(_))
+            ),
             "aiming at a thumbnail gap must mark it with a hairline"
         );
         assert!(
@@ -12440,33 +12482,7 @@ fn thumbnail_gap_drop_inserts_workspace() {
         );
     }
 
-    // The mark goes in the middle of the space that is actually visible. `strip.thumbs` are
-    // slots, and an inactive thumbnail is drawn inset inside its slot — centring between the
-    // slots leaned the hairline toward whichever neighbour was drawn at full size.
-    {
-        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
-        let mon = mon.unwrap();
-        let strip = mon.thumbnail_strip().unwrap();
-        let idx = strip.hairline.expect("the gap must still be marked");
-        let drawn = |i: usize| {
-            let slot = strip.thumbs[i];
-            let shrink = mon.strip_render_scale(i);
-            let w = slot.size.w * shrink;
-            (slot.loc.x + (slot.size.w - w) / 2., w)
-        };
-        let (lx, lw) = drawn(idx - 1);
-        let (rx, _) = drawn(idx);
-        let rect = mon.strip_hairline_rect_for_test(&strip).unwrap();
-        let (start, end) = (lx + lw, rx);
-        assert!(
-            end > start,
-            "the two thumbnails must have a gap between them"
-        );
-        assert!(
-            ((rect.loc.x + rect.size.w / 2.) - (start + end) / 2.).abs() <= 1.,
-            "the hairline must sit in the middle of the {start}..{end} gap, got {rect:?}"
-        );
-    }
+    assert_gap_mark_centred(&mut f, "the hairline");
 
     let now = f.synoik().clock.now_unadjusted();
     f.synoik()
@@ -12481,7 +12497,10 @@ fn thumbnail_gap_drop_inserts_workspace() {
             "a drag that lingers in a gap must open the drop placeholder"
         );
         assert!(
-            strip.hairline.is_none(),
+            matches!(
+                strip.insert,
+                Some(crate::layout::thumbnails::Insert::Placeholder(_))
+            ),
             "the pill replaces the hairline, it does not join it"
         );
         assert_ne!(
@@ -12489,6 +12508,7 @@ fn thumbnail_gap_drop_inserts_workspace() {
             "the placeholder must part the row it opens in"
         );
     }
+    assert_gap_mark_centred(&mut f, "the pill");
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle();
@@ -12549,7 +12569,10 @@ fn sweeping_across_the_thumbnail_row_never_opens_the_placeholder() {
             "a gap the drag only passed through must not part the row"
         );
         assert!(
-            strip.hairline.is_some(),
+            matches!(
+                strip.insert,
+                Some(crate::layout::thumbnails::Insert::Hairline(_))
+            ),
             "the gap being aimed at must still be marked"
         );
     }
