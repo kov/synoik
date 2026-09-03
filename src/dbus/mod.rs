@@ -36,6 +36,7 @@ pub mod mpris;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
+pub mod network_agent;
 pub mod polkit_agent;
 pub mod rfkill;
 pub mod secret_service;
