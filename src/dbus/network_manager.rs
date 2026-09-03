@@ -770,8 +770,16 @@ mod tests {
         );
         for device in &state.devices {
             println!(
-                "device {} kind={} state={} active={:?}",
-                device.interface, device.kind, device.state, device.active_connection
+                "device {} kind={} state={} available={:?} active={:?}",
+                device.interface,
+                device.kind,
+                device.state,
+                state
+                    .device_profiles(Some(device))
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                device.active_connection
             );
             if let Some(wireless) = &device.wireless {
                 for network in wireless.networks(&state.saved) {
