@@ -36,6 +36,7 @@ pub mod layer;
 pub mod layout;
 pub mod monitors_xml;
 pub mod mpris;
+pub mod network_model;
 pub mod network_secret;
 /// The network secret dialog's state machine, answering the NetworkManager agent.
 pub mod network_secret_dialog;
