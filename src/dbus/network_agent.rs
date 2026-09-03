@@ -259,12 +259,6 @@ pub fn start(
         .serve_at(AGENT_PATH, SecretAgent { calls: calls_tx })?
         .build()?;
 
-    // Registering may fail simply because NetworkManager is not up yet; the name watch below
-    // registers us the moment it appears, so a failure here is not fatal.
-    if let Err(err) = register(conn.inner()).await_blocking() {
-        debug!("could not register the network agent yet: {err:#}");
-    }
-
     conn.inner()
         .executor()
         .spawn(watch_nm(conn.inner().clone()), "network-agent-register")
@@ -275,19 +269,6 @@ pub fn start(
         .detach();
 
     Ok((conn, to_agent))
-}
-
-/// A tiny shim so [`start`] can call the async registration once before spawning anything.
-trait AwaitBlocking {
-    type Output;
-    fn await_blocking(self) -> Self::Output;
-}
-
-impl<F: std::future::Future> AwaitBlocking for F {
-    type Output = F::Output;
-    fn await_blocking(self) -> Self::Output {
-        async_io::block_on(self)
-    }
 }
 
 async fn register(conn: &zbus::Connection) -> anyhow::Result<()> {
@@ -304,11 +285,16 @@ async fn register(conn: &zbus::Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-register whenever NetworkManager appears.
+/// Register, and re-register whenever NetworkManager appears.
 ///
 /// NM forgets its agents when it restarts, and it is not unusual for it to start *after* the
 /// compositor. An agent that registered once at startup and never again is an agent that silently
 /// stops answering after the first `systemctl restart NetworkManager`.
+///
+/// The *first* registration happens here too, after the subscription is live, and that ordering is
+/// the whole point: registering before subscribing leaves a window in which NM appears, is missed,
+/// and is never seen again — the failure would look exactly like "NM was down at startup", which
+/// is the case this function exists to survive.
 async fn watch_nm(conn: zbus::Connection) {
     let dbus = match zbus::fdo::DBusProxy::new(&conn).await {
         Ok(proxy) => proxy,
@@ -324,6 +310,12 @@ async fn watch_nm(conn: zbus::Connection) {
         warn!("network agent: cannot subscribe to NetworkManager's name");
         return;
     };
+
+    // NM may already be up, or may not be up yet; either way the subscription above will catch
+    // what this misses.
+    if let Err(err) = register(&conn).await {
+        debug!("network agent: NetworkManager is not registering us yet: {err:#}");
+    }
 
     while let Some(signal) = changed.next().await {
         let Ok(args) = signal.args() else { continue };
@@ -393,6 +385,9 @@ async fn handle_call(
             hints,
             flags,
         } => {
+            // Resolved here rather than inside `get_secrets` so that the decision function
+            // can be driven with no store at all — the case that used to reach a dialog.
+            let store = session(keyring).await;
             get_secrets(
                 connection,
                 path,
@@ -401,7 +396,7 @@ async fn handle_call(
                 flags,
                 reply,
                 pending,
-                keyring,
+                store,
                 to_niri,
             )
             .await;
@@ -442,7 +437,7 @@ async fn get_secrets(
     flags: u32,
     reply: async_channel::Sender<Result<NmConnection, AgentError>>,
     pending: &mut HashMap<String, Pending>,
-    keyring: &mut Option<SecretSession>,
+    store: Option<&SecretSession>,
     to_niri: &calloop::channel::Sender<NetworkAgentToSynoik>,
 ) {
     let request_id = format!("{path}/{setting_name}");
@@ -468,11 +463,12 @@ async fn get_secrets(
     let key_flags = secret_key_flags(&connection, &setting_name);
     let ask_outright = flags & flags::REQUEST_NEW != 0
         || (flags & flags::ALLOW_INTERACTION != 0 && is_always_ask(&connection));
+    let may_ask = flags & (flags::ALLOW_INTERACTION | flags::REQUEST_NEW) != 0;
 
     if !ask_outright {
         // The store answers first when it can, which is what makes a saved network reconnect with
         // no dialog at all (`shell-network-agent.c:396-406`).
-        if let Some(session) = session(keyring).await {
+        if let Some(session) = store {
             let mut attrs = HashMap::new();
             attrs.insert(ATTR_UUID, info.uuid.as_str());
             attrs.insert(ATTR_SETTING_NAME, setting_name.as_str());
@@ -481,12 +477,8 @@ async fn get_secrets(
                     let _ = reply.send(Ok(wrap(&setting_name, found))).await;
                     return;
                 }
-                Ok(_) if flags & flags::ALLOW_INTERACTION == 0 => {
-                    // Nothing stored and no leave to ask: answer with the empty setting, as
-                    // upstream does, and let NM fail the activation rather than hang.
-                    let _ = reply.send(Ok(wrap(&setting_name, HashMap::new()))).await;
-                    return;
-                }
+                // Nothing stored: fall through to the `may_ask` guard, which is the single
+                // place that decides whether a dialog is allowed.
                 Ok(_) => (),
                 Err(err) => {
                     let _ = reply
@@ -498,6 +490,15 @@ async fn get_secrets(
                 }
             }
         }
+    }
+
+    // Without leave to interact there is no dialog to reach, whatever the keyring did or did not
+    // say. This has to be checked outside the block above, which is skipped entirely when the
+    // keyring is unreachable — and a session with no keyring is exactly when NM's silent probe
+    // would otherwise have put a password box on the screen.
+    if !may_ask {
+        let _ = reply.send(Ok(wrap(&setting_name, HashMap::new()))).await;
+        return;
     }
 
     let Some(content) = network_secret::content(
@@ -524,7 +525,7 @@ async fn get_secrets(
             id: info.id.clone(),
             key_flags,
             // Upstream saves whenever it was allowed to interact at all (`:492-494`).
-            save: flags & (flags::ALLOW_INTERACTION | flags::REQUEST_NEW) != 0,
+            save: may_ask,
         },
     );
 
@@ -887,6 +888,58 @@ mod tests {
         assert_eq!(
             String::try_from(setting["psk"].try_clone().unwrap()).unwrap(),
             "hunter2hunter2"
+        );
+    }
+
+    /// Drive one `GetSecrets` with no keyring at all and report what came back and whether an ask
+    /// was left outstanding.
+    fn get_with_no_store(flags: u32) -> (Option<Result<NmConnection, AgentError>>, usize) {
+        async_io::block_on(async {
+            let (reply, answer) = async_channel::bounded(1);
+            let (to_niri, _channel) = calloop::channel::channel();
+            let mut pending = HashMap::new();
+
+            get_secrets(
+                wifi_connection(secret_flags::AGENT_OWNED),
+                "/org/freedesktop/NetworkManager/Settings/1".to_owned(),
+                "802-11-wireless-security".to_owned(),
+                Vec::new(),
+                flags,
+                reply,
+                &mut pending,
+                None,
+                &to_niri,
+            )
+            .await;
+
+            (answer.try_recv().ok(), pending.len())
+        })
+    }
+
+    /// A silent probe must stay silent even when the keyring is unreachable.
+    ///
+    /// NM calls `GetSecrets` with no flags to ask "do you already have this?", and the answer is
+    /// an empty setting, never a dialog. The store lookup used to be the only thing standing
+    /// between that call and a password box: with no session bus the whole lookup was skipped and
+    /// control fell through to the ask. A session with no keyring is exactly the seat this is
+    /// tested on.
+    #[test]
+    fn no_keyring_and_no_leave_to_interact_asks_nobody() {
+        let (answer, outstanding) = get_with_no_store(0);
+        assert_eq!(outstanding, 0, "a dialog was left waiting for an answer");
+        let setting = answer
+            .expect("NM was answered")
+            .expect("with a reply, not an error");
+        assert_eq!(setting["802-11-wireless-security"].len(), 0);
+    }
+
+    #[test]
+    fn no_keyring_but_leave_to_interact_does_ask() {
+        let (answer, outstanding) = get_with_no_store(flags::ALLOW_INTERACTION);
+        assert_eq!(outstanding, 1, "the dialog should be outstanding");
+        assert!(
+            answer.is_none(),
+            "NM must not be answered until the user is"
         );
     }
 
