@@ -36,6 +36,7 @@ pub mod layer;
 pub mod layout;
 pub mod monitors_xml;
 pub mod mpris;
+pub mod network_secret;
 pub mod notifications;
 pub mod output_identity;
 #[cfg(feature = "pipewire")]
