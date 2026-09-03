@@ -356,7 +356,7 @@ pub(super) fn spawn(
             warn!("error building the NetworkManager Connection.Updated match rule");
             return;
         };
-        let Ok(mut settings_updated) =
+        let Ok(settings_updated) =
             zbus::MessageStream::for_match_rule(updated, &async_conn, Some(16)).await
         else {
             warn!("error subscribing to NetworkManager Connection.Updated");
@@ -397,7 +397,17 @@ pub(super) fn spawn(
             ),
             futures_util::stream::select(
                 props_changed.map(|_| Wake::Snapshot),
-                owner_changed.map(|_| Wake::Snapshot),
+                futures_util::stream::select(
+                    owner_changed.map(|_| Wake::Snapshot),
+                    // An edited profile announces itself with its own signal and nothing else: a
+                    // renamed VPN would otherwise show its old name until something unrelated
+                    // moved the loop.
+                    settings_updated.map(|msg| {
+                        msg.ok()
+                            .and_then(|msg| msg.header().path().map(|p| p.to_string()))
+                            .map_or(Wake::Snapshot, Wake::Profile)
+                    }),
+                ),
             ),
         );
 
@@ -481,11 +491,6 @@ pub(super) fn spawn(
             let mut wakes = vec![first];
             while let Some(Some(next)) = wake.next().now_or_never() {
                 wakes.push(next);
-            }
-            while let Some(Some(Ok(msg))) = settings_updated.next().now_or_never() {
-                if let Some(path) = msg.header().path() {
-                    profiles.remove(&path.to_string());
-                }
             }
             for w in wakes {
                 if let Wake::Profile(path) = w {
@@ -653,18 +658,19 @@ pub fn deactivate_profile(conn: &zbus::blocking::Connection, profile: String) {
 pub fn add_and_activate(conn: &zbus::blocking::Connection, device: String, ap: String) {
     let async_conn = conn.inner().clone();
     let future = async move {
-        let user = std::env::var("USER").unwrap_or_default();
-        let mut connection: HashMap<&str, zvariant::Value> = HashMap::new();
-        if !user.is_empty() {
-            connection.insert(
-                "permissions",
-                zvariant::Value::from(vec![format!("user:{user}:")]),
-            );
-        }
-        let mut settings: HashMap<&str, HashMap<&str, zvariant::Value>> = HashMap::new();
-        if !connection.is_empty() {
-            settings.insert("connection", connection);
-        }
+        // SAFETY: `getuid` is always successful and touches no memory.
+        let uid = unsafe { libc::getuid() };
+        let Some(user) = crate::utils::passwd_entry(uid).map(|entry| entry.name) else {
+            // Falling through would write a *machine-wide* profile — the opposite of the scoping
+            // this function promises — so refuse the join instead.
+            warn!("no passwd entry for uid {uid}; refusing to add an unscoped network profile");
+            return;
+        };
+        let connection = HashMap::from([(
+            "permissions",
+            zvariant::Value::from(vec![format!("user:{user}:")]),
+        )]);
+        let settings = HashMap::from([("connection", connection)]);
 
         let device_path = match zvariant::ObjectPath::try_from(device.as_str()) {
             Ok(path) => path,

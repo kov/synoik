@@ -381,6 +381,9 @@ impl WirelessNetwork {
             })
             .then_with(|| other.strength().cmp(&self.strength()))
             .then_with(|| other.security.secure().cmp(&self.security.secure()))
+            // Byte order, where upstream calls `g_utf8_collate`: a locale-aware collation would
+            // need ICU, and the difference only shows up between two networks that tie on every
+            // other key and differ by accent or case.
             .then_with(|| self.label().cmp(&other.label()))
     }
 }
@@ -553,11 +556,70 @@ pub struct NetworkDevice {
 }
 
 impl NetworkDevice {
-    /// The tile subtitle for a device that is not carrying a name of its own: the interface, as
-    /// `NM.Device.disambiguate_names` falls back to.
-    pub fn name(&self) -> String {
-        self.interface.clone()
+    /// `get_type_name` (`nm-device.c:1823-1896`) — the user-facing name of a device *type*.
+    pub fn type_name(&self) -> &'static str {
+        match self.kind {
+            device_type::ETHERNET => "Ethernet",
+            device_type::WIFI => "Wi-Fi",
+            device_type::BT => "Bluetooth",
+            device_type::MODEM => "Mobile Broadband",
+            _ => "Unknown",
+        }
     }
+
+    /// `get_device_generic_type_name_with_iface` (`nm-device.c:1916-1925`): wired devices lead
+    /// with the generic word, everything else with its own type name.
+    fn generic_name(&self) -> &'static str {
+        match self.kind {
+            device_type::ETHERNET => "Wired",
+            _ => self.type_name(),
+        }
+    }
+}
+
+/// `nm_device_disambiguate_names` (`nm-device.c:2209-2318`): short names, made unique only as far
+/// as they need to be. One Ethernet card is "Wired"; two become "Ethernet (eth0)" and
+/// "Ethernet (eth1)".
+///
+/// **Simplification.** Upstream has two rungs we skip — prefixing the udev bus name ("USB
+/// Ethernet") and the vendor — because both need a udev handle we do not keep. Skipping them only
+/// costs a longer name in the rare two-identical-cards case, since the interface rung below them
+/// always disambiguates.
+pub fn disambiguate_names(devices: &[NetworkDevice]) -> Vec<String> {
+    let mut names: Vec<String> = devices
+        .iter()
+        .map(|d| d.generic_name().to_string())
+        .collect();
+
+    let duplicates = |names: &[String]| -> Vec<bool> {
+        names
+            .iter()
+            .map(|n| names.iter().filter(|other| *other == n).count() > 1)
+            .collect()
+    };
+
+    let dup = duplicates(&names);
+    if !dup.iter().any(|d| *d) {
+        return names;
+    }
+    // "Ethernet" rather than "Wired", so an Ethernet and an InfiniBand stop colliding.
+    for (i, name) in names.iter_mut().enumerate() {
+        if dup[i] {
+            *name = devices[i].type_name().to_string();
+        }
+    }
+
+    let dup = duplicates(&names);
+    if !dup.iter().any(|d| *d) {
+        return names;
+    }
+    // Identical cards: the interface is the only thing left that differs.
+    for (i, name) in names.iter_mut().enumerate() {
+        if dup[i] && !devices[i].interface.is_empty() {
+            *name = format!("{} ({})", devices[i].type_name(), devices[i].interface);
+        }
+    }
+    names
 }
 
 /// A VPN-ish saved profile and whether it is up. GNOME's VPN tile handles `vpn` and `wireguard`
@@ -885,6 +947,46 @@ mod tests {
             dev.networks(&[])[0].icon_name(),
             "network-workgroup-symbolic"
         );
+    }
+
+    fn dev(kind: u32, interface: &str) -> NetworkDevice {
+        NetworkDevice {
+            path: format!("/dev/{interface}"),
+            kind,
+            interface: interface.to_string(),
+            state: device_state::ACTIVATED,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_device_of_a_kind_is_named_generically() {
+        let names = disambiguate_names(&[dev(device_type::ETHERNET, "eth0")]);
+        assert_eq!(names, vec!["Wired"]);
+        let names = disambiguate_names(&[
+            dev(device_type::ETHERNET, "eth0"),
+            dev(device_type::WIFI, "wlp3s0"),
+        ]);
+        assert_eq!(names, vec!["Wired", "Wi-Fi"]);
+    }
+
+    #[test]
+    fn two_devices_of_a_kind_fall_back_to_their_interfaces() {
+        let names = disambiguate_names(&[
+            dev(device_type::ETHERNET, "eth0"),
+            dev(device_type::ETHERNET, "eth1"),
+        ]);
+        assert_eq!(names, vec!["Ethernet (eth0)", "Ethernet (eth1)"]);
+    }
+
+    #[test]
+    fn only_the_colliding_devices_get_longer_names() {
+        let names = disambiguate_names(&[
+            dev(device_type::ETHERNET, "eth0"),
+            dev(device_type::ETHERNET, "eth1"),
+            dev(device_type::WIFI, "wlp3s0"),
+        ]);
+        assert_eq!(names[2], "Wi-Fi");
     }
 
     #[test]
