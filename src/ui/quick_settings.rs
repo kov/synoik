@@ -312,6 +312,9 @@ struct TextRun {
     /// The trailing right-aligned sublabel run (Connect/Disconnect/busy), if any.
     trailing: Option<ShapedText>,
     has_icon: bool,
+    /// A half-size badge drawn beside the row icon (the Wi-Fi padlock), which widens the icon
+    /// zone the label starts after.
+    has_badge: bool,
 }
 
 /// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
@@ -323,6 +326,10 @@ struct ItemRow {
     /// A second, **half-size** symbolic drawn right after the leading icon and aligned to its
     /// bottom: the Wi-Fi row's padlock (`.wireless-secure-icon`, `_quick-settings.scss:219-221`,
     /// `y_align: END`, `network.js:1011-1016`). It is a sibling of the icon, not an overlay on it.
+    ///
+    /// `Some("")` reserves the slot without drawing anything, which is how an *open* network keeps
+    /// its label aligned with the secured ones: gnome-shell always builds the icon and binds an
+    /// empty `icon-name` when the network is open (`network.js:1037-1040`).
     badge: Option<String>,
     action: PopoverAction,
     separator_before: bool,
@@ -799,10 +806,10 @@ impl DetailOwner {
                         ItemRow {
                             label: network.label(),
                             icons: vec![network.icon_name()],
-                            badge: network
-                                .security
-                                .secure()
-                                .then(|| "network-wireless-encrypted-symbolic".to_string()),
+                            badge: Some(match network.security.secure() {
+                                true => "network-wireless-encrypted-symbolic".to_string(),
+                                false => String::new(),
+                            }),
                             action,
                             separator_before: false,
                             selected: network.active,
@@ -3204,7 +3211,7 @@ impl QuickSettings {
                         // The half-size padlock, immediately after the row icon and sitting on
                         // its baseline (`.wireless-secure-icon` is `icon-size: half` with
                         // `y_align: END`, `_quick-settings.scss:219-221`).
-                        if let Some(badge) = &row.badge {
+                        if let Some(badge) = row.badge.as_ref().filter(|b| !b.is_empty()) {
                             let size = TILE_ICON / 2.;
                             let center = Point::from((
                                 rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + size / 2.,
@@ -3561,6 +3568,7 @@ impl QuickSettings {
                             .map(|t| shaper.shape(&t, TextStyle::new(DETAIL_ROW_PT)))
                             .transpose()?,
                         has_icon: !r.icons.is_empty(),
+                        has_badge: r.badge.is_some(),
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3672,8 +3680,16 @@ impl QuickSettings {
                 let label_cy = rrect.loc.y + rrect.size.h / 2.;
                 // The bluetooth placeholder line: centered bold text, nothing else in the row
                 // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`).
+                // gnome-shell puts the signal icon and the padlock in one `St.BoxLayout` and the
+                // label *after* it, so the badge widens the icon zone rather than eating the gap
+                // before the text (`NMWirelessNetworkItem._init`, `network.js:1006-1019`).
                 let label_x = if row_run.has_icon {
-                    rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
+                    let badge = if row_run.has_badge {
+                        TILE_ICON / 2.
+                    } else {
+                        0.
+                    };
+                    rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + badge + 8.
                 } else {
                     rrect.loc.x + DETAIL_ROW_INSET
                 };
