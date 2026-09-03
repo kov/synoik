@@ -3995,23 +3995,29 @@ fn super_s_focuses_quick_settings_and_the_arrows_walk_the_grid() {
     // Down out of the system row reaches the tile grid; Right crosses to the second column.
     f.key_press(KEY_DOWN);
     f.key_release(KEY_DOWN);
-    assert_eq!(
-        f.synoik().panel_popover.focused_row_label().as_deref(),
-        Some("Tile(Network)"),
-        "Network leads the grid, in the top-left cell"
+    // The network tiles need a NetworkManager device, and a headless run has none, so the first
+    // grid cell here is the leading gsettings toggle.
+    let first_tile = f
+        .synoik()
+        .panel_popover
+        .focused_row_label()
+        .expect("Down out of the system row lands on a tile");
+    assert!(
+        first_tile.starts_with("Tile("),
+        "Down out of the system row reaches the grid, got {first_tile}"
     );
     f.key_press(KEY_RIGHT);
     f.key_release(KEY_RIGHT);
-    let right_of_network = f.synoik().panel_popover.focused_row_label().unwrap();
+    let right_of_first = f.synoik().panel_popover.focused_row_label().unwrap();
     assert_ne!(
-        right_of_network, "Tile(Network)",
+        right_of_first, first_tile,
         "Right crosses to the other column"
     );
     f.key_press(KEY_LEFT);
     f.key_release(KEY_LEFT);
     assert_eq!(
-        f.synoik().panel_popover.focused_row_label().as_deref(),
-        Some("Tile(Network)"),
+        f.synoik().panel_popover.focused_row_label(),
+        Some(first_tile),
         "and Left comes back"
     );
 
@@ -4099,14 +4105,16 @@ fn a_held_arrow_repeats_in_a_panel_menu() {
     f.key_release(KEY_LEFTMETA);
 
     f.key_press(KEY_DOWN);
-    assert_eq!(
-        f.synoik().panel_popover.focused_row_label().as_deref(),
-        Some("Tile(Network)"),
-        "the press itself steps out of the system row"
+    let first_tile = f.synoik().panel_popover.focused_row_label();
+    assert!(
+        first_tile
+            .as_deref()
+            .is_some_and(|l| l.starts_with("Tile(")),
+        "the press itself steps out of the system row, got {first_tile:?}"
     );
     assert!(
         f.dispatch_until(Duration::from_secs(3), |state| {
-            state.synoik.panel_popover.focused_row_label().as_deref() != Some("Tile(Network)")
+            state.synoik.panel_popover.focused_row_label() != first_tile
         }),
         "holding Down must keep stepping"
     );
@@ -13809,14 +13817,15 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
         "clicking the quick-settings indicator must open its popover"
     );
 
-    // A click on the Do Not Disturb tile flips the local state and keeps the menu
-    // open. The grid is [Network, Dark Style, Do Not Disturb, Night Light] row-major over
-    // two columns, so DND is the bottom-left tile (row 1, col 0).
+    // A click on the Do Not Disturb tile flips the local state and keeps the menu open. The
+    // network tiles appear only when NetworkManager offers a device, and a headless run has
+    // none — so the grid here is [Dark Style, Do Not Disturb, Night Light] and DND is the
+    // top-right tile (row 0, col 1).
     let origin = popover_origin(&mut f);
-    // DND tile center (row 1, col 0), menu-local: x = PAD + TILE_W/2; y = PAD + SYS_H
-    // + TILE_GAP + (TILE_H + TILE_GAP) [second row] + TILE_H/2.
-    let tile_x = origin.x + 12. + 75.;
-    let tile_y = origin.y + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    // DND tile center (row 0, col 1), menu-local: x = PAD + TILE_W + TILE_GAP + TILE_W/2;
+    // y = PAD + SYS_H + TILE_GAP + TILE_H/2.
+    let tile_x = origin.x + 12. + 150. + 8. + 75.;
+    let tile_y = origin.y + (12. + 44. + 8.) + 28.;
     pointer_motion_to(&mut f, tile_x, tile_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -13878,10 +13887,11 @@ fn messages_indicator_toggles_with_dnd_tile() {
     };
     let click_dnd = |f: &mut Fixture| {
         let origin = popover_origin(f);
+        // Row 0, col 1: with no NetworkManager device the grid is the three gsettings toggles.
         pointer_motion_to(
             f,
-            origin.x + 12. + 75.,
-            origin.y + (12. + 44. + 8.) + (56. + 8.) + 28.,
+            origin.x + 12. + 150. + 8. + 75.,
+            origin.y + (12. + 44. + 8.) + 28.,
         );
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);

@@ -174,6 +174,26 @@ pub enum PopoverAction {
         path: String,
         connect: bool,
     },
+    /// Flip NetworkManager's `WirelessEnabled` (the Wi-Fi tile body,
+    /// `NMWirelessToggle.activate`, `network.js:1826-1832`). Menu stays open; echo-driven.
+    SetWirelessEnabled(bool),
+    /// Bring a saved profile up (a Wired/VPN row, or a Wi-Fi row for a network we already know).
+    /// `device` is empty for a VPN, which NetworkManager places itself.
+    ActivateNetworkProfile {
+        profile: String,
+        device: String,
+    },
+    /// Take a profile back down (a VPN row that is already up, or a Wired card's "Turn Off").
+    DeactivateNetworkProfile(String),
+    /// Join a wireless network we have no profile for: `AddAndActivateConnection` against the
+    /// row's best access point (`WirelessNetwork.activate`, `network.js:927-951`).
+    JoinWirelessNetwork {
+        device: String,
+        ap: String,
+    },
+    /// Ask a wireless device to scan — sent when the Wi-Fi card opens
+    /// (`_startScanning`, `network.js:1866-1874`).
+    RequestWifiScan(String),
     /// Activate a row of an app indicator's remote menu — `Event(id, "clicked")` on the client.
     /// The popover closes, as a menu activation does everywhere else.
     IndicatorMenuActivate {
@@ -1068,7 +1088,7 @@ impl PanelPopover {
         output: Output,
         anchor: Rectangle<f64, Logical>,
         toggles: crate::gnome::QuickToggles,
-        network: crate::system_status::NetworkStatus,
+        net: crate::network_model::NetworkState,
         airplane: crate::system_status::AirplaneStatus,
         power: crate::system_status::PowerProfileStatus,
         bluetooth: crate::system_status::BluetoothStatus,
@@ -1092,9 +1112,8 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.side = PopoverSide::Top;
-        self.content = Some(PopoverContent::QuickSettings(Box::new(QuickSettings::new(
+        let mut qs = QuickSettings::new(
             toggles,
-            network,
             airplane,
             power,
             bluetooth,
@@ -1108,7 +1127,9 @@ impl PanelPopover {
             source_list,
             brightness,
             accent,
-        ))));
+        );
+        qs.set_network_state(net);
+        self.content = Some(PopoverContent::QuickSettings(Box::new(qs)));
         self.anim = Some(self.make_anim(0., 1.));
     }
 
@@ -1291,6 +1312,17 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_power_profile(power)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh NetworkManager model to an open quick-settings popover, so the network tiles
+    /// and an open list track live changes. Returns whether it changed.
+    pub fn set_network_state(&mut self, net: crate::network_model::NetworkState) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_network_state(net)
             }
             _ => false,
         }

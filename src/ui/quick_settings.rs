@@ -49,7 +49,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, BluetoothRfkill, BluetoothStatus, BtAdapterState,
-    NetworkStatus, PowerProfileStatus,
+    PowerProfileStatus,
 };
 use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
 use crate::ui::widget::{
@@ -320,6 +320,10 @@ struct ItemRow {
     label: String,
     /// Optional leading symbolic-icon candidates (empty = label-only, like the shutdown rows).
     icons: Vec<String>,
+    /// A second, **half-size** symbolic drawn right after the leading icon and aligned to its
+    /// bottom: the Wi-Fi row's padlock (`.wireless-secure-icon`, `_quick-settings.scss:219-221`,
+    /// `y_align: END`, `network.js:1011-1016`). It is a sibling of the icon, not an overlay on it.
+    badge: Option<String>,
     action: PopoverAction,
     separator_before: bool,
     /// Whether this row is the current selection (a trailing check, gnome-shell's
@@ -445,8 +449,12 @@ impl DetailRow {
 /// `ShutdownItem` / `QuickSlider`, all `hasMenu` items sharing the same `QuickToggleMenu`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailOwner {
-    /// The Network grid tile's detail view (its expand-arrow half).
-    Network,
+    /// The Wired tile's connection list.
+    Wired,
+    /// The Wi-Fi tile's network list (gnome-shell's `NMWirelessDeviceItem` section).
+    Wifi,
+    /// The VPN tile's profile list.
+    Vpn,
     /// The system-row power button's session submenu (gnome-shell's `ShutdownItem`).
     Power,
     /// The Power Mode grid tile's profile picker (gnome-shell's `PowerProfilesToggle` menu).
@@ -563,6 +571,7 @@ fn session_row(label: &str, request: SessionRequest, separator_before: bool) -> 
     ItemRow {
         label: label.to_string(),
         icons: Vec::new(),
+        badge: None,
         action: PopoverAction::SessionRequest(request),
         separator_before,
         selected: false,
@@ -589,6 +598,7 @@ fn settings_row(label: &str, panel: &str, separator_before: bool) -> DetailRow {
     ItemRow {
         label: label.to_string(),
         icons: Vec::new(),
+        badge: None,
         action: settings_panel(panel),
         separator_before,
         selected: false,
@@ -619,7 +629,8 @@ struct BtDetail<'a> {
 impl DetailOwner {
     /// The header shown at the top of the detail card: symbolic-icon candidates + title, given
     /// the live state the owner reflects.
-    fn header(self, network: NetworkStatus) -> (Vec<String>, String) {
+    fn header(self, net: &crate::network_model::NetworkState) -> (Vec<String>, String) {
+        use crate::network_model::device_type;
         match self {
             // gnome-shell's `menu.setHeader('bluetooth-active-symbolic', _('Bluetooth'))`
             // (`bluetooth.js:280`).
@@ -627,7 +638,18 @@ impl DetailOwner {
                 vec!["bluetooth-active-symbolic".to_string()],
                 "Bluetooth".to_string(),
             ),
-            DetailOwner::Network => (network_icons(network), network_label(network).to_string()),
+            // `menu.setHeader('network-wireless-symbolic', _('Wi–Fi'))` (`network.js:1811`) —
+            // and that is an EN DASH in upstream's string, not a hyphen.
+            DetailOwner::Wifi => (
+                vec!["network-wireless-symbolic".to_string()],
+                "Wi\u{2013}Fi".to_string(),
+            ),
+            DetailOwner::Wired => (
+                vec![net.wired_icon().to_string()],
+                net.tile_title(device_type::ETHERNET),
+            ),
+            // `menu.setHeader('network-vpn-symbolic', _('VPN'))` (`network.js:1544`).
+            DetailOwner::Vpn => (vec!["network-vpn-symbolic".to_string()], "VPN".to_string()),
             // `menu.setHeader('display-brightness-symbolic', _('Brightness'))`
             // (`brightness.js:47`).
             DetailOwner::Brightness => (
@@ -660,12 +682,15 @@ impl DetailOwner {
     /// The action rows, top to bottom, given the live state.
     fn rows(
         self,
-        network: NetworkStatus,
+        net: &crate::network_model::NetworkState,
+        // `device_type` is only used by the network arms, but a `use` inside a match arm would
+        // repeat three times.
         audio: AudioDetail<'_>,
         power: &PowerProfileStatus,
         bt: BtDetail<'_>,
         monitors: &[crate::brightness::MonitorView],
     ) -> Vec<DetailRow> {
+        use crate::network_model::device_type;
         match self {
             // gnome-shell's device list (`bluetooth.js:283-304,395-408`): one row per visible
             // (connectable, paired‖trusted, adapter on) device — icon + alias + a trailing
@@ -690,6 +715,7 @@ impl DetailOwner {
                         ItemRow {
                             label: d.alias.clone(),
                             icons: d.icon_candidates(),
+                            badge: None,
                             action: PopoverAction::ConnectBluetoothDevice {
                                 path: d.path.clone(),
                                 connect: !d.connected,
@@ -721,6 +747,7 @@ impl DetailOwner {
                             }
                             .to_string(),
                             icons: Vec::new(),
+                            badge: None,
                             action: PopoverAction::Consumed,
                             separator_before: false,
                             selected: false,
@@ -733,11 +760,189 @@ impl DetailOwner {
                 rows.push(settings_row("Bluetooth Settings", "bluetooth", true));
                 rows
             }
-            // v1 Network detail: a single entry point to the full settings (the in-menu
-            // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
-            DetailOwner::Network => {
-                let _ = network;
-                vec![settings_row("Network Settings", "network", false)]
+            // The Wi-Fi network list (`NMWirelessDeviceItem`'s section): one row per *network* —
+            // signal icon, a padlock when it needs a secret, a check when it is the one we are
+            // on — sorted and capped by the model, then a separator + "All Networks"
+            // (`network.js:1812-1813`).
+            DetailOwner::Wifi => {
+                let networks = net
+                    .primary_device(device_type::WIFI)
+                    .and_then(|d| d.wireless.as_ref())
+                    .map(|w| w.networks(&net.saved))
+                    .unwrap_or_default();
+                // `has_windows` is true because our quick settings are never drawn over the lock
+                // shield; the model carries the locked filter for when they are.
+                let visible = crate::network_model::visible_networks(&networks, true);
+                let device = net
+                    .primary_device(device_type::WIFI)
+                    .map(|d| d.path.clone())
+                    .unwrap_or_default();
+                let mut rows: Vec<DetailRow> = visible
+                    .iter()
+                    .map(|network| {
+                        let action =
+                            match (network.connections.first(), network.access_points.first()) {
+                                (Some(profile), _) => PopoverAction::ActivateNetworkProfile {
+                                    profile: profile.clone(),
+                                    device: device.clone(),
+                                },
+                                // No profile and nothing we could ask for: Settings owns the 802.1x
+                                // form (`launchSettingsPanel('wifi', 'connect-8021x-wifi', …)`).
+                                (None, Some(ap)) if network.security.can_autoconnect() => {
+                                    PopoverAction::JoinWirelessNetwork {
+                                        device: device.clone(),
+                                        ap: ap.path.clone(),
+                                    }
+                                }
+                                _ => settings_panel("wifi"),
+                            };
+                        ItemRow {
+                            label: network.label(),
+                            icons: vec![network.icon_name()],
+                            badge: network
+                                .security
+                                .secure()
+                                .then(|| "network-wireless-encrypted-symbolic".to_string()),
+                            action,
+                            separator_before: false,
+                            selected: network.active,
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    rows.push(
+                        ItemRow {
+                            label: if net.wireless_enabled {
+                                "No networks found"
+                            } else {
+                                "Turn on Wi\u{2013}Fi to see networks"
+                            }
+                            .to_string(),
+                            icons: Vec::new(),
+                            badge: None,
+                            action: PopoverAction::Consumed,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: true,
+                        }
+                        .into(),
+                    );
+                }
+                rows.push(settings_row("All Networks", "wifi", true));
+                rows
+            }
+            // The wired device's saved profiles, then a separator + "Network Settings". A device
+            // with none offers "Connect" (`NMDeviceItem._autoConnectItem`, `network.js:446-449`);
+            // one that is up offers "Turn Off" (`_deactivateItem`, `:454`).
+            DetailOwner::Wired => {
+                let device = net.primary_device(device_type::ETHERNET);
+                let device_path = device.map(|d| d.path.clone()).unwrap_or_default();
+                let active = device.and_then(|d| d.active_connection.clone());
+                let profiles: Vec<&crate::network_model::SavedConnection> = net
+                    .saved
+                    .iter()
+                    .filter(|c| c.kind == "802-3-ethernet")
+                    .collect();
+                let mut rows: Vec<DetailRow> = profiles
+                    .iter()
+                    .take(MAX_DEVICE_ROWS)
+                    .map(|profile| {
+                        ItemRow {
+                            label: profile.id.clone(),
+                            icons: vec!["network-wired-symbolic".to_string()],
+                            badge: None,
+                            action: PopoverAction::ActivateNetworkProfile {
+                                profile: profile.path.clone(),
+                                device: device_path.clone(),
+                            },
+                            separator_before: false,
+                            selected: active.as_deref() == Some(profile.path.as_str()),
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
+                    })
+                    .collect();
+                if let Some(active) = active {
+                    rows.push(
+                        ItemRow {
+                            label: "Turn Off".to_string(),
+                            icons: Vec::new(),
+                            badge: None,
+                            action: PopoverAction::DeactivateNetworkProfile(active),
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into(),
+                    );
+                } else if rows.is_empty() {
+                    rows.push(
+                        ItemRow {
+                            label: "Not connected".to_string(),
+                            icons: Vec::new(),
+                            badge: None,
+                            action: PopoverAction::Consumed,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: true,
+                        }
+                        .into(),
+                    );
+                }
+                rows.push(settings_row("Network Settings", "network", true));
+                rows
+            }
+            // One row per saved VPN profile, the active ones checked, then "VPN Settings".
+            DetailOwner::Vpn => {
+                let mut rows: Vec<DetailRow> = net
+                    .vpn
+                    .iter()
+                    .take(MAX_DEVICE_ROWS)
+                    .map(|vpn| {
+                        ItemRow {
+                            label: vpn.id.clone(),
+                            icons: vec![vpn.icon_name().to_string()],
+                            badge: None,
+                            action: if vpn.is_active() {
+                                PopoverAction::DeactivateNetworkProfile(vpn.path.clone())
+                            } else {
+                                PopoverAction::ActivateNetworkProfile {
+                                    profile: vpn.path.clone(),
+                                    device: String::new(),
+                                }
+                            },
+                            separator_before: false,
+                            selected: vpn.is_active(),
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    rows.push(
+                        ItemRow {
+                            label: "No VPN connections".to_string(),
+                            icons: Vec::new(),
+                            badge: None,
+                            action: PopoverAction::Consumed,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: true,
+                        }
+                        .into(),
+                    );
+                }
+                rows.push(settings_row("VPN Settings", "network", true));
+                rows
             }
             // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
             // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
@@ -764,6 +969,7 @@ impl DetailOwner {
                         ItemRow {
                             label: profile.name().to_string(),
                             icons: Vec::new(),
+                            badge: None,
                             action: PopoverAction::SetPowerProfile(profile.id().to_string()),
                             separator_before: false,
                             selected: power.active == profile.id(),
@@ -791,6 +997,7 @@ impl DetailOwner {
                                 label: device.label(),
                                 icons: device.icon.clone().into_iter().collect(),
                                 selected: device.selected,
+                                badge: None,
                                 action: PopoverAction::SetOutputDevice(device.key),
                                 separator_before: false,
                                 trailing: None,
@@ -828,6 +1035,7 @@ impl DetailOwner {
                                 label: device.label(),
                                 icons: device.icon.clone().into_iter().collect(),
                                 selected: device.selected,
+                                badge: None,
                                 action: PopoverAction::SetInputDevice(device.key),
                                 separator_before: false,
                                 trailing: None,
@@ -849,7 +1057,13 @@ impl DetailOwner {
     /// source count for Input, and the profile count for PowerProfile.
     fn row_shape(self, device_count: usize) -> Vec<RowSpec> {
         match self {
-            DetailOwner::Network => vec![RowSpec::item(false)],
+            // N rows — or ONE placeholder when there is nothing to list — then the settings row
+            // past a separator. Same shape for all three network cards.
+            DetailOwner::Wifi | DetailOwner::Wired | DetailOwner::Vpn => {
+                let mut shape = vec![RowSpec::item(false); device_count.clamp(1, MAX_DEVICE_ROWS)];
+                shape.push(RowSpec::item(true));
+                shape
+            }
             DetailOwner::Power => vec![
                 RowSpec::item(false),
                 RowSpec::item(false),
@@ -923,13 +1137,20 @@ impl DetailOwner {
             grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
         };
         match self {
-            DetailOwner::Network => grid_row_bottom(network_index()),
-            // The Bluetooth tile is inserted right after Network (index 1) — same first row.
-            DetailOwner::Bluetooth => grid_row_bottom(bluetooth_index()),
-            // The Power Mode tile is the first appended conditional; its index shifts by one when
-            // the Bluetooth tile is inserted ahead of it.
+            // A network tile leads the grid; if it is not shown its card is not open either, so
+            // the fallback row never renders.
+            DetailOwner::Wired => {
+                grid_row_bottom(layout.net.index_of(GridTile::Wired).unwrap_or(0))
+            }
+            DetailOwner::Wifi => grid_row_bottom(layout.net.index_of(GridTile::Wifi).unwrap_or(0)),
+            DetailOwner::Vpn => grid_row_bottom(layout.net.index_of(GridTile::Vpn).unwrap_or(0)),
+            // The Bluetooth tile is inserted right after the network group — same row as the last
+            // of them when the group fills a row's worth.
+            DetailOwner::Bluetooth => grid_row_bottom(bluetooth_index(layout.net)),
+            // The Power Mode tile is the first appended conditional; its index shifts by the
+            // network group and by the Bluetooth tile inserted ahead of it.
             DetailOwner::PowerProfile => {
-                grid_row_bottom(power_profile_index(layout.show_bluetooth))
+                grid_row_bottom(power_profile_index(layout.net, layout.show_bluetooth))
             }
             // The power button lives in the top system row, so its detail pins right below it —
             // above the sliders and the whole grid, which shift down.
@@ -944,30 +1165,20 @@ impl DetailOwner {
     }
 }
 
-/// The grid slot the Network tile occupies (its detail view anchors below this row). Derived by
-/// identity over [`BASE_GRID`] — the conditional tiles are only ever appended (see [`grid`]), so
-/// Network's index is stable regardless of whether they show.
-fn network_index() -> usize {
-    BASE_GRID
-        .iter()
-        .position(|t| matches!(t, GridTile::Network))
-        .unwrap_or(0)
-}
-
-/// The grid slot the Bluetooth tile occupies when shown: **inserted at 1**, right after Network —
-/// GNOME's QS tile order is network, bluetooth, powerProfiles (`panel.js:380-383`), and of the
-/// tiles we carry, Bluetooth is the only one that goes *between* existing tiles rather than
-/// appending. Pinned by a debug_assert at the hit site.
-fn bluetooth_index() -> usize {
-    1
+/// The grid slot the Bluetooth tile occupies when shown: right after the network group — GNOME's
+/// QS tile order is network, bluetooth, powerProfiles (`panel.js:380-383`), and of the tiles we
+/// carry, Bluetooth is the only one that goes *between* existing tiles rather than appending.
+/// Pinned by a debug_assert at the hit site.
+fn bluetooth_index(net: NetTiles) -> usize {
+    net.len()
 }
 
 /// The grid slot the Power Mode tile occupies when shown. It's the **first** conditional tile
-/// appended after [`BASE_GRID`] (before Airplane — see [`grid`]), shifted one right when the
-/// Bluetooth tile is inserted ahead of it; its detail view anchors below this row. The order is
-/// load-bearing here and pinned by a debug_assert at the hit/render sites.
-fn power_profile_index(show_bluetooth: bool) -> usize {
-    BASE_GRID.len() + show_bluetooth as usize
+/// appended after [`BASE_GRID`] (before Airplane — see [`grid`]), shifted right by the network
+/// group and by the Bluetooth tile inserted ahead of it; its detail view anchors below this row.
+/// The order is load-bearing here and pinned by a debug_assert at the hit/render sites.
+fn power_profile_index(net: NetTiles, show_bluetooth: bool) -> usize {
+    net.len() + BASE_GRID.len() + show_bluetooth as usize
 }
 
 /// The menu-local layout context: everything the pure geometry functions need to place elements,
@@ -991,8 +1202,13 @@ struct Layout {
     /// The number of backlit monitors — the brightness card's row-pair count and the gate on its
     /// arrow.
     monitor_count: usize,
-    /// Whether the Bluetooth tile is in the grid (rfkill `available`) — it's *inserted* at index
-    /// 1, so every later tile's index shifts by it.
+    /// Which network tiles lead the grid. Every later tile's index is offset by their count.
+    net: NetTiles,
+    /// The row counts of the three network cards, in the order wired, wifi, vpn — what sizes each
+    /// card. Kept here rather than recomputed, so the geometry and the drawn rows cannot disagree.
+    net_rows: [usize; 3],
+    /// Whether the Bluetooth tile is in the grid (rfkill `available`) — it's *inserted* right
+    /// after the network group, so every later tile's index shifts by it.
     show_bluetooth: bool,
     /// The slider being dragged and the device count frozen at drag start, so a device hot-plug
     /// mid-drag can't add/remove that slider's picker arrow (which would resize the track and
@@ -1032,6 +1248,9 @@ impl Layout {
             DetailOwner::PowerProfile => self.profile_count,
             DetailOwner::Bluetooth => self.bt_device_count,
             DetailOwner::Brightness => self.monitor_count,
+            DetailOwner::Wired => self.net_rows[0],
+            DetailOwner::Wifi => self.net_rows[1],
+            DetailOwner::Vpn => self.net_rows[2],
             _ => 0,
         }
     }
@@ -1118,7 +1337,15 @@ impl Tile {
 /// the connection sub-menu are deferred, like gnome-shell's `NMDeviceToggle`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GridTile {
-    Network,
+    /// The Wired tile (gnome-shell's `NMWiredToggle`), shown while an ethernet device is managed.
+    Wired,
+    /// The Wi-Fi tile (`NMWirelessToggle`): its body flips the radio, its arrow opens the network
+    /// list. Shown while a wireless device exists, *including* while the radio is off — the tile
+    /// has to survive its own off switch.
+    Wifi,
+    /// The VPN tile (`NMVpnToggle`), shown while any `vpn`/`wireguard` profile is saved. It needs
+    /// no device: a VPN is a profile NM places itself.
+    Vpn,
     Toggle(Tile),
     /// Power Mode (power-profiles-daemon) — a live D-Bus-backed toggle, shown only when the daemon
     /// is present. Its label carries a second (subtitle) line with the active profile name, its
@@ -1136,17 +1363,60 @@ enum GridTile {
     Bluetooth,
 }
 
-/// The always-present grid tiles, row-major over two columns: Network leads in the prominent
-/// top-left cell (gnome-shell's quick-settings grid leads with connectivity), then the gsettings
-/// toggles fill out the 2×2. The PowerProfile and Airplane tiles are *appended* to this when shown
-/// (see [`grid`]) — gnome-shell adds both after every tile we carry (`panel.js`
-/// `QUICK_SETTINGS_ITEMS` order: powerProfiles before rfkill, which our append order preserves).
-const BASE_GRID: [GridTile; 4] = [
-    GridTile::Network,
+/// The always-present grid tiles, row-major over two columns. The network tiles are *prepended*
+/// to this and the Bluetooth tile inserted right after them, which is GNOME's order: the network
+/// group leads, then bluetooth, then everything else (`panel.js:380-383`). The PowerProfile and
+/// Airplane tiles are appended (see [`grid`]).
+const BASE_GRID: [GridTile; 3] = [
     GridTile::Toggle(Tile::DarkStyle),
     GridTile::Toggle(Tile::DoNotDisturb),
     GridTile::Toggle(Tile::NightLight),
 ];
+
+/// Which network tiles are in the grid, and therefore where every later tile sits.
+///
+/// The order within the group is `Indicator._init`'s push order — wired, wireless, …, vpn
+/// (`network.js:2090-2103`) — not the order they were written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NetTiles {
+    wired: bool,
+    wifi: bool,
+    vpn: bool,
+}
+
+impl NetTiles {
+    fn from_state(state: &crate::network_model::NetworkState) -> Self {
+        use crate::network_model::device_type;
+        Self {
+            wired: state.shows_tile(device_type::ETHERNET),
+            wifi: state.shows_tile(device_type::WIFI),
+            vpn: state.shows_vpn_tile(),
+        }
+    }
+
+    fn tiles(self) -> Vec<GridTile> {
+        let mut tiles = Vec::new();
+        if self.wired {
+            tiles.push(GridTile::Wired);
+        }
+        if self.wifi {
+            tiles.push(GridTile::Wifi);
+        }
+        if self.vpn {
+            tiles.push(GridTile::Vpn);
+        }
+        tiles
+    }
+
+    fn len(self) -> usize {
+        self.wired as usize + self.wifi as usize + self.vpn as usize
+    }
+
+    /// The slot a network tile occupies, or `None` when it is not shown.
+    fn index_of(self, tile: GridTile) -> Option<usize> {
+        self.tiles().iter().position(|t| *t == tile)
+    }
+}
 
 /// The live grid: [`BASE_GRID`] with the Bluetooth tile **inserted at index 1** when shown
 /// (GNOME puts bluetooth right after network, `panel.js:380-383`) plus the two appended
@@ -1154,10 +1424,16 @@ const BASE_GRID: [GridTile; 4] = [
 /// (0, unaffected by the insertion), `bluetooth_index` (1), and
 /// `power_profile_index`/`anchor_row_bottom` (shifted by `show_bluetooth`) resolve tile identity
 /// positionally; debug_asserts at the hit site (`pointer_click`) pin the order.
-fn grid(show_bluetooth: bool, show_power_profile: bool, show_airplane: bool) -> Vec<GridTile> {
-    let mut tiles = BASE_GRID.to_vec();
+fn grid(
+    net: NetTiles,
+    show_bluetooth: bool,
+    show_power_profile: bool,
+    show_airplane: bool,
+) -> Vec<GridTile> {
+    let mut tiles = net.tiles();
+    tiles.extend_from_slice(&BASE_GRID);
     if show_bluetooth {
-        tiles.insert(bluetooth_index(), GridTile::Bluetooth);
+        tiles.insert(bluetooth_index(net), GridTile::Bluetooth);
     }
     if show_power_profile {
         tiles.push(GridTile::PowerProfile);
@@ -1166,23 +1442,26 @@ fn grid(show_bluetooth: bool, show_power_profile: bool, show_airplane: bool) -> 
         tiles.push(GridTile::Airplane);
     }
     debug_assert!(
-        matches!(tiles[0], GridTile::Network),
-        "Network leads the grid (network_index depends on it)"
+        tiles
+            .iter()
+            .take(net.len())
+            .all(|t| matches!(t, GridTile::Wired | GridTile::Wifi | GridTile::Vpn)),
+        "the network tiles lead the grid (every later index is offset by their count)"
     );
     debug_assert!(
         tiles
             .iter()
             .position(|t| matches!(t, GridTile::Bluetooth))
-            .is_none_or(|i| i == bluetooth_index()),
-        "Bluetooth is the only INSERTED tile, always at slot 1 (right after Network)"
+            .is_none_or(|i| i == bluetooth_index(net)),
+        "Bluetooth is the only INSERTED tile, always right after the network group"
     );
     debug_assert!(
         tiles
             .iter()
             .position(|t| matches!(t, GridTile::PowerProfile))
-            .is_none_or(|i| i == power_profile_index(show_bluetooth)),
+            .is_none_or(|i| i == power_profile_index(net, show_bluetooth)),
         "PowerProfile must be the FIRST appended tile (before Airplane) — \
-         power_profile_index(false)/anchor_row_bottom assume its position"
+         power_profile_index/anchor_row_bottom assume its position"
     );
     tiles
 }
@@ -1190,10 +1469,15 @@ fn grid(show_bluetooth: bool, show_power_profile: bool, show_airplane: bool) -> 
 impl GridTile {
     /// The tile's (title) label given the live toggle + network state. Power Mode's title is
     /// static; its active profile is the [`subtitle`](Self::subtitle) line.
-    fn label(self, network: NetworkStatus) -> String {
+    fn label(self, net: &crate::network_model::NetworkState) -> String {
+        use crate::network_model::device_type;
         match self {
             GridTile::Toggle(t) => t.label().to_string(),
-            GridTile::Network => network_label(network).to_string(),
+            // The disambiguated device name: "Wired" for a lone card, "Ethernet (eth1)" only once
+            // a second one collides with it (`NMToggle._getDefaultName`).
+            GridTile::Wired => net.tile_title(device_type::ETHERNET),
+            GridTile::Wifi => net.tile_title(device_type::WIFI),
+            GridTile::Vpn => "VPN".to_string(),
             GridTile::PowerProfile => "Power Mode".to_string(),
             GridTile::Airplane => "Airplane Mode".to_string(),
             GridTile::Bluetooth => "Bluetooth".to_string(),
@@ -1203,10 +1487,19 @@ impl GridTile {
     /// The tile's second (subtitle) line, or `None` for a single-line tile: Power Mode's active
     /// profile, and Bluetooth's connected-device summary (`bluetooth.js:410-419`), mirroring
     /// gnome-shell's `QuickMenuToggle` subtitle.
-    fn subtitle(self, power: &PowerProfileStatus, bluetooth: &BluetoothStatus) -> Option<String> {
+    fn subtitle(
+        self,
+        power: &PowerProfileStatus,
+        bluetooth: &BluetoothStatus,
+        net: &crate::network_model::NetworkState,
+    ) -> Option<String> {
         match self {
             GridTile::PowerProfile => Some(power.name().to_string()),
             GridTile::Bluetooth => bluetooth.subtitle(),
+            // `_transformSubtitle` drops a subtitle that merely repeats the title
+            // (`network.js:1675-1680`), which is what an idle device's name would do.
+            GridTile::Wifi => net.wifi_subtitle().filter(|s| *s != self.label(net)),
+            GridTile::Vpn => net.vpn.iter().find(|v| v.is_active()).map(|v| v.id.clone()),
             _ => None,
         }
     }
@@ -1216,13 +1509,18 @@ impl GridTile {
     /// (`bluetooth.js:114-118`).
     fn icons(
         self,
-        network: NetworkStatus,
+        net: &crate::network_model::NetworkState,
         power: &PowerProfileStatus,
         bt_state: BtAdapterState,
     ) -> Vec<String> {
         match self {
             GridTile::Toggle(t) => t.icons().iter().map(|s| s.to_string()).collect(),
-            GridTile::Network => network_icons(network),
+            GridTile::Wired => vec![net.wired_icon().to_string()],
+            GridTile::Wifi => vec![net.wifi_icon()],
+            GridTile::Vpn => vec![net
+                .primary_vpn()
+                .map_or("network-vpn-disabled-symbolic", |v| v.icon_name())
+                .to_string()],
             GridTile::PowerProfile => vec![power.icon().to_string()],
             GridTile::Airplane => vec!["airplane-mode-symbolic".to_string()],
             GridTile::Bluetooth => vec![BluetoothStatus::icon_for(bt_state).to_string()],
@@ -1235,16 +1533,21 @@ impl GridTile {
     fn is_on(
         self,
         toggles: QuickToggles,
-        network: NetworkStatus,
+        net: &crate::network_model::NetworkState,
         airplane: AirplaneStatus,
         power: &PowerProfileStatus,
         bt_powered: bool,
     ) -> bool {
+        use crate::network_model::device_type;
         match self {
             GridTile::Toggle(t) => t.is_on(toggles),
-            GridTile::Network => {
-                matches!(network, NetworkStatus::Wired | NetworkStatus::Wireless(_))
-            }
+            // A device tile is checked while it has an active item (`_updateChecked`); the Wi-Fi
+            // tile is bound to the radio switch instead (`NMWirelessToggle.setClient`).
+            GridTile::Wired => net
+                .primary_device(device_type::ETHERNET)
+                .is_some_and(|d| d.active_connection.is_some()),
+            GridTile::Wifi => net.wireless_enabled,
+            GridTile::Vpn => net.vpn.iter().any(|v| v.is_active()),
             GridTile::PowerProfile => power.is_active(),
             GridTile::Airplane => airplane.active,
             GridTile::Bluetooth => bt_powered,
@@ -1258,7 +1561,9 @@ impl GridTile {
     /// gnome-shell's.)
     fn detail_owner(self) -> Option<DetailOwner> {
         match self {
-            GridTile::Network => Some(DetailOwner::Network),
+            GridTile::Wired => Some(DetailOwner::Wired),
+            GridTile::Wifi => Some(DetailOwner::Wifi),
+            GridTile::Vpn => Some(DetailOwner::Vpn),
             GridTile::PowerProfile => Some(DetailOwner::PowerProfile),
             GridTile::Bluetooth => Some(DetailOwner::Bluetooth),
             GridTile::Toggle(_) | GridTile::Airplane => None,
@@ -1266,23 +1571,33 @@ impl GridTile {
     }
 }
 
-/// The Network tile's label. The status model carries no SSID / connection name yet,
-/// so these are gnome-shell's generic per-type fallbacks.
-fn network_label(network: NetworkStatus) -> &'static str {
-    match network {
-        NetworkStatus::Wired => "Wired",
-        NetworkStatus::Wireless(_) => "Wi-Fi",
-        NetworkStatus::Offline => "Offline",
-        NetworkStatus::Unknown => "Network",
+/// How many item rows a network card draws, settings row excluded — the count `row_shape` sizes
+/// from. Zero is impossible: an empty list is one placeholder row, which `row_shape` floors to.
+///
+/// This mirrors the corresponding arm of [`DetailOwner::rows`]; the debug_assert at the draw site
+/// is what keeps the two honest.
+fn net_card_rows(net: &crate::network_model::NetworkState, owner: DetailOwner) -> usize {
+    use crate::network_model::device_type;
+    match owner {
+        DetailOwner::Wifi => net
+            .primary_device(device_type::WIFI)
+            .and_then(|d| d.wireless.as_ref())
+            .map(|w| crate::network_model::visible_networks(&w.networks(&net.saved), true).len())
+            .unwrap_or(0),
+        DetailOwner::Wired => {
+            let device = net.primary_device(device_type::ETHERNET);
+            let profiles = net
+                .saved
+                .iter()
+                .filter(|c| c.kind == "802-3-ethernet")
+                .count()
+                .min(MAX_DEVICE_ROWS);
+            // The "Turn Off" row only exists while something is up.
+            profiles + device.is_some_and(|d| d.active_connection.is_some()) as usize
+        }
+        DetailOwner::Vpn => net.vpn.len().min(MAX_DEVICE_ROWS),
+        _ => 0,
     }
-}
-
-/// The Network tile's icon candidates, falling back to a wired glyph while the state
-/// is `Unknown` (pre-first-read / no `dbus` feature) so the tile always shows an icon.
-fn network_icons(network: NetworkStatus) -> Vec<String> {
-    system_status::network_icon(network)
-        .map(|c| c.iter().map(|s| s.to_string()).collect())
-        .unwrap_or_else(|| vec!["network-wired-symbolic".to_string()])
 }
 
 /// The system-row buttons (gnome-shell's `SystemItem`, `js/ui/status/system.js`):
@@ -1360,8 +1675,8 @@ impl SysButton {
 /// updates the tile immediately (the write-back round-trips through gsettings).
 pub struct QuickSettings {
     toggles: QuickToggles,
-    /// Live network state (from the system-bus watcher), for the Network grid tile.
-    network: NetworkStatus,
+    /// The full NetworkManager model behind the Wired / Wi-Fi / VPN tiles and their cards.
+    net: crate::network_model::NetworkState,
     /// Airplane (rfkill) state, for the conditionally-shown Airplane grid tile. `show` grows the
     /// grid by one tile; `active` is the tile's on-state.
     airplane: AirplaneStatus,
@@ -1640,7 +1955,6 @@ impl QuickSettings {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         toggles: QuickToggles,
-        network: NetworkStatus,
         airplane: AirplaneStatus,
         power: PowerProfileStatus,
         bluetooth: BluetoothStatus,
@@ -1657,7 +1971,7 @@ impl QuickSettings {
     ) -> Self {
         Self {
             toggles,
-            network,
+            net: crate::network_model::NetworkState::default(),
             airplane,
             power,
             bluetooth,
@@ -1708,6 +2022,7 @@ impl QuickSettings {
     /// present).
     fn grid(&self) -> Vec<GridTile> {
         grid(
+            NetTiles::from_state(&self.net),
             self.bluetooth_rfkill.available(),
             self.power.show,
             self.airplane.show,
@@ -1723,7 +2038,7 @@ impl QuickSettings {
     /// The open detail view's rows for `owner`, with every live source threaded in.
     fn detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
         owner.rows(
-            self.network,
+            &self.net,
             AudioDetail {
                 sinks: &self.sink_list,
                 sources: &self.source_list,
@@ -1752,6 +2067,12 @@ impl QuickSettings {
             profile_count: self.power.available.len(),
             bt_device_count: self.bluetooth.visible_devices().len(),
             monitor_count: self.monitor_count(),
+            net: NetTiles::from_state(&self.net),
+            net_rows: [
+                net_card_rows(&self.net, DetailOwner::Wired),
+                net_card_rows(&self.net, DetailOwner::Wifi),
+                net_card_rows(&self.net, DetailOwner::Vpn),
+            ],
             show_bluetooth: self.bluetooth_rfkill.available(),
             // Only a top-level drag can affect the geometry (it's the arrow it pins); a card
             // slider's row is placed by the card, which sizes from the live counts anyway.
@@ -1820,6 +2141,18 @@ impl QuickSettings {
             return false;
         }
         self.power = power;
+        self.content_bumped();
+        self.normalize_expanded();
+        true
+    }
+
+    /// Adopt a fresh NetworkManager model. Returns whether it changed. The tile set itself grows
+    /// and shrinks with it, so an open card whose tile just vanished has to be normalized away.
+    pub fn set_network_state(&mut self, net: crate::network_model::NetworkState) -> bool {
+        if self.net == net {
+            return false;
+        }
+        self.net = net;
         self.content_bumped();
         self.normalize_expanded();
         true
@@ -2196,7 +2529,7 @@ impl QuickSettings {
         let checked = match stop {
             QsStop::Tile(item) | QsStop::TileArrow(item) => item.is_on(
                 self.toggles,
-                self.network,
+                &self.net,
                 self.airplane,
                 &self.power,
                 self.bluetooth.powered,
@@ -2293,12 +2626,64 @@ impl QuickSettings {
             // one at a time); the toggle-body keeps the tile's own behavior.
             QsStop::TileArrow(item) => {
                 self.toggle_detail(item.detail_owner());
-                PopoverAction::Consumed
+                // Opening the Wi-Fi list asks for a fresh scan (`open-state-changed` →
+                // `_startScanning`, `network.js:1799-1804`).
+                //
+                // DIVERGENCE: upstream then rescans every 15 s while the menu is open and spins
+                // a header spinner until `LastScan` moves. We scan once on open; a menu is
+                // usually shut again well inside that window, and the repeat needs a timer the
+                // popover does not own.
+                match (self.expanded, item) {
+                    (Some(DetailOwner::Wifi), GridTile::Wifi) => {
+                        match self
+                            .net
+                            .primary_device(crate::network_model::device_type::WIFI)
+                        {
+                            Some(device) => PopoverAction::RequestWifiScan(device.path.clone()),
+                            None => PopoverAction::Consumed,
+                        }
+                    }
+                    _ => PopoverAction::Consumed,
+                }
             }
             QsStop::Tile(item) => match item {
-                // Network body: open settings (the in-place enable/disable toggle is deferred);
-                // the arrow opens the detail view.
-                GridTile::Network => settings_panel("network"),
+                // Wi-Fi body: flip the radio (`NMWirelessToggle.activate`, `network.js:1826-1832`)
+                // — but only when the hardware switch allows it; upstream binds `reactive` to
+                // `wireless-hardware-enabled`, so a hw-killed radio's tile does not respond.
+                GridTile::Wifi => {
+                    if self.net.wireless_hardware_enabled {
+                        PopoverAction::SetWirelessEnabled(!self.net.wireless_enabled)
+                    } else {
+                        PopoverAction::Consumed
+                    }
+                }
+                // A device tile with no radio of its own: bring the primary item up, or take the
+                // active one down (`NMDeviceItem.activate`/`deactivateConnection`).
+                GridTile::Wired => {
+                    let device = self
+                        .net
+                        .primary_device(crate::network_model::device_type::ETHERNET);
+                    match device.and_then(|d| d.active_connection.clone()) {
+                        Some(active) => PopoverAction::DeactivateNetworkProfile(active),
+                        None => match self.net.saved.iter().find(|c| c.kind == "802-3-ethernet") {
+                            Some(profile) => PopoverAction::ActivateNetworkProfile {
+                                profile: profile.path.clone(),
+                                device: device.map(|d| d.path.clone()).unwrap_or_default(),
+                            },
+                            None => PopoverAction::Consumed,
+                        },
+                    }
+                }
+                GridTile::Vpn => match self.net.primary_vpn() {
+                    Some(vpn) if vpn.is_active() => {
+                        PopoverAction::DeactivateNetworkProfile(vpn.path.clone())
+                    }
+                    Some(vpn) => PopoverAction::ActivateNetworkProfile {
+                        profile: vpn.path.clone(),
+                        device: String::new(),
+                    },
+                    None => PopoverAction::Consumed,
+                },
                 GridTile::Toggle(tile) => {
                     let on = !tile.is_on(self.toggles);
                     self.set_tile(tile, on);
@@ -2711,7 +3096,7 @@ impl QuickSettings {
         for (i, item) in self.grid().into_iter().enumerate() {
             let on = item.is_on(
                 self.toggles,
-                self.network,
+                &self.net,
                 self.airplane,
                 &self.power,
                 self.bluetooth.powered,
@@ -2722,7 +3107,7 @@ impl QuickSettings {
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
             ));
-            let candidates = item.icons(self.network, &self.power, self.bt_effective_state());
+            let candidates = item.icons(&self.net, &self.power, self.bt_effective_state());
             if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
@@ -2763,7 +3148,7 @@ impl QuickSettings {
         let mut card_elements = Vec::new();
         if let (Some(owner), true) = (self.shown_detail(), self.expand.card_shown()) {
             if let Some(card) = detail_rect(layout) {
-                let (cand, _title) = owner.header(self.network);
+                let (cand, _title) = owner.header(&self.net);
                 // Centered on the icon pill (the pill itself is chrome, drawn in `draw`).
                 let center = Point::from((
                     card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL / 2.,
@@ -2799,6 +3184,28 @@ impl QuickSettings {
                             renderer, icons, &row.icons, TILE_ICON, scale, FG_OFF, origin, center,
                         ) {
                             card_elements.push(el);
+                        }
+                        // The half-size padlock, immediately after the row icon and sitting on
+                        // its baseline (`.wireless-secure-icon` is `icon-size: half` with
+                        // `y_align: END`, `_quick-settings.scss:219-221`).
+                        if let Some(badge) = &row.badge {
+                            let size = TILE_ICON / 2.;
+                            let center = Point::from((
+                                rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + size / 2.,
+                                rrect.loc.y + rrect.size.h / 2. + TILE_ICON / 2. - size / 2.,
+                            ));
+                            if let Some(el) = widget::icon_element(
+                                renderer,
+                                icons,
+                                std::slice::from_ref(badge),
+                                size,
+                                scale,
+                                FG_OFF,
+                                origin,
+                                center,
+                            ) {
+                                card_elements.push(el);
+                            }
                         }
                     }
                     // The trailing check on the selected row (gnome-shell's `Ornament.CHECK`).
@@ -3080,7 +3487,7 @@ impl QuickSettings {
         // Shape every run up front (needs `&mut renderer`, before the bake frame opens).
         let (title_run, row_runs) = {
             let mut shaper = TextShaper::new(renderer, scale);
-            let (_, title) = owner.header(self.network);
+            let (_, title) = owner.header(&self.net);
             let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
             let row_w = detail_rect(self.layout()).map_or(0., |c| c.size.w) - 2. * DETAIL_PAD;
             let rows = self.detail_rows(owner);
@@ -3101,6 +3508,7 @@ impl QuickSettings {
                         DetailRow::Label(label) => ItemRow {
                             label,
                             icons: Vec::new(),
+                            badge: None,
                             action: PopoverAction::Consumed,
                             separator_before: false,
                             selected: false,
@@ -3302,7 +3710,7 @@ impl QuickSettings {
         let labels: Vec<String> = self
             .grid()
             .iter()
-            .map(|item| item.label(self.network))
+            .map(|item| item.label(&self.net))
             .collect();
         let (label_runs, subtitle_runs, pill_run) = {
             let mut shaper = TextShaper::new(renderer, scale);
@@ -3316,7 +3724,7 @@ impl QuickSettings {
                 .grid()
                 .iter()
                 .map(|item| {
-                    item.subtitle(&self.power, &self.bluetooth)
+                    item.subtitle(&self.power, &self.bluetooth, &self.net)
                         .map(|s| shaper.shape(&s, subtitle_style))
                         .transpose()
                 })
@@ -3341,7 +3749,7 @@ impl QuickSettings {
                 let rect = tile_rect(i, layout);
                 let on = item.is_on(
                     self.toggles,
-                    self.network,
+                    &self.net,
                     self.airplane,
                     &self.power,
                     self.bluetooth.powered,
@@ -3950,9 +4358,16 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            net: NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            net_rows: [0, 3, 0],
             show_bluetooth: false,
             drag: None,
-            grid_len: BASE_GRID.len(),
+            // The three toggles plus the fixture's Wi-Fi tile.
+            grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         }
     }
@@ -3964,9 +4379,8 @@ run it with --features reference-env, as the fedora CI job does"
     fn layout_places_tiles_and_system_row_within_bounds() {
         for audio in [None, Some(AudioStatus::default())] {
             let has_slider = audio.is_some();
-            let size = QuickSettings::new(
+            let size = test_qs(
                 QuickToggles::default(),
-                NetworkStatus::Wired,
                 AirplaneStatus::default(),
                 PowerProfileStatus::default(),
                 BluetoothStatus::default(),
@@ -4020,9 +4434,8 @@ run it with --features reference-env, as the fedora CI job does"
     /// Clicking a gsettings tile flips its state and returns the matching set-action.
     #[test]
     fn clicking_a_tile_flips_and_returns_the_action() {
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4051,9 +4464,8 @@ run it with --features reference-env, as the fedora CI job does"
     /// re-bakes with the highlight, and re-hovering the same control is a no-op.
     #[test]
     fn hover_tracks_controls() {
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4103,31 +4515,16 @@ run it with --features reference-env, as the fedora CI job does"
     fn network_tile_reflects_state_and_opens_settings() {
         let off = AirplaneStatus::default();
         let np = PowerProfileStatus::default();
-        assert!(GridTile::Network.is_on(
-            QuickToggles::default(),
-            NetworkStatus::Wired,
-            off,
-            &np,
-            false
-        ));
-        assert!(GridTile::Network.is_on(
-            QuickToggles::default(),
-            NetworkStatus::Wireless(60),
-            off,
-            &np,
-            false
-        ));
-        assert!(!GridTile::Network.is_on(
-            QuickToggles::default(),
-            NetworkStatus::Offline,
-            off,
-            &np,
-            false
-        ));
+        let on = fixture_net();
+        let mut radio_off = on.clone();
+        radio_off.wireless_enabled = false;
+        // The Wi-Fi tile is checked by the radio switch, not by whether a network is joined
+        // (`NMWirelessToggle.setClient` binds `checked` to `wireless-enabled`).
+        assert!(GridTile::Wifi.is_on(QuickToggles::default(), &on, off, &np, false));
+        assert!(!GridTile::Wifi.is_on(QuickToggles::default(), &radio_off, off, &np, false));
 
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4142,26 +4539,28 @@ run it with --features reference-env, as the fedora CI job does"
             crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
-        // The tile center falls in the toggle-body (left of the arrow-half), which opens settings.
+        // The tile center falls in the toggle-body (left of the arrow-half), which flips the
+        // radio — echo-driven, so nothing changes locally until NM says so.
         let action = qs.pointer_click(center(tile_rect(0, lay(false))));
-        match action {
-            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "network"),
-            other => panic!("expected network settings, got {other:?}"),
-        }
-        // Network is not a gsettings toggle: no local flip. The first click does bump the chrome
-        // revision, because it moved the keyboard focus onto the tile and the ring has to be
-        // redrawn — but a second click on the same tile changes nothing at all.
-        let settled = qs.revision;
-        qs.pointer_click(center(tile_rect(0, lay(false))));
-        assert_eq!(qs.revision, settled);
+        assert_eq!(action, PopoverAction::SetWirelessEnabled(false));
+        assert!(qs.net.wireless_enabled, "echo-driven: no local flip");
+
+        // A hardware kill switch makes the body inert (`reactive` bound to
+        // `wireless-hardware-enabled`, `network.js:1819-1821`).
+        let mut hw_blocked = fixture_net();
+        hw_blocked.wireless_hardware_enabled = false;
+        qs.set_network_state(hw_blocked);
+        assert_eq!(
+            qs.pointer_click(center(tile_rect(0, lay(false)))),
+            PopoverAction::Consumed
+        );
     }
 
     /// The screenshot button opens the UI; the settings button spawns its command.
     #[test]
     fn clicking_system_buttons_returns_their_actions() {
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4196,9 +4595,8 @@ run it with --features reference-env, as the fedora CI job does"
     fn battery_pill_appears_and_opens_power_settings() {
         assert!(pill_rect(false).is_none());
 
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4228,9 +4626,8 @@ run it with --features reference-env, as the fedora CI job does"
     /// A click in empty menu space is consumed but does nothing.
     #[test]
     fn clicking_empty_space_is_consumed() {
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4270,9 +4667,8 @@ run it with --features reference-env, as the fedora CI job does"
             dark_style: true,
             ..Default::default()
         };
-        let qs = QuickSettings::new(
+        let qs = test_qs(
             toggles,
-            NetworkStatus::Unknown,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4346,10 +4742,74 @@ run it with --features reference-env, as the fedora CI job does"
         row.item().expect("an ordinary item row")
     }
 
-    fn qs(network: NetworkStatus, audio: Option<AudioStatus>) -> QuickSettings {
-        QuickSettings::new(
+    /// The grid slot the Wi-Fi tile occupies. Every geometry test drives that tile, so it is the
+    /// one index worth a name.
+    fn wifi_index(layout: Layout) -> usize {
+        layout
+            .net
+            .index_of(GridTile::Wifi)
+            .expect("the fixture always carries a wireless device")
+    }
+
+    /// The fixture's network model: one wireless device with three networks, one of them ours.
+    fn fixture_net() -> crate::network_model::NetworkState {
+        crate::network_model::debug_state(
+            "wifi",
+            true,
+            true,
+            &[
+                "home:80:wpa:known:active".to_string(),
+                "cafe:40:open".to_string(),
+                "campus:60:enterprise".to_string(),
+            ],
+            &[],
+        )
+        .expect("a fake network state")
+    }
+
+    /// Every test builds its menu through here, so the grid always leads with the fixture's one
+    /// Wi-Fi tile — the slot the old single Network tile held, which is what the index arithmetic
+    /// in these tests is written against.
+    #[allow(clippy::too_many_arguments)]
+    fn test_qs(
+        toggles: QuickToggles,
+        airplane: AirplaneStatus,
+        power: PowerProfileStatus,
+        bluetooth: BluetoothStatus,
+        bluetooth_rfkill: BluetoothRfkill,
+        battery: Option<BatteryStatus>,
+        audio: Option<AudioStatus>,
+        sink_list: SinkList,
+        cards: crate::audio::AudioCards,
+        headphones: bool,
+        mic: MicStatus,
+        source_list: SourceList,
+        brightness: crate::brightness::BrightnessView,
+        accent: [u8; 3],
+    ) -> QuickSettings {
+        let mut qs = QuickSettings::new(
+            toggles,
+            airplane,
+            power,
+            bluetooth,
+            bluetooth_rfkill,
+            battery,
+            audio,
+            sink_list,
+            cards,
+            headphones,
+            mic,
+            source_list,
+            brightness,
+            accent,
+        );
+        qs.set_network_state(fixture_net());
+        qs
+    }
+
+    fn qs(audio: Option<AudioStatus>) -> QuickSettings {
+        test_qs(
             QuickToggles::default(),
-            network,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -4424,7 +4884,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// `_quick-settings.scss:24`).
     #[test]
     fn a_checked_tile_rings_in_a_colour_that_shows_on_its_accent_fill() {
-        let mut qs = qs(NetworkStatus::default(), None);
+        let mut qs = qs(None);
         let tile = GridTile::Toggle(Tile::DarkStyle);
 
         assert_eq!(
@@ -4449,7 +4909,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// menu from the top.
     #[test]
     fn a_click_takes_the_keyboard_focus_with_it() {
-        let mut qs = qs(NetworkStatus::default(), None);
+        let mut qs = qs(None);
 
         let power = sys_rect(SysButton::Power, qs.has_pill());
         let hit = power.loc + Point::from((power.size.w / 2., power.size.h / 2.));
@@ -4478,7 +4938,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// land on a different tile while the menu is open.
     #[test]
     fn a_tile_appearing_does_not_move_the_focus_to_another_tile() {
-        let mut qs = qs(NetworkStatus::default(), None);
+        let mut qs = qs(None);
 
         while qs.focused_for_test().as_deref() != Some("Tile(Toggle(DarkStyle))") {
             qs.nav(Dir::TabForward);
@@ -4540,7 +5000,7 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// A quick-settings menu with a live volume slider and `n` output sinks.
     fn qs_with_sinks(n: usize) -> QuickSettings {
-        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        let mut q = qs(Some(AudioStatus::default()));
         q.sink_list = make_sinks(n);
         q
     }
@@ -4571,7 +5031,7 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// A menu with BOTH sliders live (one output sink + a recording mic) and `n` input sources.
     fn qs_with_sources(n: usize) -> QuickSettings {
-        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        let mut q = qs(Some(AudioStatus::default()));
         q.mic = recording_mic();
         q.source_list = make_sources(n);
         q
@@ -4593,7 +5053,7 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// A menu with a live brightness slider (one backlit panel) and no audio.
     fn qs_with_brightness(value: f64) -> QuickSettings {
-        let mut q = qs(NetworkStatus::Wired, None);
+        let mut q = qs(None);
         q.brightness = brightness_view(1, value);
         q
     }
@@ -4603,7 +5063,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// gnome-shell adds the items in the order output, input, brightness (`panel.js:366-373`).
     #[test]
     fn brightness_slider_shows_with_a_backlight_and_stacks_last() {
-        let none = qs(NetworkStatus::Wired, None);
+        let none = qs(None);
         assert!(!none.layout().sliders.brightness);
 
         // Alone, it takes the top slot (a desktop with no bound sink and no mic).
@@ -4611,12 +5071,9 @@ run it with --features reference-env, as the fedora CI job does"
         assert!(only.layout().sliders.brightness);
         assert_eq!(
             slider_row_rect(Slider::Brightness, only.layout()).loc.y,
-            slider_row_rect(
-                Slider::Output,
-                qs(NetworkStatus::Wired, Some(AudioStatus::default())).layout(),
-            )
-            .loc
-            .y,
+            slider_row_rect(Slider::Output, qs(Some(AudioStatus::default())).layout(),)
+                .loc
+                .y,
         );
 
         // With both volume sliders up it is the third row, below the mic.
@@ -4695,7 +5152,7 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// A menu whose brightness card is open over `n` monitors.
     fn qs_with_card(n: usize) -> QuickSettings {
-        let mut q = qs(NetworkStatus::Wired, None);
+        let mut q = qs(None);
         q.brightness = brightness_view(n, 0.5);
         q.expanded = Some(DetailOwner::Brightness);
         q
@@ -4910,7 +5367,7 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn mic_slider_shows_only_while_recording_with_a_source() {
         // Recording but no bound source → no mic slider.
-        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        let mut q = qs(Some(AudioStatus::default()));
         q.mic = MicStatus {
             recording: true,
             source_present: false,
@@ -5090,7 +5547,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// above.
     #[test]
     fn mic_only_slider_takes_the_top_slot() {
-        let mut q = qs(NetworkStatus::Wired, None); // audio None → no output slider
+        let mut q = qs(None); // audio None → no output slider
         q.mic = recording_mic();
         q.source_list = make_sources(2);
         assert!(q.sliders().mic && !q.sliders().output);
@@ -5111,10 +5568,10 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn tile_body_and_arrow_are_disjoint_regions() {
         let l = lay(false);
-        let ni = network_index();
-        let body = tile_body_rect(ni, GridTile::Network, l);
+        let ni = wifi_index(l);
+        let body = tile_body_rect(ni, GridTile::Wifi, l);
         let arrow =
-            tile_arrow_rect(ni, GridTile::Network, l).expect("the Network tile carries an arrow");
+            tile_arrow_rect(ni, GridTile::Wifi, l).expect("the Wi-Fi tile carries an arrow");
         // The body ends at (or before) the arrow's left edge — a separator sits between.
         assert!(body.loc.x + body.size.w <= arrow.loc.x);
         assert_eq!(
@@ -5138,9 +5595,8 @@ run it with --features reference-env, as the fedora CI job does"
             active: false,
             show: true,
         };
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             airplane,
             PowerProfileStatus::default(),
             BluetoothStatus::default(),
@@ -5156,7 +5612,7 @@ run it with --features reference-env, as the fedora CI job does"
             [0, 0, 0],
         );
 
-        // Five tiles now, Airplane last (the append invariant network_index() depends on).
+        // Five tiles now, Airplane last (the append invariant wifi_index(qs.layout()) depends on).
         let tiles = qs.grid();
         assert_eq!(tiles.len(), 5);
         assert_eq!(tiles[4], GridTile::Airplane);
@@ -5210,9 +5666,8 @@ run it with --features reference-env, as the fedora CI job does"
             ],
             show: true,
         };
-        let mut qs = QuickSettings::new(
+        let mut qs = test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             power,
             BluetoothStatus::default(),
@@ -5228,34 +5683,39 @@ run it with --features reference-env, as the fedora CI job does"
             [0, 0, 0],
         );
 
-        // Appended as the 5th tile at the constant power_profile_index (4).
+        // Appended after the network group and the three toggles.
+        qs.set_network_state(fixture_net());
+        let net = NetTiles::from_state(&qs.net);
         let tiles = qs.grid();
         assert_eq!(tiles.len(), 5);
-        assert_eq!(power_profile_index(false), 4);
-        assert_eq!(tiles[power_profile_index(false)], GridTile::PowerProfile);
+        assert_eq!(power_profile_index(net, false), 4);
+        assert_eq!(
+            tiles[power_profile_index(net, false)],
+            GridTile::PowerProfile
+        );
 
         // Two-line tile: static "Power Mode" title, active profile as the subtitle.
-        assert_eq!(
-            GridTile::PowerProfile.label(NetworkStatus::Wired),
-            "Power Mode"
-        );
+        assert_eq!(GridTile::PowerProfile.label(&qs.net), "Power Mode");
         assert_eq!(
             GridTile::PowerProfile
-                .subtitle(&qs.power, &qs.bluetooth)
+                .subtitle(&qs.power, &qs.bluetooth, &qs.net)
                 .as_deref(),
             Some("Performance")
         );
         // On because the active profile isn't Balanced.
         assert!(GridTile::PowerProfile.is_on(
             QuickToggles::default(),
-            NetworkStatus::Wired,
+            &qs.net,
             AirplaneStatus::default(),
             &qs.power,
             false,
         ));
 
         // Body click returns the toggle action; no arrow yet, so the whole tile is body.
-        let action = qs.pointer_click(center(tile_rect(power_profile_index(false), qs.layout())));
+        let action = qs.pointer_click(center(tile_rect(
+            power_profile_index(net, false),
+            qs.layout(),
+        )));
         assert!(matches!(action, PopoverAction::TogglePowerProfile));
 
         // Both conditionals shown: PowerProfile (4) stays ahead of Airplane (5).
@@ -5271,9 +5731,8 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// A QS with `n` known profiles present, `active` selected, daemon shown.
     fn qs_profiles(active: &str, profiles: &[KnownProfile]) -> QuickSettings {
-        QuickSettings::new(
+        test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus {
                 active: active.to_string(),
@@ -5304,7 +5763,14 @@ run it with --features reference-env, as the fedora CI job does"
             KnownProfile::Balanced,
             KnownProfile::PowerSaver,
         ];
-        let ppi = power_profile_index(false);
+        let ppi = power_profile_index(
+            NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            false,
+        );
 
         // >2 profiles → an arrow that opens the picker.
         let mut qs = qs_profiles("performance", &all);
@@ -5377,7 +5843,14 @@ run it with --features reference-env, as the fedora CI job does"
             active: false,
             show: true,
         });
-        let ppi = power_profile_index(false);
+        let ppi = power_profile_index(
+            NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            false,
+        );
         assert_eq!(qs.grid().len(), 6, "power + airplane both shown");
 
         qs.pointer_click(center(
@@ -5396,21 +5869,23 @@ run it with --features reference-env, as the fedora CI job does"
     /// state changes (Consumed) that bump the chrome revision.
     #[test]
     fn network_arrow_toggles_the_detail_view() {
-        let mut qs = qs(NetworkStatus::Wired, None);
-        let ni = network_index();
+        let mut qs = qs(None);
+        let ni = wifi_index(qs.layout());
         assert!(qs.expanded.is_none());
 
         let before = qs.revision;
+        // Opening the Wi-Fi list also asks the device for a fresh scan.
         let a = qs.pointer_click(center(
-            tile_arrow_rect(ni, GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(ni, GridTile::Wifi, qs.layout()).unwrap(),
         ));
-        assert!(matches!(a, PopoverAction::Consumed));
-        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        assert!(matches!(a, PopoverAction::RequestWifiScan(_)));
+        assert_eq!(qs.expanded, Some(DetailOwner::Wifi));
         assert!(qs.revision > before);
 
-        // Network is a row-0 tile, so opening its detail doesn't shift it — the arrow stays put.
+        // Wi-Fi is a row-0 tile, so opening its detail doesn't shift it — the arrow stays put.
+        // Closing asks for nothing.
         let a = qs.pointer_click(center(
-            tile_arrow_rect(ni, GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(ni, GridTile::Wifi, qs.layout()).unwrap(),
         ));
         assert!(matches!(a, PopoverAction::Consumed));
         assert!(qs.expanded.is_none());
@@ -5432,9 +5907,16 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            net: NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            net_rows: [0, 3, 0],
             show_bluetooth: false,
             drag: None,
-            grid_len: BASE_GRID.len(),
+            // The three toggles plus the fixture's Wi-Fi tile.
+            grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
         let expanded = Layout {
@@ -5443,15 +5925,22 @@ run it with --features reference-env, as the fedora CI job does"
                 mic: false,
                 brightness: false,
             },
-            expanded: Some(DetailOwner::Network),
+            expanded: Some(DetailOwner::Wifi),
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            net: NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            net_rows: [0, 3, 0],
             show_bluetooth: false,
             drag: None,
-            grid_len: BASE_GRID.len(),
+            // The three toggles plus the fixture's Wi-Fi tile.
+            grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
         assert!(
@@ -5459,7 +5948,7 @@ run it with --features reference-env, as the fedora CI job does"
             "the menu must grow taller"
         );
 
-        let block = DETAIL_MARGIN + DetailOwner::Network.detail_height(0);
+        let block = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3);
         // Row 0 (Network + its neighbor) does not move.
         for i in 0..COLS {
             assert_eq!(
@@ -5469,7 +5958,7 @@ run it with --features reference-env, as the fedora CI job does"
             );
         }
         // Row 1 shifts down by exactly the detail block.
-        for i in COLS..BASE_GRID.len() {
+        for i in COLS..expanded.grid_len {
             let d = tile_rect(i, expanded).loc.y - tile_rect(i, collapsed).loc.y;
             assert!(
                 (d - block).abs() < 0.01,
@@ -5478,7 +5967,7 @@ run it with --features reference-env, as the fedora CI job does"
         }
         // The card is pinned below the Network row and clears the shifted next row.
         let card = detail_rect(expanded).expect("a card when expanded");
-        let ni = network_index();
+        let ni = wifi_index(expanded);
         assert!(card.loc.y >= tile_rect(ni, expanded).loc.y + TILE_H - 0.01);
         assert!(card.loc.y + card.size.h <= tile_rect(COLS, expanded).loc.y + 0.01);
         // Never wider than the collapsed menu (keeps the popover origin stable on expand).
@@ -5489,11 +5978,11 @@ run it with --features reference-env, as the fedora CI job does"
     /// which closes the menu); the row lies inside the card.
     #[test]
     fn detail_row_runs_its_action() {
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
-        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        assert_eq!(qs.expanded, Some(DetailOwner::Wifi));
 
         let row = detail_row_rect(0, qs.layout()).expect("one detail row");
         let card = detail_rect(qs.layout()).unwrap();
@@ -5502,10 +5991,15 @@ run it with --features reference-env, as the fedora CI job does"
             "row must lie in the card"
         );
 
+        // The first row is the network we already have a profile for, so clicking it activates
+        // that profile rather than opening Settings.
         let action = qs.pointer_click(center(row));
         match action {
-            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "network"),
-            other => panic!("expected the network-settings spawn, got {other:?}"),
+            PopoverAction::ActivateNetworkProfile { profile, device } => {
+                assert!(!profile.is_empty());
+                assert!(!device.is_empty());
+            }
+            other => panic!("expected a profile activation, got {other:?}"),
         }
     }
 
@@ -5513,9 +6007,9 @@ run it with --features reference-env, as the fedora CI job does"
     /// menu is the shell's concern, not ours.
     #[test]
     fn clicking_card_gutter_is_consumed_and_keeps_the_detail_open() {
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
         let card = detail_rect(qs.layout()).unwrap();
         // The header strip (above the first row) is card space with no action.
@@ -5524,7 +6018,7 @@ run it with --features reference-env, as the fedora CI job does"
         assert!(matches!(a, PopoverAction::Consumed));
         assert_eq!(
             qs.expanded,
-            Some(DetailOwner::Network),
+            Some(DetailOwner::Wifi),
             "the detail must stay open"
         );
     }
@@ -5534,7 +6028,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// its bottom edge).
     #[test]
     fn expanded_menu_stays_within_a_sane_height() {
-        for owner in [DetailOwner::Network, DetailOwner::Power] {
+        for owner in [DetailOwner::Wifi, DetailOwner::Power] {
             for has_slider in [false, true] {
                 let l = Layout {
                     sliders: Sliders {
@@ -5548,9 +6042,16 @@ run it with --features reference-env, as the fedora CI job does"
                     profile_count: 0,
                     bt_device_count: 0,
                     monitor_count: 0,
+                    net: NetTiles {
+                        wired: false,
+                        wifi: true,
+                        vpn: false,
+                    },
+                    net_rows: [0, 3, 0],
                     show_bluetooth: false,
                     drag: None,
-                    grid_len: BASE_GRID.len(),
+                    // The three toggles plus the fixture's Wi-Fi tile.
+                    grid_len: BASE_GRID.len() + 1,
                     block_scale: 1.,
                 };
                 assert!(
@@ -5566,7 +6067,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// than powering off directly; its rows are the session actions, Log Out past a group break.
     #[test]
     fn power_button_opens_the_session_submenu() {
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         let before = qs.revision;
         let a = qs.pointer_click(center(sys_rect(SysButton::Power, false)));
         assert!(
@@ -5576,7 +6077,7 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(qs.expanded, Some(DetailOwner::Power));
         assert!(qs.revision > before);
 
-        let (_, title) = DetailOwner::Power.header(NetworkStatus::Unknown);
+        let (_, title) = DetailOwner::Power.header(&qs.net);
         assert_eq!(title, "Power Off");
         let rows = qs.detail_rows(DetailOwner::Power);
         assert_eq!(rows.len(), 4);
@@ -5609,7 +6110,7 @@ run it with --features reference-env, as the fedora CI job does"
                 return;
             }
         };
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         qs.pointer_click(center(sys_rect(SysButton::Power, false)));
         assert_eq!(qs.expanded, Some(DetailOwner::Power));
         for scale in [1.0, 2.0] {
@@ -5637,7 +6138,7 @@ run it with --features reference-env, as the fedora CI job does"
         let anims = synoik_config::Animations::default();
         let params = anims.quick_settings_detail_open_close.0;
         let dim_params = anims.quick_settings_dim.0;
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
             clock.set_unadjusted(std::time::Duration::from_millis(ms));
             qs.advance_expand(clock, params, dim_params);
@@ -5653,7 +6154,7 @@ run it with --features reference-env, as the fedora CI job does"
         // Adopt the (collapsed) starting state, then open.
         step(&mut qs, &mut clock, 0);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
         step(&mut qs, &mut clock, 0);
 
@@ -5668,7 +6169,7 @@ run it with --features reference-env, as the fedora CI job does"
             "the card is drawn the whole way out"
         );
         let (insert_y, block, card) = edges(&qs);
-        let settled_h = DETAIL_MARGIN + DetailOwner::Network.detail_height(0);
+        let settled_h = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3);
         assert!(
             block < settled_h,
             "the menu is still shorter than its settled height, {block} vs {settled_h}"
@@ -5711,7 +6212,7 @@ run it with --features reference-env, as the fedora CI job does"
 
         // Closing is the same slide backwards — the card stays drawn the whole way in.
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
         assert_eq!(qs.expanded, None, "the click closed it");
         step(&mut qs, &mut clock, 400);
@@ -5723,7 +6224,7 @@ run it with --features reference-env, as the fedora CI job does"
         );
         assert_eq!(
             qs.shown_detail(),
-            Some(DetailOwner::Network),
+            Some(DetailOwner::Wifi),
             "the card is still on screen while it slides back"
         );
         let (insert_y, block, card) = edges(&qs);
@@ -5748,13 +6249,27 @@ run it with --features reference-env, as the fedora CI job does"
         let anims = synoik_config::Animations::default();
         let params = anims.quick_settings_detail_open_close.0;
         let dim_params = anims.quick_settings_dim.0;
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
+        // Six networks, so the Wi-Fi card is a different height from the four-row Power card —
+        // the whole point of this test is the gap *between* two block heights.
+        qs.set_network_state(
+            crate::network_model::debug_state(
+                "wifi",
+                true,
+                true,
+                &(0..6)
+                    .map(|i| format!("net{i}:{}:wpa", 90 - i * 5))
+                    .collect::<Vec<_>>(),
+                &[],
+            )
+            .expect("a fake network state"),
+        );
         let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
             clock.set_unadjusted(std::time::Duration::from_millis(ms));
             qs.advance_expand(clock, params, dim_params);
         };
         let net_arrow = |qs: &QuickSettings| {
-            center(tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap())
+            center(tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap())
         };
         let block_of = |owner: DetailOwner, qs: &QuickSettings| {
             DETAIL_MARGIN + owner.detail_height(qs.layout().owner_device_count(owner))
@@ -5767,7 +6282,7 @@ run it with --features reference-env, as the fedora CI job does"
             step(&mut qs, &mut clock, ms);
         }
         assert!(qs.expand.settled());
-        let net_h = block_of(DetailOwner::Network, &qs);
+        let net_h = block_of(DetailOwner::Wifi, &qs);
 
         // Switch straight to Power. The old card goes at once, and the gap starts from the old
         // block measured against the new one — not from 0, and not snapped to the new height.
@@ -5804,7 +6319,7 @@ run it with --features reference-env, as the fedora CI job does"
         // And back, which is the same easing in the other direction: the gap has to be able to
         // start *above* the incoming block and come down to it.
         qs.pointer_click(net_arrow(&qs));
-        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        assert_eq!(qs.expanded, Some(DetailOwner::Wifi));
         step(&mut qs, &mut clock, 800);
         let (_, block) = qs
             .layout()
@@ -5862,7 +6377,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// leave (or double) a row of pixels at the menu's foot.
     #[test]
     fn the_grid_slices_tile_the_menu_exactly() {
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
 
         let collapsed = grid_slices(qs.layout(), 1.25);
         assert_eq!(collapsed.len(), 1, "nothing expanded: one whole slice");
@@ -5870,7 +6385,7 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(collapsed[0].src.size, qs.logical_size());
 
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
         let layout = qs.layout();
         let (split_y, block_h) = layout.detail_block().expect("expanded");
@@ -5913,11 +6428,11 @@ run it with --features reference-env, as the fedora CI job does"
     /// At most one detail view is open: opening a second closes the first (across owners).
     #[test]
     fn only_one_detail_view_is_open_at_a_time() {
-        let mut qs = qs(NetworkStatus::Wired, None);
+        let mut qs = qs(None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+            tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap(),
         ));
-        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        assert_eq!(qs.expanded, Some(DetailOwner::Wifi));
         // The power button is in the top row (never shifted), so it's still hittable; opening it
         // replaces the Network detail rather than stacking.
         qs.pointer_click(center(sys_rect(SysButton::Power, false)));
@@ -5940,9 +6455,16 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            net: NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            net_rows: [0, 3, 0],
             show_bluetooth: false,
             drag: None,
-            grid_len: BASE_GRID.len(),
+            // The three toggles plus the fixture's Wi-Fi tile.
+            grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
         let expanded = Layout {
@@ -5957,9 +6479,16 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            net: NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            net_rows: [0, 3, 0],
             show_bluetooth: false,
             drag: None,
-            grid_len: BASE_GRID.len(),
+            // The three toggles plus the fixture's Wi-Fi tile.
+            grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
         let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
@@ -6216,9 +6745,8 @@ run it with --features reference-env, as the fedora CI job does"
         powered: bool,
         devices: Vec<crate::system_status::BluetoothDevice>,
     ) -> QuickSettings {
-        QuickSettings::new(
+        test_qs(
             QuickToggles::default(),
-            NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
             bt_status(powered, devices),
@@ -6241,14 +6769,21 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn bluetooth_tile_inserts_at_slot_1_when_available() {
         // No soft switch → no tile (gnome-shell's `available`, bluetooth.js:103-108).
-        let hidden = qs(NetworkStatus::Wired, None);
+        let hidden = qs(None);
         assert!(!hidden.grid().contains(&GridTile::Bluetooth));
 
         let mut qs = qs_bluetooth(true, Vec::new());
         let tiles = qs.grid();
         assert_eq!(tiles.len(), 5);
-        assert_eq!(tiles[0], GridTile::Network);
-        assert_eq!(tiles[bluetooth_index()], GridTile::Bluetooth);
+        assert_eq!(tiles[0], GridTile::Wifi);
+        assert_eq!(
+            tiles[bluetooth_index(NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false
+            })],
+            GridTile::Bluetooth
+        );
         assert_eq!(tiles[2], GridTile::Toggle(Tile::DarkStyle));
 
         // With power + airplane too: PowerProfile lands at the shifted index, Airplane last.
@@ -6263,12 +6798,31 @@ run it with --features reference-env, as the fedora CI job does"
         });
         let tiles = qs.grid();
         assert_eq!(tiles.len(), 7);
-        assert_eq!(tiles[power_profile_index(true)], GridTile::PowerProfile);
+        assert_eq!(
+            tiles[power_profile_index(
+                NetTiles {
+                    wired: false,
+                    wifi: true,
+                    vpn: false
+                },
+                true
+            )],
+            GridTile::PowerProfile
+        );
         assert_eq!(tiles[6], GridTile::Airplane);
 
         // A hardware kill switch takes the tile away and collapses an open device list.
         qs.pointer_click(center(
-            tile_arrow_rect(bluetooth_index(), GridTile::Bluetooth, qs.layout()).unwrap(),
+            tile_arrow_rect(
+                bluetooth_index(NetTiles {
+                    wired: false,
+                    wifi: true,
+                    vpn: false,
+                }),
+                GridTile::Bluetooth,
+                qs.layout(),
+            )
+            .unwrap(),
         ));
         assert_eq!(qs.expanded, Some(DetailOwner::Bluetooth));
         assert!(qs.set_bluetooth_rfkill(BluetoothRfkill {
@@ -6290,10 +6844,14 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn bluetooth_body_toggles_with_a_predicted_acquiring_icon() {
         let mut qs = qs_bluetooth(true, Vec::new());
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         assert!(GridTile::Bluetooth.is_on(
             QuickToggles::default(),
-            NetworkStatus::Wired,
+            &qs.net,
             AirplaneStatus::default(),
             &PowerProfileStatus::default(),
             true,
@@ -6305,7 +6863,7 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(qs.bt_effective_state(), BtAdapterState::TurningOff);
         assert_eq!(
             GridTile::Bluetooth.icons(
-                NetworkStatus::Wired,
+                &qs.net,
                 &PowerProfileStatus::default(),
                 qs.bt_effective_state()
             )[0],
@@ -6342,7 +6900,11 @@ run it with --features reference-env, as the fedora CI job does"
                 bt_device("Alpha", false),
             ],
         );
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         let arrow = tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).expect("an arrow");
         assert!(matches!(
             qs.pointer_click(center(arrow)),
@@ -6392,7 +6954,11 @@ run it with --features reference-env, as the fedora CI job does"
             true,
             vec![bt_device("Buds", true), bt_device("Mouse", false)],
         );
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         let arrow = tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap();
         qs.pointer_click(center(arrow));
 
@@ -6471,7 +7037,11 @@ run it with --features reference-env, as the fedora CI job does"
     fn bluetooth_placeholder_shows_without_devices() {
         // Powered, no devices.
         let mut qs = qs_bluetooth(true, Vec::new());
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         qs.pointer_click(center(
             tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
         ));
@@ -6509,12 +7079,16 @@ run it with --features reference-env, as the fedora CI job does"
         let mut qs = qs_bluetooth(true, vec![bt_device("Buds", true)]);
         assert_eq!(
             GridTile::Bluetooth
-                .subtitle(&PowerProfileStatus::default(), &qs.bluetooth)
+                .subtitle(&PowerProfileStatus::default(), &qs.bluetooth, &qs.net)
                 .as_deref(),
             Some("Buds")
         );
 
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         qs.pointer_click(center(
             tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
         ));
@@ -6563,7 +7137,11 @@ run it with --features reference-env, as the fedora CI job does"
 
         // One connected device, detail open.
         let mut with_device = qs_bluetooth(true, vec![bt_device("Buds", true)]);
-        let i = bluetooth_index();
+        let i = bluetooth_index(NetTiles {
+            wired: false,
+            wifi: true,
+            vpn: false,
+        });
         with_device.pointer_click(center(
             tile_arrow_rect(i, GridTile::Bluetooth, with_device.layout()).unwrap(),
         ));
@@ -6665,7 +7243,14 @@ run it with --features reference-env, as the fedora CI job does"
             ],
             show: true,
         });
-        let ppi = power_profile_index(true);
+        let ppi = power_profile_index(
+            NetTiles {
+                wired: false,
+                wifi: true,
+                vpn: false,
+            },
+            true,
+        );
         assert_eq!(qs.grid()[ppi], GridTile::PowerProfile);
 
         qs.pointer_click(center(

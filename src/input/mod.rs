@@ -62,6 +62,7 @@ use crate::input_method::ShellEntry;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
+use crate::network_model::NetworkWrite;
 use crate::status_notifier::{ScrollOrientation, SynoikToStatusNotifier};
 use crate::synoik::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
@@ -2674,6 +2675,45 @@ impl State {
                     })
                     .unwrap();
             }
+            // The network tiles' writes. Each is recorded on the compositor as well as sent: a
+            // fire-and-forget D-Bus call has no reply to observe, and a headless test has no bus
+            // at all, so what a click *asked for* is the only thing either can assert on.
+            PopoverAction::SetWirelessEnabled(enabled) => {
+                self.record_network_write(NetworkWrite::SetWirelessEnabled(enabled));
+                if let Some(conn) = self.system_status_conn() {
+                    crate::dbus::network_manager::set_wireless_enabled(&conn, enabled);
+                }
+            }
+            PopoverAction::ActivateNetworkProfile { profile, device } => {
+                self.record_network_write(NetworkWrite::Activate {
+                    profile: profile.clone(),
+                    device: device.clone(),
+                });
+                if let Some(conn) = self.system_status_conn() {
+                    crate::dbus::network_manager::activate_connection(&conn, profile, device);
+                }
+            }
+            PopoverAction::DeactivateNetworkProfile(profile) => {
+                self.record_network_write(NetworkWrite::Deactivate(profile.clone()));
+                if let Some(conn) = self.system_status_conn() {
+                    crate::dbus::network_manager::deactivate_profile(&conn, profile);
+                }
+            }
+            PopoverAction::JoinWirelessNetwork { device, ap } => {
+                self.record_network_write(NetworkWrite::AddAndActivate {
+                    device: device.clone(),
+                    ap: ap.clone(),
+                });
+                if let Some(conn) = self.system_status_conn() {
+                    crate::dbus::network_manager::add_and_activate(&conn, device, ap);
+                }
+            }
+            PopoverAction::RequestWifiScan(device) => {
+                self.record_network_write(NetworkWrite::RequestScan(device.clone()));
+                if let Some(conn) = self.system_status_conn() {
+                    crate::dbus::network_manager::request_scan(&conn, device);
+                }
+            }
             // A Bluetooth device row: `Device1.Connect`/`Disconnect` on the system connection,
             // reporting completion back through the system-status channel to clear the busy mark.
             PopoverAction::ConnectBluetoothDevice { path, connect } => {
@@ -3938,9 +3978,9 @@ impl State {
                     None => warn!("network override cleared; NetworkManager owns the model again"),
                 }
                 let status = self.panel_system_status();
-                if self.synoik.panel.set_system_status(status) {
-                    self.synoik.queue_redraw_all();
-                }
+                self.synoik.panel.set_system_status(status);
+                let net = self.network_state().clone();
+                self.synoik.panel_popover.set_network_state(net);
                 self.synoik.queue_redraw_all();
             }
             Action::DebugSetRenderTimeMargin(millis) => {

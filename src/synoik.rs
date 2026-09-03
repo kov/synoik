@@ -2689,7 +2689,6 @@ impl State {
         let output_w = output_size(&output).w;
         let toggles = self.synoik.gnome_settings.quick_toggles;
         let anchor = self.synoik.panel.quick_settings_rect(output_w);
-        let network = self.synoik.system_status.network;
         let airplane = self.synoik.system_status.airplane;
         let power = self.synoik.system_status.power.clone();
         let bluetooth = self.synoik.system_status.bluetooth.clone();
@@ -2703,11 +2702,12 @@ impl State {
         let source_list = self.synoik.source_list.clone();
         let brightness = self.synoik.brightness.view();
         let accent = self.synoik.gnome_settings.accent_color;
+        let net = self.network_state().clone();
         self.synoik.panel_popover.toggle_quick_settings(
             output,
             anchor,
             toggles,
-            network,
+            net,
             airplane,
             power,
             bluetooth,
@@ -6916,6 +6916,14 @@ impl State {
             SystemStatusToSynoik::Network(network) => self.synoik.system_status.network = network,
             SystemStatusToSynoik::NetworkModel(state) => {
                 self.synoik.system_status.network_state = *state;
+                // An open menu tracks the model: tiles appear and vanish with their devices.
+                if self
+                    .synoik
+                    .panel_popover
+                    .set_network_state(self.network_state().clone())
+                {
+                    self.synoik.queue_redraw_all();
+                }
             }
             SystemStatusToSynoik::PowerProfiles(power) => {
                 // gnome-shell's `_sync`: whenever the (echoed) active profile is a known,
@@ -6965,9 +6973,30 @@ impl State {
             .synoik
             .panel_popover
             .set_bluetooth(self.synoik.system_status.bluetooth.clone());
+        redraw |= self
+            .synoik
+            .panel_popover
+            .set_network_state(self.network_state().clone());
         if redraw {
             self.synoik.queue_redraw_all();
         }
+    }
+
+    /// Record a network write the quick settings asked for, and keep the tail bounded.
+    pub fn record_network_write(&mut self, write: crate::network_model::NetworkWrite) {
+        self.synoik.network_writes.push(write);
+        if self.synoik.network_writes.len() > 16 {
+            self.synoik.network_writes.remove(0);
+        }
+    }
+
+    /// The shared system-bus connection the status watchers run on, when there is one. Headless
+    /// runs have none, which is why every write through it is optional.
+    pub fn system_status_conn(&self) -> Option<zbus::blocking::Connection> {
+        self.synoik
+            .dbus
+            .as_ref()
+            .and_then(|d| d.conn_system_status.clone())
     }
 
     /// The network model the tiles should read: the live snapshot, or a `debug-set-network`

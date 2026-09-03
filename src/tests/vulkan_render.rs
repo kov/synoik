@@ -3735,7 +3735,6 @@ fn vulkan_renders_the_quick_settings_popover() {
         let output_w = output_size(&output).w;
         let toggles = f.synoik().gnome_settings.quick_toggles;
         let anchor = f.synoik().panel.quick_settings_rect(output_w);
-        let network = f.synoik().system_status.network;
         let airplane = f.synoik().system_status.airplane;
         let power = f.synoik().system_status.power.clone();
         let bluetooth = f.synoik().system_status.bluetooth.clone();
@@ -3750,7 +3749,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             output.clone(),
             anchor,
             toggles,
-            network,
+            crate::network_model::NetworkState::default(),
             airplane,
             power,
             bluetooth,
@@ -10339,7 +10338,6 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let output_w = output_size(output).w;
     let toggles = f.synoik().gnome_settings.quick_toggles;
     let anchor = f.synoik().panel.quick_settings_rect(output_w);
-    let network = f.synoik().system_status.network;
     let airplane = f.synoik().system_status.airplane;
     let power = f.synoik().system_status.power.clone();
     let bluetooth = f.synoik().system_status.bluetooth.clone();
@@ -10355,7 +10353,7 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
         output.clone(),
         anchor,
         toggles,
-        network,
+        crate::network_model::NetworkState::default(),
         airplane,
         power,
         bluetooth,

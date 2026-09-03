@@ -429,6 +429,12 @@ pub struct WirelessDevice {
 }
 
 impl WirelessDevice {
+    /// The beacon the device is associated with, if any.
+    pub fn active_ap(&self) -> Option<&AccessPoint> {
+        let path = self.active_access_point.as_deref()?;
+        self.access_points.iter().find(|ap| ap.path == path)
+    }
+
     /// Group this device's beacons into rows, sorted as the menu shows them.
     pub fn networks(&self, saved: &[SavedConnection]) -> Vec<WirelessNetwork> {
         // Keyed by exactly what `checkAccessPoint` compares: SSID bytes, mode, security type. A
@@ -682,12 +688,122 @@ impl NetworkState {
     /// Whether the tile for a device type is in the grid at all: GNOME shows a device toggle only
     /// while it has a device to talk about (`NMToggle._sync`, `network.js:1531-1538`).
     pub fn shows_tile(&self, kind: u32) -> bool {
-        self.running && !self.devices_of(kind).is_empty()
+        self.running && self.networking_enabled && !self.devices_of(kind).is_empty()
     }
 
     /// The VPN tile appears when there is a profile to show, device or not.
     pub fn shows_vpn_tile(&self) -> bool {
-        self.running && !self.vpn.is_empty()
+        self.running && self.networking_enabled && !self.vpn.is_empty()
+    }
+
+    /// The device a tile speaks for: the active one, else the first shown
+    /// (`_getPrimaryItem`, `network.js:1507-1531`, minus the MRU rung — we keep no use
+    /// timestamps, so an idle machine with two radios picks the lower device path instead of the
+    /// last one touched).
+    pub fn primary_device(&self, kind: u32) -> Option<&NetworkDevice> {
+        let shown = self.devices_of(kind);
+        shown
+            .iter()
+            .find(|d| d.active_connection.is_some())
+            .or(shown.first())
+            .copied()
+    }
+
+    /// The VPN profile the tile speaks for: the active one, else the first.
+    pub fn primary_vpn(&self) -> Option<&VpnConnection> {
+        self.vpn.iter().find(|v| v.is_active()).or(self.vpn.first())
+    }
+
+    /// Whether a device's traffic is reaching the internet (`_canReachInternet`,
+    /// `network.js:1292-1297`).
+    ///
+    /// **Simplification.** Upstream only downgrades the *primary* connection's icon; we downgrade
+    /// any active device's while connectivity is short of FULL, because we do not track which
+    /// active connection NM made primary. On a machine with one route they are the same device.
+    fn can_reach_internet(&self) -> bool {
+        self.connectivity == 4
+    }
+
+    /// The Wired tile's icon (`NMWiredDeviceItem.icon_name`, `network.js:613-624`).
+    pub fn wired_icon(&self) -> &'static str {
+        match self
+            .primary_device(device_type::ETHERNET)
+            .map(|d| d.active_state)
+        {
+            Some(active_state::ACTIVATING) => "network-wired-acquiring-symbolic",
+            Some(active_state::ACTIVATED) if self.can_reach_internet() => "network-wired-symbolic",
+            Some(active_state::ACTIVATED) => "network-wired-no-route-symbolic",
+            _ => "network-wired-disconnected-symbolic",
+        }
+    }
+
+    /// The Wi-Fi tile's icon (`NMWirelessDeviceItem.icon_name`, `network.js:1131-1159`).
+    pub fn wifi_icon(&self) -> String {
+        if !self.wireless_enabled {
+            return "network-wireless-disabled-symbolic".to_string();
+        }
+        let Some(device) = self.primary_device(device_type::WIFI) else {
+            return "network-wireless-signal-none-symbolic".to_string();
+        };
+        match device.active_state {
+            active_state::ACTIVATING | active_state::DEACTIVATING => {
+                "network-wireless-acquiring-symbolic".to_string()
+            }
+            active_state::ACTIVATED => {
+                let wireless = device.wireless.as_ref();
+                if wireless.is_some_and(|w| w.hotspot) {
+                    return "network-wireless-hotspot-symbolic".to_string();
+                }
+                if !self.can_reach_internet() {
+                    return "network-wireless-no-route-symbolic".to_string();
+                }
+                match wireless.and_then(|w| w.active_ap()) {
+                    Some(ap) => format!(
+                        "network-wireless-signal-{}-symbolic",
+                        signal_to_icon(ap.strength)
+                    ),
+                    None => "network-wireless-offline-symbolic".to_string(),
+                }
+            }
+            _ => "network-wireless-signal-none-symbolic".to_string(),
+        }
+    }
+
+    /// The Wi-Fi tile's subtitle: the network the device is on (`get name`,
+    /// `network.js:1172-1189`) — the active SSID, else the active profile's name, else nothing
+    /// (upstream falls back to the device name, which the tile title already carries, and
+    /// `_transformSubtitle` then nulls it).
+    pub fn wifi_subtitle(&self) -> Option<String> {
+        let device = self.primary_device(device_type::WIFI)?;
+        let wireless = device.wireless.as_ref()?;
+        if wireless.hotspot {
+            return Some(format!("{} Hotspot", device.interface));
+        }
+        if let Some(ap) = wireless.active_ap() {
+            return Some(ssid_to_label(&ap.ssid));
+        }
+        let profile = device.active_connection.as_deref()?;
+        self.saved
+            .iter()
+            .find(|c| c.path == profile)
+            .map(|c| c.id.clone())
+    }
+
+    /// The tile title for a device type — the disambiguated name of the device it speaks for.
+    pub fn tile_title(&self, kind: u32) -> String {
+        let shown = self.devices_of(kind);
+        let owned: Vec<NetworkDevice> = shown.iter().map(|d| (*d).clone()).collect();
+        let names = disambiguate_names(&owned);
+        let primary = self.primary_device(kind);
+        shown
+            .iter()
+            .position(|d| Some(d.path.as_str()) == primary.map(|p| p.path.as_str()))
+            .and_then(|i| names.get(i).cloned())
+            .unwrap_or_else(|| match kind {
+                device_type::WIFI => "Wi-Fi".to_string(),
+                device_type::ETHERNET => "Wired".to_string(),
+                _ => "Network".to_string(),
+            })
     }
 }
 
