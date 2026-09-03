@@ -14853,3 +14853,82 @@ fn install_wallpaper(f: &mut Fixture, picture: std::path::PathBuf) {
         .with_vulkan_renderer(|r| r.gpu().clone());
     f.synoik().wallpaper.update(&settings, gpu.as_ref());
 }
+
+/// The Wi-Fi network list draws, and a secured network draws its padlock.
+///
+/// Every network card had only ever been *modelled* — the render tests all opened the popover with
+/// an empty `NetworkState`, so no network tile existed and no card could open. This rasterises the
+/// list, and pins the one draw the port added to `ItemRow`: the half-size `.wireless-secure-icon`
+/// badge after the signal icon (`_quick-settings.scss:219-221`).
+///
+/// Differential, varying **only** the security of the beacons: same SSIDs, same strengths, same
+/// row count, so the extra ink can only be the padlocks.
+#[test]
+fn vulkan_draws_the_wifi_list_and_its_padlocks() {
+    let ink_for = |secure: bool| -> Option<usize> {
+        let mut f = window_fixture(GREEN)?;
+        let output = f.synoik_output(1);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        open_quick_settings(&mut f, &output);
+        let kind = if secure { "wpa" } else { "open" };
+        let networks: Vec<String> = ["alpha:80", "bravo:60", "charlie:40"]
+            .iter()
+            .map(|n| format!("{n}:{kind}"))
+            .collect();
+        f.synoik().panel_popover.set_network_state(
+            crate::network_model::debug_state("wifi", true, true, &networks, &[])
+                .expect("a fake network state"),
+        );
+        assert!(
+            f.synoik()
+                .panel_popover
+                .grid_labels()
+                .iter()
+                .any(|l| l == "Wifi"),
+            "the fake must put a Wi-Fi tile in the grid, or there is no card to open"
+        );
+        f.synoik().panel_popover.open_wifi_card_for_test();
+        f.settle_animations();
+        assert_eq!(
+            f.synoik().panel_popover.expanded_label().as_deref(),
+            Some("Wifi")
+        );
+
+        let state = f.synoik_state();
+        state.backend.headless().with_vulkan_renderer(|vk| {
+            let elems = state.synoik.panel_popover.render(
+                vk,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
+                &output,
+            );
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 500.);
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
+            // The card is a dark plate; its labels and icons are near-white. Count the light
+            // pixels, which is glyph and icon ink and nothing else.
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 255 && p[0] > 150 && p[1] > 150 && p[2] > 150)
+                .count()
+        })
+    };
+
+    let Some(secure) = ink_for(true) else {
+        return;
+    };
+    let open = ink_for(false).expect("the renderer was there a moment ago");
+    assert!(
+        open > 0,
+        "the open-network list drew no ink at all, so this test sees nothing"
+    );
+    assert!(
+        secure > open,
+        "three secured networks must draw three padlocks the open ones do not: \
+         {secure} ink px secured vs {open} open"
+    );
+}

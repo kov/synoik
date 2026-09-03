@@ -1288,6 +1288,14 @@ impl PanelPopover {
         }
     }
 
+    /// Open the Wi-Fi network list on an open quick-settings popover. Test-only, as above.
+    #[cfg(test)]
+    pub fn open_wifi_card_for_test(&mut self) {
+        if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
+            qs.open_wifi_card_for_test();
+        }
+    }
+
     /// Push a fresh brightness snapshot to an open quick-settings popover, so the brightness
     /// slider tracks the hardware and appears/disappears with the backlight. Returns whether it
     /// changed.

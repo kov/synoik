@@ -3000,6 +3000,13 @@ impl QuickSettings {
         self.revision += 1;
     }
 
+    /// Open the Wi-Fi network list. Test-only, same reason as above.
+    #[cfg(test)]
+    pub fn open_wifi_card_for_test(&mut self) {
+        self.expanded = Some(DetailOwner::Wifi);
+        self.revision += 1;
+    }
+
     /// Adopt a fresh brightness snapshot (from the compositor's `BrightnessManager`). Returns
     /// whether it changed.
     ///
