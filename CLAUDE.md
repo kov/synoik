@@ -44,7 +44,7 @@ way" vs. a capability worth keeping, ask.
   (only the test harness). After code changes, always `cargo build --bin synoik` and restart the
   session, or the running compositor keeps running stale code.
 - Reference checkouts (read-only, not this repo): `~/Projects/gnome-shell` and
-  `~/Projects/mutter` (both 50.3) — ground behavior there; never copy GObject. Ports and docs
+  `~/Projects/mutter` (both 50.3), plus `~/Projects/NetworkManager` (1.56.1) for libnm semantics — ground behavior there; never copy GObject. Ports and docs
   written before 2026-07-31 cite **50.1** line numbers; when one no longer matches, re-grep rather
   than assume drift is a divergence (`git show 50.1:<file>` gets the cited revision back).
 - **Reference-first, not memory.** Before porting or changing any GNOME behavior/layout, read the
