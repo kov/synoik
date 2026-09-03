@@ -2516,6 +2516,19 @@ impl QuickSettings {
     /// The focused control, named for a conformance test. Its `Debug` form is the assertion —
     /// `Tile(Network)`, `SliderTrack(Output)` — so a test names the control, never a rect.
     #[cfg(test)]
+    /// The open detail card's owner, if any. Test-only.
+    #[cfg(test)]
+    pub fn expanded_label(&self) -> Option<String> {
+        self.expanded.map(|o| format!("{o:?}"))
+    }
+
+    /// The grid's tiles, in order, named. Test-only — how the corpus asserts which tiles a given
+    /// network model puts on screen without arithmetic over the box model.
+    #[cfg(test)]
+    pub fn grid_labels(&self) -> Vec<String> {
+        self.grid().iter().map(|t| format!("{t:?}")).collect()
+    }
+
     pub fn focused_for_test(&self) -> Option<String> {
         let stops = self.stops();
         self.live_focus(&stops).map(|s| format!("{s:?}"))

@@ -1243,6 +1243,24 @@ impl PanelPopover {
         }
     }
 
+    /// The quick-settings open detail card's owner, if any. Test-only.
+    #[cfg(test)]
+    pub fn expanded_label(&self) -> Option<String> {
+        match self.content.as_ref()? {
+            PopoverContent::QuickSettings(qs) => qs.expanded_label(),
+            _ => None,
+        }
+    }
+
+    /// The quick-settings grid's tiles, in order. Test-only; empty for any other menu.
+    #[cfg(test)]
+    pub fn grid_labels(&self) -> Vec<String> {
+        match self.content.as_ref() {
+            Some(PopoverContent::QuickSettings(qs)) => qs.grid_labels(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The label of the keyboard-focused row of whatever menu is up, if it has one. Test-only —
     /// how the corpus names the focus without arithmetic over each menu's box model.
     #[cfg(test)]

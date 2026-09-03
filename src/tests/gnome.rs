@@ -38247,3 +38247,163 @@ fn a_strip_drop_onto_an_offscreen_workspace_still_arrives() {
          view, dropped at {frac_x},{frac_y} of the thumbnail",
     );
 }
+
+/// The network tiles are not one "Network" tile: GNOME pushes a toggle per device type and shows
+/// each only while it has something to speak for (`network.js:2090-2103`).
+///
+/// This VM has no wireless hardware and the harness has no NetworkManager at all, so the whole
+/// list is driven through `debug-set-network` — the same model the bus fills in, which is the
+/// point: the beacons the fake invents carry real flag bits, so the rows here are grouped, sorted
+/// and capped by the port rather than by the fixture.
+#[test]
+fn the_network_tiles_come_and_go_with_their_devices() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let set = |f: &mut Fixture, devices: &str, networks: &[&str], vpns: &[&str]| {
+        f.synoik_state().do_action(
+            Action::DebugSetNetwork(
+                devices.to_owned(),
+                true,
+                true,
+                networks.iter().map(|s| (*s).to_owned()).collect(),
+                vpns.iter().map(|s| (*s).to_owned()).collect(),
+            ),
+            false,
+        );
+    };
+    let open = |f: &mut Fixture| {
+        let x = qs_center_x(f, 1920.);
+        pointer_motion_to(f, x, 10.);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    // No network at all: the grid is the gsettings toggles and nothing else.
+    set(&mut f, "none", &[], &[]);
+    open(&mut f);
+    let tiles = f.synoik().panel_popover.grid_labels();
+    assert!(
+        !tiles
+            .iter()
+            .any(|t| t.contains("Wifi") || t.contains("Wired") || t.contains("Vpn")),
+        "no devices, no network tiles: {tiles:?}"
+    );
+
+    // A wired device and a saved VPN each bring their own tile, and the network group leads the
+    // grid in NM's own order — wired before vpn.
+    set(&mut f, "wired", &[], &["work"]);
+    let tiles = f.synoik().panel_popover.grid_labels();
+    assert_eq!(
+        tiles[0], "Wired",
+        "the network group leads the grid: {tiles:?}"
+    );
+    assert_eq!(
+        tiles[1], "Vpn",
+        "wired before vpn, as Indicator pushes them"
+    );
+    assert!(!tiles.iter().any(|t| t == "Wifi"));
+
+    // A radio that is switched off keeps its tile — the Wi-Fi toggle has to survive its own off
+    // switch (`NMWirelessToggle._shouldShowDevice`) — where a wired device in the same state
+    // would not.
+    set(&mut f, "wifi-off", &[], &[]);
+    let tiles = f.synoik().panel_popover.grid_labels();
+    assert!(
+        tiles.contains(&"Wifi".to_string()),
+        "an UNAVAILABLE radio keeps its tile: {tiles:?}"
+    );
+}
+
+/// What the Wi-Fi tile's two halves ask NetworkManager for. The writes are fire-and-forget D-Bus
+/// calls with no reply, and the harness has no bus at all, so the compositor's record of what a
+/// click *asked for* is the observable.
+#[test]
+fn the_wifi_tile_flips_the_radio_and_opening_its_list_scans() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let set = |f: &mut Fixture, hw: bool| {
+        f.synoik_state().do_action(
+            Action::DebugSetNetwork(
+                "wifi".to_owned(),
+                true,
+                hw,
+                vec![
+                    "home:80:wpa:known:active".to_owned(),
+                    "cafe:40:open".to_owned(),
+                ],
+                Vec::new(),
+            ),
+            false,
+        );
+    };
+    let focus_tile = |f: &mut Fixture, want: &str| {
+        // Super+S opens the menu focused in the system row; Down enters the grid, and the arrows
+        // walk it. The network group leads, so the tile is a few steps away at most.
+        for _ in 0..12 {
+            if f.synoik().panel_popover.focused_row_label().as_deref() == Some(want) {
+                return true;
+            }
+            f.key_press(KEY_RIGHT);
+            f.key_release(KEY_RIGHT);
+        }
+        false
+    };
+
+    set(&mut f, true);
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_S);
+    f.key_release(KEY_S);
+    f.key_release(KEY_LEFTMETA);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert!(
+        focus_tile(&mut f, "Tile(Wifi)"),
+        "the Wi-Fi tile is reachable from the grid"
+    );
+
+    // The body asks for the radio to go off; nothing flips locally, because NM's echo is what
+    // moves the tile.
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert_eq!(
+        f.synoik().network_writes.last(),
+        Some(&crate::network_model::NetworkWrite::SetWirelessEnabled(
+            false
+        )),
+        "the tile body flips WirelessEnabled"
+    );
+
+    // With the hardware switch off the same click asks for nothing at all.
+    let before = f.synoik().network_writes.len();
+    set(&mut f, false);
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert_eq!(
+        f.synoik().network_writes.len(),
+        before,
+        "a hardware-killed radio's tile is inert"
+    );
+
+    // The arrow half opens the network list, and opening it asks the device to scan.
+    set(&mut f, true);
+    assert!(
+        focus_tile(&mut f, "TileArrow(Wifi)"),
+        "the Wi-Fi tile's arrow is its own focus stop"
+    );
+    f.key_press(KEY_ENTER);
+    f.key_release(KEY_ENTER);
+    assert!(
+        matches!(
+            f.synoik().network_writes.last(),
+            Some(crate::network_model::NetworkWrite::RequestScan(_))
+        ),
+        "opening the list asks for a fresh scan, got {:?}",
+        f.synoik().network_writes.last()
+    );
+
+    // Row activation is covered at the unit level (`detail_row_runs_its_action`): walking into
+    // the card from a tile's arrow does not work once the open animation has finished, which is a
+    // navigation gap of its own and not this test's subject.
+}
