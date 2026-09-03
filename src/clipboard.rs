@@ -189,6 +189,13 @@ impl State {
         let edit = match entry {
             ShellEntry::Shield => self.synoik.unlock_dialog.entry(),
             ShellEntry::Polkit => self.synoik.polkit_dialog.entry(),
+            // Only the focused field can hold a selection, and only when one is focused at all.
+            ShellEntry::NetworkSecret => match self.synoik.network_secret_dialog.focus() {
+                crate::network_secret_dialog::Focus::Field(index) => {
+                    self.synoik.network_secret_dialog.entry(index)?
+                }
+                _ => return None,
+            },
             ShellEntry::RunDialog => self.synoik.run_dialog.edit(),
             ShellEntry::FolderRename => self.synoik.folder_dialog.rename_edit()?,
             ShellEntry::OverviewSearch => self.synoik.overview_search.edit(),

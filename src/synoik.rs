@@ -1067,6 +1067,17 @@ pub struct Synoik {
     pub dock: crate::ui::dock::Dock,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
     pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
+    /// The NetworkManager secret dialog: what it is asking, and how it is drawn.
+    pub network_secret_dialog: crate::network_secret_dialog::NetworkSecretDialog,
+    pub network_secret_ui: crate::ui::network_secret_dialog::NetworkSecretDialogUi,
+    /// Answers go back to [`crate::dbus::network_agent`] over this.
+    pub network_secret_requests:
+        Option<async_channel::Sender<crate::dbus::network_agent::NetworkAgentRequest>>,
+    /// A request that arrived while the screen was covered, held until it is not — the same
+    /// deferral the polkit dialog makes, and for the same reason: a password box must not be drawn
+    /// over a shield. NetworkManager's own 120 s agent timeout bounds the wait and arrives as a
+    /// `CancelGetSecrets`, so a request held past it is withdrawn rather than stranded.
+    pub network_secret_deferred: Option<Box<crate::dbus::network_agent::SecretRequest>>,
     /// The agent's side of the conversation.
     pub polkit_requests: Option<async_channel::Sender<crate::dbus::polkit_agent::PolkitRequest>>,
     /// A request that arrived while the screen was locked.
@@ -1617,6 +1628,8 @@ pub enum KeyboardFocus {
     EndSessionDialog,
     /// The polkit authentication dialog, which is modal like the three above it.
     PolkitDialog,
+    /// The NetworkManager secret dialog, modal in the same way.
+    NetworkSecretDialog,
     Popover,
     Overview,
     /// The Alt-Tab / Super-Tab switcher holds a modal grab while it is up.
@@ -1784,6 +1797,7 @@ impl KeyboardFocus {
             KeyboardFocus::RunDialog => "RunDialog",
             KeyboardFocus::EndSessionDialog => "EndSessionDialog",
             KeyboardFocus::PolkitDialog => "PolkitDialog",
+            KeyboardFocus::NetworkSecretDialog => "NetworkSecretDialog",
             KeyboardFocus::Popover => "Popover",
             KeyboardFocus::Overview => "Overview",
             KeyboardFocus::Switcher => "Switcher",
@@ -1813,6 +1827,7 @@ impl KeyboardFocus {
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::PolkitDialog => None,
+            KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Switcher => None,
@@ -1829,6 +1844,7 @@ impl KeyboardFocus {
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::PolkitDialog => None,
+            KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Switcher => None,
@@ -2311,6 +2327,9 @@ impl State {
         // gets covered — our own shield and an `ext-session-lock` client — and only one of them
         // has an event we own. A held request that nobody resumes is polkitd waiting forever on a
         // dialog that will never be drawn.
+        if self.synoik.network_secret_deferred.is_some() && !self.synoik.screen_is_covered() {
+            self.resume_deferred_network_secret();
+        }
         if self.synoik.polkit_deferred.is_some() && !self.synoik.screen_is_covered() {
             self.resume_deferred_polkit();
         }
@@ -3431,6 +3450,8 @@ impl State {
             }
         } else if self.synoik.polkit_is_open() {
             KeyboardFocus::PolkitDialog
+        } else if self.synoik.network_secret_is_open() {
+            KeyboardFocus::NetworkSecretDialog
         } else if self.synoik.screenshot_ui.is_open() {
             KeyboardFocus::ScreenshotUi
         } else if self.synoik.switcher.is_open() {
@@ -6182,6 +6203,83 @@ impl State {
             .ok();
     }
 
+    /// A message from the NetworkManager secret agent — see [`crate::dbus::network_agent`].
+    pub fn on_network_agent_msg(&mut self, msg: crate::dbus::network_agent::NetworkAgentToSynoik) {
+        use crate::dbus::network_agent::NetworkAgentToSynoik;
+
+        match msg {
+            NetworkAgentToSynoik::Begin(request) => {
+                // A password box must not be drawn over the shield, so it waits — the same rule
+                // the polkit dialog follows. NetworkManager's own 120 s agent timeout bounds the
+                // wait: a request still held when it expires arrives back as a Cancel and is
+                // withdrawn, so nothing is stranded.
+                if self.synoik.screen_is_covered() {
+                    debug!(
+                        "network agent: holding {} until the screen unlocks",
+                        request.request_id
+                    );
+                    self.synoik.network_secret_deferred = Some(request);
+                    return;
+                }
+                let now = self.synoik.clock.now_unadjusted();
+                let effects = self.synoik.network_secret_dialog.begin(*request, now);
+                self.apply_network_secret_effects(effects);
+            }
+            NetworkAgentToSynoik::Cancel { request_id } => {
+                // The withdrawal may be for the request we are still holding rather than the one
+                // on screen; both have to be checked, or a deferred request would be resumed after
+                // NetworkManager had already given up on it.
+                if self
+                    .synoik
+                    .network_secret_deferred
+                    .as_ref()
+                    .is_some_and(|r| r.request_id == request_id)
+                {
+                    self.synoik.network_secret_deferred = None;
+                    return;
+                }
+                let effects = self.synoik.network_secret_dialog.withdraw(&request_id);
+                self.apply_network_secret_effects(effects);
+            }
+        }
+    }
+
+    /// The screen has unlocked: put up whatever the network agent asked for while it was down.
+    pub fn resume_deferred_network_secret(&mut self) {
+        let Some(request) = self.synoik.network_secret_deferred.take() else {
+            return;
+        };
+        self.on_network_agent_msg(crate::dbus::network_agent::NetworkAgentToSynoik::Begin(
+            request,
+        ));
+    }
+
+    /// Carry out what driving the network secret dialog asked for.
+    pub fn apply_network_secret_effects(
+        &mut self,
+        effects: crate::network_secret_dialog::SecretEffects,
+    ) {
+        if let Some(request) = effects.request {
+            if let Some(tx) = self.synoik.network_secret_requests.as_ref() {
+                let _ = tx.send_blocking(request);
+            } else {
+                warn!("network agent: no agent to send to; the dialog is talking to nothing");
+            }
+        }
+
+        if self.synoik.network_secret_dialog.is_open() {
+            self.synoik.network_secret_ui.show();
+        } else {
+            self.synoik.network_secret_ui.hide();
+        }
+
+        if effects.close || effects.redraw {
+            self.synoik.queue_redraw_all();
+        }
+        // Opening and closing a modal both change where the keyboard goes.
+        self.update_keyboard_focus();
+    }
+
     /// A message from the polkit agent — see [`crate::dbus::polkit_agent`].
     pub fn on_polkit_msg(&mut self, msg: crate::dbus::polkit_agent::PolkitToSynoik) {
         use crate::dbus::polkit_agent::PolkitToSynoik;
@@ -7784,6 +7882,10 @@ impl Synoik {
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
         let polkit_ui =
             crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
+        let network_secret_ui = crate::ui::network_secret_dialog::NetworkSecretDialogUi::new(
+            animation_clock.clone(),
+            config.clone(),
+        );
         let panel_popover = PanelPopover::new(animation_clock.clone(), config.clone());
         let panel = Panel::new(animation_clock.clone(), config.clone());
 
@@ -8168,6 +8270,10 @@ impl Synoik {
             polkit_ui,
             polkit_requests: None,
             polkit_deferred: None,
+            network_secret_dialog: crate::network_secret_dialog::NetworkSecretDialog::new(),
+            network_secret_ui,
+            network_secret_requests: None,
+            network_secret_deferred: None,
             polkit_reset_timer: None,
             panel,
             panel_popover,
@@ -9418,6 +9524,7 @@ impl Synoik {
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
             || self.polkit_is_open()
+            || self.network_secret_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
         {
@@ -9503,6 +9610,7 @@ impl Synoik {
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
             || self.polkit_is_open()
+            || self.network_secret_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             // Faded out under the search results: gnome-shell drops the strip's
@@ -9544,6 +9652,14 @@ impl Synoik {
         }
     }
 
+    /// Whether the network secret dialog is on screen. Always false without `dbus`, where there is
+    /// no agent to raise one.
+    pub fn network_secret_is_open(&self) -> bool {
+        {
+            self.network_secret_ui.is_open()
+        }
+    }
+
     /// The cursor may be inside the window's activation region, but not within the window's input
     /// region.
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
@@ -9551,6 +9667,7 @@ impl Synoik {
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
             || self.polkit_is_open()
+            || self.network_secret_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             // The window picker is faded out under the search results, so its
@@ -9617,6 +9734,7 @@ impl Synoik {
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
             || self.polkit_is_open()
+            || self.network_secret_is_open()
         {
             return rv;
         } else if self.is_locked() {
@@ -10548,6 +10666,7 @@ impl Synoik {
             KeyboardFocus::RunDialog => true,
             KeyboardFocus::EndSessionDialog => true,
             KeyboardFocus::PolkitDialog => true,
+            KeyboardFocus::NetworkSecretDialog => true,
             KeyboardFocus::Popover => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Switcher => true,
@@ -10632,7 +10751,8 @@ impl Synoik {
         );
         causes.set(
             AnimCauses::POLKIT,
-            self.polkit_ui.are_animations_ongoing(now_unadjusted),
+            self.polkit_ui.are_animations_ongoing(now_unadjusted)
+                || self.network_secret_ui.are_animations_ongoing(),
         );
         // The flash is fired from a D-Bus call and is usually the only thing on screen that
         // is moving, so without this it would freeze at full white until something else asked
@@ -10813,6 +10933,7 @@ impl Synoik {
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
         self.polkit_ui.advance_animations();
+        self.network_secret_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
         self.ripples.advance(self.clock.now_unadjusted());
         // A drag out of the dock holds it open until the drop, wherever the pointer goes.
@@ -11277,6 +11398,16 @@ impl Synoik {
             ctx.renderer,
             &self.icon_cache,
             output,
+            self.gnome_settings.accent_color,
+            &mut |elem| push(elem.into()),
+        );
+
+        // The network secret dialog, under polkit: both defer rather than stacking on a shield,
+        // and if the two ever coincide, authenticating is the more urgent of the two.
+        self.network_secret_ui.render(
+            ctx.renderer,
+            output,
+            &self.network_secret_dialog,
             self.gnome_settings.accent_color,
             &mut |elem| push(elem.into()),
         );
@@ -16679,6 +16810,7 @@ synoik_render_elements! {
         EmojiPicker = EmojiPickerRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,
         PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
+        NetworkSecretDialog = crate::ui::network_secret_dialog::NetworkSecretDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`

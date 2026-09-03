@@ -100,6 +100,10 @@ pub struct DBusServers {
     /// The session's polkit authentication agent (system bus). Without it, every action needing
     /// authentication fails with no prompt — see [`polkit_agent`].
     pub conn_polkit: Option<Connection>,
+    /// The session's NetworkManager secret agent (system bus). Without it, a secret request that
+    /// arrives outside GNOME Settings — a VPN, an 802.1X re-auth — fails with no prompt; see
+    /// [`network_agent`].
+    pub conn_network_agent: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -428,6 +432,27 @@ impl DBusServers {
                 // Loud: the failure mode is silent everywhere else. Every polkit action will fail
                 // with no prompt, and the user has no way to tell that from being denied.
                 Err(err) => warn!("no polkit authentication agent: {err:?}"),
+            }
+
+            // The NetworkManager secret agent, on the same session gate and for the same reason:
+            // NM routes a secret request to the agents registered for the caller's session, and a
+            // second instance would take the seat's prompt away from the real shell.
+            let (to_niri, from_network_agent) = calloop::channel::channel();
+            synoik
+                .event_loop
+                .insert_source(from_network_agent, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_network_agent_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match network_agent::start(to_niri) {
+                Ok((conn, requests)) => {
+                    dbus.conn_network_agent = Some(conn);
+                    synoik.network_secret_requests = Some(requests);
+                }
+                // Loud for the same reason: without an agent, a VPN or 802.1X connection fails
+                // with nothing on screen to say a password was ever wanted.
+                Err(err) => warn!("no NetworkManager secret agent: {err:?}"),
             }
         }
 

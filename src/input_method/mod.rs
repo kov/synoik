@@ -78,6 +78,8 @@ pub enum ShellEntry {
     RunDialog,
     /// The polkit authentication dialog's password field.
     Polkit,
+    /// The NetworkManager secret dialog's fields.
+    NetworkSecret,
     /// Renaming an app folder in the overview.
     FolderRename,
     /// The overview's search entry.
@@ -89,7 +91,11 @@ pub enum ShellEntry {
 impl ShellEntry {
     /// Whether this entry holds a secret, and must be announced to the engine as such.
     pub fn is_password(self) -> bool {
-        matches!(self, Self::Shield | Self::Polkit)
+        // NetworkSecret is announced as a password even for its one non-secret field (an 802.1X
+        // username): the entry kind is fixed per surface, and announcing PRIVATE | HIDDEN_TEXT for
+        // a username costs a completion popup, while the other way round shows a password to the
+        // input method.
+        matches!(self, Self::Shield | Self::Polkit | Self::NetworkSecret)
     }
 
     /// The content type to announce for it, already in IBus's enums.
@@ -1276,6 +1282,7 @@ impl State {
             ShellEntry::Shield => self.synoik.unlock_dialog.set_preedit(preedit),
             ShellEntry::RunDialog => self.synoik.run_dialog.set_preedit(preedit),
             ShellEntry::Polkit => self.synoik.polkit_dialog.set_preedit(preedit),
+            ShellEntry::NetworkSecret => self.synoik.network_secret_dialog.set_preedit(preedit),
             ShellEntry::FolderRename => self.synoik.folder_dialog.set_preedit(preedit),
             ShellEntry::OverviewSearch => self.synoik.overview_search.set_preedit(preedit),
             ShellEntry::WorkspaceRename => self

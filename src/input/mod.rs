@@ -366,6 +366,9 @@ impl State {
                 self.synoik.queue_redraw_all();
             }
             ShellEntry::Polkit => self.handle_polkit_key(raw, text, mods, theme, pressed),
+            ShellEntry::NetworkSecret => {
+                self.handle_network_secret_key(raw, text, mods, theme, pressed)
+            }
             ShellEntry::FolderRename => {
                 use crate::ui::folder_dialog::RenameKey;
                 match self.synoik.folder_dialog.rename_key(raw, text, mods, theme) {
@@ -480,6 +483,93 @@ impl State {
             },
         };
         self.apply_polkit_effects(effects);
+    }
+
+    /// A key on the open network secret dialog.
+    fn handle_network_secret_key(
+        &mut self,
+        raw: Option<Keysym>,
+        text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
+        theme: crate::ui::text_edit::KeyTheme,
+        pressed: bool,
+    ) {
+        use crate::network_secret_dialog::Focus;
+
+        if !pressed {
+            return;
+        }
+        let effects = match raw {
+            Some(Keysym::Escape) => self.synoik.network_secret_dialog.cancel(),
+            Some(Keysym::Return) | Some(Keysym::KP_Enter) => {
+                match self.synoik.network_secret_dialog.focus() {
+                    Focus::Cancel => self.synoik.network_secret_dialog.cancel(),
+                    // Enter in any entry is the Connect button: upstream wires every entry's
+                    // `activate` to `_onOk` (`networkAgent.js:79`, `:110`).
+                    Focus::Field(_) | Focus::Connect => self.synoik.network_secret_dialog.connect(),
+                }
+            }
+            Some(Keysym::Tab) => self.synoik.network_secret_dialog.cycle_focus(true),
+            Some(Keysym::ISO_Left_Tab) => self.synoik.network_secret_dialog.cycle_focus(false),
+            Some(Keysym::Down) => self.synoik.network_secret_dialog.cycle_focus(true),
+            Some(Keysym::Up) => self.synoik.network_secret_dialog.cycle_focus(false),
+            _ => match self
+                .synoik
+                .network_secret_dialog
+                .entry_key(raw, text, mods, theme)
+            {
+                Some(effects) => effects,
+                // Left/Right are the entry's while it has one; only when it does not do they move
+                // between controls.
+                None => match raw {
+                    Some(Keysym::Right) => self.synoik.network_secret_dialog.cycle_focus(true),
+                    Some(Keysym::Left) => self.synoik.network_secret_dialog.cycle_focus(false),
+                    _ => return,
+                },
+            },
+        };
+        self.apply_network_secret_effects(effects);
+    }
+
+    /// Hovering a network secret control focuses it, the way its siblings do.
+    fn network_secret_pointer_motion(
+        &mut self,
+        output_size: Size<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) {
+        let Some(focus) =
+            self.synoik
+                .network_secret_ui
+                .hit(&self.synoik.network_secret_dialog, output_size, pos)
+        else {
+            return;
+        };
+        let effects = self.synoik.network_secret_dialog.set_focus(focus);
+        self.apply_network_secret_effects(effects);
+    }
+
+    /// A left click on the network secret dialog.
+    fn network_secret_pointer_click(
+        &mut self,
+        output_size: Size<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) {
+        use crate::network_secret_dialog::Focus;
+
+        let Some(focus) =
+            self.synoik
+                .network_secret_ui
+                .hit(&self.synoik.network_secret_dialog, output_size, pos)
+        else {
+            return;
+        };
+        let effects = match focus {
+            Focus::Cancel => self.synoik.network_secret_dialog.cancel(),
+            Focus::Connect => self.synoik.network_secret_dialog.connect(),
+            // Clicking an entry only moves focus into it; `set_focus` refuses the display rows.
+            Focus::Field(_) => self.synoik.network_secret_dialog.set_focus(focus),
+        };
+        self.apply_network_secret_effects(effects);
     }
 
     /// Hovering a polkit control focuses it, the way its siblings do.
@@ -1191,6 +1281,33 @@ impl State {
                 // The polkit "Authentication Required" dialog is modal in the same way, and it is
                 // the one that matters most: it is a password box, so a key that leaked past it
                 // would be a character of somebody's password delivered to a window.
+                // The network secret dialog is modal and holds a password box in exactly the
+                // same way, so it takes keys on exactly the same terms.
+                if this.synoik.network_secret_is_open() {
+                    let text = modified
+                        .key_char()
+                        .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                    this.shell_key(
+                        ShellEntry::NetworkSecret,
+                        raw,
+                        text,
+                        edit_mods(mods),
+                        modified.raw(),
+                        key_code,
+                        pressed,
+                        key_repeats,
+                    );
+
+                    if pressed {
+                        this.synoik.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        return FilterResult::Forward;
+                    }
+                }
+
                 if this.synoik.polkit_is_open() {
                     let text = modified
                         .key_char()
@@ -2093,6 +2210,7 @@ impl State {
         match entry {
             ShellEntry::Shield => self.synoik.screen_shield.is_active(),
             ShellEntry::Polkit => self.synoik.polkit_is_open(),
+            ShellEntry::NetworkSecret => self.synoik.network_secret_is_open(),
             ShellEntry::RunDialog => self.synoik.run_dialog.is_open(),
             ShellEntry::FolderRename => self.synoik.folder_dialog.is_renaming(),
             ShellEntry::WorkspaceRename => self.synoik.workspace_rename.is_some(),
@@ -6283,6 +6401,12 @@ impl State {
                 self.polkit_pointer_motion(output_size, pos_within_output);
             }
         }
+        if self.synoik.network_secret_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
+                let output_size = output_size(output);
+                self.network_secret_pointer_motion(output_size, pos_within_output);
+            }
+        }
 
         // Drag first: the dash's hover feedback is derived from the drag's unpin state,
         // so computing it the other way round would paint it one motion stale.
@@ -6467,6 +6591,12 @@ impl State {
             if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 self.polkit_pointer_motion(output_size, pos_within_output);
+            }
+        }
+        if self.synoik.network_secret_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
+                let output_size = output_size(output);
+                self.network_secret_pointer_motion(output_size, pos_within_output);
             }
         }
 
@@ -8706,6 +8836,20 @@ impl State {
                 return;
             }
 
+            // The network secret dialog swallows buttons on the same terms.
+            if self.synoik.network_secret_is_open() {
+                if button == Some(MouseButton::Left) {
+                    let location = pointer.current_location();
+                    if let Some((output, pos_within_output)) = self.synoik.output_under(location) {
+                        let output_size = output_size(output);
+                        self.network_secret_pointer_click(output_size, pos_within_output);
+                    }
+                }
+
+                self.synoik.suppressed_buttons.insert(button_code);
+                return;
+            }
+
             // GNOME top panel + its popovers.
             if self.synoik.layout.is_gnome_mode() {
                 let location = pointer.current_location();
@@ -10062,6 +10206,12 @@ impl State {
             if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 self.polkit_pointer_motion(output_size, pos_within_output);
+            }
+        }
+        if self.synoik.network_secret_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
+                let output_size = output_size(output);
+                self.network_secret_pointer_motion(output_size, pos_within_output);
             }
         }
 
