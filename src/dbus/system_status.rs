@@ -34,6 +34,9 @@ pub enum SystemStatusToSynoik {
     Battery(Option<BatteryStatus>),
     /// NetworkManager's primary-connection state.
     Network(NetworkStatus),
+    /// The full NetworkManager model behind the quick-settings network tiles. Boxed: it is much
+    /// larger than every other variant and the channel is sized by its widest one.
+    NetworkModel(Box<crate::network_model::NetworkState>),
     /// power-profiles-daemon's profile state (hidden when the daemon is absent).
     PowerProfiles(PowerProfileStatus),
     /// BlueZ's adapter + device snapshot (absent default when bluetoothd is gone).
@@ -104,58 +107,8 @@ pub fn start(
             .detach();
     }
 
-    // --- NetworkManager primary connection ---
-    {
-        let to_niri = to_niri.clone();
-        let async_conn = async_conn.clone();
-        let future = async move {
-            let proxy = match fdo::PropertiesProxy::new(
-                &async_conn,
-                "org.freedesktop.NetworkManager",
-                "/org/freedesktop/NetworkManager",
-            )
-            .await
-            {
-                Ok(proxy) => proxy,
-                Err(err) => {
-                    warn!("error creating NetworkManager PropertiesProxy: {err:?}");
-                    return;
-                }
-            };
-            let iface = InterfaceName::try_from("org.freedesktop.NetworkManager").unwrap();
-
-            let mut changed = match proxy.receive_properties_changed().await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    warn!("error subscribing to NetworkManager PropertiesChanged: {err:?}");
-                    return;
-                }
-            };
-
-            let mut last: Option<NetworkStatus> = None;
-            loop {
-                if let Ok(props) = proxy.get_all(iface.clone()).await {
-                    let network = read_network(&props);
-                    if last != Some(network) {
-                        last = Some(network);
-                        if to_niri
-                            .send(SystemStatusToSynoik::Network(network))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                if changed.next().await.is_none() {
-                    return;
-                }
-            }
-        };
-        conn.inner()
-            .executor()
-            .spawn(future, "monitor NetworkManager state")
-            .detach();
-    }
+    // --- NetworkManager (panel status + the quick-settings tiles' model) ---
+    super::network_manager::spawn(&conn, to_niri.clone());
 
     // --- power-profiles-daemon ---
     {
@@ -314,30 +267,6 @@ fn read_battery(props: &Props) -> Option<BatteryStatus> {
         state: BatteryState::from_upower(get_u32(props, "State").unwrap_or(0)),
         warning: BatteryWarning::from_upower(get_u32(props, "WarningLevel").unwrap_or(0)),
     })
-}
-
-/// Map NetworkManager's top-level properties to a [`NetworkStatus`]. Airplane mode is no longer
-/// derived here (the old coarse `!WirelessEnabled` proxy) — gsd-rfkill owns it now
-/// ([`crate::dbus::rfkill`]); a disconnected primary is simply `Offline`.
-fn read_network(props: &Props) -> NetworkStatus {
-    // NM_STATE: 70 CONNECTED_GLOBAL, 60 SITE, 50 LOCAL, 40 CONNECTING, 20 DISCONNECTED, 10 ASLEEP.
-    let state = get_u32(props, "State").unwrap_or(0);
-    let conn_type = get_str(props, "PrimaryConnectionType").unwrap_or_default();
-
-    if state >= 50 {
-        if conn_type.starts_with("802-11") {
-            // TODO: read the active AP's real strength (PrimaryConnection → Devices
-            // → wireless → ActiveAccessPoint.Strength) and subscribe for live
-            // updates. Unverifiable on this wired VM, so a fixed "good" bucket for
-            // now — the icon still correctly reads "wireless, connected".
-            NetworkStatus::Wireless(70)
-        } else {
-            // 802-3 (wired) and any other connected primary (vpn/tun/bridge).
-            NetworkStatus::Wired
-        }
-    } else {
-        NetworkStatus::Offline
-    }
 }
 
 /// Build a [`PowerProfileStatus`] from power-profiles-daemon's properties. Called only on a

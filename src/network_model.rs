@@ -526,6 +526,109 @@ pub fn should_show_device(state: u32, wifi: bool) -> bool {
     }
 }
 
+/// `NMActiveConnectionState` (`nm-dbus-interface.h`).
+pub mod active_state {
+    pub const UNKNOWN: u32 = 0;
+    pub const ACTIVATING: u32 = 1;
+    pub const ACTIVATED: u32 = 2;
+    pub const DEACTIVATING: u32 = 3;
+    pub const DEACTIVATED: u32 = 4;
+}
+
+/// One NM device, of whatever type. The Wi-Fi extras hang off [`Self::wireless`] rather than
+/// widening this for every type: only one tile ever reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkDevice {
+    pub path: String,
+    /// [`device_type`].
+    pub kind: u32,
+    pub interface: String,
+    pub state: u32,
+    /// The `Settings.Connection` path behind the device's active connection, if any.
+    pub active_connection: Option<String>,
+    /// The active connection's own state ([`active_state`]) — what the tile's icon reads to tell
+    /// "connecting" from "connected".
+    pub active_state: u32,
+    pub wireless: Option<WirelessDevice>,
+}
+
+impl NetworkDevice {
+    /// The tile subtitle for a device that is not carrying a name of its own: the interface, as
+    /// `NM.Device.disambiguate_names` falls back to.
+    pub fn name(&self) -> String {
+        self.interface.clone()
+    }
+}
+
+/// A VPN-ish saved profile and whether it is up. GNOME's VPN tile handles `vpn` and `wireguard`
+/// and skips port connections (`_shouldHandleConnection`, `network.js:1600-1614`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VpnConnection {
+    pub path: String,
+    pub uuid: String,
+    pub id: String,
+    pub kind: String,
+    /// [`active_state`]; `UNKNOWN` when the profile is not up at all.
+    pub state: u32,
+}
+
+impl VpnConnection {
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.state,
+            active_state::ACTIVATING | active_state::ACTIVATED
+        )
+    }
+
+    /// `NMVpnConnectionItem.icon_name` (`network.js:1367-1376`).
+    pub fn icon_name(&self) -> &'static str {
+        match self.state {
+            active_state::ACTIVATING => "network-vpn-acquiring-symbolic",
+            active_state::ACTIVATED => "network-vpn-symbolic",
+            _ => "network-vpn-disabled-symbolic",
+        }
+    }
+}
+
+/// Everything the network tiles read. Rebuilt whole from NM's object tree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkState {
+    /// NM is on the bus at all. Every tile hides when this is false (`nm-running`).
+    pub running: bool,
+    pub networking_enabled: bool,
+    pub wireless_enabled: bool,
+    /// The rfkill/hardware switch. False makes the Wi-Fi tile unclickable rather than hidden.
+    pub wireless_hardware_enabled: bool,
+    /// `NMConnectivityState`: 4 is FULL.
+    pub connectivity: u32,
+    pub devices: Vec<NetworkDevice>,
+    /// Every saved profile, whatever its type.
+    pub saved: Vec<SavedConnection>,
+    /// The subset the VPN tile shows, with live state.
+    pub vpn: Vec<VpnConnection>,
+}
+
+impl NetworkState {
+    /// The devices of one type that earn a menu row (`_shouldShowDevice`).
+    pub fn devices_of(&self, kind: u32) -> Vec<&NetworkDevice> {
+        self.devices
+            .iter()
+            .filter(|d| d.kind == kind && should_show_device(d.state, kind == device_type::WIFI))
+            .collect()
+    }
+
+    /// Whether the tile for a device type is in the grid at all: GNOME shows a device toggle only
+    /// while it has a device to talk about (`NMToggle._sync`, `network.js:1531-1538`).
+    pub fn shows_tile(&self, kind: u32) -> bool {
+        self.running && !self.devices_of(kind).is_empty()
+    }
+
+    /// The VPN tile appears when there is a profile to show, device or not.
+    pub fn shows_vpn_tile(&self) -> bool {
+        self.running && !self.vpn.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

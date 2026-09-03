@@ -17,6 +17,9 @@
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SystemStatus {
     pub network: NetworkStatus,
+    /// The full NetworkManager model the quick-settings network tiles read: devices, the grouped
+    /// Wi-Fi networks and the saved VPN profiles.
+    pub network_state: crate::network_model::NetworkState,
     /// `None` when there's no battery (desktop / VM without one).
     pub battery: Option<BatteryStatus>,
     /// Airplane (rfkill) mode, from gsd-rfkill (the authoritative source, replacing the old coarse

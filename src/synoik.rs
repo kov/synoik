@@ -6907,6 +6907,9 @@ impl State {
         match msg {
             SystemStatusToSynoik::Battery(battery) => self.synoik.system_status.battery = battery,
             SystemStatusToSynoik::Network(network) => self.synoik.system_status.network = network,
+            SystemStatusToSynoik::NetworkModel(state) => {
+                self.synoik.system_status.network_state = *state;
+            }
             SystemStatusToSynoik::PowerProfiles(power) => {
                 // gnome-shell's `_sync`: whenever the (echoed) active profile is a known,
                 // non-Balanced one, that becomes the last-selected the body-toggle returns to —
