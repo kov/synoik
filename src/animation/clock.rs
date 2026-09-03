@@ -24,6 +24,12 @@ struct LazyClock {
     /// event-loop iteration instead of being re-fetched from the monotonic clock. See
     /// [`Clock::freeze`].
     frozen: bool,
+    /// Added to every monotonic read, so that leaving a freeze cannot move time **backwards**.
+    /// A freeze that drove the clock past real time (a test stepping frame by frame faster than
+    /// wall time, which is every test) would otherwise rewind on unfreeze, and an animation that
+    /// had finished would read as unfinished again — for as many seconds as the test had
+    /// fast-forwarded. Zero in a session, where nothing freezes.
+    offset: Duration,
 }
 
 /// Clock that can adjust its rate.
@@ -97,8 +103,14 @@ impl Clock {
     }
 
     /// Let the clock follow the monotonic clock again. See [`freeze`](Self::freeze).
+    ///
+    /// Time never goes backwards across this: a freeze that stepped past real time keeps its lead
+    /// as a fixed offset on every later read.
     pub fn unfreeze(&mut self) {
         let mut clock = self.inner.borrow_mut();
+        let pinned = clock.inner.now();
+        let following = get_monotonic_time() + clock.inner.offset;
+        clock.inner.offset += pinned.saturating_sub(following);
         clock.inner.frozen = false;
         clock.inner.clear();
     }
@@ -137,6 +149,7 @@ impl LazyClock {
         Self {
             time: Some(time),
             frozen: false,
+            offset: Duration::ZERO,
         }
     }
 
@@ -151,7 +164,10 @@ impl LazyClock {
     }
 
     pub fn now(&mut self) -> Duration {
-        *self.time.get_or_insert_with(get_monotonic_time)
+        let offset = self.offset;
+        *self
+            .time
+            .get_or_insert_with(|| get_monotonic_time() + offset)
     }
 }
 
@@ -225,6 +241,23 @@ mod tests {
 
         clock.set_unadjusted(Duration::from_millis(200));
         assert_eq!(clock.now(), Duration::from_millis(200));
+    }
+
+    /// A test drives the clock forward far faster than wall time; coming out of a freeze must not
+    /// hand back the seconds it skipped, or every animation it just finished starts running again.
+    #[test]
+    fn unfreezing_never_moves_time_backwards() {
+        let mut clock = Clock::default();
+        clock.freeze();
+        let ahead = clock.now_unadjusted() + Duration::from_secs(30);
+        clock.set_unadjusted(ahead);
+        clock.unfreeze();
+
+        clock.clear();
+        assert!(
+            clock.now_unadjusted() >= ahead,
+            "the clock rewound out of a freeze"
+        );
     }
 
     #[test]

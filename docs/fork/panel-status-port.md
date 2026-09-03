@@ -342,9 +342,6 @@ pills would warn twice from two processes.
    `org.gnome.shell last-selected-power-profile`, authoritative on `Synoik`. Not live (VM has no ppd).
 10. ✅ **QuickMenuToggle detail-view framework** — done (`2f7d2b0a`/`16d81fc9`); every in-menu list
     now rides it (network, bluetooth, audio devices, brightness, power profiles, Q1 power submenu).
-    One known gap: once a card's open animation has finished, Down from a tile's *arrow* skips the
-    card and lands on the next grid row (it works before the animation runs, and from the system
-    power button).
 11. ✅ Q4 brightness — **complete**: Q4a backlight subsystem, Q4b manager algebra, Q4c the QS
     slider + the per-monitor card, Q4d keybindings + the `org.gnome.Shell.Brightness` object, and
     the OSD, which landed as slice C of the **OSD + media milestone**

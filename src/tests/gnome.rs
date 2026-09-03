@@ -38403,7 +38403,17 @@ fn the_wifi_tile_flips_the_radio_and_opening_its_list_scans() {
         f.synoik().network_writes.last()
     );
 
-    // Row activation is covered at the unit level (`detail_row_runs_its_action`): walking into
-    // the card from a tile's arrow does not work once the open animation has finished, which is a
-    // navigation gap of its own and not this test's subject.
+    // And the card the arrow opened is where Down goes next, once it has finished sliding out:
+    // the rows join the focus chain directly under their owner, not after the rest of the grid.
+    f.run_until_settled(240);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert!(
+        f.synoik()
+            .panel_popover
+            .focused_row_label()
+            .is_some_and(|l| l.starts_with("DetailRow(")),
+        "Down out of the arrow walks into the open card, got {:?}",
+        f.synoik().panel_popover.focused_row_label()
+    );
 }
