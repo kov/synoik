@@ -1132,12 +1132,12 @@ pub enum Action {
         /// `auto` to clear the override.
         #[cfg_attr(feature = "clap", arg(long, default_value = "wifi"))]
         devices: String,
-        /// Whether the Wi-Fi radio reads as enabled.
-        #[cfg_attr(feature = "clap", arg(long, default_value_t = true))]
-        wireless_enabled: bool,
-        /// Whether the hardware kill switch reads as off (a false makes the tile unclickable).
-        #[cfg_attr(feature = "clap", arg(long, default_value_t = true))]
-        wireless_hardware_enabled: bool,
+        /// Switch the Wi-Fi radio off, as the tile's own toggle would.
+        #[cfg_attr(feature = "clap", arg(long))]
+        radio_off: bool,
+        /// Block the radio in hardware, which makes the tile unclickable.
+        #[cfg_attr(feature = "clap", arg(long))]
+        hardware_off: bool,
         /// Repeatable `ssid[:strength[:security[:flag...]]]`; security is `open`, `wpa`,
         /// `enterprise` or `owe`, flags are `known` and `active`.
         #[cfg_attr(feature = "clap", arg(long = "network"))]

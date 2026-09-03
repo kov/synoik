@@ -758,17 +758,11 @@ impl From<synoik_ipc::Action> for Action {
             } => Self::DebugSetBattery(percentage, state, warning),
             synoik_ipc::Action::DebugSetNetwork {
                 devices,
-                wireless_enabled,
-                wireless_hardware_enabled,
+                radio_off,
+                hardware_off,
                 networks,
                 vpns,
-            } => Self::DebugSetNetwork(
-                devices,
-                wireless_enabled,
-                wireless_hardware_enabled,
-                networks,
-                vpns,
-            ),
+            } => Self::DebugSetNetwork(devices, !radio_off, !hardware_off, networks, vpns),
             synoik_ipc::Action::DebugToggleOutput { connector } => {
                 Self::DebugToggleOutput(connector)
             }

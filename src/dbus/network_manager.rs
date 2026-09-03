@@ -225,6 +225,7 @@ fn read_state(
             state,
             active_connection,
             active_state,
+            available_connections: available,
             wireless,
         });
     }

@@ -558,6 +558,8 @@ pub struct NetworkDevice {
     /// The active connection's own state ([`active_state`]) — what the tile's icon reads to tell
     /// "connecting" from "connected".
     pub active_state: u32,
+    /// `Settings.Connection` paths NM says could be used on this device.
+    pub available_connections: Vec<String>,
     pub wireless: Option<WirelessDevice>,
 }
 
@@ -689,6 +691,21 @@ impl NetworkState {
     /// while it has a device to talk about (`NMToggle._sync`, `network.js:1531-1538`).
     pub fn shows_tile(&self, kind: u32) -> bool {
         self.running && self.networking_enabled && !self.devices_of(kind).is_empty()
+    }
+
+    /// The profiles a device's card lists: `device.get_available_connections()`, skipping the
+    /// unnamed (`_syncConnections`, `network.js:502-513`). A saved profile of the right *type* is
+    /// not enough — NM decides which ones this hardware can actually take.
+    pub fn device_profiles(&self, device: Option<&NetworkDevice>) -> Vec<&SavedConnection> {
+        let Some(device) = device else {
+            return Vec::new();
+        };
+        device
+            .available_connections
+            .iter()
+            .filter_map(|path| self.saved.iter().find(|c| &c.path == path))
+            .filter(|c| !c.id.is_empty())
+            .collect()
     }
 
     /// The VPN tile appears when there is a profile to show, device or not.
@@ -944,6 +961,14 @@ pub fn debug_state(
     }
 
     if wants_wired {
+        state.saved.push(SavedConnection {
+            path: "/debug/Settings/wired".to_string(),
+            uuid: "debug-wired".to_string(),
+            id: "Wired connection 1".to_string(),
+            kind: "802-3-ethernet".to_string(),
+            ssid: None,
+            wireless_mode: None,
+        });
         state.devices.push(NetworkDevice {
             path: "/debug/Devices/wired".to_string(),
             kind: device_type::ETHERNET,
@@ -951,6 +976,7 @@ pub fn debug_state(
             state: device_state::ACTIVATED,
             active_connection: Some("/debug/Settings/wired".to_string()),
             active_state: active_state::ACTIVATED,
+            available_connections: vec!["/debug/Settings/wired".to_string()],
             wireless: None,
         });
     }
@@ -966,6 +992,7 @@ pub fn debug_state(
             } else {
                 active_state::UNKNOWN
             },
+            available_connections: wifi.available_connections.clone(),
             wireless: Some(wifi),
         });
     }
