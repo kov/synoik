@@ -1119,6 +1119,33 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long, default_value = "none"))]
         warning: String,
     },
+    /// Override the network model the quick-settings tiles read, ignoring NetworkManager until
+    /// cleared.
+    ///
+    /// The machine this port was written on has no radio, so the Wi-Fi list is otherwise
+    /// unreachable — to look at and to test. The fake stops at the model: the beacons it invents
+    /// carry real flag bits, so what is exercised is the whole path from a beacon to a row.
+    ///
+    /// `--devices auto` hands the model back to NetworkManager.
+    DebugSetNetwork {
+        /// Comma-separated: `wired`, `wifi`, `wifi-off` (present but switched off), `none`, or
+        /// `auto` to clear the override.
+        #[cfg_attr(feature = "clap", arg(long, default_value = "wifi"))]
+        devices: String,
+        /// Whether the Wi-Fi radio reads as enabled.
+        #[cfg_attr(feature = "clap", arg(long, default_value_t = true))]
+        wireless_enabled: bool,
+        /// Whether the hardware kill switch reads as off (a false makes the tile unclickable).
+        #[cfg_attr(feature = "clap", arg(long, default_value_t = true))]
+        wireless_hardware_enabled: bool,
+        /// Repeatable `ssid[:strength[:security[:flag...]]]`; security is `open`, `wpa`,
+        /// `enterprise` or `owe`, flags are `known` and `active`.
+        #[cfg_attr(feature = "clap", arg(long = "network"))]
+        networks: Vec<String>,
+        /// Repeatable `id[:off|activating|active]`.
+        #[cfg_attr(feature = "clap", arg(long = "vpn"))]
+        vpns: Vec<String>,
+    },
     /// Type text into whatever is focused, the way the emoji picker will.
     ///
     /// Drives the real insertion seam -- the focused shell entry, else the client's

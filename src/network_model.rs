@@ -691,6 +691,209 @@ impl NetworkState {
     }
 }
 
+/// A write the network tiles ask for. Recorded on the compositor as well as sent, because a
+/// headless fixture has no system bus: the corpus asserts on what the click *asked for*, which is
+/// the only observable half of a fire-and-forget D-Bus write even on a live session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkWrite {
+    /// Flip the Wi-Fi radio.
+    SetWirelessEnabled(bool),
+    /// Ask a device to scan, by device path.
+    RequestScan(String),
+    /// Bring a saved profile up; `device` is empty for a VPN, which NM places itself.
+    Activate { profile: String, device: String },
+    /// Take a profile back down, by `Settings.Connection` path.
+    Deactivate(String),
+    /// Join a network we have no profile for.
+    AddAndActivate { device: String, ap: String },
+}
+
+/// Build a whole [`NetworkState`] from the `debug-set-network` action's strings.
+///
+/// This machine has no radio, so the Wi-Fi list would otherwise be unreachable — both to look at
+/// and to test. The fake stops at the *model*: the beacons it invents carry real flag bits, so the
+/// security type each row shows is still derived by [`AccessPoint::security`] rather than asserted
+/// here, and the corpus exercises the same grouping, sort and cap the bus feeds.
+///
+/// `devices` is a comma-separated list of `wired`, `wifi` and `wifi-off` (a radio that is present
+/// but switched off, the `UNAVAILABLE` state a Wi-Fi tile has to survive). `networks` entries are
+/// `ssid[:strength[:security[:flag...]]]` with security one of `open`, `wpa`, `enterprise`, `owe`
+/// and flags drawn from `known` and `active`. `vpn` entries are `id[:off|activating|active]`.
+///
+/// Returns `None` for `auto`, which hands the model back to NetworkManager.
+pub fn debug_state(
+    devices: &str,
+    wireless_enabled: bool,
+    wireless_hardware_enabled: bool,
+    networks: &[String],
+    vpns: &[String],
+) -> Option<NetworkState> {
+    if devices.trim() == "auto" {
+        return None;
+    }
+
+    let mut state = NetworkState {
+        running: true,
+        networking_enabled: true,
+        wireless_enabled,
+        wireless_hardware_enabled,
+        // FULL. A fake that read as "no route" would show every tile its degraded icon.
+        connectivity: 4,
+        ..Default::default()
+    };
+
+    let mut wifi: Option<WirelessDevice> = None;
+    let mut wifi_state = device_state::DISCONNECTED;
+    let mut wants_wifi = false;
+    let mut wants_wired = false;
+    for spec in devices.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match spec {
+            "wired" => wants_wired = true,
+            "wifi" => wants_wifi = true,
+            "wifi-off" => {
+                wants_wifi = true;
+                wifi_state = device_state::UNAVAILABLE;
+            }
+            "none" => {}
+            other => warn!("debug-set-network: unknown device {other:?}; ignoring"),
+        }
+    }
+
+    if wants_wifi {
+        let mut device = WirelessDevice {
+            path: "/debug/Devices/wifi".to_string(),
+            interface: "wlan0".to_string(),
+            state: wifi_state,
+            capabilities: DEBUG_WIFI_CAPS,
+            ..Default::default()
+        };
+        for (i, spec) in networks.iter().enumerate() {
+            let mut parts = spec.split(':');
+            let ssid = parts.next().unwrap_or_default();
+            if ssid.is_empty() {
+                continue;
+            }
+            let strength: u8 = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60)
+                .min(100);
+            let security = parts.next().unwrap_or("wpa");
+            let flags: Vec<&str> = parts.collect();
+
+            let mut ap = AccessPoint {
+                path: format!("/debug/AccessPoints/{i}"),
+                ssid: ssid.as_bytes().to_vec(),
+                strength,
+                mode: mode::INFRA,
+                flags: 0,
+                wpa_flags: 0,
+                rsn_flags: 0,
+            };
+            match security {
+                "open" => {}
+                "owe" => ap.rsn_flags = ap_sec::KEY_MGMT_OWE,
+                "enterprise" => {
+                    ap.flags = ap_flags::PRIVACY;
+                    ap.rsn_flags = ap_sec::KEY_MGMT_802_1X | ap_sec::PAIR_CCMP | ap_sec::GROUP_CCMP;
+                }
+                _ => {
+                    ap.flags = ap_flags::PRIVACY;
+                    ap.rsn_flags = ap_sec::KEY_MGMT_PSK | ap_sec::PAIR_CCMP | ap_sec::GROUP_CCMP;
+                }
+            }
+
+            if flags.contains(&"known") || flags.contains(&"active") {
+                let path = format!("/debug/Settings/{i}");
+                state.saved.push(SavedConnection {
+                    path: path.clone(),
+                    uuid: format!("debug-{i}"),
+                    id: ssid.to_string(),
+                    kind: "802-11-wireless".to_string(),
+                    ssid: Some(ssid.as_bytes().to_vec()),
+                    wireless_mode: None,
+                });
+                device.available_connections.push(path.clone());
+                if flags.contains(&"active") {
+                    device.active_connection = Some(path);
+                }
+            }
+            if flags.contains(&"active") {
+                device.active_access_point = Some(ap.path.clone());
+                device.state = device_state::ACTIVATED;
+            }
+            device.access_points.push(ap);
+        }
+        wifi = Some(device);
+    }
+
+    if wants_wired {
+        state.devices.push(NetworkDevice {
+            path: "/debug/Devices/wired".to_string(),
+            kind: device_type::ETHERNET,
+            interface: "eth0".to_string(),
+            state: device_state::ACTIVATED,
+            active_connection: Some("/debug/Settings/wired".to_string()),
+            active_state: active_state::ACTIVATED,
+            wireless: None,
+        });
+    }
+    if let Some(wifi) = wifi {
+        state.devices.push(NetworkDevice {
+            path: wifi.path.clone(),
+            kind: device_type::WIFI,
+            interface: wifi.interface.clone(),
+            state: wifi.state,
+            active_connection: wifi.active_connection.clone(),
+            active_state: if wifi.active_connection.is_some() {
+                active_state::ACTIVATED
+            } else {
+                active_state::UNKNOWN
+            },
+            wireless: Some(wifi),
+        });
+    }
+
+    for (i, spec) in vpns.iter().enumerate() {
+        let mut parts = spec.split(':');
+        let id = parts.next().unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let path = format!("/debug/Settings/vpn{i}");
+        state.vpn.push(VpnConnection {
+            path: path.clone(),
+            uuid: format!("debug-vpn-{i}"),
+            id: id.to_string(),
+            kind: "vpn".to_string(),
+            state: match parts.next().unwrap_or("off") {
+                "active" => active_state::ACTIVATED,
+                "activating" => active_state::ACTIVATING,
+                _ => active_state::UNKNOWN,
+            },
+        });
+        state.saved.push(SavedConnection {
+            path,
+            uuid: format!("debug-vpn-{i}"),
+            id: id.to_string(),
+            kind: "vpn".to_string(),
+            ssid: None,
+            wireless_mode: None,
+        });
+    }
+
+    Some(state)
+}
+
+/// The capabilities the faked radio claims: every cipher, WPA and RSN. A fake device that could
+/// not do RSN would make every WPA2 beacon read as `Invalid` and the list would come back empty.
+const DEBUG_WIFI_CAPS: u32 = wifi_caps::CIPHER_WEP40
+    | wifi_caps::CIPHER_WEP104
+    | wifi_caps::CIPHER_TKIP
+    | wifi_caps::CIPHER_CCMP
+    | wifi_caps::WPA
+    | wifi_caps::RSN;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,6 +1160,61 @@ mod tests {
             state: device_state::ACTIVATED,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_fake_derives_its_security_the_same_way_the_bus_does() {
+        let state = debug_state(
+            "wifi",
+            true,
+            true,
+            &[
+                "home:80:wpa:known:active".to_string(),
+                "cafe:30:open".to_string(),
+                "campus:90:enterprise".to_string(),
+            ],
+            &[],
+        )
+        .expect("a fake state");
+        let device = state.devices[0].wireless.as_ref().unwrap();
+        let networks = device.networks(&state.saved);
+        let by_name = |name: &str| {
+            networks
+                .iter()
+                .find(|n| n.label() == name)
+                .unwrap_or_else(|| panic!("no {name} row"))
+                .clone()
+        };
+        assert_eq!(by_name("home").security, SecurityType::Wpa2Psk);
+        assert_eq!(by_name("cafe").security, SecurityType::None);
+        assert_eq!(by_name("campus").security, SecurityType::Wpa2Enterprise);
+        assert!(by_name("home").active);
+        assert!(by_name("home").has_connections());
+        assert!(!by_name("cafe").has_connections());
+    }
+
+    #[test]
+    fn the_fake_can_switch_the_radio_off_without_losing_the_device() {
+        let state = debug_state("wifi-off", false, true, &[], &[]).expect("a fake state");
+        assert!(!state.wireless_enabled);
+        // A switched-off radio is UNAVAILABLE, and the Wi-Fi tile has to survive it.
+        assert!(state.shows_tile(device_type::WIFI));
+        assert!(!state.shows_tile(device_type::ETHERNET));
+    }
+
+    #[test]
+    fn the_fake_hands_the_model_back_on_auto() {
+        assert!(debug_state("auto", true, true, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn a_vpn_profile_shows_its_tile_with_no_device_at_all() {
+        let state = debug_state("none", true, true, &[], &["work:active".to_string()])
+            .expect("a fake state");
+        assert!(state.devices.is_empty());
+        assert!(state.shows_vpn_tile());
+        assert!(state.vpn[0].is_active());
+        assert_eq!(state.vpn[0].icon_name(), "network-vpn-symbolic");
     }
 
     #[test]

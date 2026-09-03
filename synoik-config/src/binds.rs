@@ -134,6 +134,7 @@ pub enum Action {
     DebugSetRenderTimeMargin(f64),
     /// Percentage, UPower state spelling, UPower warning-level spelling.
     DebugSetBattery(f64, String, String),
+    DebugSetNetwork(String, bool, bool, Vec<String>, Vec<String>),
     DebugToggleOutput(String),
     DebugInsertText(String),
     Spawn(Vec<String>),
@@ -755,6 +756,19 @@ impl From<synoik_ipc::Action> for Action {
                 state,
                 warning,
             } => Self::DebugSetBattery(percentage, state, warning),
+            synoik_ipc::Action::DebugSetNetwork {
+                devices,
+                wireless_enabled,
+                wireless_hardware_enabled,
+                networks,
+                vpns,
+            } => Self::DebugSetNetwork(
+                devices,
+                wireless_enabled,
+                wireless_hardware_enabled,
+                networks,
+                vpns,
+            ),
             synoik_ipc::Action::DebugToggleOutput { connector } => {
                 Self::DebugToggleOutput(connector)
             }

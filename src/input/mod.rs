@@ -3914,6 +3914,35 @@ impl State {
                     self.synoik.queue_redraw_all();
                 }
             }
+            Action::DebugSetNetwork(
+                devices,
+                wireless_enabled,
+                wireless_hardware_enabled,
+                networks,
+                vpns,
+            ) => {
+                self.synoik.network_override = crate::network_model::debug_state(
+                    &devices,
+                    wireless_enabled,
+                    wireless_hardware_enabled,
+                    &networks,
+                    &vpns,
+                );
+                match &self.synoik.network_override {
+                    Some(state) => warn!(
+                        "network overridden: {} device(s), {} saved, {} vpn",
+                        state.devices.len(),
+                        state.saved.len(),
+                        state.vpn.len()
+                    ),
+                    None => warn!("network override cleared; NetworkManager owns the model again"),
+                }
+                let status = self.panel_system_status();
+                if self.synoik.panel.set_system_status(status) {
+                    self.synoik.queue_redraw_all();
+                }
+                self.synoik.queue_redraw_all();
+            }
             Action::DebugSetRenderTimeMargin(millis) => {
                 let millis = millis.clamp(0., 100.);
                 let margin = crate::frame_clock::set_render_time_margin(Duration::from_micros(
@@ -11767,6 +11796,7 @@ fn is_debug_action(action: &Action) -> bool {
             | Action::DebugToggleDeadlineDispatch
             | Action::DebugSetRenderTimeMargin(_)
             | Action::DebugSetBattery(..)
+            | Action::DebugSetNetwork(..)
             | Action::DebugToggleOutput(_)
     )
 }

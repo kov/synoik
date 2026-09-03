@@ -633,6 +633,13 @@ pub struct Synoik {
     /// written into `system_status`, so the live UPower snapshot underneath stays true and the
     /// next real update does not silently reinstate itself over the override.
     pub battery_override: Option<crate::system_status::BatteryStatus>,
+    /// A `debug-set-network` override standing in for NetworkManager's whole model. Set on a
+    /// machine with no radio, which is the only way the Wi-Fi list can be driven here.
+    pub network_override: Option<crate::network_model::NetworkState>,
+    /// The last few network writes the quick-settings tiles asked for, newest last. Kept so a
+    /// headless test — which has no system bus for the write to land on — can assert what a click
+    /// meant; capped, because nothing ever reads the older end.
+    pub network_writes: Vec<crate::network_model::NetworkWrite>,
     /// The authoritative last-selected (non-Balanced) power profile the Power Mode tile toggles
     /// back to (gnome-shell's `last-selected-power-profile`). Seeded from gsettings at
     /// startup, updated from each power-profile echo, and write-through-persisted — kept here
@@ -6963,6 +6970,15 @@ impl State {
         }
     }
 
+    /// The network model the tiles should read: the live snapshot, or a `debug-set-network`
+    /// override standing in for NetworkManager entirely.
+    pub fn network_state(&self) -> &crate::network_model::NetworkState {
+        self.synoik
+            .network_override
+            .as_ref()
+            .unwrap_or(&self.synoik.system_status.network_state)
+    }
+
     /// The system status as the panel should see it: the live snapshot, with a
     /// `debug-set-battery` override standing in for UPower's battery if one is set.
     pub fn panel_system_status(&self) -> SystemStatus {
@@ -8134,6 +8150,8 @@ impl Synoik {
             audio_backend: None,
             system_status: SystemStatus::default(),
             battery_override: None,
+            network_override: None,
+            network_writes: Vec::new(),
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,
             gtk_notifications_emit: None,
