@@ -842,11 +842,7 @@ impl DetailOwner {
                 let device = net.primary_device(device_type::ETHERNET);
                 let device_path = device.map(|d| d.path.clone()).unwrap_or_default();
                 let active = device.and_then(|d| d.active_connection.clone());
-                let profiles: Vec<&crate::network_model::SavedConnection> = net
-                    .saved
-                    .iter()
-                    .filter(|c| c.kind == "802-3-ethernet")
-                    .collect();
+                let profiles = net.device_profiles(device);
                 let mut rows: Vec<DetailRow> = profiles
                     .iter()
                     .take(MAX_DEVICE_ROWS)
@@ -1059,8 +1055,13 @@ impl DetailOwner {
         match self {
             // N rows — or ONE placeholder when there is nothing to list — then the settings row
             // past a separator. Same shape for all three network cards.
+            //
+            // No cap here: each network card has its own, applied where its rows are counted
+            // (`net_card_rows`) — the Wi-Fi list holds eight, one more than the Wired card's six
+            // profiles plus "Turn Off". Clamping to `MAX_DEVICE_ROWS` here sized a seven- or
+            // eight-network card one row short, so the settings row fell off the bottom.
             DetailOwner::Wifi | DetailOwner::Wired | DetailOwner::Vpn => {
-                let mut shape = vec![RowSpec::item(false); device_count.clamp(1, MAX_DEVICE_ROWS)];
+                let mut shape = vec![RowSpec::item(false); device_count.max(1)];
                 shape.push(RowSpec::item(true));
                 shape
             }
@@ -1586,12 +1587,7 @@ fn net_card_rows(net: &crate::network_model::NetworkState, owner: DetailOwner) -
             .unwrap_or(0),
         DetailOwner::Wired => {
             let device = net.primary_device(device_type::ETHERNET);
-            let profiles = net
-                .saved
-                .iter()
-                .filter(|c| c.kind == "802-3-ethernet")
-                .count()
-                .min(MAX_DEVICE_ROWS);
+            let profiles = net.device_profiles(device).len().min(MAX_DEVICE_ROWS);
             // The "Turn Off" row only exists while something is up.
             profiles + device.is_some_and(|d| d.active_connection.is_some()) as usize
         }
@@ -2678,7 +2674,7 @@ impl QuickSettings {
                         .primary_device(crate::network_model::device_type::ETHERNET);
                     match device.and_then(|d| d.active_connection.clone()) {
                         Some(active) => PopoverAction::DeactivateNetworkProfile(active),
-                        None => match self.net.saved.iter().find(|c| c.kind == "802-3-ethernet") {
+                        None => match self.net.device_profiles(device).first() {
                             Some(profile) => PopoverAction::ActivateNetworkProfile {
                                 profile: profile.path.clone(),
                                 device: device.map(|d| d.path.clone()).unwrap_or_default(),
@@ -5880,6 +5876,62 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// The Network arrow opens the detail view; clicking it again collapses it. Both are internal
     /// state changes (Consumed) that bump the chrome revision.
+    /// A card is sized from `row_shape` and drawn from `rows()`; if the two disagree the card is
+    /// short and its last row falls off the bottom. They did, at seven and eight networks — the
+    /// ordinary result of a scan in a city.
+    #[test]
+    fn every_network_card_is_sized_for_the_rows_it_draws() {
+        let mut qs = qs(None);
+        let shapes_match = |qs: &QuickSettings, owner: DetailOwner| {
+            let layout = qs.layout();
+            let rows = qs.detail_rows(owner).len();
+            let shape = owner.row_shape(layout.owner_device_count(owner)).len();
+            assert_eq!(rows, shape, "{owner:?}: {rows} rows vs a shape of {shape}");
+        };
+
+        // Eight networks, which is exactly the visible cap — two more than MAX_DEVICE_ROWS.
+        let mut specs: Vec<String> = (0..8)
+            .map(|i| format!("net{i}:{}:wpa", 90 - i * 5))
+            .collect();
+        specs[0] = "open-one:70:open".to_string();
+        specs[1] = "campus:60:enterprise:known".to_string();
+        qs.set_network_state(
+            crate::network_model::debug_state("wifi", true, true, &specs, &[]).unwrap(),
+        );
+        assert_eq!(qs.layout().owner_device_count(DetailOwner::Wifi), 8);
+        shapes_match(&qs, DetailOwner::Wifi);
+
+        // And with none at all, where the single placeholder row is the whole list.
+        qs.set_network_state(
+            crate::network_model::debug_state("wifi", true, true, &[], &[]).unwrap(),
+        );
+        shapes_match(&qs, DetailOwner::Wifi);
+
+        // The Wired card's six profiles plus "Turn Off" is seven rows.
+        let mut wired = crate::network_model::debug_state("wired", true, true, &[], &[]).unwrap();
+        wired.saved = (0..8)
+            .map(|i| crate::network_model::SavedConnection {
+                path: format!("/debug/Settings/wired{i}"),
+                uuid: format!("wired-{i}"),
+                id: format!("Wired connection {i}"),
+                kind: "802-3-ethernet".to_string(),
+                ssid: None,
+                wireless_mode: None,
+            })
+            .collect();
+        wired.devices[0].available_connections =
+            wired.saved.iter().map(|c| c.path.clone()).collect();
+        qs.set_network_state(wired);
+        shapes_match(&qs, DetailOwner::Wired);
+
+        // And the VPN card, capped at six.
+        let vpns: Vec<String> = (0..8).map(|i| format!("vpn{i}")).collect();
+        qs.set_network_state(
+            crate::network_model::debug_state("none", true, true, &[], &vpns).unwrap(),
+        );
+        shapes_match(&qs, DetailOwner::Vpn);
+    }
+
     #[test]
     fn network_arrow_toggles_the_detail_view() {
         let mut qs = qs(None);
