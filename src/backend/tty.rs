@@ -142,7 +142,10 @@ pub struct OutputDevice {
     // SAFETY: drop after all the objects used with them are dropped.
     // See https://github.com/Smithay/smithay/issues/1102.
     drm: DrmDevice,
-    gbm: GbmDevice<DrmDeviceFd>,
+    // Optional: this is the *cursor*-plane allocator, plus the buffer source for
+    // screencasts. gbm needs a gallium driver for the node, which a Vulkan-only host
+    // renderer does not provide, and neither of those must cost us the display.
+    gbm: Option<GbmDevice<DrmDeviceFd>>,
     // Allocates this device's scanout buffers on the renderer's Vulkan device. Display-only
     // devices share it: there is one render device, and its buffers are what KMS displays.
     allocator: VulkanScanoutAllocator,
@@ -817,10 +820,25 @@ impl Tty {
             let _span = tracy_client::span!("DrmDevice::new");
             DrmDevice::new(device_fd.clone(), false)
         }?;
+        // Never scanout -- that is allocated on the renderer's Vulkan device and PRIME-imported,
+        // so a node with no gallium driver behind it still displays. Without a cursor allocator
+        // `DrmCompositor` refuses the cursor plane and the cursor element falls through to the
+        // primary plane, so *we* draw it: a visible pointer, at the cost of a full frame per
+        // motion instead of a plane flip. Screencasting has no such fallback -- `prepare_pw_cast`
+        // takes this device and `pw_utils` allocates every cast buffer on it with
+        // `GbmBufferFlags::RENDERING`, the very gallium-backed op that is missing, so casts fail
+        // outright until they move to a Vulkan allocator like `VulkanScanoutAllocator`.
         let gbm = {
             let _span = tracy_client::span!("GbmDevice::new");
             GbmDevice::new(device_fd)
-        }?;
+        }
+        .map_err(|err| {
+            warn!(
+                "no gbm device for {node}: the cursor moves to the primary plane and \
+                 screencasting is unavailable: {err:?}"
+            )
+        })
+        .ok();
 
         // Ask DRM for this device's render node, the same way `Tty::new` derives the primary one.
         // This used to go through an EGL probe (`EGLDevice::device_for_display`), which also
@@ -1571,7 +1589,7 @@ impl Tty {
             // formats, even though we only ever render on the primary GPU.
             render_formats.clone(),
             device.drm.cursor_size(),
-            Some(device.gbm.clone()),
+            device.gbm.clone(),
         );
 
         // No retry-with-a-different-set fallback: the INVALID case a fallback would exist for is
@@ -2289,7 +2307,7 @@ impl Tty {
         // Otherwise, try to get the device corresponding to the primary node.
         let device = device.or_else(|| self.devices.get(&self.primary_node));
 
-        Some(device?.gbm.clone())
+        device?.gbm.clone()
     }
 
     pub fn set_monitors_active(&mut self, active: bool) {
