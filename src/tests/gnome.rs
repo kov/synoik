@@ -27208,6 +27208,172 @@ fn a_request_that_arrives_locked_waits_for_the_unlock() {
     );
 }
 
+/// A NetworkManager secret request becomes a prompt, and what is typed is what NM is told.
+///
+/// This drives the entry points a live session drives — `State::on_network_agent_msg` for the
+/// agent's side, synthetic key events for the user's — so it fails for the wiring mistakes it
+/// exists to catch: a dialog that never takes keyboard focus, keys reaching a window behind it, a
+/// password that is not what gets sent, or a cancel NetworkManager reads as a failure rather than
+/// a refusal.
+#[test]
+fn a_network_secret_request_becomes_a_prompt_and_sends_what_was_typed() {
+    use crate::dbus::network_agent::{NetworkAgentRequest, NetworkAgentToSynoik, SecretRequest};
+    use crate::network_secret::{content, ConnectionInfo};
+    use crate::synoik::KeyboardFocus;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Stand in for the agent, so what the dialog *sends* can be read back rather than assumed.
+    let (to_agent, from_dialog) = async_channel::unbounded();
+    f.synoik().network_secret_requests = Some(to_agent);
+    let sent = move || from_dialog.try_recv().ok();
+
+    let info = ConnectionInfo {
+        kind: "802-11-wireless".to_owned(),
+        id: "Café".to_owned(),
+        uuid: "uuid-1".to_owned(),
+        ssid: Some("Café".to_owned()),
+        key_mgmt: Some("wpa-psk".to_owned()),
+        ..Default::default()
+    };
+    let request = || {
+        NetworkAgentToSynoik::Begin(Box::new(SecretRequest {
+            request_id: "/settings/1/802-11-wireless-security".to_owned(),
+            content: content(&info, "802-11-wireless-security", &[], false).unwrap(),
+            user_requested: true,
+        }))
+    };
+
+    f.synoik_state().on_network_agent_msg(request());
+    f.synoik().network_secret_ui.settle();
+    assert!(f.synoik().network_secret_is_open());
+    f.synoik_state().refresh_and_flush_clients();
+    assert!(
+        matches!(
+            f.synoik().keyboard_focus,
+            KeyboardFocus::NetworkSecretDialog
+        ),
+        "the dialog is modal, so it owns the keyboard: {:?}",
+        f.synoik().keyboard_focus,
+    );
+
+    // A real password off a real keyboard, masked on the way in. WPA needs eight characters, so
+    // this also pins that Enter does nothing until the field is valid.
+    for key in [KEY_A, KEY_T, KEY_E] {
+        tap(&mut f, key);
+    }
+    assert_eq!(
+        f.synoik().network_secret_dialog.entry_display(0),
+        "\u{25cf}\u{25cf}\u{25cf}"
+    );
+    tap(&mut f, KEY_ENTER);
+    assert!(
+        sent().is_none(),
+        "three characters is not a WPA password, so Enter must not answer"
+    );
+    assert!(f.synoik().network_secret_is_open(), "and it stays up");
+
+    for key in [KEY_A, KEY_T, KEY_E, KEY_A, KEY_T] {
+        tap(&mut f, key);
+    }
+    tap(&mut f, KEY_ENTER);
+    match sent() {
+        Some(NetworkAgentRequest::Respond { request_id, values }) => {
+            assert_eq!(request_id, "/settings/1/802-11-wireless-security");
+            assert_eq!(
+                values.get("psk").map(String::as_str),
+                Some("ateateat"),
+                "what was typed is what is sent"
+            );
+        }
+        other => panic!("expected a response, got {other:?}"),
+    }
+    assert_eq!(
+        f.synoik().network_secret_dialog.entry_display(0),
+        "",
+        "the buffer does not outlive the answer"
+    );
+
+    // Escape is a refusal, which NetworkManager must hear as UserCanceled rather than as a
+    // failure: it is what stops NM asking the next agent for the same secret.
+    f.synoik().network_secret_ui.settle();
+    f.synoik_state().on_network_agent_msg(request());
+    f.synoik().network_secret_ui.settle();
+    tap(&mut f, KEY_ESC);
+    assert!(matches!(sent(), Some(NetworkAgentRequest::Dismiss { .. })));
+    f.synoik().network_secret_ui.settle();
+    assert!(!f.synoik().network_secret_is_open());
+}
+
+/// A secret request that arrives while the screen is locked waits for the unlock, and one
+/// NetworkManager withdraws while it waits is dropped rather than shown afterwards.
+///
+/// The second half is the one worth pinning: NM's agent call times out after 120 s, so a request
+/// held across a long lock *will* be withdrawn while it is being held. Resuming it on unlock would
+/// put a password box up for a connection nobody is waiting on, and answering it would be a second
+/// reply to a call that no longer exists.
+#[test]
+fn a_secret_request_withdrawn_while_deferred_is_never_shown() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::dbus::network_agent::{NetworkAgentToSynoik, SecretRequest};
+    use crate::network_secret::{content, ConnectionInfo};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_agent, from_dialog) = async_channel::unbounded();
+    f.synoik().network_secret_requests = Some(to_agent);
+    let sent = move || from_dialog.try_recv().ok();
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
+
+    let info = ConnectionInfo {
+        kind: "802-11-wireless".to_owned(),
+        id: "Café".to_owned(),
+        ssid: Some("Café".to_owned()),
+        key_mgmt: Some("wpa-psk".to_owned()),
+        ..Default::default()
+    };
+    f.synoik_state()
+        .on_network_agent_msg(NetworkAgentToSynoik::Begin(Box::new(SecretRequest {
+            request_id: "/settings/1/802-11-wireless-security".to_owned(),
+            content: content(&info, "802-11-wireless-security", &[], false).unwrap(),
+            user_requested: true,
+        })));
+    assert!(
+        !f.synoik().network_secret_is_open(),
+        "not over a lock screen"
+    );
+    assert!(
+        f.synoik().network_secret_deferred.is_some(),
+        "the request is held, not dropped -- NetworkManager is still waiting on it"
+    );
+
+    // NM gives up on it while it is still held.
+    f.synoik_state()
+        .on_network_agent_msg(NetworkAgentToSynoik::Cancel {
+            request_id: "/settings/1/802-11-wireless-security".to_owned(),
+        });
+    assert!(
+        f.synoik().network_secret_deferred.is_none(),
+        "a withdrawn request must not stay held"
+    );
+
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.synoik().screen_shield.is_active());
+    f.synoik_state().refresh_and_flush_clients();
+    assert!(
+        !f.synoik().network_secret_is_open(),
+        "and must not be put up on unlock"
+    );
+    assert!(sent().is_none(), "nor answered");
+}
+
 /// The portal's window list is built from the real window and app models, with the fields its
 /// chooser reads (`GetWindows`, `introspect.js:135-182`).
 ///
