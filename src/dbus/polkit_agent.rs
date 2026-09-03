@@ -257,9 +257,11 @@ pub fn start(
         .serve_at(AGENT_PATH, AuthenticationAgent { calls: calls_tx })?
         .build()?;
 
-    register(&conn)?;
-
     let (helper_tx, helper_rx) = async_channel::unbounded();
+    conn.inner()
+        .executor()
+        .spawn(watch_polkitd(conn.inner().clone()), "polkit-agent-register")
+        .detach();
     conn.inner()
         .executor()
         .spawn(
@@ -280,21 +282,23 @@ pub fn start(
 /// the session scope and the pid lookup fails
 /// (`polkitbackendsessionmonitor-systemd.c:378-390`). Reading the id off the session object we
 /// already resolved gets the same answer without a second guess.
-fn subject(
-    conn: &zbus::blocking::Connection,
+async fn subject(
+    conn: &zbus::Connection,
 ) -> anyhow::Result<(String, std::collections::HashMap<String, OwnedValue>)> {
     use anyhow::Context as _;
 
     let path = crate::dbus::freedesktop_login1::session_path()
         .context("we have no logind session to register an agent for")?;
-    let session = zbus::blocking::Proxy::new(
+    let session = zbus::Proxy::new(
         conn,
         "org.freedesktop.login1",
         path,
         "org.freedesktop.login1.Session",
-    )?;
+    )
+    .await?;
     let id: String = session
         .get_property("Id")
+        .await
         .context("reading the session Id")?;
 
     // A **map**, not a list of pairs: polkit's subject is `(sa{sv})`, and a `Vec<(String, _)>`
@@ -305,26 +309,66 @@ fn subject(
     Ok(("unix-session".to_owned(), details))
 }
 
-fn register(conn: &zbus::blocking::Connection) -> anyhow::Result<()> {
+async fn register(conn: &zbus::Connection) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
-    let subject = subject(conn)?;
+    let subject = subject(conn).await?;
     // polkit's own choice of locale, and its own fallback (`polkitagentlistener.c:146-148`). It is
     // what polkitd localises the action's description with, so an empty string here would give the
     // dialog untranslated body text.
     let locale = std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_owned());
 
-    let authority =
-        zbus::blocking::Proxy::new(conn, AUTHORITY_NAME, AUTHORITY_PATH, AUTHORITY_IFACE)?;
+    let authority = zbus::Proxy::new(conn, AUTHORITY_NAME, AUTHORITY_PATH, AUTHORITY_IFACE).await?;
     authority
-        .call_method(
+        .call::<_, _, ()>(
             "RegisterAuthenticationAgent",
             &(subject, locale, AGENT_PATH),
         )
+        .await
         .context("RegisterAuthenticationAgent")?;
 
     debug!("registered as the session's polkit authentication agent");
     Ok(())
+}
+
+/// Register, and re-register whenever polkitd appears.
+///
+/// polkitd keeps its agent registrations in memory only, so a `systemctl restart polkit` — or a
+/// polkitd that has not started yet when the compositor does — leaves a session with no agent.
+/// That failure is silent and total: every polkit action that needs authentication fails with no
+/// prompt at all until the shell is restarted.
+///
+/// The *first* registration happens here too, after the subscription is live, so there is no window
+/// in which polkitd appears, is missed, and is never seen again.
+async fn watch_polkitd(conn: zbus::Connection) {
+    let dbus = match zbus::fdo::DBusProxy::new(&conn).await {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            warn!("polkit agent: cannot watch for polkitd: {err}");
+            return;
+        }
+    };
+    let Ok(mut changed) = dbus
+        .receive_name_owner_changed_with_args(&[(0, AUTHORITY_NAME)])
+        .await
+    else {
+        warn!("polkit agent: cannot subscribe to polkitd's name");
+        return;
+    };
+
+    if let Err(err) = register(&conn).await {
+        warn!("polkit agent: registering with polkitd failed: {err:#}");
+    }
+
+    while let Some(signal) = changed.next().await {
+        let Ok(args) = signal.args() else { continue };
+        if args.new_owner().is_none() {
+            continue;
+        }
+        if let Err(err) = register(&conn).await {
+            warn!("polkit agent: re-registering with polkitd failed: {err:#}");
+        }
+    }
 }
 
 /// The interface polkitd calls. Only polkitd can: the shipped bus policy denies the interface to

@@ -6221,6 +6221,11 @@ impl State {
                     self.synoik.network_secret_deferred = Some(request);
                     return;
                 }
+                // DIVERGENCE: GNOME raises a notification first when NM asked on its own —
+                // `request.user_requested == false` — so a modal grab never lands under the
+                // user's fingers mid-sentence (`networkAgent.js:797-801`). We put the dialog up
+                // either way for now; the flag is carried so the notification path can be added
+                // without touching the agent.
                 let now = self.synoik.clock.now_unadjusted();
                 let effects = self.synoik.network_secret_dialog.begin(*request, now);
                 self.apply_network_secret_effects(effects);
