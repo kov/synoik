@@ -23,6 +23,8 @@ pub mod indicator_menu;
 pub mod input_source_menu;
 pub mod lock_screen;
 pub mod media_card;
+/// Draws [`crate::network_secret_dialog`].
+pub mod network_secret_dialog;
 pub mod notification_banner;
 pub mod notification_card;
 pub mod osd;
