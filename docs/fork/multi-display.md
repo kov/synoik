@@ -348,7 +348,14 @@ better, and pay for it with one field:
   display-local, so restoring a session while the big monitor is unplugged must not be what makes a
   window small forever; the position half falls back to wherever placement put it.
 - **Applied when a work area grows enough to hold it again**, which is what makes a workspace
-  returning to its big display return the windows to their old geometry.
+  returning to its big display return the windows to their old geometry. "Enough" is judged in the
+  integer window frame a configure can express, not in logical floats: a fractionally scaled display
+  hands back sizes with a fraction in them, and comparing one of those against a rounded configure
+  can never come out true.
+- **Spent only when the whole rect lands.** An area may hold the size and not the position — a
+  display tall enough for the window but not for where it sat, a panel that grew. The size goes out
+  anyway, but the memory is kept, so the display that *can* restore the position still has one to
+  restore.
 - **Unanimated**, for `refit_to_working_area`'s reason: the user did not ask for this, the area
   moved underneath them, and mutter re-constrains instantly.
 - **Persisted into the session record**, so the "back on the big monitor tomorrow" case works
