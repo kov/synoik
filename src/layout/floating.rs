@@ -170,6 +170,48 @@ fn move_rect_between_areas(
     ))
 }
 
+/// Pulls a rect the *compositor* moved back wholly inside the work area, per axis, on each axis
+/// that can hold it.
+///
+/// mutter's `constrain_fully_onscreen` (`constraints.c:1880`), which sits at
+/// `PRIORITY_ENTIRELY_VISIBLE_ON_WORKAREA` and bails out on `info->is_user_action`. A work area
+/// changing underneath a window is not a user action, so unplugging a display lands its windows
+/// wholly on the one that is left; a drag keeps the looser allowance in `recompute_logical_pos`,
+/// which is mutter's `constrain_partially_onscreen`. An axis too small to hold the window drops
+/// out of the constraint, the way mutter's priority loop relaxes one it cannot satisfy.
+fn fully_onscreen(
+    loc: Point<f64, Logical>,
+    size: Size<f64, Logical>,
+    area: Rectangle<f64, Logical>,
+) -> Point<f64, Logical> {
+    let axis = |loc: f64, size: f64, area_loc: f64, area_size: f64| {
+        if size > area_size {
+            loc
+        } else {
+            loc.clamp(area_loc, area_loc + area_size - size)
+        }
+    };
+    Point::from((
+        axis(loc.x, size.w, area.loc.x, area.size.w),
+        axis(loc.y, size.h, area.loc.y, area.size.h),
+    ))
+}
+
+/// What a fit did to one tile.
+///
+/// The size matters to the caller because a fit only *asks* for it: the client has not committed
+/// it yet, so the tile is still carrying the size it is leaving, and anything that places the
+/// window by that size places a window that no longer exists.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fitted {
+    /// The tile size the fit requested, when it requested one.
+    tile_size: Option<Size<f64, Logical>>,
+
+    /// Where to put the window, when it just got its overridden geometry back and the area can
+    /// hold it there.
+    restore_pos: Option<Point<f64, Logical>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Data {
     /// Position relative to the working area.
@@ -256,7 +298,18 @@ impl Data {
 
         logical_pos -= self.working_area.loc;
         logical_pos.x = f64::max(logical_pos.x, -max_off_screen_hor);
-        logical_pos.y = f64::max(logical_pos.y, -max_off_screen_ver);
+        // No allowance at the top. mutter's `constrain_titlebar_visible` expands the usable region
+        // by the off-screen amount to the left, to the right and downwards, but by 0 upwards —
+        // "Don't let titlebar off" (`constraints.c:1996`).
+        //
+        // Divergence, deliberate and narrow: mutter lifts this for a grab carrying
+        // `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` — a Super+drag or a keyboard move
+        // (`window.c:7811`, `keybindings.c:2212`), but *not* a client-requested
+        // `xdg_toplevel.move`, which is the CSD titlebar drag (`meta-wayland-xdg-shell.c:339`).
+        // Both of ours reach one `MoveGrab`, which carries no origin, so a Super+drag is clamped
+        // here too. Closing it means threading the origin from `MoveGrab::new` through
+        // `interactive_move_begin` to the drop.
+        logical_pos.y = f64::max(logical_pos.y, 0.);
         logical_pos.x = f64::min(
             logical_pos.x,
             self.working_area.size.w - self.size.w + max_off_screen_hor,
@@ -270,7 +323,11 @@ impl Data {
         self.logical_pos = logical_pos;
     }
 
-    pub fn update_config(&mut self, working_area: Rectangle<f64, Logical>) {
+    pub fn update_config(
+        &mut self,
+        working_area: Rectangle<f64, Logical>,
+        fitted_size: Option<Size<f64, Logical>>,
+    ) {
         if self.working_area == working_area {
             return;
         }
@@ -285,8 +342,14 @@ impl Data {
             return;
         }
 
-        let rect = Rectangle::new(self.logical_pos, self.size);
-        self.set_logical_pos(move_rect_between_areas(rect, old, working_area));
+        // The size the fit just asked the client for, when it asked for one. `self.size` is still
+        // the size the window is *leaving* — the client has not acked yet — and moving by that one
+        // places the window as though it had never been shrunk, which is how a taller display's
+        // windows landed with their titlebars above the top of a shorter one.
+        let size = fitted_size.unwrap_or(self.size);
+        let rect = Rectangle::new(self.logical_pos, size);
+        let moved = move_rect_between_areas(rect, old, working_area);
+        self.set_logical_pos(fully_onscreen(moved, size, working_area));
     }
 
     pub fn update<W: LayoutElement>(&mut self, tile: &Tile<W>) {
@@ -367,8 +430,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // (`workspace.c:829`), which is where its maximized size comes from (`constraints.c:1326`).
         let area_changed = self.view_size != view_size || self.working_area != working_area;
 
-        // Before the move below, which has to see the size the window is going to end up with.
-        let restore_pos: Vec<Option<Point<f64, Logical>>> = if area_changed {
+        // Before the move below, which has to see the size the window is going to end up with —
+        // hence `Fitted::tile_size`, since the tile itself will not carry it until the client acks.
+        let fitted: Vec<Fitted> = if area_changed {
             (0..self.tiles.len())
                 .map(|idx| self.fit_to_working_area(idx, working_area))
                 .collect()
@@ -376,10 +440,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             Vec::new()
         };
 
-        for (tile, data) in zip(&mut self.tiles, &mut self.data) {
+        for (idx, (tile, data)) in zip(&mut self.tiles, &mut self.data).enumerate() {
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
-            data.update_config(working_area);
+            data.update_config(working_area, fitted.get(idx).and_then(|f| f.tile_size));
         }
 
         self.view_size = view_size;
@@ -398,8 +462,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // A window that got its overridden geometry back is put where it was, over the move's
         // answer: the whole point of keeping the rect is that a workspace returning to the display
         // it came from returns its windows to where they were, not merely to the same size.
-        for (idx, pos) in restore_pos.into_iter().enumerate() {
-            if let Some(pos) = pos {
+        for (idx, fitted) in fitted.into_iter().enumerate() {
+            if let Some(pos) = fitted.restore_pos {
                 self.data[idx].set_logical_pos(pos);
             }
         }
@@ -417,22 +481,20 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// Everything is derived from the *desired* rect, never from the current one, so a second
     /// smaller display does not shrink an already-shrunk window and a dock cycle cannot ratchet.
     ///
-    /// Returns the position to put the window back at, when it just got its rect back and the area
-    /// can hold it there.
-    fn fit_to_working_area(
-        &mut self,
-        idx: usize,
-        area: Rectangle<f64, Logical>,
-    ) -> Option<Point<f64, Logical>> {
+    /// Returns the size it asked the client for and, when the window just got its rect back and
+    /// the area can hold it there, the position to put it back at.
+    fn fit_to_working_area(&mut self, idx: usize, area: Rectangle<f64, Logical>) -> Fitted {
         let old_area = self.working_area;
         let tile = &self.tiles[idx];
 
         // A window this maximized because nothing else fit comes back out when something does.
         if tile.auto_maximized && tile.window().pending_sizing_mode().is_maximized() {
-            let desired = tile.displaced_rect?;
+            let Some(desired) = tile.displaced_rect else {
+                return Fitted::default();
+            };
             let restored = Rectangle::new(desired.loc + area.loc, desired.size);
             if !area.contains_rect(restored) {
-                return None;
+                return Fitted::default();
             }
             let id = tile.window().id().clone();
             self.set_maximized(&id, false);
@@ -443,7 +505,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 tile.window_height_for_tile_height(desired.size.h).round() as i32,
             ));
             tile.window_mut().request_size_once(win_size, false);
-            return Some(restored.loc);
+            return Fitted {
+                tile_size: Some(desired.size),
+                restore_pos: Some(restored.loc),
+            };
         }
 
         // Only a plain floating window otherwise. Maximized, fullscreen and edge-tiled geometry is
@@ -451,7 +516,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         if !tile.window().pending_sizing_mode().is_normal()
             || tile.window().edge_tiled_side().is_some()
         {
-            return None;
+            return Fitted::default();
         }
 
         let current = Rectangle::new(
@@ -493,10 +558,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // area moved underneath them, and mutter re-constrains such a window instantly.
         let tile = &mut self.tiles[idx];
         if fits {
-            let desired = tile.displaced_rect.take()?;
+            let Some(desired) = tile.displaced_rect.take() else {
+                return Fitted::default();
+            };
             tile.window_mut().request_size_once(win_size, false);
             let restored = Rectangle::new(desired.loc + area.loc, desired.size);
-            return area.contains_rect(restored).then_some(restored.loc);
+            return Fitted {
+                tile_size: Some(tile_size),
+                restore_pos: area.contains_rect(restored).then_some(restored.loc),
+            };
         }
 
         self.tiles[idx].displaced_rect.get_or_insert(current);
@@ -510,7 +580,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             let id = self.tiles[idx].window().id().clone();
             self.set_maximized(&id, true);
             self.tiles[idx].auto_maximized = true;
-            return None;
+            return Fitted::default();
         }
 
         // A window that cannot be maximized either — its own maximum size is smaller than the work
@@ -519,7 +589,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles[idx]
             .window_mut()
             .request_size_once(win_size, false);
-        None
+        Fitted {
+            tile_size: Some(tile_size),
+            restore_pos: None,
+        }
     }
 
     /// Whether this window may be maximized on the compositor's own initiative.
@@ -2715,7 +2788,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
             let mut data2 = *data;
             data2.update(tile);
-            data2.update_config(self.working_area);
+            data2.update_config(self.working_area, None);
             assert_eq!(data, &data2, "tile data must be up to date");
 
             for tile_below in &self.tiles[i + 1..] {

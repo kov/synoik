@@ -31657,6 +31657,78 @@ fn a_floating_window_is_fitted_to_a_smaller_area_and_restored_by_a_bigger_one() 
     );
 }
 
+/// A window the compositor had to shrink lands wholly inside the smaller work area, titlebar
+/// included.
+///
+/// The fit only *asks* the client for the smaller size, so anything that places the window by the
+/// size it is still carrying places a window that is about to stop existing: mutter's
+/// `move_rect_between_rects` then takes its centre-preserving branch and pushes the top-left
+/// negative. Two constraints have to hold once it lands — `constrain_titlebar_visible` gives the
+/// top edge no off-screen allowance at all (`constraints.c:1996`), and `constrain_fully_onscreen`
+/// applies to everything that is not a user action (`constraints.c:1880`), which a display going
+/// away is not.
+#[test]
+fn a_window_shrunk_for_a_smaller_display_lands_wholly_inside_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1000, 900), None);
+
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        let (w, h) = win.configures_received.last().unwrap().1.size;
+        if w > 0 && h > 0 {
+            win.set_size(w as u16, h as u16);
+        }
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+
+    // Off-centre and well to the right, which is the whole point: a window parked near the origin
+    // cannot be pushed negative by a move that preserves its centre, so it cannot see this.
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            // Work-area relative, which is the frame `MoveFloatingWindow` speaks.
+            x: synoik_ipc::PositionChange::SetFixed(700.),
+            y: synoik_ipc::PositionChange::SetFixed(100.),
+        },
+        false,
+    );
+    f.settle();
+
+    // Shorter and narrower: 1000 columns still fit, 900 rows no longer do.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("it floats");
+
+    // Placed by the size it is leaving, this landed at roughly (300, -57): a titlebar 57 rows above
+    // the top of the display and 20 columns hanging off the right.
+    assert_eq!(
+        rect.loc.y.round(),
+        area.loc.y.round(),
+        "the top edge has no off-screen allowance, so a full-height window sits at the work area top"
+    );
+    assert!(
+        area.contains_rect(rect),
+        "a window the compositor moved lands wholly inside the work area: \
+         {rect:?} is not inside {area:?}"
+    );
+}
+
 /// A window whose *minimum* size does not fit the new work area is maximized instead of shrunk,
 /// and un-maximized again when an area that can hold it comes back.
 ///

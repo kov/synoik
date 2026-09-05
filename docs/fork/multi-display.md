@@ -280,7 +280,7 @@ edge-tiled windows need none of it: their geometry is a *function* of the work a
 `FloatingSpace::refit_to_working_area` (`src/layout/floating.rs:343`) already re-derives it. What
 follows is for normal floating windows.
 
-### The move is mutter's, and ours is currently the naive version of it
+### The move is mutter's, and so is the constraint pass that lands it
 
 mutter's `move_rect_between_rects` (`~/Projects/mutter/src/core/window.c:4520-4562`, reached from
 `meta_window_update_for_monitors_changed` → `meta_window_move_between_rects`, `:4137`) has two
@@ -297,15 +297,41 @@ second branch without the centre term: a window at fraction 0.5 kept its left ed
 and hung the rest off the right. Both branches now, in `move_rect_between_areas`, at the one seam
 where the old and the new area both exist.
 
+The move alone does not settle the position; mutter runs the whole constraint system afterwards, and
+two of its constraints decide where a moved window may end up:
+
+- **The titlebar has no off-screen allowance upwards.** `constrain_titlebar_visible` expands the
+  usable region by the off-screen amount to the left, to the right and downwards, but by 0 upwards —
+  `constraints.c:1996`, "Don't let titlebar off". `Data::recompute_logical_pos` clamps the top edge
+  to the work area; the other three edges keep mutter's `constrain_partially_onscreen` allowance of
+  the window size less 10–75px.
+
+  **Open divergence.** mutter lifts the top clamp for a grab carrying
+  `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` — a Super+drag or a keyboard move (`window.c:7811`,
+  `keybindings.c:2212`) — but not for a client-requested `xdg_toplevel.move`, the CSD titlebar drag
+  (`meta-wayland-xdg-shell.c:339`). Ours arrive at one `MoveGrab` from both origins
+  (`xdg_shell.rs:208` and `input/mod.rs:10966`) and it carries no origin flag, so a Super+drag
+  cannot push a titlebar off the top the way GNOME's can. Closing it is threading that one bit from
+  `MoveGrab::new` through `interactive_move_begin` to the drop.
+- **A window the compositor moved lands wholly inside the work area.** `constrain_fully_onscreen`
+  sits at `PRIORITY_ENTIRELY_VISIBLE_ON_WORKAREA` and bails only on `info->is_user_action`
+  (`constraints.c:1880`); a work area changing underneath a window is not one. `fully_onscreen`
+  applies that on the work-area-change path only, per axis, and an axis too small to hold the window
+  drops out of it — the way mutter's priority loop relaxes a constraint it cannot satisfy. A drag
+  keeps the looser allowance.
+
 ### The shrink is ours, and it is remembered
 
 mutter only *moves* here; `constrain_size_limits` applies the client's own hints and nothing shrinks
 a normal window to fit a smaller monitor, so it overflows with the titlebar kept reachable. We do
 better, and pay for it with one field:
 
-- **Fit is size first, then move.** Clamp each axis **independently** — a too-tall window must not
-  also narrow — bounded below by the client's minimum size (`ensure_min_max_size`). Then run the
-  two-branch move above.
+- **Fit is size first, then move — and the move is told the new size.** Clamp each axis
+  **independently** — a too-tall window must not also narrow — bounded below by the client's minimum
+  size (`ensure_min_max_size`). Then run the two-branch move above **on the size the fit just asked
+  for**, which `Fitted::tile_size` carries: a fit only sends a configure, so the tile is still
+  holding the size it is leaving, and moving a window by a size it is about to stop having sends the
+  centre-preserving branch far off the top-left.
 - **`displaced_rect: Option<Rect>` per tile**, holding the rect we overrode. This is mutter's
   `unconstrained_rect` in Wayland clothes: mutter can keep the desired rect and re-derive the
   visible one through the constraint system on every pass, but here the client owns the buffer, so
