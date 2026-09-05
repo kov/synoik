@@ -40,6 +40,12 @@ pub struct MoveGrab {
     new_location: Point<f64, Logical>,
     event_timestamp: Option<Duration>,
     relative_delta: Option<Point<f64, Logical>>,
+    /// Whether this grab may put the window's titlebar above the work area.
+    ///
+    /// mutter's `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED`: a Super+drag carries it
+    /// (`window.c:7811`), a client-requested `xdg_toplevel.move` — the CSD titlebar drag — does
+    /// not (`meta-wayland-xdg-shell.c:339`).
+    unconstrained: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +62,7 @@ impl MoveGrab {
         window: Window,
         enable_view_offset: bool,
         move_icon: Option<CursorIcon>,
+        unconstrained: bool,
     ) -> Option<Self> {
         let location = start_data.location();
         let (output, pos_within_output) = state.synoik.output_under(location)?;
@@ -73,6 +80,7 @@ impl MoveGrab {
             new_location: location,
             event_timestamp: None,
             relative_delta: None,
+            unconstrained,
         })
     }
 
@@ -126,6 +134,7 @@ impl MoveGrab {
             self.window.clone(),
             &self.start_output,
             self.start_pos_within_output,
+            self.unconstrained,
         ) {
             // Can no longer start the move.
             return false;

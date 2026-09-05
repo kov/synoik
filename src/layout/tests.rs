@@ -1592,7 +1592,7 @@ impl Op {
                 let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
                     return;
                 };
-                layout.interactive_move_begin(window, &output, Point::from((px, py)));
+                layout.interactive_move_begin(window, &output, Point::from((px, py)), false);
             }
             Op::InteractiveMoveUpdate {
                 window,

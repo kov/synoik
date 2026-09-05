@@ -104,6 +104,14 @@ pub struct Tile<W: LayoutElement> {
     /// resizes or moves the window, which is them saying this is the geometry now.
     pub(super) displaced_rect: Option<Rectangle<f64, Logical>>,
 
+    /// Set on the drop when the grab that moved this window was one mutter exempts from the
+    /// titlebar clamp — a Super+drag, never a client-requested `xdg_toplevel.move`.
+    ///
+    /// Rides the tile because the drop is where the grab's answer and the floating space meet, and
+    /// nothing between them needs to know: `FloatingSpace::add_tile_at` takes it off and hands it
+    /// to `Data::unconstrained_top`, which is where it means something.
+    pub(super) unconstrained_top: bool,
+
     /// The window size to restore when untiling (mutter's `saved_rect`).
     ///
     /// Kept separately from `floating_window_size`, which tracks the live
@@ -376,6 +384,7 @@ impl<W: LayoutElement> Tile<W> {
             floating_pos: None,
             auto_maximized: false,
             displaced_rect: None,
+            unconstrained_top: false,
             tiled_restore_size: None,
             tiled_restore_pos: None,
             restore_in_flight: None,

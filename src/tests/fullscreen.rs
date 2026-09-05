@@ -247,7 +247,7 @@ fn interactive_move_unfullscreen_to_scrolling_restores_size() {
     let window = mapped.window.clone();
     synoik
         .layout
-        .interactive_move_begin(window.clone(), &output, Point::default());
+        .interactive_move_begin(window.clone(), &output, Point::default(), false);
     synoik.layout.interactive_move_update(
         &window,
         Point::from((1000., 0.)),
@@ -288,7 +288,7 @@ fn interactive_move_unmaximize_to_scrolling_restores_size() {
     let window = mapped.window.clone();
     synoik
         .layout
-        .interactive_move_begin(window.clone(), &output, Point::default());
+        .interactive_move_begin(window.clone(), &output, Point::default(), false);
     synoik.layout.interactive_move_update(
         &window,
         Point::from((1000., 0.)),

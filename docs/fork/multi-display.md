@@ -306,13 +306,16 @@ two of its constraints decide where a moved window may end up:
   to the work area; the other three edges keep mutter's `constrain_partially_onscreen` allowance of
   the window size less 10–75px.
 
-  **Open divergence.** mutter lifts the top clamp for a grab carrying
-  `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` — a Super+drag or a keyboard move (`window.c:7811`,
-  `keybindings.c:2212`) — but not for a client-requested `xdg_toplevel.move`, the CSD titlebar drag
-  (`meta-wayland-xdg-shell.c:339`). Ours arrive at one `MoveGrab` from both origins
-  (`xdg_shell.rs:208` and `input/mod.rs:10966`) and it carries no origin flag, so a Super+drag
-  cannot push a titlebar off the top the way GNOME's can. Closing it is threading that one bit from
-  `MoveGrab::new` through `interactive_move_begin` to the drop.
+  **Two grabs are exempt**, as in mutter: a Super+drag and a keyboard move carry
+  `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` (`window.c:7811`, `keybindings.c:2212`), a
+  client-requested `xdg_toplevel.move` — the CSD titlebar drag — does not
+  (`meta-wayland-xdg-shell.c:339`). The bit rides `MoveGrab` → `interactive_move_begin` →
+  `InteractiveMoveData` → the dropped `Tile` → `Data::unconstrained_top`; the keyboard move reaches
+  the same field directly through `nudge_window`. It lives on the `Data` and not in the grab
+  because `recompute_logical_pos` is a derivation replayed from `pos` on demand and checked by
+  `verify_invariants` — a bit that expired with the grab would make the replay disagree with the
+  screen. It expires where mutter's does instead, at the next constraint pass: any size change, any
+  work-area change, and any placement that is not itself unconstrained.
 - **A window the compositor moved lands wholly inside the work area.** `constrain_fully_onscreen`
   sits at `PRIORITY_ENTIRELY_VISIBLE_ON_WORKAREA` and bails only on `info->is_user_action`
   (`constraints.c:1880`); a work area changing underneath a window is not one. `fully_onscreen`

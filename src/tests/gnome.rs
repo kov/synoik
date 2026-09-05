@@ -31729,6 +31729,119 @@ fn a_window_shrunk_for_a_smaller_display_lands_wholly_inside_it() {
     );
 }
 
+/// A Super+drag may put a titlebar above the top of the display; a titlebar drag may not; and the
+/// next constraint pass takes the exemption back.
+///
+/// mutter's `constrain_titlebar_visible` lifts its top clamp only for a grab carrying
+/// `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` — a Super+drag or a keyboard move (`window.c:7811`,
+/// `keybindings.c:2212`) — and never for a client-requested `xdg_toplevel.move`, which is what a
+/// CSD titlebar drag is (`meta-wayland-xdg-shell.c:339`). The exemption belongs to the grab, so it
+/// is gone by the next non-user-action pass (`constraints.c:1934`); ours is any work area change.
+#[test]
+fn only_an_unconstrained_grab_may_drag_a_titlebar_off_the_top() {
+    // Returns where the window landed, in work-area-relative rows.
+    let drag_up = |unconstrained: bool| {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        let id = f.add_client();
+        let surface = map_window_sized(&mut f, id, (1000, 800), None);
+        f.double_roundtrip(id);
+        let win = f.client(id).window(&surface);
+        win.set_size(1000, 800);
+        win.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+
+        f.synoik_state().do_action(
+            Action::MoveFloatingWindowById {
+                id: None,
+                x: synoik_ipc::PositionChange::SetFixed(100.),
+                y: synoik_ipc::PositionChange::SetFixed(100.),
+            },
+            false,
+        );
+        f.settle();
+
+        let output = f.synoik_output(1);
+        let window = f.synoik().layout.focus().unwrap().window.clone();
+        let synoik = f.synoik();
+        // Grabbed near the *bottom* of the window on purpose. The pointer has to stay well clear
+        // of the top edge — reaching it is edge tiling, which maximizes and answers a different
+        // question — so the only way to push the top edge off the screen is a long lever.
+        synoik.layout.interactive_move_begin(
+            window.clone(),
+            &output,
+            Point::from((200., 700.)),
+            unconstrained,
+        );
+        // Far enough to shake loose, then parked so the window's top is above the output and the
+        // pointer is still 300 rows down it.
+        synoik.layout.interactive_move_update(
+            &window,
+            Point::from((0., -400.)),
+            output.clone(),
+            Point::from((200., 300.)),
+        );
+        synoik.layout.interactive_move_update(
+            &window,
+            Point::from((0., 0.)),
+            output,
+            Point::from((200., 300.)),
+        );
+        synoik.layout.interactive_move_end(&window);
+        f.settle();
+
+        let area = f.synoik().layout.active_workspace().unwrap().working_area();
+        let rect = f
+            .synoik()
+            .layout
+            .session_snapshot(&window)
+            .unwrap()
+            .tile
+            .live_rect
+            .expect("it floats");
+        (f, id, surface, window, rect.loc.y - area.loc.y)
+    };
+
+    // Same drag, one bit apart, so the difference is the exemption and nothing else.
+    let (_, _, _, _, titlebar_drag) = drag_up(false);
+    assert_eq!(
+        titlebar_drag, 0.,
+        "a client-requested move is constrained, so the titlebar stops at the work area top"
+    );
+
+    let (mut f, id, surface, window, super_drag) = drag_up(true);
+    assert!(
+        super_drag < 0.,
+        "a Super+drag may put the titlebar above the top: landed at {super_drag}"
+    );
+
+    // The grab is over, so the next pass over this window runs with `is_user_action` false and
+    // `constrain_titlebar_visible` applies again. A client resize is such a pass.
+    let win = f.client(id).window(&surface);
+    win.set_size(900, 700);
+    win.commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&window)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("it floats");
+    assert!(
+        rect.loc.y >= area.loc.y,
+        "the exemption belongs to the grab: a later resize puts the titlebar back on screen, \
+         but it is at {} against a work area top of {}",
+        rect.loc.y,
+        area.loc.y
+    );
+}
+
 /// A window whose *minimum* size does not fit the new work area is maximized instead of shrunk,
 /// and un-maximized again when an area that can hold it comes back.
 ///

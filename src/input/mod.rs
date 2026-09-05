@@ -9259,9 +9259,16 @@ impl State {
                         };
                         let start_data = PointerOrTouchStartData::Pointer(start_data);
                         let icon = CursorIcon::Grabbing;
-                        if let Some(grab) =
-                            MoveGrab::new(self, start_data, window.clone(), false, Some(icon))
-                        {
+                        // Only the Super+drag is unconstrained; an overview drag is a picker
+                        // drag, which names a workspace and never places the window.
+                        if let Some(grab) = MoveGrab::new(
+                            self,
+                            start_data,
+                            window.clone(),
+                            false,
+                            Some(icon),
+                            mod_down && !is_overview_open,
+                        ) {
                             pointer.set_grab(self, grab, serial, Focus::Clear);
 
                             // Set the cursor to Grabbing right away for Mod+LMB since it doesn't
@@ -10963,7 +10970,9 @@ impl State {
                         location: pos,
                     };
                     let start_data = PointerOrTouchStartData::Touch(start_data);
-                    if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None)
+                    // Reached only under `mod_down`: the touch equivalent of a Super+drag.
+                    if let Some(grab) =
+                        MoveGrab::new(self, start_data, window.clone(), true, None, true)
                     {
                         handle.set_grab(self, grab, serial);
                     }

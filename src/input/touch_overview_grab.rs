@@ -180,10 +180,13 @@ impl TouchGrab<State> for TouchOverviewGrab {
             if let Some(window) = self.window.as_ref().filter(|win| win.alive()) {
                 let passed = timestamp.saturating_sub(self.start_timestamp);
                 if INTERACTIVE_MOVE_THRESHOLD <= passed
+                    // An overview long-press picks up a preview, which names a workspace and
+                    // never places the window: constrained.
                     && layout.interactive_move_begin(
                         window.clone(),
                         &self.output,
                         self.start_pos_within_output,
+                        false,
                     )
                 {
                     self.gesture = GestureState::InteractiveMove;

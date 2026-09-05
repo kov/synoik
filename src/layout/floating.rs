@@ -8,6 +8,7 @@
 
 use std::cmp::max;
 use std::iter::zip;
+use std::mem;
 use std::rc::Rc;
 
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
@@ -232,6 +233,19 @@ struct Data {
 
     /// Working area used for conversions.
     working_area: Rectangle<f64, Logical>,
+
+    /// Whether this window's titlebar may sit above the work area.
+    ///
+    /// mutter's `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED`, which a Super+drag and a keyboard move
+    /// carry (`window.c:7811`, `keybindings.c:2212`) and a client-requested `xdg_toplevel.move` —
+    /// the CSD titlebar drag — does not (`meta-wayland-xdg-shell.c:339`).
+    ///
+    /// Kept on the data rather than in the grab because `recompute_logical_pos` is a *derivation*,
+    /// replayed from `pos` on demand and asserted by `verify_invariants`; a bit that expired with
+    /// the grab would make the next replay disagree with the position on screen. It expires the
+    /// way mutter's does instead — at the next constraint pass, which here is any size or work
+    /// area change, and any placement that is not itself unconstrained.
+    unconstrained_top: bool,
 }
 
 impl Data {
@@ -239,6 +253,7 @@ impl Data {
         working_area: Rectangle<f64, Logical>,
         tile: &Tile<W>,
         logical_pos: Point<f64, Logical>,
+        unconstrained_top: bool,
     ) -> Self {
         let mut rv = Self {
             pos: Point::default(),
@@ -246,9 +261,10 @@ impl Data {
             logical_pos: Point::default(),
             size: Size::default(),
             working_area,
+            unconstrained_top: false,
         };
         rv.update(tile);
-        rv.set_logical_pos(logical_pos);
+        rv.set_logical_pos_maybe_unconstrained(logical_pos, unconstrained_top);
         rv.set_anchor(anchor_for(tile));
         rv
     }
@@ -298,18 +314,17 @@ impl Data {
 
         logical_pos -= self.working_area.loc;
         logical_pos.x = f64::max(logical_pos.x, -max_off_screen_hor);
-        // No allowance at the top. mutter's `constrain_titlebar_visible` expands the usable region
-        // by the off-screen amount to the left, to the right and downwards, but by 0 upwards —
-        // "Don't let titlebar off" (`constraints.c:1996`).
-        //
-        // Divergence, deliberate and narrow: mutter lifts this for a grab carrying
-        // `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` — a Super+drag or a keyboard move
-        // (`window.c:7811`, `keybindings.c:2212`), but *not* a client-requested
-        // `xdg_toplevel.move`, which is the CSD titlebar drag (`meta-wayland-xdg-shell.c:339`).
-        // Both of ours reach one `MoveGrab`, which carries no origin, so a Super+drag is clamped
-        // here too. Closing it means threading the origin from `MoveGrab::new` through
-        // `interactive_move_begin` to the drop.
-        logical_pos.y = f64::max(logical_pos.y, 0.);
+        // No allowance at the top, unless the grab that placed the window was one of the two
+        // mutter exempts. `constrain_titlebar_visible` expands the usable region by the off-screen
+        // amount to the left, to the right and downwards, but by 0 upwards — "Don't let titlebar
+        // off" (`constraints.c:1996`) — and lifts that only for
+        // `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED`. See [`Self::unconstrained_top`].
+        let max_off_screen_top = if self.unconstrained_top {
+            max_off_screen_ver
+        } else {
+            0.
+        };
+        logical_pos.y = f64::max(logical_pos.y, -max_off_screen_top);
         logical_pos.x = f64::min(
             logical_pos.x,
             self.working_area.size.w - self.size.w + max_off_screen_hor,
@@ -335,6 +350,9 @@ impl Data {
         let old = self.working_area;
         self.working_area = working_area;
 
+        // A work area change is a constraint pass too — the same reason as in `update`.
+        self.unconstrained_top = false;
+
         // A derived position is not carried, it is re-derived: `recompute_logical_pos` already
         // pins a maximized window to the work area and a fullscreen one to the output.
         if self.anchor != Anchor::Free {
@@ -359,10 +377,30 @@ impl Data {
         }
 
         self.size = size;
+        // A resize is a constraint pass, and the grab that earned the exemption is over: mutter
+        // re-runs `constrain_titlebar_visible` here with `is_user_action` false and pulls the
+        // titlebar back down.
+        self.unconstrained_top = false;
         self.recompute_logical_pos();
     }
 
     pub fn set_logical_pos(&mut self, logical_pos: Point<f64, Logical>) {
+        self.set_logical_pos_maybe_unconstrained(logical_pos, false);
+    }
+
+    /// Places the window with the top clamp lifted — see [`Self::unconstrained_top`].
+    pub fn set_logical_pos_unconstrained(&mut self, logical_pos: Point<f64, Logical>) {
+        self.set_logical_pos_maybe_unconstrained(logical_pos, true);
+    }
+
+    fn set_logical_pos_maybe_unconstrained(
+        &mut self,
+        logical_pos: Point<f64, Logical>,
+        unconstrained_top: bool,
+    ) {
+        // A constrained placement retracts the exemption: it is the window being put somewhere by
+        // something that is not the grab that earned it.
+        self.unconstrained_top = unconstrained_top;
         self.pos = Self::logical_to_size_frac_in_working_area(self.working_area, logical_pos);
 
         // This will clamp the logical position to the current working area.
@@ -931,7 +969,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
         });
 
-        let data = Data::new(self.working_area, &tile, pos);
+        // Taken off the tile: it rides the drop from the grab that placed it, and is spent here.
+        let unconstrained_top = mem::take(&mut tile.unconstrained_top);
+        let data = Data::new(self.working_area, &tile, pos, unconstrained_top);
         self.data.insert(idx, data);
         self.tiles.insert(idx, tile);
 
@@ -1618,6 +1658,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.interactive_resize_end(None);
     }
 
+    /// [`Self::move_to`] for a grab mutter exempts from the titlebar clamp — see
+    /// [`Data::unconstrained_top`]. Unanimated: it is a keyboard step, and the window is already
+    /// where the last step left it.
+    fn move_to_unconstrained(&mut self, idx: usize, new_pos: Point<f64, Logical>) {
+        self.data[idx].set_logical_pos_unconstrained(new_pos);
+        self.interactive_resize_end(None);
+    }
+
     fn move_by(&mut self, amount: Point<f64, Logical>) {
         let Some(active_id) = &self.active_window_id else {
             return;
@@ -2130,7 +2178,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         };
 
         let new_pos = self.data[idx].logical_pos + amount;
-        self.move_to(idx, new_pos, false);
+        // The keyboard move is one of the two grabs carrying
+        // `META_GRAB_OP_WINDOW_FLAG_UNCONSTRAINED` (`keybindings.c:2212`), so it may walk a
+        // titlebar off the top of the display.
+        self.move_to_unconstrained(idx, new_pos);
         true
     }
 

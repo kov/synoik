@@ -586,6 +586,9 @@ enum InteractiveMoveState<W: LayoutElement> {
         ///
         /// This helps the pointer remain inside the window as it resizes.
         pointer_ratio_within_window: (f64, f64),
+        /// Carried from the grab that started this, for the [`InteractiveMoveData`] the rubber
+        /// band eventually becomes.
+        unconstrained: bool,
     },
     /// Moving; the window is no longer in the layout.
     Moving(InteractiveMoveData<W>),
@@ -605,6 +608,9 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) is_full_width: bool,
     /// Whether the window targets the floating layout.
     pub(self) is_floating: bool,
+    /// Whether this grab is one mutter exempts from the titlebar clamp — a Super+drag, not a
+    /// client-requested `xdg_toplevel.move`. See [`floating::Data::unconstrained_top`].
+    pub(self) unconstrained: bool,
     /// Pointer location within the visual window geometry as ratio from geometry size.
     ///
     /// This helps the pointer remain inside the window as it resizes.
@@ -3521,6 +3527,7 @@ impl<W: LayoutElement> Layout<W> {
                     window_id,
                     pointer_delta: _,
                     pointer_ratio_within_window: _,
+                    unconstrained: _,
                 } => {
                     assert!(
                         self.has_window(window_id),
@@ -5333,6 +5340,7 @@ impl<W: LayoutElement> Layout<W> {
         window_id: W::Id,
         output: &Output,
         start_pos_within_output: Point<f64, Logical>,
+        unconstrained: bool,
     ) -> bool {
         if self.interactive_move.is_some() {
             return false;
@@ -5393,6 +5401,7 @@ impl<W: LayoutElement> Layout<W> {
             window_id,
             pointer_delta: Point::from((0., 0.)),
             pointer_ratio_within_window,
+            unconstrained,
         });
 
         for mon in self.monitors_mut() {
@@ -5425,12 +5434,14 @@ impl<W: LayoutElement> Layout<W> {
                 window_id,
                 mut pointer_delta,
                 pointer_ratio_within_window,
+                unconstrained,
             } => {
                 if window_id != *window {
                     self.interactive_move = Some(InteractiveMoveState::Starting {
                         window_id,
                         pointer_delta,
                         pointer_ratio_within_window,
+                        unconstrained,
                     });
                     return false;
                 }
@@ -5491,6 +5502,7 @@ impl<W: LayoutElement> Layout<W> {
                     window_id: window_id.clone(),
                     pointer_delta,
                     pointer_ratio_within_window,
+                    unconstrained,
                 });
 
                 // mutter shakes a maximized window loose after shake_threshold
@@ -5628,6 +5640,7 @@ impl<W: LayoutElement> Layout<W> {
                     width,
                     is_full_width,
                     is_floating,
+                    unconstrained,
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
@@ -6003,6 +6016,9 @@ impl<W: LayoutElement> Layout<W> {
                             // Dropping a window is the user placing it, so a displaced geometry
                             // stops being one to go back to — the same rule a resize follows.
                             tile.displaced_rect = None;
+                            // Only a drop that places the window can carry the exemption; a picker
+                            // drop names a workspace and leaves the position alone.
+                            tile.unconstrained_top = move_.unconstrained;
 
                             match insert_ws {
                                 InsertWorkspace::Existing(_) => {

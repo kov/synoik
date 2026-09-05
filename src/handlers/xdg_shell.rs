@@ -205,13 +205,17 @@ impl XdgShellHandler for State {
 
         match &start_data {
             PointerOrTouchStartData::Pointer(_) => {
-                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                if let Some(grab) =
+                    MoveGrab::new(self, start_data, window.clone(), true, None, false)
+                {
                     pointer.set_grab(self, grab, serial, Focus::Clear);
                 }
             }
             PointerOrTouchStartData::Touch(_) => {
                 let touch = self.synoik.seat.get_touch().unwrap();
-                if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
+                if let Some(grab) =
+                    MoveGrab::new(self, start_data, window.clone(), true, None, false)
+                {
                     touch.set_grab(self, grab, serial);
                 }
             }
