@@ -587,23 +587,51 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.tile_width_for_window_width(f64::from(win_size.w)),
             tile.tile_height_for_window_height(f64::from(win_size.h)),
         ));
-        let fits = tile_size.w >= desired.size.w && tile_size.h >= desired.size.h;
+        // Judged at the precision a configure can carry, which is why this compares window sizes
+        // and not `tile_size` against `desired.size`. A configure holds integers, so `win_size` has
+        // already been through `round()`; a desired size with a fraction in it — 1691.33, which is
+        // what a 1.5-scaled display hands back — asks for 1691, gets a 1691.0 tile, and 1691.0 is
+        // not >= 1691.33. The comparison could then never come out true on a fractional scale, and
+        // since only the *position* restore is gated on it, the window came back its old size at a
+        // new place. Both sides now go through the same rounding.
+        let desired_win = Size::<i32, Logical>::from((
+            tile.window_width_for_tile_width(desired.size.w).round() as i32,
+            tile.window_height_for_tile_height(desired.size.h).round() as i32,
+        ));
+        let fits = win_size.w >= desired_win.w && win_size.h >= desired_win.h;
         // Whether the fit fits: a minimum size bigger than the area comes back out of the clamp
-        // unchanged, and no size we could ask for would help.
-        let fit_at_all = tile_size.w <= area.size.w && tile_size.h <= area.size.h;
+        // unchanged, and no size we could ask for would help. Compared in the same integer window
+        // frame as `fits`, and for the same reason: a fractional work area — 963.75, what a
+        // 1.333-scaled display hands back — asks for 964, gets a 964.0 tile, and 964.0 is not
+        // <= 963.75, so a window we just sized to the area would read as not fitting at all and be
+        // auto-maximized instead.
+        let available_win = Size::<i32, Logical>::from((
+            tile.window_width_for_tile_width(area.size.w).round() as i32,
+            tile.window_height_for_tile_height(area.size.h).round() as i32,
+        ));
+        let fit_at_all = win_size.w <= available_win.w && win_size.h <= available_win.h;
 
         // Unanimated, for `refit_to_working_area`'s reason: the user did not ask for this, the
         // area moved underneath them, and mutter re-constrains such a window instantly.
         let tile = &mut self.tiles[idx];
         if fits {
-            let Some(desired) = tile.displaced_rect.take() else {
+            let Some(desired) = tile.displaced_rect else {
                 return Fitted::default();
             };
-            tile.window_mut().request_size_once(win_size, false);
             let restored = Rectangle::new(desired.loc + area.loc, desired.size);
+            // The size request goes out either way — this area can hold it, and it is what the
+            // window asked for. The remembered *rect* is only spent once it can actually be put
+            // back: an area that holds the size but not the position — a display tall enough for
+            // the window but not for where it sat, a panel that grew — would otherwise consume the
+            // memory and leave the next area with nothing to restore to.
+            let restorable = area.contains_rect(restored);
+            if restorable {
+                tile.displaced_rect = None;
+            }
+            tile.window_mut().request_size_once(win_size, false);
             return Fitted {
                 tile_size: Some(tile_size),
-                restore_pos: area.contains_rect(restored).then_some(restored.loc),
+                restore_pos: restorable.then_some(restored.loc),
             };
         }
 

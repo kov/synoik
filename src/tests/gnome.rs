@@ -4761,6 +4761,32 @@ fn take_the_configured_size(f: &mut Fixture, id: ClientId, surface: &WlSurface) 
     f.settle();
 }
 
+/// Answer every configure these surfaces have outstanding, at the size asked for, until they stop
+/// arriving. A display change is several rounds — the area moves, the window is resized, the resize
+/// is acked, the position is recomputed — and a client that answers only the first round leaves the
+/// layout mid-flight. Unlike [`take_the_configured_size`] it does not insist a configure be there.
+fn ack_configures(f: &mut Fixture, id: ClientId, surfaces: &[WlSurface]) {
+    for _ in 0..4 {
+        f.double_roundtrip(id);
+        for surface in surfaces {
+            let window = f.client(id).window(surface);
+            // `recent_configures` drains, so a serial is only acked once — re-acking one is a
+            // protocol error.
+            let Some(size) = window.recent_configures().last().map(|c| c.size) else {
+                continue;
+            };
+            let window = f.client(id).window(surface);
+            if size.0 > 0 && size.1 > 0 {
+                window.attach_new_buffer();
+                window.set_size(size.0 as u16, size.1 as u16);
+            }
+            window.ack_last_and_commit();
+        }
+        f.double_roundtrip(id);
+        f.settle();
+    }
+}
+
 /// Whether the layout has *committed* `window` to maximized — the client has acked.
 fn window_is_maximized(f: &mut Fixture, window: &smithay::desktop::Window) -> bool {
     f.synoik()
@@ -31726,6 +31752,160 @@ fn a_window_shrunk_for_a_smaller_display_lands_wholly_inside_it() {
         area.contains_rect(rect),
         "a window the compositor moved lands wholly inside the work area: \
          {rect:?} is not inside {area:?}"
+    );
+}
+
+/// A window that fits again comes back to where it sat, on a fractionally scaled display.
+///
+/// The remembered rect is only spendable when the window can be given its size back, and that
+/// comparison used to be made between a rounded tile size and an unrounded remembered one. A
+/// configure carries integers, so a window whose logical size has a fraction in it — every window
+/// on a 1.5-scaled display, since its buffer rounds to whole physical pixels — asks for 1691, gets
+/// 1691.0 back, and 1691.0 is not >= 1691.33. The test that gates the *position* restore could
+/// therefore never come out true on such a display: the window returned its old size at a new
+/// place. One output, one mode change and back: no migration, nothing else varies.
+#[test]
+fn a_window_on_a_fractional_scale_returns_to_its_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.5));
+
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1691, 1197), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            x: synoik_ipc::PositionChange::SetFixed(666.),
+            y: synoik_ipc::PositionChange::SetFixed(142.),
+        },
+        false,
+    );
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    let rect_of = |f: &mut Fixture, w: &smithay::desktop::Window| {
+        f.synoik()
+            .layout
+            .session_snapshot(w)
+            .unwrap()
+            .tile
+            .live_rect
+            .expect("it floats")
+    };
+    let before = rect_of(&mut f, &win);
+    // The size is fractional, which is the whole point of the fixture: 1691 logical columns at 1.5
+    // is 2536.5 physical, and a buffer is whole pixels.
+    assert_ne!(
+        before.size.w.fract(),
+        0.,
+        "a 1.5-scaled display is what makes the size fractional: {before:?}"
+    );
+
+    // Too short for 1197 rows: the window is shrunk and its rect remembered.
+    f.resize_output(1, Some((2048, 1328)), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+    let shrunk = rect_of(&mut f, &win);
+    assert!(
+        shrunk.size.h < before.size.h,
+        "the smaller mode must actually shrink it: {shrunk:?}"
+    );
+
+    f.resize_output(1, Some((3840, 2160)), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    let after = rect_of(&mut f, &win);
+    assert_eq!(
+        (after.loc.x.round(), after.loc.y.round()),
+        (before.loc.x.round(), before.loc.y.round()),
+        "the window fits again, so it belongs where it was: {after:?} came back from {before:?}"
+    );
+    assert!(
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .displaced_rect
+            .is_none(),
+        "a rect that has been restored is spent"
+    );
+}
+
+/// A work area that holds the size but not the position does not consume the remembered rect.
+///
+/// mutter keeps `unconstrained_rect` until the constraint pass stops overriding it, and the
+/// override is the whole rect, not just its size. An intermediate area big enough for the window
+/// but not for where it sat — a display tall enough at one mode and not the next, a panel that grew
+/// — used to spend the memory on a position it then declined to use, so the area that could have
+/// restored it found nothing left. Scale 1 throughout: only the area varies.
+#[test]
+fn an_area_that_cannot_restore_the_position_keeps_the_rect() {
+    let mut f = Fixture::new();
+    f.add_output(1, (2560, 1440));
+    // Short enough that 1197 rows do not fit, so the migration shrinks the window and remembers.
+    f.add_output(2, (2048, 1000));
+
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (1691, 1197), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            x: synoik_ipc::PositionChange::SetFixed(666.),
+            y: synoik_ipc::PositionChange::SetFixed(142.),
+        },
+        false,
+    );
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+    let before = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("it floats");
+
+    f.remove_output(1);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    // 1296 rows of work area: enough for 1197, but not for 1197 starting at row 174, so the
+    // position cannot be restored here even though the size can.
+    f.resize_output(2, Some((2048, 1328)), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+    let snap = f.synoik().layout.session_snapshot(&win).unwrap();
+    assert_eq!(
+        snap.tile.live_rect.unwrap().size.h.round(),
+        before.size.h.round(),
+        "this area can hand the size back"
+    );
+    assert!(
+        snap.tile.displaced_rect.is_some(),
+        "and cannot hand the position back, so it keeps owing one"
+    );
+
+    f.resize_output(2, Some((2048, 1000)), None);
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+    f.add_output(1, (2560, 1440));
+    ack_configures(&mut f, id, std::slice::from_ref(&surface));
+
+    let after = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("it floats");
+    assert_eq!(
+        (after.loc.x.round(), after.loc.y.round()),
+        (before.loc.x.round(), before.loc.y.round()),
+        "the display that can restore the position still has one to restore: \
+         {after:?} came back from {before:?}"
     );
 }
 
