@@ -77,9 +77,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use synoik_ipc::SceneBreakdown;
 
 thread_local! {
     /// Number of widget bakes this thread has run. A bake is an uncached
@@ -1410,6 +1412,48 @@ pub fn instance_shrinks(
     lines
 }
 
+/// The live [`SceneBreakdown`] setting, as a `u8` so it costs one relaxed load on the frame path.
+///
+/// `u8::MAX` means "not read from the environment yet"; every other value is a discriminant.
+static SCENE_BREAKDOWN: AtomicU8 = AtomicU8::new(u8::MAX);
+
+fn encode_scene_breakdown(mode: SceneBreakdown) -> u8 {
+    match mode {
+        SceneBreakdown::Off => 0,
+        SceneBreakdown::Totals => 1,
+        SceneBreakdown::Verbose => 2,
+    }
+}
+
+/// Change what [`log_scene_breakdown`] logs from here on. Overrides `SYNOIK_SCENE_BREAKDOWN`.
+pub fn set_scene_breakdown(mode: SceneBreakdown) {
+    SCENE_BREAKDOWN.store(encode_scene_breakdown(mode), Ordering::Relaxed);
+}
+
+/// What to log now, reading `SYNOIK_SCENE_BREAKDOWN` once if nothing has set it.
+///
+/// The env is read under a race that can run twice and cannot disagree: both racers compute the
+/// same value from the same environment, so the loser storing after the winner is a no-op. A
+/// concurrent [`set_scene_breakdown`] can be overwritten by that store, which is why this reads
+/// the env at all only while the value is still the sentinel.
+fn scene_breakdown_mode() -> SceneBreakdown {
+    let mut raw = SCENE_BREAKDOWN.load(Ordering::Relaxed);
+    if raw == u8::MAX {
+        let mode = match std::env::var("SYNOIK_SCENE_BREAKDOWN") {
+            Ok(v) if v == "verbose" => SceneBreakdown::Verbose,
+            Ok(_) => SceneBreakdown::Totals,
+            Err(_) => SceneBreakdown::Off,
+        };
+        raw = encode_scene_breakdown(mode);
+        SCENE_BREAKDOWN.store(raw, Ordering::Relaxed);
+    }
+    match raw {
+        1 => SceneBreakdown::Totals,
+        2 => SceneBreakdown::Verbose,
+        _ => SceneBreakdown::Off,
+    }
+}
+
 /// Log which *elements* a frame's `scene` overdraw went to, when `SYNOIK_SCENE_BREAKDOWN` is set.
 ///
 /// The frame line splits coverage by [`DrawSite`](synoik_vk::stats::DrawSite) — scene vs blur vs
@@ -1424,6 +1468,10 @@ pub fn instance_shrinks(
 /// Off by default and one atomic load when off. On, it logs one frame in [`EVERY`]: the breakdown
 /// of a settled scene does not change, and a per-frame log of ninety elements would push
 /// everything else out of the journal.
+///
+/// `SYNOIK_SCENE_BREAKDOWN` sets the starting mode; [`set_scene_breakdown`] changes it after that.
+/// Both, because the frames worth attributing are usually the ones a live seat is rendering *now*,
+/// and restarting the compositor to set an environment variable ends the session that had them.
 pub fn log_scene_breakdown<E>(
     elements: &[E],
     scale: smithay::utils::Scale<f64>,
@@ -1434,13 +1482,10 @@ pub fn log_scene_breakdown<E>(
     /// Log one frame in this many.
     const EVERY: u64 = 240;
 
-    static MODE: OnceLock<Option<bool>> = OnceLock::new();
-    let verbose = match MODE.get_or_init(|| match std::env::var("SYNOIK_SCENE_BREAKDOWN") {
-        Ok(v) => Some(v == "verbose"),
-        Err(_) => None,
-    }) {
-        Some(verbose) => *verbose,
-        None => return,
+    let verbose = match scene_breakdown_mode() {
+        SceneBreakdown::Off => return,
+        SceneBreakdown::Totals => false,
+        SceneBreakdown::Verbose => true,
     };
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if !SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(EVERY) {

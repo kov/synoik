@@ -1099,6 +1099,18 @@ pub enum Action {
         /// Slack in milliseconds.
         millis: f64,
     },
+    /// Log which elements a frame's `scene` overdraw is going to.
+    ///
+    /// The frame line splits coverage by draw site -- scene vs blur vs text -- which says which
+    /// *class* to attack and no more. This names the elements paying for the scene term, one
+    /// frame in 240. It is a runtime switch rather than only the `SYNOIK_SCENE_BREAKDOWN`
+    /// environment variable because the frames worth attributing are the ones a live seat is
+    /// rendering now, and restarting the compositor to read them ends the session that had them.
+    DebugSetSceneBreakdown {
+        /// `off`, `totals` (the one-line summary), or `verbose` (a line per element).
+        #[cfg_attr(feature = "clap", arg(value_enum))]
+        mode: SceneBreakdown,
+    },
     /// Override the battery the panel shows, ignoring UPower until cleared.
     ///
     /// The dynamic battery indicator has five readings (charging, plugged-in-idle, normal, low,
@@ -1665,6 +1677,19 @@ pub struct LogicalOutput {
     /// inspectable output model rather than derived at the D-Bus edge.
     #[serde(default)]
     pub is_primary: bool,
+}
+
+/// How much detail [`Action::DebugSetSceneBreakdown`] asks the frame log for.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum SceneBreakdown {
+    /// Not logged. One relaxed atomic load per frame.
+    #[default]
+    Off,
+    /// The one-line summary: how much of the output the scene's elements cover between them.
+    Totals,
+    /// The summary plus a line per element that the renderer would actually shade.
+    Verbose,
 }
 
 /// Output transform, which goes counter-clockwise.

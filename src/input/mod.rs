@@ -3991,6 +3991,11 @@ impl State {
                 warn!("dispatch deadline margin is now {margin:?}");
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugSetSceneBreakdown(mode) => {
+                crate::frame_log::set_scene_breakdown(mode);
+                warn!("scene breakdown is now {mode:?}");
+                self.synoik.queue_redraw_all();
+            }
             Action::DebugToggleDamage(age) => {
                 self.synoik.debug_toggle_damage(age.map(usize::from));
             }
@@ -11844,6 +11849,7 @@ fn is_debug_action(action: &Action) -> bool {
             | Action::DebugDumpScanout
             | Action::DebugToggleDeadlineDispatch
             | Action::DebugSetRenderTimeMargin(_)
+            | Action::DebugSetSceneBreakdown(_)
             | Action::DebugSetBattery(..)
             | Action::DebugSetNetwork(..)
             | Action::DebugToggleOutput(_)

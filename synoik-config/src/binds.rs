@@ -132,6 +132,7 @@ pub enum Action {
     DebugDumpScanout,
     DebugToggleDeadlineDispatch,
     DebugSetRenderTimeMargin(f64),
+    DebugSetSceneBreakdown(synoik_ipc::SceneBreakdown),
     /// Percentage, UPower state spelling, UPower warning-level spelling.
     DebugSetBattery(f64, String, String),
     DebugSetNetwork(String, bool, bool, Vec<String>, Vec<String>),
@@ -750,6 +751,9 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
             synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {
                 Self::DebugSetRenderTimeMargin(millis)
+            }
+            synoik_ipc::Action::DebugSetSceneBreakdown { mode } => {
+                Self::DebugSetSceneBreakdown(mode)
             }
             synoik_ipc::Action::DebugSetBattery {
                 percentage,
