@@ -9,6 +9,34 @@
 //! `render_helpers::background_effect`. What these cover is the seam between: the protocol object,
 //! the double-buffered commit, our post-commit hook, and the lazily-recomputed rect cache. A bug
 //! anywhere along there means no blur at all, silently — the surface just renders as it always did.
+//!
+//! ## What this harness models, and what it still does not
+//!
+//! The capture guards below (`a_client_repainting_itself_…`, `a_front_window_repainting_…`,
+//! `a_self_repaint_…_swapchain`) exist to reproduce a live seat that re-runs a blur chain on ~88%
+//! of frames while nothing behind the effect changes. They do not reproduce it. Each was added by
+//! closing one gap between this harness and a seat, so the list of what is closed is also the list
+//! of what has been ruled out:
+//!
+//! - **A real wallpaper** behind the scene (`add_wallpaper`). Without one the backdrop is the clear
+//!   colour, and blurring a constant returns that constant — a flat fill is the one backdrop that
+//!   cannot show a stale blur, so a harness without a wallpaper cannot tell a correct capture from
+//!   a skipped one.
+//! - **Two overlapping blurred windows**, only the front one repainting.
+//! - **A cycling swapchain** with true buffer ages (`render_frame_aged`). The plain `render_frame`
+//!   renders into one reused offscreen at `age = 1`, so the damage a frame owes is always just that
+//!   frame's; a seat cycles three or four buffers and an older one owes several frames of damage.
+//!
+//! Still unmodelled, in the order worth trying next:
+//!
+//! - **`DrmCompositor`.** There is no KMS here, so these drive `OutputDamageTracker` directly. The
+//!   screen path wraps it with plane assignment and its own element-state bookkeeping.
+//! - **A panel whose backdrop actually captures.** It never does in this harness, which is why the
+//!   panel case is not pinned at all: the test written for it asserted its own precondition away.
+//! - **Client buffers via dmabuf** rather than the solid shm buffers used here.
+//!
+//! When adding to this list, make the assertion **absolute** (zero captures), never "no more than
+//! some other frame" — under the defect every frame recaptures, so a relative bound passes.
 
 use std::time::Duration;
 
@@ -217,6 +245,37 @@ fn render_frame_aged(
         .expect("the fixture must have a Vulkan renderer");
 
     (trace::take_captures(), trace::take())
+}
+
+/// Put the session's real wallpaper behind the scene.
+///
+/// Without this the scene below a blurred window is the clear colour — a flat fill — and a flat
+/// fill is the one backdrop that cannot show a stale blur, because blurring a constant returns
+/// that same constant (`ui/panel.rs`, on why a wallpaper-less session still looks right). A
+/// harness that omits it therefore cannot tell a correct capture from a skipped one by looking at
+/// pixels, and the effects that sample it may not behave as they do on a seat.
+///
+/// Decoded synchronously — there is no decode worker here — and staged into device memory the way
+/// the session does. Once per fixture, outside any measured frame.
+/// Returns `false` when this machine ships no picture to use, so the caller can skip rather than
+/// quietly measure the flat-fill scene this exists to avoid. A silent fallback here would leave
+/// the test green while testing the thing it was written to stop testing.
+#[must_use]
+fn add_wallpaper(f: &mut Fixture) -> bool {
+    let Some(picture) = crate::tests::vulkan_render::wallpaper_picture() else {
+        return false;
+    };
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some(picture),
+        options: crate::gnome::BackgroundOptions::default(),
+    };
+    let gpu = f
+        .synoik_state()
+        .backend
+        .with_vulkan_renderer(|r| r.gpu().clone());
+    f.synoik().wallpaper.update(&settings, gpu.as_ref());
+    f.settle();
+    true
 }
 
 fn render_frame(
@@ -809,6 +868,10 @@ fn a_client_repainting_itself_does_not_recapture_its_backdrop() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1280, 720));
+    if !add_wallpaper(&mut f) {
+        eprintln!("skipping: no wallpaper picture on this machine");
+        return;
+    }
 
     let id = f.add_client();
     let window = f.client(id).create_window();
@@ -902,6 +965,10 @@ fn a_front_window_repainting_does_not_recapture_a_window_behind_it() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1280, 720));
+    if !add_wallpaper(&mut f) {
+        eprintln!("skipping: no wallpaper picture on this machine");
+        return;
+    }
 
     // Two blurred, translucent windows. Both are centered by the default placement, so they
     // overlap heavily — which is the point: the front one's damage covers the rear one's backdrop.
@@ -993,6 +1060,10 @@ fn a_self_repaint_does_not_recapture_across_a_cycling_swapchain() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1280, 720));
+    if !add_wallpaper(&mut f) {
+        eprintln!("skipping: no wallpaper picture on this machine");
+        return;
+    }
 
     let id = f.add_client();
     let window = f.client(id).create_window();
