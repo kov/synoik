@@ -42,9 +42,21 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// outlives us instead of dying in the compositor's cgroup.
 const IBUS_UNIT: &str = "org.freedesktop.IBus.session.GNOME.service";
 
-/// The floor between two attempts to revive the daemon. A daemon that keeps dying must not be
-/// fought: one start per interval, no matter how fast the redial loop spins.
+/// The floor between two attempts to revive the daemon, doubling up to [`REVIVE_MAX`] while the
+/// attempts keep failing. A daemon that keeps dying must not be fought: one start per interval,
+/// no matter how fast the redial loop spins.
 const REVIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The ceiling that interval doubles to. A seat where the unit can never start — a session
+/// without gnome-session, so `gnome-session-initialized.target` is never active and every job
+/// dies with `dependency` — must settle into a heartbeat instead of failing a job every 30s for
+/// the life of the session.
+const REVIVE_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// How long to wait for systemd to finish the start job before giving up on hearing its result.
+/// Timing out is **not** a start: the only thing a start buys is a redial ramp, and an
+/// unconfirmed one must not get it.
+const JOB_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the worker. Returns immediately; the thread lives as long as the request channel does.
 ///
@@ -69,9 +81,11 @@ async fn run(
     revive_daemon: bool,
 ) {
     let mut backoff = RETRY_START;
+    let mut revive_interval = REVIVE_INTERVAL;
     let mut last_revive: Option<Instant> = None;
     loop {
-        match session(&requests, &to_compositor).await {
+        let mut connected = false;
+        match session(&requests, &to_compositor, &mut connected).await {
             // The request channel closed: the compositor is going away.
             Ok(()) => return,
             Err(err) => {
@@ -82,19 +96,29 @@ async fn run(
             }
         }
 
+        // A daemon we did reach and then lost is a different situation from one that was never
+        // there: whatever made the last revive pointless no longer holds, so the intervals start
+        // over rather than inheriting a ceiling earned by a seat state that has since changed.
+        if connected {
+            revive_interval = REVIVE_INTERVAL;
+        }
+
         // No daemon means no dead keys and no Compose *for every client on the seat*: we
         // advertise `zwp_text_input_v3` unconditionally, which is what makes GTK drop its own
         // compose table (see the note atop `crate::dbus::ibus`). So an absent daemon is not
         // something to wait out — it is something to fix. Killing a wedged `ibus-daemon` is the
         // standing workaround for it eating a core, and `Restart=on-abnormal` in the unit does
         // not cover a clean SIGTERM, so a killed daemon stays dead until something asks for it.
-        let stale = last_revive.is_none_or(|at| at.elapsed() >= REVIVE_INTERVAL);
+        let stale = last_revive.is_none_or(|at| at.elapsed() >= revive_interval);
         if revive_daemon && stale {
             last_revive = Some(Instant::now());
             if revive().await {
                 // The daemon is coming up now; redial promptly rather than sitting out the
                 // slow heartbeat this loop has settled into.
                 backoff = RETRY_START;
+                revive_interval = REVIVE_INTERVAL;
+            } else {
+                revive_interval = (revive_interval * 2).min(REVIVE_MAX);
             }
         }
 
@@ -162,7 +186,12 @@ enum UnitStart {
     Refused,
 }
 
-/// `StartUnit` on the systemd *user* manager.
+/// `StartUnit` on the systemd *user* manager, waited out to its **job result**.
+///
+/// `StartUnit` returns a job path, not an outcome: systemd accepting the job says nothing about
+/// the unit coming up. A session that never reaches `gnome-session-initialized.target` — a
+/// compositor started outside gnome-session — has every job die with `dependency` seconds later,
+/// and reading the accepted job as a start told the redial loop a daemon was on its way forever.
 async fn start_unit() -> UnitStart {
     let call = async {
         let conn = zbus::Connection::session().await?;
@@ -173,14 +202,44 @@ async fn start_unit() -> UnitStart {
             "org.freedesktop.systemd1.Manager",
         )
         .await?;
+        // Subscribed before the call, so a job that finishes immediately is not missed.
+        let mut jobs = manager.receive_signal("JobRemoved").await?;
         // "replace" is systemd's ordinary queueing mode, and what `systemctl start` uses.
         let job: zbus::zvariant::OwnedObjectPath =
             manager.call("StartUnit", &(IBUS_UNIT, "replace")).await?;
-        Ok::<_, zbus::Error>(job)
+
+        let result = async {
+            while let Some(message) = jobs.next().await {
+                let body = message.body();
+                let Ok((_id, path, _unit, result)) =
+                    body.deserialize::<(u32, zbus::zvariant::OwnedObjectPath, String, String)>()
+                else {
+                    continue;
+                };
+                if path == job {
+                    return Some(result);
+                }
+            }
+            None
+        };
+        let result = std::pin::pin!(result);
+        let timeout = std::pin::pin!(async_io::Timer::after(JOB_TIMEOUT));
+        Ok::<_, zbus::Error>(match future::select(result, timeout).await {
+            future::Either::Left((result, _)) => result,
+            future::Either::Right(_) => None,
+        })
     };
 
     let err = match call.await {
-        Ok(_job) => return UnitStart::Started,
+        // systemd ran the job to completion and it worked.
+        Ok(Some(result)) if result == "done" => return UnitStart::Started,
+        // The job failed, was cancelled, timed out, or died on a dependency; or we never heard
+        // its result. None of those is a daemon on its way, and spawning behind a unit that
+        // exists is not ours to do, so this is the same answer as an outright refusal.
+        Ok(other) => {
+            tracing::debug!("{IBUS_UNIT} did not start: job result {other:?}");
+            return UnitStart::Refused;
+        }
         Err(err) => err,
     };
     tracing::debug!("could not start {IBUS_UNIT}: {err:?}");
@@ -203,6 +262,7 @@ async fn start_unit() -> UnitStart {
 async fn session(
     requests: &async_channel::Receiver<ImRequest>,
     to_compositor: &calloop::channel::Sender<ImUpdate>,
+    connected: &mut bool,
 ) -> anyhow::Result<()> {
     let (_conn, bus, ctx) = ibus::connect().await?;
     tracing::info!("connected to ibus");
@@ -267,6 +327,7 @@ async fn session(
     ];
     let mut events = stream::select_all(streams);
 
+    *connected = true;
     if to_compositor.send(ImUpdate::Connected(true)).is_err() {
         return Ok(());
     }
