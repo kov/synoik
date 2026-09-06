@@ -38782,3 +38782,225 @@ fn the_wifi_tile_flips_the_radio_and_opening_its_list_scans() {
         f.synoik().panel_popover.focused_row_label()
     );
 }
+
+/// Every workspace thumbnail's shadow must run along all four of its sides, at every scale.
+///
+/// A drop shadow is drawn as separate bars — top, bottom and two sides, plus corner pieces once
+/// the radius earns them — and they are derived by cutting the card's own box out of the shadow's
+/// (`layout::shadow`), with both ceil-rounded to physical pixels. So a side is not a property of
+/// the shadow but a *remainder*, and a remainder can round away. When one does, the other three
+/// bars still draw: the thumbnail keeps a shadow everywhere except that edge, which reads on
+/// screen as one thumbnail flatter than its neighbours rather than as anything obviously broken.
+///
+/// Swept across scales because rounding is the whole risk here and it is not monotonic — a bar can
+/// survive 1.5 and 2.0 and vanish at 1.75. A guard pinned at one scale is free to pass while the
+/// shape is open at another, and 1.0 is the least likely value to catch anything, being the one
+/// where nothing has to round at all.
+///
+/// Asserted on the elements' geometry rather than on pixels: what would fail is a bar that is
+/// never emitted, and geometry names *which* side with no dependence on the theme's shadow colour
+/// or on there being a wallpaper behind the strip.
+///
+/// The assignment of bars to cards carries the tolerances this needs, and they are not cosmetic:
+/// a bar sits just outside the edge it draws, so an overlap test — even one allowing touching —
+/// drops the very bars this looks for and reports a whole shadow as open. That false failure is
+/// what this test did first, and it survived being "confirmed" against a real screenshot.
+#[test]
+fn a_thumbnail_shadow_closes_on_every_side_at_every_scale() {
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    if crate::render_helpers::vulkan::VulkanRenderer::new().is_err() {
+        eprintln!("skipping: no Vulkan device");
+        return;
+    }
+
+    // 4/3 and 1.5 are the two the reporting seat runs; the rest bracket them, and 2.0 is the one
+    // that was broken. Integral and fractional both, since the bars are rounded to physical pixels.
+    /// The panel this was found on, in physical pixels.
+    const OUT_W: i32 = 2048;
+    const OUT_H: i32 = 1328;
+
+    let mut open = Vec::new();
+    for scale in [1.0, 1.25, 4. / 3., 1.5, 1.75, 2.0, 3.0] {
+        let mut f = Fixture::new();
+        f.synoik_state()
+            .backend
+            .headless()
+            .add_renderer()
+            .expect("build the Vulkan renderer");
+        f.add_output(1, (OUT_W as u16, OUT_H as u16));
+        f.resize_output(1, None, Some(scale));
+        f.settle();
+
+        // Enough workspaces that the strip is a row of thumbnails rather than a single one, with
+        // the active in the middle so both its neighbours are ordinary.
+        for _ in 0..6 {
+            let id = f.add_client();
+            let _ = map_focused_window(&mut f, id);
+            f.settle();
+            f.synoik_state()
+                .do_action(Action::FocusWorkspaceDown, false);
+            f.settle();
+        }
+        for _ in 0..4 {
+            f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+            f.settle();
+        }
+
+        f.synoik_state().do_action(Action::OpenOverview, false);
+        f.settle();
+
+        let output = f.synoik_output(1);
+        let (band_top, band_bottom, cards) = strip_band_physical(&mut f, &output);
+        // The active thumbnail's shadow is thrown deeper than its neighbours', so the window has
+        // to be the band plus that reach — clipping at the band exactly would drop the active
+        // one's bottom bar and indict it for a bug that is this filter's.
+        let reach = (60. * scale).round() as i32;
+
+        let state = f.synoik_state();
+        let rects = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let synoik = &mut state.synoik;
+                synoik.update_render_elements(Some(&output));
+                let ctx = RenderCtx {
+                    renderer: vk,
+                    target: RenderTarget::Output,
+                    appearance: Some(synoik.appearance()),
+                };
+                let elements = synoik.render_to_vec(ctx, &output, false);
+                let scale_f = output.current_scale().fractional_scale();
+                elements
+                    .iter()
+                    .filter(|e| format!("{e:?}").contains("Shadow"))
+                    .map(|e| {
+                        smithay::backend::renderer::element::Element::geometry(e, scale_f.into())
+                    })
+                    // The strip's shadows only. The workspace row below the band casts its own,
+                    // and they are excluded two ways because neither alone is enough: they reach
+                    // outside the band's glow window (its tall side bars), and they are far wider
+                    // than a thumbnail (its full-row bar, which would otherwise bridge every
+                    // group into one).
+                    .filter(|g: &Rectangle<i32, Physical>| {
+                        g.loc.y >= band_top - reach
+                            && g.loc.y + g.size.h <= band_bottom + reach
+                            && g.size.w * 3 < OUT_W
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("the fixture must have a Vulkan renderer");
+
+        // Only the cards the band actually shows: a scrolled row can park one wholly outside,
+        // and a card that is not drawn casts nothing.
+        let onscreen: Vec<_> = cards
+            .iter()
+            .filter(|c| c.loc.x >= 0 && c.loc.x + c.size.w <= OUT_W)
+            .collect();
+        assert!(
+            onscreen.len() >= 3 && !rects.is_empty(),
+            "precondition at scale {scale}: {} card(s) on screen and {} shadow rect(s) — a test \
+             that found neither would pass every assertion below for the wrong reason",
+            onscreen.len(),
+            rects.len(),
+        );
+
+        for (n, card) in onscreen.iter().enumerate() {
+            // Every bar hugging this card: the ones that overlap it horizontally and sit within
+            // its own vertical reach. Assigning by overlap rather than by containment is what
+            // keeps the active thumbnail's deeper shadow — which is thrown *outside* its slot —
+            // attached to the card that cast it.
+            let mine: Vec<_> = rects
+                .iter()
+                .filter(|r| {
+                    // A few pixels of slack, not plain overlap: a side bar sits just *outside*
+                    // the edge it draws, and rounding can start it a pixel past the card, so an
+                    // overlap test — even one that allows touching — drops the very bar this is
+                    // here to find and reports a shadow as open when it is whole. Kept far below
+                    // the gap between cards so a neighbour's bar is never claimed.
+                    r.loc.x <= card.loc.x + card.size.w + 6
+                        && r.loc.x + r.size.w >= card.loc.x - 6
+                        && r.loc.y < card.loc.y + card.size.h + (band_bottom - band_top)
+                        && r.loc.y + r.size.h > card.loc.y - (band_bottom - band_top)
+                })
+                .collect();
+            assert!(
+                !mine.is_empty(),
+                "at scale {scale}, thumbnail {n} casts no shadow at all.\ncard: {card:?}",
+            );
+
+            // Each side needs a bar that *runs along* it, not merely something reaching past the
+            // card's edge. Enclosure alone is too weak to see this: with the bottom bar gone the
+            // two side bars still overhang the card's bottom, so a bounding-box test passes while
+            // the shadow is visibly open. Asked of every side, because which one rounds away is
+            // the part that varies.
+            let (cl, cr) = (card.loc.x, card.loc.x + card.size.w);
+            let (ct, cb) = (card.loc.y, card.loc.y + card.size.h);
+            let spans_w = |r: &&Rectangle<i32, Physical>| r.size.w * 5 >= card.size.w * 4;
+            let spans_h = |r: &&Rectangle<i32, Physical>| r.size.h * 5 >= card.size.h * 4;
+
+            // A bar is not flush against its edge — it runs from outside the card to under it,
+            // where the card hides the inner half — so what marks it is reaching *past* that
+            // edge while running the length of it.
+            let top = mine.iter().any(|r| r.loc.y < ct && spans_w(r));
+            let bottom = mine.iter().any(|r| r.loc.y + r.size.h > cb && spans_w(r));
+            let left = mine.iter().any(|r| r.loc.x < cl && spans_h(r));
+            let right = mine.iter().any(|r| r.loc.x + r.size.w > cr && spans_h(r));
+
+            // Collected rather than asserted here: which *scales* break is the finding, and
+            // stopping at the first would report one of them as if it were the whole story.
+            if !(top && bottom && left && right) {
+                let missing: Vec<_> = [
+                    (!top).then_some("top"),
+                    (!bottom).then_some("bottom"),
+                    (!left).then_some("left"),
+                    (!right).then_some("right"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                open.push(format!(
+                    "scale {scale}: thumbnail {n} has no {}",
+                    missing.join("+")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        open.is_empty(),
+        "a thumbnail's shadow is missing a whole side at some scales, while the other sides still \
+         draw — so the shape reads as open, and at the scales below every thumbnail in the strip \
+         is affected at once:\n  {}",
+        open.join("\n  "),
+    );
+}
+
+/// The thumbnail band's top and bottom in physical pixels — the window the strip's own shadows
+/// live in, as against the far larger ones the workspace row below it casts — plus each
+/// thumbnail slot's horizontal span, which is what says who a shadow bar belongs to.
+fn strip_band_physical(
+    f: &mut Fixture,
+    output: &Output,
+) -> (i32, i32, Vec<Rectangle<i32, Physical>>) {
+    let scale = output.current_scale().fractional_scale();
+    let mon = f
+        .synoik()
+        .layout
+        .monitors()
+        .find(|m| m.output() == output)
+        .expect("the output must have a monitor");
+    let strip = mon
+        .thumbnail_strip()
+        .expect("the overview must show a strip");
+    let cards = mon
+        .thumbnail_drawn_rects()
+        .into_iter()
+        .map(|c| c.to_physical_precise_round(scale))
+        .collect();
+    (
+        (strip.band.loc.y * scale).round() as i32,
+        ((strip.band.loc.y + strip.band.size.h) * scale).round() as i32,
+        cards,
+    )
+}

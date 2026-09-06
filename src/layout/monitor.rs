@@ -2753,6 +2753,39 @@ impl<W: LayoutElement> Monitor<W> {
     /// **Read this, not [`Self::expose_progress`], for anything that shapes the strip.** The two
     /// differ in exactly the way that matters: `expose_progress` also drives the window spread and
     /// the desktop's own geometry, which the peek must leave alone.
+    /// Each thumbnail's rect **as drawn**, in view coordinates — the slot shrunk by that
+    /// thumbnail's render scale and re-centred in it, with the row's slide applied.
+    ///
+    /// A thumbnail is drawn inset inside its slot ([`thumbnail_drawn_rect`]) by an amount that
+    /// depends on its distance from the active one, so the slot is not where the miniature — or
+    /// the shadow hugging it — actually lands. Anything measuring against what is on screen wants
+    /// this, not `Strip::thumbs`.
+    pub fn thumbnail_drawn_rects(&self) -> Vec<Rectangle<f64, Logical>> {
+        let Some(strip) = self.thumbnail_strip() else {
+            return Vec::new();
+        };
+        let Some(progress) = self.strip_progress() else {
+            return Vec::new();
+        };
+        let slide = Point::from((0., self.thumbnail_slide_offset(&strip, progress)));
+        (0..self.workspaces.len().min(strip.thumbs.len()))
+            .map(|idx| self.thumbnail_drawn_rect_at(idx, &strip, slide))
+            .collect()
+    }
+
+    /// One thumbnail's drawn rect. The render loop has `strip` and `slide` in hand already, so it
+    /// goes through here rather than through [`Self::thumbnail_drawn_rects`], which would lay the
+    /// row out again for every frame — but both derive the rect the same single way, so what a
+    /// test measures cannot drift from what the renderer drew.
+    fn thumbnail_drawn_rect_at(
+        &self,
+        idx: usize,
+        strip: &Strip,
+        slide: Point<f64, Logical>,
+    ) -> Rectangle<f64, Logical> {
+        thumbnail_drawn_rect(strip.thumbs[idx], self.strip_render_scale(idx), slide)
+    }
+
     pub fn strip_progress(&self) -> Option<f64> {
         if let Some(progress) = self.expose_progress() {
             return Some(progress);
@@ -4136,9 +4169,9 @@ impl<W: LayoutElement> Monitor<W> {
             .into_iter()
             .chain((0..n).filter(|i| carried != Some(*i)));
         for idx in order {
-            let (ws, slot) = (&self.workspaces[idx], &strip.thumbs[idx]);
+            let ws = &self.workspaces[idx];
             let shrink = self.strip_render_scale(idx);
-            let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
+            let thumb = self.thumbnail_drawn_rect_at(idx, &strip, slide);
             let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
 
@@ -4255,6 +4288,20 @@ impl<W: LayoutElement> Monitor<W> {
             .to_physical_precise_round(scale);
             let push_shadow = &mut |elem: ShadowRenderElement| {
                 let elem = elem.with_alpha(progress.clamp(0., 1.) as f32);
+                if std::env::var_os("CROP_DBG").is_some() {
+                    let g = smithay::backend::renderer::element::Element::geometry(
+                        &elem,
+                        smithay::utils::Scale::from(scale),
+                    );
+                    eprintln!(
+                        "CROPDBG idx={idx} crop={:?} {:?} elem={:?} {:?} kept={}",
+                        glow_crop.loc,
+                        glow_crop.size,
+                        g.loc,
+                        g.size,
+                        CropRenderElement::from_element(elem.clone(), scale, glow_crop).is_some(),
+                    );
+                }
                 if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_crop) {
                     let elem = MonitorInnerRenderElement::CroppedShadow(elem);
                     let elem =
