@@ -705,6 +705,104 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
     );
 }
 
+/// A client repainting its **own** surface must not make its backdrop re-capture and re-blur.
+///
+/// This is the whole cost argument for a blurred window on a desktop that is not idle. A terminal
+/// running a spinner commits ~10 times a second, and Mesa's Vulkan WSI marks the *entire* surface
+/// damaged on every present (measured on a real ghost session: 821 of 821 `damage_buffer` calls
+/// were `0,0,INT32_MAX,INT32_MAX`). None of that changes what is *behind* the window, so the
+/// captured backdrop is still valid and the gaussian chain must not run again. Measured on the
+/// live seat, re-running it costs 0.250 ms of a 1.310 ms frame — 19%.
+///
+/// The sibling test `moving_the_effect_recaptures_even_with_a_static_backdrop` pins the opposite
+/// direction, and its idle control pins the third case (nothing happens at all). This one is the
+/// case in between, and it is the one a real session spends its time in: damage every frame,
+/// none of it below the effect.
+///
+/// **The assertion is absolute, not relative.** "Captured no more often than some other frame"
+/// passes when every frame re-captures, which is exactly the bug — the same trap that made a
+/// previous cached-blur regression invisible to its own test. So this counts captures across a
+/// run of foreground-only commits and requires *zero*.
+#[test]
+fn a_client_repainting_itself_does_not_recapture_its_backdrop() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Translucent, for the same reason as the sibling test: an opaque buffer occludes the effect
+    // and the tracker culls it before the framebuffer-effect scan runs, so the effect would never
+    // capture for a reason that has nothing to do with what this test is about.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.settle();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // Warm the tracker and the caches, and confirm the effect is really there: a test that never
+    // rendered the effect at all would count zero captures for the wrong reason.
+    let mut seen_effect = false;
+    for _ in 0..3 {
+        let (_, effects) = render_frame(&mut f, &mut tracker);
+        seen_effect |= !effects.is_empty();
+    }
+    assert!(
+        seen_effect,
+        "precondition: the effect never rendered, so counting its captures proves nothing",
+    );
+
+    // Now do what the client does: attach a new buffer, damage the whole surface, commit. Nothing
+    // moves and nothing behind the window changes.
+    let mut captures = Vec::new();
+    for i in 0..5 {
+        let window = f.client(id).window(&surface);
+        // Alternate the colour so each commit really is new content, not a buffer the compositor
+        // could recognise as identical.
+        let g = if i % 2 == 0 { u32::MAX } else { u32::MAX / 2 };
+        window.attach_solid_buffer(0, g, 0, u32::MAX / 2);
+        window.damage_all();
+        window.commit();
+        f.double_roundtrip(id);
+
+        let (frame_captures, _) = render_frame(&mut f, &mut tracker);
+        captures.extend(frame_captures);
+    }
+
+    assert!(
+        captures.is_empty(),
+        "the client repainted only itself, but its backdrop re-captured and re-blurred {} \
+         time(s). Nothing below the effect changed, so the cached capture was still valid and \
+         the gaussian chain ran for nothing.\ncaptures: {captures:?}",
+        captures.len(),
+    );
+}
+
 /// A blur region set on a **subsurface** must blur that subsurface's own backdrop.
 ///
 /// `docs/fork/client-blur.md` §5 gap 4. The protocol lets a client call `get_background_effect` on
