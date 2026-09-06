@@ -114,10 +114,43 @@ pub struct Headless {
     /// the size or transform changes.
     damage_trackers: HashMap<Output, OutputDamageTracker>,
 
+    /// One swapchain per output: the buffers a frame is actually rendered into, and when each was
+    /// last drawn.
+    ///
+    /// Headless renders for real rather than only computing damage, because the alternative is
+    /// that every test wanting a rendered frame stages its own — its own texture, its own tracker,
+    /// its own `render_output` — and then asserts about *that* loop rather than about the
+    /// compositor's. Eighteen call sites had grown that way, three of them with subtly different
+    /// ideas of what a buffer age is.
+    ///
+    /// Several slots, not one, because the damage a frame owes is a function of its target's age:
+    /// a buffer last drawn three frames ago owes three frames of damage, and a harness that always
+    /// renders into the same buffer at age 1 never asks for any of that. It is also the only way
+    /// the age-dependent half of the effect and blur paths is reachable at all.
+    swapchains: HashMap<Output, Swapchain>,
+
     /// Displays [unplugged](Self::unplug_output) at runtime, so the same panel can be plugged back
     /// in. A headless run has no hardware to pull the cable on, and what a display going away and
     /// coming back costs is the whole of `docs/fork/multi-display.md`.
     unplugged: Vec<UnpluggedOutput>,
+}
+
+/// How many buffers a headless output cycles through.
+///
+/// Three is the shallow end of what a real swapchain runs, and enough for an age to reach 3 — past
+/// the age-1 case that a single-buffer harness collapses everything into.
+const SWAPCHAIN_SLOTS: usize = 3;
+
+/// The buffers one output cycles through, with the frame number each was last drawn into.
+struct Swapchain {
+    /// `(buffer, frame it was last rendered into)`. A `0` means never drawn, which is the age
+    /// smithay reads as "no usable history, repaint everything".
+    slots: Vec<(crate::render_helpers::vulkan::VkTexture, u64)>,
+    /// Size the slots were made for. A mode change remakes them rather than rendering a frame into
+    /// a buffer of the wrong size.
+    size: Size<i32, smithay::utils::Physical>,
+    /// Frames rendered into this output, counted from 1 so that `0` can mean "never".
+    frame: u64,
 }
 
 /// A display that was unplugged, kept so plugging it back in is the *same* display.
@@ -177,6 +210,7 @@ impl Headless {
             #[cfg(test)]
             damage_log: None,
             damage_trackers: HashMap::new(),
+            swapchains: HashMap::new(),
             unplugged: Vec::new(),
         }
     }
@@ -210,6 +244,7 @@ impl Headless {
                 .unwrap()
                 .retain(|_, ipc| ipc.name != connector);
             self.damage_trackers.remove(&output);
+            self.swapchains.remove(&output);
             synoik.remove_output(&output);
             return true;
         }
@@ -497,19 +532,75 @@ impl Headless {
             .damage_trackers
             .entry(output.clone())
             .or_insert_with(|| OutputDamageTracker::from_output(output));
-        match damage_tracker.damage_output(1, &elements) {
-            Ok((_damage, states)) => {
+
+        // Render, rather than only computing damage. `damage_output` stops short of the half of
+        // the frame that draws — so `capture_framebuffer`, every offscreen and every blur chain
+        // were unreachable through this backend, and a test that wanted one had to stage a render
+        // of its own. See [`Headless::swapchains`].
+        let size = output.current_mode().map_or_else(Size::default, |m| m.size);
+        let renderer = self.renderer.as_mut().expect("checked at the top");
+        let chain = self
+            .swapchains
+            .entry(output.clone())
+            .or_insert_with(|| Swapchain {
+                slots: Vec::new(),
+                size,
+                frame: 0,
+            });
+        if chain.size != size {
+            chain.slots.clear();
+            chain.size = size;
+        }
+        while chain.slots.len() < SWAPCHAIN_SLOTS {
+            match crate::render_helpers::create_texture(
+                renderer,
+                size,
+                crate::render_helpers::NATIVE_FOURCC,
+            ) {
+                Ok(texture) => chain.slots.push((texture, 0)),
+                Err(err) => {
+                    warn!("error creating a headless swapchain buffer: {err:?}");
+                    return RenderElementStates::default();
+                }
+            }
+        }
+        chain.frame += 1;
+        let index = (chain.frame as usize - 1) % chain.slots.len();
+        // Age is how many frames back this slot was last drawn into. Zero means never, which is
+        // what smithay reads as "no usable history".
+        let age = match chain.slots[index].1 {
+            0 => 0,
+            last => (chain.frame - last) as usize,
+        };
+        chain.slots[index].1 = chain.frame;
+
+        let mut framebuffer =
+            match smithay::backend::renderer::Bind::bind(renderer, &mut chain.slots[index].0) {
+                Ok(fb) => fb,
+                Err(err) => {
+                    warn!("error binding a headless swapchain buffer: {err:?}");
+                    return RenderElementStates::default();
+                }
+            };
+        match damage_tracker.render_output(
+            renderer,
+            &mut framebuffer,
+            age,
+            &elements,
+            [0., 0., 0., 1.],
+        ) {
+            Ok(res) => {
                 #[cfg(test)]
                 if let Some(log) = &mut self.damage_log {
                     log.push(FrameDamage {
                         output: output.name(),
-                        damage: _damage.cloned(),
+                        damage: res.damage.cloned(),
                     });
                 }
-                states
+                res.states
             }
             Err(err) => {
-                warn!("error computing headless render element states: {err:?}");
+                warn!("error rendering a headless frame: {err:?}");
                 RenderElementStates::default()
             }
         }
