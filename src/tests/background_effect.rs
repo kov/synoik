@@ -151,6 +151,74 @@ fn sample_with_damage(
 /// Render one real frame through `tracker`, returning what the capture grabbed and what the effect
 /// resolved. Unlike `sample_with_damage` this actually draws, which is the only way
 /// `capture_framebuffer` runs at all.
+/// As [`render_frame`], but cycling `n` distinct framebuffers the way a real swapchain does, and
+/// reporting each one's true age.
+///
+/// The headless harness has no `DrmCompositor` and no KMS, so a test that renders into one reused
+/// offscreen at `age = 1` is not exercising the buffer cycling a seat actually runs. That matters
+/// here because the damage a frame must repaint is a function of its target's age: a buffer last
+/// drawn three frames ago owes three frames of damage, and whether an effect's "did anything below
+/// me change" test sees one frame of damage or three is exactly the question.
+fn render_frame_aged(
+    f: &mut Fixture,
+    tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker,
+    buffers: &mut Vec<(crate::render_helpers::vulkan::VkTexture, u64)>,
+    slots: usize,
+    frame_no: u64,
+) -> (
+    Vec<crate::render_helpers::background_effect::trace::CaptureSample>,
+    Vec<crate::render_helpers::background_effect::trace::EffectSample>,
+) {
+    use smithay::backend::renderer::Bind;
+    use smithay::utils::{Physical, Size};
+
+    use crate::render_helpers::background_effect::trace;
+    use crate::render_helpers::{create_texture, RenderCtx, RenderTarget, NATIVE_FOURCC};
+
+    let _ = trace::take();
+    let _ = trace::take_captures();
+
+    let output = f.synoik_output(1);
+    let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            while buffers.len() < slots {
+                buffers.push((
+                    create_texture(vk, size, NATIVE_FOURCC).expect("create offscreen"),
+                    0,
+                ));
+            }
+            let idx = (frame_no as usize) % slots;
+            // Age is how many frames back this slot was last rendered into; 0 means never, which
+            // is what smithay reads as "no usable history, repaint everything".
+            let age = if buffers[idx].1 == 0 {
+                0
+            } else {
+                frame_no - buffers[idx].1
+            };
+            buffers[idx].1 = frame_no;
+
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, &output, false);
+            let mut fb = vk.bind(&mut buffers[idx].0).expect("bind offscreen");
+            tracker
+                .render_output(vk, &mut fb, age as usize, &elements, [0., 0., 0., 1.])
+                .expect("render output");
+        })
+        .expect("the fixture must have a Vulkan renderer");
+
+    (trace::take_captures(), trace::take())
+}
+
 fn render_frame(
     f: &mut Fixture,
     tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker,
@@ -799,6 +867,191 @@ fn a_client_repainting_itself_does_not_recapture_its_backdrop() {
         "the client repainted only itself, but its backdrop re-captured and re-blurred {} \
          time(s). Nothing below the effect changed, so the cached capture was still valid and \
          the gaussian chain ran for nothing.\ncaptures: {captures:?}",
+        captures.len(),
+    );
+}
+
+/// Two overlapping blurred windows: repainting the front one must not recapture *either*
+/// backdrop.
+///
+/// The single-window case is pinned above; this is the shape the live seat actually runs, and the
+/// one that shows 4092 captures in 4651 frames. Two ghost terminals overlapping by roughly a third
+/// of the output, only the front one animating.
+///
+/// Both directions matter and they fail differently. The front window's own damage must not reach
+/// **its own** backdrop, which sits directly beneath it — that is a z-order question, and getting
+/// the "damage from below" slice backwards would make every self-repaint recapture. And it must
+/// not reach the **rear** window's backdrop either, which is further down still but whose region
+/// the front window overlaps: a trigger keyed on plain rect overlap rather than on z-order would
+/// fire there even with the slice the right way round.
+#[test]
+fn a_front_window_repainting_does_not_recapture_a_window_behind_it() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    // Two blurred, translucent windows. Both are centered by the default placement, so they
+    // overlap heavily — which is the point: the front one's damage covers the rear one's backdrop.
+    let mut surfaces = Vec::new();
+    for _ in 0..2 {
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+        window.set_size(400, 300);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+        f.double_roundtrip(id);
+        f.settle();
+        f.double_roundtrip(id);
+        surfaces.push((id, surface));
+    }
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // Warm up, and require that *both* effects are really in the scene: if only one ever renders,
+    // a zero-capture result says nothing about the pair.
+    let mut most_effects = 0;
+    for _ in 0..3 {
+        let (_, effects) = render_frame(&mut f, &mut tracker);
+        most_effects = most_effects.max(effects.len());
+    }
+    assert_eq!(
+        most_effects, 2,
+        "precondition: expected two blurred windows in the scene, saw {most_effects}",
+    );
+
+    // Repaint only the front window — the last one mapped, which is on top.
+    let (front_id, front_surface) = surfaces.last().cloned().expect("two windows");
+    let mut captures = Vec::new();
+    for i in 0..5 {
+        let window = f.client(front_id).window(&front_surface);
+        let g = if i % 2 == 0 { u32::MAX } else { u32::MAX / 2 };
+        window.attach_solid_buffer(0, g, 0, u32::MAX / 2);
+        window.damage_all();
+        window.commit();
+        f.double_roundtrip(front_id);
+
+        let (frame_captures, _) = render_frame(&mut f, &mut tracker);
+        captures.extend(frame_captures);
+    }
+
+    assert!(
+        captures.is_empty(),
+        "only the front window repainted, but {} backdrop capture(s) ran. Its own damage is \
+         above its backdrop, and above the window behind it, so neither backdrop's input \
+         changed.\ncaptures: {captures:?}",
+        captures.len(),
+    );
+}
+
+/// The same self-repaint, rendered through a **cycling swapchain** instead of one reused buffer.
+///
+/// This is the variable the two tests above hold fixed and a real seat does not. They render into
+/// a single offscreen at `age = 1`, so the damage a frame owes is always just that frame's. A seat
+/// cycles three or four buffers, and a buffer last drawn three frames ago owes three frames of
+/// damage — which puts *earlier* frames' damage, including the client's own previous repaints,
+/// inside the window the effect's "did anything below me change" test looks at.
+///
+/// If a self-repaint recaptures here but not above, the age is the trigger and the fix belongs in
+/// how the effect's damage window is computed, not in how the client behaves.
+#[test]
+fn a_self_repaint_does_not_recapture_across_a_cycling_swapchain() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.settle();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // Three slots, the shallow end of what a seat runs.
+    const SLOTS: usize = 3;
+    let mut buffers = Vec::new();
+    let mut frame_no = 0u64;
+
+    // Warm every slot, so no capture below can be blamed on a first-ever render into it.
+    let mut seen_effect = false;
+    for _ in 0..(SLOTS * 2) {
+        frame_no += 1;
+        let (_, effects) = render_frame_aged(&mut f, &mut tracker, &mut buffers, SLOTS, frame_no);
+        seen_effect |= !effects.is_empty();
+    }
+    assert!(
+        seen_effect,
+        "precondition: the effect never rendered, so counting its captures proves nothing",
+    );
+
+    let mut captures = Vec::new();
+    for i in 0..9 {
+        let window = f.client(id).window(&surface);
+        let g = if i % 2 == 0 { u32::MAX } else { u32::MAX / 2 };
+        window.attach_solid_buffer(0, g, 0, u32::MAX / 2);
+        window.damage_all();
+        window.commit();
+        f.double_roundtrip(id);
+
+        frame_no += 1;
+        let (frame_captures, _) =
+            render_frame_aged(&mut f, &mut tracker, &mut buffers, SLOTS, frame_no);
+        captures.extend(frame_captures);
+    }
+
+    assert!(
+        captures.is_empty(),
+        "with {SLOTS} swapchain slots the client's own repaints caused {} backdrop capture(s), \
+         though the same sequence into a single buffer causes none. The effect's damage window is \
+         picking up frames of damage that are only being replayed to heal an older \
+         buffer.\ncaptures: {captures:?}",
         captures.len(),
     );
 }
