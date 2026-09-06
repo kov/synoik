@@ -139,7 +139,7 @@ pub struct Headless {
 ///
 /// Three is the shallow end of what a real swapchain runs, and enough for an age to reach 3 — past
 /// the age-1 case that a single-buffer harness collapses everything into.
-const SWAPCHAIN_SLOTS: usize = 3;
+pub(crate) const SWAPCHAIN_SLOTS: usize = 3;
 
 /// The buffers one output cycles through, with the frame number each was last drawn into.
 struct Swapchain {
