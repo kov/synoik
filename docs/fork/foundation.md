@@ -84,7 +84,15 @@ exactly the class of bug this replaces.
 
 **What still uses gbm:** the cursor plane only. `DrmCompositor` takes a `GbmDevice` purely for
 CPU-written `CURSOR | WRITE` buffers framed with `framebuffer_from_bo`; Vulkan never sees them.
-(The cursor is software today anyway — §6.)
+
+The cursor plane is live: `ALLOW_CURSOR_PLANE_SCANOUT` is set unconditionally in
+`compositor_frame_flags` and only `debug.disable_cursor_plane` clears it, so pointer motion is a
+plane flip rather than a full repaint. This needs the smithay fork's
+`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` support (`ff981660`, plus `596854ca` for output transforms) —
+without it a para-virtualized guest shows a double cursor. There is still a software fallback, but
+it is conditional, not the norm: with no gbm cursor allocator `DrmCompositor` refuses the plane and
+the cursor element falls through to the primary, costing a full frame per motion
+(`backend/tty.rs:825`).
 
 ### The implicit-modifier plane
 
@@ -642,10 +650,6 @@ Everything here was measured. Re-deriving any of it costs a day.
 
 Slottable any time:
 
-- **The hardware cursor plane.** We composite in software because smithay never sets
-  `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, which otherwise produces a double cursor. Blocked on the
-  smithay fork patch; a real HW offload we are not using, and it removes a full repaint per pointer
-  motion.
 - **Skip the import on our own scanout buffers.** `DrmCompositor` hands the renderer a `Dmabuf` and
   `import_dmabuf_target` builds a *second* `VkImage` around it — correct but redundant, since the
   allocator already holds the `VkImage` that memory belongs to. Registering it against the exported
