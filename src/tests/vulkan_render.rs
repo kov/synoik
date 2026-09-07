@@ -14932,3 +14932,239 @@ fn vulkan_draws_the_wifi_list_and_its_padlocks() {
          {secure} ink px secured vs {open} open"
     );
 }
+
+/// The screen must hold the frame a full redraw would have produced.
+///
+/// A capture — synoik's screenshot, `render_to_vec`, every screencast path — re-renders the element
+/// list into a fresh target with full damage, so it can never show an under-damage bug: it paints
+/// every pixel it is asked about. The screen is the opposite. It is a swapchain slot several frames
+/// old, and a pixel nobody damaged keeps whatever a previous frame left there. So a report of the
+/// form "it looks wrong on screen and right in a screenshot" is, by construction, a damage report,
+/// and this is the differential that can see it.
+///
+/// The window is deliberately a **buffer larger than its `window_geometry`** — the shape of a CSD
+/// client, whose drop shadow lives in the buffer outside the geometry. That margin is the part a
+/// capture and the screen were seen to disagree about in the overview.
+fn a_settled_frame_matches_a_full_redraw(
+    minimize: bool,
+    wallpaper: bool,
+) -> Option<(u64, Rectangle<i32, Physical>)> {
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    if crate::render_helpers::vulkan::VulkanRenderer::new().is_err() {
+        eprintln!("skipping: no Vulkan device");
+        return None;
+    }
+
+    const OUT_W: u16 = 1280;
+    const OUT_H: u16 = 800;
+    /// The buffer, and the geometry inside it. The difference is the CSD margin.
+    const BUF: i32 = 400;
+    const INSET: i32 = 50;
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    f.settle();
+
+    // A wallpaper is not decoration here: it is what puts a *picture* behind the overview instead
+    // of a flat solid, so the backdrop's blur has real content to capture and the
+    // framebuffer-effect pass runs at all. The reported seat has one; a solid-colour desktop
+    // exercises neither.
+    if wallpaper {
+        let picture = wallpaper_picture()?;
+        let settings = crate::gnome::BackgroundSettings {
+            picture: Some(picture),
+            options: crate::gnome::BackgroundOptions::default(),
+        };
+        let gpu = f
+            .synoik_state()
+            .backend
+            .with_vulkan_renderer(|r| r.gpu().clone());
+        f.synoik().wallpaper.update(&settings, gpu.as_ref());
+        f.settle();
+    }
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BUF, BUF, 255, 0, 255, 255);
+    window.set_window_geometry(INSET, INSET, BUF - INSET * 2, BUF - INSET * 2);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    if minimize {
+        f.synoik_state().do_action(Action::MinimizeWindow, false);
+        f.settle();
+    }
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+
+    // Cycle the swapchain past age 1 with frames that damage almost nothing, which is what a
+    // settled overview under a moving pointer actually is. A slot drawn three frames ago owes three
+    // frames of damage; getting that accounting wrong is the bug this looks for, and a harness that
+    // renders one frame into one buffer can never reach it.
+    //
+    // The clock has to cross the estimated-vblank deadline, not merely reach it: a redraw queued
+    // while the output already waits on its vblank parks until the clock is *past* it, so advancing
+    // by exactly one refresh interval lands the frame on a coin flip. `run_until_settled` advances
+    // by exactly the interval, which is why settling alone drew two frames for this whole scene.
+    const PAST_VBLANK: Duration = Duration::from_micros(17_667);
+    let output = f.synoik_output(1);
+    // Record what the tracker asked the screen to repaint, so the assert below can prove this
+    // differential is capable of failing: if every pumped frame repaints the whole output, the two
+    // arms agree for a reason that has nothing to do with damage, and a green run means nothing.
+    f.synoik_state().backend.headless().damage_log = Some(Vec::new());
+    f.freeze_clock();
+    for _ in 0..(crate::backend::headless::SWAPCHAIN_SLOTS * 3) {
+        // Ask for the frame outright. A settled scene queues no redraw of its own, and the point
+        // here is a *settled* scene rendered several times over — the damage the tracker computes
+        // for each of those frames is the thing under test, and it is free to be empty.
+        f.synoik().queue_redraw(&output);
+        f.advance_clock(PAST_VBLANK);
+        f.dispatch();
+        // `Fixture::refresh` is `State::refresh`, which reconciles but never draws — the draw is in
+        // `refresh_and_flush_clients`, the loop's post-dispatch pass. Settling this whole scene
+        // through the former rendered two frames in total.
+        f.synoik_state().refresh_and_flush_clients();
+    }
+
+    let frames = f
+        .synoik_state()
+        .backend
+        .headless()
+        .damage_log
+        .take()
+        .expect("the damage log was armed above");
+    let full_area = i64::from(OUT_W) * i64::from(OUT_H);
+    assert!(
+        frames.len() >= crate::backend::headless::SWAPCHAIN_SLOTS,
+        "only {} frames were drawn; the swapchain never cycled, so no slot is older than one \
+         frame and partial damage is never exercised",
+        frames.len()
+    );
+    assert!(
+        frames.iter().any(|d| d.area() < full_area),
+        "every one of the {} frames repainted the whole output, so this differential could not \
+         have caught an under-damage bug even if there were one",
+        frames.len()
+    );
+
+    // The screen: the slot as damage tracking left it.
+    let (screen, w, h) = f
+        .synoik_state()
+        .backend
+        .headless()
+        .last_frame_pixels(&output)
+        .expect("the compositor must have drawn a frame");
+
+    // The capture: the same element list, full damage, fresh target.
+    let state = f.synoik_state();
+    let full = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<Vec<u8>> {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, &output, true);
+            crate::render_helpers::render_to_vec(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+        })
+        .expect("the fixture must hold a Vulkan renderer")
+        .expect("compositing through Vulkan must not error");
+
+    assert_eq!(
+        screen.len(),
+        full.len(),
+        "the two arms must be the same frame"
+    );
+
+    // Count differing pixels and box them, so a failure says *where* the screen went stale rather
+    // than only that it did. One channel step of slack: the two arms take different render passes
+    // to the same pixels, and a rounding difference is not a missing repaint.
+    let mut differing = 0u64;
+    let mut bbox: Option<Rectangle<i32, Physical>> = None;
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let off = (0..4).any(|c| screen[i + c].abs_diff(full[i + c]) > 1);
+            if !off {
+                continue;
+            }
+            differing += 1;
+            let px = Rectangle::new(Point::from((x, y)), Size::from((1, 1)));
+            bbox = Some(bbox.map_or(px, |b| {
+                let x0 = b.loc.x.min(x);
+                let y0 = b.loc.y.min(y);
+                let x1 = (b.loc.x + b.size.w).max(x + 1);
+                let y1 = (b.loc.y + b.size.h).max(y + 1);
+                Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)))
+            }));
+        }
+    }
+    Some((differing, bbox.unwrap_or_default()))
+}
+
+#[test]
+fn the_overview_screen_matches_a_full_redraw() {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(false, false) else {
+        return;
+    };
+    assert_eq!(
+        differing, 0,
+        "the screen disagrees with a full redraw over {differing} px in {bbox:?}: damage tracking \
+         left pixels nobody repainted, which is exactly what a screenshot cannot show"
+    );
+}
+
+#[test]
+fn the_overview_screen_matches_a_full_redraw_with_a_minimized_window() {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, false) else {
+        return;
+    };
+    assert_eq!(
+        differing, 0,
+        "with the window minimized the screen disagrees with a full redraw over {differing} px in \
+         {bbox:?}. A minimized client's buffer is frozen, so nothing ever damages it again and the \
+         stale pixels never heal — the reported symptom"
+    );
+}
+
+/// As [`the_overview_screen_matches_a_full_redraw_with_a_minimized_window`], over a wallpaper.
+///
+/// The backdrop's blur only has something to capture when there is a picture behind it, and the
+/// framebuffer-effect pass is the part of the frame that reads *previous* content rather than
+/// drawing its own — the one place where a pixel nobody damaged can be sampled and baked in.
+#[test]
+fn the_overview_screen_matches_a_full_redraw_over_a_wallpaper() {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, true) else {
+        return;
+    };
+    assert_eq!(
+        differing, 0,
+        "over a wallpaper, with the window minimized, the screen disagrees with a full redraw over \
+         {differing} px in {bbox:?}"
+    );
+}

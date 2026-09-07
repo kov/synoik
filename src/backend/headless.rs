@@ -477,6 +477,40 @@ impl Headless {
         self.renderer.as_mut().map(f)
     }
 
+    /// The pixels of the frame the compositor last drew for `output`, as `Abgr8888`.
+    ///
+    /// This reads the **swapchain slot itself**, so what comes back is what damage tracking left
+    /// there: the pixels a previous frame wrote and this one did not repaint are still in it, which
+    /// is the whole point. Anything that re-renders the element list into a fresh target — a
+    /// screenshot, `render_to_vec`, every capture path — draws with full damage and can therefore
+    /// never show an under-damage bug. Compare the two and the difference is exactly the pixels the
+    /// screen was never told to repaint.
+    #[cfg(test)]
+    pub(crate) fn last_frame_pixels(&mut self, output: &Output) -> Option<(Vec<u8>, i32, i32)> {
+        use smithay::backend::renderer::ExportMem as _;
+
+        let chain = self.swapchains.get(output)?;
+        if chain.frame == 0 {
+            return None;
+        }
+        let size = chain.size;
+        let index = (chain.frame as usize - 1) % chain.slots.len();
+        let texture = chain.slots[index].0.clone();
+
+        let renderer = self.renderer.as_mut()?;
+        let region =
+            smithay::utils::Rectangle::from_size(smithay::utils::Size::from((size.w, size.h)));
+        let mapping = renderer
+            .copy_texture(
+                &texture,
+                region,
+                smithay::backend::allocator::Fourcc::Abgr8888,
+            )
+            .ok()?;
+        let pixels = renderer.map_texture(&mapping).ok()?.to_vec();
+        Some((pixels, size.w, size.h))
+    }
+
     /// Which surfaces this redraw is presenting, from the same element pass the tty backend runs.
     ///
     /// Headless has no scanout, but it still owes an answer to "is this surface being presented on
