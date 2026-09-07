@@ -3457,8 +3457,7 @@ fn render_surface_with(
             // Take the `debug-dump-scanout` one-shot now: the frame is rendered and, on a
             // successful submit, the scanout image is at rest in TRANSFER_SRC_OPTIMAL. This is a
             // blocking readback that costs a submit and a wait — debug-only, never per frame.
-            if synoik.dump_scanout_next_frame {
-                synoik.dump_scanout_next_frame = false;
+            if synoik.dump_scanout_pending.remove(&output.name()) {
                 match &res.primary_element {
                     PrimaryPlaneElement::Swapchain(element) => {
                         dump_scanout_png(element.buffer(), &output.name());

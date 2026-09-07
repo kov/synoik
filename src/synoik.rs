@@ -1214,9 +1214,15 @@ pub struct Synoik {
 
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
-    /// One-shot: dump the scanned-out framebuffer to a PNG after the next frame is rendered.
-    /// Set by `Action::DebugDumpScanout`, taken by the tty backend.
-    pub dump_scanout_next_frame: bool,
+    /// One-shot per output: dump each named output's scanned-out framebuffer to a PNG after its
+    /// next frame is rendered. Set by `Action::DebugDumpScanout`, taken by the tty backend, which
+    /// removes an output's name once it has written it.
+    ///
+    /// A set rather than a flag because the backend renders one output per call: a single bool is
+    /// consumed by whichever output happens to draw first, so a two-monitor seat gets a dump of an
+    /// arbitrary one of them and silence for the other — and the one that answers the question is
+    /// as likely as not the one that was dropped.
+    pub dump_scanout_pending: HashSet<String>,
 
     /// Frame-timing instrumentation, off unless `SYNOIK_FRAME_LOG` says otherwise.
     /// See [`crate::frame_log`].
@@ -8379,7 +8385,7 @@ impl Synoik {
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
-            dump_scanout_next_frame: false,
+            dump_scanout_pending: HashSet::new(),
 
             frame_log: FrameLog::from_env(),
 

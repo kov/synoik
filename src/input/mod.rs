@@ -4001,8 +4001,15 @@ impl State {
             }
             Action::DebugDumpScanout => {
                 // Armed here, taken by the tty backend once the next frame has been rendered —
-                // that is the only moment the scanout image is complete and at rest.
-                self.synoik.dump_scanout_next_frame = true;
+                // that is the only moment the scanout image is complete and at rest. Armed for
+                // *every* output: on a multi-monitor seat the interesting one is rarely the one
+                // that happens to draw first.
+                self.synoik.dump_scanout_pending = self
+                    .synoik
+                    .global_space
+                    .outputs()
+                    .map(|output| output.name())
+                    .collect();
                 self.synoik.queue_redraw_all();
             }
             Action::Spawn(command) => {
