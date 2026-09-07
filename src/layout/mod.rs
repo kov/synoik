@@ -1911,7 +1911,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
-                        if ws.has_window(window) {
+                        if ws.holds_window(window) {
                             ws.update_window(window, serial);
                             return;
                         }
@@ -1920,7 +1920,7 @@ impl<W: LayoutElement> Layout<W> {
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
-                    if ws.has_window(window) {
+                    if ws.holds_window(window) {
                         ws.update_window(window, serial);
                         return;
                     }

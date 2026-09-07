@@ -3742,9 +3742,34 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
-        if !self.floating.update_window(window, serial) {
-            self.scrolling.update_window(window, serial);
+        if self.floating.update_window(window, serial) {
+            return;
         }
+
+        // Parked tiles are in neither half, so a commit from a minimized window was swallowed:
+        // `Layout::update_window` looked the workspace up with `has_window`, which does *not*
+        // count the minimized ones, so no workspace claimed the window and the commit was dropped
+        // without ever reaching `on_commit`. A minimized window does keep committing — losing the
+        // focus it was minimized with makes a CSD client redraw in its backdrop state, with a
+        // different buffer, a different geometry and a different opaque region — and the tile kept
+        // answering with what it knew before it was parked.
+        //
+        // Same shape as the `Moving` tile in `Layout::update_window`: ack the serial first so
+        // `Tile::update_window` reads up-to-date state, then recompute the tile.
+        if let Some(parked) = self
+            .minimized
+            .iter_mut()
+            .find(|parked| parked.removed.tile.window().id() == window)
+        {
+            let tile = &mut parked.removed.tile;
+            if let Some(serial) = serial {
+                tile.window_mut().on_commit(serial);
+            }
+            tile.update_window();
+            return;
+        }
+
+        self.scrolling.update_window(window, serial);
     }
 
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
