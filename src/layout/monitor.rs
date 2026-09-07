@@ -1937,10 +1937,12 @@ impl<W: LayoutElement> Monitor<W> {
             1.,
         );
 
-        if let Some(strip) = self.thumbnail_strip() {
+        let drawn_strip = self.drawn_strip();
+
+        if let Some((strip, _)) = &drawn_strip {
             let scale = self.scale.fractional_scale();
 
-            if let Some((rect, is_pill)) = self.strip_gap_mark(&strip) {
+            if let Some((rect, is_pill)) = self.strip_gap_mark(strip) {
                 let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
                 let ring = if is_pill {
                     &mut self.thumb_placeholder
@@ -1976,11 +1978,18 @@ impl<W: LayoutElement> Monitor<W> {
         });
 
         let background_radius = self.workspace_background_radius();
-        // The cull drops every workspace whose geometry misses the output — with the overview
-        // closed, that is all of them but the active one. A peek puts *all* of them on screen as
-        // thumbnails, so their elements have to be updated or the strip draws them stale. Bounded
-        // to the peek: the desktop keeps the cull, and the overview's spread makes it moot.
-        let cull = !self.strip_is_peek();
+        // The cull drops every workspace whose geometry misses the output — with no strip on
+        // screen, that is all of them but the active one.
+        //
+        // Every workspace the strip draws has to be baked here. `render_thumbnails` walks all of
+        // them, while only the slots next to the active one have full-size geometry that still
+        // meets the output, so a culled workspace draws its miniature out of whatever shader
+        // rects it last baked. That is invisible while nothing about it changes and wrong the
+        // moment something does: a workspace moved between outputs of different sizes keeps the
+        // source output's shadow — too small arriving on a larger output, overflowing the strip
+        // arriving on a smaller one — because the move refreshes its config and only this loop
+        // rebakes the shape.
+        let cull = drawn_strip.is_none();
         for (ws, _) in self.workspaces_with_render_geo_mut(cull) {
             ws.update_render_elements(is_active, background_radius);
         }
@@ -2808,6 +2817,15 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
         (self.peek_progress > 0.).then_some(self.peek_progress)
+    }
+
+    /// The strip as it will be drawn: its layout, and the progress it is drawn at.
+    ///
+    /// The single predicate for "the strip puts thumbnails on screen". `render_thumbnails` draws
+    /// exactly when this is `Some`, and `update_render_elements` bakes every workspace exactly
+    /// when this is `Some`, so what is drawn cannot outrun what is baked.
+    pub fn drawn_strip(&self) -> Option<(Strip, f64)> {
+        Some((self.thumbnail_strip()?, self.strip_progress()?))
     }
 
     /// Whether the strip on screen is the peek's rather than the overview's — which is what
@@ -4205,10 +4223,7 @@ impl<W: LayoutElement> Monitor<W> {
         wallpaper: Option<&Wallpaper>,
         push: &mut dyn FnMut(MonitorRenderElement),
     ) {
-        let Some(strip) = self.thumbnail_strip() else {
-            return;
-        };
-        let Some(progress) = self.strip_progress() else {
+        let Some((strip, progress)) = self.drawn_strip() else {
             return;
         };
         let _span = tracy_client::span!("Monitor::render_thumbnails");

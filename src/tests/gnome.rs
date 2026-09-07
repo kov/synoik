@@ -39004,3 +39004,110 @@ fn strip_band_physical(
         cards,
     )
 }
+
+/// A workspace's overview shadow is baked from its output's size, so moving it between outputs of
+/// different heights has to rebake it — and the strip draws every workspace, including the ones
+/// whose full-size geometry has scrolled off the output and out of the update loop's cull.
+///
+/// It reads either way round: too small arriving on a larger output, overflowing the strip
+/// arriving on a smaller one.
+///
+/// Asserted as enclosure rather than against an expected extent, because a shadow's measurements
+/// are the thing under test: reproducing the 9-slice arithmetic here would agree with a wrong
+/// bake as readily as with a right one. A shadow always surrounds its caster, so a hull that no
+/// longer contains the workspace is stale, whatever the numbers.
+#[test]
+fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
+    let mut f = Fixture::new();
+    // Different *heights*: the shadow's softness, spread and offset all normalize by
+    // `view_size.h / 1080`, so two outputs of the same height would bake the same shadow and the
+    // stale one would be indistinguishable from the fresh one.
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (2560, 1440));
+    f.settle();
+
+    // Fill the destination first, so the arriving workspace lands at the end of a row long
+    // enough to put it outside the cull.
+    // The pointer picks the monitor a window maps on, so it has to be over the destination for
+    // these to build the destination's row rather than the source's.
+    pointer_motion_to(&mut f, 1380., 100.);
+    f.settle();
+    for _ in 0..5 {
+        let id = f.add_client();
+        let _ = map_focused_window(&mut f, id);
+        f.settle();
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
+        f.settle();
+    }
+
+    pointer_motion_to(&mut f, 100., 100.);
+    f.settle();
+    let id = f.add_client();
+    let _ = map_focused_window(&mut f, id);
+    f.settle();
+    let moved = f
+        .synoik()
+        .layout
+        .active_workspace()
+        .expect("the source output has an active workspace")
+        .id();
+
+    let destination = f.synoik_output(2).name();
+    f.synoik_state()
+        .do_action(Action::MoveWorkspaceToMonitor(destination), false);
+    f.settle();
+
+    // To the far end of the destination's row: the bug only shows on a workspace the cull drops,
+    // and the active one is never dropped, nor are the slots either side of it.
+    pointer_motion_to(&mut f, 1380., 100.);
+    f.settle();
+    for _ in 0..8 {
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+        f.settle();
+    }
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+
+    let output = f.synoik_output(2);
+    let synoik = f.synoik();
+    synoik.update_render_elements(Some(&output));
+
+    let mon = synoik
+        .layout
+        .monitors()
+        .find(|m| m.output() == &output)
+        .expect("the destination has a monitor");
+    let ws = mon
+        .workspaces_ref()
+        .iter()
+        .find(|ws| ws.id() == moved)
+        .expect("the moved workspace is on the destination");
+
+    // The precondition the bug needs: this workspace's full-size geometry misses the output, so
+    // the cull would drop it while the strip still draws its thumbnail. Without it the test would
+    // pass on a workspace that was never at risk.
+    let culled = !mon
+        .workspaces_with_render_geo()
+        .any(|(ws, _)| ws.id() == moved);
+    assert!(
+        culled,
+        "precondition: the moved workspace is still on screen at full size, so nothing here is \
+         exercised — the destination's row needs to be longer, or scrolled further"
+    );
+
+    let caster = Rectangle::from_size(ws.view_size());
+    let hull = ws
+        .shadow()
+        .shader_rects()
+        .iter()
+        .copied()
+        .reduce(|a, b| a.merge(b))
+        .expect("a workspace shadow is made of at least one rect");
+    assert!(
+        hull.contains_rect(caster),
+        "the moved workspace's shadow {hull:?} does not surround the workspace {caster:?} it is \
+         cast by — it is still the shape baked for the output it came from"
+    );
+}

@@ -3604,7 +3604,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     /// This workspace's overview shadow, for instrumentation only.
-    pub(super) fn shadow(&self) -> &Shadow {
+    pub(crate) fn shadow(&self) -> &Shadow {
         &self.shadow
     }
 
