@@ -316,8 +316,12 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
     // Warm the pipelines and let the tracker take a first, necessarily-full frame, then start the
     // ledgers: the first render into a fresh target is a full repaint by construction and would
     // otherwise be counted as the peek's doing.
+    // `dispatch` pumps the loop; the *turn* is what drains the redraw queue, so without the
+    // refresh this warm frame was never taken here — it landed on the first turn of `body`
+    // instead, and was billed to whatever that arm was measuring.
     f.synoik().queue_redraw_all();
     f.dispatch();
+    f.refresh();
     *counted.borrow_mut() = (0, 0, [0; SITES]);
     f.synoik_state().backend.headless().damage_log = Some(Vec::new());
 
@@ -435,7 +439,7 @@ fn cursor_only(f: &mut Fixture, step: (f64, f64), times: usize) -> Cost {
             f.pointer_motion(step.0, step.1);
             f.advance_clock(FRAME);
             f.dispatch();
-            f.service_redraws();
+            f.refresh();
         }
     })
 }
@@ -477,48 +481,12 @@ fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
 /// tick regardless — which is what a probe reading the wrong seam, or compositing on its own
 /// schedule, would see — then "the peek repaints the screen" is a claim the instrument would make
 /// about a still desktop too, and none of the peek rows would mean anything.
-/// **The second control.** Moving the pointer reaches the compositor, and queues no redraw.
+/// **The second control.** Motion renders, one frame per motion event.
 ///
-/// The motion arms came back at exactly zero frames on a still scene, and a counter that hits
-/// precisely zero has been a blind instrument every previous time in this fork — so it is pinned
-/// here rather than believed. Both halves matter: the pointer really moves (or the arms inject
-/// nothing), and no frame follows (which is why motion is measured on top of a client repaint, not
-/// on a still scene — see [`poke_nudging`]).
-///
-/// A harness artifact, not a property of the compositor. The cursor *is* in the element list this
-/// backend assembles — headless renders with `include_pointer = true`, exactly as the tty backend
-/// does — and `on_pointer_motion` ends in an unconditional `queue_redraw_all`. What is missing is
-/// the drain: the queue is serviced by `refresh_and_flush_clients`, which on a seat runs after
-/// every pass of the event loop that libinput events arrive through, and here runs only when the
-/// compositor's fd wakes. Synthetic input goes straight into `process_input_event`, so the queued
-/// redraw sits there. [`Fixture::service_redraws`] is the seat's pass, asked for by name; the arms
-/// that want the frames motion really costs use it.
-#[test]
-fn the_control_pointer_motion_queues_no_redraw() {
-    let Some((mut f, _)) = build(4) else { return };
-
-    let before = f.synoik().seat.get_pointer().unwrap().current_location();
-    let moved = still(&mut f, |f| {
-        f.pointer_motion(3., 0.);
-    });
-    let after = f.synoik().seat.get_pointer().unwrap().current_location();
-
-    assert_ne!(
-        before, after,
-        "the pointer never moved, so this probe's motion arms are injecting nothing"
-    );
-    assert_eq!(
-        moved.frames, 0,
-        "pointer motion now queues redraws ({} of them). That is a change in what this backend          costs while the mouse moves, and the motion arms in this file — which ride on a client's          frames precisely because motion produced none — are measuring something else now",
-        moved.frames,
-    );
-}
-
-/// **The third control.** Serviced motion renders, one frame per motion event.
-///
-/// The pair to [`the_control_pointer_motion_queues_no_redraw`], and the anti-vacuity guard for the
-/// cursor arms: those read `frames x cost`, and a harness that had quietly stopped draining would
-/// report the cursor as free rather than as broken.
+/// The anti-vacuity guard for the cursor arms: those read `frames x cost`, and a harness that had
+/// quietly stopped draining the redraw queue would report the cursor as free rather than as
+/// broken — which is exactly what it did until `Fixture::refresh` began running the loop turn the
+/// session runs.
 #[test]
 fn the_control_serviced_pointer_motion_renders_a_frame_each() {
     let Some((mut f, _)) = build(4) else { return };

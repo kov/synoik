@@ -161,8 +161,16 @@ impl Fixture {
     /// Deliberately not `refresh_and_flush_clients`: that redraws too, so a test using it would
     /// pass whether the state were synced here or at render time — which is exactly the confusion
     /// that let the Activities highlight sit one cycle late.
+    /// One turn's worth of end-of-loop work — **the callback the live session runs**.
+    ///
+    /// `main.rs` hands `event_loop.run` a `refresh_and_flush_clients` closure, so that is what
+    /// closes every turn of the real compositor: reconcile, advance animations, *drain the queued
+    /// redraws*, flush clients. `Fixture::dispatch` is `event_loop.dispatch`, which does not run
+    /// that callback, so a harness that reconciled with the inner `refresh` alone left the drain
+    /// out — and a queued redraw was then taken only by whatever happened to redraw synchronously.
+    /// A `settle()` could return having drawn no frames at all while reporting itself settled.
     pub fn refresh(&mut self) {
-        self.synoik_state().refresh();
+        self.synoik_state().refresh_and_flush_clients();
     }
 
     pub fn synoik(&mut self) -> &mut Synoik {
@@ -469,17 +477,6 @@ impl Fixture {
             },
         };
         self.synoik_state().process_input_event(event);
-    }
-
-    /// Drain the redraw queue, the way a seat's event loop does after every batch of events.
-    ///
-    /// [`Self::dispatch`] pumps the *outer* loop, and the compositor's own loop only runs when its
-    /// fd is readable — so synthetic input, which goes straight into `process_input_event`, leaves
-    /// `RedrawState::Queued` sitting there with nothing to service it. On a seat, libinput events
-    /// arrive *through* that loop and every pass ends in this call, which is why moving the mouse
-    /// there produces frames. A test measuring what input costs has to ask for that explicitly.
-    pub fn service_redraws(&mut self) {
-        self.synoik_state().refresh_and_flush_clients();
     }
 
     /// Inject relative pointer motion through the real input pipeline.
