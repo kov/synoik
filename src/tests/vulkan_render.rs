@@ -14948,6 +14948,7 @@ fn vulkan_draws_the_wifi_list_and_its_padlocks() {
 fn a_settled_frame_matches_a_full_redraw(
     minimize: bool,
     wallpaper: bool,
+    shrink: bool,
 ) -> Option<(u64, Rectangle<i32, Physical>)> {
     use crate::render_helpers::{RenderCtx, RenderTarget};
 
@@ -15025,17 +15026,34 @@ fn a_settled_frame_matches_a_full_redraw(
     // arms agree for a reason that has nothing to do with damage, and a green run means nothing.
     f.synoik_state().backend.headless().damage_log = Some(Vec::new());
     f.freeze_clock();
-    for _ in 0..(crate::backend::headless::SWAPCHAIN_SLOTS * 3) {
-        // Ask for the frame outright. A settled scene queues no redraw of its own, and the point
-        // here is a *settled* scene rendered several times over — the damage the tracker computes
-        // for each of those frames is the thing under test, and it is free to be empty.
-        f.synoik().queue_redraw(&output);
-        f.advance_clock(PAST_VBLANK);
-        f.dispatch();
-        // `Fixture::refresh` is `State::refresh`, which reconciles but never draws — the draw is in
-        // `refresh_and_flush_clients`, the loop's post-dispatch pass. Settling this whole scene
-        // through the former rendered two frames in total.
-        f.synoik_state().refresh_and_flush_clients();
+    let pump = |f: &mut Fixture| {
+        for _ in 0..(crate::backend::headless::SWAPCHAIN_SLOTS * 3) {
+            // Ask for the frame outright. A settled scene queues no redraw of its own, and the
+            // point here is a *settled* scene rendered several times over — the damage
+            // the tracker computes for each of those frames is the thing under test,
+            // and it is free to be empty.
+            f.synoik().queue_redraw(&output);
+            f.advance_clock(PAST_VBLANK);
+            f.dispatch();
+            // `Fixture::refresh` is `State::refresh`, which reconciles but never draws — the draw
+            // is in `refresh_and_flush_clients`, the loop's post-dispatch pass. Settling this whole
+            // scene through the former rendered two frames in total.
+            f.synoik_state().refresh_and_flush_clients();
+        }
+    };
+    pump(&mut f);
+
+    // The backdrop redraw: a client that has just lost the focus it was minimized with commits a
+    // *smaller* buffer, because the drop shadow it was drawing outside its window geometry is gone.
+    // Every pixel of the old margin is now nobody's — and the ring it vacates is exactly the shape
+    // of the reported artifact, so this is the arm that has to hold.
+    if shrink {
+        let window = f.client(id).window(&surface);
+        window.attach_shm_buffer(BUF - INSET * 2, BUF - INSET * 2, 255, 0, 255, 255);
+        window.set_window_geometry(0, 0, BUF - INSET * 2, BUF - INSET * 2);
+        window.commit();
+        f.double_roundtrip(id);
+        pump(&mut f);
     }
 
     let frames = f
@@ -15129,7 +15147,7 @@ fn a_settled_frame_matches_a_full_redraw(
 
 #[test]
 fn the_overview_screen_matches_a_full_redraw() {
-    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(false, false) else {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(false, false, false) else {
         return;
     };
     assert_eq!(
@@ -15141,7 +15159,7 @@ fn the_overview_screen_matches_a_full_redraw() {
 
 #[test]
 fn the_overview_screen_matches_a_full_redraw_with_a_minimized_window() {
-    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, false) else {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, false, false) else {
         return;
     };
     assert_eq!(
@@ -15159,12 +15177,34 @@ fn the_overview_screen_matches_a_full_redraw_with_a_minimized_window() {
 /// drawing its own — the one place where a pixel nobody damaged can be sampled and baked in.
 #[test]
 fn the_overview_screen_matches_a_full_redraw_over_a_wallpaper() {
-    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, true) else {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, true, false) else {
         return;
     };
     assert_eq!(
         differing, 0,
         "over a wallpaper, with the window minimized, the screen disagrees with a full redraw over \
          {differing} px in {bbox:?}"
+    );
+}
+
+/// The reported artifact: a minimized CSD client redraws in its backdrop state with a **smaller**
+/// buffer — the drop shadow it painted outside `set_window_geometry` is gone — and the ring that
+/// buffer vacates has to be repainted by whatever is behind the preview. Chrome does this and
+/// Firefox does not, which is why only some minimized previews are left wearing a shadow-shaped
+/// smear of whatever the swapchain slot happened to hold.
+///
+/// Nothing but the screen can answer this: a screenshot renders every element in full over a
+/// freshly cleared target (`render_elements`), so it repaints the ring by construction and comes
+/// out clean while the screen stays wrong.
+#[test]
+fn a_minimized_preview_whose_buffer_shrinks_repaints_what_it_vacated() {
+    let Some((differing, bbox)) = a_settled_frame_matches_a_full_redraw(true, true, true) else {
+        return;
+    };
+    assert_eq!(
+        differing, 0,
+        "after the minimized client shrank its buffer the screen disagrees with a full redraw over \
+         {differing} px in {bbox:?}: the margin the old buffer occupied was never repainted, so the \
+         preview keeps a ring of stale pixels that no later frame damages"
     );
 }

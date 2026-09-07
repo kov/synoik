@@ -608,14 +608,19 @@ impl Headless {
         };
         chain.slots[index].1 = chain.frame;
 
-        let mut framebuffer =
-            match smithay::backend::renderer::Bind::bind(renderer, &mut chain.slots[index].0) {
-                Ok(fb) => fb,
-                Err(err) => {
-                    warn!("error binding a headless swapchain buffer: {err:?}");
-                    return RenderElementStates::default();
-                }
-            };
+        // Bind *preserving*: this slot already holds the frame it was last drawn with, and
+        // `render_output` below is given its age, so it repaints only the damage owed since then.
+        // A plain `bind` begins a `DONT_CARE` pass, which leaves everything outside the damage
+        // undefined — and a tiling driver writes back whole 32×32 tiles, so a partial frame came
+        // back with a tile-aligned black band around each damage rect. That is the harness
+        // fabricating the very class of bug these tests exist to catch.
+        let mut framebuffer = match renderer.bind_preserving(&mut chain.slots[index].0) {
+            Ok(fb) => fb,
+            Err(err) => {
+                warn!("error binding a headless swapchain buffer: {err:?}");
+                return RenderElementStates::default();
+            }
+        };
         match damage_tracker.render_output(
             renderer,
             &mut framebuffer,
