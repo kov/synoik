@@ -891,6 +891,29 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating
             .update_render_elements(is_active && self.floating_is_active.get(), view_rect);
 
+        // Parked tiles are in neither half, so nothing else walks them — the same reason
+        // `advance_animations` has to reach them by hand. They *are* animated there, and the
+        // picker draws them like any other preview, so a shadow (or border, or focus ring) left
+        // un-updated keeps the slice decomposition it had at the moment of the minimize: the
+        // window's own animated size moves out from under a frozen set of shader rects and the
+        // shadow comes apart along the seams between them.
+        for parked in &mut self.minimized {
+            let tile = &mut parked.removed.tile;
+            let pos = self
+                .floating
+                .stored_or_default_tile_pos(tile)
+                .unwrap_or_else(|| {
+                    center_preferring_top_left_in_area(
+                        self.floating.working_area(),
+                        tile.tile_size(),
+                    )
+                });
+            let mut tile_view_rect = view_rect;
+            tile_view_rect.loc -= pos + tile.render_offset();
+            // Never active: a minimized window does not hold the focus it was minimized with.
+            tile.update_render_elements(false, tile_view_rect);
+        }
+
         self.shadow.update_render_elements(
             self.view_size,
             true,
@@ -931,6 +954,26 @@ impl<W: LayoutElement> Workspace<W> {
 
         self.base_options = base_options;
         self.options = options;
+
+        self.update_minimized_config();
+    }
+
+    /// Hand the parked tiles the config the two halves just got.
+    ///
+    /// A minimized tile is in neither half, so nothing else reaches it — the same fact
+    /// `advance_animations` and `update_render_elements` each have to compensate for. Its
+    /// `Options` are scale-adjusted, so a tile left behind here keeps a shadow softness, border
+    /// width and corner radius derived for whatever scale and settings were live when it was
+    /// minimized, and the picker draws that preview unlike every other one.
+    fn update_minimized_config(&mut self) {
+        let view_size = self.view_size;
+        let scale = self.scale.fractional_scale();
+        for parked in &mut self.minimized {
+            parked
+                .removed
+                .tile
+                .update_config(view_size, scale, self.options.clone());
+        }
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<synoik_config::LayoutPart>) {
@@ -945,6 +988,10 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn update_shaders(&mut self) {
         self.scrolling.update_shaders();
         self.floating.update_shaders();
+        // Parked tiles are in neither half; see `update_render_elements`.
+        for parked in &mut self.minimized {
+            parked.removed.tile.update_shaders();
+        }
         self.shadow.update_shaders();
     }
 
@@ -1306,6 +1353,8 @@ impl<W: LayoutElement> Workspace<W> {
             let shadow_config =
                 compute_workspace_shadow_config(self.options.overview.workspace_shadow, size);
             self.shadow.update_config(shadow_config);
+
+            self.update_minimized_config();
         }
 
         self.background_buffer.resize(size);
