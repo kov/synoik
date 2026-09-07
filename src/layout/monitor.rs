@@ -4288,20 +4288,6 @@ impl<W: LayoutElement> Monitor<W> {
             .to_physical_precise_round(scale);
             let push_shadow = &mut |elem: ShadowRenderElement| {
                 let elem = elem.with_alpha(progress.clamp(0., 1.) as f32);
-                if std::env::var_os("CROP_DBG").is_some() {
-                    let g = smithay::backend::renderer::element::Element::geometry(
-                        &elem,
-                        smithay::utils::Scale::from(scale),
-                    );
-                    eprintln!(
-                        "CROPDBG idx={idx} crop={:?} {:?} elem={:?} {:?} kept={}",
-                        glow_crop.loc,
-                        glow_crop.size,
-                        g.loc,
-                        g.size,
-                        CropRenderElement::from_element(elem.clone(), scale, glow_crop).is_some(),
-                    );
-                }
                 if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_crop) {
                     let elem = MonitorInnerRenderElement::CroppedShadow(elem);
                     let elem =
