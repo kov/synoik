@@ -4012,6 +4012,20 @@ impl State {
                     .collect();
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugDumpThumbnailGeometry => {
+                let text = self.synoik.layout.debug_thumbnail_geometry();
+                // Same directory the scanout dumps and the frame log land in, so one
+                // reproduction's evidence stays together.
+                let dir = std::path::PathBuf::from(crate::frame_log::dump_dir());
+                let path = dir.join("thumbnail-geometry.txt");
+                match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &text)) {
+                    Ok(()) => warn!("debug-dump-thumbnail-geometry: wrote {}", path.display()),
+                    Err(err) => warn!(
+                        "debug-dump-thumbnail-geometry: writing {}: {err:?}\n{text}",
+                        path.display()
+                    ),
+                }
+            }
             Action::Spawn(command) => {
                 let (token, _) = self.synoik.activation_state.create_external_token(None);
                 spawn(command, Some(token.clone()));
@@ -11854,6 +11868,7 @@ fn is_debug_action(action: &Action) -> bool {
         Action::DebugToggleOpaqueRegions
             | Action::DebugToggleDamage(_)
             | Action::DebugDumpScanout
+            | Action::DebugDumpThumbnailGeometry
             | Action::DebugToggleDeadlineDispatch
             | Action::DebugSetRenderTimeMargin(_)
             | Action::DebugSetSceneBreakdown(_)

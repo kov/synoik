@@ -769,6 +769,12 @@ impl<W: LayoutElement> Monitor<W> {
         &self.output_name
     }
 
+    /// The active thumbnail's own shadow config — deliberately deeper than a workspace's, see
+    /// [`active_workspace_shadow_config`].
+    pub fn active_shadow_config(&self) -> &synoik_config::Shadow {
+        self.active_shadow.config()
+    }
+
     pub fn active_workspace_idx(&self) -> usize {
         self.active_workspace_idx
     }
@@ -4097,6 +4103,97 @@ impl<W: LayoutElement> Monitor<W> {
                     RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
                 push(elem);
             });
+    }
+
+    /// Every number [`Self::render_thumbnails`] derives for the strip, as text.
+    ///
+    /// A shadow that measures wrong on screen has four candidate causes that a screenshot cannot
+    /// tell apart: the caster's size, the shadow config derived from it, the 9-slice rects, and
+    /// the crop each one is drawn through. This prints all four side by side, per workspace, so
+    /// the one that disagrees with its neighbours names itself. Mirrors the render loop rather
+    /// than sharing code with it deliberately — the point is to show what that loop *would*
+    /// compute right now, including anything stale it is holding.
+    pub fn debug_thumbnail_geometry(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let scale = self.scale.fractional_scale();
+        let _ = writeln!(
+            out,
+            "output {} view_size={:?} scale={scale}",
+            self.output.name(),
+            self.view_size,
+        );
+
+        let Some(strip) = self.thumbnail_strip() else {
+            let _ = writeln!(out, "  no thumbnail strip (the overview is not showing)");
+            return;
+        };
+        let Some(progress) = self.strip_progress() else {
+            let _ = writeln!(out, "  no strip progress");
+            return;
+        };
+        let slide = Point::from((0., self.thumbnail_slide_offset(&strip, progress)));
+        let band = Rectangle::new(strip.band.loc + slide, strip.band.size);
+        let glow_margin = SHADOW_GLOW_MARGIN * overview_layout::chrome_ramp(self.view_size);
+        let glow_bounds_logical = Rectangle::new(
+            band.loc - Point::from((0., glow_margin)),
+            band.size + Size::from((0., glow_margin * 2.)),
+        );
+        let _ = writeln!(
+            out,
+            "  strip scale={} band={:?} glow_bounds={:?} progress={progress} active={}",
+            strip.scale, band, glow_bounds_logical, self.active_workspace_idx,
+        );
+
+        let n = self.workspaces.len().min(strip.thumbs.len());
+        for idx in 0..n {
+            let ws = &self.workspaces[idx];
+            let shrink = self.strip_render_scale(idx);
+            let thumb = self.thumbnail_drawn_rect_at(idx, &strip, slide);
+            let thumb_scale = strip.scale * shrink;
+            let glow_crop = Rectangle::new(
+                Point::from((
+                    (glow_bounds_logical.loc.x - thumb.loc.x) / thumb_scale,
+                    (glow_bounds_logical.loc.y - thumb.loc.y) / thumb_scale,
+                )),
+                glow_bounds_logical.size.downscale(thumb_scale),
+            );
+
+            // The active workspace casts the monitor-owned deeper shadow, every other one its
+            // own. Reading the wrong one would make the active thumbnail look like the bug.
+            let shadow = if idx == self.active_workspace_idx {
+                &self.active_shadow
+            } else {
+                ws.shadow()
+            };
+            let cfg = shadow.config();
+            let rects = shadow.shader_rects();
+            // The union is what the shadow occupies; comparing it against the caster says how far
+            // past the thumbnail it reaches, which is the number that differs when this is wrong.
+            let hull = rects.iter().copied().reduce(|a, b| a.merge(b));
+            let _ = writeln!(
+                out,
+                "  ws[{idx}]{} id={:?} view_size={:?} shrink={shrink} thumb={thumb:?} \
+                 thumb_scale={thumb_scale}",
+                if idx == self.active_workspace_idx {
+                    " ACTIVE"
+                } else {
+                    ""
+                },
+                ws.id(),
+                ws.view_size(),
+            );
+            let _ = writeln!(
+                out,
+                "         glow_crop={glow_crop:?} shadow(softness={} spread={} offset=({},{})) \
+                 rects={} hull={hull:?}",
+                cfg.softness,
+                cfg.spread,
+                cfg.offset.x.0,
+                cfg.offset.y.0,
+                rects.len(),
+            );
+        }
     }
 
     /// Renders the overview workspace thumbnails strip: each workspace in

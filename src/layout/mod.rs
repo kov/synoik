@@ -2609,6 +2609,21 @@ impl<W: LayoutElement> Layout<W> {
         Some(&monitors[*active_monitor_idx])
     }
 
+    /// Every number the overview's thumbnail strip is drawn from, on every monitor.
+    ///
+    /// See [`Monitor::debug_thumbnail_geometry`]. Reached from
+    /// `Action::DebugDumpThumbnailGeometry`.
+    pub fn debug_thumbnail_geometry(&self) -> String {
+        let mut out = String::new();
+        for mon in self.monitors() {
+            mon.debug_thumbnail_geometry(&mut out);
+        }
+        if out.is_empty() {
+            out.push_str("no monitors\n");
+        }
+        out
+    }
+
     pub fn monitors(&self) -> impl Iterator<Item = &Monitor<W>> + '_ {
         let monitors = if let MonitorSet::Normal { monitors, .. } = &self.monitor_set {
             &monitors[..]

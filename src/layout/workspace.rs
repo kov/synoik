@@ -1370,6 +1370,12 @@ impl<W: LayoutElement> Workspace<W> {
         self.view_size
     }
 
+    /// This workspace's overview shadow config — see [`compute_workspace_shadow_config`], which
+    /// normalizes it to [`Self::view_size`].
+    pub fn shadow_config(&self) -> &synoik_config::Shadow {
+        self.shadow.config()
+    }
+
     pub fn make_tile(&self, window: W) -> Tile<W> {
         Tile::new(
             window,
@@ -3595,6 +3601,11 @@ impl<W: LayoutElement> Workspace<W> {
                     )
                 })
             })
+    }
+
+    /// This workspace's overview shadow, for instrumentation only.
+    pub(super) fn shadow(&self) -> &Shadow {
+        &self.shadow
     }
 
     pub fn render_shadow(&self, push: &mut dyn FnMut(ShadowRenderElement)) {

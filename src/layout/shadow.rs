@@ -27,6 +27,21 @@ impl Shadow {
         }
     }
 
+    /// The config the shape is derived from — softness, spread and offset are the whole of a
+    /// shadow's extent, so this plus the caster's size says what it should measure.
+    pub fn config(&self) -> &synoik_config::Shadow {
+        &self.config
+    }
+
+    /// The 9-slice pieces this shadow actually draws, in the caster's own coordinates.
+    ///
+    /// The extent of these is the whole of what a shadow puts on screen — the caster's size and
+    /// the config are only the *inputs* — so a shadow that measures wrong is diagnosed here and
+    /// nowhere else.
+    pub fn shader_rects(&self) -> &[Rectangle<f64, Logical>] {
+        &self.shader_rects
+    }
+
     pub fn update_config(&mut self, config: synoik_config::Shadow) {
         self.config = config;
     }

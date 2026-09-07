@@ -1080,6 +1080,10 @@ pub enum Action {
     /// This copies back the very image KMS is presenting. If it looks correct while the screen
     /// does not, our writes landed and the display side stopped reading them.
     DebugDumpScanout {},
+    /// Write the overview thumbnail strip's geometry — per workspace: the caster's size, the
+    /// shadow config, the 9-slice rects and the crop each is drawn through — to a file under
+    /// `$XDG_STATE_HOME/synoik`, and log the path.
+    DebugDumpThumbnailGeometry {},
     /// Toggle holding each frame until its dispatch deadline.
     ///
     /// On (`SYNOIK_DEADLINE_DISPATCH=1` starts a session that way) a continuously animating output

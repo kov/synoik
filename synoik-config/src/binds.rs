@@ -130,6 +130,7 @@ pub enum Action {
     DebugToggleOpaqueRegions,
     DebugToggleDamage(Option<u8>),
     DebugDumpScanout,
+    DebugDumpThumbnailGeometry,
     DebugToggleDeadlineDispatch,
     DebugSetRenderTimeMargin(f64),
     DebugSetSceneBreakdown(synoik_ipc::SceneBreakdown),
@@ -748,6 +749,7 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::DebugToggleOpaqueRegions {} => Self::DebugToggleOpaqueRegions,
             synoik_ipc::Action::DebugToggleDamage { age } => Self::DebugToggleDamage(age),
             synoik_ipc::Action::DebugDumpScanout {} => Self::DebugDumpScanout,
+            synoik_ipc::Action::DebugDumpThumbnailGeometry {} => Self::DebugDumpThumbnailGeometry,
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
             synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {
                 Self::DebugSetRenderTimeMargin(millis)
