@@ -210,6 +210,7 @@ use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose, ThumbnailEntr
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::timers::{Again, TimerToken, Timers};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::xwayland::selection::Bridge as XSelectionBridge;
@@ -421,6 +422,13 @@ pub struct Synoik {
     pub config_file_output_config: synoik_config::Outputs,
 
     pub event_loop: LoopHandle<'static, State>,
+    /// Deadlines on the compositor's own clock. **The way to arm a timer** — see
+    /// [`crate::utils::timers`] for why calloop's is the wrong clock to time the compositor by.
+    pub timers: Timers<State>,
+    /// The calloop source that exists only to wake the loop when `timers` next comes due. It
+    /// carries no behaviour: the wheel is dispatched from the turn, whether the loop woke for this
+    /// or for anything else.
+    timer_wakeup: Option<RegistrationToken>,
     pub scheduler: Scheduler<()>,
     pub stop_signal: LoopSignal,
     pub display_handle: DisplayHandle,
@@ -934,18 +942,18 @@ pub struct Synoik {
     /// click-drag pages the grid — the only route there is on a machine with no
     /// touchpad. `dragging` is false until the press clears the drag threshold.
     pub app_grid_pan: Option<AppGridPan>,
-    pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
-    pub bind_repeat_timer: Option<RegistrationToken>,
+    pub bind_cooldown_timers: HashMap<Key, TimerToken>,
+    pub bind_repeat_timer: Option<TimerToken>,
     /// The running keyboard move or resize grab, if any — see
     /// [`crate::input::keyboard_window_grab`].
     pub keyboard_window_grab: Option<KeyboardWindowGrab>,
-    pub grab_repeat_timer: Option<RegistrationToken>,
+    pub grab_repeat_timer: Option<TimerToken>,
     /// The key held down over one of the compositor's own surfaces — a shell text entry or the
     /// panel popover — and the timer re-delivering it. Wayland hands a compositor one press per
     /// physical key and leaves repeats to the client; nothing behind these surfaces is a client,
     /// so the repeat has to be ours. See [`crate::input::RepeatKey`].
     pub key_repeat: Option<(Keycode, crate::input::RepeatKey)>,
-    pub key_repeat_timer: Option<RegistrationToken>,
+    pub key_repeat_timer: Option<TimerToken>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -1148,26 +1156,26 @@ pub struct Synoik {
     /// size the target was resolved against.
     pub grid_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
     /// The timer arming that move; dropped and re-armed whenever the target changes.
-    pub grid_move_timer: Option<RegistrationToken>,
+    pub grid_move_timer: Option<TimerToken>,
     /// The tile a drag is resting on that would take the drop *into* it — an absolute
     /// entry index. Onto a folder that is a join and lights up at once; onto an app it is
     /// an offer to make a folder, and `grid_drop_timer` counts out [`FOLDER_PREVIEW_MS`]
     /// before it shows.
     pub grid_drop_target: Option<usize>,
-    pub grid_drop_timer: Option<RegistrationToken>,
+    pub grid_drop_timer: Option<TimerToken>,
     /// Counts out `POPDOWN_DIALOG_TIMEOUT` while a drag out of the open folder dialog is
     /// outside its panel; when it fires the dialog pops down and the drag carries on over
     /// the grid (`_setupPopdownTimeout`, `appDisplay.js:2832-2841`).
-    pub folder_popdown_timer: Option<RegistrationToken>,
+    pub folder_popdown_timer: Option<TimerToken>,
     /// The same delayed move as `grid_pending_move`, but among the *open folder's* members:
     /// `FolderView` inherits `BaseAppView._maybeMoveItem`, so a drag inside the dialog
     /// reorders the folder on exactly the same terms.
     pub folder_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
-    pub folder_move_timer: Option<RegistrationToken>,
+    pub folder_move_timer: Option<TimerToken>,
     /// The timer that flips the grid's page while a drag hovers a preview band or leans
     /// on the screen edge (`appDisplay.js:827-921`) — first the initial delay, then the
     /// repeat.
-    pub grid_page_switch_timer: Option<RegistrationToken>,
+    pub grid_page_switch_timer: Option<TimerToken>,
     /// Where the pointer was when an edge bump last fired, so leaning on the edge
     /// switches once rather than continuously (`_lastOvershootCoord`).
     pub grid_page_switch_overshoot: Option<f64>,
@@ -2331,8 +2339,23 @@ impl State {
         Ok(state)
     }
 
+    /// Run every compositor timer that has come due, then re-arm the loop's wakeup.
+    ///
+    /// The clock is read *unadjusted*: the rate knob slows animations down, and a key repeat or a
+    /// save deadline must not stretch with it.
+    pub fn dispatch_timers(&mut self) {
+        let now = self.synoik.clock.now_unadjusted();
+        Timers::dispatch_from(self, now, |state| &mut state.synoik.timers);
+        self.synoik.arm_timer_wakeup();
+    }
+
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
+
+        // Before the reconcile, not after: a timer that queues a redraw must get its frame on this
+        // turn. Dispatched after the loop's dispatch, which is where a calloop timer fired, so
+        // ordering within the turn is unchanged from when these were calloop timers.
+        self.dispatch_timers();
 
         // Whatever polkit asked for while the screen was covered gets its turn once it is not.
         //
@@ -8098,6 +8121,8 @@ impl Synoik {
             config_file_output_config,
 
             event_loop,
+            timers: Timers::default(),
+            timer_wakeup: None,
             scheduler,
             stop_signal,
             socket_name,
@@ -10295,6 +10320,62 @@ impl Synoik {
             })
             .unwrap();
         self.wallpaper_timer = Some(token);
+    }
+
+    /// Arm a timer to come due `after` from now, on the compositor's clock.
+    ///
+    /// **This, not `calloop::timer::Timer`, is how the compositor waits for a deadline** — see
+    /// [`crate::utils::timers`]. The callback is handed the whole [`State`] and returns `None` to
+    /// be done or `Some(d)` to come due again in `d`.
+    pub fn timer_after(
+        &mut self,
+        after: Duration,
+        callback: impl FnMut(&mut State) -> Again + 'static,
+    ) -> TimerToken {
+        let deadline = self.clock.now_unadjusted() + after;
+        self.timer_at(deadline, callback)
+    }
+
+    /// Arm a timer for an instant on the compositor's clock.
+    pub fn timer_at(
+        &mut self,
+        deadline: Duration,
+        callback: impl FnMut(&mut State) -> Again + 'static,
+    ) -> TimerToken {
+        let token = self.timers.insert_at(deadline, callback);
+        self.arm_timer_wakeup();
+        token
+    }
+
+    /// Cancel a pending timer. Cancelling one that has already fired is a no-op.
+    pub fn cancel_timer(&mut self, token: TimerToken) {
+        self.timers.cancel(token);
+        self.arm_timer_wakeup();
+    }
+
+    /// Point the loop's wakeup at the earliest pending deadline.
+    ///
+    /// The source's callback is empty on purpose: waking the loop is all it is for, because the
+    /// turn dispatches the wheel however the loop happened to wake. A session waits on this; a
+    /// harness pumps with a zero timeout and never sees it fire, which is the whole reason the
+    /// deadline lives on the compositor's clock rather than the machine's.
+    pub fn arm_timer_wakeup(&mut self) {
+        if let Some(token) = self.timer_wakeup.take() {
+            self.event_loop.remove(token);
+        }
+
+        let Some(after) = self.timers.wakeup_in(self.clock.now_unadjusted()) else {
+            return;
+        };
+
+        match self
+            .event_loop
+            .insert_source(Timer::from_duration(after), |_, _, _state| {
+                TimeoutAction::Drop
+            }) {
+            Ok(token) => self.timer_wakeup = Some(token),
+            Err(err) => warn!("error arming the timer wakeup: {err:?}"),
+        }
     }
 
     pub fn queue_redraw_all(&mut self) {

@@ -11,7 +11,6 @@ use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
@@ -950,10 +949,10 @@ impl State {
         // FIXME: handle this properly.
         if !pressed {
             if let Some(token) = self.synoik.bind_repeat_timer.take() {
-                self.synoik.event_loop.remove(token);
+                self.synoik.cancel_timer(token);
             }
             if let Some(token) = self.synoik.grab_repeat_timer.take() {
-                self.synoik.event_loop.remove(token);
+                self.synoik.cancel_timer(token);
             }
             // Keyed on the keycode, unlike the two above: the shell entries repeat printable
             // keys, and a Shift tapped mid-word must not stop the letter being held.
@@ -2007,29 +2006,27 @@ impl State {
 
         // Stop the previous key repeat if any.
         if let Some(token) = self.synoik.bind_repeat_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
 
-        let config = self.synoik.config.borrow();
-        let config = &config.input.keyboard;
+        let (repeat_rate, repeat_delay) = {
+            let config = self.synoik.config.borrow();
+            let config = &config.input.keyboard;
+            (config.repeat_rate, config.repeat_delay)
+        };
 
-        let repeat_rate = config.repeat_rate;
         if repeat_rate == 0 {
             return;
         }
         let repeat_duration = Duration::from_secs_f64(1. / f64::from(repeat_rate));
 
-        let repeat_timer =
-            Timer::from_duration(Duration::from_millis(u64::from(config.repeat_delay)));
-
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(repeat_timer, move |_, _, state| {
+        let token = self.synoik.timer_after(
+            Duration::from_millis(u64::from(repeat_delay)),
+            move |state| {
                 state.handle_bind(bind.clone());
-                TimeoutAction::ToDuration(repeat_duration)
-            })
-            .unwrap();
+                Some(repeat_duration)
+            },
+        );
 
         self.synoik.bind_repeat_timer = Some(token);
     }
@@ -2134,21 +2131,18 @@ impl State {
         }
         let period = Duration::from_secs_f64(1. / f64::from(repeat_rate));
 
-        let timer = Timer::from_duration(Duration::from_millis(u64::from(repeat_delay)));
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        let token = self.synoik.timer_after(
+            Duration::from_millis(u64::from(repeat_delay)),
+            move |state| {
                 if !state.deliver_repeat_key() {
-                    // The surface went away under the held key. Drop the source rather than
-                    // removing its token: calloop is running it.
+                    // The surface went away under the held key.
                     state.synoik.key_repeat = None;
                     state.synoik.key_repeat_timer = None;
-                    return TimeoutAction::Drop;
+                    return None;
                 }
-                TimeoutAction::ToDuration(period)
-            })
-            .unwrap();
+                Some(period)
+            },
+        );
 
         self.synoik.key_repeat = Some((keycode, key));
         self.synoik.key_repeat_timer = Some(token);
@@ -2158,7 +2152,7 @@ impl State {
     fn stop_key_repeat(&mut self) {
         self.synoik.key_repeat = None;
         if let Some(token) = self.synoik.key_repeat_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
     }
 
@@ -2261,22 +2255,16 @@ impl State {
             // The bind is on cooldown.
             Entry::Occupied(_) => (),
             Entry::Vacant(entry) => {
-                let timer = Timer::from_duration(cooldown);
-                let token = self
-                    .synoik
-                    .event_loop
-                    .insert_source(timer, move |_, _, state| {
-                        if state
-                            .synoik
-                            .bind_cooldown_timers
-                            .remove(&bind.key)
-                            .is_none()
-                        {
+                let key = bind.key;
+                let token = self.synoik.timers.insert_at(
+                    self.synoik.clock.now_unadjusted() + cooldown,
+                    move |state| {
+                        if state.synoik.bind_cooldown_timers.remove(&key).is_none() {
                             error!("bind cooldown timer entry disappeared");
                         }
-                        TimeoutAction::Drop
-                    })
-                    .unwrap();
+                        None
+                    },
+                );
                 entry.insert(token);
 
                 self.do_action(bind.action, bind.allow_when_locked);
@@ -2663,17 +2651,13 @@ impl State {
                         crate::dbus::bluez::set_adapter_powered(conn, path, true);
                     }
                 }
-                let timer =
-                    calloop::timer::Timer::from_duration(std::time::Duration::from_secs(30));
                 self.synoik
-                    .event_loop
-                    .insert_source(timer, |_, _, state| {
+                    .timer_after(std::time::Duration::from_secs(30), |state| {
                         if state.synoik.panel_popover.clear_bluetooth_prediction() {
                             state.synoik.queue_redraw_all();
                         }
-                        calloop::timer::TimeoutAction::Drop
-                    })
-                    .unwrap();
+                        None
+                    });
             }
             // The network tiles' writes. Each is recorded on the compositor as well as sent: a
             // fire-and-forget D-Bus call has no reply to observe, and a headless test has no bus
@@ -3363,7 +3347,7 @@ impl State {
             return;
         };
         if let Some(token) = self.synoik.grab_repeat_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
         if grab.kind == GrabKind::Resize {
             self.synoik.layout.interactive_resize_end(&grab.window);
@@ -3375,7 +3359,7 @@ impl State {
     /// its repeats from Clutter; ours come from the same timer the keybindings use.
     fn start_grab_key_repeat(&mut self, keysym: Keysym, mods: ModifiersState) {
         if let Some(token) = self.synoik.grab_repeat_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
 
         let (repeat_rate, repeat_delay) = {
@@ -3388,22 +3372,17 @@ impl State {
         }
         let period = Duration::from_secs_f64(1. / f64::from(repeat_rate));
 
-        let timer = Timer::from_duration(Duration::from_millis(u64::from(repeat_delay)));
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                // Out of the state for the duration of the dispatch: ending the grab removes
-                // whatever token it finds, and this one is the source calloop is running.
-                let token = state.synoik.grab_repeat_timer.take();
+        let token = self.synoik.timer_after(
+            Duration::from_millis(u64::from(repeat_delay)),
+            move |state| {
                 state.keyboard_window_grab_key_inner(keysym, mods, false);
                 if state.synoik.keyboard_window_grab.is_none() {
-                    return TimeoutAction::Drop;
+                    state.synoik.grab_repeat_timer = None;
+                    return None;
                 }
-                state.synoik.grab_repeat_timer = token;
-                TimeoutAction::ToDuration(period)
-            })
-            .unwrap();
+                Some(period)
+            },
+        );
         self.synoik.grab_repeat_timer = Some(token);
     }
 
@@ -6985,27 +6964,24 @@ impl State {
         if self.synoik.folder_popdown_timer.is_some() {
             return;
         }
-        let timer = Timer::from_duration(Duration::from_millis(POPDOWN_DIALOG_MS));
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.folder_popdown_timer = None;
-                if state.synoik.folder_dialog.popdown() {
-                    // The drag carries on over the grid, which has been ignoring it.
-                    state.update_dash_drop_slot();
-                    state.update_grid_drag();
-                    state.synoik.queue_redraw_all();
-                }
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token =
+            self.synoik
+                .timer_after(Duration::from_millis(POPDOWN_DIALOG_MS), move |state| {
+                    state.synoik.folder_popdown_timer = None;
+                    if state.synoik.folder_dialog.popdown() {
+                        // The drag carries on over the grid, which has been ignoring it.
+                        state.update_dash_drop_slot();
+                        state.update_grid_drag();
+                        state.synoik.queue_redraw_all();
+                    }
+                    None
+                });
         self.synoik.folder_popdown_timer = Some(token);
     }
 
     fn clear_folder_popdown_timer(&mut self) {
         if let Some(token) = self.synoik.folder_popdown_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
     }
 
@@ -7424,16 +7400,13 @@ impl State {
 
         self.clear_folder_pending_move();
         self.synoik.folder_pending_move = Some((target, per_page));
-        let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
         let token = self
             .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+            .timer_after(Duration::from_millis(DELAYED_MOVE_MS), move |state| {
                 state.synoik.folder_move_timer = None;
                 state.apply_folder_pending_move();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+                None
+            });
         self.synoik.folder_move_timer = Some(token);
     }
 
@@ -7441,7 +7414,7 @@ impl State {
     fn clear_folder_pending_move(&mut self) {
         self.synoik.folder_pending_move = None;
         if let Some(token) = self.synoik.folder_move_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
     }
 
@@ -7554,19 +7527,16 @@ impl State {
         if self.synoik.grid_page_switch_timer.is_some() {
             return;
         }
-        let timer = Timer::from_duration(Duration::from_millis(PAGE_SWITCH_INITIAL_MS));
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                // Clear the slot first: this source is mid-dispatch and about to be
-                // dropped, and the repeat setup would otherwise try to remove it.
+        let token = self.synoik.timer_after(
+            Duration::from_millis(PAGE_SWITCH_INITIAL_MS),
+            move |state| {
+                // Clear the slot first: the repeat setup below arms its own timer into it.
                 state.synoik.grid_page_switch_timer = None;
                 state.step_grid_page(direction);
                 state.setup_drag_page_switch_repeat(direction);
-                TimeoutAction::Drop
-            })
-            .unwrap();
+                None
+            },
+        );
         self.synoik.grid_page_switch_timer = Some(token);
     }
 
@@ -7575,14 +7545,10 @@ impl State {
     fn setup_drag_page_switch_repeat(&mut self, direction: PageArrow) {
         self.reset_drag_page_switch();
         let repeat = Duration::from_millis(PAGE_SWITCH_REPEAT_MS);
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(Timer::from_duration(repeat), move |_, _, state| {
-                state.step_grid_page(direction);
-                TimeoutAction::ToDuration(repeat)
-            })
-            .unwrap();
+        let token = self.synoik.timer_after(repeat, move |state| {
+            state.step_grid_page(direction);
+            Some(repeat)
+        });
         self.synoik.grid_page_switch_timer = Some(token);
     }
 
@@ -7590,7 +7556,7 @@ impl State {
     /// (`_resetDragPageSwitch`, `appDisplay.js:827-839`).
     fn reset_drag_page_switch(&mut self) {
         if let Some(token) = self.synoik.grid_page_switch_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
         self.synoik.grid_page_switch_overshoot = None;
     }
@@ -7715,16 +7681,13 @@ impl State {
 
         self.clear_grid_pending_move();
         self.synoik.grid_pending_move = Some((target, per_page));
-        let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
         let token = self
             .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+            .timer_after(Duration::from_millis(DELAYED_MOVE_MS), move |state| {
                 state.synoik.grid_move_timer = None;
                 state.apply_grid_pending_move();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+                None
+            });
         self.synoik.grid_move_timer = Some(token);
     }
 
@@ -7748,18 +7711,15 @@ impl State {
             }
             return;
         }
-        let timer = Timer::from_duration(Duration::from_millis(FOLDER_PREVIEW_MS));
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.grid_drop_timer = None;
-                if state.synoik.app_grid.set_drop_hover(Some(target)) {
-                    state.synoik.queue_redraw_all();
-                }
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token =
+            self.synoik
+                .timer_after(Duration::from_millis(FOLDER_PREVIEW_MS), move |state| {
+                    state.synoik.grid_drop_timer = None;
+                    if state.synoik.app_grid.set_drop_hover(Some(target)) {
+                        state.synoik.queue_redraw_all();
+                    }
+                    None
+                });
         self.synoik.grid_drop_timer = Some(token);
     }
 
@@ -7881,7 +7841,7 @@ impl State {
     fn clear_grid_drop_hover(&mut self) {
         self.synoik.grid_drop_target = None;
         if let Some(token) = self.synoik.grid_drop_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
         if self.synoik.app_grid.set_drop_hover(None) {
             self.synoik.queue_redraw_all();
@@ -7892,7 +7852,7 @@ impl State {
     fn clear_grid_pending_move(&mut self) {
         self.synoik.grid_pending_move = None;
         if let Some(token) = self.synoik.grid_move_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
     }
 
