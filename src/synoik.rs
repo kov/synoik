@@ -324,10 +324,7 @@ pub const DYNAMIC_CAST_TARGET_LABEL: &str = "Dynamic Target";
 /// go wrong — a timer that always reloads makes the coalescing a no-op, one that always
 /// re-waits never reloads at all — and neither is reachable from a test without sleeping
 /// out a real five seconds.
-fn app_catalog_reload_wait(
-    deadline: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> Option<std::time::Instant> {
+fn app_catalog_reload_wait(deadline: Option<Duration>, now: Duration) -> Option<Duration> {
     deadline.filter(|at| *at > now)
 }
 
@@ -537,13 +534,13 @@ pub struct Synoik {
     pub idle_monitor: crate::idle_monitor::IdleMonitor,
     /// The single timer re-armed to the next idle watch's deadline (see
     /// `IdleMonitor::next_wakeup`).
-    pub idle_monitor_timer: Option<RegistrationToken>,
+    pub idle_monitor_timer: Option<TimerToken>,
     /// `org.gnome.SessionManager.EndSessionDialog` lifecycle: gnome-session's logout/shutdown/
     /// restart confirmation. The interactive surface is `end_session_dialog`;
     /// `Confirmed*`/`Canceled` go out via `emit_end_session_signal`.
     pub end_session: crate::end_session::EndSession,
     /// The timer armed to the countdown's auto-confirm deadline (see `EndSession::deadline`).
-    pub end_session_timer: Option<RegistrationToken>,
+    pub end_session_timer: Option<TimerToken>,
     /// Where `org.gnome.Software.OfflineUpdates.GetState` replies come back to. `None` with no
     /// session bus, which simply means the update checkbox is never offered.
     pub offline_update_tx: Option<calloop::channel::Sender<crate::end_session::OfflineUpdateState>>,
@@ -553,7 +550,7 @@ pub struct Synoik {
     /// Ticks a time-of-day wallpaper along its slideshow; `None` whenever `picture-uri` is an
     /// ordinary picture, which must not cost a wake-up. See
     /// [`refresh_wallpaper_timer`](Synoik::refresh_wallpaper_timer).
-    pub wallpaper_timer: Option<RegistrationToken>,
+    pub wallpaper_timer: Option<TimerToken>,
     pub data_device_state: DataDeviceState,
     /// Mime types whoever owns the clipboard right now is offering.
     ///
@@ -589,7 +586,7 @@ pub struct Synoik {
     /// The named workspaces that outlive this session (`docs/fork/multi-display.md` §6).
     pub workspace_names: crate::workspace_names::WorkspaceNameStore,
     /// Armed when a snapshot differs from what the store holds; `None` means no write is pending.
-    pub workspace_names_save_timer: Option<RegistrationToken>,
+    pub workspace_names_save_timer: Option<TimerToken>,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -631,7 +628,7 @@ pub struct Synoik {
     /// When a coalesced catalog reload is due, if one is pending — see
     /// [`Synoik::queue_app_catalog_reload`]. `Some` also means a timer is already armed, so
     /// a burst of `installed-changed` pings arms exactly one.
-    pub app_catalog_reload_at: Option<std::time::Instant>,
+    pub app_catalog_reload_at: Option<Duration>,
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
@@ -730,14 +727,14 @@ pub struct Synoik {
     pub gdm_requests: Option<async_channel::Sender<crate::dbus::gdm::VerifierRequest>>,
     /// The pending idle lock (`_lockTimeoutId`). Armed when the session goes idle, dropped when
     /// the user comes back — the grace period is exactly this token's lifetime.
-    pub lock_timer: Option<calloop::RegistrationToken>,
+    pub lock_timer: Option<TimerToken>,
     /// The idle fade's completion, which is what actually puts the shield down.
-    pub fade_timer: Option<calloop::RegistrationToken>,
+    pub fade_timer: Option<TimerToken>,
     /// Wakes the unlock dialog when the message on screen has had its read time.
     ///
     /// Its own timer rather than the panel's minute tick: a message is owed two seconds, and a
     /// tick that lands up to a minute later is not a queue, it is a stall.
-    pub unlock_message_timer: Option<calloop::RegistrationToken>,
+    pub unlock_message_timer: Option<TimerToken>,
     /// logind's `Session.Active`: whether our VT is the one on screen. Assumed true until logind
     /// says otherwise, which is right for the usual case of starting on the active VT.
     pub session_active: bool,
@@ -754,7 +751,7 @@ pub struct Synoik {
     /// removal path remember that would be a second place to get it wrong.
     pub shield_frames_owed: HashSet<Output>,
     /// The bound on the above (see [`Self::SHIELD_PRESENT_DEADLINE`]).
-    pub shield_present_deadline: Option<calloop::RegistrationToken>,
+    pub shield_present_deadline: Option<TimerToken>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
     pub shield_snapshot:
@@ -812,7 +809,7 @@ pub struct Synoik {
     pub osd: crate::ui::osd::OsdManager,
     /// Wake-up for the OSD's 1500 ms hide timeout: an OSD over a static desktop
     /// produces no frames of its own to expire on.
-    pub osd_timer: Option<RegistrationToken>,
+    pub osd_timer: Option<TimerToken>,
     /// The deadline `osd_timer` is actually armed for. The OSD arms its deadline in
     /// `show()`, which can happen from anywhere between frames (a D-Bus call, a
     /// brightness key), so a before/after-`advance_animations` comparison cannot see
@@ -824,9 +821,9 @@ pub struct Synoik {
     /// animation, so nothing asks for frames, so the grace period after the pointer leaves never
     /// elapses and the dock sits on screen forever. Its deadline is also set between frames (by
     /// the pointer leaving), so a before/after-`advance_animations` diff would never re-arm.
-    pub dock_timer: Option<RegistrationToken>,
+    pub dock_timer: Option<TimerToken>,
     pub dock_timer_at: Option<Duration>,
-    pub switcher_timer: Option<RegistrationToken>,
+    pub switcher_timer: Option<TimerToken>,
     pub switcher_timer_at: Option<Duration>,
     /// An outcome produced by a timer firing inside `advance_animations`, which is `Synoik`-level
     /// and so cannot activate a window itself. Drained by [`State::finish_switcher`].
@@ -844,7 +841,7 @@ pub struct Synoik {
     pub switcher_ws_preview: Vec<crate::layout::WorkspacePreviewOrigin>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
-    pub notification_banner_timer: Option<RegistrationToken>,
+    pub notification_banner_timer: Option<TimerToken>,
     /// Default audio-sink state (volume + mute) for the panel output indicator and
     /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
     pub audio: Option<crate::audio::AudioStatus>,
@@ -982,7 +979,7 @@ pub struct Synoik {
     /// which passes it down through grabs, which decide what to do with it as they see fit.
     pub pointer_contents: PointContents,
     pub pointer_visibility: PointerVisibility,
-    pub pointer_inactivity_timer: Option<RegistrationToken>,
+    pub pointer_inactivity_timer: Option<TimerToken>,
     /// Whether the pointer inactivity timer got reset this event loop iteration.
     ///
     /// Used for limiting the reset to once per iteration, so that it's not spammed with high
@@ -1102,7 +1099,7 @@ pub struct Synoik {
     /// password box on top of the shield or answer polkitd without asking anyone.
     pub polkit_deferred: Option<Box<crate::dbus::polkit_agent::BeginRequest>>,
     /// The delayed entry reset — see [`crate::polkit_dialog::DELAYED_RESET`].
-    pub polkit_reset_timer: Option<calloop::RegistrationToken>,
+    pub polkit_reset_timer: Option<TimerToken>,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
     /// Whether the overview was open at the last render-elements update, to
@@ -1290,7 +1287,7 @@ pub struct PendingCapture {
     action: PendingAction,
     /// Monotonic; the countdown reads it, and it — not the tick count — decides when to fire.
     fires_at: Duration,
-    token: RegistrationToken,
+    token: TimerToken,
 }
 
 /// What the countdown ends in. The picker's shot/cast control decides which, and the two share
@@ -1542,10 +1539,7 @@ pub enum RedrawState {
     WaitingForVBlank { redraw_needed: bool },
     /// A redraw is due, and deliberately held until its dispatch deadline (see
     /// [`FrameClock::next_dispatch`]). The timer fires at `aim.target − estimated cost`.
-    ScheduledDispatch {
-        token: RegistrationToken,
-        aim: FrameAim,
-    },
+    ScheduledDispatch { token: TimerToken, aim: FrameAim },
     /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
     WaitingForEstimatedVBlank(RegistrationToken),
     /// A redraw is queued on top of the above.
@@ -1678,7 +1672,7 @@ pub enum LockState {
     Unlocked,
     WaitingForSurfaces {
         confirmation: SessionLocker,
-        deadline_token: RegistrationToken,
+        deadline_token: TimerToken,
     },
     Locking(SessionLocker),
     Locked(ExtSessionLockV1),
@@ -2549,17 +2543,14 @@ impl State {
         if self.synoik.workspace_names_save_timer.is_some() {
             return;
         }
-        let timer = calloop::timer::Timer::from_duration(crate::handlers::SESSION_SAVE_DELAY);
-        self.synoik.workspace_names_save_timer = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.synoik.workspace_names_save_timer = Some(self.synoik.timer_after(
+            crate::handlers::SESSION_SAVE_DELAY,
+            move |state| {
                 state.synoik.workspace_names_save_timer = None;
                 state.synoik.save_workspace_names();
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the named-workspace save: {err:?}"))
-            .ok();
+                None
+            },
+        ));
     }
 
     /// Push the active keyboard-layout short label into the panel's `keyboard` indicator (GNOME's
@@ -4634,17 +4625,11 @@ impl State {
         let fires_at = self.synoik.clock.now_unadjusted() + delay;
         // Ticks every second so the countdown can redraw; the fire condition is the clock, not the
         // tick count, so a late or coalesced wakeup shortens the last tick instead of the delay.
-        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(1));
         let token = self
             .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| state.tick_pending_capture())
-            .map_err(|err| warn!("error arming the delayed capture: {err:?}"))
-            .ok();
-        let Some(token) = token else {
-            action.dismiss();
-            return;
-        };
+            .timer_after(Duration::from_secs(1), move |state| {
+                state.tick_pending_capture()
+            });
 
         self.synoik.pending_capture = Some(PendingCapture {
             output: output.downgrade(),
@@ -4738,9 +4723,9 @@ impl State {
     ///
     /// `pub(crate)` for the corpus: the cancellation rules live here, and the alternative is a test
     /// that reimplements them.
-    pub(crate) fn tick_pending_capture(&mut self) -> calloop::timer::TimeoutAction {
+    pub(crate) fn tick_pending_capture(&mut self) -> Again {
         let Some(pending) = &self.synoik.pending_capture else {
-            return calloop::timer::TimeoutAction::Drop;
+            return None;
         };
 
         // A lock arriving mid-countdown cancels: the delay was armed against a screen the user
@@ -4748,23 +4733,23 @@ impl State {
         if self.synoik.is_locked() || self.synoik.screen_shield.is_active() {
             debug!("screen locked mid-countdown; dropping the delayed capture");
             self.cancel_pending_capture();
-            return calloop::timer::TimeoutAction::Drop;
+            return None;
         }
 
         // The output is held weakly, so unplugging it mid-countdown lands here.
         if pending.output.upgrade().is_none() {
             debug!("the delayed capture's output is gone; dropping it");
             self.cancel_pending_capture();
-            return calloop::timer::TimeoutAction::Drop;
+            return None;
         }
 
         if self.synoik.clock.now_unadjusted() < pending.fires_at {
             self.synoik.queue_redraw_all();
-            return calloop::timer::TimeoutAction::ToDuration(Duration::from_secs(1));
+            return Some(Duration::from_secs(1));
         }
 
         self.fire_pending_capture();
-        calloop::timer::TimeoutAction::Drop
+        None
     }
 
     /// Do what the delay was armed for, against the live screen.
@@ -4772,8 +4757,8 @@ impl State {
         let Some(pending) = self.synoik.pending_capture.take() else {
             return;
         };
-        // The timer that got us here is dropped by its own return value; removing it as well would
-        // be a double removal, so the token is deliberately left alone.
+        // The timer that got us here ends by returning `None`; cancelling it as well would be
+        // harmless but pointless, so the token is deliberately left alone.
         let PendingCapture { output, action, .. } = pending;
         let Some(output) = output.upgrade() else {
             action.dismiss();
@@ -4854,7 +4839,7 @@ impl State {
         let Some(pending) = self.synoik.pending_capture.take() else {
             return false;
         };
-        self.synoik.event_loop.remove(pending.token);
+        self.synoik.cancel_timer(pending.token);
         pending.action.dismiss();
         self.synoik.queue_redraw_all();
         true
@@ -6217,26 +6202,19 @@ impl State {
     /// fire against the wrong one.
     fn arm_unlock_message_timer(&mut self) {
         if let Some(token) = self.synoik.unlock_message_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
         let Some(deadline) = self.synoik.unlock_dialog.message_deadline() else {
             return;
         };
-        let now = self.synoik.shield_now();
-        let timer = calloop::timer::Timer::from_duration(deadline.saturating_sub(now));
-        self.synoik.unlock_message_timer = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.unlock_message_timer = None;
-                let now = state.synoik.shield_now();
-                let effects = state.synoik.unlock_dialog.tick(now);
-                // Re-arms through `apply_unlock_effects` if more is queued behind this one.
-                state.apply_unlock_effects(effects);
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the unlock message timer: {err:?}"))
-            .ok();
+        self.synoik.unlock_message_timer = Some(self.synoik.timer_at(deadline, move |state| {
+            state.synoik.unlock_message_timer = None;
+            let now = state.synoik.shield_now();
+            let effects = state.synoik.unlock_dialog.tick(now);
+            // Re-arms through `apply_unlock_effects` if more is queued behind this one.
+            state.apply_unlock_effects(effects);
+            None
+        }));
     }
 
     /// A message from the NetworkManager secret agent — see [`crate::dbus::network_agent`].
@@ -6385,7 +6363,7 @@ impl State {
 
         if effects.close {
             if let Some(token) = self.synoik.polkit_reset_timer.take() {
-                self.synoik.event_loop.remove(token);
+                self.synoik.cancel_timer(token);
             }
         }
 
@@ -6403,20 +6381,17 @@ impl State {
     /// [`DELAYED_RESET`]: crate::polkit_dialog::DELAYED_RESET
     fn arm_polkit_reset_timer(&mut self) {
         if let Some(token) = self.synoik.polkit_reset_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
-        let timer = calloop::timer::Timer::from_duration(crate::polkit_dialog::DELAYED_RESET);
-        self.synoik.polkit_reset_timer = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.synoik.polkit_reset_timer = Some(self.synoik.timer_after(
+            crate::polkit_dialog::DELAYED_RESET,
+            move |state| {
                 state.synoik.polkit_reset_timer = None;
                 let effects = state.synoik.polkit_dialog.on_reset_timeout();
                 state.apply_polkit_effects(effects);
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the polkit reset timer: {err:?}"))
-            .ok();
+                None
+            },
+        ));
     }
 
     /// A message from gdm's verifier — see [`crate::dbus::gdm`].
@@ -6621,7 +6596,7 @@ impl State {
         if effects.stop_fade {
             self.synoik.lock_screen.light_off();
             if let Some(token) = self.synoik.fade_timer.take() {
-                self.synoik.event_loop.remove(token);
+                self.synoik.cancel_timer(token);
             }
         }
 
@@ -6634,7 +6609,7 @@ impl State {
 
         if effects.cancel_lock_timer {
             if let Some(token) = self.synoik.lock_timer.take() {
-                self.synoik.event_loop.remove(token);
+                self.synoik.cancel_timer(token);
             }
         }
 
@@ -6670,21 +6645,15 @@ impl State {
     /// Epoch-tagged like every other answer, so a watchdog for an abandoned lock cannot refuse a
     /// later one; `authenticator_ready` drops it on the floor.
     fn arm_authenticator_watchdog(&mut self, epoch: u64) {
-        let timer = calloop::timer::Timer::from_duration(Self::AUTHENTICATOR_TIMEOUT);
-        let res = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.synoik
+            .timer_after(Self::AUTHENTICATOR_TIMEOUT, move |state| {
                 let effects = state.synoik.screen_shield.authenticator_ready(epoch, false);
                 if effects != crate::screen_shield::ShieldEffects::default() {
                     warn!("gdm never answered; the shield stays a screensaver");
                 }
                 state.apply_shield_effects(effects);
-                calloop::timer::TimeoutAction::Drop
+                None
             });
-        if let Err(err) = res {
-            warn!("error arming the verifier watchdog: {err:?}");
-        }
     }
 
     /// Arm the fade's completion — the moment the screen is black and the shield goes down.
@@ -6694,60 +6663,50 @@ impl State {
     /// covered).
     fn arm_fade_timer(&mut self) {
         if let Some(token) = self.synoik.fade_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
-        let timer = calloop::timer::Timer::from_duration(crate::ui::lock_screen::FADE_TIME);
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.synoik.fade_timer = Some(self.synoik.timer_after(
+            crate::ui::lock_screen::FADE_TIME,
+            move |state| {
                 state.synoik.fade_timer = None;
                 let now = state.synoik.shield_now();
                 let effects = state.synoik.screen_shield.fade_complete(now);
                 state.apply_shield_effects(effects);
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the idle fade timer: {err:?}"))
-            .ok();
-        self.synoik.fade_timer = token;
+                None
+            },
+        ));
     }
 
     /// Arm the idle grace period. Any timer already pending is replaced, never stacked.
     fn arm_lock_timer(&mut self, delay: std::time::Duration) {
         if let Some(token) = self.synoik.lock_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
 
-        let timer = calloop::timer::Timer::from_duration(delay);
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.lock_timer = None;
+        let token = self.synoik.timer_after(delay, move |state| {
+            state.synoik.lock_timer = None;
 
-                // The timer outlives anything that locked in the meantime — a suspend during the
-                // grace period, or `loginctl lock-session` — because only `deactivate` cancels it
-                // (`_completeDeactivate`, `screenShield.js:575-578`). GNOME's `lock()` is benign
-                // when re-run; ours would bump the epoch and restart the gdm conversation, pulling
-                // the prompt out from under someone already typing their password.
-                // (`is_dismissible` already implies not locked and not mid-handshake, so it is the
-                // whole condition — and it is the predicate the model's tests pin.)
-                if !state.synoik.screen_shield.is_dismissible() {
-                    return calloop::timer::TimeoutAction::Drop;
-                }
+            // The timer outlives anything that locked in the meantime — a suspend during the
+            // grace period, or `loginctl lock-session` — because only `deactivate` cancels it
+            // (`_completeDeactivate`, `screenShield.js:575-578`). GNOME's `lock()` is benign
+            // when re-run; ours would bump the epoch and restart the gdm conversation, pulling
+            // the prompt out from under someone already typing their password.
+            // (`is_dismissible` already implies not locked and not mid-handshake, so it is the
+            // whole condition — and it is the predicate the model's tests pin.)
+            if !state.synoik.screen_shield.is_dismissible() {
+                return None;
+            }
 
-                let now = state.synoik.shield_now();
-                match state.synoik.screen_shield.lock(now, false) {
-                    Ok(effects) => state.apply_shield_effects(effects),
-                    Err(crate::screen_shield::LockRefused::LockedDown) => {
-                        debug!("screen lock is locked down; the idle shield stays a screensaver");
-                    }
+            let now = state.synoik.shield_now();
+            match state.synoik.screen_shield.lock(now, false) {
+                Ok(effects) => state.apply_shield_effects(effects),
+                Err(crate::screen_shield::LockRefused::LockedDown) => {
+                    debug!("screen lock is locked down; the idle shield stays a screensaver");
                 }
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the idle lock timer: {err:?}"))
-            .ok();
-        self.synoik.lock_timer = token;
+            }
+            None
+        });
+        self.synoik.lock_timer = Some(token);
     }
 
     /// gnome-session's presence changed (`_onStatusChanged`, `screenShield.js:242-272`).
@@ -7875,21 +7834,6 @@ impl Synoik {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
         let activation_state = XdgActivationState::new::<State>(&display_handle);
-        event_loop
-            .insert_source(
-                Timer::from_duration(XDG_ACTIVATION_TOKEN_TIMEOUT),
-                |_, _, state| {
-                    state
-                        .synoik
-                        .activation_state
-                        .retain_tokens(|_, token_data| {
-                            token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
-                        });
-                    TimeoutAction::ToDuration(XDG_ACTIVATION_TOKEN_TIMEOUT)
-                },
-            )
-            .unwrap();
-
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         // Starts empty and in memory; `State::new` loads the real file, except in tests.
@@ -7973,16 +7917,6 @@ impl Synoik {
 
         let a11y = A11y::new(event_loop.clone());
 
-        event_loop
-            .insert_source(
-                Timer::from_duration(Duration::from_secs(1)),
-                |_, _, state| {
-                    state.synoik.send_frame_callbacks_on_fallback_timer();
-                    TimeoutAction::ToDuration(Duration::from_secs(1))
-                },
-            )
-            .unwrap();
-
         let socket_name = match &wayland_socket {
             WaylandSocket::None => None,
             socket => {
@@ -8056,61 +7990,6 @@ impl Synoik {
         // (`RUST_LOG=synoik=info,devmem=debug`) instead of running a whole desktop at debug for the
         // days a slow leak takes to show — which is noisy enough that nobody would leave it on, and
         // an instrument nobody leaves on measures nothing.
-        if tracing::enabled!(target: DEVICE_MEMORY_CENSUS_TARGET, tracing::Level::DEBUG) {
-            event_loop
-                .insert_source(Timer::immediate(), |_, _, _state| {
-                    debug!(target: DEVICE_MEMORY_CENSUS_TARGET, "{}", synoik_vk::devmem::census(8));
-                    TimeoutAction::ToDuration(DEVICE_MEMORY_CENSUS_PERIOD)
-                })
-                .unwrap();
-        }
-
-        event_loop
-            .insert_source(
-                Timer::from_duration(Duration::from_secs(60)),
-                |_, _, state| {
-                    let _span = tracy_client::span!("startup timeout");
-                    state.synoik.is_at_startup = false;
-                    state.synoik.recompute_window_rules();
-                    state.synoik.recompute_layer_rules();
-                    TimeoutAction::Drop
-                },
-            )
-            .unwrap();
-
-        // Tick the panel clock on each minute boundary. The timer is the wake
-        // source, so this works even when input is idle (no frame starvation).
-        event_loop
-            .insert_source(
-                Timer::from_duration(Duration::from_secs(
-                    crate::ui::panel::secs_until_next_minute(),
-                )),
-                |_, _, state| {
-                    // The shield's curtain shows the same clock and is the only thing on screen
-                    // while it is down, so it rides this tick too — explicitly, rather than
-                    // relying on the panel's label happening to change on the same boundary.
-                    if state.synoik.panel.update_clock() || state.synoik.screen_shield.is_active() {
-                        state.synoik.queue_redraw_all();
-                    }
-                    // ...and so does the unlock prompt's two-minute escape back to the clock.
-                    // Riding the clock tick makes that granular to a minute rather than exact,
-                    // which is the right trade for a timeout whose only job is to not leave a
-                    // half-typed password on an unattended screen.
-                    if state.synoik.unlock_dialog.is_waiting_to_escape() {
-                        let now = state.synoik.shield_now();
-                        let effects = state.synoik.unlock_dialog.tick(now);
-                        state.apply_unlock_effects(effects);
-                    }
-                    // Refresh the open World Clocks section's live times/offsets on
-                    // the same tick (gnome-shell's `WallClock notify::clock`).
-                    state.synoik.refresh_popover_world_clocks();
-                    // Re-arm for the next second (when showing seconds) or the next
-                    // minute boundary, per the current clock format.
-                    TimeoutAction::ToDuration(state.synoik.panel.clock_tick_interval())
-                },
-            )
-            .unwrap();
-
         drop(config_);
         let mut synoik = Self {
             input_method: None,
@@ -8434,6 +8313,77 @@ impl Synoik {
 
         synoik.reset_pointer_inactivity_timer();
 
+        // The session-long timers, armed now that there is a wheel to arm them on. Each is on the
+        // compositor's clock like every other deadline — see [`crate::utils::timers`].
+        synoik.timer_after(XDG_ACTIVATION_TOKEN_TIMEOUT, |state| {
+            state
+                .synoik
+                .activation_state
+                .retain_tokens(|_, token_data| {
+                    token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
+                });
+            Some(XDG_ACTIVATION_TOKEN_TIMEOUT)
+        });
+
+        synoik.timer_after(Duration::from_secs(1), |state| {
+            state.synoik.send_frame_callbacks_on_fallback_timer();
+            Some(Duration::from_secs(1))
+        });
+
+        // Census the live `VkDeviceMemory` into the log, so a long session leaves a time series a
+        // leak's slope is readable from. It is a *timer* and not a per-frame hook on purpose:
+        // memory this instrument exists to find (see `synoik_vk::devmem`) lives on the host, in the
+        // VMM, where no guest process accounting reaches it — an idle compositor that is quietly
+        // retaining is exactly the case a frame-driven sample would miss.
+        //
+        // On its own `devmem` target so a seat can turn the census on *alone*
+        // (`RUST_LOG=synoik=info,devmem=debug`) instead of running a whole desktop at debug for the
+        // days a slow leak takes to show — which is noisy enough that nobody would leave it on, and
+        // an instrument nobody leaves on measures nothing.
+        if tracing::enabled!(target: DEVICE_MEMORY_CENSUS_TARGET, tracing::Level::DEBUG) {
+            synoik.timer_after(Duration::ZERO, |_state| {
+                debug!(target: DEVICE_MEMORY_CENSUS_TARGET, "{}", synoik_vk::devmem::census(8));
+                Some(DEVICE_MEMORY_CENSUS_PERIOD)
+            });
+        }
+
+        synoik.timer_after(Duration::from_secs(60), |state| {
+            let _span = tracy_client::span!("startup timeout");
+            state.synoik.is_at_startup = false;
+            state.synoik.recompute_window_rules();
+            state.synoik.recompute_layer_rules();
+            None
+        });
+
+        // Tick the panel clock on each minute boundary. The timer is the wake
+        // source, so this works even when input is idle (no frame starvation).
+        synoik.timer_after(
+            Duration::from_secs(crate::ui::panel::secs_until_next_minute()),
+            |state| {
+                // The shield's curtain shows the same clock and is the only thing on screen
+                // while it is down, so it rides this tick too — explicitly, rather than
+                // relying on the panel's label happening to change on the same boundary.
+                if state.synoik.panel.update_clock() || state.synoik.screen_shield.is_active() {
+                    state.synoik.queue_redraw_all();
+                }
+                // ...and so does the unlock prompt's two-minute escape back to the clock.
+                // Riding the clock tick makes that granular to a minute rather than exact,
+                // which is the right trade for a timeout whose only job is to not leave a
+                // half-typed password on an unattended screen.
+                if state.synoik.unlock_dialog.is_waiting_to_escape() {
+                    let now = state.synoik.shield_now();
+                    let effects = state.synoik.unlock_dialog.tick(now);
+                    state.apply_unlock_effects(effects);
+                }
+                // Refresh the open World Clocks section's live times/offsets on
+                // the same tick (gnome-shell's `WallClock notify::clock`).
+                state.synoik.refresh_popover_world_clocks();
+                // Re-arm for the next second (when showing seconds) or the next
+                // minute boundary, per the current clock format.
+                Some(state.synoik.panel.clock_tick_interval())
+            },
+        );
+
         // One GPU upload map for every surface that draws app icons, as gnome-shell keeps
         // one Cogl texture per gicon+size shell-wide (`st-texture-cache.c:998`). The dash's
         // is the one they all take, so the drag proxy's map is the same object too.
@@ -8509,7 +8459,7 @@ impl Synoik {
     /// Cancels a pending debounced save and writes synchronously. For the shutdown path.
     pub fn flush_workspace_names(&mut self) {
         if let Some(token) = self.workspace_names_save_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         self.workspace_names.flush();
     }
@@ -8986,7 +8936,7 @@ impl Synoik {
             RedrawState::Idle => (),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => (),
-            RedrawState::ScheduledDispatch { token, .. } => self.event_loop.remove(token),
+            RedrawState::ScheduledDispatch { token, .. } => self.cancel_timer(token),
             RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
         }
@@ -9008,18 +8958,13 @@ impl Synoik {
         // process it.
         let global = state.global;
         self.display_handle.disable_global::<State>(global.clone());
-        self.event_loop
-            .insert_source(
-                Timer::from_duration(Duration::from_secs(10)),
-                move |_, _, state| {
-                    state
-                        .synoik
-                        .display_handle
-                        .remove_global::<State>(global.clone());
-                    TimeoutAction::Drop
-                },
-            )
-            .unwrap();
+        self.timer_after(Duration::from_secs(10), move |state| {
+            state
+                .synoik
+                .display_handle
+                .remove_global::<State>(global.clone());
+            None
+        });
 
         match mem::take(&mut self.lock_state) {
             LockState::Locking(confirmation) => {
@@ -10297,28 +10242,23 @@ impl Synoik {
     /// current.
     pub fn refresh_wallpaper_timer(&mut self) {
         if let Some(token) = self.wallpaper_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         let Some(delay) = self.wallpaper.slideshow_wakeup() else {
             return;
         };
 
-        let token = self
-            .event_loop
-            .insert_source(Timer::from_duration(delay), |_, _, state| {
-                let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
-                // No redraw here: `refresh` only *asks* for a decode, and the tick that lands on
-                // the picture already up asks for nothing at all. The redraw rides the result.
-                state.synoik.wallpaper.refresh(gpu.as_ref());
-                match state.synoik.wallpaper.slideshow_wakeup() {
-                    Some(next) => TimeoutAction::ToDuration(next),
-                    None => {
-                        state.synoik.wallpaper_timer = None;
-                        TimeoutAction::Drop
-                    }
-                }
-            })
-            .unwrap();
+        let token = self.timer_after(delay, |state| {
+            let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
+            // No redraw here: `refresh` only *asks* for a decode, and the tick that lands on
+            // the picture already up asks for nothing at all. The redraw rides the result.
+            state.synoik.wallpaper.refresh(gpu.as_ref());
+            let next = state.synoik.wallpaper.slideshow_wakeup();
+            if next.is_none() {
+                state.synoik.wallpaper_timer = None;
+            }
+            next
+        });
         self.wallpaper_timer = Some(token);
     }
 
@@ -10440,33 +10380,26 @@ impl Synoik {
     /// without being removed (the rogue-vblank error path in `Tty::on_vblank`) costs one wasted
     /// wakeup and nothing else.
     fn schedule_dispatch(&mut self, output: &Output, at: Duration, target: Duration) {
-        let now = get_monotonic_time();
         let timer_output = output.clone();
-        let token = self
-            .event_loop
-            .insert_source(
-                Timer::from_duration(at.saturating_sub(now)),
-                move |_, _, data| {
-                    let synoik = &mut data.synoik;
-                    let Some(state) = synoik.output_state.get_mut(&timer_output) else {
-                        // The output went away while the deadline was pending.
-                        return TimeoutAction::Drop;
-                    };
+        let token = self.timer_at(at, move |data| {
+            let synoik = &mut data.synoik;
+            let Some(state) = synoik.output_state.get_mut(&timer_output) else {
+                // The output went away while the deadline was pending.
+                return None;
+            };
 
-                    // Only *this* deadline may release the output: a token dropped without being
-                    // removed (the rogue-vblank error path in `Tty::on_vblank`) would otherwise
-                    // fire into whatever deadline was armed after it and release that one early.
-                    if let RedrawState::ScheduledDispatch { aim, .. } = state.redraw_state {
-                        if aim.scheduled_at == Some(at) {
-                            state.pending_aim = Some(aim);
-                            state.redraw_state = RedrawState::Queued;
-                        }
-                    }
+            // Only *this* deadline may release the output: a token dropped without being
+            // cancelled (the rogue-vblank error path in `Tty::on_vblank`) would otherwise
+            // fire into whatever deadline was armed after it and release that one early.
+            if let RedrawState::ScheduledDispatch { aim, .. } = state.redraw_state {
+                if aim.scheduled_at == Some(at) {
+                    state.pending_aim = Some(aim);
+                    state.redraw_state = RedrawState::Queued;
+                }
+            }
 
-                    TimeoutAction::Drop
-                },
-            )
-            .unwrap();
+            None
+        });
 
         let state = self.output_state.get_mut(output).unwrap();
         state.redraw_state = RedrawState::ScheduledDispatch {
@@ -11265,20 +11198,18 @@ impl Synoik {
         }
 
         if let Some(token) = self.shield_present_deadline.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
-        let timer = calloop::timer::Timer::from_duration(Self::SHIELD_PRESENT_DEADLINE);
-        self.shield_present_deadline = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.shield_present_deadline = Some(self.timer_after(
+            Self::SHIELD_PRESENT_DEADLINE,
+            move |state| {
                 if !state.synoik.shield_frames_owed.is_empty() {
                     warn!("the shield never reached the screen; letting the suspend go ahead");
                     state.synoik.clear_shield_present_wait();
                 }
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the shield presentation deadline: {err:?}"))
-            .ok();
+                None
+            },
+        ));
     }
 
     /// Stop waiting, whatever the reason — the frame landed, the deadline passed, or the suspend
@@ -11286,7 +11217,7 @@ impl Synoik {
     pub fn clear_shield_present_wait(&mut self) {
         self.shield_frames_owed.clear();
         if let Some(token) = self.shield_present_deadline.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         for state in self.output_state.values_mut() {
             state.shield_frame_queued = false;
@@ -14299,15 +14230,11 @@ impl Synoik {
             // let's wait for the lock surfaces.
             //
             // Give them a second; swaylock can take its time to paint a big enough image.
-            let timer = Timer::from_duration(Duration::from_millis(1000));
-            let deadline_token = self
-                .event_loop
-                .insert_source(timer, |_, _, state| {
-                    trace!("lock deadline expired, continuing");
-                    state.synoik.continue_to_locking();
-                    TimeoutAction::Drop
-                })
-                .unwrap();
+            let deadline_token = self.timer_after(Duration::from_millis(1000), |state| {
+                trace!("lock deadline expired, continuing");
+                state.synoik.continue_to_locking();
+                None
+            });
 
             self.lock_state = LockState::WaitingForSurfaces {
                 confirmation,
@@ -14345,7 +14272,7 @@ impl Synoik {
                 confirmation,
                 deadline_token,
             } => {
-                self.event_loop.remove(deadline_token);
+                self.cancel_timer(deadline_token);
 
                 self.close_screenshot_ui();
                 self.cursor_manager
@@ -14375,7 +14302,7 @@ impl Synoik {
 
         let prev = mem::take(&mut self.lock_state);
         if let LockState::WaitingForSurfaces { deadline_token, .. } = prev {
-            self.event_loop.remove(deadline_token);
+            self.cancel_timer(deadline_token);
         }
 
         for output_state in self.output_state.values_mut() {
@@ -14897,7 +14824,7 @@ impl Synoik {
         let _span = tracy_client::span!("Synoik::reset_pointer_inactivity_timer");
 
         if let Some(token) = self.pointer_inactivity_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
 
         let Some(timeout_ms) = self.config.borrow().cursor.hide_after_inactive_ms else {
@@ -14905,22 +14832,18 @@ impl Synoik {
         };
 
         let duration = Duration::from_millis(timeout_ms as u64);
-        let timer = Timer::from_duration(duration);
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.pointer_inactivity_timer = None;
+        let token = self.timer_after(duration, move |state| {
+            state.synoik.pointer_inactivity_timer = None;
 
-                // If the pointer is already invisible, don't reset it back to Hidden causing one
-                // frame of hover.
-                if state.synoik.pointer_visibility.is_visible() {
-                    state.synoik.pointer_visibility = PointerVisibility::Hidden;
-                    state.synoik.queue_redraw_all();
-                }
+            // If the pointer is already invisible, don't reset it back to Hidden causing one
+            // frame of hover.
+            if state.synoik.pointer_visibility.is_visible() {
+                state.synoik.pointer_visibility = PointerVisibility::Hidden;
+                state.synoik.queue_redraw_all();
+            }
 
-                TimeoutAction::Drop
-            })
-            .unwrap();
+            None
+        });
         self.pointer_inactivity_timer = Some(token);
 
         self.pointer_inactivity_timer_got_reset = true;
@@ -15220,31 +15143,22 @@ impl Synoik {
     /// same period. A pending deadline means a timer is already armed, so a burst arms
     /// exactly one.
     pub fn queue_app_catalog_reload(&mut self) {
-        let deadline = std::time::Instant::now() + APP_CATALOG_RELOAD_DEBOUNCE;
+        let deadline = self.clock.now_unadjusted() + APP_CATALOG_RELOAD_DEBOUNCE;
         if self.app_catalog_reload_at.replace(deadline).is_some() {
             // A timer is already running; it will see the moved deadline and wait again.
             return;
         }
-        let armed = self.event_loop.insert_source(
-            Timer::from_duration(APP_CATALOG_RELOAD_DEBOUNCE),
-            |_, _, state| match app_catalog_reload_wait(
-                state.synoik.app_catalog_reload_at,
-                std::time::Instant::now(),
-            ) {
-                Some(at) => TimeoutAction::ToInstant(at),
+        self.timer_after(APP_CATALOG_RELOAD_DEBOUNCE, |state| {
+            let now = state.synoik.clock.now_unadjusted();
+            match app_catalog_reload_wait(state.synoik.app_catalog_reload_at, now) {
+                Some(at) => Some(at.saturating_sub(now)),
                 None => {
                     state.synoik.app_catalog_reload_at = None;
                     state.synoik.reload_app_catalog();
-                    TimeoutAction::Drop
+                    None
                 }
-            },
-        );
-        if let Err(err) = armed {
-            // No timer means no reload, so do it now rather than lose the change.
-            tracing::warn!("could not arm the app catalog reload: {err}");
-            self.app_catalog_reload_at = None;
-            self.reload_app_catalog();
-        }
+            }
+        });
     }
 
     /// Re-read the app catalog and everything derived from it.
@@ -16230,22 +16144,17 @@ impl Synoik {
     /// `advance_animations`; this timer only wakes an otherwise idle loop.
     pub fn reschedule_notification_banner_timer(&mut self) {
         if let Some(token) = self.notification_banner_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         let Some(deadline) = self.notification_banner.next_wakeup() else {
             return;
         };
-        let now = self.clock.now_unadjusted();
-        let timer = Timer::from_duration(deadline.saturating_sub(now));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.notification_banner_timer = None;
-                // The frame's advance_animations re-checks the deadline.
-                state.synoik.queue_redraw_all();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token = self.timer_at(deadline, move |state| {
+            state.synoik.notification_banner_timer = None;
+            // The frame's advance_animations re-checks the deadline.
+            state.synoik.queue_redraw_all();
+            None
+        });
         self.notification_banner_timer = Some(token);
     }
 
@@ -16254,24 +16163,19 @@ impl Synoik {
     /// wake the loop at the earliest armed 1500 ms hide deadline.
     pub fn reschedule_osd_timer(&mut self) {
         if let Some(token) = self.osd_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         self.osd_timer_at = self.osd.next_wakeup();
         let Some(deadline) = self.osd_timer_at else {
             return;
         };
-        let now = self.clock.now_unadjusted();
-        let timer = Timer::from_duration(deadline.saturating_sub(now));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.osd_timer = None;
-                state.synoik.osd_timer_at = None;
-                // The frame's advance_animations re-checks the deadline.
-                state.synoik.queue_redraw_all();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token = self.timer_at(deadline, move |state| {
+            state.synoik.osd_timer = None;
+            state.synoik.osd_timer_at = None;
+            // The frame's advance_animations re-checks the deadline.
+            state.synoik.queue_redraw_all();
+            None
+        });
         self.osd_timer = Some(token);
     }
 
@@ -16401,24 +16305,19 @@ impl Synoik {
 
     pub fn reschedule_dock_timer(&mut self) {
         if let Some(token) = self.dock_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         self.dock_timer_at = self.dock.next_wakeup();
         let Some(deadline) = self.dock_timer_at else {
             return;
         };
-        let now = self.clock.now_unadjusted();
-        let timer = Timer::from_duration(deadline.saturating_sub(now));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.dock_timer = None;
-                state.synoik.dock_timer_at = None;
-                // The frame's advance_animations re-checks the deadline.
-                state.synoik.queue_redraw_all();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token = self.timer_at(deadline, move |state| {
+            state.synoik.dock_timer = None;
+            state.synoik.dock_timer_at = None;
+            // The frame's advance_animations re-checks the deadline.
+            state.synoik.queue_redraw_all();
+            None
+        });
         self.dock_timer = Some(token);
     }
 
@@ -16429,28 +16328,23 @@ impl Synoik {
     /// while a modifier is merely being *held*, so the 150 ms reveal has no other event to ride.
     pub fn reschedule_switcher_timer(&mut self) {
         if let Some(token) = self.switcher_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         self.switcher_timer_at = self.switcher.next_deadline();
         let Some(deadline) = self.switcher_timer_at else {
             return;
         };
-        let now = self.clock.now_unadjusted();
-        let timer = Timer::from_duration(deadline.saturating_sub(now));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.switcher_timer = None;
-                state.synoik.switcher_timer_at = None;
+        let token = self.timer_at(deadline, move |state| {
+            state.synoik.switcher_timer = None;
+            state.synoik.switcher_timer_at = None;
 
-                let now = state.synoik.clock.now_unadjusted();
-                let outcome = state.synoik.switcher.advance(now);
-                state.finish_switcher(outcome);
-                state.hide_osd_for_switcher();
-                state.synoik.queue_redraw_all();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+            let now = state.synoik.clock.now_unadjusted();
+            let outcome = state.synoik.switcher.advance(now);
+            state.finish_switcher(outcome);
+            state.hide_osd_for_switcher();
+            state.synoik.queue_redraw_all();
+            None
+        });
         self.switcher_timer = Some(token);
     }
 
@@ -16471,22 +16365,17 @@ impl Synoik {
     /// Idempotent; call after anything that changes the watch set or the last-activity time.
     pub fn reschedule_idle_monitor_timer(&mut self) {
         if let Some(token) = self.idle_monitor_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         let Some(deadline) = self.idle_monitor.next_wakeup() else {
             return;
         };
-        // A deadline already in the past (e.g. a watch added while long idle) yields a zero delay,
-        // which fires on the next loop iteration — mutter fires such a watch at its next dispatch.
-        let delay = deadline.saturating_sub(self.clock.now_unadjusted());
-        let timer = Timer::from_duration(delay);
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.on_idle_monitor_timer();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        // A deadline already in the past (e.g. a watch added while long idle) comes due on the
+        // next turn — mutter fires such a watch at its next dispatch.
+        let token = self.timer_at(deadline, move |state| {
+            state.synoik.on_idle_monitor_timer();
+            None
+        });
         self.idle_monitor_timer = Some(token);
     }
 
@@ -16622,19 +16511,15 @@ impl Synoik {
     /// deadline, auto-confirm. Cancels the timer when no dialog is counting down.
     pub fn reschedule_end_session_timer(&mut self) {
         if let Some(token) = self.end_session_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         if self.end_session.deadline().is_none() {
             return;
         }
-        let timer = Timer::from_duration(Duration::from_secs(1));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.on_end_session_timer();
-                TimeoutAction::Drop
-            })
-            .unwrap();
+        let token = self.timer_after(Duration::from_secs(1), move |state| {
+            state.on_end_session_timer();
+            None
+        });
         self.end_session_timer = Some(token);
     }
 
@@ -16999,7 +16884,6 @@ fn log_session_record(session_id: &str, name: &str, record: &ToplevelRecord) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
 
     use super::*;
 
@@ -17009,7 +16893,8 @@ mod tests {
     /// so a newly installed app simply never appears.
     #[test]
     fn the_reload_timer_waits_out_a_moved_deadline() {
-        let now = Instant::now();
+        // An instant on the compositor's clock, like every other deadline.
+        let now = Duration::from_secs(1000);
 
         // Nothing pending (the reload already ran, or was never queued): run, don't wait.
         assert_eq!(app_catalog_reload_wait(None, now), None);

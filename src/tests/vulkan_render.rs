@@ -654,10 +654,7 @@ fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
     let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + Duration::from_secs(4));
-    assert!(matches!(
-        f.synoik_state().tick_pending_capture(),
-        calloop::timer::TimeoutAction::Drop
-    ));
+    assert!(f.synoik_state().tick_pending_capture().is_none());
     assert!(f.synoik().pending_capture.is_none());
 
     // The PNG is encoded off-thread; bounded work, so this waits rather than polls forever.

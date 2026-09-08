@@ -27717,18 +27717,12 @@ fn a_lock_mid_countdown_cancels_the_delayed_capture() {
     assert!(f.synoik().pending_capture.is_some());
 
     // A tick before the lock keeps counting — otherwise this would pass for the wrong reason.
-    assert!(matches!(
-        f.synoik_state().tick_pending_capture(),
-        calloop::timer::TimeoutAction::ToDuration(_)
-    ));
+    assert!(f.synoik_state().tick_pending_capture().is_some());
     assert!(f.synoik().pending_capture.is_some());
 
     f.synoik_state()
         .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
-    assert!(matches!(
-        f.synoik_state().tick_pending_capture(),
-        calloop::timer::TimeoutAction::Drop
-    ));
+    assert!(f.synoik_state().tick_pending_capture().is_none());
     assert!(
         f.synoik().pending_capture.is_none(),
         "the locked screen must not be shot"
