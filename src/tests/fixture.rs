@@ -120,11 +120,21 @@ impl Fixture {
         self.state.server.turn();
     }
 
-    /// Pump the compositor's own event loop until `pred` holds, giving up after
-    /// `timeout`. This spends **real** wall-clock time: it is for the handful of
-    /// behaviours driven by a calloop timer rather than by the animation clock (drag
-    /// countdowns), which no amount of `synoik_complete_animations` will fire. Returns
-    /// whether the predicate came true.
+    /// Step the clock forward one frame at a time, taking a turn each step, until `pred` holds —
+    /// giving up after `within` of *clock* time. Returns whether the predicate came true.
+    ///
+    /// This is how a test reaches a timer: every deadline in the compositor is on the clock the
+    /// test is driving here (see [`crate::utils::timers`]), so a key repeat, a drag countdown or
+    /// an idle deadline all come due in the turn that steps past them. It spends no wall-clock,
+    /// which is what the wall-clock `dispatch_until` it replaced did — a 3 s repeat test really
+    /// slept for up to 3 s.
+    /// Pump the loop until `pred` holds, spending **real** wall-clock — for the one deadline
+    /// [`advance_until`](Self::advance_until) cannot reach.
+    ///
+    /// Every deadline the compositor reasons about is on the clock a test drives, so this is not
+    /// the tool for one: reach for `advance_until`. What is left on calloop's clock is the
+    /// estimated-vblank pacer, which stands in for display hardware — and an output already parked
+    /// on it when a test freezes the clock is freed only by real time passing.
     pub fn dispatch_until(
         &mut self,
         timeout: Duration,
@@ -132,10 +142,7 @@ impl Fixture {
     ) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            for client in &mut self.state.clients {
-                client.dispatch();
-            }
-            self.state.server.turn();
+            self.turn();
             if pred(&mut self.state.server.state) {
                 return true;
             }
@@ -144,6 +151,31 @@ impl Fixture {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    pub fn advance_until(
+        &mut self,
+        within: Duration,
+        mut pred: impl FnMut(&mut crate::synoik::State) -> bool,
+    ) -> bool {
+        const FRAME: Duration = Duration::from_micros(16_667);
+
+        let was_frozen = self.synoik().clock.is_frozen();
+        self.freeze_clock();
+
+        let mut elapsed = Duration::ZERO;
+        let mut held = pred(&mut self.state.server.state);
+        while !held && elapsed < within {
+            self.advance_clock(FRAME);
+            self.turn();
+            elapsed += FRAME;
+            held = pred(&mut self.state.server.state);
+        }
+
+        if !was_frozen {
+            self.synoik().clock.unfreeze();
+        }
+        held
     }
 
     pub fn synoik_state(&mut self) -> &mut crate::synoik::State {

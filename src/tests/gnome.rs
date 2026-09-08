@@ -2460,14 +2460,14 @@ fn what_the_screen_was_shown_is_the_scene_when_the_strip_stops() {
     // the one this whole probe exists to catch.
     let settle = |f: &mut Fixture| {
         let target = out.clone();
-        f.dispatch_until(Duration::from_millis(1500), move |state| {
+        f.advance_until(Duration::from_millis(1500), move |state| {
             state
                 .synoik
                 .anim_causes(&target)
                 .difference(crate::frame_log::AnimCauses::ONGOING)
                 .is_empty()
         });
-        f.dispatch_until(Duration::from_millis(200), |_| false);
+        f.advance_until(Duration::from_millis(200), |_| false);
     };
 
     settle(&mut f);
@@ -4074,7 +4074,7 @@ fn a_held_key_repeats_into_a_shell_entry() {
     );
 
     assert!(
-        f.dispatch_until(Duration::from_secs(3), |state| {
+        f.advance_until(Duration::from_secs(3), |state| {
             state.synoik.run_dialog.entry().chars().count() >= 3
         }),
         "holding the key must keep typing it, got {:?}",
@@ -4085,7 +4085,7 @@ fn a_held_key_repeats_into_a_shell_entry() {
     f.key_release(KEY_Z);
     let settled = f.synoik().run_dialog.entry().chars().count();
     assert!(
-        !f.dispatch_until(Duration::from_millis(200), |state| {
+        !f.advance_until(Duration::from_millis(200), |state| {
             state.synoik.run_dialog.entry().chars().count() > settled
         }),
         "the release must stop the repeat"
@@ -4113,7 +4113,7 @@ fn a_held_arrow_repeats_in_a_panel_menu() {
         "the press itself steps out of the system row, got {first_tile:?}"
     );
     assert!(
-        f.dispatch_until(Duration::from_secs(3), |state| {
+        f.advance_until(Duration::from_secs(3), |state| {
             state.synoik.panel_popover.focused_row_label() != first_tile
         }),
         "holding Down must keep stepping"
@@ -4122,7 +4122,7 @@ fn a_held_arrow_repeats_in_a_panel_menu() {
     f.key_release(KEY_DOWN);
     let settled = f.synoik().panel_popover.focused_row_label();
     assert!(
-        !f.dispatch_until(Duration::from_millis(200), |state| {
+        !f.advance_until(Duration::from_millis(200), |state| {
             state.synoik.panel_popover.focused_row_label() != settled
         }),
         "the release must stop the repeat"
@@ -4140,7 +4140,7 @@ fn key_repeat_turned_off_never_repeats() {
     f.synoik_state().do_action(Action::ShowRunDialog, false);
     f.key_press(KEY_Z);
     assert!(
-        !f.dispatch_until(Duration::from_millis(200), |state| {
+        !f.advance_until(Duration::from_millis(200), |state| {
             state.synoik.run_dialog.entry().chars().count() > 1
         }),
         "a zero repeat rate must type exactly once"
@@ -4162,7 +4162,7 @@ fn a_modifier_tapped_mid_hold_does_not_stop_the_repeat() {
     tap(&mut f, KEY_LEFTSHIFT);
 
     assert!(
-        f.dispatch_until(Duration::from_secs(3), |state| {
+        f.advance_until(Duration::from_secs(3), |state| {
             state.synoik.run_dialog.entry().chars().count() >= 3
         }),
         "Shift neither repeats itself nor stops the key being held, got {:?}",
@@ -17139,6 +17139,12 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
 
     // Real time, not the animation clock: the release is a presentation, so it has to come from
     // the compositor's own loop rendering the frame after the slide lands.
+    // The one wait in the corpus that still spends **real** time, and the only place left where
+    // that is not a choice: the release rides a *presented* frame, and the frame that presents it
+    // is paced by the headless estimated-vblank timer — the last deadline still on calloop's
+    // clock rather than the compositor's (see `crate::utils::timers`). An output already parked on
+    // that timer when a test freezes the clock cannot be freed by advancing the clock, because the
+    // pacer was armed against wall time before the freeze.
     assert!(
         f.dispatch_until(Duration::from_millis(900), |state| {
             !state.synoik.shield_frame_owed()
@@ -17191,7 +17197,7 @@ fn a_lock_holds_the_suspend_until_its_own_curtain_lands() {
     );
 
     assert!(
-        f.dispatch_until(Duration::from_millis(900), |state| {
+        f.advance_until(Duration::from_millis(900), |state| {
             !state.synoik.curtain_frame_owed()
         }),
         "the curtain never landed"
@@ -19974,12 +19980,12 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
 
     // Wait out most of that timer's delay, so its firing lands *inside* the window the
     // second drag is watched over.
-    f.dispatch_until(Duration::from_millis(150), |_| false);
+    f.advance_until(Duration::from_millis(150), |_| false);
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
     assert!(f.synoik().folder_pending_move.is_some(), "a move is armed");
-    let moved_early = f.dispatch_until(Duration::from_millis(100), |state| {
+    let moved_early = f.advance_until(Duration::from_millis(100), |state| {
         state.synoik.folder_dialog.member_ids() != after_first
     });
     assert!(
@@ -20576,7 +20582,7 @@ fn overview_dragging_an_app_between_folders_moves_it() {
     // Out of the panel, and hold there until the dialog gives up and pops down.
     pointer_motion_to(&mut f, office.x, office.y);
     assert!(f.synoik().app_drag.is_some(), "the drag must have started");
-    let popped = f.dispatch_until(Duration::from_millis(2000), |state| {
+    let popped = f.advance_until(Duration::from_millis(2000), |state| {
         !state.synoik.folder_dialog.is_open()
     });
     assert!(
@@ -36686,13 +36692,13 @@ fn every_frames_damage_covers_what_that_frame_changed() {
 
     let settle = |f: &mut Fixture| {
         let t = out.clone();
-        f.dispatch_until(Duration::from_millis(1500), move |s| {
+        f.advance_until(Duration::from_millis(1500), move |s| {
             s.synoik
                 .anim_causes(&t)
                 .difference(crate::frame_log::AnimCauses::ONGOING)
                 .is_empty()
         });
-        f.dispatch_until(Duration::from_millis(200), |_| false);
+        f.advance_until(Duration::from_millis(200), |_| false);
     };
     settle(&mut f);
 

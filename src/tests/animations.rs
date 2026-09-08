@@ -235,7 +235,7 @@ fn a_client_is_paced_by_the_redraw_not_the_overdue_fallback() {
 
         f.synoik().queue_redraw(&output);
 
-        let paced = f.dispatch_until(BUDGET, |_| {
+        let paced = f.advance_until(BUDGET, |_| {
             frame.done.load(std::sync::atomic::Ordering::Relaxed)
         });
         assert!(
@@ -281,7 +281,7 @@ fn the_headless_redraw_loop_keeps_an_animation_going() {
     let before = f.synoik().output_state[&output].frame_callback_sequence;
     f.synoik().queue_redraw(&output);
 
-    let kept_going = f.dispatch_until(Duration::from_millis(500), |state| {
+    let kept_going = f.advance_until(Duration::from_millis(500), |state| {
         state.synoik.output_state[&output]
             .frame_callback_sequence
             .wrapping_sub(before)
