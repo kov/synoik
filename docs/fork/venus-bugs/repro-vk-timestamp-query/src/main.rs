@@ -5,25 +5,28 @@
 //! Minimal, self-contained reproducer for a Venus (Mesa `venus`) timestamp-query gap.
 //!
 //! The device advertises timestamp queries in full — `timestampComputeAndGraphics = true`,
-//! `timestampValidBits = 64` on the graphics queue, `timestampPeriod = 1` — but
-//! `vkCmdWriteTimestamp` never writes a value. After a submit and a fence wait the queries come
-//! back **available (`availability = 1`) with a value of `0`**.
+//! `timestampValidBits = 64` on the graphics queue — and the queries do come back **available
+//! (`availability = 1`) with large, plausible tick values**. What they do not do is *move*: the two
+//! stamps bracketing one submit resolve to the **same tick**, so the delta is `0` however much GPU
+//! work sits between them.
 //!
 //! That combination is the whole problem. The queries are not "not ready" and the calls do not
 //! fail: `vkGetQueryPoolResults` correctly reports success for a resolved query, and hands the
-//! caller a zero. There is nothing in the API surface that distinguishes "this GPU pass took no
-//! measurable time" from "this driver does not implement the feature it advertises", so a profiler
-//! that trusts the result reports a confident, wrong `0ns` for every pass.
+//! caller two identical values. There is nothing in the API surface that distinguishes "this GPU
+//! pass took no measurable time" from "this driver does not resolve the write where it claims to",
+//! so a profiler that trusts the result reports a confident, wrong `0ns` for every pass.
 //!
-//! The device clock itself is fine: `vkGetCalibratedTimestampsEXT` returns a live `DEVICE`
-//! timestamp on the same device, advancing at one tick per nanosecond (so `timestampPeriod = 1` is
-//! accurate). The gap is the query-pool write/resolve path specifically, not a missing GPU clock.
+//! `timestampPeriod` reads `41.666668` (a 24 MHz clock). `vkGetCalibratedTimestampsEXT` advertises
+//! `DEVICE`, `CLOCK_MONOTONIC` and `CLOCK_MONOTONIC_RAW` but returns `ERROR_OUT_OF_HOST_MEMORY` on
+//! the first call, so the device clock cannot be cross-checked from the guest; set
+//! `SKIP_CALIBRATED=1` to step past it and reach the shape matrix.
 //!
 //! Run with Venus selected (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json
 //! cargo run`) and against lavapipe on the same guest
 //! (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run`) for the contrast:
-//! identical declared limits, real timestamps out of lavapipe.
-
+//! identical declared limits, real timestamps out of lavapipe. Note that lavapipe swaps the *whole*
+//! guest→host stack, so it is a control for the stack and cannot by itself name which host layer
+//! (the VMM's virglrenderer or the host Vulkan driver underneath it) owns a difference.
 use std::ffi::{c_char, CStr};
 
 use ash::vk;
@@ -176,10 +179,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- 5. Cross-check that a device clock exists at all. ------------------------------------
-    if has_calibrated {
+    if has_calibrated && std::env::var("SKIP_CALIBRATED").is_err() {
         let ct_instance = ash::ext::calibrated_timestamps::Instance::new(&entry, &instance);
-        let domains =
-            unsafe { ct_instance.get_physical_device_calibrateable_time_domains(phys) }?;
+        let domains = unsafe { ct_instance.get_physical_device_calibrateable_time_domains(phys) }?;
         println!("\ncalibrated time domains: {domains:?}");
 
         if domains.contains(&vk::TimeDomainEXT::DEVICE) {
@@ -240,61 +242,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // compositor timing a frame — brackets real GPU work. If the sample lands at completion rather
     // than execution (§11), an empty buffer is precisely the degenerate case, so it is worth
     // knowing whether the shape we would actually use behaves differently.
-    for &work in &[false, true] {
-    println!("  -- {} --", if work { "with a 16 MiB fill between the stamps" } else { "empty command buffer" });
-    for &use_sync2 in &[false, true] {
-        for &resolve in &[Resolve::Host, Resolve::CopySameCbuf, Resolve::CopyOtherCbuf] {
-            let label = format!(
-                "{:<24} {:<22}",
-                if use_sync2 {
-                    "vkCmdWriteTimestamp2"
-                } else {
-                    "vkCmdWriteTimestamp"
-                },
-                match resolve {
-                    Resolve::Host => "GetQueryPoolResults",
-                    Resolve::CopySameCbuf => "CopyQueryPoolResults",
-                    Resolve::CopyOtherCbuf => "Copy (separate cbuf)",
-                },
-            );
+    // A failing arm can wedge the device for the rest of the process, so every later arm then
+    // reports the corpse rather than its own behaviour. `ONLY_WORK` and `ONLY_SYNC2` (`0` or `1`)
+    // pin one value of an axis, which is what lets each arm be run in a **fresh process** when
+    // that happens; unset runs both, as before.
+    let axis = |name: &str| -> Vec<bool> {
+        match std::env::var(name).ok().as_deref() {
+            Some("0") => vec![false],
+            Some("1") => vec![true],
+            _ => vec![false, true],
+        }
+    };
+    let (work_axis, sync2_axis) = (axis("ONLY_WORK"), axis("ONLY_SYNC2"));
+    for &work in &work_axis {
+        println!(
+            "  -- {} --",
+            if work {
+                "with a 16 MiB fill between the stamps"
+            } else {
+                "empty command buffer"
+            }
+        );
+        for &use_sync2 in &sync2_axis {
+            for &resolve in &[Resolve::Host, Resolve::CopySameCbuf, Resolve::CopyOtherCbuf] {
+                let label = format!(
+                    "{:<24} {:<22}",
+                    if use_sync2 {
+                        "vkCmdWriteTimestamp2"
+                    } else {
+                        "vkCmdWriteTimestamp"
+                    },
+                    match resolve {
+                        Resolve::Host => "GetQueryPoolResults",
+                        Resolve::CopySameCbuf => "CopyQueryPoolResults",
+                        Resolve::CopyOtherCbuf => "Copy (separate cbuf)",
+                    },
+                );
 
-            let mut deltas = Vec::new();
-            let mut zeros = 0usize;
-            let mut err = None;
-            for _ in 0..reps {
-                match run_shape(
-                    &device, queue, queue_family, phys, &instance, use_sync2, resolve, work,
-                ) {
-                    // A lost sample reads as 0 *and still reports available*, so a zero is
-                    // indistinguishable from a real result except by being zero. Count it, never
-                    // average it in — see `foundation.md` §5.
-                    Ok([a, b]) if a != 0 || b != 0 => deltas.push(b.wrapping_sub(a)),
-                    Ok(_) => zeros += 1,
-                    Err(e) => {
-                        err = Some(e);
-                        break;
+                let mut deltas = Vec::new();
+                let mut zeros = 0usize;
+                let mut err = None;
+                for _ in 0..reps {
+                    match run_shape(
+                        &device,
+                        queue,
+                        queue_family,
+                        phys,
+                        &instance,
+                        use_sync2,
+                        resolve,
+                        work,
+                    ) {
+                        // A lost sample reads as 0 *and still reports available*, so a zero is
+                        // indistinguishable from a real result except by being zero. Count it,
+                        // never average it in — see `foundation.md` §5.
+                        Ok([a, b]) if a != 0 || b != 0 => deltas.push(b.wrapping_sub(a)),
+                        Ok(_) => zeros += 1,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     }
                 }
-            }
 
-            if let Some(e) = err {
-                println!("  {label} -> error: {e:?}");
-                continue;
-            }
-            let ok = deltas.len();
-            let pct = 100.0 * ok as f64 / reps as f64;
-            if ok == 0 {
-                println!("  {label} -> 0/{reps} usable ({pct:.0}%)  all zero");
-            } else {
-                deltas.sort_unstable();
-                println!(
+                if let Some(e) = err {
+                    println!("  {label} -> error: {e:?}");
+                    continue;
+                }
+                let ok = deltas.len();
+                let pct = 100.0 * ok as f64 / reps as f64;
+                if ok == 0 {
+                    println!("  {label} -> 0/{reps} usable ({pct:.0}%)  all zero");
+                } else {
+                    deltas.sort_unstable();
+                    println!(
                     "  {label} -> {ok}/{reps} usable ({pct:.0}%)  median delta {} ns  [{} zeros]",
                     deltas[ok / 2],
                     zeros,
                 );
+                }
             }
         }
-    }
     }
     println!(
         "\nRead the RATE, not a pass/fail. The defect is intermittent, a lost sample comes back as\n\
