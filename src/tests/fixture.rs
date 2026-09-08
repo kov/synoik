@@ -316,6 +316,53 @@ impl Fixture {
         }
     }
 
+    /// Record the element list of every frame the compositor draws from here on, per output.
+    ///
+    /// This is the way to ask "what did the compositor put on screen". The alternative a test
+    /// reaches for otherwise — call `update_render_elements`, then `render_to_vec` — runs the
+    /// render path a *second* time, from the test, and the resulting list is a product of the
+    /// test's own sequencing. This one is the list the frame was drawn from, taken inside
+    /// `Headless::render` on the frames the compositor's own redraw machinery chose to run.
+    ///
+    /// The recording keeps growing for the rest of the test: it installs the one frame sink, so
+    /// taking a second recording replaces the first, and a test that wants a fresh window calls
+    /// [`FrameRecording::clear`] rather than recording again.
+    /// Needs a renderer: the element pass runs inside `Headless::render_element_states`, which has
+    /// nothing to build a `RenderCtx` from without one and returns before the sink is called. A
+    /// test that records frames therefore calls `add_renderer` and skips itself where there is no
+    /// Vulkan device, the same as every other test that needs the real render path.
+    pub fn record_frames(&mut self) -> FrameRecording {
+        assert!(
+            self.synoik_state()
+                .backend
+                .headless()
+                .with_vulkan_renderer(|_| ())
+                .is_some(),
+            "record_frames without a renderer: no frame is ever drawn, so the recording would \
+             stay empty and every assertion over it would be vacuous. Call \
+             `backend.headless().add_renderer()` first, and skip the test where that fails."
+        );
+        let frames: std::rc::Rc<std::cell::RefCell<Vec<crate::frame_log::FrameSnapshot>>> =
+            Default::default();
+        let sink = frames.clone();
+        self.synoik_state().backend.headless().frame_sink =
+            Some(Box::new(move |_vk, output, elements| {
+                let scale = output.current_scale().fractional_scale();
+                let bounds = smithay::utils::Rectangle::from_size(
+                    output
+                        .current_mode()
+                        .map_or_else(Default::default, |m| m.size),
+                );
+                sink.borrow_mut().push(crate::frame_log::snapshot_frame(
+                    &output.name(),
+                    elements,
+                    scale.into(),
+                    bounds,
+                ));
+            }));
+        FrameRecording { frames }
+    }
+
     /// Whether anything is still animating, on any output — **the compositor's own answer**.
     ///
     /// `State::redraw` decides whether to queue another frame from `Synoik::anim_causes`, so the
@@ -704,5 +751,48 @@ impl Drop for State {
         for _ in 0..5 {
             self.server.dispatch();
         }
+    }
+}
+
+/// The frames the compositor drew while a recording was installed. See
+/// [`Fixture::record_frames`].
+#[derive(Clone)]
+pub struct FrameRecording {
+    frames: std::rc::Rc<std::cell::RefCell<Vec<crate::frame_log::FrameSnapshot>>>,
+}
+
+impl FrameRecording {
+    /// The last frame drawn for `output`.
+    ///
+    /// Panics when there is none, rather than returning an `Option` a test can quietly let fall
+    /// through: a recording with no frames in it makes every assertion below it vacuous, and that
+    /// is the failure mode this whole port exists to remove.
+    pub fn last(&self, output: &Output) -> crate::frame_log::FrameSnapshot {
+        let name = output.name();
+        self.frames
+            .borrow()
+            .iter()
+            .rev()
+            .find(|f| f.output == name)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no frame was drawn for {name} while recording — every assertion about this \
+                     frame would pass for want of a frame. Drawn: {:?}",
+                    self.outputs()
+                )
+            })
+    }
+
+    /// Which outputs drew, and how many frames each — the diagnostic for an empty recording.
+    pub fn outputs(&self) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for frame in self.frames.borrow().iter() {
+            match counts.iter_mut().find(|(name, _)| *name == frame.output) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((frame.output.clone(), 1)),
+            }
+        }
+        counts
     }
 }

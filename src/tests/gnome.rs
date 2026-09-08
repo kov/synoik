@@ -39012,13 +39012,27 @@ fn strip_band_physical(
 /// It reads either way round: too small arriving on a larger output, overflowing the strip
 /// arriving on a smaller one.
 ///
-/// Asserted as enclosure rather than against an expected extent, because a shadow's measurements
-/// are the thing under test: reproducing the 9-slice arithmetic here would agree with a wrong
-/// bake as readily as with a right one. A shadow always surrounds its caster, so a hull that no
-/// longer contains the workspace is stale, whatever the numbers.
+/// Asserted on the elements of a frame **the compositor drew**, and as enclosure rather than
+/// against an expected extent: a shadow's measurements are the thing under test, so reproducing
+/// the 9-slice arithmetic here would agree with a wrong bake as readily as with a right one. A
+/// shadow always surrounds its caster, so a thumbnail whose shadow no longer reaches around it is
+/// wearing another output's.
 #[test]
 fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow: no Vulkan \
+             ({e})"
+        );
+        return;
+    }
+
     let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
     // Different *heights*: the shadow's softness, spread and offset all normalize by
     // `view_size.h / 1080`, so two outputs of the same height would bake the same shadow and the
     // stale one would be indistinguishable from the fresh one.
@@ -39026,8 +39040,6 @@ fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
     f.add_output(2, (2560, 1440));
     f.settle();
 
-    // Fill the destination first, so the arriving workspace lands at the end of a row long
-    // enough to put it outside the cull.
     // The pointer picks the monitor a window maps on, so it has to be over the destination for
     // these to build the destination's row rather than the source's.
     pointer_motion_to(&mut f, 1380., 100.);
@@ -39067,22 +39079,28 @@ fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
         f.settle();
     }
 
+    let frames = f.record_frames();
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle();
+    // Draw the settled state. A settle stops when nothing is animating, and the last frame it
+    // happened to draw can be one from part-way through the opening — the strip still sliding in,
+    // its thumbnails above the band. Asking for one more frame is asking the compositor to draw
+    // what is on screen now, which is what the assertions below are about.
+    f.synoik().queue_redraw_all();
+    f.refresh();
 
     let output = f.synoik_output(2);
-    let synoik = f.synoik();
-    synoik.update_render_elements(Some(&output));
-
-    let mon = synoik
+    let scale = output.current_scale().fractional_scale();
+    let mon = f
+        .synoik()
         .layout
         .monitors()
         .find(|m| m.output() == &output)
         .expect("the destination has a monitor");
-    let ws = mon
+    let idx = mon
         .workspaces_ref()
         .iter()
-        .find(|ws| ws.id() == moved)
+        .position(|ws| ws.id() == moved)
         .expect("the moved workspace is on the destination");
 
     // The precondition the bug needs: this workspace's full-size geometry misses the output, so
@@ -39091,23 +39109,22 @@ fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
     let culled = !mon
         .workspaces_with_render_geo()
         .any(|(ws, _)| ws.id() == moved);
+    let card = mon.thumbnail_drawn_rects()[idx].to_physical_precise_round(scale);
     assert!(
         culled,
         "precondition: the moved workspace is still on screen at full size, so nothing here is \
          exercised — the destination's row needs to be longer, or scrolled further"
     );
 
-    let caster = Rectangle::from_size(ws.view_size());
-    let hull = ws
-        .shadow()
-        .shader_rects()
-        .iter()
-        .copied()
-        .reduce(|a, b| a.merge(b))
-        .expect("a workspace shadow is made of at least one rect");
+    let frame = frames.last(&output);
+    let shadow = frame
+        .union_within("ShadowRenderElement", card)
+        .unwrap_or_else(|| {
+            panic!("the moved workspace's thumbnail {card:?} casts no shadow at all")
+        });
     assert!(
-        hull.contains_rect(caster),
-        "the moved workspace's shadow {hull:?} does not surround the workspace {caster:?} it is \
-         cast by — it is still the shape baked for the output it came from"
+        shadow.contains_rect(card),
+        "the shadow drawn around the moved workspace's thumbnail {shadow:?} does not reach around \
+         the thumbnail {card:?} — it is still the shape baked for the output it came from"
     );
 }

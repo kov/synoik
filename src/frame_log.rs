@@ -1341,6 +1341,155 @@ where
     by_id
 }
 
+/// Every type and variant name in an element's `Debug`, outermost first — `Monitor`, `Relocate`,
+/// `Rescale`, `Workspace`, `Crop`, `Shadow` for a workspace shadow drawn in a thumbnail.
+///
+/// The outermost name alone is nearly useless on this codebase: everything the layout draws
+/// arrives wrapped in `Monitor(Relocate(Rescale(..)))`, so the whole overview classifies as one
+/// kind. The wrapper chain *is* the interesting part — it says which transforms an element went
+/// through — and the innermost name is what a reader calls the thing.
+///
+/// Collected by scanning for identifiers that open a payload, `Name(` or `Name {`, because the
+/// wrappers are a mix of both: smithay's are structs and ours are enums, so a parser that
+/// descended only through `(` stopped dead at the first `RelocateRenderElement { .. }` and
+/// reported every overview element as a `Monitor`.
+fn kind_path(debug: &str) -> Vec<String> {
+    /// Deep enough to reach the innermost element through every wrapper we stack, and bounded so
+    /// a texture's `Debug` cannot turn this into an unbounded allocation.
+    const MAX: usize = 32;
+
+    let bytes = debug.as_bytes();
+    let mut path: Vec<String> = Vec::new();
+    let mut start = None;
+    for (i, b) in bytes.iter().enumerate() {
+        if b.is_ascii_alphanumeric() || *b == b'_' {
+            start.get_or_insert(i);
+            continue;
+        }
+        let Some(from) = start.take() else { continue };
+        // `Name(` or `Name {` opens a payload; `Name<`, `Name:` and the rest do not.
+        let opens = *b == b'(' || (*b == b' ' && bytes.get(i + 1) == Some(&b'{'));
+        if !opens {
+            continue;
+        }
+        let name = &debug[from..i];
+        if !path.iter().any(|k| k == name) {
+            path.push(name.to_owned());
+            if path.len() == MAX {
+                break;
+            }
+        }
+    }
+    path
+}
+
+/// One element of one frame, as plain data.
+///
+/// Everything here is what the element *offered the damage tracker* — the same six axes
+/// `ElementInstanceState::matches` compares, plus the opaque regions the occlusion pass reads.
+/// Recorded rather than re-derived: a test that re-renders a frame to obtain an element list runs
+/// the render path a second time, and then it is asserting about its own execution rather than
+/// about the one the compositor performed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameElement {
+    /// Wrapper chain from `Debug`, outermost first. See [`kind_path`].
+    pub kind: Vec<String>,
+    /// The element's `Id`, rendered — identity across frames, and across the instances one
+    /// element draws when a window appears in both a workspace and its thumbnail.
+    pub id: String,
+    pub geometry: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    pub src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+    pub alpha: f32,
+    /// Position in the frame's element list, topmost first — the list's own order, not the
+    /// tracker's z-index over shaded elements only.
+    pub z_index: usize,
+    pub opaque: Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    /// Whether anything of it survives the occlusion pass. An element wholly behind opaque
+    /// regions is in the list and on no pixel of the screen, so a test that counts it as drawn is
+    /// measuring the list, not the frame.
+    pub shaded: bool,
+}
+
+impl FrameElement {
+    /// Whether this element's wrapper chain contains `name` — `Shadow` finds a shadow however
+    /// deeply it is wrapped.
+    pub fn is(&self, name: &str) -> bool {
+        self.kind.iter().any(|k| k == name)
+    }
+}
+
+/// What the compositor drew for one output on one frame.
+#[derive(Debug, Clone)]
+pub struct FrameSnapshot {
+    pub output: String,
+    /// The frame counter this was taken on, so a recording lines up with the damage log.
+    pub seq: u64,
+    pub scale: f64,
+    pub elements: Vec<FrameElement>,
+}
+
+impl FrameSnapshot {
+    /// Every element whose wrapper chain contains `name`, in list order.
+    pub fn of_kind<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a FrameElement> + 'a {
+        self.elements.iter().filter(move |e| e.is(name))
+    }
+
+    /// The union of the geometries of every element matching `name` that lies within `bounds`.
+    ///
+    /// Bounded rather than global because one kind is drawn many times over: asking for "the
+    /// shadows" on an overview frame unions every workspace's, and the answer is the output.
+    /// `None` when nothing matched, which is a finding and not an empty rectangle.
+    pub fn union_within(
+        &self,
+        name: &str,
+        bounds: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Physical>> {
+        self.of_kind(name)
+            .filter(|e| bounds.overlaps(e.geometry))
+            .map(|e| e.geometry)
+            .reduce(|a, b| a.merge(b))
+    }
+}
+
+/// Snapshot a frame's element list as plain data.
+///
+/// Called from the backend's own render, with the list it is about to draw — see
+/// `Headless::frame_sink`.
+pub fn snapshot_frame<E>(
+    output: &str,
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    bounds: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) -> FrameSnapshot
+where
+    E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+{
+    let shaded: std::collections::HashSet<usize> = shaded_elements(elements, scale, bounds)
+        .into_iter()
+        .map(|(i, _, _)| i)
+        .collect();
+    let elements = elements
+        .iter()
+        .enumerate()
+        .map(|(z_index, e)| FrameElement {
+            kind: kind_path(&format!("{e:?}")),
+            id: format!("{:?}", e.id()),
+            geometry: e.geometry(scale),
+            src: e.src(),
+            alpha: e.alpha(),
+            z_index,
+            opaque: e.opaque_regions(scale).to_vec(),
+            shaded: shaded.contains(&z_index),
+        })
+        .collect();
+    FrameSnapshot {
+        output: output.to_owned(),
+        seq: current_frame_seq(),
+        scale: scale.x,
+        elements,
+    }
+}
+
 /// Report every element that dropped an instance while a sibling stayed put — the one way the
 /// damage tracker under-reports.
 ///
