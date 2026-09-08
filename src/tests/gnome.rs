@@ -13761,14 +13761,20 @@ fn panel_popover_stays_open_in_overview() {
     );
 }
 
-/// The Activities highlight tracks the overview **without a render**.
+/// The Activities highlight tracks the overview within **one loop turn**.
 ///
-/// It used to be armed inside `update_render_elements`, so the frame that opened the overview
-/// drew the button unlit and the highlight only latched on the next advance+render — one frame
-/// late on the seat, and invisible to any test that did not render first. The sync belongs where
-/// the state changes (`State::refresh`), which is what this pins: not one render happens here.
+/// It used to be armed inside `update_render_elements` in a shape that only latched on the
+/// *following* advance+render, so the frame that opened the overview drew the button unlit — one
+/// frame late on the seat. What that costs the user is a turn's lag, so a turn is what this
+/// measures: after the action, one `turn()`, and the panel is already right.
+///
+/// It does not pin *where* the sync lives. `Synoik::redraw` calls `update_render_elements`
+/// unconditionally, before the backend is consulted, and the turn drains the redraw queue — so a
+/// sync moved back into the render path still lands inside this same turn and this test still
+/// passes (checked by moving it). Keeping the sync in `State::refresh` is an altitude rule, held
+/// by review, not by this test.
 #[test]
-fn panel_activities_highlight_needs_no_render() {
+fn panel_activities_highlight_lands_in_one_turn() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.turn();
@@ -13781,14 +13787,14 @@ fn panel_activities_highlight_needs_no_render() {
     f.turn();
     assert!(
         f.synoik().panel.activities_checked(),
-        "one refresh after the overview opens, Activities must already be lit — no render",
+        "one turn after the overview opens, Activities must already be lit",
     );
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
     f.turn();
     assert!(
         !f.synoik().panel.activities_checked(),
-        "and unlit again one refresh after it closes",
+        "and unlit again one turn after it closes",
     );
 }
 
