@@ -14950,8 +14950,6 @@ fn a_settled_frame_matches_a_full_redraw(
     wallpaper: bool,
     shrink: bool,
 ) -> Option<(u64, Rectangle<i32, Physical>)> {
-    use crate::render_helpers::{RenderCtx, RenderTarget};
-
     if crate::render_helpers::vulkan::VulkanRenderer::new().is_err() {
         eprintln!("skipping: no Vulkan device");
         return None;
@@ -15077,72 +15075,13 @@ fn a_settled_frame_matches_a_full_redraw(
         frames.len()
     );
 
-    // The screen: the slot as damage tracking left it.
-    let (screen, w, h) = f
-        .synoik_state()
-        .backend
-        .headless()
-        .last_frame_pixels(&output)
-        .expect("the compositor must have drawn a frame");
+    // The screen as damage tracking left it, against one full-damage redraw of the same frame.
+    // Only the first arm can hold a pixel nobody repainted; see `fixture::screen_pixels`.
+    let output_ref = &output;
+    let (screen, w, h) = crate::tests::fixture::screen_pixels(&mut f, output_ref);
+    let (full, _, _) = crate::tests::fixture::capture_pixels(&mut f, output_ref);
 
-    // The capture: the same element list, full damage, fresh target.
-    let state = f.synoik_state();
-    let full = state
-        .backend
-        .headless()
-        .with_vulkan_renderer(|vk| -> anyhow::Result<Vec<u8>> {
-            let synoik = &mut state.synoik;
-            synoik.update_render_elements(Some(&output));
-            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            let ctx = RenderCtx {
-                renderer: vk,
-                target: RenderTarget::Output,
-                appearance: Some(synoik.appearance()),
-            };
-            let elements = synoik.render_to_vec(ctx, &output, true);
-            crate::render_helpers::render_to_vec(
-                vk,
-                size,
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elements.iter().rev(),
-            )
-        })
-        .expect("the fixture must hold a Vulkan renderer")
-        .expect("compositing through Vulkan must not error");
-
-    assert_eq!(
-        screen.len(),
-        full.len(),
-        "the two arms must be the same frame"
-    );
-
-    // Count differing pixels and box them, so a failure says *where* the screen went stale rather
-    // than only that it did. One channel step of slack: the two arms take different render passes
-    // to the same pixels, and a rounding difference is not a missing repaint.
-    let mut differing = 0u64;
-    let mut bbox: Option<Rectangle<i32, Physical>> = None;
-    for y in 0..h {
-        for x in 0..w {
-            let i = ((y * w + x) * 4) as usize;
-            let off = (0..4).any(|c| screen[i + c].abs_diff(full[i + c]) > 1);
-            if !off {
-                continue;
-            }
-            differing += 1;
-            let px = Rectangle::new(Point::from((x, y)), Size::from((1, 1)));
-            bbox = Some(bbox.map_or(px, |b| {
-                let x0 = b.loc.x.min(x);
-                let y0 = b.loc.y.min(y);
-                let x1 = (b.loc.x + b.size.w).max(x + 1);
-                let y1 = (b.loc.y + b.size.h).max(y + 1);
-                Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)))
-            }));
-        }
-    }
-    Some((differing, bbox.unwrap_or_default()))
+    Some(crate::tests::fixture::never_painted(&screen, &full, w, h).unwrap_or_default())
 }
 
 #[test]

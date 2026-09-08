@@ -754,6 +754,107 @@ impl Drop for State {
     }
 }
 
+/// The pixels the **screen** holds for `output`: the swapchain slot as damage tracking left it.
+///
+/// This is the only arm that can show a missing repaint. Every capture path — screenshot,
+/// screencast, `render_to_vec` — goes through `render_helpers::render_elements`, which clears a
+/// fresh target and draws every element over its whole geometry with no damage tracker and no
+/// occlusion culling. A pixel nobody was told to repaint is therefore repainted by construction
+/// in a capture, and a bug of that class is invisible to one however the picture is compared.
+///
+/// Pair it with [`capture_pixels`] and [`never_painted`].
+pub fn screen_pixels(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
+    f.synoik_state()
+        .backend
+        .headless()
+        .last_frame_pixels(output)
+        .expect(
+            "no frame has been drawn for this output, so there is no screen to read — the \
+             comparison below would be against an empty slot",
+        )
+}
+
+/// The same frame through the **capture** path: one full-damage draw into a fresh target.
+///
+/// Deliberately a second render, and deliberately the path a screenshot takes — it is the control
+/// arm, and what it is worth is that it cannot carry a stale pixel. See [`screen_pixels`].
+pub fn capture_pixels(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::utils::{Physical, Scale, Size, Transform};
+
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    let size: Size<i32, Physical> = output.current_mode().expect("the output has a mode").size;
+    let state = f.synoik_state();
+    let pixels = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<Vec<u8>> {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(output));
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, output, true);
+            crate::render_helpers::render_to_vec(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+        })
+        .expect("the fixture must hold a Vulkan renderer")
+        .expect("compositing through Vulkan must not error");
+    (pixels, size.w, size.h)
+}
+
+/// Where the screen disagrees with a full redraw: the count of differing pixels and the box that
+/// contains them, or `None` when the two agree.
+///
+/// The box is what makes a failure actionable — it says *where* the screen went stale rather than
+/// only that it did. One channel step of slack, because the two arms take different render passes
+/// to the same pixels and a rounding difference is not a missing repaint.
+pub fn never_painted(
+    screen: &[u8],
+    capture: &[u8],
+    w: i32,
+    h: i32,
+) -> Option<(u64, Rectangle<i32, smithay::utils::Physical>)> {
+    use smithay::utils::{Point, Size};
+
+    assert_eq!(
+        screen.len(),
+        capture.len(),
+        "the screen and the capture must be the same frame"
+    );
+
+    let mut differing = 0u64;
+    let mut bbox: Option<Rectangle<i32, smithay::utils::Physical>> = None;
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            if !(0..4).any(|c| screen[i + c].abs_diff(capture[i + c]) > 1) {
+                continue;
+            }
+            differing += 1;
+            let px = Rectangle::new(Point::from((x, y)), Size::from((1, 1)));
+            bbox = Some(bbox.map_or(px, |b| {
+                let x0 = b.loc.x.min(x);
+                let y0 = b.loc.y.min(y);
+                let x1 = (b.loc.x + b.size.w).max(x + 1);
+                let y1 = (b.loc.y + b.size.h).max(y + 1);
+                Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)))
+            }));
+        }
+    }
+    (differing > 0).then(|| (differing, bbox.unwrap_or_default()))
+}
+
 /// The frames the compositor drew while a recording was installed. See
 /// [`Fixture::record_frames`].
 #[derive(Clone)]
