@@ -9737,25 +9737,44 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
 // **no widget may bake on more than one frame of it.** One bake is fine and
 // expected — content appearing for the first time. Every frame is the bug.
 
-/// Render `frames` frames of whatever animation is currently running, stepping the
-/// clock by `step` between them, and return each frame's bake sites.
+/// Start an animation with `start` and render `frames` frames of it, stepping the clock by
+/// `step` between them, and return each frame's bake sites.
 ///
 /// The clock is driven explicitly rather than through `synoik_complete_animations`,
 /// which settles an animation instead of sampling it — the whole point here is to
 /// look *at* the frames in between.
+///
+/// **`start` is a parameter so that it runs inside the freeze**, and that is the whole fix: the
+/// window that has to be held is the one between starting the animation and taking the first
+/// sample, not the sampling loop. An unfrozen clock is cleared at the end of every loop turn, so
+/// the next read comes back off the monotonic clock — and `start` is where the turns are, because
+/// several of these actions only take effect through one. However long that turn takes in real
+/// time is time the animation has already spent before frame one. On this machine that is
+/// negligible; on CI's llvmpipe it consumed the whole animation and one frame of six was still
+/// running, tripping the anti-vacuity assertion below
+/// (`opening_the_overview_rebakes_no_panel_chrome`, fedora, 2026-09-08). Inside the loop the clock
+/// cannot drift — `advance_clock` pins it every iteration — so freezing *after* the action would
+/// have fixed nothing, and a caller left to remember the freeze is the same trap with better
+/// manners. Verified by control, not by going green: a 300 ms sleep between the toggle and the
+/// turn reproduces CI exactly without the freeze (0 of 6) and changes nothing with it (6 of 6).
+/// Same failure `e104780c` fixed one helper over.
 fn bake_sites_per_frame(
     f: &mut Fixture,
     output: &Output,
     frames: usize,
     step: Duration,
+    start: impl FnOnce(&mut Fixture),
 ) -> Vec<Vec<crate::frame_log::BakeSite>> {
+    // Leave the clock as it was found: a caller that froze deliberately must not be thawed here.
+    let was_frozen = f.synoik().clock.is_frozen();
+    f.freeze_clock();
+    start(f);
+
     let mut per_frame = Vec::with_capacity(frames);
     let mut animated = 0usize;
     for _ in 0..frames {
-        let mut clock = f.synoik().clock.clone();
-        let now = clock.now_unadjusted();
-        clock.set_unadjusted(now + step);
-        f.synoik().advance_animations();
+        f.advance_clock(step);
+
         if f.synoik().layout.are_animations_ongoing(Some(output))
             || f.synoik().panel_popover.are_animations_ongoing()
         {
@@ -9765,6 +9784,9 @@ fn bake_sites_per_frame(
         let _ = crate::frame_log::take_bake_sites();
         let _ = render_output_vulkan(f, output);
         per_frame.push(crate::frame_log::take_bake_sites());
+    }
+    if !was_frozen {
+        f.synoik().clock.unfreeze();
     }
     // Anti-vacuity, and it is not hypothetical: every caller here asserts that *nothing* re-baked,
     // which a run of six static frames satisfies perfectly. A `step` larger than the animation, or
@@ -9803,8 +9825,9 @@ fn overview_open_bake_sites(
     let _ = render_output_vulkan(f, output);
     let _ = crate::frame_log::take_bake_sites();
 
-    f.synoik().layout.toggle_overview();
-    bake_sites_per_frame(f, output, 6, Duration::from_millis(40))
+    bake_sites_per_frame(f, output, 6, Duration::from_millis(40), |f| {
+        f.synoik().layout.toggle_overview();
+    })
 }
 
 /// Nothing may re-bake on every frame of the overview animation.
@@ -9868,13 +9891,14 @@ fn opening_the_overview_rebakes_no_panel_chrome() {
         let _ = render_output_vulkan(&mut f, &output);
         let _ = crate::frame_log::take_bake_sites();
 
-        f.synoik().layout.toggle_overview();
-        // The Activities highlight is armed in `State::refresh`, not in the render — so a test
-        // that only toggles the layout never flips `activities_checked` and never reaches the
-        // invalidation this pins. (An earlier draft did exactly that and passed with the bug
-        // deliberately re-introduced.)
-        f.turn();
-        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
+        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40), |f| {
+            f.synoik().layout.toggle_overview();
+            // The Activities highlight is armed in `State::refresh`, not in the render — so a test
+            // that only toggles the layout never flips `activities_checked` and never reaches the
+            // invalidation this pins. (An earlier draft did exactly that and passed with the bug
+            // deliberately re-introduced.)
+            f.turn();
+        });
 
         let panel: Vec<String> = per_frame
             .iter()
@@ -9914,9 +9938,10 @@ fn the_workspace_switch_rebakes_nothing_per_frame() {
     let _ = render_output_vulkan(&mut f, &output);
     let _ = crate::frame_log::take_bake_sites();
 
-    f.synoik_state()
-        .do_action(Action::FocusWorkspaceDown, false);
-    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(30));
+    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(30), |f| {
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
+    });
     let repeats = sites_baking_repeatedly(&per_frame);
 
     assert!(
@@ -10435,9 +10460,10 @@ fn a_popover_open_fade_rebakes_nothing_per_frame() {
         let _ = render_output_vulkan(&mut f, &output);
         let _ = crate::frame_log::take_bake_sites();
 
-        open(&mut f, &output);
-        assert!(f.synoik().panel_popover.is_open(), "{name} did not open");
-        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(20));
+        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(20), |f| {
+            open(f, &output);
+            assert!(f.synoik().panel_popover.is_open(), "{name} did not open");
+        });
         let repeats = sites_baking_repeatedly(&per_frame);
 
         assert!(
@@ -10506,8 +10532,9 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
     let _ = render_output_vulkan(&mut f, &output);
     let _ = crate::frame_log::take_bake_sites();
 
-    assert!(f.synoik().layout.toggle_app_grid());
-    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
+    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40), |f| {
+        assert!(f.synoik().layout.toggle_app_grid());
+    });
     let repeats = sites_baking_repeatedly(&per_frame);
 
     assert!(
