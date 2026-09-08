@@ -18,7 +18,6 @@ use std::time::Duration;
 use std::{io, mem, slice};
 
 use anyhow::{ensure, Context as _};
-use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
 use pipewire::context::ContextRc;
 use pipewire::core::{CoreRc, PW_ID_CORE};
@@ -64,6 +63,7 @@ use crate::render_helpers::{
 };
 use crate::screencasting::CastRenderElement;
 use crate::synoik::{CastTarget, State};
+use crate::utils::timers::{TimerToken, Timers};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 
 // Give a 0.1 ms allowance for presentation time errors.
@@ -106,7 +106,7 @@ pub struct Cast {
     offer_alpha: bool,
     cursor_mode: CursorMode,
     pub last_frame_time: Duration,
-    scheduled_redraw: Option<RegistrationToken>,
+    scheduled_redraw: Option<TimerToken>,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
@@ -1010,31 +1010,30 @@ impl Cast {
         Duration::ZERO
     }
 
-    fn schedule_redraw(&mut self, output: Output, target_time: Duration) {
+    fn schedule_redraw(
+        &mut self,
+        timers: &mut Timers<State>,
+        output: Output,
+        target_time: Duration,
+    ) {
         if self.scheduled_redraw.is_some() {
             return;
         }
 
-        let now = get_monotonic_time();
-        let duration = target_time.saturating_sub(now);
-        let timer = Timer::from_duration(duration);
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                // Guard against output disconnecting before the timer has a chance to run.
-                if state.synoik.output_state.contains_key(&output) {
-                    state.synoik.queue_redraw(&output);
-                }
+        let token = timers.insert_at(target_time, move |state| {
+            // Guard against output disconnecting before the timer has a chance to run.
+            if state.synoik.output_state.contains_key(&output) {
+                state.synoik.queue_redraw(&output);
+            }
 
-                TimeoutAction::Drop
-            })
-            .unwrap();
+            None
+        });
         self.scheduled_redraw = Some(token);
     }
 
-    fn remove_scheduled_redraw(&mut self) {
+    fn remove_scheduled_redraw(&mut self, timers: &mut Timers<State>) {
         if let Some(token) = self.scheduled_redraw.take() {
-            self.event_loop.remove(token);
+            timers.cancel(token);
         }
     }
 
@@ -1047,16 +1046,17 @@ impl Cast {
     /// [`Cast::dequeue_buffer_and_render()`].
     pub fn check_time_and_schedule(
         &mut self,
+        timers: &mut Timers<State>,
         output: &Output,
         target_frame_time: Duration,
     ) -> bool {
         let delay = self.compute_extra_delay(target_frame_time);
         if delay >= CAST_DELAY_ALLOWANCE {
             trace!("delay >= allowance, scheduling redraw");
-            self.schedule_redraw(output.clone(), target_frame_time + delay);
+            self.schedule_redraw(timers, output.clone(), target_frame_time + delay);
             true
         } else {
-            self.remove_scheduled_redraw();
+            self.remove_scheduled_redraw(timers);
             false
         }
     }

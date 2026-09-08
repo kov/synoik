@@ -953,27 +953,22 @@ impl State {
     /// Start the clock on the key at the head of the queue.
     fn arm_im_key_timeout(&mut self, after: Duration) {
         self.disarm_im_key_timeout();
-        let timer = calloop::timer::Timer::from_duration(after);
-        let token = self
-            .synoik
-            .event_loop
-            .insert_source(timer, |_, _, state| {
-                state.on_im_key_timeout();
-                calloop::timer::TimeoutAction::Drop
-            })
-            .unwrap();
+        let token = self.synoik.timer_after(after, |state| {
+            state.on_im_key_timeout();
+            None
+        });
         self.synoik.im_key_timer = Some(token);
     }
 
     fn disarm_im_key_timeout(&mut self) {
         if let Some(token) = self.synoik.im_key_timer.take() {
-            self.synoik.event_loop.remove(token);
+            self.synoik.cancel_timer(token);
         }
     }
 
     /// The engine took too long. Deliver what has actually expired and re-arm for the rest.
     fn on_im_key_timeout(&mut self) {
-        // The source returns `TimeoutAction::Drop`, so the token it left behind names nothing.
+        // The callback returns `None`, so the token it left behind names nothing.
         self.synoik.im_key_timer = None;
         self.expire_im_keys_at(std::time::Instant::now());
     }

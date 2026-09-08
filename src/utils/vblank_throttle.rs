@@ -8,6 +8,10 @@
 //!
 //! Some buggy drivers deliver VBlanks way earlier than necessary. This helper throttles the VBlank
 //! in such cases to avoid tearing and to get more consistent timings.
+//!
+//! One of the three timers still on calloop rather than [`crate::utils::timers`], with the two
+//! estimated-vblank pacers: they stand in for display hardware rather than for a deadline the
+//! compositor reasons about, so real time is the clock they belong on.
 
 use std::time::Duration;
 
@@ -59,9 +63,11 @@ impl VBlankThrottle {
                 }
 
                 let remaining = refresh - passed;
+                #[allow(clippy::disallowed_methods)]
+                let timer = Timer::from_duration(remaining);
                 let token = self
                     .event_loop
-                    .insert_source(Timer::from_duration(remaining), move |_, _, state| {
+                    .insert_source(timer, move |_, _, state| {
                         call_vblank(state);
                         TimeoutAction::Drop
                     })

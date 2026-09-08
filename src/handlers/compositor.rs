@@ -657,7 +657,11 @@ impl CompositorHandler for State {
                     // If this is the only instance, then this transaction will complete
                     // immediately, so no need to set the timer.
                     if !transaction.is_last() {
-                        transaction.register_deadline_timer(&self.synoik.event_loop);
+                        transaction.register_deadline_timer(
+                            self.synoik.clock.now_unadjusted(),
+                            &mut self.synoik.timers,
+                            &self.synoik.event_loop,
+                        );
                     }
 
                     if was_active {

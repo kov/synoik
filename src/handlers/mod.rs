@@ -1016,17 +1016,12 @@ impl SessionManagerHandler for State {
             return;
         }
 
-        let timer = calloop::timer::Timer::from_duration(SESSION_SAVE_DELAY);
-        self.synoik.session_save_timer = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
+        self.synoik.session_save_timer =
+            Some(self.synoik.timer_after(SESSION_SAVE_DELAY, move |state| {
                 state.synoik.session_save_timer = None;
                 state.synoik.save_session_store();
-                calloop::timer::TimeoutAction::Drop
-            })
-            .map_err(|err| warn!("error arming the session store save: {err:?}"))
-            .ok();
+                None
+            }));
     }
 
     fn save_live_session_toplevels(&mut self, session_id: &str) {

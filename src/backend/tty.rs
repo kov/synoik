@@ -1333,19 +1333,13 @@ impl Tty {
                     synoik
                         .dmabuf_state
                         .disable_global::<State>(&synoik.display_handle, &global);
-                    synoik
-                        .event_loop
-                        .insert_source(
-                            Timer::from_duration(Duration::from_secs(10)),
-                            move |_, _, state| {
-                                state
-                                    .synoik
-                                    .dmabuf_state
-                                    .destroy_global::<State>(&state.synoik.display_handle, global);
-                                TimeoutAction::Drop
-                            },
-                        )
-                        .unwrap();
+                    synoik.timer_after(Duration::from_secs(10), move |state| {
+                        state
+                            .synoik
+                            .dmabuf_state
+                            .destroy_global::<State>(&state.synoik.display_handle, global);
+                        None
+                    });
 
                     // Clear the dmabuf feedbacks for all surfaces.
                     for device in self.devices.values_mut() {
@@ -1368,19 +1362,13 @@ impl Tty {
                     synoik
                         .display_handle
                         .disable_global::<State>(global.clone());
-                    synoik
-                        .event_loop
-                        .insert_source(
-                            Timer::from_duration(Duration::from_secs(10)),
-                            move |_, _, state| {
-                                state
-                                    .synoik
-                                    .display_handle
-                                    .remove_global::<State>(global.clone());
-                                TimeoutAction::Drop
-                            },
-                        )
-                        .unwrap();
+                    synoik.timer_after(Duration::from_secs(10), move |state| {
+                        state
+                            .synoik
+                            .display_handle
+                            .remove_global::<State>(global.clone());
+                        None
+                    });
                 }
             }
         }
@@ -3678,6 +3666,9 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
 
     trace!("queueing estimated vblank timer to fire in {duration:?}");
 
+    // Stays on calloop, unlike every other deadline (`crate::utils::timers`): this stands in for
+    // a vblank the hardware did not report, so real time is the clock it belongs on.
+    #[allow(clippy::disallowed_methods)]
     let timer = Timer::from_duration(duration);
     let token = synoik
         .event_loop

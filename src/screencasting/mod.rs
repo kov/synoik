@@ -12,8 +12,7 @@ use std::mem;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use calloop::timer::{TimeoutAction, Timer};
-use calloop::{LoopHandle, RegistrationToken};
+use calloop::LoopHandle;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
@@ -27,6 +26,7 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToSynoik, Stre
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::synoik::{CastTarget, OutputRenderElements, PointerRenderElements, State, Synoik};
 use crate::synoik_render_elements;
+use crate::utils::timers::TimerToken;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{Mapped, MappedId, WindowCastRenderElements};
 
@@ -101,7 +101,7 @@ pub struct NativeRecording {
     /// A pending self-driven redraw that keeps frames flowing while the output is otherwise idle.
     /// Unlike a screencast (whose consumer pulls frames), a recording has no external driver, so
     /// it schedules its own redraws at the frame cadence.
-    scheduled_redraw: Option<RegistrationToken>,
+    scheduled_redraw: Option<TimerToken>,
 }
 
 /// A screencast request that hasn't been started yet.
@@ -663,7 +663,7 @@ impl Synoik {
                 }
             }
 
-            if cast.check_time_and_schedule(output, target_presentation_time) {
+            if cast.check_time_and_schedule(&mut self.timers, output, target_presentation_time) {
                 continue;
             }
 
@@ -753,7 +753,7 @@ impl Synoik {
                 }
             }
 
-            if cast.check_time_and_schedule(output, target_presentation_time) {
+            if cast.check_time_and_schedule(&mut self.timers, output, target_presentation_time) {
                 continue;
             }
 
@@ -850,7 +850,7 @@ impl Synoik {
                 }
             }
 
-            if cast.check_time_and_schedule(output, target_presentation_time) {
+            if cast.check_time_and_schedule(&mut self.timers, output, target_presentation_time) {
                 continue;
             }
 
@@ -1201,7 +1201,7 @@ impl Synoik {
                 let rec = self.casting.recordings.remove(idx);
                 if let RecordingKind::Native(n) = rec.kind {
                     if let Some(token) = n.scheduled_redraw {
-                        self.event_loop.remove(token);
+                        self.timers.cancel(token);
                     }
                     // Finalize off-thread so the stop-click doesn't stall the compositor on encoder
                     // drain + WebM finalize.
@@ -1234,7 +1234,7 @@ impl Synoik {
             if is_here {
                 if let RecordingKind::Native(n) = self.casting.recordings.remove(i).kind {
                     if let Some(token) = n.scheduled_redraw {
-                        self.event_loop.remove(token);
+                        self.timers.cancel(token);
                     }
                     // Finalize off-thread (an output can be removed on the compositor thread too).
                     n.recorder.finish_async(n.path.display().to_string());
@@ -1268,7 +1268,6 @@ impl Synoik {
         use crate::render_helpers::render_to_vec;
 
         let weak = output.downgrade();
-        let loop_handle = self.event_loop.clone();
 
         // Snapshot the native recordings on this output: (id, last_frame_time, interval,
         // started_at). started_at anchors a fixed capture grid so timer latency can't accumulate.
@@ -1382,7 +1381,7 @@ impl Synoik {
                 {
                     if let RecordingKind::Native(n) = self.casting.recordings.remove(pos).kind {
                         if let Some(token) = n.scheduled_redraw {
-                            loop_handle.remove(token);
+                            self.timers.cancel(token);
                         }
                     }
                 }
@@ -1408,18 +1407,15 @@ impl Synoik {
                 .map(|r| &mut r.kind)
             {
                 if let Some(token) = n.scheduled_redraw.take() {
-                    loop_handle.remove(token);
+                    self.timers.cancel(token);
                 }
-                let delay = deadline.saturating_sub(get_monotonic_time());
                 let out = output.clone();
-                let token = loop_handle
-                    .insert_source(Timer::from_duration(delay), move |_, _, state| {
-                        if state.synoik.output_state.contains_key(&out) {
-                            state.synoik.queue_redraw(&out);
-                        }
-                        TimeoutAction::Drop
-                    })
-                    .unwrap();
+                let token = self.timers.insert_at(deadline, move |state| {
+                    if state.synoik.output_state.contains_key(&out) {
+                        state.synoik.queue_redraw(&out);
+                    }
+                    None
+                });
                 n.scheduled_redraw = Some(token);
             }
         }
@@ -1437,26 +1433,20 @@ impl Synoik {
             // Drive the M:SS label from a dedicated 1 s timer while recording, independent of the
             // clock's minute cadence, so the elapsed time never sits frozen at 0:00.
             if self.recording_tick.is_none() {
-                let token = self
-                    .event_loop
-                    .insert_source(
-                        Timer::from_duration(Duration::from_secs(1)),
-                        |_, _, state| {
-                            if state.synoik.casting.recordings.is_empty() {
-                                state.synoik.recording_tick = None;
-                                return TimeoutAction::Drop;
-                            }
-                            if state.synoik.panel.update_recording_label() {
-                                state.synoik.queue_redraw_all();
-                            }
-                            TimeoutAction::ToDuration(Duration::from_secs(1))
-                        },
-                    )
-                    .unwrap();
+                let token = self.timer_after(Duration::from_secs(1), |state| {
+                    if state.synoik.casting.recordings.is_empty() {
+                        state.synoik.recording_tick = None;
+                        return None;
+                    }
+                    if state.synoik.panel.update_recording_label() {
+                        state.synoik.queue_redraw_all();
+                    }
+                    Some(Duration::from_secs(1))
+                });
                 self.recording_tick = Some(token);
             }
         } else if let Some(token) = self.recording_tick.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
 
         if redraw {

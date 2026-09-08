@@ -56,6 +56,7 @@ use smithay::wayland::selection::SelectionTarget;
 use crate::input_method::{ShellEntry, ShellKey};
 use crate::synoik::State;
 use crate::ui::text_edit::EditMods;
+use crate::utils::timers::TimerToken;
 use crate::utils::xwayland::selection::FromX;
 
 /// The most a single paste may bring in, in bytes.
@@ -137,7 +138,7 @@ struct Paste {
     /// The fd source, so the timeout can take it out of the loop.
     source: Cell<Option<RegistrationToken>>,
     /// The timer, so a finished read can cancel it.
-    timeout: Cell<Option<RegistrationToken>>,
+    timeout: Cell<Option<TimerToken>>,
     /// Set by whichever of the two arms gets there first, so the other becomes a no-op.
     done: Cell<bool>,
 }
@@ -448,7 +449,7 @@ impl State {
                         let entry = paste.entry;
                         let text = paste_text(&paste.buf);
                         if let Some(timeout) = paste.timeout.take() {
-                            this.synoik.event_loop.remove(timeout);
+                            this.synoik.cancel_timer(timeout);
                         }
                         drop(paste);
                         this.synoik.clipboard_paste_pending = false;
@@ -467,26 +468,19 @@ impl State {
 
         paste.borrow().source.set(Some(token));
 
-        let timer = smithay::reexports::calloop::timer::Timer::from_duration(PASTE_TIMEOUT);
         let state = Rc::clone(&paste);
-        let timeout = self
-            .synoik
-            .event_loop
-            .insert_source(timer, move |_, _, this| {
-                let paste = state.borrow();
-                if !paste.done.get() {
-                    if let Some(source) = paste.source.take() {
-                        this.synoik.event_loop.remove(source);
-                    }
-                    warn!("the clipboard owner never finished writing; paste dropped");
-                    this.synoik.clipboard_paste_pending = false;
+        let timeout = self.synoik.timer_after(PASTE_TIMEOUT, move |this| {
+            let paste = state.borrow();
+            if !paste.done.get() {
+                if let Some(source) = paste.source.take() {
+                    this.synoik.event_loop.remove(source);
                 }
-                smithay::reexports::calloop::timer::TimeoutAction::Drop
-            });
-        match timeout {
-            Ok(timeout) => paste.borrow().timeout.set(Some(timeout)),
-            Err(err) => warn!("error arming the paste timeout: {err:?}"),
-        }
+                warn!("the clipboard owner never finished writing; paste dropped");
+                this.synoik.clipboard_paste_pending = false;
+            }
+            None
+        });
+        paste.borrow().timeout.set(Some(timeout));
         self.synoik.clipboard_paste_pending = true;
     }
 

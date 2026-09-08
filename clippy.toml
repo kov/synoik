@@ -3,3 +3,15 @@ ignore-interior-mutability = [
     "smithay::output::Output",
     "wayland_server::backend::ClientId",
 ]
+
+# Timers belong on the compositor's own clock, not the machine's — see `src/utils/timers.rs`.
+# A calloop timer cannot be reached by a test that steps the clock instead of spending wall-clock,
+# so `Synoik::timer_after`/`timer_at` is the way to wait for a deadline. The five remaining calloop
+# timers each carry an `#[allow]` and a reason: two estimated-vblank pacers and the vblank throttle
+# (they stand in for display hardware), the wheel's own loop wakeup, and pipewire-audio's reconnect
+# (that module is handed a loop handle before `Synoik` exists).
+disallowed-methods = [
+    { path = "calloop::timer::Timer::from_duration", reason = "arm it on the compositor's clock: Synoik::timer_after" },
+    { path = "calloop::timer::Timer::from_deadline", reason = "arm it on the compositor's clock: Synoik::timer_at" },
+    { path = "calloop::timer::Timer::immediate", reason = "arm it on the compositor's clock: Synoik::timer_after(Duration::ZERO, ..)" },
+]

@@ -757,10 +757,16 @@ fn queue_next_frame(synoik: &mut Synoik, output: &Output, target_presentation_ti
         }
     }
 
+    // Stays on calloop, unlike every other deadline (`crate::utils::timers`): it stands in for a
+    // vblank this backend has no hardware to get, so real time is the clock it belongs on — and it
+    // asks for the next frame immediately when a test has taken the clock over (see
+    // `Clock::freeze`).
+    #[allow(clippy::disallowed_methods)]
+    let timer = Timer::from_duration(duration);
     let timer_output = output.clone();
     let token = synoik
         .event_loop
-        .insert_source(Timer::from_duration(duration), move |_, _, data| {
+        .insert_source(timer, move |_, _, data| {
             on_frame_timer(&mut data.synoik, &timer_output);
             TimeoutAction::Drop
         })

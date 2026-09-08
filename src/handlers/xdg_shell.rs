@@ -866,7 +866,11 @@ impl XdgShellHandler for State {
         // If this is the only instance, then this transaction will complete immediately, so no
         // need to set the timer.
         if !transaction.is_last() {
-            transaction.register_deadline_timer(&self.synoik.event_loop);
+            transaction.register_deadline_timer(
+                self.synoik.clock.now_unadjusted(),
+                &mut self.synoik.timers,
+                &self.synoik.event_loop,
+            );
         }
 
         if was_active {
@@ -1787,7 +1791,11 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 if !transaction.is_completed() && !disable {
                     // Register the deadline even if this is the last pending, since dmabuf
                     // rendering can still run over the deadline.
-                    transaction.register_deadline_timer(&state.synoik.event_loop);
+                    transaction.register_deadline_timer(
+                        state.synoik.clock.now_unadjusted(),
+                        &mut state.synoik.timers,
+                        &state.synoik.event_loop,
+                    );
 
                     let is_last = transaction.is_last();
 

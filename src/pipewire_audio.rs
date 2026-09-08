@@ -572,6 +572,11 @@ fn schedule_reconnect(
     let handle = loop_handle.clone();
     let conn_cell = conn_cell.clone();
     let inner = inner.clone();
+    // One of the timers that stays on calloop rather than the compositor's wheel
+    // (`crate::utils::timers`): this module is handed a loop handle and nothing else — it is
+    // started from `main` before `Synoik` exists, and reconnects from a source callback that has
+    // no compositor to reach the wheel through.
+    #[allow(clippy::disallowed_methods)]
     let res = loop_handle.insert_source(
         Timer::from_duration(RECONNECT_DELAY),
         move |_, _, state: &mut State| {

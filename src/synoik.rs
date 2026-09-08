@@ -546,7 +546,7 @@ pub struct Synoik {
     pub offline_update_tx: Option<calloop::channel::Sender<crate::end_session::OfflineUpdateState>>,
     /// 1 s repeating timer that ticks the R1 screen-recording indicator's `M:SS` label while any
     /// recording is live; `None` when nothing is recording.
-    pub recording_tick: Option<RegistrationToken>,
+    pub recording_tick: Option<TimerToken>,
     /// Ticks a time-of-day wallpaper along its slideshow; `None` whenever `picture-uri` is an
     /// ordinary picture, which must not cost a wake-up. See
     /// [`refresh_wallpaper_timer`](Synoik::refresh_wallpaper_timer).
@@ -582,7 +582,7 @@ pub struct Synoik {
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
     pub session_manager_state: SessionManagerState,
     /// Armed by [`State::schedule_session_save`]; `None` means no write is pending.
-    pub session_save_timer: Option<RegistrationToken>,
+    pub session_save_timer: Option<TimerToken>,
     /// The named workspaces that outlive this session (`docs/fork/multi-display.md` §6).
     pub workspace_names: crate::workspace_names::WorkspaceNameStore,
     /// Armed when a snapshot differs from what the store holds; `None` means no write is pending.
@@ -615,7 +615,7 @@ pub struct Synoik {
     pub im_cursor_rect: Option<(WlSurface, Rectangle<i32, Logical>)>,
     /// Deadline for the oldest keystroke the engine has not answered for, so a wedged daemon
     /// cannot hold the keyboard indefinitely.
-    pub im_key_timer: Option<RegistrationToken>,
+    pub im_key_timer: Option<TimerToken>,
 
     /// Inspectable model of the GNOME settings the compositor honors.
     pub gnome_settings: GnomeSettings,
@@ -2340,7 +2340,6 @@ impl State {
     pub fn dispatch_timers(&mut self) {
         let now = self.synoik.clock.now_unadjusted();
         Timers::dispatch_from(self, now, |state| &mut state.synoik.timers);
-        self.synoik.arm_timer_wakeup();
     }
 
     pub fn refresh_and_flush_clients(&mut self) {
@@ -2380,6 +2379,13 @@ impl State {
         }
 
         self.synoik.update_locked_hint();
+
+        // Point the loop's wakeup at the earliest deadline, **once, here at the end of the turn**.
+        // Everything that arms or cancels a timer does so from inside a loop dispatch or from this
+        // callback, both of which run before this line, so one arm per turn covers every change —
+        // and arming per insert instead would be both redundant and wrong, since a timer armed
+        // later in the same turn would still need this pass.
+        self.synoik.arm_timer_wakeup();
 
         // Clear the time so it's fetched afresh next iteration.
         self.synoik.clock.clear();
@@ -8441,7 +8447,7 @@ impl Synoik {
     /// costs up to `SESSION_SAVE_DELAY`, same as mutter.
     pub fn flush_session_store(&mut self) {
         if let Some(token) = self.session_save_timer.take() {
-            self.event_loop.remove(token);
+            self.cancel_timer(token);
         }
         self.session_manager_state.store.flush();
     }
@@ -10282,18 +10288,16 @@ impl Synoik {
         deadline: Duration,
         callback: impl FnMut(&mut State) -> Again + 'static,
     ) -> TimerToken {
-        let token = self.timers.insert_at(deadline, callback);
-        self.arm_timer_wakeup();
-        token
+        self.timers.insert_at(deadline, callback)
     }
 
     /// Cancel a pending timer. Cancelling one that has already fired is a no-op.
     pub fn cancel_timer(&mut self, token: TimerToken) {
         self.timers.cancel(token);
-        self.arm_timer_wakeup();
     }
 
-    /// Point the loop's wakeup at the earliest pending deadline.
+    /// Point the loop's wakeup at the earliest pending deadline. Called once per turn, at its end
+    /// — see [`State::refresh_and_flush_clients`].
     ///
     /// The source's callback is empty on purpose: waking the loop is all it is for, because the
     /// turn dispatches the wheel however the loop happened to wake. A session waits on this; a
@@ -10308,11 +10312,15 @@ impl Synoik {
             return;
         };
 
+        // The one calloop timer the wheel itself needs: something has to end the loop's poll when
+        // the earliest deadline arrives. Real time is right here, because the loop's sleep is the
+        // thing being cut short.
+        #[allow(clippy::disallowed_methods)]
+        let wakeup = Timer::from_duration(after);
         match self
             .event_loop
-            .insert_source(Timer::from_duration(after), |_, _, _state| {
-                TimeoutAction::Drop
-            }) {
+            .insert_source(wakeup, |_, _, _state| TimeoutAction::Drop)
+        {
             Ok(token) => self.timer_wakeup = Some(token),
             Err(err) => warn!("error arming the timer wakeup: {err:?}"),
         }
