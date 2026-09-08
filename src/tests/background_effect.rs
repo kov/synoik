@@ -186,8 +186,8 @@ fn sample_with_damage(
 /// `f.double_roundtrip(id)` — a helper that cleared the trace on entry and read it on exit would
 /// throw away the very frame it was asked to measure, and report that the effect never rendered.
 /// A redraw queued while the output is already waiting on its estimated vblank parks instead, so
-/// the clock has to cross that deadline before it lands: hence the advance, `dispatch` and
-/// `refresh` on the way out. Between the two, every frame `drive` provoked is inside the window.
+/// the clock has to cross that deadline before it lands: hence the advance and the turn on the
+/// way out. Between the two, every frame `drive` provoked is inside the window.
 ///
 /// Unlike [`render_frame`] this owns no tracker and binds no offscreen: the frame is the backend's
 /// own, through `Headless::render`, into its cycling swapchain and with that slot's true age.
@@ -211,8 +211,7 @@ fn compositor_frame(
 
     f.freeze_clock();
     f.advance_clock(PAST_VBLANK);
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     (trace::take_captures(), trace::take())
 }

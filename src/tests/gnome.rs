@@ -5825,7 +5825,7 @@ fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
 
     // Hovering the Activities button must not light it up...
     f.pointer_motion(10., 10.);
-    f.refresh();
+    f.turn();
     assert_eq!(
         f.synoik().panel.hovered_role(),
         None,
@@ -9312,8 +9312,7 @@ fn a_minimized_windows_preview_comes_from_where_the_window_went() {
     tap(&mut f, KEY_LEFTMETA);
     f.freeze_clock();
     f.advance_clock(Duration::from_millis(20));
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     let drawn = f
         .synoik()
@@ -13205,8 +13204,7 @@ fn a_drag_begun_mid_settle_leaves_the_other_previews_travelling() {
 
     // One frame in, mid-slide, pick B up.
     f.advance_clock(Duration::from_micros(16_667));
-    f.dispatch();
-    f.refresh();
+    f.turn();
     let mid = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
     pointer_motion_to(
@@ -13507,7 +13505,7 @@ fn panel_activities_click_toggles_overview() {
     f.add_output(1, (1920, 1080));
 
     assert!(!f.synoik().layout.is_overview_open());
-    f.refresh();
+    f.turn();
     assert!(
         !f.synoik().panel.activities_checked(),
         "Activities starts unchecked"
@@ -13523,7 +13521,7 @@ fn panel_activities_click_toggles_overview() {
         f.synoik().layout.is_overview_open(),
         "clicking Activities must open the overview"
     );
-    f.refresh();
+    f.turn();
     assert!(
         f.synoik().panel.activities_checked(),
         "Activities must be checked while the overview is open"
@@ -13537,7 +13535,7 @@ fn panel_activities_click_toggles_overview() {
         !f.synoik().layout.is_overview_open(),
         "clicking Activities again must close the overview"
     );
-    f.refresh();
+    f.turn();
     assert!(
         !f.synoik().panel.activities_checked(),
         "Activities must be unchecked once the overview closes"
@@ -13735,7 +13733,7 @@ fn panel_popover_stays_open_in_overview() {
     f.add_output(1, (1920, 1080));
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.refresh();
+    f.turn();
     assert!(f.synoik().layout.is_overview_open());
 
     // Click the clock: the calendar popover opens.
@@ -13750,8 +13748,8 @@ fn panel_popover_stays_open_in_overview() {
 
     // Subsequent cycles must not dismiss it (a level-triggered overview check
     // once closed the popover on the very next reconcile after it opened).
-    f.refresh();
-    f.refresh();
+    f.turn();
+    f.turn();
     f.settle();
     assert!(
         f.synoik().panel_popover.is_open(),
@@ -13773,21 +13771,21 @@ fn panel_popover_stays_open_in_overview() {
 fn panel_activities_highlight_needs_no_render() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.refresh();
+    f.turn();
     assert!(
         !f.synoik().panel.activities_checked(),
         "Activities starts unchecked"
     );
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.refresh();
+    f.turn();
     assert!(
         f.synoik().panel.activities_checked(),
         "one refresh after the overview opens, Activities must already be lit — no render",
     );
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.refresh();
+    f.turn();
     assert!(
         !f.synoik().panel.activities_checked(),
         "and unlit again one refresh after it closes",
@@ -13801,7 +13799,7 @@ fn panel_activities_highlight_needs_no_render() {
 fn overview_open_dismisses_open_panel_popover() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.refresh();
+    f.turn();
 
     let x = clock_center_x(&mut f, 1920.);
     pointer_motion_to(&mut f, x, 10.);
@@ -13810,7 +13808,7 @@ fn overview_open_dismisses_open_panel_popover() {
     assert!(f.synoik().panel_popover.is_open());
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.refresh();
+    f.turn();
     f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
@@ -16156,7 +16154,7 @@ fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    f.refresh();
+    f.turn();
 
     let focused_surface = |f: &mut Fixture| match &f.synoik().keyboard_focus {
         KeyboardFocus::Layout { surface } => surface.clone(),
@@ -16170,7 +16168,7 @@ fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
 
     // Opening takes the keyboard away — like `pushModal` at the top of the open animation.
     open_calendar(&mut f);
-    f.refresh();
+    f.turn();
     assert!(
         matches!(f.synoik().keyboard_focus, KeyboardFocus::Popover),
         "the open menu holds the modal grab: {:?}",
@@ -16180,7 +16178,7 @@ fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
     // Escape starts the close. Do NOT settle: the assertion is about the fade window.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.refresh();
+    f.turn();
 
     assert!(
         f.synoik().panel_popover.is_open(),
@@ -16198,7 +16196,7 @@ fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
 
     // And it stays there once the fade settles — the restore is not undone by the settle.
     f.settle();
-    f.refresh();
+    f.turn();
     assert!(!f.synoik().panel_popover.is_open());
     assert_eq!(focused_surface(&mut f), window_surface);
 }
@@ -23330,7 +23328,7 @@ fn an_installed_changed_burst_does_not_reload_the_catalog_per_ping() {
     for _ in 0..8 {
         f.synoik().queue_app_catalog_reload();
     }
-    f.dispatch();
+    f.turn();
 
     assert!(
         f.synoik().app_grid.entry_id(0).is_none(),
@@ -30624,8 +30622,7 @@ fn a_minimized_window_is_saved_and_restored_minimized() {
     tap(&mut f, KEY_LEFTMETA);
     f.freeze_clock();
     f.advance_clock(Duration::from_millis(20));
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     let drawn = f
         .synoik()
@@ -33054,8 +33051,7 @@ fn a_workspace_name_leaves_with_its_thumbnail() {
     f.freeze_clock();
     tap(&mut f, KEY_LEFTMETA);
     f.advance_clock(Duration::from_micros(16_667 * 3));
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     let mid = label_y(&mut f);
     assert!(

@@ -316,12 +316,11 @@ fn measure(f: &mut Fixture, body: impl FnOnce(&mut Fixture)) -> Cost {
     // Warm the pipelines and let the tracker take a first, necessarily-full frame, then start the
     // ledgers: the first render into a fresh target is a full repaint by construction and would
     // otherwise be counted as the peek's doing.
-    // `dispatch` pumps the loop; the *turn* is what drains the redraw queue, so without the
-    // refresh this warm frame was never taken here — it landed on the first turn of `body`
+    // It takes a whole turn: the redraw queue is drained by the turn's callback, so pumping the
+    // loop alone left this warm frame untaken here — it landed on the first turn of `body`
     // instead, and was billed to whatever that arm was measuring.
     f.synoik().queue_redraw_all();
-    f.dispatch();
-    f.refresh();
+    f.turn();
     *counted.borrow_mut() = (0, 0, [0; SITES]);
     f.synoik_state().backend.headless().damage_log = Some(Vec::new());
 
@@ -368,8 +367,7 @@ fn still(f: &mut Fixture, mut nudge: impl FnMut(&mut Fixture)) -> Cost {
         while elapsed < STILL {
             f.advance_clock(FRAME);
             nudge(f);
-            f.dispatch();
-            f.refresh();
+            f.turn();
             elapsed += FRAME;
         }
     })
@@ -418,8 +416,7 @@ fn poke_nudging(
             }
             f.roundtrip(p.client);
             f.advance_clock(FRAME);
-            f.dispatch();
-            f.refresh();
+            f.turn();
         }
     })
 }
@@ -438,8 +435,7 @@ fn cursor_only(f: &mut Fixture, step: (f64, f64), times: usize) -> Cost {
         for _ in 0..times {
             f.pointer_motion(step.0, step.1);
             f.advance_clock(FRAME);
-            f.dispatch();
-            f.refresh();
+            f.turn();
         }
     })
 }
@@ -448,7 +444,7 @@ fn cursor_only(f: &mut Fixture, step: (f64, f64), times: usize) -> Cost {
 fn warp_to(f: &mut Fixture, to: Point<f64, Logical>) {
     let at = f.synoik().seat.get_pointer().unwrap().current_location();
     f.pointer_motion(to.x - at.x, to.y - at.y);
-    f.dispatch();
+    f.turn();
 }
 
 /// Every thumbnail's rect on the peeked strip, in the strip's own order.
@@ -714,7 +710,7 @@ fn peek_damage_what_does_a_still_peek_repaint() {
             if peek {
                 summon_peek(&mut f);
                 f.synoik_complete_animations();
-                f.dispatch();
+                f.turn();
             }
             let _ = crate::render_helpers::background_effect::trace::take_settled();
             let c = poke(&mut f, &at, win.0, 30);
@@ -759,7 +755,7 @@ fn peek_damage_what_does_a_still_peek_repaint() {
         if peek {
             summon_peek(&mut f);
             f.synoik_complete_animations();
-            f.dispatch();
+            f.turn();
         }
         warp_to(&mut f, park);
         let _ = crate::render_helpers::background_effect::trace::take_settled();
@@ -945,7 +941,7 @@ fn a_blur_recapture_does_not_cascade_to_the_blurs_behind_it() {
         };
         summon_peek(&mut f);
         f.synoik_complete_animations();
-        f.dispatch();
+        f.turn();
         let _ = crate::render_helpers::background_effect::trace::take_settled();
         let c = poke(&mut f, &at, win.0, 30);
         let settled = crate::render_helpers::background_effect::trace::take_settled();
@@ -983,10 +979,10 @@ fn overview_mouse_what_does_the_pointer_cost() {
             if overview {
                 f.synoik_state().do_action(Action::OpenOverview, false);
                 f.synoik_complete_animations();
-                f.dispatch();
+                f.turn();
             }
             pointer_motion_to(&mut f, 700., 600.);
-            f.dispatch();
+            f.turn();
             let _ = crate::render_helpers::background_effect::trace::take_settled();
             let c = poke_nudging(&mut f, &at, 860, 30, |f| {
                 if moving {

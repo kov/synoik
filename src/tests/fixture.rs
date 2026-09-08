@@ -6,13 +6,10 @@
 // distributed under the GNU General Public License version 3 or later.
 // Modified for synoik in 2026.
 
-use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use smithay::backend::input::{ButtonState, InputEvent, KeyState, Keycode};
 use smithay::output::Output;
 use smithay::utils::{Logical, Rectangle};
@@ -28,8 +25,6 @@ use crate::input::synthetic::{
 use crate::synoik::{NewClient, Synoik};
 
 pub struct Fixture {
-    pub event_loop: EventLoop<'static, State>,
-    pub handle: LoopHandle<'static, State>,
     pub state: State,
     /// Monotonic timestamp (ms) handed to each synthesized input event.
     next_input_time: u32,
@@ -92,50 +87,37 @@ impl Fixture {
 
     pub fn with_config(config: Config) -> Self {
         pin_collation();
-        let event_loop = EventLoop::try_new().unwrap();
-        let handle = event_loop.handle();
-
-        let server = Server::new(config);
-        let fd = server.event_loop.as_fd().try_clone_to_owned().unwrap();
-        let source = Generic::new(fd, Interest::READ, Mode::Level);
-        handle
-            .insert_source(source, |_, _, state: &mut State| {
-                state.server.dispatch();
-                Ok(PostAction::Continue)
-            })
-            .unwrap();
 
         let state = State {
-            server,
+            server: Server::new(config),
             clients: Vec::new(),
         };
 
         Self {
-            event_loop,
-            handle,
             state,
             next_input_time: 0,
         }
     }
 
-    /// Pump both event loops once, without reconciling — see [`refresh`](Self::refresh) for the
-    /// turn.
+    /// Run one turn of the compositor's event loop, and the test clients' loops with it.
     ///
-    /// The compositor runs its *own* calloop loop; the fixture's loop only watches that loop's
-    /// poll fd (see `Fixture::with_config`). calloop keeps its timers inside the loop rather than
-    /// on a timerfd, so an expired compositor timer never makes that fd readable: driving the
-    /// outer loop alone delivers client traffic and **nothing that is due on a timer**, so the
-    /// inner loop is dispatched here directly. An animation's estimated-vblank timer is one such
-    /// timer: without this it renders a single frame and stalls at whatever progress it reached.
-    pub fn dispatch(&mut self) {
-        self.event_loop
-            .dispatch(Duration::ZERO, &mut self.state)
-            .unwrap();
-        let server = &mut self.state.server;
-        server
-            .event_loop
-            .dispatch(Duration::ZERO, &mut server.state)
-            .unwrap();
+    /// **This is the harness's only way to advance the compositor**, and it is
+    /// [`Server::turn`] — the body `EventLoop::run` executes, which is what `main.rs` runs. The
+    /// clients are pumped first so that whatever they sent last turn is on the socket before the
+    /// compositor dispatches.
+    ///
+    /// A turn used to be two separately-orderable halves (`dispatch`, then `refresh`), and the
+    /// compositor's loop was a `Generic` source *inside* the fixture's own loop. That put the turn
+    /// boundary wherever the compositor's poll fd happened to become readable — a full hidden turn
+    /// mid-`roundtrip`, none at all for a timer, since calloop keeps timers in the loop rather
+    /// than on an fd. An animation therefore rendered a single frame and stalled, and
+    /// `double_roundtrip` exists because a configure sometimes needed a second, unpredictable
+    /// turn to land.
+    pub fn turn(&mut self) {
+        for client in &mut self.state.clients {
+            client.dispatch();
+        }
+        self.state.server.turn();
     }
 
     /// Pump the compositor's own event loop until `pred` holds, giving up after
@@ -150,7 +132,10 @@ impl Fixture {
     ) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            self.state.server.dispatch();
+            for client in &mut self.state.clients {
+                client.dispatch();
+            }
+            self.state.server.turn();
             if pred(&mut self.state.server.state) {
                 return true;
             }
@@ -163,18 +148,6 @@ impl Fixture {
 
     pub fn synoik_state(&mut self) -> &mut crate::synoik::State {
         &mut self.state.server.state
-    }
-
-    /// One turn's worth of end-of-loop work — **the callback the live session runs**.
-    ///
-    /// `main.rs` hands `event_loop.run` a `refresh_and_flush_clients` closure, so that is what
-    /// closes every turn of the real compositor: reconcile, advance animations, *drain the queued
-    /// redraws*, flush clients. `Fixture::dispatch` is `event_loop.dispatch`, which does not run
-    /// that callback, so a harness that reconciled with the inner `refresh` alone left the drain
-    /// out — and a queued redraw was then taken only by whatever happened to redraw synchronously.
-    /// A `settle()` could return having drawn no frames at all while reporting itself settled.
-    pub fn refresh(&mut self) {
-        self.synoik_state().refresh_and_flush_clients();
     }
 
     pub fn synoik(&mut self) -> &mut Synoik {
@@ -260,13 +233,12 @@ impl Fixture {
     /// Run the compositor the way the live session runs it — one frame at a time — until nothing
     /// is animating.
     ///
-    /// The primitives around this one each do a *part* of a frame:
+    /// The primitive beside it does only a *part* of a frame:
     /// [`synoik_complete_animations`](Self::synoik_complete_animations) teleports the animation
-    /// clock to the end without a reconcile, [`refresh`](Self::refresh) reconciles without
-    /// advancing, [`dispatch`](Self::dispatch) pumps the loop without either. A test that needs a
-    /// transition to *finish the way it finishes in the session* had to hand-assemble the
-    /// sequence, and every test assembled it slightly differently — which is how a behaviour that
-    /// lands on the frame after an animation ends can be invisible to the corpus.
+    /// clock to the end without a turn. A test that needs a transition to *finish the way it
+    /// finishes in the session* had to hand-assemble the sequence, and every test assembled it
+    /// slightly differently — which is how a behaviour that lands on the frame after an animation
+    /// ends can be invisible to the corpus.
     ///
     /// This is that sequence, in the order the real loop runs it: advance the clock by one refresh
     /// interval, pump the event loop, reconcile. One turn draws one frame — the estimated-vblank
@@ -285,15 +257,13 @@ impl Fixture {
         let mut settled = false;
         for _ in 0..max_frames {
             self.advance_clock(FRAME);
-            self.dispatch();
-            self.refresh();
+            self.turn();
             if !self.transitions_ongoing() {
                 // One more full frame: the live loop reconciles *after* the last animated frame,
                 // and that trailing pass is where anything deferred to the end of a transition
                 // actually lands.
                 self.advance_clock(FRAME);
-                self.dispatch();
-                self.refresh();
+                self.turn();
                 settled = true;
                 break;
             }
@@ -433,8 +403,7 @@ impl Fixture {
         let mut elapsed = Duration::ZERO;
         while elapsed < duration {
             self.advance_clock(FRAME);
-            self.dispatch();
-            self.refresh();
+            self.turn();
             elapsed += FRAME;
         }
     }
@@ -679,15 +648,8 @@ impl Fixture {
         let client = Client::new(sock2);
         let id = client.id;
 
-        let fd = client.event_loop.as_fd().try_clone_to_owned().unwrap();
-        let source = Generic::new(fd, Interest::READ, Mode::Level);
-        self.handle
-            .insert_source(source, move |_, _, state: &mut State| {
-                state.client(id).dispatch();
-                Ok(PostAction::Continue)
-            })
-            .unwrap();
-
+        // No source, no second loop: every client's loop is dispatched by `Fixture::turn`, which
+        // is the only thing that advances anything here.
         self.state.clients.push(client);
         self.roundtrip(id);
         id
@@ -701,19 +663,20 @@ impl Fixture {
         let client = self.state.client(id);
         let data = client.send_sync();
         while !data.done.load(Ordering::Relaxed) {
-            self.dispatch();
+            self.turn();
         }
     }
 
-    /// Roundtrip twice in a row.
+    /// Roundtrip twice in a row — **required whenever the roundtrip is meant to deliver a
+    /// configure**.
     ///
-    /// For some reason, when running tests on many threads at once, a single roundtrip is
-    /// sometimes not sufficient to get the configure events to the client.
+    /// A configure is sent from the turn's *callback* (`refresh_and_flush_clients`), which runs
+    /// after the dispatch that answered the sync — so the `done` the first roundtrip waits on is
+    /// already on its way out when the configure is queued behind it, and the client's dispatch
+    /// stops at `done`. The second roundtrip's first turn delivers it.
     ///
-    /// I suspect that this is because these configure events are sent from the synoik loop
-    /// callback, so they arrive after the sync done event and don't get processed in that
-    /// client dispatch cycle. I'm not sure why this would be dependent on multithreading. But
-    /// if this is indeed the issue, then a double roundtrip fixes it.
+    /// Not a flake tolerance: with one roundtrip, 13 tests fail deterministically, on a missing
+    /// configure or on `wrong configure serial`.
     pub fn double_roundtrip(&mut self, id: ClientId) {
         self.roundtrip(id);
         self.roundtrip(id);
@@ -754,9 +717,9 @@ impl Drop for State {
         self.clients.clear();
 
         // Bounded, because a compositor that will not reap is a bug to see, not to hang on. One
-        // dispatch is enough in practice; the rest are for a client whose disconnect races it.
+        // turn is enough in practice; the rest are for a client whose disconnect races it.
         for _ in 0..5 {
-            self.server.dispatch();
+            self.server.turn();
         }
     }
 }

@@ -64,7 +64,17 @@ impl Server {
         }
     }
 
-    pub fn dispatch(&mut self) {
+    /// One iteration of the compositor's event loop — **the body `EventLoop::run` executes**.
+    ///
+    /// `calloop-0.14.4/src/loop_logic.rs:657` is `while !stopped { self.dispatch(timeout, data);
+    /// cb(data) }`, and `main.rs` passes `|state| state.refresh_and_flush_clients()` as that `cb`.
+    /// So these two calls, in this order, are the whole of a turn, and there is no second
+    /// definition of one for a test to drift from.
+    ///
+    /// The one argument that still differs from the session is the dispatch timeout: `None` there
+    /// (block until an fd or a timer is due), `ZERO` here (take what is ready and move on), because
+    /// a harness steps a clock it owns instead of spending wall-clock.
+    pub fn turn(&mut self) {
         self.event_loop
             .dispatch(Duration::ZERO, &mut self.state)
             .unwrap();

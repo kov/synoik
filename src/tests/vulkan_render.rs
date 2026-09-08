@@ -8033,8 +8033,7 @@ fn vulkan_unminimizing_grows_the_window_out_of_the_dock() {
     );
     f.freeze_clock();
     f.advance_clock(Duration::from_millis(40));
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     let (midway, midway_y) = green(&pixels, w, h);
@@ -8102,8 +8101,7 @@ fn vulkan_minimizing_shrinks_the_window_instead_of_vanishing() {
     assert!(f.synoik_state().minimize_window(&win), "it minimizes");
     f.freeze_clock();
     f.advance_clock(Duration::from_millis(40));
-    f.dispatch();
-    f.refresh();
+    f.turn();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     let (midway, midway_peak) = green(&pixels, w, h);
@@ -9852,7 +9850,7 @@ fn opening_the_overview_rebakes_no_panel_chrome() {
     // literal zero instead of an allowlist that would hide the next real regression.
     for _ in 0..2 {
         f.synoik().layout.toggle_overview();
-        f.refresh();
+        f.turn();
         f.synoik_complete_animations();
         let _ = render_output_vulkan(&mut f, &output);
     }
@@ -9867,7 +9865,7 @@ fn opening_the_overview_rebakes_no_panel_chrome() {
         // that only toggles the layout never flips `activities_checked` and never reaches the
         // invalidation this pins. (An earlier draft did exactly that and passed with the bug
         // deliberately re-introduced.)
-        f.refresh();
+        f.turn();
         let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
 
         let panel: Vec<String> = per_frame
@@ -10035,7 +10033,7 @@ fn the_scene_breakdown_totals_what_was_actually_shaded() {
     };
     let output = f.synoik().global_space.outputs().next().unwrap().clone();
     f.synoik().layout.toggle_overview();
-    f.refresh();
+    f.turn();
     f.synoik_complete_animations();
     // One warm frame first: the breakdown describes a settled scene, and the first render of one
     // uploads and bakes things that never draw again.
@@ -10310,13 +10308,13 @@ fn nothing_churns_its_element_id_while_the_pointer_moves() {
     let y = size.h / 2.;
     let at = f.synoik().seat.get_pointer().unwrap().current_location();
     f.pointer_motion(size.w * 0.25 - at.x, y - at.y);
-    f.dispatch();
+    f.turn();
     let _ = named_element_ids(&mut f, &output);
 
     let mut per_frame = Vec::new();
     for _ in 0..5 {
         f.pointer_motion(4., 0.);
-        f.dispatch();
+        f.turn();
         per_frame.push(named_element_ids(&mut f, &output));
     }
 
@@ -14671,7 +14669,7 @@ fn nothing_churns_its_element_id_in_a_settled_overview_over_a_wallpaper() {
 
     f.synoik().layout.toggle_overview();
     f.synoik_complete_animations();
-    f.dispatch();
+    f.turn();
     let _ = named_element_ids(&mut f, &output);
 
     let first = named_element_ids(&mut f, &output);
@@ -14739,7 +14737,7 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
 
         f.synoik().layout.toggle_overview();
         f.synoik_complete_animations();
-        f.dispatch();
+        f.turn();
 
         // Anti-vacuity: with no wallpaper element in the list this proves nothing, which is
         // exactly how the single-output guards stayed green through this bug.
@@ -15032,7 +15030,7 @@ fn a_settled_frame_matches_a_full_redraw(
             // and it is free to be empty.
             f.synoik().queue_redraw(&output);
             f.advance_clock(PAST_VBLANK);
-            f.dispatch();
+            f.turn();
             // `Fixture::refresh` is `State::refresh`, which reconciles but never draws — the draw
             // is in `refresh_and_flush_clients`, the loop's post-dispatch pass. Settling this whole
             // scene through the former rendered two frames in total.
