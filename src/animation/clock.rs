@@ -82,11 +82,12 @@ impl Clock {
     /// straight past the frames under test. Freezing makes the sampled instant a property of the
     /// test rather than of the machine.
     ///
-    /// Intended for tests; nothing in a session freezes the clock. Everything else derived from
-    /// real time stands down for a frozen clock, since it would otherwise put the machine back in
-    /// charge of a clock a test had taken over: `Synoik::redraw`, which pins the clock at each
-    /// frame's target presentation time, and the headless backend's estimated-vblank pacer, whose
-    /// wait would never elapse in a harness that pumps the loop without spending wall-clock.
+    /// Intended for tests; nothing in a session freezes the clock. One writer stands down for a
+    /// frozen clock, because it would otherwise put the machine back in charge of a clock a test
+    /// had taken over: `Synoik::redraw`, which pins the clock at each frame's target presentation
+    /// time. Everything else that used to need real time is a deadline, and deadlines are on this
+    /// clock (`crate::utils::timers`) — the estimated-vblank pacer included, so a frozen clock
+    /// paces frames rather than stopping them.
     pub fn freeze(&mut self) {
         let mut clock = self.inner.borrow_mut();
         // Materialize the current time first: freezing an unset lazy clock would otherwise pin it

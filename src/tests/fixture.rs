@@ -127,32 +127,8 @@ impl Fixture {
     /// test is driving here (see [`crate::utils::timers`]), so a key repeat, a drag countdown or
     /// an idle deadline all come due in the turn that steps past them. It spends no wall-clock,
     /// which is what the wall-clock `dispatch_until` it replaced did — a 3 s repeat test really
-    /// slept for up to 3 s.
-    /// Pump the loop until `pred` holds, spending **real** wall-clock — for the one deadline
-    /// [`advance_until`](Self::advance_until) cannot reach.
-    ///
-    /// Every deadline the compositor reasons about is on the clock a test drives, so this is not
-    /// the tool for one: reach for `advance_until`. What is left on calloop's clock is the
-    /// estimated-vblank pacer, which stands in for display hardware — and an output already parked
-    /// on it when a test freezes the clock is freed only by real time passing.
-    pub fn dispatch_until(
-        &mut self,
-        timeout: Duration,
-        mut pred: impl FnMut(&mut crate::synoik::State) -> bool,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            self.turn();
-            if pred(&mut self.state.server.state) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
+    /// slept for up to 3 s. **There is no deadline it cannot reach**: the headless
+    /// estimated-vblank pacer is on this clock too, so a frame comes out of every step.
     pub fn advance_until(
         &mut self,
         within: Duration,
@@ -274,7 +250,8 @@ impl Fixture {
     ///
     /// This is that sequence, in the order the real loop runs it: advance the clock by one refresh
     /// interval, pump the event loop, reconcile. One turn draws one frame — the estimated-vblank
-    /// pacer stands down for a frozen clock and lets this step be the vblank — so a transition
+    /// pacer's deadline is one refresh interval on this same clock, so this step *is* the vblank
+    /// (`crate::utils::timers`) — so a transition
     /// settled here has been *rendered* frame by frame, and the last frame drawn is the settled
     /// one. It gives up after `max_frames` so a transition that never settles fails the test
     /// instead of hanging it.
@@ -283,7 +260,8 @@ impl Fixture {
 
         // Freezing is how the frames get a size that is a property of the test rather than of the
         // machine, but it must not outlive the call: a caller that never froze goes on to expect a
-        // clock that follows real time, and calloop-timer behaviour would silently never fire.
+        // clock that follows real time, and would find every later frame paced by this one's
+        // leftover freeze instead.
         let was_frozen = self.synoik().clock.is_frozen();
         self.freeze_clock();
         let mut settled = false;

@@ -1544,9 +1544,9 @@ pub enum RedrawState {
     /// [`FrameClock::next_dispatch`]). The timer fires at `aim.target − estimated cost`.
     ScheduledDispatch { token: TimerToken, aim: FrameAim },
     /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
-    WaitingForEstimatedVBlank(RegistrationToken),
+    WaitingForEstimatedVBlank(TimerToken),
     /// A redraw is queued on top of the above.
-    WaitingForEstimatedVBlankAndQueued(RegistrationToken),
+    WaitingForEstimatedVBlankAndQueued(TimerToken),
 }
 
 impl RedrawState {
@@ -8952,8 +8952,8 @@ impl Synoik {
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => (),
             RedrawState::ScheduledDispatch { token, .. } => self.cancel_timer(token),
-            RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
-            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
+            RedrawState::WaitingForEstimatedVBlank(token) => self.cancel_timer(token),
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.cancel_timer(token),
         }
 
         self.stop_casts_for_target(CastTarget::output(output));

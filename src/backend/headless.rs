@@ -35,7 +35,6 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::ImportDma as _;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::rustix::fs as rfs;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::reexports::rustix::fs::OFlags;
@@ -645,11 +644,13 @@ impl Headless {
         }
     }
 
+    /// `target_presentation_time` is the tty path's; headless presents inline and paces the next
+    /// frame off the compositor's clock, which `Synoik::redraw` has already set to it.
     pub fn render(
         &mut self,
         synoik: &mut Synoik,
         output: &Output,
-        target_presentation_time: Duration,
+        _target_presentation_time: Duration,
     ) -> RenderResult {
         let states = self.render_element_states(synoik, output);
         synoik.update_primary_scanout_output(output, &states);
@@ -667,9 +668,7 @@ impl Headless {
             RedrawState::Queued => (),
             // Damage landed while the next animation frame was pending (see `queue_next_frame`),
             // and that redraw is this one — so the timer has nothing left to ask for.
-            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                synoik.event_loop.remove(token)
-            }
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => synoik.cancel_timer(token),
             RedrawState::Idle
             | RedrawState::ScheduledDispatch { .. }
             | RedrawState::WaitingForVBlank { .. }
@@ -686,7 +685,7 @@ impl Headless {
             synoik.note_shield_frame_presented(output);
         }
 
-        queue_next_frame(synoik, output, target_presentation_time);
+        queue_next_frame(synoik, output);
 
         RenderResult::Submitted
     }
@@ -733,44 +732,32 @@ impl Default for Headless {
 /// presentation time from DRM), minus the DRM parts.
 ///
 /// [`Synoik::render_captures_with`]: crate::synoik::Synoik
-fn queue_next_frame(synoik: &mut Synoik, output: &Output, target_presentation_time: Duration) {
+fn queue_next_frame(synoik: &mut Synoik, output: &Output) {
     let output_state = synoik.output_state.get_mut(output).unwrap();
     if !output_state.unfinished_animations_remain {
         return;
     }
 
-    // A frozen clock means a test has taken time over (see `Clock::freeze`), and this interval is
-    // derived from real time — a harness that pumps the loop without spending wall-clock would
-    // never see the timer fire, so the animation would render exactly the one frame this
-    // reasoning exists to prevent. Ask for the next frame immediately instead and let the
-    // harness's own step pace it: its `advance_clock` is the vblank.
-    let mut duration = Duration::ZERO;
-    if !synoik.clock.is_frozen() {
-        // A zero-length timer would just spin: `render` already sent this frame's callbacks, so
-        // wait out the frame interval before asking for the next one.
-        duration = target_presentation_time.saturating_sub(get_monotonic_time());
-        if duration.is_zero() {
-            duration += output_state
-                .frame_clock
-                .refresh_interval()
-                .unwrap_or(Duration::from_micros(16_667));
-        }
-    }
+    // One refresh interval past the frame just presented, on the compositor's own clock
+    // (`crate::utils::timers`) like every other deadline. `render` presents inline and has already
+    // sent this frame's callbacks, so a deadline at the presented instant would just spin.
+    //
+    // The clock reads the presented instant because `Synoik::redraw` set it there — and when a
+    // test has frozen the clock it reads the test's instant instead, so one `advance_clock` of a
+    // frame reaches this deadline exactly as a vblank would. That is the whole reason the pacer
+    // is here and not on calloop's clock: it stands in for hardware the backend does not have,
+    // and a harness that pumps the loop without spending wall-clock has no hardware either.
+    let interval = output_state
+        .frame_clock
+        .refresh_interval()
+        .unwrap_or(Duration::from_micros(16_667));
+    let deadline = synoik.clock.now_unadjusted() + interval;
 
-    // Stays on calloop, unlike every other deadline (`crate::utils::timers`): it stands in for a
-    // vblank this backend has no hardware to get, so real time is the clock it belongs on — and it
-    // asks for the next frame immediately when a test has taken the clock over (see
-    // `Clock::freeze`).
-    #[allow(clippy::disallowed_methods)]
-    let timer = Timer::from_duration(duration);
     let timer_output = output.clone();
-    let token = synoik
-        .event_loop
-        .insert_source(timer, move |_, _, data| {
-            on_frame_timer(&mut data.synoik, &timer_output);
-            TimeoutAction::Drop
-        })
-        .unwrap();
+    let token = synoik.timer_at(deadline, move |state| {
+        on_frame_timer(&mut state.synoik, &timer_output);
+        None
+    });
 
     // Claim the output for the duration, so a `queue_redraw` in between lands as
     // `WaitingForEstimatedVBlankAndQueued` instead of starting a second, unpaced redraw loop.

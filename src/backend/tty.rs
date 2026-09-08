@@ -37,7 +37,6 @@ use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale};
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
     Dispatcher, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
@@ -3552,9 +3551,11 @@ fn render_surface_with(
                             RedrawState::WaitingForVBlank { .. } => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                                synoik.event_loop.remove(token);
+                                synoik.cancel_timer(token);
                             }
                         };
+
+                        let output_state = synoik.output_state.get_mut(output).unwrap();
 
                         // We queued this frame successfully, so the current client buffers were
                         // latched. We can send frame callbacks now, since a new client commit
@@ -3647,38 +3648,35 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
         }
     }
 
-    let now = get_monotonic_time();
-    let mut duration = output_state
-        .frame_clock
-        .next_vblank_estimate()
-        .saturating_sub(now);
+    let now = synoik.clock.now_unadjusted();
+    let mut deadline = output_state.frame_clock.next_vblank_estimate();
 
     // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
     // render(). This can happen for example with unknown presentation time from DRM.
-    if duration.is_zero() {
-        duration += output_state
-            .frame_clock
-            .refresh_interval()
-            // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
-            // but it's not that important for this code path.
-            .unwrap_or(Duration::from_micros(16_667));
+    if deadline <= now {
+        deadline = now
+            + output_state
+                .frame_clock
+                .refresh_interval()
+                // Unknown refresh interval, i.e. winit backend. Would be good to estimate it
+                // somehow but it's not that important for this code path.
+                .unwrap_or(Duration::from_micros(16_667));
     }
 
-    trace!("queueing estimated vblank timer to fire in {duration:?}");
+    trace!(
+        "queueing estimated vblank timer to fire in {:?}",
+        deadline - now
+    );
 
-    // Stays on calloop, unlike every other deadline (`crate::utils::timers`): this stands in for
-    // a vblank the hardware did not report, so real time is the clock it belongs on.
-    #[allow(clippy::disallowed_methods)]
-    let timer = Timer::from_duration(duration);
-    let token = synoik
-        .event_loop
-        .insert_source(timer, move |_, _, data| {
-            data.backend
-                .tty()
-                .on_estimated_vblank_timer(&mut data.synoik, output.clone());
-            TimeoutAction::Drop
-        })
-        .unwrap();
+    let timer_output = output.clone();
+    let token = synoik.timer_at(deadline, move |state| {
+        state
+            .backend
+            .tty()
+            .on_estimated_vblank_timer(&mut state.synoik, timer_output.clone());
+        None
+    });
+    let output_state = synoik.output_state.get_mut(&output).unwrap();
     output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
 }
 

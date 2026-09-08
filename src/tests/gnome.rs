@@ -2370,8 +2370,9 @@ fn no_buffer_of_the_screen_keeps_a_thumbnail_the_scene_moved() {
 /// compositor never rendered gets drawn by the probe anyway, and an artifact whose whole nature is
 /// a missing repaint is invisible to it. Here the backend hands over each frame it actually
 /// renders ([`Headless::frame_sink`]), on the turns its own redraw machinery chose, at its own
-/// clock; the test composites on no schedule of its own. The clock is left running for the same
-/// reason — the frame timer is a real one, and freezing it would decide the sampling.
+/// clock; the test composites on no schedule of its own. The clock is left running so the pacing
+/// stays the compositor's: a freeze would make the test's own step the vblank and so decide the
+/// sampling it is trying to observe.
 ///
 /// Measured on kov's seat 2026-08-19: after a drop, a miniature's left edge sat at x=1866 in one
 /// swapchain buffer and x=1876 in the other, while a from-scratch render put it at x=1909. Two
@@ -2416,8 +2417,8 @@ fn what_the_screen_was_shown_is_the_scene_when_the_strip_stops() {
     let size: Size<i32, Physical> = out.current_mode().unwrap().size;
 
     summon_peek(&mut f);
-    // `summon_peek` runs frames, which freezes the clock. From here the compositor's own timer
-    // decides when to draw, so the clock has to follow real time again.
+    // `summon_peek` runs frames, which freezes the clock. From here the compositor's own pacing
+    // must decide when to draw, so the clock has to follow real time again.
     f.synoik().clock.unfreeze();
 
     let (band, below_panel) = {
@@ -17117,9 +17118,6 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
     // itself at once and what is left is the curtain.
     f.synoik_state().synoik.gdm_requests = None;
 
-    // Timed from the arming, because that is when the deadline that could *also* end this wait
-    // starts running: finishing inside it is what proves a presented frame did the releasing.
-    let armed = std::time::Instant::now();
     f.synoik_state()
         .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
     assert!(
@@ -17137,23 +17135,16 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
     f.synoik_state().refresh_and_flush_clients();
     assert!(f.synoik().shield_frame_owed());
 
-    // Real time, not the animation clock: the release is a presentation, so it has to come from
-    // the compositor's own loop rendering the frame after the slide lands.
-    // The one wait in the corpus that still spends **real** time, and the only place left where
-    // that is not a choice: the release rides a *presented* frame, and the frame that presents it
-    // is paced by the headless estimated-vblank timer — the last deadline still on calloop's
-    // clock rather than the compositor's (see `crate::utils::timers`). An output already parked on
-    // that timer when a test freezes the clock cannot be freed by advancing the clock, because the
-    // pacer was armed against wall time before the freeze.
+    // The release rides a *presented* frame, so the wait has to be the compositor's own loop
+    // pacing frames out — which it now does on the clock this steps (`crate::utils::timers`),
+    // estimated-vblank pacer included. The budget is deliberately **under**
+    // `SHIELD_PRESENT_DEADLINE`: the fallback that would also end this wait is on the same clock,
+    // so finishing inside 600 ms is what proves a frame did the releasing and not the deadline.
     assert!(
-        f.dispatch_until(Duration::from_millis(900), |state| {
+        f.advance_until(Duration::from_millis(600), |state| {
             !state.synoik.shield_frame_owed()
         }),
         "the curtain landed and the wait never ended"
-    );
-    assert!(
-        armed.elapsed() < Duration::from_millis(900),
-        "released by the deadline rather than by a presented frame"
     );
 
     let owed = f.synoik().curtain_frame_owed();
