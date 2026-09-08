@@ -10,7 +10,7 @@
 //!
 //! So the deadline lives here instead, on the same clock everything else is timed against, and
 //! the wheel is dispatched from the loop's turn. calloop's role shrinks to *waking the loop up*:
-//! [`Timers::wakeup_in`] says when the loop must next come round, and the caller arms an
+//! [`Timers::next_deadline`] says when the loop must next come round, and the caller arms an
 //! otherwise-empty source with it. A session waits on that source; a harness pumps the loop with
 //! a zero timeout and never needs it. **Both dispatch the same wheel, in the same place in the
 //! turn, through the same callbacks** — only who woke the loop differs.
@@ -98,12 +98,6 @@ impl<D> Timers<D> {
     /// The earliest deadline, or `None` when nothing is pending.
     pub fn next_deadline(&self) -> Option<Duration> {
         self.entries.iter().map(|e| e.deadline).min()
-    }
-
-    /// How long the loop may sleep before it must come round to dispatch — `None` when nothing is
-    /// pending and it may sleep indefinitely. Zero when something is already due.
-    pub fn wakeup_in(&self, now: Duration) -> Option<Duration> {
-        self.next_deadline().map(|d| d.saturating_sub(now))
     }
 
     /// Run every timer due at `now`, in deadline order, and reschedule the ones that ask for it.
@@ -313,22 +307,13 @@ mod tests {
     #[test]
     fn the_wakeup_is_the_earliest_deadline_and_nothing_when_idle() {
         let mut h = Harness::default();
-        assert_eq!(
-            h.timers.wakeup_in(Duration::ZERO),
-            None,
-            "an idle loop may sleep"
-        );
+        assert_eq!(h.timers.next_deadline(), None, "an idle loop may sleep");
 
         h.timers.insert_at(30 * MS, |_: &mut Harness| None);
         let token = h.timers.insert_at(10 * MS, |_: &mut Harness| None);
-        assert_eq!(h.timers.wakeup_in(Duration::ZERO), Some(10 * MS));
-        assert_eq!(
-            h.timers.wakeup_in(50 * MS),
-            Some(Duration::ZERO),
-            "already due: come round now"
-        );
+        assert_eq!(h.timers.next_deadline(), Some(10 * MS));
 
         h.timers.cancel(token);
-        assert_eq!(h.timers.wakeup_in(Duration::ZERO), Some(30 * MS));
+        assert_eq!(h.timers.next_deadline(), Some(30 * MS));
     }
 }

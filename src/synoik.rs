@@ -422,10 +422,13 @@ pub struct Synoik {
     /// Deadlines on the compositor's own clock. **The way to arm a timer** — see
     /// [`crate::utils::timers`] for why calloop's is the wrong clock to time the compositor by.
     pub timers: Timers<State>,
-    /// The calloop source that exists only to wake the loop when `timers` next comes due. It
-    /// carries no behaviour: the wheel is dispatched from the turn, whether the loop woke for this
-    /// or for anything else.
-    timer_wakeup: Option<RegistrationToken>,
+    /// The calloop source that exists only to wake the loop when `timers` next comes due, paired
+    /// with the deadline it was armed for. It carries no behaviour beyond clearing itself: the
+    /// wheel is dispatched from the turn, whether the loop woke for this or for anything else.
+    /// The deadline is kept so a turn that did not move the earliest one re-arms nothing — in a
+    /// session the panel tick and the frame-callback fallback are always pending, so a blind
+    /// remove-and-insert would churn a calloop source sixty times a second.
+    timer_wakeup: Option<(RegistrationToken, Duration)>,
     pub scheduler: Scheduler<()>,
     pub stop_signal: LoopSignal,
     pub display_handle: DisplayHandle,
@@ -8399,6 +8402,12 @@ impl Synoik {
         synoik.folder_dialog.share_icon_uploads(&shared);
         synoik.app_icon_uploads = shared;
 
+        // Point the loop at the session-long timers armed above. Every later arm is covered by
+        // the once-per-turn pass in `refresh_and_flush_clients`, but nothing has turned yet: the
+        // loop is about to block in `dispatch(None)`, and without this it would sleep past the
+        // first panel tick until something else happened to wake it.
+        synoik.arm_timer_wakeup();
+
         synoik
     }
 
@@ -10304,24 +10313,38 @@ impl Synoik {
     /// harness pumps with a zero timeout and never sees it fire, which is the whole reason the
     /// deadline lives on the compositor's clock rather than the machine's.
     pub fn arm_timer_wakeup(&mut self) {
-        if let Some(token) = self.timer_wakeup.take() {
+        let now = self.clock.now_unadjusted();
+        let deadline = self.timers.next_deadline();
+
+        // A source that has already fired cleared this field from its own callback, so a match
+        // here means the armed source is still live *and* still points at the right instant.
+        if let (Some((_, armed)), Some(deadline)) = (&self.timer_wakeup, deadline) {
+            if *armed == deadline {
+                return;
+            }
+        }
+
+        if let Some((token, _)) = self.timer_wakeup.take() {
             self.event_loop.remove(token);
         }
 
-        let Some(after) = self.timers.wakeup_in(self.clock.now_unadjusted()) else {
+        let Some(deadline) = deadline else {
             return;
         };
+        let after = deadline.saturating_sub(now);
 
         // The one calloop timer the wheel itself needs: something has to end the loop's poll when
         // the earliest deadline arrives. Real time is right here, because the loop's sleep is the
         // thing being cut short.
         #[allow(clippy::disallowed_methods)]
         let wakeup = Timer::from_duration(after);
-        match self
-            .event_loop
-            .insert_source(wakeup, |_, _, _state| TimeoutAction::Drop)
-        {
-            Ok(token) => self.timer_wakeup = Some(token),
+        match self.event_loop.insert_source(wakeup, |_, _, state| {
+            // Dropped by calloop, so the token is dead the moment this returns: clear it, or the
+            // next arm could match a stale deadline against a source that no longer exists.
+            state.synoik.timer_wakeup = None;
+            TimeoutAction::Drop
+        }) {
+            Ok(token) => self.timer_wakeup = Some((token, deadline)),
             Err(err) => warn!("error arming the timer wakeup: {err:?}"),
         }
     }
