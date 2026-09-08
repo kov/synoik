@@ -118,9 +118,23 @@ impl Fixture {
         }
     }
 
+    /// Pump both event loops once, without reconciling — see [`refresh`](Self::refresh) for the
+    /// turn.
+    ///
+    /// The compositor runs its *own* calloop loop; the fixture's loop only watches that loop's
+    /// poll fd (see `Fixture::with_config`). calloop keeps its timers inside the loop rather than
+    /// on a timerfd, so an expired compositor timer never makes that fd readable: driving the
+    /// outer loop alone delivers client traffic and **nothing that is due on a timer**, so the
+    /// inner loop is dispatched here directly. An animation's estimated-vblank timer is one such
+    /// timer: without this it renders a single frame and stalls at whatever progress it reached.
     pub fn dispatch(&mut self) {
         self.event_loop
             .dispatch(Duration::ZERO, &mut self.state)
+            .unwrap();
+        let server = &mut self.state.server;
+        server
+            .event_loop
+            .dispatch(Duration::ZERO, &mut server.state)
             .unwrap();
     }
 
@@ -151,16 +165,6 @@ impl Fixture {
         &mut self.state.server.state
     }
 
-    /// Run the compositor's reconcile phase (`State::refresh`) — and **nothing else**: no
-    /// animation advance, no redraw.
-    ///
-    /// This, not a render, is where UI state that *tracks* the layout is brought in line (the
-    /// panel's Activities highlight, a panel menu the overview opens over). Reach for it after
-    /// driving an action directly with `do_action`, which does not pump the loop.
-    ///
-    /// Deliberately not `refresh_and_flush_clients`: that redraws too, so a test using it would
-    /// pass whether the state were synced here or at render time — which is exactly the confusion
-    /// that let the Activities highlight sit one cycle late.
     /// One turn's worth of end-of-loop work — **the callback the live session runs**.
     ///
     /// `main.rs` hands `event_loop.run` a `refresh_and_flush_clients` closure, so that is what
@@ -265,8 +269,11 @@ impl Fixture {
     /// lands on the frame after an animation ends can be invisible to the corpus.
     ///
     /// This is that sequence, in the order the real loop runs it: advance the clock by one refresh
-    /// interval, pump the event loop, reconcile. It gives up after `max_frames` so a transition
-    /// that never settles fails the test instead of hanging it.
+    /// interval, pump the event loop, reconcile. One turn draws one frame — the estimated-vblank
+    /// pacer stands down for a frozen clock and lets this step be the vblank — so a transition
+    /// settled here has been *rendered* frame by frame, and the last frame drawn is the settled
+    /// one. It gives up after `max_frames` so a transition that never settles fails the test
+    /// instead of hanging it.
     pub fn run_until_settled(&mut self, max_frames: usize) -> bool {
         const FRAME: Duration = Duration::from_micros(16_667);
 

@@ -39082,12 +39082,6 @@ fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
     let frames = f.record_frames();
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle();
-    // Draw the settled state. A settle stops when nothing is animating, and the last frame it
-    // happened to draw can be one from part-way through the opening — the strip still sliding in,
-    // its thumbnails above the band. Asking for one more frame is asking the compositor to draw
-    // what is on screen now, which is what the assertions below are about.
-    f.synoik().queue_redraw_all();
-    f.refresh();
 
     let output = f.synoik_output(2);
     let scale = output.current_scale().fractional_scale();

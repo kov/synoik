@@ -82,10 +82,11 @@ impl Clock {
     /// straight past the frames under test. Freezing makes the sampled instant a property of the
     /// test rather than of the machine.
     ///
-    /// Intended for tests; nothing in a session freezes the clock. The compositor's own writer
-    /// — `Synoik::redraw`, pinning the clock at each frame's target presentation time — checks
-    /// [`is_frozen`](Self::is_frozen) and stands down, since that target is derived from real
-    /// time and would put the machine back in charge of a clock a test had taken over.
+    /// Intended for tests; nothing in a session freezes the clock. Everything else derived from
+    /// real time stands down for a frozen clock, since it would otherwise put the machine back in
+    /// charge of a clock a test had taken over: `Synoik::redraw`, which pins the clock at each
+    /// frame's target presentation time, and the headless backend's estimated-vblank pacer, whose
+    /// wait would never elapse in a harness that pumps the loop without spending wall-clock.
     pub fn freeze(&mut self) {
         let mut clock = self.inner.borrow_mut();
         // Materialize the current time first: freezing an unset lazy clock would otherwise pin it
