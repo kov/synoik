@@ -134,6 +134,17 @@ fn window_fixture_with_client(
     window.commit();
     f.roundtrip(id);
 
+    if !settle {
+        // An unsettled fixture exists to be sampled mid-open, and a mid-animation sample has to
+        // hold the clock: an unfrozen one is cleared at the end of every loop turn, so the next
+        // read comes from the monotonic clock and the animation jumps by however long the turn
+        // took in real time. The turns below render, so on a software rasteriser the open
+        // animation is most of the way through before the caller takes its first frame — CI saw
+        // 76% where this machine sees 0%. Freeze before the map, so the animation starts at the
+        // instant the clock is pinned to and only `advance_clock` moves it.
+        f.freeze_clock();
+    }
+
     let window = f.client(id).window(&surface);
     window.attach_solid_buffer(color[0], color[1], color[2], color[3]);
     window.set_size(WIN, WIN);
