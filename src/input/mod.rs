@@ -4063,6 +4063,10 @@ impl State {
                 self.open_screenshot_ui(path);
                 self.synoik.switcher.cancel();
             }
+            Action::ScreenshotQuick => {
+                self.open_screenshot_ui_quick();
+                self.synoik.switcher.cancel();
+            }
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.synoik.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {

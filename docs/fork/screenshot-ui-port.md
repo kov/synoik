@@ -168,6 +168,37 @@ its rectangle across a close. `ScreenshotUi::new` names that type, which is why 
 Restoring a remembered type is a plain assignment in `open`, with GNOME's one guard: `Window` with
 nothing left to pick falls back to `Selection` (`js/ui/screenshot.js:1662-1664`).
 
+## Addition: the crosshair (`screenshot-quick`, `<Alt><Shift>4`)
+
+Requested 2026-09-10, after macOS' Cmd+Shift+4. All three of GNOME's screenshot keys open the
+picker, so there is nothing upstream to bind for "just let me drag a region": `screenshot-quick`
+lives in `org.synoik.keybindings`. Its siblings do map onto GNOME keys and are extra accelerators
+on those instead — `<Alt><Shift>3` on `screenshot`, `<Alt><Shift>5` on `show-screenshot-ui`
+(`docs/fork/keybindings-port.md`).
+
+It is the same session, not a second UI. `Open::quick` holds the `Closed` fields it borrowed, and
+four things follow from it:
+
+- **Selection, always.** A quick session forces the type rather than reading the remembered one,
+  and hands the remembered one back at close along with the selection rectangle. It is a
+  parenthesis in the picker's state, not a write to it. (`show_pointer` is untouched either way:
+  it is the one control the crosshair cannot reach.)
+- **No chrome, from one lever.** `render_output` skips `ensure_panel`, and that bake is what
+  populates the layout — the sole hit-test authority. No layout means no panel rect, no controls
+  under the pointer, and no corner handles baked to draw. `lay_out_panels`, the headless
+  counterpart, refuses for the same reason.
+- **The release is the shutter.** A finished drag returns `PointerUp::Capture`. A bare click does
+  not: the picker inflates a zero-sized selection to 32×32 so a stray click leaves something
+  draggable, and firing on that would hand back a 32px screenshot. It cancels.
+- **Space arms the focused window.** In the picker Space *is* the capture; here it toggles
+  Selection↔Window, and `open` already seeds `selected_window` from the focused one. Return still
+  captures, Escape still cancels, and the picker's `s`/`c`/`w`/`p`/`v` keys are off — `c` (Screen)
+  would take the crosshair out of being one.
+
+Pinned by `the_quick_screenshot_is_a_crosshair_with_no_picker_around_it`,
+`the_crosshair_captures_on_release_and_cancels_on_a_bare_click` and
+`space_in_the_crosshair_arms_the_focused_window`.
+
 ## Approved divergence: delayed capture
 
 Requested 2026-08-03. GNOME's shell UI has no delay (gnome-screenshot had one; the shell dropped

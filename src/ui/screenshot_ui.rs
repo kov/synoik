@@ -163,10 +163,21 @@ pub enum ScreenshotUi {
         /// still works — it just does not light up first.
         hover: Option<Control>,
         open_anim: Animation,
+        /// Set when this session was opened by `screenshot-quick` — the crosshair with no picker.
+        /// Holds the `Closed` state to put back, because a quick session is explicitly *not*
+        /// remembered: it forces Selection over whatever was picked last, and handing that back
+        /// as the remembered type would make the next ordinary open come up in it.
+        quick: Option<Remembered>,
         clock: Clock,
         config: Rc<RefCell<Config>>,
         path: Option<String>,
     },
+}
+
+/// The `Closed` fields a quick session borrows and gives back untouched (see `Open::quick`).
+pub struct Remembered {
+    capture_type: CaptureType,
+    last_selection: Option<(WeakOutput, Rectangle<i32, Physical>)>,
 }
 
 /// GNOME's tooltip appears 300ms after the pointer settles, then fades in over 150ms
@@ -736,6 +747,9 @@ impl ScreenshotUi {
         default_output: Output,
         focused_window: Option<u64>,
         path: Option<String>,
+        // Open the crosshair rather than the picker: no panel, Selection whatever was
+        // remembered, and nothing about this session written back at close.
+        quick: bool,
     ) -> bool {
         if screenshots.is_empty() {
             // Every output's capture failed (each warned individually). Say so, or the keybind
@@ -756,6 +770,11 @@ impl ScreenshotUi {
         };
         let show_pointer = *show_pointer;
         let remembered_type = *remembered_type;
+        // Taken before the selection is consumed below, so what goes back is what was there.
+        let quick = quick.then(|| Remembered {
+            capture_type: remembered_type,
+            last_selection: last_selection.clone(),
+        });
 
         let last_selection = last_selection
             .take()
@@ -861,11 +880,14 @@ impl ScreenshotUi {
         // (`js/ui/screenshot.js:1662-1664`). A remembered Window mode with nothing left to pick
         // would otherwise arm an insensitive button over an empty selector.
         let no_windows = output_data.values().all(|d| d.windows.is_empty());
-        let capture_type = if remembered_type == CaptureType::Window && no_windows {
-            CaptureType::Selection
-        } else {
-            remembered_type
-        };
+        // The crosshair is Selection by definition — that is what macOS' Cmd+Shift+4 is — so it
+        // ignores the remembered type rather than being one more thing that sets it.
+        let capture_type =
+            if quick.is_some() || (remembered_type == CaptureType::Window && no_windows) {
+                CaptureType::Selection
+            } else {
+                remembered_type
+            };
 
         *self = Self::Open {
             area,
@@ -881,6 +903,7 @@ impl ScreenshotUi {
             tooltip: None,
             hover: None,
             open_anim,
+            quick,
             clock: clock.clone(),
             config: config.clone(),
             path,
@@ -896,6 +919,7 @@ impl ScreenshotUi {
             area,
             show_pointer,
             capture_type,
+            quick,
             clock,
             config,
             ..
@@ -905,13 +929,21 @@ impl ScreenshotUi {
         };
 
         // `area` is the dragged rectangle in every mode, so the next open gets it back whatever
-        // this one was capturing.
-        let last_selection = Some((area.0.downgrade(), rect_from_corner_points(area.1, area.2)));
+        // this one was capturing — unless this was a quick session, which gives back what it
+        // borrowed instead. `show_pointer` is not part of that: it is the one control a quick
+        // session has no way to touch, so it cannot have changed.
+        let (last_selection, capture_type) = match quick {
+            Some(remembered) => (remembered.last_selection.take(), remembered.capture_type),
+            None => (
+                Some((area.0.downgrade(), rect_from_corner_points(area.1, area.2))),
+                *capture_type,
+            ),
+        };
 
         *self = Self::Closed {
             last_selection,
             show_pointer: *show_pointer,
-            capture_type: *capture_type,
+            capture_type,
             clock: clock.clone(),
             config: config.clone(),
         };
@@ -993,7 +1025,15 @@ impl ScreenshotUi {
     /// For the headless corpus (`src/tests/gnome.rs`), which has no device.
     #[cfg(test)]
     pub fn lay_out_panels(&mut self, metrics: CaptionMetrics) {
-        let Self::Open { output_data, .. } = self else {
+        let Self::Open {
+            output_data,
+            // A quick session has no panel — `render_output` skips the bake that would otherwise
+            // produce this layout, so producing one here would give a headless test controls the
+            // live session does not have.
+            quick: None,
+            ..
+        } = self
+        else {
             return;
         };
         for data in output_data.values() {
@@ -1117,6 +1157,11 @@ impl ScreenshotUi {
         match self {
             Self::Open { capture_type, .. } | Self::Closed { capture_type, .. } => *capture_type,
         }
+    }
+
+    /// Whether this is a `screenshot-quick` session: the crosshair, with no picker around it.
+    pub fn is_quick(&self) -> bool {
+        matches!(self, Self::Open { quick: Some(_), .. })
     }
 
     pub fn is_open(&self) -> bool {
@@ -1545,6 +1590,22 @@ impl ScreenshotUi {
         ))
     }
 
+    /// Where a window's thumbnail sits in the Window selector, output-local and logical.
+    ///
+    /// Test-only, and read from the same `slots` the hit test uses. The selector is an exposé, so
+    /// a thumbnail is nowhere near the window it stands for and a test that guessed at a point
+    /// would be asserting on the layout strategy by accident.
+    #[cfg(test)]
+    pub fn window_slot(&self, output: &Output, id: u64) -> Option<Rectangle<f64, Logical>> {
+        let Self::Open { output_data, .. } = self else {
+            return None;
+        };
+        let data = output_data.get(output)?;
+        zip(&data.windows, &data.slots)
+            .find(|(shot, _)| shot.id == id)
+            .map(|(_, slot)| *slot)
+    }
+
     /// The panel's control geometry on `output`, panel-local and logical. Test-only, and the same
     /// value the bake and the hit test both read — a test that guessed its own coordinates would
     /// prove nothing about whether those two agree.
@@ -1581,6 +1642,7 @@ impl ScreenshotUi {
             hover,
             button,
             open_anim,
+            quick,
             ..
         } = self
         else {
@@ -1610,8 +1672,12 @@ impl ScreenshotUi {
         };
 
         // The panel goes on top. Built lazily here (no renderer exists at open time), so this is
-        // also what first populates the layout the hit test reads.
-        output_data.ensure_panel(renderer, accent, state);
+        // also what first populates the layout the hit test reads — which is why skipping the bake
+        // is all a quick session needs to have no chrome: no layout means no panel rect, no
+        // controls to hit and no handles baked to draw on the corners.
+        if quick.is_none() {
+            output_data.ensure_panel(renderer, accent, state);
+        }
         if let Some(size) = output_data.panel.borrow().size() {
             let alpha = if button.is_dragging_selection() {
                 0.3
@@ -1788,13 +1854,35 @@ impl ScreenshotUi {
     }
 
     pub fn action(&self, raw: Keysym, mods: ModifiersState) -> Option<Action> {
-        let Self::Open { button, .. } = self else {
+        let Self::Open {
+            button,
+            quick,
+            capture_type,
+            ..
+        } = self
+        else {
             return None;
         };
 
-        // Pressing Space while the button is down goes into origin moving rather than capture.
+        // Pressing Space while the button is down goes into origin moving rather than capture
+        // (`set_space_down`), in either session.
         if matches!(button, Button::Down { .. }) && raw == Keysym::space {
             return None;
+        }
+
+        if quick.is_some() {
+            // The crosshair answers to four keys, and only four: it has no controls for the rest
+            // to stand in for, and `c` (Screen) would take it out of being a crosshair at all.
+            // Space is macOS': arm the focused window, and press it again to come back.
+            return match raw {
+                Keysym::space => Some(match capture_type {
+                    CaptureType::Window => Action::ScreenshotTypeSelection,
+                    _ => Action::ScreenshotTypeWindow,
+                }),
+                Keysym::Escape | Keysym::Return => action(raw, mods),
+                Keysym::c if mods.ctrl => action(raw, mods),
+                _ => None,
+            };
         }
 
         action(raw, mods)
@@ -2222,7 +2310,6 @@ impl ScreenshotUi {
 
     pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<PointerUp> {
         let Self::Open {
-            area,
             output_data,
             button,
             ..
@@ -2254,6 +2341,7 @@ impl ScreenshotUi {
         }
 
         let last_pos = last_pos.clone();
+        let was_new_drag = matches!(grab, Grab::New);
         *button = Button::Up;
 
         // A press armed on a control acts only if the release lands on that same control.
@@ -2265,6 +2353,36 @@ impl ScreenshotUi {
             }
             return Some(self.activate(control));
         }
+
+        // The crosshair has no capture button, so the release *is* the shutter — a drag out and
+        // let go, like macOS' Cmd+Shift+4. Window mode takes the click alone, there being nothing
+        // to drag. A bare click in Selection is not a 32px screenshot anyone asked for (see the
+        // inflate below), so it cancels instead.
+        if let Self::Open {
+            quick: Some(_),
+            capture_type,
+            area,
+            ..
+        } = self
+        {
+            // Degenerate by the same measure the inflate below uses: a press and release on one
+            // spot, which is a click, not a rectangle.
+            let size = rect_from_corner_points(area.1, area.2).size;
+            let dragged = !(size.is_empty() || size == Size::from((1, 1)));
+            let up = match capture_type {
+                CaptureType::Window => PointerUp::Capture,
+                _ if was_new_drag && !dragged => PointerUp::Close,
+                _ => PointerUp::Capture,
+            };
+            return Some(up);
+        }
+
+        let Self::Open {
+            area, output_data, ..
+        } = self
+        else {
+            unreachable!("checked open at the top");
+        };
 
         // Check if the resulting selection is zero-sized, and try to come up with a small
         // default rectangle.

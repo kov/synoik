@@ -2391,6 +2391,10 @@ fn adopted_synoik_keybindings() -> Vec<(String, Action, Vec<String>, Option<Dura
             SwitchFocusBetweenFloatingAndTiling,
             "<Super><Shift>g",
         ),
+        // macOS' Cmd+Shift+4, which GNOME has no key for: its screenshot bindings all go through
+        // the picker, and this is the crosshair without one. Its siblings, Cmd+Shift+3 and +5, do
+        // have GNOME keys and are extra accelerators on those (see the `.gschema.override`).
+        key("screenshot-quick", ScreenshotQuick, "<Alt><Shift>4"),
         key(
             "switch-group-current-workspace",
             SwitchGroup {

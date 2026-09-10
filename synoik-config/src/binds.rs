@@ -158,6 +158,9 @@ pub enum Action {
         // Path; not settable from knuffel
         Option<String>,
     ),
+    /// Open the screenshot UI as a bare crosshair — no picker, and the release takes the shot.
+    /// Nothing about the session is remembered, unlike [`Self::Screenshot`].
+    ScreenshotQuick,
     ScreenshotScreen(
         bool,
         bool,
@@ -486,6 +489,7 @@ impl From<synoik_ipc::Action> for Action {
                 Self::DoScreenTransition(delay_ms)
             }
             synoik_ipc::Action::Screenshot { path } => Self::Screenshot(path),
+            synoik_ipc::Action::ScreenshotQuick {} => Self::ScreenshotQuick,
             synoik_ipc::Action::ScreenshotScreen {
                 write_to_disk,
                 show_pointer,

@@ -491,6 +491,12 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set))]
         path: Option<String>,
     },
+    /// Open the screenshot UI as a bare crosshair — no picker, and the release takes the shot.
+    ///
+    /// `screenshot-quick` (`<Alt><Shift>4`), after macOS' Cmd+Shift+4. Unlike
+    /// [`Self::Screenshot`], nothing about the session is remembered: it forces the Selection
+    /// capture type and hands back whatever the picker had before it.
+    ScreenshotQuick {},
     /// Screenshot the focused screen.
     ScreenshotScreen {
         /// Write the screenshot to disk in addition to putting it in your clipboard.

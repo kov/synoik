@@ -212,6 +212,16 @@
       <summary>Move the focus between the floating and tiling layers</summary>
     </key>
 
+    <!-- Screenshots. GNOME's three screenshot keys all go through the picker, so it has
+         nothing to bind for macOS' Cmd+Shift+4: a crosshair over the frozen screen with no
+         picker around it, where the release takes the shot and Space arms the focused
+         window instead. Cmd+Shift+3 and Cmd+Shift+5 do map onto GNOME keys, and are extra
+         accelerators on those rather than keys here. -->
+    <key name="screenshot-quick" type="as">
+      <default>['&lt;Alt&gt;&lt;Shift&gt;4']</default>
+      <summary>Screenshot a region, without the picker</summary>
+    </key>
+
     <!-- Switchers. GNOME gives `switch-group` both &lt;Super&gt;` and &lt;Alt&gt;`, one
          binding on two chords, scoped by org.gnome.shell.app-switcher
          current-workspace-only. We split them: &lt;Super&gt;` stays on GNOME's key and

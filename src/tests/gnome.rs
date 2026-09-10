@@ -27598,6 +27598,17 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
 /// What it does *not* get is pixels: with no texture the panel draws nothing. Any claim about how
 /// something **looks** belongs in `src/tests/vulkan_render.rs`.
 fn open_picker_headless(f: &mut Fixture) {
+    open_picker_headless_maybe_quick(f, false);
+}
+
+/// The same, opened as a `screenshot-quick` crosshair. No panel layout is installed: the live
+/// session skips the bake that produces one, so a test that got a layout here would be able to
+/// click controls that do not exist.
+fn open_quick_picker_headless(f: &mut Fixture) {
+    open_picker_headless_maybe_quick(f, true);
+}
+
+fn open_picker_headless_maybe_quick(f: &mut Fixture, quick: bool) {
     use smithay::backend::allocator::Fourcc;
     use smithay::utils::{Size, Transform};
 
@@ -27659,7 +27670,7 @@ fn open_picker_headless(f: &mut Fixture) {
         .collect();
 
     f.synoik_state()
-        .open_screenshot_ui_with(neutrals, window_shots, None);
+        .open_screenshot_ui_with(neutrals, window_shots, None, quick);
     assert!(
         f.synoik().screenshot_ui.is_open(),
         "the picker must open from hand-built neutrals; a renderer is not what opens it"
@@ -28429,6 +28440,209 @@ fn a_running_area_recording_shades_what_it_leaves_out() {
     // And it stops the moment the recording does.
     f.synoik().cast_area_indicator.clear();
     assert!(shades(&mut f, RenderTarget::Output).is_empty());
+}
+
+/// DIVERGENCE: `screenshot-quick` (`<Alt><Shift>4`) is a crosshair, not the picker.
+///
+/// macOS' Cmd+Shift+4 gives you a crosshair over the frozen screen with no panel at all: drag,
+/// release, and the shot is taken. GNOME has no key for that — all three of its screenshot keys go
+/// through the picker — so this is ours. Its siblings do map onto GNOME keys and are extra
+/// accelerators on those instead (`the_screenshot_keys_come_from_gnome_settings`).
+///
+/// Asserting on the *panel rect* rather than on a screenshot is the point: the whole mechanism is
+/// "skip the bake", and the layout the bake produces is the one hit-test authority, so no panel
+/// rect is exactly "no controls to click".
+#[test]
+fn the_quick_screenshot_is_a_crosshair_with_no_picker_around_it() {
+    use crate::ui::screenshot_ui::CaptureType;
+
+    const KEY_W: u32 = 17;
+    const KEY_S: u32 = 31;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+    let output = f.synoik_output(1);
+
+    // An ordinary picker first, left on a type and a selection that are neither Selection nor the
+    // defaults a fresh `ScreenshotUi` would come up with — so "restored" and "reset" cannot pass
+    // for each other.
+    open_picker_headless_in_selection(&mut f);
+    drag_selection(&mut f, (100, 100), (300, 240));
+    let picked = selection_of(&mut f);
+    f.key_press(KEY_W);
+    f.key_release(KEY_W);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Window);
+    f.synoik_state().cancel_screenshot();
+
+    open_quick_picker_headless(&mut f);
+    assert!(f.synoik().screenshot_ui.is_quick());
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "the crosshair is Selection by definition, whatever the picker last had"
+    );
+    assert!(
+        f.synoik().screenshot_ui.panel_rect(&output).is_none(),
+        "and it has no panel — which is also what leaves it with no controls to click"
+    );
+
+    // Drag something in the crosshair, so the restore has a wrong answer available to it.
+    drag_selection(&mut f, (600, 400), (920, 660));
+    assert_ne!(selection_of(&mut f), picked);
+
+    // Closing must hand back both halves of what it borrowed, or the next ordinary picker comes up
+    // in a mode, or over a region, the user never picked.
+    f.synoik_state().cancel_screenshot();
+    open_picker_headless(&mut f);
+    assert!(!f.synoik().screenshot_ui.is_quick());
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "a quick session is not remembered"
+    );
+    assert!(
+        f.synoik().screenshot_ui.panel_rect(&output).is_some(),
+        "...and the picker still has its panel"
+    );
+
+    f.key_press(KEY_S);
+    f.key_release(KEY_S);
+    assert_eq!(
+        selection_of(&mut f),
+        picked,
+        "...and neither is the region it was dragged over"
+    );
+}
+
+/// In the crosshair, the release *is* the shutter — there is no capture button to click.
+///
+/// A bare click is the case worth pinning: the picker inflates a zero-sized selection to 32x32 so
+/// a stray click still leaves something draggable, and firing the shutter on that would hand the
+/// user a 32px screenshot they did not ask for. It cancels instead.
+#[test]
+fn the_crosshair_captures_on_release_and_cancels_on_a_bare_click() {
+    use smithay::utils::Point;
+
+    use crate::ui::screenshot_ui::PointerUp;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+
+    let output = f.synoik_output(1);
+
+    // A drag out and let go.
+    open_quick_picker_headless(&mut f);
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
+    let from = Point::<i32, smithay::utils::Physical>::from((200, 200));
+    let to = Point::<i32, smithay::utils::Physical>::from((600, 500));
+    ui.pointer_motion(from, None);
+    assert!(ui.pointer_down(output.clone(), from, None, false).is_some());
+    ui.pointer_motion(to, None);
+    assert_eq!(
+        ui.pointer_up(None),
+        Some(PointerUp::Capture),
+        "the release is the shutter"
+    );
+    f.synoik_state().cancel_screenshot();
+
+    // Press and release on one spot, having dragged nothing.
+    open_quick_picker_headless(&mut f);
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
+    ui.pointer_motion(from, None);
+    assert!(ui.pointer_down(output, from, None, false).is_some());
+    assert_eq!(
+        ui.pointer_up(None),
+        Some(PointerUp::Close),
+        "a click is not a 32px screenshot; it backs out"
+    );
+}
+
+/// Space in the crosshair arms the focused window, and again comes back — macOS' Cmd+Shift+4.
+///
+/// It cannot mean what it means in the picker, where Space *is* the capture (`action`,
+/// `js/ui/screenshot.js:2207-2233`): the crosshair has no other way to reach window mode, and
+/// Return is still there for the capture. The single type keys are off with it, `c` in particular:
+/// Screen would take the crosshair out of being one.
+#[test]
+fn space_in_the_crosshair_arms_the_focused_window() {
+    use smithay::input::keyboard::{Keysym, ModifiersState};
+    use smithay::utils::Point;
+
+    use crate::ui::screenshot_ui::{CaptureType, PointerUp};
+
+    const KEY_SPACE: u32 = 57;
+    const KEY_C: u32 = 46;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+    let focused = f.synoik().layout.focus().unwrap().id().get();
+
+    open_quick_picker_headless(&mut f);
+    let tap = |f: &mut Fixture, code| {
+        f.key_press(code);
+        f.key_release(code);
+    };
+
+    tap(&mut f, KEY_SPACE);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "Space arms the window rather than firing the shutter"
+    );
+    assert_eq!(
+        f.synoik().screenshot_ui.selected_window().map(|(_, id)| id),
+        Some(focused),
+        "...the focused one"
+    );
+
+    tap(&mut f, KEY_C);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "`c` is the picker's Screen key and has no business here"
+    );
+
+    tap(&mut f, KEY_SPACE);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "and Space again comes back to the crosshair"
+    );
+
+    // In window mode there is nothing to drag, so the click alone takes it. The selector is an
+    // exposé, so the thumbnail is at the middle of the output rather than where the window is.
+    tap(&mut f, KEY_SPACE);
+    let output = f.synoik_output(1);
+    let scale = output.current_scale().fractional_scale();
+    let slot = f
+        .synoik()
+        .screenshot_ui
+        .window_slot(&output, focused)
+        .expect("the focused window has a thumbnail in the selector");
+    let at: Point<i32, smithay::utils::Physical> = (slot.loc
+        + Point::from((slot.size.w / 2., slot.size.h / 2.)))
+    .to_physical_precise_round(scale);
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
+    ui.pointer_motion(at, None);
+    assert!(
+        ui.pointer_down(output, at, None, false).is_some(),
+        "a press on the thumbnail picks that window"
+    );
+    assert_eq!(ui.pointer_up(None), Some(PointerUp::Capture));
+
+    // And Return does the same without the pointer.
+    assert!(matches!(
+        f.synoik()
+            .screenshot_ui
+            .action(Keysym::Return, ModifiersState::default()),
+        Some(Action::ConfirmScreenshot { .. })
+    ));
 }
 
 /// Single keys drive the type row and the shot/cast pill, so the picker is usable without the

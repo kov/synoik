@@ -4502,6 +4502,16 @@ impl State {
     }
 
     pub fn open_screenshot_ui(&mut self, path: Option<String>) {
+        self.open_screenshot_ui_maybe_quick(path, false);
+    }
+
+    /// `screenshot-quick` (`<Alt><Shift>4`) — macOS' Cmd+Shift+4: a crosshair over the frozen
+    /// screen with no picker around it, where the release takes the shot.
+    pub fn open_screenshot_ui_quick(&mut self) {
+        self.open_screenshot_ui_maybe_quick(None, true);
+    }
+
+    fn open_screenshot_ui_maybe_quick(&mut self, path: Option<String>, quick: bool) {
         if self.synoik.is_locked() || self.synoik.screenshot_ui.is_open() {
             return;
         }
@@ -4520,7 +4530,7 @@ impl State {
             .with_vulkan_renderer(|vk| self.synoik.capture_screenshot_window_neutrals(vk))
             .unwrap_or_default();
 
-        self.open_screenshot_ui_with(vk_neutrals, window_shots, path);
+        self.open_screenshot_ui_with(vk_neutrals, window_shots, path, quick);
     }
 
     /// Open the picker around neutrals that have **already been captured**.
@@ -4534,6 +4544,7 @@ impl State {
         vk_neutrals: std::collections::HashMap<Output, [ScreenshotNeutral; RenderTarget::COUNT]>,
         window_shots: std::collections::HashMap<Output, Vec<crate::ui::screenshot_ui::WindowShot>>,
         path: Option<String>,
+        quick: bool,
     ) {
         let default_output = self
             .synoik
@@ -4564,6 +4575,7 @@ impl State {
             default_output,
             focused_window,
             path,
+            quick,
         );
 
         // Selection is the mode it opens in, so the crosshair is right — and it is all we can say

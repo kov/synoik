@@ -151,8 +151,8 @@ Three divergences from upstream have been found:
 `org.gnome.shell-rs.keybindings`, path `/org/gnome/shell-rs/keybindings/`, source in
 `resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml` — the scrolling-window-manager actions
 GNOME has no key for: column focus and movement, monitor focus, consume/expel, the preset
-width and height cycles, centring, tabbed display, floating, the session keys, and
-`switch-group-current-workspace(-backward)`.
+width and height cycles, centring, tabbed display, floating, the session keys,
+`screenshot-quick` and `switch-group-current-workspace(-backward)`.
 
 `switch-group-current-workspace` is the one key here that is not a scrolling-layout action.
 GNOME puts both `<Super>Above_Tab` and `<Alt>Above_Tab` on `switch-group`, one binding on two
