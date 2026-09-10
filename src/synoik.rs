@@ -12668,6 +12668,8 @@ impl Synoik {
         }
 
         if res == RenderResult::Skipped {
+            self.frame_log.skipped();
+
             // Update the redraw state on failed render.
             state.redraw_state = if let RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) =

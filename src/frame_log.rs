@@ -962,7 +962,14 @@ const CADENCE_MAX: usize = 4;
 /// Rolling per-output tallies, reset every time a summary is emitted.
 #[derive(Debug, Default)]
 struct Stats {
+    /// Every redraw that ran, whether or not it drew anything. The percentiles are over these.
     frames: u64,
+    /// Of [`Self::frames`], those that found nothing to draw and handed nothing to the display.
+    skipped: u64,
+    /// Presentations the display reported back — what reached the screen, and what the
+    /// summary's `fps` is. A client committing without damage every vblank makes `frames`
+    /// run at the refresh rate while this stays at the content's rate.
+    flips: u64,
     /// Every frame's total, kept so the summary can report percentiles rather
     /// than just a mean — a stutter is a tail event and a mean hides it.
     totals: Vec<Duration>,
@@ -1060,6 +1067,9 @@ struct InFlight {
     shaded_by_site_at_start: [u64; synoik_vk::stats::DrawSite::ALL.len()],
     blitted_by_site_at_start: [u64; synoik_vk::stats::BlitSite::ALL.len()],
     context: FrameContext,
+    /// The redraw found nothing to draw and handed nothing to the display. See
+    /// [`FrameLog::skipped`].
+    skipped: bool,
 }
 
 /// What a finished frame cost, beyond its per-phase wall clock: the counters and
@@ -2547,7 +2557,16 @@ impl FrameLog {
             shaded_by_site_at_start: synoik_vk::stats::shaded_by_site(),
             blitted_by_site_at_start: synoik_vk::stats::blitted_by_site(),
             context: FrameContext::default(),
+            skipped: false,
         });
+    }
+
+    /// Mark the frame in flight as a redraw that drew nothing (no damage), so the summary can
+    /// count it apart from the ones that reached the screen.
+    pub fn skipped(&mut self) {
+        if let Some(frame) = self.in_flight.as_mut() {
+            frame.skipped = true;
+        }
     }
 
     /// Close the running phase (if any) and open `phase`. Everything between two
@@ -2755,10 +2774,9 @@ impl FrameLog {
         life.over_budget += u64::from(over);
         life.worst = life.worst.max(cost);
 
-        self.stats
-            .entry(frame.output)
-            .or_default()
-            .record(cost, over, totals.gpu, totals.gpu_lost);
+        let stats = self.stats.entry(frame.output).or_default();
+        stats.skipped += u64::from(frame.skipped);
+        stats.record(cost, over, totals.gpu, totals.gpu_lost);
     }
 
     fn format_frame(
@@ -3076,6 +3094,8 @@ impl FrameLog {
         // output the next `end` can be a second away. The flip is the other thing that happens, and
         // it happens *after* the submit it waited on — so by here the samples have landed.
         self.flush_parked(settings);
+
+        self.stats.entry(output.to_owned()).or_default().flips += 1;
 
         // Only the frame that was built for this target: on a miss the next
         // frame's queue overwrites the entry, and pairing a late presentation
@@ -3411,7 +3431,10 @@ impl FrameLog {
             sorted.sort_unstable();
             let p50 = Stats::percentile(&sorted, 50.);
             let p95 = Stats::percentile(&sorted, 95.);
-            let fps = stats.frames as f64 / elapsed.as_secs_f64();
+            let secs = elapsed.as_secs_f64();
+            let fps = stats.flips as f64 / secs;
+            let redraws = stats.frames as f64 / secs;
+            let skips = stats.skipped as f64 / secs;
 
             let gpu = match (stats.gpu_total.is_zero(), stats.gpu_lost) {
                 (true, 0) => String::new(),
@@ -3455,10 +3478,12 @@ impl FrameLog {
             let aim = histogram_clause("aim", &stats.aim);
 
             let line = format!(
-                "{output}: {:.1} fps over {}, p50 {}, p95 {}, worst {}, {} over budget, \
-                 {} dropped{gpu}{headroom}{cadence}{aim}",
+                "{output}: {:.1} fps over {} ({:.1} redraws/s, {:.1} skips/s), p50 {}, p95 {}, \
+                 worst {}, {} over budget, {} dropped{gpu}{headroom}{cadence}{aim}",
                 fps,
                 ms(elapsed),
+                redraws,
+                skips,
                 ms(p50),
                 ms(p95),
                 ms(stats.worst),
@@ -3996,6 +4021,7 @@ mod tests {
             shaded_by_site_at_start: [0; synoik_vk::stats::DrawSite::ALL.len()],
             blitted_by_site_at_start: [0; synoik_vk::stats::BlitSite::ALL.len()],
             context: FrameContext::default(),
+            skipped: false,
         }
     }
 
@@ -5263,6 +5289,48 @@ mod tests {
             "a six-cycle gap saturates into the last bucket rather than being lost"
         );
         assert_eq!(cadence[0], 0, "nothing landed inside a single cycle");
+    }
+
+    /// Redraws, skips and flips are three different counts. A client committing without damage
+    /// every vblank runs redraws at the refresh rate while the screen flips at the content's rate,
+    /// and a summary that called redraws "fps" reported 152 fps on a 120Hz display.
+    #[test]
+    fn redraws_skips_and_flips_are_counted_apart() {
+        let refresh = Duration::from_micros(8333);
+        let mut log = FrameLog {
+            parked: VecDeque::new(),
+            dump_override: None,
+            ring: VecDeque::new(),
+            dumps: 0,
+            settings: Some(Settings::default()),
+            in_flight: None,
+            stats: HashMap::new(),
+            queued: HashMap::new(),
+            last_presented: HashMap::new(),
+            last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
+            loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
+            lifetime: HashMap::new(),
+        };
+
+        let base = Duration::from_secs(100);
+        for i in 0..4 {
+            log.begin("out");
+            if i % 2 == 1 {
+                log.skipped();
+            } else {
+                let at = base + refresh * i;
+                log.presented("out", at, at, Some(refresh));
+            }
+            log.end(Some(refresh));
+        }
+
+        let stats = &log.stats["out"];
+        assert_eq!(stats.frames, 4, "every redraw counts");
+        assert_eq!(stats.skipped, 2, "only the marked redraws are skips");
+        assert_eq!(stats.flips, 2, "only presentations are flips");
     }
 
     /// The `aim` histogram must be blind to whether the frame it describes missed — that is the
