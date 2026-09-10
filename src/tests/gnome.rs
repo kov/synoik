@@ -28577,18 +28577,32 @@ fn the_screenshot_keys_come_from_gnome_settings() {
         .collect();
     assert_eq!(adopted.len(), 4, "all four keys adopted, got {adopted:?}");
 
-    // ...with GNOME's own accelerators, and mapped to the actions those keys mean.
-    let screenshot_accels = f
-        .synoik()
-        .gnome_settings
-        .keybindings
-        .iter()
-        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::Screenshot))
-        .map(|kb| kb.accels.len())
-        .expect("adopted");
+    // ...with GNOME's accelerators plus the macOS twin we add to each (DIVERGENCE): a laptop
+    // keyboard with no Print key cannot reach either of these otherwise.
+    let mut accels_for = |action| {
+        f.synoik()
+            .gnome_settings
+            .keybindings
+            .iter()
+            .find(|kb| kb.action.gnome() == Some(action))
+            .map(|kb| kb.accels.clone())
+            .expect("adopted")
+    };
     assert_eq!(
-        screenshot_accels, 1,
-        "<Shift>Print, from GNOME's own default — plain Print opens the picker"
+        accels_for(GnomeKeyAction::Screenshot),
+        crate::gnome::parse_accels(
+            "screenshot",
+            vec!["<Shift>Print".to_owned(), "<Alt><Shift>3".to_owned()]
+        ),
+        "GNOME's <Shift>Print, and macOS' Cmd+Shift+3 as Alt+Shift+3"
+    );
+    assert_eq!(
+        accels_for(GnomeKeyAction::ShowScreenshotUi),
+        crate::gnome::parse_accels(
+            "show-screenshot-ui",
+            vec!["Print".to_owned(), "<Alt><Shift>5".to_owned()]
+        ),
+        "GNOME's plain Print, and macOS' Cmd+Shift+5 as Alt+Shift+5"
     );
 
     use crate::input::action_for_gnome;

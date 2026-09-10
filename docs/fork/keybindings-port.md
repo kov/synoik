@@ -323,9 +323,15 @@ Two groups:
   *application* switcher; we ship Alt+Tab as the *window* switcher and leave `<Super>Tab` to
   the applications. It also takes `<Alt>Above_Tab` off `switch-group`, leaving it `<Super>`-only,
   so that chord is free for `org.synoik.keybindings switch-group-current-workspace`.
-  `override_matches_the_tables` checks every key in this group against
+  `override_matches_the_tables` checks every key in these groups against
   `adopted_wm_keybindings()`, because the tables are what the conformance corpus runs on: a
   divergence written in one and not the other is a session that behaves unlike every test.
+- `org.gnome.shell.keybindings` — the screenshot chords. GNOME reaches `show-screenshot-ui` and
+  `screenshot` through `Print` and `<Shift>Print` alone, which a laptop keyboard without a Print
+  key cannot press at all. Each keeps its Print chord and gains its macOS twin — `<Alt><Shift>5`
+  and `<Alt><Shift>3`, from Cmd+Shift+5 and Cmd+Shift+3. macOS' Cmd+Shift+4 has no GNOME
+  equivalent to bind (it is a crosshair with no picker), so it is `screenshot-quick` in our own
+  schema.
 - `org.gnome.mutter` — *not* a divergence. These five are what gnome-shell's own override sets
   for a GNOME session, and shadowing `org.gnome.mutter` with our copy would otherwise drop
   them back to mutter's raw defaults.

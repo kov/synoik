@@ -41,3 +41,12 @@ edge-tiling=true
 dynamic-workspaces=true
 workspaces-only-on-primary=true
 focus-change-on-pointer-rest=true
+
+# DIVERGENCE (deliberate). GNOME reaches the screenshot keys through Print alone,
+# which a laptop keyboard without one cannot press at all. Each keeps its Print
+# chord and gains its macOS twin — Cmd+Shift+3/4/5 there is screen, region,
+# picker. Region is `screenshot-quick` in org.synoik.keybindings, since GNOME has
+# no crosshair-without-the-picker to bind.
+[org.gnome.shell.keybindings]
+show-screenshot-ui=['Print', '<Alt><Shift>5']
+screenshot=['<Shift>Print', '<Alt><Shift>3']

@@ -1555,7 +1555,7 @@ fn default_keybindings() -> Vec<GnomeKeybinding> {
 /// Parse a settings key's accelerator array, mirroring mutter's
 /// `update_binding`: an invalid entry is warned about and skipped without
 /// poisoning the valid rest, and disabled entries simply don't bind.
-fn parse_accels(key: &str, values: impl IntoIterator<Item = String>) -> Vec<Accel> {
+pub(crate) fn parse_accels(key: &str, values: impl IntoIterator<Item = String>) -> Vec<Accel> {
     let mut accels = Vec::new();
     for value in values {
         match parse_accelerator(&value) {
@@ -2105,15 +2105,20 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             vec!["<Super>s".to_owned()],
         ),
         // Print opens the picker; Shift+Print is the one that goes straight to a file.
+        //
+        // DIVERGENCE (deliberate, ours): each also gets its macOS chord, because a laptop
+        // keyboard without a Print key otherwise has no way to reach either. macOS is
+        // Cmd+Shift+3/4/5 — screen, region, picker — so ours is Alt+Shift+3/4/5 with 4 in our
+        // own schema (`screenshot-quick`, which GNOME has no equivalent for).
         (
             "show-screenshot-ui".to_owned(),
             GnomeKeyAction::ShowScreenshotUi,
-            vec!["Print".to_owned()],
+            vec!["Print".to_owned(), "<Alt><Shift>5".to_owned()],
         ),
         (
             "screenshot".to_owned(),
             GnomeKeyAction::Screenshot,
-            vec!["<Shift>Print".to_owned()],
+            vec!["<Shift>Print".to_owned(), "<Alt><Shift>3".to_owned()],
         ),
         (
             "screenshot-window".to_owned(),
@@ -3843,16 +3848,23 @@ mod tests {
         rv
     }
 
-    /// The `[org.gnome.desktop.wm.keybindings]` group of `synoik.gschema.override`, as
-    /// `(key, accelerators)`.
+    /// The keybinding groups of `synoik.gschema.override`, as `(schema, key, accelerators)`.
     ///
     /// What a session actually runs is the vendored schema *composed with* this file, so any
     /// test that asks "what does GNOME ship on this chord" has to compose them too — a key we
     /// override to release a chord still has upstream's value in the XML.
-    fn override_wm_keybindings() -> Vec<(String, Vec<String>)> {
+    ///
+    /// Only the groups whose keys are *keybindings* are returned: the `org.gnome.mutter` group
+    /// carries settings that are not accelerators at all.
+    fn override_keybindings() -> Vec<(&'static str, String, Vec<String>)> {
+        const KEYBINDING_GROUPS: [&str; 2] = [
+            "org.gnome.desktop.wm.keybindings",
+            "org.gnome.shell.keybindings",
+        ];
+
         let text = include_str!("../resources/schemas/synoik.gschema.override");
 
-        let mut group = "";
+        let mut group = None;
         let mut rv = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -3860,15 +3872,12 @@ mod tests {
                 continue;
             }
             if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                group = match name {
-                    "org.gnome.desktop.wm.keybindings" => name,
-                    _ => "",
-                };
+                group = KEYBINDING_GROUPS.into_iter().find(|g| *g == name);
                 continue;
             }
-            if group.is_empty() {
+            let Some(group) = group else {
                 continue;
-            }
+            };
 
             let (key, value) = line.split_once('=').expect("a key line is key=value");
             let accels = value
@@ -3879,7 +3888,7 @@ mod tests {
                 .map(|s| s.trim().trim_matches('\'').to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
-            rv.push((key.to_owned(), accels));
+            rv.push((group, key.to_owned(), accels));
         }
         rv
     }
@@ -3920,28 +3929,28 @@ mod tests {
         // What ships is the vendored schema composed with our override, so an overridden key
         // contributes the chords *we* give it, not upstream's. Without this, releasing a chord
         // for one of our own keys reads as a collision with the value we just replaced.
-        let overridden = override_wm_keybindings();
+        let overridden = override_keybindings();
 
         let mut theirs: Vec<(Accel, String)> = Vec::new();
         let mut sources = 0;
         let mut add = |schema: &str, xml: &str, sources: &mut usize| {
             *sources += 1;
-            let is_wm = schema == "org.gnome.desktop.wm.keybindings";
             for (key, accel) in schema_default_accels(xml) {
                 // The override replaces the key wholesale, so skip upstream's rows for it and
                 // add ours once, below.
-                if is_wm && overridden.iter().any(|(name, _)| *name == key) {
+                if overridden
+                    .iter()
+                    .any(|(g, name, _)| *g == schema && *name == key)
+                {
                     continue;
                 }
                 for parsed in parse_accels(&key, vec![accel]) {
                     theirs.push((parsed, format!("{schema} {key}")));
                 }
             }
-            if is_wm {
-                for (key, accels) in &overridden {
-                    for parsed in parse_accels(key, accels.clone()) {
-                        theirs.push((parsed, format!("{schema} {key}")));
-                    }
+            for (_, key, accels) in overridden.iter().filter(|(g, ..)| *g == schema) {
+                for parsed in parse_accels(key, accels.clone()) {
+                    theirs.push((parsed, format!("{schema} {key}")));
                 }
             }
         };
@@ -4126,14 +4135,22 @@ mod tests {
     /// group carries settings we do not read as keybindings.
     #[test]
     fn override_matches_the_tables() {
-        let overridden = override_wm_keybindings();
+        let overridden = override_keybindings();
         assert!(
             !overridden.is_empty(),
             "the override parser matched nothing at all"
         );
 
-        for (key, want) in overridden {
-            let got = adopted_wm_keybindings()
+        for (schema, key, want) in overridden {
+            // Each group against the table that mirrors it — an unrecognized group would
+            // otherwise be parsed and then checked against nothing.
+            let table = match schema {
+                "org.gnome.desktop.wm.keybindings" => adopted_wm_keybindings(),
+                "org.gnome.shell.keybindings" => adopted_shell_keybindings(),
+                _ => panic!("{schema} is a keybinding group with no table to check it against"),
+            };
+
+            let got = table
                 .into_iter()
                 .find(|(name, ..)| *name == key)
                 .unwrap_or_else(|| panic!("the override sets {key}, which no table names"))
@@ -4141,7 +4158,7 @@ mod tests {
 
             assert_eq!(
                 got, want,
-                "org.gnome.desktop.wm.keybindings {key} differs between the override and the table"
+                "{schema} {key} differs between the override and the table"
             );
         }
     }
