@@ -26078,6 +26078,88 @@ fn switch_group_walks_the_current_apps_windows_as_a_window_switcher() {
     f.key_release(KEY_LEFTSHIFT);
 }
 
+/// DIVERGENCE: Alt+` and Super+` are the same list at two workspace scopes.
+///
+/// Upstream puts both chords on `switch-group`, so they are one binding twice
+/// (`org.gnome.desktop.wm.keybindings`) scoped by `org.gnome.shell.app-switcher
+/// current-workspace-only`. We keep Super+` on that key — which, at the setting's default of
+/// false, spans workspaces — and give Alt+` to `switch-group-current-workspace` in
+/// `org.synoik.keybindings`, which pins the scope instead of reading it.
+///
+/// The two-window/two-workspace shape is the whole point: with everything on one workspace the
+/// scopes are indistinguishable and the test would pass on a binding that ignored it.
+#[test]
+fn alt_above_tab_switches_the_apps_windows_on_this_workspace_only() {
+    const KEY_GRAVE: u32 = 41;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+
+    let client = f.add_client();
+    // Three windows of one app: two here, one parked on the workspace below.
+    map_window_for_app(&mut f, client, "org.example.One");
+    let away = f.synoik().layout.focus().unwrap().id();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    // The move takes the focus with it, so come back before mapping the other two here.
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.synoik().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.synoik().layout.focus().unwrap().id();
+    f.settle();
+
+    // Super + the key above Tab: GNOME's key, spanning workspaces.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_GRAVE);
+    assert_eq!(
+        f.synoik().switcher.item_count(),
+        Some(3),
+        "Super+` spans workspaces, so the parked window is in the list"
+    );
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    f.double_roundtrip(client);
+    // Committed onto `a`; put the focus back on `b` so both arms start from the same place.
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), a);
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_GRAVE);
+    assert!(
+        f.synoik().switcher.is_open(),
+        "Alt+` raises the switcher too — it is a key of ours, and the popup is the same one"
+    );
+    assert_eq!(
+        f.synoik().switcher.item_count(),
+        Some(2),
+        "...over this workspace's windows of the app alone"
+    );
+    assert_eq!(
+        f.synoik().switcher.selected(),
+        Some(1),
+        "starting on the second, like every other switcher"
+    );
+
+    // A second tap advances the list rather than falling through: the popup is modal, and our
+    // own key has to keep resolving through its grab.
+    tap(&mut f, KEY_GRAVE);
+    assert_eq!(
+        f.synoik().switcher.selected(),
+        Some(0),
+        "a second Alt+` wraps around the two-item list, not dies at the grab"
+    );
+
+    f.key_release(KEY_LEFTALT);
+    f.settle();
+    f.double_roundtrip(client);
+    let focused = f.synoik().layout.focus().unwrap().id();
+    assert_eq!(focused, a, "committed to the window it had picked");
+    assert_ne!(focused, b, "not the one it started on");
+    assert_ne!(focused, away, "and never to the one on the other workspace");
+}
+
 /// `cycle-windows` (`<Alt>Escape`) walks the same window list with **no popup at all**.
 ///
 /// `WindowCyclerPopup` (`altTab.js:638-667`) extends `CyclerPopup`, whose `_switcherList` is a

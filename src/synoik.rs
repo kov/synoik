@@ -3015,7 +3015,11 @@ impl State {
     /// title, no app row — because every item in this session belongs to one app by construction,
     /// and the row above them names it once and then just sits there. Recorded in
     /// `docs/fork/alt-tab-port.md`.
-    pub fn switch_group(&mut self, backward: bool) {
+    ///
+    /// `current_workspace_only` overrides the setting the GNOME key reads: `None` is
+    /// `switch-group` itself, `Some` is our `switch-group-current-workspace` (`<Alt>Above_Tab`),
+    /// which pins the list to this workspace while Super+` keeps spanning them.
+    pub fn switch_group(&mut self, backward: bool, current_workspace_only: Option<bool>) {
         if self.synoik.switcher.is_open() {
             let now = self.synoik.clock.now_unadjusted();
             let outcome = self
@@ -3029,12 +3033,14 @@ impl State {
         }
 
         // `switch-group` spans workspaces like the app switcher whose setting it reads — the same
-        // key `GroupCyclerPopup` reads for its own list (`altTab.js:557-570`).
-        let only_here = self
-            .synoik
-            .gnome_settings
-            .switchers
-            .apps_current_workspace_only;
+        // key `GroupCyclerPopup` reads for its own list (`altTab.js:557-570`). Our
+        // `switch-group-current-workspace` says so outright instead.
+        let only_here = current_workspace_only.unwrap_or(
+            self.synoik
+                .gnome_settings
+                .switchers
+                .apps_current_workspace_only,
+        );
         let tab_list = self.synoik.switcher_tab_list(only_here);
 
         // The focused app's windows, in tab-list order — `focus_app.get_windows()`.

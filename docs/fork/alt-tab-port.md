@@ -13,7 +13,7 @@ session's defaults (read live from `org.gnome.desktop.wm.keybindings`) are:
 | --- | --- | --- | --- |
 | `<Super>Tab` | `switch-applications` | `AppSwitcherPopup` | one item per **app**, 96px icons |
 | `<Alt>Tab` | `switch-windows` | `WindowSwitcherPopup` | one item per **window**, 128px preview + 48px app icon |
-| `<Alt>Above_Tab`, `<Super>Above_Tab` | `switch-group` | `AppSwitcherPopup` | same popup, opened *within the current app* |
+| `<Alt>Above_Tab`, `<Super>Above_Tab` | `switch-group` | `AppSwitcherPopup` | same popup, opened *within the current app* (we split these two — see divergence 2b) |
 | `<Alt>Escape` | `cycle-windows` | `WindowCyclerPopup` | **no list** — highlights each window in place |
 | `<Alt>F6` | `cycle-group` | `GroupCyclerPopup` | ditto, within the current app |
 
@@ -233,8 +233,8 @@ would be a third timer interacting with two others for a case we have not seen m
 against a real complaint.
 
 **Slice 4 (`switch-group`) landed 2026-08-01.** `switch-group` / `switch-group-backward` are now
-adopted from `org.gnome.desktop.wm.keybindings` with GNOME's own defaults
-(`<Super>Above_Tab` / `<Alt>Above_Tab`, plus the `<Shift>` twins), and `Above_Tab` parses to the
+adopted from `org.gnome.desktop.wm.keybindings`, on `<Super>Above_Tab` and its `<Shift>` twin
+(GNOME also gives them `<Alt>Above_Tab`; that chord is ours — divergence 2b), and `Above_Tab` parses to the
 `KEY_GRAVE + 8` **keycode** — see the correction at the top of this doc; there is no per-layout
 resolution left to do. It opens the same `AppSwitcherPopup` on the same full app list — you can
 still tab out of the group — differing only in `_initialSelection`: app 0 (the app you are in)
@@ -394,6 +394,24 @@ Side effect, intended: because the rewrite matches on `Items::Windows`, pressing
 an *Alt-Tab* popup is up now advances that list too, where GNOME ignores it there. Both popups are
 window lists at that point and the key means "next window" in one of them, so making it mean
 nothing in the other is a distinction without a difference.
+
+### 2b. DIVERGENCE: Above_Tab's two chords are two workspace scopes
+
+GNOME gives `switch-group` both `<Super>Above_Tab` and `<Alt>Above_Tab` — one binding on two
+chords, so the second is redundant — and scopes its list with
+`org.gnome.shell.app-switcher current-workspace-only` (default false, i.e. spanning). We spend the
+spare chord: Super+` keeps GNOME's key and its setting, Alt+` is
+`org.synoik.keybindings switch-group-current-workspace`, the same popup over the same app pinned
+to this workspace.
+
+The scope rides the action (`SwitchGroup { backward, current_workspace_only: Option<bool> }`,
+`None` = read the setting), because a pinned scope has nowhere to live on GNOME's own key. The
+override takes `<Alt>Above_Tab` off `switch-group` so the chord is free; see
+`docs/fork/keybindings-port.md`.
+
+While a popup is up the binding gate is on the resolved `Action` rather than on the key's schema,
+so this key of ours advances an open list like GNOME's does. Pinned by
+`alt_above_tab_switches_the_apps_windows_on_this_workspace_only`.
 
 ### 3. DIVERGENCE: every switcher previews what it would raise
 

@@ -212,6 +212,21 @@
       <summary>Move the focus between the floating and tiling layers</summary>
     </key>
 
+    <!-- Switchers. GNOME gives `switch-group` both &lt;Super&gt;` and &lt;Alt&gt;`, one
+         binding on two chords, scoped by org.gnome.shell.app-switcher
+         current-workspace-only. We split them: &lt;Super&gt;` stays on GNOME's key and
+         follows that setting, and &lt;Alt&gt;` is this one, always the current workspace.
+         Same list, same popup — only the scope differs, and it is pinned here rather
+         than read, which is why it needs a key of its own. -->
+    <key name="switch-group-current-workspace" type="as">
+      <default>['&lt;Alt&gt;Above_Tab']</default>
+      <summary>Switch windows of the current app on this workspace</summary>
+    </key>
+    <key name="switch-group-current-workspace-backward" type="as">
+      <default>['&lt;Shift&gt;&lt;Alt&gt;Above_Tab']</default>
+      <summary>Switch windows of the current app on this workspace, backward</summary>
+    </key>
+
     <!-- Shell UI. GNOME has no emoji picker of its own; the chord is macOS's,
          and it shadows emacs' mark-sexp, which is why it is rebindable. -->
     <key name="emoji-picker" type="as">

@@ -24,6 +24,14 @@ switch-applications-backward=['<Shift><Super>Tab']
 switch-windows=['<Alt>Tab']
 switch-windows-backward=['<Alt><Shift>Tab']
 
+# DIVERGENCE (deliberate). Upstream gives switch-group both <Super>Above_Tab and
+# <Alt>Above_Tab. We keep Super+` here — spanning workspaces, as
+# org.gnome.shell.app-switcher current-workspace-only defaults — and hand Alt+`
+# to org.synoik.keybindings switch-group-current-workspace, which pins the same
+# list to this workspace.
+switch-group=['<Super>Above_Tab']
+switch-group-backward=['<Shift><Super>Above_Tab']
+
 # Not a divergence: these are the defaults gnome-shell's own override sets for a
 # GNOME session, which we would otherwise lose by shadowing org.gnome.mutter
 # with our vendored copy. Kept verbatim from 00_org.gnome.shell.gschema.override.

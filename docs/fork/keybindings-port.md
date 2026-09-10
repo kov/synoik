@@ -151,7 +151,21 @@ Three divergences from upstream have been found:
 `org.gnome.shell-rs.keybindings`, path `/org/gnome/shell-rs/keybindings/`, source in
 `resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml` — the scrolling-window-manager actions
 GNOME has no key for: column focus and movement, monitor focus, consume/expel, the preset
-width and height cycles, centring, tabbed display, floating, and the session keys.
+width and height cycles, centring, tabbed display, floating, the session keys, and
+`switch-group-current-workspace(-backward)`.
+
+`switch-group-current-workspace` is the one key here that is not a scrolling-layout action.
+GNOME puts both `<Super>Above_Tab` and `<Alt>Above_Tab` on `switch-group`, one binding on two
+chords, scoped by `org.gnome.shell.app-switcher current-workspace-only`. We split them: Super+`
+stays on GNOME's key and follows that setting, Alt+` is ours and pins the scope to this
+workspace. A pinned scope has nowhere to live on GNOME's key, which is why it needs one of its
+own — the action is the same `SwitchGroup`, carrying `current_workspace_only: Option<bool>`
+(`None` = read the setting).
+
+Keys of ours normally lose to everything GNOME defines, and one of them is *modal*: while a
+switcher popup holds its grab, only switcher actions keep resolving. That gate is on the
+resolved `Action`, not on which schema the key came from (`SwitcherGrab::resolves`), so a
+second Alt+` advances the list instead of dying at the grab.
 
 `GnomeKeybinding.action` is a `KeybindingAction { Gnome(GnomeKeyAction), Synoik(Action) }` rather
 than a `GnomeKeyAction` grown into a mirror of niri's ~200 actions. `read_keybinding_table` is
@@ -178,7 +192,9 @@ Three unit tests keep it honest, each covering a failure that is otherwise silen
   collision would leave a settings key that changes nothing, which is worse than one that
   isn't there.
 - `synoik_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
-  *default* in the vendored schemas plus gnome-settings-daemon's media keys, adopted or not.
+  *default* in the vendored schemas **composed with the override**, plus gnome-settings-daemon's
+  media keys, adopted or not. Composing matters: what ships is the pair, so a chord we release by
+  overriding a GNOME key still reads as taken if only the vendored XML is consulted.
   The narrower test above has two blind spots and both were real: a GNOME key deferred at the
   time still shipped a default (`begin-move` = `<Alt>F7`), and **gsd's keys are in no
   table of ours at all** (`screensaver` = `<Super>l`). Comparison goes through
@@ -305,7 +321,9 @@ Two groups:
 - `org.gnome.desktop.wm.keybindings` — the Alt+Tab divergence. Upstream leaves `switch-windows`
   empty and gives `<Alt>Tab` to `switch-applications`, so a stock GNOME Alt+Tab is the
   *application* switcher; we ship Alt+Tab as the *window* switcher and leave `<Super>Tab` to
-  the applications. `override_matches_the_tables` checks every key in this group against
+  the applications. It also takes `<Alt>Above_Tab` off `switch-group`, leaving it `<Super>`-only,
+  so that chord is free for `org.synoik.keybindings switch-group-current-workspace`.
+  `override_matches_the_tables` checks every key in this group against
   `adopted_wm_keybindings()`, because the tables are what the conformance corpus runs on: a
   divergence written in one and not the other is a session that behaves unlike every test.
 - `org.gnome.mutter` — *not* a divergence. These five are what gnome-shell's own override sets

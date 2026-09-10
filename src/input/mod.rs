@@ -5928,8 +5928,11 @@ impl State {
             Action::SwitchApplications { backward } => {
                 self.switch_applications(backward);
             }
-            Action::SwitchGroup { backward } => {
-                self.switch_group(backward);
+            Action::SwitchGroup {
+                backward,
+                current_workspace_only,
+            } => {
+                self.switch_group(backward, current_workspace_only);
             }
             Action::SwitchWindows { backward } => {
                 self.switch_windows(backward);
@@ -11122,21 +11125,26 @@ impl SwitcherGrab {
         self != SwitcherGrab::Closed
     }
 
-    /// Whether a GNOME action still resolves as a binding while this popup is up.
-    fn resolves(self, action: GnomeKeyAction) -> bool {
+    /// Whether a binding still resolves while this popup is up.
+    ///
+    /// Gated on the compositor action rather than on which schema the key came from: the
+    /// popup is modal, so what may resolve is "a switcher action", and one of them
+    /// (`switch-group-current-workspace`) is a key of ours. Everything else falls through to
+    /// the popup's own keysym handling.
+    fn resolves(self, action: &Action) -> bool {
         match self {
             SwitcherGrab::Closed => true,
             SwitcherGrab::Popup => matches!(
                 action,
-                GnomeKeyAction::SwitchWindows { .. }
-                    | GnomeKeyAction::SwitchApplications { .. }
-                    | GnomeKeyAction::SwitchGroup { .. }
+                Action::SwitchWindows { .. }
+                    | Action::SwitchApplications { .. }
+                    | Action::SwitchGroup { .. }
             ),
             SwitcherGrab::Cycler { group: false } => {
-                matches!(action, GnomeKeyAction::CycleWindows { .. })
+                matches!(action, Action::CycleWindows { .. })
             }
             SwitcherGrab::Cycler { group: true } => {
-                matches!(action, GnomeKeyAction::CycleGroup { .. })
+                matches!(action, Action::CycleGroup { .. })
             }
         }
     }
@@ -11402,18 +11410,16 @@ fn find_gnome_bind(
                 .any(|accel| accel_matches(accel, key_code, raw, mods))
     })?;
 
+    let action = action_for_keybinding(&keybinding.action)?;
+
     // The switcher is modal (GNOME holds a grab while it's up; niri disables the general binds):
     // only the actions the popup that is up actually matches keep resolving, so further taps
-    // continue cycling and everything else falls through to the popup's keysym handling. Our
-    // own actions never resolve through it — the popup owns the keyboard.
-    let gnome = keybinding.action.gnome();
-    match gnome {
-        Some(action) if !switcher.resolves(action) => return None,
-        None if switcher.is_open() => return None,
-        _ => {}
+    // continue cycling and everything else falls through to the popup's keysym handling.
+    if !switcher.resolves(&action) {
+        return None;
     }
 
-    let action = action_for_keybinding(&keybinding.action)?;
+    let gnome = keybinding.action.gnome();
 
     // Mutter flags the workspace switches META_KEY_BINDING_IGNORE_AUTOREPEAT.
     let repeat = !matches!(
@@ -11636,7 +11642,10 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::MoveToWorkspaceNext => Action::MoveWindowToWorkspaceDown(true),
         GnomeKeyAction::SwitchWindows { backward } => Action::SwitchWindows { backward },
         GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
-        GnomeKeyAction::SwitchGroup { backward } => Action::SwitchGroup { backward },
+        GnomeKeyAction::SwitchGroup { backward } => Action::SwitchGroup {
+            backward,
+            current_workspace_only: None,
+        },
         GnomeKeyAction::CycleWindows { backward } => Action::CycleWindows { backward },
         GnomeKeyAction::CycleGroup { backward } => Action::CycleGroup { backward },
     })

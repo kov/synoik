@@ -1416,15 +1416,20 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             SwitchWindows { backward: true },
             strs(&["<Alt><Shift>Tab"]),
         ),
+        // DIVERGENCE (deliberate, ours): upstream gives `switch-group` both `<Super>Above_Tab`
+        // and `<Alt>Above_Tab`, so the two chords are the same binding. We keep Super+` on
+        // this key — spanning workspaces, as `apps_current_workspace_only` defaults — and give
+        // Alt+` to `switch-group-current-workspace` in our own schema, pinned to this
+        // workspace. Same window list, two scopes, one on each chord.
         (
             "switch-group".to_owned(),
             SwitchGroup { backward: false },
-            strs(&["<Super>Above_Tab", "<Alt>Above_Tab"]),
+            strs(&["<Super>Above_Tab"]),
         ),
         (
             "switch-group-backward".to_owned(),
             SwitchGroup { backward: true },
-            strs(&["<Shift><Super>Above_Tab", "<Shift><Alt>Above_Tab"]),
+            strs(&["<Shift><Super>Above_Tab"]),
         ),
         (
             "cycle-windows".to_owned(),
@@ -2380,6 +2385,22 @@ fn adopted_synoik_keybindings() -> Vec<(String, Action, Vec<String>, Option<Dura
             "switch-focus-between-floating-and-tiling",
             SwitchFocusBetweenFloatingAndTiling,
             "<Super><Shift>g",
+        ),
+        key(
+            "switch-group-current-workspace",
+            SwitchGroup {
+                backward: false,
+                current_workspace_only: Some(true),
+            },
+            "<Alt>Above_Tab",
+        ),
+        key(
+            "switch-group-current-workspace-backward",
+            SwitchGroup {
+                backward: true,
+                current_workspace_only: Some(true),
+            },
+            "<Shift><Alt>Above_Tab",
         ),
         key("emoji-picker", ToggleEmojiPicker, "<Control><Alt>space"),
         key(
@@ -3822,6 +3843,47 @@ mod tests {
         rv
     }
 
+    /// The `[org.gnome.desktop.wm.keybindings]` group of `synoik.gschema.override`, as
+    /// `(key, accelerators)`.
+    ///
+    /// What a session actually runs is the vendored schema *composed with* this file, so any
+    /// test that asks "what does GNOME ship on this chord" has to compose them too — a key we
+    /// override to release a chord still has upstream's value in the XML.
+    fn override_wm_keybindings() -> Vec<(String, Vec<String>)> {
+        let text = include_str!("../resources/schemas/synoik.gschema.override");
+
+        let mut group = "";
+        let mut rv = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                group = match name {
+                    "org.gnome.desktop.wm.keybindings" => name,
+                    _ => "",
+                };
+                continue;
+            }
+            if group.is_empty() {
+                continue;
+            }
+
+            let (key, value) = line.split_once('=').expect("a key line is key=value");
+            let accels = value
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('\'').to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            rv.push((key.to_owned(), accels));
+        }
+        rv
+    }
+
     /// No accelerator of ours may take a chord GNOME *ships*, adopted or not.
     ///
     /// [`synoik_accels_do_not_collide_with_gnome`] only compares against the keys we adopt,
@@ -3855,13 +3917,31 @@ mod tests {
             ),
         ];
 
+        // What ships is the vendored schema composed with our override, so an overridden key
+        // contributes the chords *we* give it, not upstream's. Without this, releasing a chord
+        // for one of our own keys reads as a collision with the value we just replaced.
+        let overridden = override_wm_keybindings();
+
         let mut theirs: Vec<(Accel, String)> = Vec::new();
         let mut sources = 0;
         let mut add = |schema: &str, xml: &str, sources: &mut usize| {
             *sources += 1;
+            let is_wm = schema == "org.gnome.desktop.wm.keybindings";
             for (key, accel) in schema_default_accels(xml) {
+                // The override replaces the key wholesale, so skip upstream's rows for it and
+                // add ours once, below.
+                if is_wm && overridden.iter().any(|(name, _)| *name == key) {
+                    continue;
+                }
                 for parsed in parse_accels(&key, vec![accel]) {
                     theirs.push((parsed, format!("{schema} {key}")));
+                }
+            }
+            if is_wm {
+                for (key, accels) in &overridden {
+                    for parsed in parse_accels(key, accels.clone()) {
+                        theirs.push((parsed, format!("{schema} {key}")));
+                    }
                 }
             }
         };
@@ -4046,50 +4126,24 @@ mod tests {
     /// group carries settings we do not read as keybindings.
     #[test]
     fn override_matches_the_tables() {
-        let text = include_str!("../resources/schemas/synoik.gschema.override");
+        let overridden = override_wm_keybindings();
+        assert!(
+            !overridden.is_empty(),
+            "the override parser matched nothing at all"
+        );
 
-        let mut group = "";
-        let mut checked = 0;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                group = match name {
-                    "org.gnome.desktop.wm.keybindings" => name,
-                    _ => "",
-                };
-                continue;
-            }
-            if group.is_empty() {
-                continue;
-            }
-
-            let (key, value) = line.split_once('=').expect("a key line is key=value");
-            let want: Vec<String> = value
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .map(|s| s.trim().trim_matches('\'').to_owned())
-                .filter(|s| !s.is_empty())
-                .collect();
-
+        for (key, want) in overridden {
             let got = adopted_wm_keybindings()
                 .into_iter()
-                .find(|(name, ..)| name == key)
+                .find(|(name, ..)| *name == key)
                 .unwrap_or_else(|| panic!("the override sets {key}, which no table names"))
                 .2;
 
             assert_eq!(
                 got, want,
-                "{group} {key} differs between the override and the table"
+                "org.gnome.desktop.wm.keybindings {key} differs between the override and the table"
             );
-            checked += 1;
         }
-
-        assert!(checked > 0, "the override parser matched nothing at all");
     }
 
     /// The brightness keys come from `org.gnome.shell.keybindings`, which we had never read

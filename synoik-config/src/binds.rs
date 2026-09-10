@@ -452,6 +452,11 @@ pub enum Action {
     /// (`AppSwitcherPopup._initialSelection`, `altTab.js:117-137`).
     SwitchGroup {
         backward: bool,
+        /// Which workspaces the list spans. `None` follows
+        /// `org.gnome.shell.app-switcher current-workspace-only` like GNOME's own key;
+        /// `Some` is our `switch-group-current-workspace`, which pins the scope rather than
+        /// reading it so the two `Above_Tab` chords can differ.
+        current_workspace_only: Option<bool>,
     },
     /// GNOME's `cycle-windows` (`<Alt>Escape`) — `WindowCyclerPopup` (`altTab.js:638-667`). Same
     /// window list as the window switcher, but **no popup**: the selected window is raised and
