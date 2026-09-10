@@ -54,6 +54,7 @@ mod layer_shell;
 mod peek_damage;
 mod perf_probe;
 mod producer_sync;
+mod redraw_attribution;
 mod remove_output;
 mod swapchain_ages;
 mod teardown;

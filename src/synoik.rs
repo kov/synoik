@@ -10,9 +10,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
+use std::panic::Location;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -139,7 +140,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntr
 use crate::dbus::gnome_shell_screenshot::{ScreenshotToSynoik, SynoikToScreenshot};
 use crate::dbus::system_status::SystemStatusToSynoik;
 use crate::frame_clock::{Dispatch, FrameClock};
-use crate::frame_log::{AnimCauses, FrameContext, FrameLog, Phase};
+use crate::frame_log::{self, AnimCauses, FrameContext, FrameLog, Phase, Requester};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter, TileSide};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::keyboard_window_grab::KeyboardWindowGrab;
@@ -1235,6 +1236,9 @@ pub struct Synoik {
     /// Frame-timing instrumentation, off unless `SYNOIK_FRAME_LOG` says otherwise.
     /// See [`crate::frame_log`].
     pub frame_log: FrameLog,
+    /// Who redraw requests are charged to while a client's commit is being handled; `None`
+    /// charges each to its call site. Set around `CompositorHandler::commit`.
+    pub redraw_requester: Option<Requester>,
 
     pub dbus: Option<crate::dbus::DBusServers>,
     pub a11y_keyboard_monitor: Option<crate::dbus::freedesktop_a11y::KeyboardMonitor>,
@@ -1508,6 +1512,9 @@ pub struct OutputState {
     /// looks like (our own PRIME-imported scanout buffers report `imported=no`), and reading
     /// scan-out off it produced a confidently wrong answer on 2026-08-15.
     pub last_frame_scanout: ScanoutTally,
+    /// Who asked for a redraw since this output's last one, with how many times each — handed to
+    /// the frame log by `redraw`. See [`crate::frame_log::Requester`].
+    pub redraw_requesters: Vec<(Requester, u32)>,
     /// Which animations were running when the last frame was built. The set the
     /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
     /// log can name what a slow frame was doing.
@@ -8319,6 +8326,7 @@ impl Synoik {
             dump_scanout_pending: HashSet::new(),
 
             frame_log: FrameLog::from_env(),
+            redraw_requester: None,
 
             dbus: None,
             a11y_keyboard_monitor: None,
@@ -8438,6 +8446,7 @@ impl Synoik {
 
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
+            redraw_attribution_id: CLIENT_ATTRIBUTION_ID.fetch_add(1, Ordering::Relaxed) + 1,
             compositor_state: Default::default(),
             can_view_decoration_globals: config.prefer_no_csd,
             primary_selection_disabled: config.clipboard.disable_primary,
@@ -8893,6 +8902,7 @@ impl Synoik {
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
             last_frame_scanout: ScanoutTally::default(),
+            redraw_requesters: Vec::new(),
             frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
@@ -10367,14 +10377,42 @@ impl Synoik {
         }
     }
 
+    /// Who a request made right now is charged to: the client whose commit is being handled,
+    /// else the caller. See [`Self::redraw_requester`].
+    #[track_caller]
+    fn current_requester(&self) -> Requester {
+        // Outside any closure: a closure is not `#[track_caller]`, so `caller()` inside one
+        // names the closure, and every request would be charged to this line.
+        let caller = Location::caller();
+        self.redraw_requester.unwrap_or(Requester::Internal(caller))
+    }
+
+    #[track_caller]
     pub fn queue_redraw_all(&mut self) {
+        let requester = self.current_requester();
         for state in self.output_state.values_mut() {
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
+            frame_log::note_request(&mut state.redraw_requesters, requester);
         }
     }
 
     /// Schedules an immediate redraw if one is not already scheduled.
+    #[track_caller]
     pub fn queue_redraw(&mut self, output: &Output) {
+        let requester = self.current_requester();
+        self.queue_redraw_for(output, requester);
+    }
+
+    /// [`Self::queue_redraw`], charged to `requester` rather than the caller.
+    pub fn queue_redraw_for(&mut self, output: &Output, requester: Requester) {
+        let state = self.output_state.get_mut(output).unwrap();
+        state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
+        frame_log::note_request(&mut state.redraw_requesters, requester);
+    }
+
+    /// Queue the redraw that requests made while a frame was in flight were promised. Charged to
+    /// nobody new: those requests are still in the output's pending set, and they get the credit.
+    pub fn queue_deferred_redraw(&mut self, output: &Output) {
         let state = self.output_state.get_mut(output).unwrap();
         state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
     }
@@ -12597,6 +12635,9 @@ impl Synoik {
         }
 
         self.frame_log.begin(&output.name());
+        // Taken now: whatever asks during this redraw is asking for the next one.
+        let mut requesters =
+            mem::take(&mut self.output_state.get_mut(output).unwrap().redraw_requesters);
         self.frame_log.phase(Phase::Elements);
         self.update_render_elements(Some(output));
 
@@ -12761,6 +12802,13 @@ impl Synoik {
                     u64::from(m.size.w.max(0) as u32) * u64::from(m.size.h.max(0) as u32)
                 }),
             });
+        }
+        self.frame_log.attribute(&mut requesters);
+        // Hand the emptied buffer back for its allocation, unless this redraw already queued the
+        // next one's requests into a fresh one.
+        let state = self.output_state.get_mut(output).unwrap();
+        if state.redraw_requesters.is_empty() {
+            state.redraw_requesters = requesters;
         }
         self.frame_log.end(refresh_interval);
     }
@@ -16809,6 +16857,7 @@ impl Synoik {
         }
     }
 
+    #[track_caller]
     pub fn queue_redraw_switcher_output(&mut self) {
         if let Some(output) = self.switcher.output().cloned() {
             self.queue_redraw(&output);
@@ -16822,7 +16871,13 @@ pub struct NewClient {
     pub credentials_unknown: bool,
 }
 
+/// Source of [`ClientState::redraw_attribution_id`].
+static CLIENT_ATTRIBUTION_ID: AtomicU64 = AtomicU64::new(0);
+
 pub struct ClientState {
+    /// Names this client in the frame log's redraw attribution. Never reused, unlike a pid or an
+    /// allocation address. See [`crate::frame_log::Requester::Client`].
+    pub redraw_attribution_id: u64,
     pub compositor_state: CompositorClientState,
     pub can_view_decoration_globals: bool,
     pub primary_selection_disabled: bool,

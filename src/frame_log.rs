@@ -77,6 +77,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1003,6 +1004,160 @@ struct Stats {
     /// a cycle late by construction and so files itself under 2. This one is fixed before the
     /// outcome is known. Both are logged: the pair is what separates intent from result.
     aim: [u64; CADENCE_MAX + 1],
+    /// Who asked for this window's redraws. See [`Requester`].
+    requesters: HashMap<Requester, RequesterCounts>,
+}
+
+/// Who asked for a redraw.
+///
+/// Requests coalesce — any number of them before a redraw runs produce one redraw — so a redraw
+/// carries the set of everyone who asked since the last one, and each is credited with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Requester {
+    /// A client's commit: the client's attribution id, and the window its surface belongs to
+    /// when it belongs to one (`MappedId`).
+    Client { client: u64, window: Option<u64> },
+    /// An animation still running when the last frame was built, asking for the next one.
+    Animation,
+    /// The compositor itself, at this call site.
+    Internal(&'static Location<'static>),
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RequesterCounts {
+    /// Calls, coalesced ones included.
+    requests: u64,
+    /// Redraws this requester was among the causes of.
+    redraws: u64,
+    /// Redraws this requester caused alone that handed nothing to the display — the ones that
+    /// would not have happened without it, and bought nothing.
+    sole_skips: u64,
+}
+
+/// How many requesters one output remembers between redraws. Past this, further distinct ones
+/// go uncounted until the next redraw; it takes a storm from every corner at once to get there.
+pub const MAX_PENDING_REQUESTERS: usize = 32;
+
+/// Record one request in an output's pending set. See [`Requester`].
+pub fn note_request(pending: &mut Vec<(Requester, u32)>, requester: Requester) {
+    if let Some((_, count)) = pending.iter_mut().find(|(r, _)| *r == requester) {
+        *count += 1;
+    } else if pending.len() < MAX_PENDING_REQUESTERS {
+        pending.push((requester, 1));
+    }
+}
+
+/// The module a call site lives in, as the summary groups it: `src/input/mod.rs` → `input`,
+/// `src/handlers/compositor.rs` → `handlers/compositor`.
+fn module_of(location: &'static Location<'static>) -> &'static str {
+    let file = location.file();
+    let file = file.strip_prefix("src/").unwrap_or(file);
+    let file = file.strip_suffix(".rs").unwrap_or(file);
+    file.strip_suffix("/mod").unwrap_or(file)
+}
+
+/// One output's requester breakdown, most redraws first: `firefox[2828]/w7 152 (240 req, 116
+/// sole skips), synoik 12 (synoik.rs:10370), animation 3`. Its own summary line rather than a
+/// clause of the main one, which is long enough already. Internal call sites roll up to their
+/// module, naming the busiest line. Empty when nothing asked.
+fn requesters_clause(
+    requesters: &HashMap<Requester, RequesterCounts>,
+    labels: &HashMap<u64, String>,
+) -> String {
+    const SHOWN: usize = 6;
+
+    struct Row {
+        name: String,
+        counts: RequesterCounts,
+        busiest: Option<(&'static Location<'static>, u64)>,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut by_module: HashMap<&'static str, usize> = HashMap::new();
+    for (requester, counts) in requesters {
+        let (row, busiest) = match *requester {
+            Requester::Client { client, window } => {
+                let mut name = labels
+                    .get(&client)
+                    .cloned()
+                    .unwrap_or_else(|| format!("client#{client}"));
+                if let Some(window) = window {
+                    let _ = write!(name, "/w{window}");
+                }
+                rows.push(Row {
+                    name,
+                    counts: RequesterCounts::default(),
+                    busiest: None,
+                });
+                (rows.len() - 1, None)
+            }
+            Requester::Animation => {
+                rows.push(Row {
+                    name: "animation".to_owned(),
+                    counts: RequesterCounts::default(),
+                    busiest: None,
+                });
+                (rows.len() - 1, None)
+            }
+            Requester::Internal(location) => {
+                let module = module_of(location);
+                let row = *by_module.entry(module).or_insert_with(|| {
+                    rows.push(Row {
+                        name: module.to_owned(),
+                        counts: RequesterCounts::default(),
+                        busiest: None,
+                    });
+                    rows.len() - 1
+                });
+                (row, Some(location))
+            }
+        };
+        let row = &mut rows[row];
+        row.counts.requests += counts.requests;
+        row.counts.redraws += counts.redraws;
+        row.counts.sole_skips += counts.sole_skips;
+        if let Some(location) = busiest {
+            if row.busiest.is_none_or(|(_, n)| counts.redraws > n) {
+                row.busiest = Some((location, counts.redraws));
+            }
+        }
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Ties broken by name, so two runs of the same window print the same line.
+    rows.sort_by(|a, b| {
+        b.counts
+            .redraws
+            .cmp(&a.counts.redraws)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut out = String::new();
+    for (i, row) in rows.iter().take(SHOWN).enumerate() {
+        let sep = if i == 0 { "" } else { ", " };
+        let _ = write!(out, "{sep}{} {}", row.name, row.counts.redraws);
+        let mut notes: Vec<String> = Vec::new();
+        if row.counts.requests != row.counts.redraws {
+            notes.push(format!("{} req", row.counts.requests));
+        }
+        if row.counts.sole_skips > 0 {
+            notes.push(format!("{} sole skips", row.counts.sole_skips));
+        }
+        if let Some((location, _)) = row.busiest {
+            let file = location.file();
+            let file = file.strip_prefix("src/").unwrap_or(file);
+            notes.push(format!("{file}:{}", location.line()));
+        }
+        if !notes.is_empty() {
+            let _ = write!(out, " ({})", notes.join(", "));
+        }
+    }
+    if rows.len() > SHOWN {
+        let _ = write!(out, ", +{} more", rows.len() - SHOWN);
+    }
+    out
 }
 
 impl Stats {
@@ -2347,6 +2502,10 @@ pub struct FrameLog {
     /// that from the journal means finding and adding up every summary line since
     /// login. These are the same events, kept.
     lifetime: HashMap<String, Lifetime>,
+    /// `comm[pid]` per client attribution id, for naming [`Requester::Client`] in the summary.
+    /// Cleared at every summary, so a client that went away does not linger and a recycled pid
+    /// is re-read. See [`FrameLog::has_client_label`].
+    client_labels: HashMap<u64, String>,
 }
 
 /// Per-output tallies for the whole session, behind the perf IPC request.
@@ -2442,6 +2601,7 @@ impl FrameLog {
             loop_watch: LoopWatch::default(),
             lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
+            client_labels: HashMap::new(),
         }
     }
 
@@ -2567,6 +2727,58 @@ impl FrameLog {
         if let Some(frame) = self.in_flight.as_mut() {
             frame.skipped = true;
         }
+    }
+
+    /// Credit the frame in flight to everyone in `pending` — the requests its output collected
+    /// since its last redraw — and empty it, keeping its allocation. Call after
+    /// [`skipped`](Self::skipped) and before [`end`](Self::end).
+    pub fn attribute(&mut self, pending: &mut Vec<(Requester, u32)>) {
+        let Some(frame) = self.in_flight.as_ref() else {
+            pending.clear();
+            return;
+        };
+        let sole = pending.len() == 1;
+        let skipped = frame.skipped;
+        let stats = self.stats.entry(frame.output.clone()).or_default();
+        for (requester, count) in pending.drain(..) {
+            let counts = stats.requesters.entry(requester).or_default();
+            counts.requests += u64::from(count);
+            counts.redraws += 1;
+            counts.sole_skips += u64::from(sole && skipped);
+        }
+    }
+
+    /// Whether client `id` already has a label for this summary window. Asked on every commit, so
+    /// the caller only works out the label (a `/proc` read) the first time a client shows up.
+    pub fn has_client_label(&self, id: u64) -> bool {
+        self.settings.is_none() || self.client_labels.contains_key(&id)
+    }
+
+    pub fn set_client_label(&mut self, id: u64, label: String) {
+        self.client_labels.insert(id, label);
+    }
+
+    /// Turn the log on for a harness test, without the process-global env var — which a parallel
+    /// test binary cannot touch safely. No summary is emitted, so the tallies accumulate for the
+    /// test to read.
+    #[cfg(test)]
+    pub fn enable_for_test(&mut self) {
+        self.settings = Some(Settings {
+            summary_every: None,
+            ..Settings::default()
+        });
+    }
+
+    /// The redraws each requester was credited with on `output` so far.
+    #[cfg(test)]
+    pub fn redraws_by(&self, output: &str) -> Vec<(Requester, u64)> {
+        self.stats.get(output).map_or_else(Vec::new, |stats| {
+            stats
+                .requesters
+                .iter()
+                .map(|(r, counts)| (*r, counts.redraws))
+                .collect()
+        })
     }
 
     /// Close the running phase (if any) and open `phase`. Everything between two
@@ -3499,8 +3711,18 @@ impl FrameLog {
             }
             tracing::info!("{line}");
 
+            let requesters = requesters_clause(&stats.requesters, &self.client_labels);
+            if !requesters.is_empty() {
+                let line = format!("{output}: redraws by {requesters}");
+                if ring_cap.is_some() {
+                    banked.push(line.clone());
+                }
+                tracing::info!("{line}");
+            }
+
             *stats = Stats::default();
         }
+        self.client_labels.clear();
 
         if let Some(cap) = ring_cap {
             for line in banked {
@@ -4376,6 +4598,7 @@ mod tests {
             loop_watch: LoopWatch::default(),
             lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
+            client_labels: HashMap::new(),
         }
     }
 
@@ -5168,23 +5391,7 @@ mod tests {
     #[test]
     fn only_a_late_presentation_counts_as_missed() {
         let refresh = Duration::from_micros(16667);
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
 
         // On time: presented essentially at the target.
@@ -5218,23 +5425,7 @@ mod tests {
         // once a second, each frame hitting its own target exactly. A metric based
         // on the gap between presentations would call this 59 dropped frames every
         // second; it is a compositor with nothing to draw.
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
         for i in 0..5 {
             let target = Duration::from_secs(200) + Duration::from_secs(i);
             log.presented("out", target, target, Some(refresh));
@@ -5255,23 +5446,7 @@ mod tests {
     #[test]
     fn cadence_counts_the_gaps_between_presentations() {
         let refresh = Duration::from_micros(16667);
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
 
         let base = Duration::from_secs(100);
         // Gaps of 1, 1, 2 then 6 cycles. The first presentation opens the interval
@@ -5297,23 +5472,7 @@ mod tests {
     #[test]
     fn redraws_skips_and_flips_are_counted_apart() {
         let refresh = Duration::from_micros(8333);
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
 
         let base = Duration::from_secs(100);
         for i in 0..4 {
@@ -5333,6 +5492,57 @@ mod tests {
         assert_eq!(stats.flips, 2, "only presentations are flips");
     }
 
+    /// Coalesced requests credit everyone who asked with the one redraw they produced, and a
+    /// redraw that one requester caused alone and that flipped nothing is that requester's
+    /// *sole skip* — the number that names a client busy-looping on empty commits.
+    #[test]
+    fn a_redraw_is_credited_to_everyone_who_asked_for_it() {
+        let mut log = test_log();
+        let firefox = Requester::Client {
+            client: 1,
+            window: Some(7),
+        };
+        let here = Requester::Internal(Location::caller());
+        log.set_client_label(1, "firefox[2828]".to_owned());
+
+        let mut pending = Vec::new();
+        // Two requests from the client and one from the compositor, coalesced into one redraw.
+        note_request(&mut pending, firefox);
+        note_request(&mut pending, firefox);
+        note_request(&mut pending, here);
+        log.begin("out");
+        log.attribute(&mut pending);
+        log.end(None);
+        assert!(pending.is_empty(), "attribution empties the pending set");
+
+        // Then three redraws the client asked for alone, which found nothing to draw.
+        for _ in 0..3 {
+            note_request(&mut pending, firefox);
+            log.begin("out");
+            log.skipped();
+            log.attribute(&mut pending);
+            log.end(None);
+        }
+
+        let counts = log.stats["out"].requesters[&firefox];
+        assert_eq!(counts.requests, 5);
+        assert_eq!(counts.redraws, 4);
+        assert_eq!(counts.sole_skips, 3);
+        let counts = log.stats["out"].requesters[&here];
+        assert_eq!(
+            (counts.requests, counts.redraws, counts.sole_skips),
+            (1, 1, 0)
+        );
+
+        let line = requesters_clause(&log.stats["out"].requesters, &log.client_labels);
+        assert!(
+            line.starts_with(
+                "firefox[2828]/w7 4 (5 req, 3 sole skips), frame_log 1 (frame_log.rs:"
+            ),
+            "{line}"
+        );
+    }
+
     /// The `aim` histogram must be blind to whether the frame it describes missed — that is the
     /// entire reason it exists next to `cadence`.
     ///
@@ -5344,23 +5554,7 @@ mod tests {
     #[test]
     fn a_miss_moves_the_landing_bucket_but_never_the_aim_bucket() {
         let refresh = Duration::from_micros(16667);
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
 
         let base = Duration::from_secs(100);
         // Opens the interval.
@@ -5398,23 +5592,7 @@ mod tests {
     #[test]
     fn headroom_belongs_to_the_frame_that_was_queued() {
         let refresh = Duration::from_micros(16667);
-        let mut log = FrameLog {
-            parked: VecDeque::new(),
-            dump_override: None,
-            ring: VecDeque::new(),
-            dumps: 0,
-            settings: Some(Settings::default()),
-            in_flight: None,
-            stats: HashMap::new(),
-            queued: HashMap::new(),
-            last_presented: HashMap::new(),
-            last_summary: Instant::now(),
-            last_autodump: None,
-            autodumps: 0,
-            loop_watch: LoopWatch::default(),
-            lateness: DispatchLateness::default(),
-            lifetime: HashMap::new(),
-        };
+        let mut log = test_log();
         let headroom = |log: &FrameLog| {
             log.stats
                 .get("out")

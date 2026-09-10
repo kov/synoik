@@ -1915,7 +1915,11 @@ impl Tty {
                 .non_continuous_frame(surface.vblank_frame_name);
             surface.vblank_frame = Some(vblank_frame);
 
-            synoik.queue_redraw(&output);
+            if unfinished_animations_remain {
+                synoik.queue_redraw_for(&output, crate::frame_log::Requester::Animation);
+            } else {
+                synoik.queue_deferred_redraw(&output);
+            }
         } else {
             synoik.send_frame_callbacks(&output);
         }
@@ -1949,7 +1953,7 @@ impl Tty {
         }
 
         if output_state.unfinished_animations_remain {
-            synoik.queue_redraw(&output);
+            synoik.queue_redraw_for(&output, crate::frame_log::Requester::Animation);
         } else {
             synoik.send_frame_callbacks(&output);
         }

@@ -28,6 +28,7 @@ use synoik_config::WindowingMode;
 use synoik_ipc::PositionChange;
 
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
+use crate::frame_log::Requester;
 use crate::gnome::FocusNewWindows;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
@@ -66,6 +67,93 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Every redraw this commit asks for is the client's, whichever handler below asks.
+        let requester = self.commit_requester(surface);
+        let outer = std::mem::replace(&mut self.synoik.redraw_requester, requester);
+        self.handle_commit(surface);
+        self.synoik.redraw_requester = outer;
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
+        // when that happens, so that the closing animation includes all these subsurfaces.
+        //
+        // Test client: alacritty with CSD <= 0.13 (it was fixed in winit afterwards:
+        // https://github.com/rust-windowing/winit/pull/3625).
+        //
+        // This is still not perfect, as this function is called already after the (first)
+        // subsurface is destroyed; in the case of alacritty, this is the top CSD shadow. But, it
+        // gets most of the job done.
+        if let Some(root) = self.synoik.root_surface.get(surface) {
+            if let Some((mapped, _output)) = self.synoik.layout.find_window_and_output(root) {
+                let window = mapped.window.clone();
+                self.store_unmap_snapshot(&window);
+            }
+        }
+
+        self.synoik
+            .root_surface
+            .retain(|k, v| k != surface && v != surface);
+
+        // The object destruction order is not guaranteed to follow the logical role order. So for
+        // example when a client disconnects unexpectedly, WlSurface::destroyed() may be called
+        // before XdgShellHandler::toplevel_destroyed(). In this case, the surface will *not* have
+        // the default dmabuf pre-commit hook: it will still have the toplevel pre-commit hook.
+        //
+        // So, this may come out empty, and then the toplevel pre-commit hook will be removed in the
+        // subsequent toplevel_destroyed() call.
+        if let Some(hook) = self.synoik.dmabuf_pre_commit_hook.remove(surface) {
+            remove_pre_commit_hook(surface, &hook);
+        }
+    }
+}
+
+impl BufferHandler for State {
+    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.synoik.shm_state
+    }
+}
+
+delegate_compositor!(State);
+delegate_shm!(State);
+
+impl State {
+    /// Who a commit on `surface` charges its redraws to: its client, and the window it belongs to
+    /// when it belongs to one. Labels the client for the frame log the first time it shows up in
+    /// a summary window.
+    fn commit_requester(&mut self, surface: &WlSurface) -> Option<Requester> {
+        let client = surface.client()?;
+        let id = client.get_data::<ClientState>()?.redraw_attribution_id;
+        if !self.synoik.frame_log.has_client_label(id) {
+            let label = match client.get_credentials(&self.synoik.display_handle) {
+                Ok(credentials) => {
+                    let pid = credentials.pid;
+                    let comm =
+                        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                    format!("{}[{pid}]", comm.trim())
+                }
+                Err(_) => format!("client#{id}"),
+            };
+            self.synoik.frame_log.set_client_label(id, label);
+        }
+
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let window = self
+            .synoik
+            .layout
+            .find_window_and_output(&root)
+            .map(|(mapped, _)| mapped.id().get());
+        Some(Requester::Client { client: id, window })
+    }
+
+    fn handle_commit(&mut self, surface: &WlSurface) {
         let _span = tracy_client::span!("CompositorHandler::commit");
         let _span = trace_span!("commit", surface = %surface.id()).entered();
         trace!("commit");
@@ -839,54 +927,6 @@ impl CompositorHandler for State {
         trace!("commit on an unrecognized surface: {surface:?}, root: {root_surface:?}");
     }
 
-    fn destroyed(&mut self, surface: &WlSurface) {
-        // Clients may destroy their subsurfaces before the main surface. Ensure we have a snapshot
-        // when that happens, so that the closing animation includes all these subsurfaces.
-        //
-        // Test client: alacritty with CSD <= 0.13 (it was fixed in winit afterwards:
-        // https://github.com/rust-windowing/winit/pull/3625).
-        //
-        // This is still not perfect, as this function is called already after the (first)
-        // subsurface is destroyed; in the case of alacritty, this is the top CSD shadow. But, it
-        // gets most of the job done.
-        if let Some(root) = self.synoik.root_surface.get(surface) {
-            if let Some((mapped, _output)) = self.synoik.layout.find_window_and_output(root) {
-                let window = mapped.window.clone();
-                self.store_unmap_snapshot(&window);
-            }
-        }
-
-        self.synoik
-            .root_surface
-            .retain(|k, v| k != surface && v != surface);
-
-        // The object destruction order is not guaranteed to follow the logical role order. So for
-        // example when a client disconnects unexpectedly, WlSurface::destroyed() may be called
-        // before XdgShellHandler::toplevel_destroyed(). In this case, the surface will *not* have
-        // the default dmabuf pre-commit hook: it will still have the toplevel pre-commit hook.
-        //
-        // So, this may come out empty, and then the toplevel pre-commit hook will be removed in the
-        // subsequent toplevel_destroyed() call.
-        if let Some(hook) = self.synoik.dmabuf_pre_commit_hook.remove(surface) {
-            remove_pre_commit_hook(surface, &hook);
-        }
-    }
-}
-
-impl BufferHandler for State {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-impl ShmHandler for State {
-    fn shm_state(&self) -> &ShmState {
-        &self.synoik.shm_state
-    }
-}
-
-delegate_compositor!(State);
-delegate_shm!(State);
-
-impl State {
     pub fn add_default_dmabuf_pre_commit_hook(&mut self, surface: &WlSurface) {
         if !surface.is_alive() {
             error!("tried to add dmabuf pre-commit hook for a dead surface");
