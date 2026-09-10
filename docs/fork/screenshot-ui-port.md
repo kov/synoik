@@ -179,10 +179,18 @@ on those instead — `<Alt><Shift>3` on `screenshot`, `<Alt><Shift>5` on `show-s
 It is the same session, not a second UI. `Open::quick` holds the `Closed` fields it borrowed, and
 four things follow from it:
 
-- **Selection, always.** A quick session forces the type rather than reading the remembered one,
-  and hands the remembered one back at close along with the selection rectangle. It is a
-  parenthesis in the picker's state, not a write to it. (`show_pointer` is untouched either way:
-  it is the one control the crosshair cannot reach.)
+- **Selection, always — and nothing selected until the first press.** A quick session forces the
+  type rather than reading the remembered one, and hands the remembered one back at close along
+  with the selection rectangle. It is a parenthesis in the picker's state, not a write to it.
+  (`show_pointer` is untouched either way: it is the one control the crosshair cannot reach.)
+  It also starts with no rectangle at all: the picker seeds one from the last selection, or from a
+  centred default, and in a UI with no panel a rectangle the user did not put there is the only
+  thing on screen claiming to be their answer. `Quick::selected` is false until a press, and
+  `crosshair_only` is the one predicate every consumer asks — no shade on *any* output, no border,
+  no handles, the crosshair cursor everywhere, every press starting a new rectangle rather than
+  grabbing a hidden one, `selection_rect_global` answering `None`, and Return declining because it
+  has nothing to confirm. It stops being true the moment a press lands, and the Window selector is
+  a selection of its own, so arming it (Space) leaves the state too.
 - **No chrome, from one lever.** `render_output` skips `ensure_panel`, and that bake is what
   populates the layout — the sole hit-test authority. No layout means no panel rect, no controls
   under the pointer, and no corner handles baked to draw. `lay_out_panels`, the headless

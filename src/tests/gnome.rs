@@ -28487,10 +28487,20 @@ fn the_quick_screenshot_is_a_crosshair_with_no_picker_around_it() {
         f.synoik().screenshot_ui.panel_rect(&output).is_none(),
         "and it has no panel — which is also what leaves it with no controls to click"
     );
+    assert_eq!(
+        f.synoik().screenshot_ui.selection_rect_global(),
+        None,
+        "and nothing is selected — the picker's rectangle is not something the user put there"
+    );
 
-    // Drag something in the crosshair, so the restore has a wrong answer available to it.
-    drag_selection(&mut f, (600, 400), (920, 660));
-    assert_ne!(selection_of(&mut f), picked);
+    // A press *inside* where the picker's rectangle was: with no selection there is nothing to
+    // take hold of, so this starts a new one rather than moving the old one.
+    drag_selection(&mut f, (150, 150), (400, 400));
+    assert_eq!(
+        selection_of(&mut f).size,
+        Size::from((251, 251)),
+        "a press in the crosshair drags a new rectangle out, it does not move a hidden one"
+    );
 
     // Closing must hand back both halves of what it borrowed, or the next ordinary picker comes up
     // in a mode, or over a region, the user never picked.
@@ -28523,6 +28533,7 @@ fn the_quick_screenshot_is_a_crosshair_with_no_picker_around_it() {
 /// user a 32px screenshot they did not ask for. It cancels instead.
 #[test]
 fn the_crosshair_captures_on_release_and_cancels_on_a_bare_click() {
+    use smithay::input::keyboard::{Keysym, ModifiersState};
     use smithay::utils::Point;
 
     use crate::ui::screenshot_ui::PointerUp;
@@ -28536,6 +28547,13 @@ fn the_crosshair_captures_on_release_and_cancels_on_a_bare_click() {
 
     // A drag out and let go.
     open_quick_picker_headless(&mut f);
+    assert!(
+        f.synoik()
+            .screenshot_ui
+            .action(Keysym::Return, ModifiersState::default())
+            .is_none(),
+        "with nothing dragged out yet, Return has no rectangle to confirm"
+    );
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
     let from = Point::<i32, smithay::utils::Physical>::from((200, 200));
     let to = Point::<i32, smithay::utils::Physical>::from((600, 500));

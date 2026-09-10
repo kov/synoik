@@ -164,17 +164,26 @@ pub enum ScreenshotUi {
         hover: Option<Control>,
         open_anim: Animation,
         /// Set when this session was opened by `screenshot-quick` — the crosshair with no picker.
-        /// Holds the `Closed` state to put back, because a quick session is explicitly *not*
-        /// remembered: it forces Selection over whatever was picked last, and handing that back
-        /// as the remembered type would make the next ordinary open come up in it.
-        quick: Option<Remembered>,
+        quick: Option<Quick>,
         clock: Clock,
         config: Rc<RefCell<Config>>,
         path: Option<String>,
     },
 }
 
-/// The `Closed` fields a quick session borrows and gives back untouched (see `Open::quick`).
+/// What makes a quick session (`screenshot-quick`) different from the picker.
+pub struct Quick {
+    /// The `Closed` state to put back, because a quick session is explicitly *not* remembered: it
+    /// forces Selection over whatever was picked last, and handing that back as the remembered
+    /// type would make the next ordinary open come up in it.
+    remembered: Remembered,
+    /// Whether a rectangle has been dragged out yet. Until one has, there is no selection at all —
+    /// not the picker's remembered rectangle, not a default one — and the crosshair is the only
+    /// thing on screen saying what this UI wants. See [`ScreenshotUi::crosshair_only`].
+    selected: bool,
+}
+
+/// The `Closed` fields a quick session borrows and gives back untouched (see [`Quick`]).
 pub struct Remembered {
     capture_type: CaptureType,
     last_selection: Option<(WeakOutput, Rectangle<i32, Physical>)>,
@@ -771,15 +780,21 @@ impl ScreenshotUi {
         let show_pointer = *show_pointer;
         let remembered_type = *remembered_type;
         // Taken before the selection is consumed below, so what goes back is what was there.
-        let quick = quick.then(|| Remembered {
-            capture_type: remembered_type,
-            last_selection: last_selection.clone(),
+        let quick = quick.then(|| Quick {
+            remembered: Remembered {
+                capture_type: remembered_type,
+                last_selection: last_selection.clone(),
+            },
+            selected: false,
         });
 
         let last_selection = last_selection
             .take()
             .and_then(|(weak, sel)| weak.upgrade().map(|output| (output, sel)));
         let area = match last_selection {
+            // A quick session starts with nothing selected, so the rectangle here is only the
+            // origin the first drag overwrites — never something drawn (`crosshair_only`).
+            _ if quick.is_some() => (default_output, Rectangle::from_size(Size::from((1, 1)))),
             Some(area) if screenshots.contains_key(&area.0) => area,
             _ => {
                 let output = default_output;
@@ -933,7 +948,10 @@ impl ScreenshotUi {
         // borrowed instead. `show_pointer` is not part of that: it is the one control a quick
         // session has no way to touch, so it cannot have changed.
         let (last_selection, capture_type) = match quick {
-            Some(remembered) => (remembered.last_selection.take(), remembered.capture_type),
+            Some(quick) => (
+                quick.remembered.last_selection.take(),
+                quick.remembered.capture_type,
+            ),
             None => (
                 Some((area.0.downgrade(), rect_from_corner_points(area.1, area.2))),
                 *capture_type,
@@ -1162,6 +1180,28 @@ impl ScreenshotUi {
     /// Whether this is a `screenshot-quick` session: the crosshair, with no picker around it.
     pub fn is_quick(&self) -> bool {
         matches!(self, Self::Open { quick: Some(_), .. })
+    }
+
+    /// A quick session with nothing dragged out yet: no rectangle, no shade, no handles.
+    ///
+    /// The crosshair *is* the affordance — a rectangle already on screen at open would be one the
+    /// user did not put there, and in a UI with no panel there is nothing else saying what it is.
+    /// Every place that draws, hit-tests or captures the selection asks this first, which is also
+    /// why it is one predicate rather than a flag read five ways: the Window selector is a
+    /// selection of its own, so arming it (Space) leaves this state even with `selected` still
+    /// false.
+    fn crosshair_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Open {
+                quick: Some(Quick {
+                    selected: false,
+                    ..
+                }),
+                capture_type: CaptureType::Selection,
+                ..
+            }
+        )
     }
 
     pub fn is_open(&self) -> bool {
@@ -1487,6 +1527,11 @@ impl ScreenshotUi {
     }
 
     fn update_buffers(&mut self) {
+        // Nothing is selected, so nothing frames a selection — not even the shade on the other
+        // monitors: a press lands on whichever output it happens on, so dimming all but one would
+        // point at a choice the user has not made yet.
+        let crosshair_only = self.crosshair_only();
+
         let Self::Open {
             area,
             output_data,
@@ -1506,7 +1551,11 @@ impl ScreenshotUi {
             let size = data.size;
             let scale = data.scale;
 
-            if output == area_output {
+            if crosshair_only {
+                for buffer in buffers.iter_mut() {
+                    buffer.resize((0., 0.));
+                }
+            } else if output == area_output {
                 // An output that shrank can leave the *area* out of bounds; reset it to the default
                 // rectangle if so. Only the area is written back — the drawn rect is derived below,
                 // and storing Screen's whole-output rect here would be the aliasing this design
@@ -1629,6 +1678,8 @@ impl ScreenshotUi {
     ) {
         let _span = tracy_client::span!("ScreenshotUi::render_output");
 
+        let crosshair_only = self.crosshair_only();
+
         let Self::Open {
             area,
             output_data,
@@ -1730,7 +1781,7 @@ impl ScreenshotUi {
             // The four corner handles ride above the border, and only on the output being captured
             // — the others draw the shade alone. Screen mode has no handles: it takes the whole
             // output, and nothing about that is draggable.
-            if output == &area.0 && *capture_type == CaptureType::Selection {
+            if output == &area.0 && *capture_type == CaptureType::Selection && !crosshair_only {
                 let rect = rect_from_corner_points(area.1, area.2);
                 output_data.push_handles(renderer, rect, progress, push);
             }
@@ -1879,6 +1930,9 @@ impl ScreenshotUi {
                     CaptureType::Window => Action::ScreenshotTypeSelection,
                     _ => Action::ScreenshotTypeWindow,
                 }),
+                // Return needs something to confirm: with the crosshair still empty there is no
+                // rectangle for it to take.
+                Keysym::Return if self.crosshair_only() => None,
                 Keysym::Escape | Keysym::Return => action(raw, mods),
                 Keysym::c if mods.ctrl => action(raw, mods),
                 _ => None,
@@ -1894,6 +1948,10 @@ impl ScreenshotUi {
     /// space its caller then passes to `ScreenshotArea` — output-local physical is what the UI
     /// works in and is not it.
     pub fn selection_rect_global(&self) -> Option<Rectangle<i32, Logical>> {
+        if self.crosshair_only() {
+            return None;
+        }
+
         let Self::Open {
             area,
             output_data,
@@ -2030,6 +2088,7 @@ impl ScreenshotUi {
     /// changed — a rebake and a redraw only happen when it does.
     fn update_hover(&mut self, point: Point<i32, Physical>) -> bool {
         let window_enabled = self.window_enabled();
+        let crosshair_only = self.crosshair_only();
         let Self::Open {
             area,
             output_data,
@@ -2064,6 +2123,8 @@ impl ScreenshotUi {
             {
                 CursorIcon::Default
             }
+            // Nothing to grab yet, so nothing but the crosshair.
+            _ if crosshair_only => CursorIcon::Crosshair,
             // Free pointer over the selectable area: whatever a press here would grab.
             _ => data.map_or(CursorIcon::Crosshair, |data| {
                 area_target(rect_from_corner_points(area.1, area.2), point, data.scale).cursor()
@@ -2131,6 +2192,8 @@ impl ScreenshotUi {
         slot: Option<TouchSlot>,
         move_existing: bool,
     ) -> Option<PointerDown> {
+        let crosshair_only = self.crosshair_only();
+
         let Self::Open {
             area,
             output_data,
@@ -2138,6 +2201,7 @@ impl ScreenshotUi {
             selected_window,
             button,
             cursor,
+            quick,
             ..
         } = self
         else {
@@ -2167,7 +2231,7 @@ impl ScreenshotUi {
         }
 
         if move_existing {
-            if output != area.0 || *capture_type != CaptureType::Selection {
+            if output != area.0 || *capture_type != CaptureType::Selection || crosshair_only {
                 return None;
             }
 
@@ -2229,7 +2293,10 @@ impl ScreenshotUi {
 
         // What the press grabbed. Only a press on the *selection output's* own rectangle can grab
         // it — a second monitor has its own panel but not this selection.
-        let target = if output == area.0 {
+        let target = if crosshair_only {
+            // There is no rectangle to take hold of, so every press starts one.
+            AreaTarget::Outside
+        } else if output == area.0 {
             area_target(
                 rect_from_corner_points(area.1, area.2),
                 point,
@@ -2290,6 +2357,12 @@ impl ScreenshotUi {
                 (Grab::Resize { x, y }, Some(warp))
             }
         };
+
+        // The press is the moment a quick session acquires a selection — before the buffers are
+        // rebuilt below, so the first frame of the drag already draws its shade.
+        if let Some(quick) = quick {
+            quick.selected = true;
+        }
 
         // GNOME sets the cursor inside `_onPress` (`js/ui/screenshot.js:465`, `:519`), and it has
         // to: taking hold of a handle is a cursor change with no motion behind it.
