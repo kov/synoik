@@ -3655,20 +3655,10 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
         }
     }
 
-    let now = synoik.clock.now_unadjusted();
-    let mut deadline = output_state.frame_clock.next_vblank_estimate();
-
-    // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
-    // render(). This can happen for example with unknown presentation time from DRM.
-    if deadline <= now {
-        deadline = now
-            + output_state
-                .frame_clock
-                .refresh_interval()
-                // Unknown refresh interval, i.e. winit backend. Would be good to estimate it
-                // somehow but it's not that important for this code path.
-                .unwrap_or(Duration::from_micros(16_667));
-    }
+    // Real time, not `synoik.clock`: this runs inside `redraw`, which has pinned the compositor
+    // clock at the very vblank being estimated. The deadline itself still goes on the wheel.
+    let now = get_monotonic_time();
+    let deadline = output_state.frame_clock.estimated_vblank_deadline(now);
 
     trace!(
         "queueing estimated vblank timer to fire in {:?}",

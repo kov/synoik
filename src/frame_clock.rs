@@ -249,15 +249,31 @@ impl FrameClock {
         self.next_target(true)
     }
 
-    /// When the next vblank is due, whatever we can or cannot get done by then.
+    /// When the estimated-vblank timer should fire: the next vblank, whatever we can or cannot get
+    /// done by then, asked at `now` — **real** time, never the compositor clock.
     ///
-    /// This is a property of the *display*, so it is what the estimated-vblank fallback timer
-    /// waits on: that timer stands in for a page flip we never made, and pushing it out by what a
-    /// frame would have cost would slow the fallback cadence for a cost no frame is paying.
-    /// [`next_presentation_time`](Self::next_presentation_time) is the one that answers "aim at
-    /// what?" and is allowed to skip a vblank; this one is not.
-    pub fn next_vblank_estimate(&self) -> Duration {
-        self.next_target(false)
+    /// The vblank is a property of the *display*: that timer stands in for a page flip we never
+    /// made, and pushing it out by what a frame would have cost would slow the fallback cadence for
+    /// a cost no frame is paying. [`next_presentation_time`](Self::next_presentation_time) is the
+    /// one that answers "aim at what?" and is allowed to skip a vblank; this one is not.
+    ///
+    /// `Synoik::redraw` pins the compositor clock at the frame's target presentation time, and on a
+    /// frame with nothing to draw that target is exactly the vblank this estimates. Measured
+    /// against it, the estimate always read as already past and was pushed a whole refresh out:
+    /// every no-damage cycle lost a vblank, and a client pacing itself on frame callbacks got one
+    /// tick in three, so a 30 fps video played at 20.
+    pub fn estimated_vblank_deadline(&self, now: Duration) -> Duration {
+        let estimate = self.next_target_from(now, false);
+        if estimate > now {
+            return estimate;
+        }
+        // No cadence to sit in (no presentation time yet): the estimate is `now` itself, and a zero
+        // timer would spin — this frame's callbacks go out right after the render anyway.
+        now + self
+            .refresh_interval()
+            // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
+            // but it's not that important for this code path.
+            .unwrap_or(Duration::from_micros(16_667))
     }
 
     /// Where in the display's cadence `now` sits, if there is a cadence to sit in.
@@ -443,6 +459,29 @@ mod tests {
 
     fn clock() -> FrameClock {
         FrameClock::new(Some(REFRESH), false)
+    }
+
+    /// A frame with nothing to draw waits for the next vblank, not the one after it — asked the
+    /// way the tty backend asks, just after a presentation.
+    #[test]
+    fn a_frame_with_nothing_to_draw_waits_one_vblank_not_two() {
+        let mut c = clock();
+        let presented = Duration::from_secs(1000);
+        c.presented(presented);
+        let next = presented + REFRESH;
+        assert_eq!(
+            c.estimated_vblank_deadline(presented + Duration::from_micros(300)),
+            next
+        );
+
+        // What the compositor clock reads during that redraw: pinned at the frame's target, which
+        // is `next` itself. Asked with it, the estimate is "already past" and goes a refresh out —
+        // the lost vblank. This is why the caller must pass real time.
+        assert_eq!(c.estimated_vblank_deadline(next), next + REFRESH);
+
+        // No presentation yet, so no cadence: never a zero timer.
+        let now = Duration::from_secs(5);
+        assert_eq!(clock().estimated_vblank_deadline(now), now + REFRESH);
     }
 
     /// With nothing measured yet, the target is the next vblank and nothing else — a fresh clock
