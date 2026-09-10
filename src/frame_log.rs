@@ -964,7 +964,7 @@ const CADENCE_MAX: usize = 4;
 struct Stats {
     /// Every redraw that ran, whether or not it drew anything. The percentiles are over these.
     frames: u64,
-    /// Of [`Self::frames`], those that found nothing to draw and handed nothing to the display.
+    /// Of [`Self::frames`], those that handed nothing to the display.
     skipped: u64,
     /// Presentations the display reported back — what reached the screen, and what the
     /// summary's `fps` is. A client committing without damage every vblank makes `frames`
@@ -2561,8 +2561,8 @@ impl FrameLog {
         });
     }
 
-    /// Mark the frame in flight as a redraw that drew nothing (no damage), so the summary can
-    /// count it apart from the ones that reached the screen.
+    /// Mark the frame in flight as a redraw that handed nothing to the display — no damage, or no
+    /// render at all — so the summary can count it apart from the ones that reached the screen.
     pub fn skipped(&mut self) {
         if let Some(frame) = self.in_flight.as_mut() {
             frame.skipped = true;

@@ -12648,6 +12648,8 @@ impl Synoik {
         // the mark set would let some *later* frame's vblank answer for this one.
         if !matches!(res, RenderResult::Submitted) {
             state.shield_frame_queued = false;
+            // `NoDamage` as much as `Skipped`: either way the screen was not flipped.
+            self.frame_log.skipped();
         }
 
         // What this frame cost, start of redraw to handed-to-KMS — the span the next frame's
@@ -12668,8 +12670,6 @@ impl Synoik {
         }
 
         if res == RenderResult::Skipped {
-            self.frame_log.skipped();
-
             // Update the redraw state on failed render.
             state.redraw_state = if let RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) =
