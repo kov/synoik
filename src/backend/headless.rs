@@ -788,7 +788,8 @@ fn on_frame_timer(synoik: &mut Synoik, output: &Output) {
     }
 
     if output_state.unfinished_animations_remain {
-        synoik.queue_redraw_for(output, crate::frame_log::Requester::Animation);
+        let causes = output_state.last_frame_anim_causes;
+        synoik.queue_redraw_for(output, crate::frame_log::Requester::Animation(causes));
     } else {
         synoik.send_frame_callbacks(output);
     }

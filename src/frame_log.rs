@@ -68,6 +68,11 @@
 //!   else on the compositor thread — a D-Bus callback, a burst of client messages, a blocking read
 //!   — reports every frame under budget and leaves no trace but a `cadence` bucket. "It stuttered
 //!   and the log is clean" is what this answers.
+//! - **Who asked for each redraw** ([`Requester`]): a client's window, an animation, or a
+//!   compositor call site. The summary separates flips (`fps`) from redraws and from skips —
+//!   redraws that handed nothing to the display — and a `redraws by` line credits each requester,
+//!   counting the skips it caused alone. A client committing without damage every vblank shows up
+//!   there as redraws at the refresh rate against flips at its content's.
 //!
 //! Neither is much use without knowing what the frame was *doing*, so a logged
 //! frame carries its [`FrameContext`]: element count, whether the damage was
@@ -585,7 +590,7 @@ bitflags::bitflags! {
     /// Bits are deliberately fine-grained where the cost classes differ: a workspace
     /// switch composites *two* workspaces with a crop on the join axis, which is a
     /// different frame shape from any other layout animation.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
     pub struct AnimCauses: u32 {
         /// A workspace switch — a keyboard/programmatic animation, or a touchpad
         /// gesture being dragged. The gesture case is labelling only: a drag does not
@@ -1017,8 +1022,9 @@ pub enum Requester {
     /// A client's commit: the client's attribution id, and the window its surface belongs to
     /// when it belongs to one (`MappedId`).
     Client { client: u64, window: Option<u64> },
-    /// An animation still running when the last frame was built, asking for the next one.
-    Animation,
+    /// Animations still running when the last frame was built, asking for the next one — named,
+    /// so an overview that will not settle and a panel fade that will not stop are two rows.
+    Animation(AnimCauses),
     /// The compositor itself, at this call site.
     Internal(&'static Location<'static>),
 }
@@ -1057,9 +1063,9 @@ fn module_of(location: &'static Location<'static>) -> &'static str {
 }
 
 /// One output's requester breakdown, most redraws first: `firefox[2828]/w7 152 (240 req, 116
-/// sole skips), synoik 12 (synoik.rs:10370), animation 3`. Its own summary line rather than a
-/// clause of the main one, which is long enough already. Internal call sites roll up to their
-/// module, naming the busiest line. Empty when nothing asked.
+/// sole skips), synoik 12 (synoik.rs:10370), animation:overview 3`. Its own summary line rather
+/// than a clause of the main one, which is long enough already. Internal call sites roll up to
+/// their module, naming the busiest line. Empty when nothing asked.
 fn requesters_clause(
     requesters: &HashMap<Requester, RequesterCounts>,
     labels: &HashMap<u64, String>,
@@ -1091,9 +1097,15 @@ fn requesters_clause(
                 });
                 (rows.len() - 1, None)
             }
-            Requester::Animation => {
+            Requester::Animation(causes) => {
+                let names = causes.names();
+                let name = if names.is_empty() {
+                    "animation".to_owned()
+                } else {
+                    format!("animation:{}", names.join("+"))
+                };
                 rows.push(Row {
-                    name: "animation".to_owned(),
+                    name,
                     counts: RequesterCounts::default(),
                     busiest: None,
                 });
@@ -5541,6 +5553,18 @@ mod tests {
             ),
             "{line}"
         );
+
+        // An animation's row names what was animating, so two animations are two rows.
+        note_request(
+            &mut pending,
+            Requester::Animation(AnimCauses::WORKSPACE_SWITCH),
+        );
+        log.begin("out");
+        log.attribute(&mut pending);
+        log.end(None);
+        let line = requesters_clause(&log.stats["out"].requesters, &log.client_labels);
+        let names = AnimCauses::WORKSPACE_SWITCH.names().join("+");
+        assert!(line.contains(&format!("animation:{names} 1")), "{line}");
     }
 
     /// The `aim` histogram must be blind to whether the frame it describes missed — that is the

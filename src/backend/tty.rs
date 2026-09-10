@@ -1898,6 +1898,7 @@ impl Tty {
         // Ends the `output_state` borrow so the frame log (which lives on `synoik`)
         // can be reached below.
         let unfinished_animations_remain = output_state.unfinished_animations_remain;
+        let anim_causes = output_state.last_frame_anim_causes;
 
         if let Some((target, actual)) = missed_deadline {
             synoik
@@ -1916,7 +1917,8 @@ impl Tty {
             surface.vblank_frame = Some(vblank_frame);
 
             if unfinished_animations_remain {
-                synoik.queue_redraw_for(&output, crate::frame_log::Requester::Animation);
+                synoik
+                    .queue_redraw_for(&output, crate::frame_log::Requester::Animation(anim_causes));
             } else {
                 synoik.queue_deferred_redraw(&output);
             }
@@ -1953,7 +1955,8 @@ impl Tty {
         }
 
         if output_state.unfinished_animations_remain {
-            synoik.queue_redraw_for(&output, crate::frame_log::Requester::Animation);
+            let causes = output_state.last_frame_anim_causes;
+            synoik.queue_redraw_for(&output, crate::frame_log::Requester::Animation(causes));
         } else {
             synoik.send_frame_callbacks(&output);
         }
