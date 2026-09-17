@@ -3888,7 +3888,10 @@ impl State {
     /// transition to race, and it is reached through the same key a user has rather than through a
     /// test-only switch. Pinning the *clock* is Fixture-internal and deliberately stays that way.
     pub(crate) fn apply_animation_clock(&mut self, config: &Config) {
-        let rate = 1.0 / config.animations.slowdown.max(0.001);
+        // A floor, not a clamp on the setting: the schema's range already keeps a user out of
+        // here, but the model is reachable from tests and a zero rate is a *frozen* clock, which
+        // is a different thing from a slow one and would hang every animation mid-flight.
+        let rate = self.synoik.gnome_settings.animation_speed.max(0.01);
         let off = config.animations.off || !self.synoik.gnome_settings.enable_animations;
 
         self.synoik.clock.set_rate(rate);
@@ -7763,8 +7766,9 @@ impl Synoik {
 
         let mut animation_clock = Clock::default();
 
-        let rate = 1.0 / config_.animations.slowdown.max(0.001);
-        animation_clock.set_rate(rate);
+        // The rate stays at the clock's own 1.0 here: `org.synoik.animations speed` lives in the
+        // settings model, which is not loaded yet. `State::refresh_animation_clock`, right after
+        // the first `load_and_watch_gsettings`, is what applies it.
         animation_clock.set_complete_instantly(config_.animations.off);
 
         let layout = Layout::new(animation_clock.clone(), &config_);

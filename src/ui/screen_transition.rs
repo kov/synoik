@@ -97,7 +97,7 @@ impl ScreenTransition {
     }
 
     fn alpha(&self) -> f32 {
-        // Screen transition ignores animation slowdown.
+        // Screen transition ignores the animation speed setting.
         let now = self.clock.now_unadjusted();
 
         if self.start_at + DURATION <= now {

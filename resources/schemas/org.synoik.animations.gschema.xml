@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  How fast the shell's own animations run.
+
+  GNOME has no user-facing key for this: org.gnome.desktop.interface
+  enable-animations is all-or-nothing, and St.Settings' slow-down-factor is a
+  debug knob with no schema behind it, settable only through the
+  GNOME_SHELL_SLOWDOWN_FACTOR environment variable (js/ui/environment.js:390).
+  So this is ours, and it is a *speed*, the reciprocal of GNOME's factor —
+  0.5 is half speed, which is what slow_down_factor 2.0 means.
+-->
+<schemalist>
+  <schema id="org.synoik.animations" path="/org/synoik/animations/">
+
+    <key name="speed" type="d">
+      <default>1.0</default>
+      <range min="0.1" max="10.0"/>
+      <summary>Animation speed multiplier</summary>
+      <description>
+        A multiplier on the rate every shell animation advances at. 1.0 is the
+        designed speed, 0.5 runs everything at half speed, 2.0 at double.
+
+        This scales time, not durations: a spring keeps its shape and an easing
+        curve its curve, they just play slower or faster. Animations already
+        running when the value changes finish on the rate they started with.
+
+        It cannot reach zero — that is a frozen clock, not a slow one. To turn
+        animations off, use org.gnome.desktop.interface enable-animations.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

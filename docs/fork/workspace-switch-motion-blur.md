@@ -73,6 +73,11 @@ and after that instant. A one-sided trail would model a shutter that opened wher
 - **Per output.** Both the offscreen and the chain are sized to one output, and two monitors can be
   mid-switch at once; one shared pair fails the offscreen's uniqueness check and reallocates every
   frame that both ask for it.
+- **The exposure is wall-clock; the curve is sampled in clock time.** `org.synoik.animations speed`
+  scales the animation clock, so the sampling window is scaled by `Clock::rate` before it is used.
+  An unscaled window asks the curve how far it travels in 16.67 ms *of animation*, which at half
+  speed is two real frames — double the smear, in the one mode where someone is watching closely
+  enough to have slowed it down.
 
 ## Cost
 

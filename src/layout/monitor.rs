@@ -87,6 +87,8 @@ const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 /// A shutter time, deliberately not the output's refresh interval: the smear should describe the
 /// same motion whether the screen runs at 60 or 144 Hz, and a refresh-derived exposure would make
 /// a fast monitor look sharper for the same gesture. Deterministic, so a test can pin it.
+///
+/// Wall-clock, so the sampling that uses it scales by the animation clock's rate.
 const MOTION_BLUR_EXPOSURE: Duration = Duration::from_micros(16_667);
 
 /// Travel below which the switch is not blurred at all.
@@ -3798,7 +3800,11 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         let now = self.clock.now();
-        let half = MOTION_BLUR_EXPOSURE / 2;
+        // The exposure is a wall-clock quantity, but the curve is sampled in *clock* time, which
+        // `org.synoik.animations speed` scales. At half speed one real frame advances the
+        // animation half as far, so without this the smear would claim twice the travel that
+        // actually lands on screen — and slow motion is exactly when someone is looking closely.
+        let half = MOTION_BLUR_EXPOSURE.mul_f64(self.clock.rate()) / 2;
         let travel_idx = (switch.current_idx_at(now + half)
             - switch.current_idx_at(now.saturating_sub(half)))
         .abs();

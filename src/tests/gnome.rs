@@ -35936,6 +35936,69 @@ fn enable_animations_off_stops_the_shell_animating() {
     );
 }
 
+/// `org.synoik.animations speed` scales how fast every animation runs — half speed takes twice
+/// the frames, double speed half of them.
+///
+/// GNOME has no key for this. `enable-animations` is all-or-nothing, and `St.Settings`'
+/// `slow_down_factor` — the only multiplier in the shell — has no schema behind it: Looking Glass
+/// and `GNOME_SHELL_SLOWDOWN_FACTOR` are its setters (`js/ui/environment.js:390`), so it cannot be
+/// changed in a running session. Ours is a key, and it is a **speed** rather than GNOME's duration
+/// factor, so the number reads the way a playback rate reads.
+///
+/// The assertion is on *frames rendered*, not on the clock's rate: a rate that reached the clock
+/// but not the animations would be invisible to a rate check, and this is the same measurement a
+/// user makes by looking at the screen.
+#[test]
+fn animation_speed_scales_how_long_a_transition_takes() {
+    const FRAME: Duration = Duration::from_micros(16_667);
+
+    /// Frames of *real* time an overview transition takes at this speed.
+    fn frames_to_settle(speed: f64) -> usize {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        let output = f.synoik_output(1);
+
+        f.synoik_state().synoik.gnome_settings.animation_speed = speed;
+        f.synoik_state().refresh_animation_clock();
+        assert_eq!(
+            f.synoik().clock.rate(),
+            speed,
+            "the setting must reach the animation clock as a rate",
+        );
+
+        f.freeze_clock();
+        f.synoik_state().do_action(Action::ToggleOverview, false);
+        f.synoik().advance_animations();
+
+        let mut frames = 0;
+        while f.synoik().layout.are_animations_ongoing(Some(&output)) && frames < 2000 {
+            f.advance_clock(FRAME);
+            f.turn();
+            frames += 1;
+        }
+        assert!(
+            frames > 0 && frames < 2000,
+            "the transition must run and end"
+        );
+        frames
+    }
+
+    let normal = frames_to_settle(1.);
+    let half = frames_to_settle(0.5);
+    let double = frames_to_settle(2.);
+
+    // A frame either side: the loop can only stop on a frame boundary, so the counts are the real
+    // ratio rounded up to one.
+    assert!(
+        half >= normal * 2 - 1 && half <= normal * 2 + 1,
+        "half speed must take about twice the frames: {half} vs {normal}",
+    );
+    assert!(
+        double >= normal / 2 - 1 && double <= normal / 2 + 1,
+        "double speed must take about half the frames: {double} vs {normal}",
+    );
+}
+
 /// `synoik msg windows` reports the window states the client was actually told.
 ///
 /// Everything a consumer could ask about a window's shape used to have to be inferred: the listing

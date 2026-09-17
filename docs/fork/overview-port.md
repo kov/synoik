@@ -660,7 +660,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     a client inside the closure, or the lazy clock resets and re-times everything (the
     headless-animation-clock trap).
   - **Live-validated (2026-07-24)** on a private headless seat with animations **on** and
-    `slowdown 30.0`, three workspaces with the active in the middle — burst screenshots, column-profiled
+    animations slowed 30× (today: `org.synoik.animations speed 0.033`), three workspaces with the active in the middle — burst screenshots, column-profiled
     for the row's extent. Picker → grid: active left edge 69 → 166 → 261 → 426 → 565 → 666 → 735 → 779
     → 803 → 813 → 820, strictly monotone into its settled spot. Grid → picker (Escape): 819 → 737 →
     653 → 569 → 489 → 418 → 361 → 319 → 291 → 274 → 268. Close from the grid: 820 → 648 → 366 → 202 →

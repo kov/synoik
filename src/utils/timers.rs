@@ -16,7 +16,7 @@
 //! turn, through the same callbacks** — only who woke the loop differs.
 //!
 //! Timers are keyed on [`Clock::now_unadjusted`](crate::animation::Clock::now_unadjusted): the
-//! rate knob is animation slowdown, and a key repeat or a save deadline must not stretch with it.
+//! rate knob is animation speed, and a key repeat or a save deadline must not stretch with it.
 
 use std::time::Duration;
 

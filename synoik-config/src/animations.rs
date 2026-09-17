@@ -5,12 +5,12 @@
 // Modified for synoik in 2026.
 
 use crate::utils::MergeWith;
-use crate::FloatOrInt;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Every animation's shape. `off` is ours (the debug/test switch); how *fast* they run is not
+/// here but in the settings model, as `org.synoik.animations speed`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Animations {
     pub off: bool,
-    pub slowdown: f64,
     pub workspace_switch: WorkspaceSwitchAnim,
     pub window_open: WindowOpenAnim,
     pub window_close: WindowCloseAnim,
@@ -27,34 +27,10 @@ pub struct Animations {
     pub overview_open_close: OverviewOpenCloseAnim,
 }
 
-impl Default for Animations {
-    fn default() -> Self {
-        Self {
-            off: false,
-            slowdown: 1.,
-            workspace_switch: Default::default(),
-            horizontal_view_movement: Default::default(),
-            window_movement: Default::default(),
-            window_open: Default::default(),
-            window_close: Default::default(),
-            window_resize: Default::default(),
-            config_notification_open_close: Default::default(),
-            exit_confirmation_open_close: Default::default(),
-            screenshot_ui_open: Default::default(),
-            panel_popover_open_close: Default::default(),
-            quick_settings_detail_open_close: Default::default(),
-            quick_settings_dim: Default::default(),
-            notification_open_close: Default::default(),
-            overview_open_close: Default::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnimationsPart {
     pub off: bool,
     pub on: bool,
-    pub slowdown: Option<FloatOrInt<0, { i32::MAX }>>,
     pub workspace_switch: Option<WorkspaceSwitchAnim>,
     pub window_open: Option<WindowOpenAnim>,
     pub window_close: Option<WindowCloseAnim>,
@@ -77,8 +53,6 @@ impl MergeWith<AnimationsPart> for Animations {
         if part.on {
             self.off = false;
         }
-
-        merge!((self, part), slowdown);
 
         // Animation properties are fairly tied together, except maybe `off`. So let's just save
         // ourselves the work and not merge within individual animations.

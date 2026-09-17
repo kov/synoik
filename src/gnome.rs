@@ -146,6 +146,22 @@ pub struct GnomeSettings {
     ///
     /// [`State::apply_animation_clock`]: crate::synoik::State::apply_animation_clock
     pub enable_animations: bool,
+    /// `org.synoik.animations speed`: a multiplier on the rate animations advance at — 0.5 is
+    /// half speed, 2.0 double. Ours, and a **speed**, where GNOME's undocumented
+    /// `St.Settings.slow_down_factor` is a duration factor (the reciprocal).
+    ///
+    /// GNOME has no user-facing key here at all: `enable-animations` is the only preference, and
+    /// `slow_down_factor` has no schema behind it — Looking Glass and the
+    /// `GNOME_SHELL_SLOWDOWN_FACTOR` environment variable are its only setters
+    /// (`js/ui/environment.js:390`). A key is the better home for it: a running session can be
+    /// slowed to inspect an animation without a restart, which is what an env var cannot do.
+    ///
+    /// Reaches the animation clock through [`State::apply_animation_clock`], and cannot be zero —
+    /// a zero rate is a *frozen* clock, not a slow one. Turning animations off is
+    /// `enable-animations`.
+    ///
+    /// [`State::apply_animation_clock`]: crate::synoik::State::apply_animation_clock
+    pub animation_speed: f64,
     /// `org.gnome.desktop.interface enable-hot-corners`: whether the top-left corner toggles the
     /// overview when the pointer pushes into it (`layout.js:436-443`). GNOME has exactly one hot
     /// corner and no way to move it; which corner is a text-direction question, not a preference.
@@ -418,6 +434,7 @@ impl Default for GnomeSettings {
             center_new_windows: true,
             auto_maximize: true,
             enable_animations: true,
+            animation_speed: 1.,
             enable_hot_corners: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
@@ -710,6 +727,14 @@ impl GnomeSettings {
             picture: resolve_picture_uri(uri.as_str(), options),
             options,
         };
+    }
+
+    /// `org.synoik.animations` — one key, and only ours. Absent on a checkout that never ran
+    /// `scripts/install-test-session.sh`, which leaves the default speed in charge.
+    fn load_animations(&mut self, animations: Option<&gio::Settings>) {
+        if let Some(animations) = animations.filter(|s| settings_has_key(s, "speed")) {
+            self.animation_speed = animations.double("speed");
+        }
     }
 
     fn load_interface(&mut self, interface: &gio::Settings) {
@@ -2614,6 +2639,9 @@ struct Stores {
     synoik_keybindings: Option<gio::Settings>,
     /// `org.synoik.emoji` — the emoji picker's history.
     synoik_emoji: Option<gio::Settings>,
+    /// `org.synoik.animations` — how fast animations run. Ours because GNOME has no
+    /// user-facing key for it; see [`GnomeSettings::animation_speed`].
+    synoik_animations: Option<gio::Settings>,
     /// `org.gtk.gtk4.Settings.EmojiChooser` — GTK's own history, read to seed ours and never
     /// written. Installed by GTK itself, so `None` on a machine without it.
     gtk_emoji_chooser: Option<gio::Settings>,
@@ -2684,6 +2712,7 @@ impl Stores {
             wayland_keybindings: gsettings("org.gnome.mutter.wayland.keybindings", b),
             synoik_keybindings: gsettings("org.synoik.keybindings", b),
             synoik_emoji: gsettings("org.synoik.emoji", b),
+            synoik_animations: gsettings("org.synoik.animations", b),
             gtk_emoji_chooser: gsettings("org.gtk.gtk4.Settings.EmojiChooser", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
@@ -2747,6 +2776,7 @@ impl Stores {
             &self.wayland_keybindings,
             &self.synoik_keybindings,
             &self.synoik_emoji,
+            &self.synoik_animations,
             &self.gtk_emoji_chooser,
             &self.shell_keybindings,
             &self.wm_keybindings,
@@ -2806,6 +2836,7 @@ impl Stores {
             settings.load_shell(shell);
         }
         settings.load_emoji(self.synoik_emoji.as_ref(), self.gtk_emoji_chooser.as_ref());
+        settings.load_animations(self.synoik_animations.as_ref());
         settings.load_switchers(self.app_switcher.as_ref(), self.window_switcher.as_ref());
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
@@ -4728,6 +4759,34 @@ mod tests {
             5,
             "right (4 accels) + down (1 accel) collapse onto next"
         );
+    }
+
+    /// `org.synoik.animations speed` reaches the model through the real store set.
+    ///
+    /// The conformance test beside this one pokes `animation_speed` directly, which pins what the
+    /// *compositor* does with the value and nothing about where it comes from — a store we forgot
+    /// to open, or a key read under the wrong name, would leave that test green and the setting
+    /// dead. Skipped on a checkout that has not installed our schemas.
+    #[test]
+    fn animation_speed_comes_from_our_store() {
+        if !schema_available("org.synoik.animations", Some("speed")) {
+            return;
+        }
+
+        let stores = Rc::new(Stores::open(SettingsStore::Memory));
+        assert_eq!(
+            stores.read().animation_speed,
+            1.,
+            "the schema default is the designed speed",
+        );
+
+        stores
+            .synoik_animations
+            .as_ref()
+            .expect("the schema is installed")
+            .set_double("speed", 0.5)
+            .unwrap();
+        assert_eq!(stores.read().animation_speed, 0.5);
     }
 
     /// The change subscription re-reads the model when a key in any watched
