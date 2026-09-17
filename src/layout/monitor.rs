@@ -4417,20 +4417,19 @@ impl<W: LayoutElement> Monitor<W> {
             let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
 
-            // Clip each miniature to its workspace, and to the part of it the band
-            // leaves visible. Both live in *workspace* coordinates, because the crop
-            // is applied before the thumbnail's rescale and relocate.
-            let x0 = ((band.loc.x - thumb.loc.x) / thumb_scale).max(0.);
-            let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / thumb_scale).min(self.view_size.w);
-            if x1 <= x0 {
-                // Scrolled entirely out of the band.
+            // Clip each miniature to its workspace, to the part of it the band leaves visible,
+            // and to the work area — see [`thumbnail_crop`].
+            let Some(crop_bounds) = thumbnail_crop(
+                band,
+                thumb,
+                thumb_scale,
+                self.view_size,
+                self.working_area.loc.y,
+            ) else {
+                // Scrolled entirely out of the band, or still above the work area.
                 continue;
-            }
-            let crop_bounds = Rectangle::new(
-                Point::from((x0, 0.)),
-                Size::from((x1 - x0, self.view_size.h)),
-            )
-            .to_physical_precise_round(scale);
+            };
+            let crop_bounds = crop_bounds.to_physical_precise_round(scale);
 
             macro_rules! push_thumb {
                 () => {{
@@ -4611,18 +4610,18 @@ impl<W: LayoutElement> Monitor<W> {
         let thumb_scale = strip_scale * grow;
         let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
 
-        // The same band clip the real thumbnails get, in the same pre-transform
-        // (workspace) coordinates.
-        let x0 = ((band.loc.x - thumb.loc.x) / thumb_scale).max(0.);
-        let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / thumb_scale).min(self.view_size.w);
-        if x1 <= x0 {
+        // The same clip the real thumbnails get, in the same pre-transform (workspace)
+        // coordinates.
+        let Some(crop_bounds) = thumbnail_crop(
+            band,
+            thumb,
+            thumb_scale,
+            self.view_size,
+            self.working_area.loc.y,
+        ) else {
             return;
-        }
-        let crop_bounds = Rectangle::new(
-            Point::from((x0, 0.)),
-            Size::from((x1 - x0, self.view_size.h)),
-        )
-        .to_physical_precise_round(scale);
+        };
+        let crop_bounds = crop_bounds.to_physical_precise_round(scale);
 
         let radius = self.strip_background_radius();
         let mut wallpapered = false;
@@ -5366,6 +5365,40 @@ impl InactiveDistance {
 /// One expression, because the close button has to land on the drawn rect and not on the
 /// slot: the workspaces that grow a close button are the empty ones, which are hardly ever
 /// the active one, so they are hardly ever drawn at slot size.
+/// The part of a thumbnail that is actually visible: the band clips it along the strip as it
+/// scrolls, and the work area clips it from above as it slides in.
+///
+/// In *workspace* coordinates, because the crop is applied before the thumbnail's rescale and
+/// relocate. `None` once nothing is left of it.
+///
+/// The vertical half is what keeps the strip out of the panel. It slides in from above the top of
+/// the screen, so on its way it crosses the panel's band; the panel is transparent while the
+/// overview is up (`#panel:overview`, `_panel.scss:98-102`) and a thumbnail carries its own
+/// *unblurred* wallpaper, so uncropped it shows straight through the panel for the two or three
+/// frames the strip takes to clear it — measured on the seat as wallpaper-bright pixels reaching
+/// row 13 of a 32px panel, on every overview transition, in both directions.
+fn thumbnail_crop(
+    band: Rectangle<f64, Logical>,
+    thumb: Rectangle<f64, Logical>,
+    thumb_scale: f64,
+    view_size: Size<f64, Logical>,
+    work_top: f64,
+) -> Option<Rectangle<f64, Logical>> {
+    let x0 = ((band.loc.x - thumb.loc.x) / thumb_scale).max(0.);
+    let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / thumb_scale).min(view_size.w);
+    let y0 = ((work_top - thumb.loc.y) / thumb_scale).max(0.);
+    let y1 = view_size.h;
+
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    Some(Rectangle::new(
+        Point::from((x0, y0)),
+        Size::from((x1 - x0, y1 - y0)),
+    ))
+}
+
 fn thumbnail_drawn_rect(
     slot: Rectangle<f64, Logical>,
     shrink: f64,
@@ -5548,5 +5581,68 @@ mod row_tests {
                 "row not rigid at render_idx={idx}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// A 1920x1080 workspace drawn into a 480x270 slot — a quarter scale, which keeps the
+    /// workspace-coordinate arithmetic readable.
+    const SCALE: f64 = 0.25;
+
+    fn view() -> Size<f64, Logical> {
+        Size::from((1920., 1080.))
+    }
+
+    fn band() -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((0., 40.)), Size::from((1920., 270.)))
+    }
+
+    fn thumb_at(y: f64) -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((100., y)), Size::from((480., 270.)))
+    }
+
+    /// The strip slides in from above the top of the screen, so on the way it crosses the panel —
+    /// which is transparent while the overview is up. A thumbnail carries its own unblurred
+    /// wallpaper, so one still crossing the panel has to be cropped to the work area or the
+    /// picture shows straight through the panel.
+    #[test]
+    fn a_thumbnail_crossing_the_panel_is_cropped_to_the_work_area() {
+        let work_top = 32.;
+        let thumb = thumb_at(12.);
+
+        let crop = thumbnail_crop(band(), thumb, SCALE, view(), work_top)
+            .expect("most of the thumbnail is below the panel, so it still draws");
+
+        // The crop is in workspace coordinates, so it scales back by SCALE to output ones.
+        let visible_top = thumb.loc.y + crop.loc.y * SCALE;
+        assert!(
+            (visible_top - work_top).abs() < 1e-9,
+            "the visible top must land exactly on the work area, got {visible_top}"
+        );
+    }
+
+    #[test]
+    fn a_thumbnail_clear_of_the_panel_keeps_its_full_height() {
+        let crop = thumbnail_crop(band(), thumb_at(40.), SCALE, view(), 32.).unwrap();
+        assert_eq!(crop.loc.y, 0., "there is nothing above it to clip against");
+        assert_eq!(crop.size.h, view().h);
+    }
+
+    /// Fully above the work area — 270px at quarter scale is the whole 1080px workspace, so a
+    /// thumbnail this far up has nothing left below the panel.
+    #[test]
+    fn a_thumbnail_still_entirely_above_the_work_area_draws_nothing() {
+        assert!(thumbnail_crop(band(), thumb_at(-240.), SCALE, view(), 32.).is_none());
+    }
+
+    /// The horizontal half of the clip, unchanged: a thumbnail scrolled off the end of the band
+    /// draws nothing either.
+    #[test]
+    fn a_thumbnail_scrolled_out_of_the_band_draws_nothing() {
+        let thumb = Rectangle::new(Point::from((2400., 40.)), Size::from((480., 270.)));
+        assert!(thumbnail_crop(band(), thumb, SCALE, view(), 32.).is_none());
     }
 }
