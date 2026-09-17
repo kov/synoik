@@ -853,15 +853,12 @@ impl Avatar {
                 }
             }
         }
-        let tb = uploads.map.get(&key)?;
-        // Re-tag at the page's scale: dividing the buffer scale magnifies.
-        let tb = TextureBuffer::from_texture(
-            renderer,
-            tb.texture().clone(),
-            scale / page_scale.max(f64::EPSILON),
-            Transform::Normal,
-            Vec::new(),
-        );
+        // Re-tag at the page's scale: dividing the buffer scale magnifies. Set on a clone of the
+        // cached buffer rather than built fresh — `from_texture` mints a new `Id`, so re-tagging
+        // that way told the damage tracker every frame that the old element was gone and a
+        // stranger had arrived, and the avatar was fully redrawn for the life of the crossfade.
+        let mut tb = uploads.map.get(&key)?.clone();
+        tb.set_texture_scale(scale / page_scale.max(f64::EPSILON));
         let logical = tb.logical_size();
         let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
         let inner = TextureRenderElement::from_texture_buffer(
