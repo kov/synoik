@@ -4787,6 +4787,26 @@ mod tests {
             .set_double("speed", 0.5)
             .unwrap();
         assert_eq!(stores.read().animation_speed, 0.5);
+
+        // The schema's own range is the first guard, and the only one a user meets: a write
+        // outside it is refused by GSettings rather than stored. Without the `<range>` element
+        // `gsettings set … 0` would succeed and hand the compositor a frozen clock.
+        for bad in [0., -1., 11.] {
+            assert!(
+                stores
+                    .synoik_animations
+                    .as_ref()
+                    .unwrap()
+                    .set_double("speed", bad)
+                    .is_err(),
+                "the schema must refuse speed {bad}",
+            );
+        }
+        assert_eq!(
+            stores.read().animation_speed,
+            0.5,
+            "a refused write must leave the value alone",
+        );
     }
 
     /// The change subscription re-reads the model when a key in any watched

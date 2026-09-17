@@ -35999,6 +35999,55 @@ fn animation_speed_scales_how_long_a_transition_takes() {
     );
 }
 
+/// No animation speed can leave a clock that does not run.
+///
+/// The schema's range keeps a user away from these, but the model is a plain `f64` that anything
+/// in-process can write, and the failure is the worst kind: a zero rate does not error or look
+/// wrong, it *stops time*, and every animation stays frozen mid-transition — an overview half
+/// open, a window half resized — for the rest of the session. So the floor is checked against the
+/// values that get there, NaN included (`f64::max` returns the other operand for NaN, which is
+/// what makes the one-line floor enough).
+#[test]
+fn no_animation_speed_can_stop_the_clock() {
+    // Big steps, because the floor is 1/100 speed: one second of real time per step is 10 ms of
+    // animation there, and this has to reach the end of a transition at every speed in the list.
+    const STEP: Duration = Duration::from_secs(1);
+
+    for speed in [0., -3., f64::NAN, f64::INFINITY, f64::MAX] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        let output = f.synoik_output(1);
+
+        f.synoik_state().synoik.gnome_settings.animation_speed = speed;
+        f.synoik_state().refresh_animation_clock();
+
+        let rate = f.synoik().clock.rate();
+        assert!(
+            rate.is_finite() && rate > 0.,
+            "speed {speed} left the clock at rate {rate}",
+        );
+
+        f.freeze_clock();
+        f.synoik_state().do_action(Action::ToggleOverview, false);
+        f.synoik().advance_animations();
+
+        let mut steps = 0;
+        while f.synoik().layout.are_animations_ongoing(Some(&output)) && steps < 200 {
+            f.advance_clock(STEP);
+            f.turn();
+            steps += 1;
+        }
+        assert!(
+            steps < 200,
+            "speed {speed}: the overview transition never ended",
+        );
+        assert!(
+            f.synoik().layout.is_overview_open(),
+            "speed {speed}: and it must have ended open",
+        );
+    }
+}
+
 /// `synoik msg windows` reports the window states the client was actually told.
 ///
 /// Everything a consumer could ask about a window's shape used to have to be inferred: the listing
