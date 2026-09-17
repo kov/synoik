@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{anyhow, Context, Result};
@@ -63,6 +63,65 @@ fn device_lifecycle_lock() -> std::sync::MutexGuard<'static, ()> {
 /// is set, since without it no layer is loaded and nothing reports.
 pub fn validation_errors() -> usize {
     VALIDATION_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Set when a device is built on a driver that will not report DMA_BUF as a compatible image
+/// handle type. See [`reports_external_image_compat`].
+static EXTERNAL_IMAGE_COMPAT_UNREPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The VUIDs the layer raises, on every dmabuf image, when the driver answers that query with
+/// `VK_ERROR_FORMAT_NOT_SUPPORTED`. All three are the same fault: the first at `vkCreateImage`,
+/// the other two when the memory is bound.
+const EXTERNAL_COMPAT_VUIDS: [&str; 3] = [
+    "VUID-VkImageCreateInfo-pNext-00990",
+    "VUID-VkExportMemoryAllocateInfo-handleTypes-09860",
+    "VUID-VkImportMemoryWin32HandleInfoKHR-handleType-09861",
+];
+
+/// Whether a reported violation should fail the run.
+///
+/// Everything counts, except the three external-memory VUIDs *while the driver is known not to
+/// report external image compatibility at all* — on such a driver they fire on every dmabuf image
+/// and say nothing about our code. Tying the exemption to the measurement rather than to a driver
+/// name is what makes it self-retiring: the day the driver answers the query properly, the flag
+/// stays clear and these VUIDs fail the run again, as they should, because then they would mean
+/// something.
+fn counts_as_validation_failure(vuid: Option<&str>, external_compat_unreported: bool) -> bool {
+    if !external_compat_unreported {
+        return true;
+    }
+    !vuid.is_some_and(|v| EXTERNAL_COMPAT_VUIDS.contains(&v))
+}
+
+/// Does this device report DMA_BUF as a compatible external handle type for images?
+///
+/// This is the query VUID-VkImageCreateInfo-pNext-00990 is written against, asked in its simplest
+/// valid form — ordinary tiling, so no DRM-modifier structure is required in the chain.
+///
+/// **Measured 2026-09-17, Venus (virtio-gpu) on an M4 Pro: `VK_ERROR_FORMAT_NOT_SUPPORTED`, with
+/// `compatibleHandleTypes` empty, for every tiling (`OPTIMAL`, `LINEAR`, `DRM_FORMAT_MODIFIER_EXT`)
+/// and every usage we allocate.** Drop the external-handle structure from the chain and the same
+/// query succeeds, so it is that structure the driver refuses, not the format. Our dmabuf import
+/// and export work regardless — the render tests assert the pixels — so this is the driver
+/// declining to describe a capability it has, not a capability we lack.
+fn reports_external_image_compat(instance: &ash::Instance, phys: vk::PhysicalDevice) -> bool {
+    let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut ext_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED)
+        .push_next(&mut ext);
+    let queried =
+        unsafe { instance.get_physical_device_image_format_properties2(phys, &info, &mut props) };
+    queried.is_ok()
+        && ext_props
+            .external_memory_properties
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 }
 
 /// Registers [`fail_on_validation_errors`] once per process.
@@ -117,8 +176,20 @@ unsafe extern "system" fn debug_callback(
         // loader's complaint meant the *run* aborted instead, dumping a 13 MB core and reading
         // exactly like a renderer bug. Seen once on 2026-08-14 and it cost an investigation.
         // Everything is still printed below — this changes what fails a run, not what you can see.
-        let counts = types.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION);
-        if counts && severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        let is_error = types.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION)
+            && severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR);
+
+        let vuid = unsafe { (*data).p_message_id_name };
+        let vuid = if vuid.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(vuid) }.to_string_lossy())
+        };
+        let counted = counts_as_validation_failure(
+            vuid.as_deref(),
+            EXTERNAL_IMAGE_COMPAT_UNREPORTED.load(Ordering::Relaxed),
+        );
+        if is_error && counted {
             VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -128,7 +199,12 @@ unsafe extern "system" fn debug_callback(
         } else {
             unsafe { CStr::from_ptr(message) }.to_string_lossy()
         };
-        eprintln!("VULKAN {severity:?} {types:?}: {message}");
+        let tag = if is_error && !counted {
+            " (NOT COUNTED: this driver reports no DMA_BUF image compatibility)"
+        } else {
+            ""
+        };
+        eprintln!("VULKAN {severity:?} {types:?}{tag}: {message}");
     });
 
     vk::FALSE
@@ -442,6 +518,28 @@ impl Gpu {
             eprintln!("  enabling device extensions: {enabled_extensions:?}");
         }
 
+        // One query per device, and only where dmabuf is in play: a driver that will not describe
+        // DMA_BUF image compatibility makes the layer raise three VUIDs on every dmabuf image we
+        // create or import, none of them about our code. `counts_as_validation_failure` exempts
+        // exactly those three, and only while this is set.
+        let dmabuf_ready = [
+            "VK_EXT_external_memory_dma_buf",
+            "VK_KHR_external_memory_fd",
+            "VK_EXT_image_drm_format_modifier",
+        ]
+        .iter()
+        .all(|want| enabled_extensions.iter().any(|e| e == want));
+        if dmabuf_ready
+            && !reports_external_image_compat(&instance, phys)
+            && !EXTERNAL_IMAGE_COMPAT_UNREPORTED.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "  this driver reports no DMA_BUF image compatibility; {} are printed but not \
+                 counted as validation failures",
+                EXTERNAL_COMPAT_VUIDS.join(", ")
+            );
+        }
+
         // Timeline semaphores (core in 1.2, still opt-in as a feature) are what lets a submit be
         // left in flight without letting the next one execute alongside it. See [`SubmitOrder`].
         let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -602,6 +700,12 @@ impl Gpu {
     /// `vkGetPhysicalDeviceImageFormatProperties2`, and `vkCreateImage` then creates it happily. So
     /// there is no second query to lean on — this enumeration is the only honest gate, which is
     /// exactly why an absence from a *populated* list is treated as an answer.
+    ///
+    /// That query is untrustworthy in **both** directions, and the other one is why
+    /// [`reports_external_image_compat`] exists: ask it with a `VkPhysicalDeviceExternal-
+    /// ImageFormatInfo` in the chain and Venus refuses every handle type, for every tiling and
+    /// usage, on images it then imports and exports perfectly well. Permissive about modifiers it
+    /// cannot back, refusing about capabilities it has — either way, not a gate.
     pub fn check_modifier_features(
         &self,
         format: vk::Format,
@@ -1237,5 +1341,34 @@ mod tests {
             vk::FormatFeatureFlags::BLIT_DST,
         );
         assert!(res.is_err(), "accepted a modifier no device can import");
+    }
+
+    /// The external-memory exemption is tied to the measurement, never to a driver name.
+    ///
+    /// A truth table over the predicate rather than an assertion about a device: the property
+    /// worth pinning is that those three VUIDs stop failing a run *only* while this driver has
+    /// been measured not to report external image compatibility. A test asserting what Venus
+    /// answers today would go red for the wrong reason the day Venus is fixed — this one stays
+    /// green in both worlds, and the exemption turns itself off.
+    #[test]
+    fn only_an_unreporting_driver_exempts_the_external_memory_vuids() {
+        let exempt = "VUID-VkImageCreateInfo-pNext-00990";
+        let unrelated = "VUID-vkCmdBlitImage-dstImage-02000";
+
+        // A driver that answers the query: everything counts, these three included — there they
+        // would be about us.
+        assert!(counts_as_validation_failure(Some(exempt), false));
+        assert!(counts_as_validation_failure(Some(unrelated), false));
+        assert!(counts_as_validation_failure(None, false));
+
+        // One that does not: exactly the three, and nothing else.
+        for vuid in EXTERNAL_COMPAT_VUIDS {
+            assert!(
+                !counts_as_validation_failure(Some(vuid), true),
+                "{vuid} should not fail a run on a driver that reports no external compatibility"
+            );
+        }
+        assert!(counts_as_validation_failure(Some(unrelated), true));
+        assert!(counts_as_validation_failure(None, true));
     }
 }
