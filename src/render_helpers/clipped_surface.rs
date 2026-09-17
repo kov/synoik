@@ -111,6 +111,14 @@ impl ClippedSurfaceRenderElement {
     }
 }
 
+/// FNV-1a over the bit patterns of a draw's continuous inputs, for [`Element::draw_key`].
+///
+/// By bit pattern rather than rounded: the question is only whether anything changed, and a
+/// rounded key goes stale within its own step.
+fn fold_draw_key(key: u64, bits: u64) -> u64 {
+    (key ^ bits).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
 impl Element for ClippedSurfaceRenderElement {
     fn id(&self) -> &Id {
         self.inner.id()
@@ -137,7 +145,6 @@ impl Element for ClippedSurfaceRenderElement {
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        // FIXME: radius changes need to cause damage.
         let damage = self.inner.damage_since(scale, commit);
 
         // Intersect with geometry, since we're clipping by it.
@@ -147,6 +154,29 @@ impl Element for ClippedSurfaceRenderElement {
             .into_iter()
             .filter_map(|rect| rect.intersection(geo))
             .collect()
+    }
+
+    fn draw_key(&self) -> u64 {
+        // `draw` clips to `geometry` with `corner_radius`, both in logical units converted by
+        // `scale`, and none of the three is part of the instance key the tracker compares. A
+        // radius that changes while the surface sits still would leave the pixels drawn at the
+        // old one; so would a clip rect that moves while the inner element holds where it is,
+        // since `geometry()` reports the inner element's rect, not the clip.
+        let mut key = 0xcbf2_9ce4_8422_2325;
+        for bits in [
+            u64::from(self.corner_radius.top_left.to_bits()),
+            u64::from(self.corner_radius.top_right.to_bits()),
+            u64::from(self.corner_radius.bottom_right.to_bits()),
+            u64::from(self.corner_radius.bottom_left.to_bits()),
+            u64::from(self.scale.to_bits()),
+            self.geometry.loc.x.to_bits(),
+            self.geometry.loc.y.to_bits(),
+            self.geometry.size.w.to_bits(),
+            self.geometry.size.h.to_bits(),
+        ] {
+            key = fold_draw_key(key, bits);
+        }
+        key
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
