@@ -36048,6 +36048,183 @@ fn no_animation_speed_can_stop_the_clock() {
     }
 }
 
+/// A switch that skips over workspaces leaves the ones it passes at the size they were.
+///
+/// gnome-shell scales each workspace by its distance from the *animated* scroll position
+/// (`_updateWorkspacesState`, `workspacesView.js:243-266`), which is complete for gnome-shell
+/// because its keyboard switch lays out only `[from, to]`, side by side. Our row is continuous, so
+/// a 6→1 switch drags four workspaces through the middle of the screen, and under that rule each
+/// one swelled from 0.94 to full size and shrank back as it transited the centre. The slot pitch is
+/// fixed, so the swelling went into the gaps: measured at 1920x1080, the gap between neighbours
+/// pumped 97px → 61px → 97px four times over while the row flowed past — the strip wobbling.
+///
+/// Note what this does *not* assert: that nothing moves backwards. The row travels 200-300px per
+/// frame, so a 73px swell never turns a step negative, and a backward-motion check calls the
+/// wobbling row perfectly clean. Size is the axis the bug is on.
+///
+/// `docs/fork/workspace-inactive-scale-divergence.md`.
+#[test]
+fn a_switch_that_skips_workspaces_leaves_their_size_alone() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 6);
+    f.settle();
+
+    // In the overview, because the inactive shrink is ramped in with the overview progress: on a
+    // plain desktop the ramp is 0, nothing resizes, and the assertions could not come out the
+    // other way.
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle();
+
+    let widths = |f: &mut Fixture| -> Vec<f64> {
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+        let horizontal = mon.workspaces_horizontal();
+        mon.workspaces_render_geo()
+            .map(|r| if horizontal { r.size.w } else { r.size.h })
+            .collect()
+    };
+    let active = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+
+    let from = active(&mut f);
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(1)),
+        false,
+    );
+    let frames = f.sample_every_frame(3000, widths);
+    let to = active(&mut f);
+
+    assert!(
+        from.abs_diff(to) > 1,
+        "this must be a switch that skips workspaces, went {from} -> {to}"
+    );
+    assert!(
+        frames.len() > 4,
+        "the switch must animate, got {} frames",
+        frames.len()
+    );
+
+    for w in 0..frames[0].len() {
+        let series: Vec<f64> = frames.iter().map(|r| r[w]).collect();
+        let (mut grew, mut shrank) = (0f64, 0f64);
+        for pair in series.windows(2) {
+            grew = grew.max(pair[1] - pair[0]);
+            shrank = shrank.min(pair[1] - pair[0]);
+        }
+        assert!(
+            grew <= 1. || shrank >= -1.,
+            "workspace {w} both grew {grew:.1}px and shrank {shrank:.1}px during one switch, \
+             which is the wobble: {series:?}"
+        );
+
+        // The ones merely passed over must not resize at all. Without this the test would also
+        // pass on a build that resized every workspace monotonically to nothing.
+        if w != from && w != to {
+            let (lo, hi) = series
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+            assert!(
+                hi - lo <= 1.,
+                "the switch only passes over workspace {w}, so its size must not move: {series:?}"
+            );
+        }
+    }
+
+    // And the cue itself still happens, or "nothing ever resizes" would pass everything above.
+    let (first, last) = (&frames[0], frames.last().unwrap());
+    assert!(
+        last[to] > first[to] + 1.,
+        "the workspace being switched to must grow to full size, {} -> {}",
+        first[to],
+        last[to]
+    );
+    assert!(
+        last[from] < first[from] - 1.,
+        "the workspace being left must take the inactive shrink, {} -> {}",
+        first[from],
+        last[from]
+    );
+}
+
+/// The case gnome-shell actually has: switching to the workspace next door still trades size
+/// between the two, smoothly, and both ends of that trade are visible mid-flight.
+///
+/// The divergence in [`a_switch_that_skips_workspaces_leaves_their_size_alone`] is defined so that
+/// an adjacent switch is byte-for-byte unchanged — with `from` and `to` one apart, interpolating
+/// the endpoint distances and measuring the distance of the interpolated position are the same
+/// expression. This is what stops that claim from quietly becoming "nothing resizes any more".
+#[test]
+fn an_adjacent_switch_still_trades_size_between_the_two_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 6);
+    f.settle();
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle();
+
+    let widths = |f: &mut Fixture| -> Vec<f64> {
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+        let horizontal = mon.workspaces_horizontal();
+        mon.workspaces_render_geo()
+            .map(|r| if horizontal { r.size.w } else { r.size.h })
+            .collect()
+    };
+    let active = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+
+    let from = active(&mut f);
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    let frames = f.sample_every_frame(3000, widths);
+    let to = active(&mut f);
+    assert_eq!(
+        from.abs_diff(to),
+        1,
+        "FocusWorkspaceUp must move exactly one workspace, went {from} -> {to}"
+    );
+
+    let leaving: Vec<f64> = frames.iter().map(|r| r[from]).collect();
+    let arriving: Vec<f64> = frames.iter().map(|r| r[to]).collect();
+
+    for pair in leaving.windows(2) {
+        assert!(
+            pair[1] <= pair[0] + 1.,
+            "the workspace being left must only shrink: {leaving:?}"
+        );
+    }
+    for pair in arriving.windows(2) {
+        assert!(
+            pair[1] >= pair[0] - 1.,
+            "the workspace being arrived at must only grow: {arriving:?}"
+        );
+    }
+
+    let ends = (arriving[0], *arriving.last().unwrap());
+    assert!(
+        ends.1 > ends.0 + 1.,
+        "the arriving workspace must end bigger than it started: {arriving:?}"
+    );
+    assert!(
+        arriving
+            .iter()
+            .any(|w| *w > ends.0 + 1. && *w < ends.1 - 1.),
+        "it must ramp between the two sizes rather than snap: {arriving:?}"
+    );
+}
+
 /// `synoik msg windows` reports the window states the client was actually told.
 ///
 /// Everything a consumer could ask about a window's shape used to have to be inferred: the listing

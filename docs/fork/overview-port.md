@@ -557,6 +557,9 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     anchor don't move, and hit-testing / drag targets / shadows all follow the same rect.
     **Divergence:** gnome-shell scales overview-only actors, so ours ramps in with the overview
     progress or a desktop workspace switch would shrink both workspaces mid-slide.
+    **Second divergence:** the distance is measured between the start and end layouts rather than
+    from the animated scroll position, so a switch that skips workspaces doesn't swell each one it
+    passes over — `docs/fork/workspace-inactive-scale-divergence.md`.
 - **S8e — Overview interaction fidelity (reported live, 2026-07-24). ✅ DONE.** A second batch
   Gustavo spotted, all reference-cited and headless-pinned:
   - **Double-Super opens the app grid (`e4e4a0bf`).** A second overlay-key tap that lands while the

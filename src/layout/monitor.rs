@@ -2533,15 +2533,37 @@ impl<W: LayoutElement> Monitor<W> {
         } else {
             0.
         };
-        workspace_render_scale(self.workspace_scroll_position(), idx, ramp)
+        workspace_render_scale(self.workspace_inactive_distance(), idx, ramp)
     }
 
     pub fn workspace_render_scale(&self, idx: usize) -> f64 {
         workspace_render_scale(
-            self.workspace_scroll_position(),
+            self.workspace_inactive_distance(),
             idx,
             self.workspace_inactive_ramp(),
         )
+    }
+
+    /// What the inactive shrink measures distance against — see [`InactiveDistance`].
+    fn workspace_inactive_distance(&self) -> InactiveDistance {
+        let switch = match &self.workspace_switch {
+            // A fling counts as the gesture it continues: the user has been dragging the row
+            // through these workspaces and is still watching that same motion settle.
+            Some(WorkspaceSwitch::Animation(anim)) if !self.workspace_switch_from_gesture => {
+                let (from, to) = (anim.from(), anim.to());
+                let progress = if to == from {
+                    1.
+                } else {
+                    ((anim.value() - from) / (to - from)).clamp(0., 1.)
+                };
+                Some((from, to, progress))
+            }
+            _ => None,
+        };
+        InactiveDistance {
+            scroll_position: self.workspace_scroll_position(),
+            switch,
+        }
     }
 
     /// Where workspace 0 starts on the strip axis, and how far apart consecutive
@@ -3842,7 +3864,7 @@ impl<W: LayoutElement> Monitor<W> {
         // nor its centered anchor move; only the workspace drawn in it shrinks,
         // about the slot's center like gnome-shell's centered pivot.
         let ramp = self.workspace_inactive_ramp();
-        let scroll_position = self.workspace_scroll_position();
+        let distance = self.workspace_inactive_distance();
         let view_size = self.view_size;
 
         // Return position for one-past-last workspace too.
@@ -3855,7 +3877,7 @@ impl<W: LayoutElement> Monitor<W> {
             };
             let loc = loc + static_offset;
 
-            let ws_scale = workspace_render_scale(scroll_position, idx, ramp);
+            let ws_scale = workspace_render_scale(distance, idx, ramp);
             let size = if ws_scale == 1. {
                 ws_size
             } else {
@@ -5290,9 +5312,50 @@ impl<W: LayoutElement> Monitor<W> {
 ///
 /// A free function so the render-geometry iterator can call it from a `move`
 /// closure over plain `Copy` inputs without re-deriving the formula.
-fn workspace_render_scale(scroll_position: f64, idx: usize, ramp: f64) -> f64 {
-    let distance = (scroll_position - idx as f64).abs().clamp(0., 1.);
-    1. - (1. - WORKSPACE_INACTIVE_SCALE) * distance * ramp
+fn workspace_render_scale(distance: InactiveDistance, idx: usize, ramp: f64) -> f64 {
+    1. - (1. - WORKSPACE_INACTIVE_SCALE) * distance.for_idx(idx) * ramp
+}
+
+/// How far each workspace counts as being from "the one you are on", which is what the inactive
+/// shrink is a function of.
+///
+/// **Divergence.** gnome-shell measures this straight off the animated scroll position
+/// (`_updateWorkspacesState`, `workspacesView.js:258`), and for gnome-shell that is complete: its
+/// keyboard switch lays out only `[from, to]`, side by side, so nothing else ever moves. Our row is
+/// continuous — a switch from 6 to 1 drags four intermediate workspaces through the middle of the
+/// screen — and each one, passing the centre, would swell from 0.94 to 1 and shrink back. The
+/// pitch between slots is fixed, so that pumps the gap between neighbours open and shut (measured:
+/// 97px → 61px → 97px at 1920x1080) while the row flows past. It reads as the whole strip wobbling.
+///
+/// So during a switch the distance is interpolated between the layout at the start and the layout
+/// at the end, rather than measured from a position part-way between them. The workspace being
+/// left shrinks, the one being arrived at grows, and everything the row merely passes over stays
+/// inactive-sized the whole way.
+///
+/// For an *adjacent* switch the two are the same expression: with `from` and `to` one apart, each
+/// endpoint distance is linear in the scroll position over the whole range, so interpolating the
+/// distances and taking the distance of the interpolated position agree exactly. The divergence
+/// only bites where gnome-shell has no equivalent case.
+///
+/// A gesture is left alone deliberately. There the row is tracking a finger, the user is scrolling
+/// *through* those workspaces rather than past them, and each one growing as it reaches the centre
+/// is the point rather than an artifact.
+#[derive(Debug, Clone, Copy)]
+struct InactiveDistance {
+    /// gnome-shell's `_scrollAdjustment.value` — see [`Monitor::workspace_scroll_position`].
+    scroll_position: f64,
+    /// An animated, non-gesture switch, as `(from, to, progress)`.
+    switch: Option<(f64, f64, f64)>,
+}
+
+impl InactiveDistance {
+    fn for_idx(self, idx: usize) -> f64 {
+        let at = |pos: f64| (pos - idx as f64).abs().clamp(0., 1.);
+        match self.switch {
+            Some((from, to, t)) => at(from) + (at(to) - at(from)) * t,
+            None => at(self.scroll_position),
+        }
+    }
 }
 
 /// Where a thumbnail is actually *drawn* inside its strip slot: inactive workspaces

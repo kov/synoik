@@ -284,6 +284,50 @@ impl Fixture {
         settled
     }
 
+    /// [`run_until_settled`](Self::run_until_settled), recording `f` once per **rendered frame**.
+    ///
+    /// The difference from [`sample_animation`](Self::sample_animation) is what the samples are
+    /// spaced by. That one pins the clock at `n` equal fractions of a span the caller guesses,
+    /// which answers "what shape is this curve" — but the frames it names never happened, and the
+    /// end of a spring, where the value moves least per unit time, gets whichever one or two
+    /// samples land there. This runs the real loop and samples the frames the session would
+    /// actually draw, including the trailing reconcile frame, which is where a transition that
+    /// ends on a snap shows it.
+    ///
+    /// The first sample is taken before any frame runs, so `samples[0]` is the state the
+    /// transition starts from.
+    ///
+    /// Trigger the transition before calling. The clock is frozen for the duration and left as it
+    /// was found, like `run_until_settled`.
+    pub fn sample_every_frame<T>(
+        &mut self,
+        max_frames: usize,
+        mut f: impl FnMut(&mut Self) -> T,
+    ) -> Vec<T> {
+        const FRAME: Duration = Duration::from_micros(16_667);
+
+        let was_frozen = self.synoik().clock.is_frozen();
+        self.freeze_clock();
+
+        let mut samples = vec![f(self)];
+        for _ in 0..max_frames {
+            self.advance_clock(FRAME);
+            self.turn();
+            samples.push(f(self));
+            if !self.transitions_ongoing() {
+                self.advance_clock(FRAME);
+                self.turn();
+                samples.push(f(self));
+                break;
+            }
+        }
+
+        if !was_frozen {
+            self.synoik().clock.unfreeze();
+        }
+        samples
+    }
+
     /// [`run_until_settled`](Self::run_until_settled) with a generous cap, failing the test if the
     /// transition never ends. This is the one to reach for: a test almost never wants to *tolerate*
     /// a transition that will not finish.
