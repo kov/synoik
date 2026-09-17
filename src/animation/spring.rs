@@ -71,8 +71,44 @@ impl Spring {
 
         // f64::EPSILON is too small for this specific comparison, so we use
         // f32::EPSILON even though it's doubles.
-        if (beta - omega0).abs() <= f64::from(f32::EPSILON) || beta < omega0 {
-            return Duration::from_secs_f64(x0);
+        let critically_damped = (beta - omega0).abs() <= f64::from(f32::EPSILON);
+        if critically_damped || beta < omega0 {
+            if !critically_damped || !x0.is_finite() {
+                return Duration::from_secs_f64(x0);
+            }
+
+            // A critically damped spring decays as `(A + B t) * e^(-beta t)`, and that linear
+            // factor outlives the bare envelope the estimate above is taken from: at `x0` the
+            // spring is still around `ln(1/epsilon) * epsilon` short of its target.
+            //
+            // That is not a slightly-early finish. `Animation::value_at` returns `to` outright
+            // once the duration is up, so whatever the spring had left to travel is taken in one
+            // step, on the frame the animation is retired. Measured on a workspace switch at
+            // `org.synoik.animations speed 0.3`: the render index moved ~0.00016 per frame all
+            // the way down the tail and then 0.00106 in the final frame — six frames of travel
+            // at once, 3 physical pixels of the row jumping into place.
+            //
+            // Solve for the time the *actual* curve is within epsilon instead. Each pass feeds
+            // the current estimate back through `|x0| + |slope| t = epsilon * e^(beta t)`, which
+            // approaches from below and settles in a handful of iterations.
+            let displacement = self.from - self.to;
+            let slope = (beta * displacement + self.initial_velocity).abs();
+            let displacement = displacement.abs();
+
+            let mut t = x0;
+            for _ in 0..100 {
+                if (self.to - self.oscillate(t)).abs() <= self.params.epsilon {
+                    break;
+                }
+
+                let next = ((displacement + slope * t) / self.params.epsilon).ln() / beta;
+                if !next.is_finite() || next <= t {
+                    break;
+                }
+                t = next;
+            }
+
+            return Duration::from_secs_f64(t);
         }
 
         // Since the overdamped solution decays way slower than the envelope
@@ -184,6 +220,33 @@ impl Spring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A critically damped spring's duration must be long enough that the spring has actually
+    /// arrived, because nothing eases it in afterwards: `Animation::value_at` returns `to` the
+    /// moment the duration is up, so a duration that ends early does not shorten the animation,
+    /// it *truncates* it — the remaining distance is taken in a single frame.
+    ///
+    /// The estimate this replaced came from the decay envelope alone, which ignores the linear
+    /// term critical damping carries, and landed `ln(1/epsilon) * epsilon` short: ~9.2e-4 against
+    /// a 1e-4 epsilon, nine times the tolerance it claimed to honour.
+    #[test]
+    fn a_critically_damped_spring_has_arrived_when_its_duration_is_up() {
+        // The workspace switch's own parameters.
+        let spring = Spring {
+            from: 0.,
+            to: 1.,
+            initial_velocity: 0.,
+            params: SpringParams::new(1., 1000., 0.0001),
+        };
+
+        let residual = (spring.to - spring.value_at(spring.duration())).abs();
+        assert!(
+            residual <= spring.params.epsilon,
+            "the spring is still {residual} from its target when its duration ends, \
+             which is more than the {} epsilon it is meant to settle within",
+            spring.params.epsilon,
+        );
+    }
 
     #[test]
     fn overdamped_spring_equal_from_to_nan() {

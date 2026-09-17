@@ -5894,7 +5894,11 @@ fn panel_slides_away_with_the_switch_onto_a_fullscreen_workspace() {
     f.freeze_clock();
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
-    let down = f.sample_animation(Duration::from_millis(400), 8, |f| {
+    // The window has to outlast the spring, or the last sample is taken mid-flight and "settled"
+    // is asserted against a value that simply had not arrived yet. A critically damped spring
+    // settles later than its decay envelope alone suggests: the switch runs ~365ms and
+    // `overview_open_close` ~410ms, both of which used to be cut short.
+    let down = f.sample_animation(Duration::from_millis(500), 8, |f| {
         (hidden(f), f.synoik().panel_takes_input_on(&output))
     });
     let fractions: Vec<f64> = down.iter().map(|(v, _)| *v).collect();
@@ -5918,7 +5922,7 @@ fn panel_slides_away_with_the_switch_onto_a_fullscreen_workspace() {
 
     // Opening the overview on that workspace brings it back down the same way.
     f.synoik().layout.toggle_overview();
-    let up = f.sample_animation(Duration::from_millis(400), 8, hidden);
+    let up = f.sample_animation(Duration::from_millis(500), 8, hidden);
     assert!(
         up.windows(2).all(|w| w[1] <= w[0]),
         "the overview must bring the panel back down monotonically: {up:?}"
@@ -39827,5 +39831,57 @@ fn a_workspace_moved_between_outputs_rebakes_its_thumbnail_shadow() {
         shadow.contains_rect(card),
         "the shadow drawn around the moved workspace's thumbnail {shadow:?} does not reach around \
          the thumbnail {card:?} — it is still the shape baked for the output it came from"
+    );
+}
+
+/// A switch arrives rather than jumping the last of the way.
+///
+/// The row's position follows the switch spring, and `Animation::value_at` snaps to the target the
+/// moment the animation's duration is up. So a spring whose duration expires while it is still
+/// short of the target does not finish early — it finishes *abruptly*, taking everything it had
+/// left in the frame it is retired. Measured before the fix, at `speed 0.3`: the row crept
+/// 0.5 logical px per frame down the tail and then moved 1.5 in the last one.
+///
+/// A critically damped spring decays monotonically, so each step must be no larger than the ones
+/// before it. The final step is the whole test; the rest of the series is here to give it
+/// something to be compared against.
+#[test]
+fn a_workspace_switch_arrives_instead_of_snapping_into_place() {
+    let mut f = Fixture::new();
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(2.));
+    let output = f.synoik_output(1);
+    // Slow, because this is a tail: at full speed the whole settle is a couple of frames and the
+    // truncated step hides among steps of its own size.
+    f.synoik_state().synoik.gnome_settings.animation_speed = 0.3;
+    f.synoik_state().refresh_animation_clock();
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 2);
+    f.settle();
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle();
+
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    let positions = f.sample_every_frame(3000, |f| {
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+        mon.workspaces_render_geo().next().unwrap().loc.x
+    });
+
+    let mut steps: Vec<f64> = positions.windows(2).map(|p| (p[1] - p[0]).abs()).collect();
+    while steps.last() == Some(&0.) {
+        steps.pop();
+    }
+    assert!(
+        steps.len() > 8,
+        "the switch must have a tail to test, got {steps:?}"
+    );
+
+    let last = steps[steps.len() - 1];
+    let before = &steps[steps.len() - 6..steps.len() - 1];
+    let largest = before.iter().copied().fold(0f64, f64::max);
+    assert!(
+        last <= largest + 0.5,
+        "the switch's final step is {last}px against {largest}px for the five before it,          so the row is jumping the last of the way rather than arriving: {:?}",
+        &steps[steps.len().saturating_sub(10)..]
     );
 }
