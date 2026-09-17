@@ -79,6 +79,10 @@ impl<T: Texture> Element for GradientFadeTextureRenderElement<T> {
     fn kind(&self) -> Kind {
         self.inner.kind()
     }
+
+    fn draw_key(&self) -> u64 {
+        self.inner.draw_key()
+    }
 }
 
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};

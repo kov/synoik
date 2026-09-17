@@ -88,6 +88,15 @@ macro_rules! synoik_render_elements {
                     $($(#[$attr])* $name::$variant(elem) => elem.is_framebuffer_effect()),+
                 }
             }
+
+            // Must be forwarded like the rest of the identity: the damage tracker compares this
+            // per instance, so an enum that answered the default `0` would hide a wrapped
+            // element's drifting draw inputs and leave its pixels stale.
+            fn draw_key(&self) -> u64 {
+                match self {
+                    $($(#[$attr])* $name::$variant(elem) => elem.draw_key()),+
+                }
+            }
         }
 
         impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>

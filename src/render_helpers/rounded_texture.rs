@@ -76,6 +76,22 @@ impl<T: Texture> Element for RoundedTextureRenderElement<T> {
     fn kind(&self) -> Kind {
         self.inner.kind()
     }
+
+    fn draw_key(&self) -> u64 {
+        // `draw` rounds to `corner_radius * scale * (dst.w / geometry.w)`. The last factor is the
+        // outer rescale, which moves `geometry` and so is already part of the tracker's instance
+        // key; the first two are continuous animated values it cannot see. Without them here the
+        // arc keeps shrinking while the tracker believes the instance is unchanged, and a target
+        // repainted incrementally keeps the corner pixels it drew at the older radius — for as
+        // long as the instance sits still, which is exactly when an animation settles.
+        //
+        // The inner texture's commit cannot carry this: one `TextureBuffer` is cloned into every
+        // instance drawn from it (the full-screen wallpaper and each strip thumbnail share an
+        // `Id`), and `ElementState` keeps a single commit per `Id`, so a per-instance commit would
+        // mismatch every frame and damage the wallpaper in full. Per-instance state is the
+        // tracker's to hold.
+        (u64::from(self.corner_radius.to_bits()) << 32) | u64::from(self.scale.to_bits())
+    }
 }
 
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};

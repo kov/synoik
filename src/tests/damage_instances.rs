@@ -27,6 +27,9 @@ struct Patch {
     id: Id,
     geometry: Rectangle<i32, Physical>,
     commit: CommitCounter,
+    /// Stands in for whatever an element's `draw` reads that the rest of the instance key does not
+    /// cover — `RoundedTextureRenderElement` folds its corner radius and scale into this.
+    draw_key: u64,
 }
 
 impl Patch {
@@ -35,7 +38,13 @@ impl Patch {
             id: id.clone(),
             geometry: Rectangle::new(Point::from((x, y)), Size::from((w, h))),
             commit: CommitCounter::default(),
+            draw_key: 0,
         }
+    }
+
+    fn with_draw_key(mut self, draw_key: u64) -> Self {
+        self.draw_key = draw_key;
+        self
     }
 }
 
@@ -73,6 +82,10 @@ impl Element for Patch {
 
     fn kind(&self) -> Kind {
         Kind::Unspecified
+    }
+
+    fn draw_key(&self) -> u64 {
+        self.draw_key
     }
 }
 
@@ -162,5 +175,54 @@ fn an_instance_that_moves_in_one_frame_heals_where_it_was() {
     assert!(
         covered(&damage, vacated),
         "a moved instance did not heal the rect it left: asked for {damage:?}"
+    );
+}
+
+/// A draw input the instance key does not otherwise cover still damages its instance.
+///
+/// An element's `draw` may read values the tracker cannot see: `RoundedTextureRenderElement` rounds
+/// to `corner_radius * scale`, both continuous and both animated. While such a value drifts with
+/// the instance sitting still, the tracker finds a matching instance, asks only for `damage_since`,
+/// and a target repainted incrementally keeps the pixels drawn at the older value — permanently,
+/// since nothing later reports them. `Element::draw_key` folds those inputs into the per-instance
+/// key so a change damages the instance the way a move does.
+///
+/// It has to be *per instance*: one `TextureBuffer` is cloned into every element drawn from it, so
+/// the full-screen wallpaper and each strip thumbnail share an `Id` and the single `last_commit`
+/// that comes with it, while drawing at different radii in the same frame. A commit derived from
+/// the radius would mismatch every frame and damage all of them in full.
+///
+/// The second half matters as much as the first: a key that never settles would keep the tracker
+/// from ever reporting an empty frame, and an idle screen would repaint forever.
+#[test]
+fn a_drifting_draw_input_damages_its_instance() {
+    let id = Id::new();
+    let other = Id::new();
+    let mut tracker = tracker();
+
+    let backdrop = Patch::new(&other, 0, 0, 800, 600);
+    let thumbnail = |key| Patch::new(&id, 400, 300, 100, 100).with_draw_key(key);
+    let geometry = thumbnail(0).geometry;
+
+    tracker
+        .damage_output(0, &[backdrop.clone(), thumbnail(1)])
+        .unwrap();
+
+    // Same geometry, same commit, different draw key: the pixels differ, so it must be repainted.
+    let (rects, _) = tracker
+        .damage_output(1, &[backdrop.clone(), thumbnail(2)])
+        .unwrap();
+    let damage = vec![rects.cloned().unwrap_or_default()];
+    assert!(
+        covered(&damage, geometry),
+        "a changed draw key left its instance unrepainted: asked for {damage:?}"
+    );
+
+    // Steady again: nothing to repaint, or the screen never goes idle.
+    let (rects, _) = tracker.damage_output(1, &[backdrop, thumbnail(2)]).unwrap();
+    let damage = rects.cloned().unwrap_or_default();
+    assert!(
+        damage.is_empty(),
+        "a steady draw key asked for repaint anyway: {damage:?}"
     );
 }
