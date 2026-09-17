@@ -56,6 +56,7 @@ mod perf_probe;
 mod producer_sync;
 mod redraw_attribution;
 mod remove_output;
+mod subpixel;
 mod swapchain_ages;
 mod teardown;
 mod transactions;

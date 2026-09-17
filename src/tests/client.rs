@@ -1050,6 +1050,57 @@ impl Window {
         format: wl_shm::Format,
         damage: Option<(i32, i32, i32, i32)>,
     ) {
+        let size = (w * 4 * h) as usize;
+        let data: Vec<u8> = texel.iter().copied().cycle().take(size).collect();
+        self.attach_shm_pixels(w, h, &data, format, damage);
+    }
+
+    /// Fills the window with a sharp light-to-dark step a quarter of the way across.
+    ///
+    /// A probe for measuring position to a fraction of a pixel. A full-width gradient cannot do
+    /// it: spread over a few hundred pixels its luminance rises by ~1.5 units per pixel, so
+    /// interpolating a threshold between 8-bit samples bottoms out at about half a pixel and the
+    /// instrument's own floor gets read as the renderer's. A step concentrates the whole 0-255
+    /// range into a small span of texels, so the crossing resolves finely.
+    ///
+    /// The ramp is deliberately wide rather than a hard edge. Interpolating a position out of it
+    /// assumes it arrives on screen as a sampled slope spanning several pixels; a ramp narrower
+    /// than that lands as one blended pixel between two flats, and the interpolator then sits at
+    /// that pixel's centre across a whole pixel of real motion before sweeping across in one
+    /// frame — a staircase contributed by the probe, not by what is being measured. Size it
+    /// against the worst minification it will meet: a workspace thumbnail shows a whole
+    /// 1280px-wide workspace in about 170px, so roughly 7.4 texels collapse into each pixel.
+    ///
+    /// Light first and dark after, so that a surface filled with this still contrasts against a
+    /// dark backdrop along its left edge. With the dark end leading, that edge has nothing to
+    /// find: a measurement aimed at it locks onto the nearest thing that does contrast — the
+    /// outside of the drop shadow — which sits a few pixels clear of the surface and, worse,
+    /// moves with it as it scales, so the offset is not even a constant that would cancel.
+    pub fn attach_shm_step_edge(&self, w: i32, h: i32) {
+        const RAMP: i32 = 28;
+        let edge = w / 4;
+        let mut data = Vec::with_capacity((w * 4 * h) as usize);
+        for _ in 0..h {
+            for x in 0..w {
+                let t = ((x - edge + RAMP / 2) as f64 / f64::from(RAMP)).clamp(0., 1.);
+                let v = ((1. - t) * 255.).round() as u8;
+                // Argb8888 memory order. Opaque, so the step survives premultiplication.
+                data.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        self.attach_shm_pixels(w, h, &data, wl_shm::Format::Argb8888, None);
+    }
+
+    /// Attach a `w`×`h` shm buffer holding `data` verbatim — 4 bytes per pixel, in `format`'s
+    /// memory order. `damage` is the buffer-coordinate rect to report; `None` damages all of it.
+    fn attach_shm_pixels(
+        &self,
+        w: i32,
+        h: i32,
+        data: &[u8],
+        format: wl_shm::Format,
+        damage: Option<(i32, i32, i32, i32)>,
+    ) {
         use std::io::Write as _;
         use std::os::fd::{AsFd, OwnedFd};
 
@@ -1058,13 +1109,13 @@ impl Window {
         let shm = self.shm.as_ref().expect("wl_shm not bound");
         let stride = w * 4;
         let size = (stride * h) as usize;
+        assert_eq!(data.len(), size, "pixel data must cover the whole buffer");
 
         let fd = memfd_create("synoik-test-shm", MemfdFlags::CLOEXEC).expect("memfd_create");
         ftruncate(&fd, size as u64).expect("ftruncate");
 
-        let data: Vec<u8> = texel.iter().copied().cycle().take(size).collect();
         let mut file = std::fs::File::from(fd);
-        file.write_all(&data).expect("write shm buffer");
+        file.write_all(data).expect("write shm buffer");
         let fd: OwnedFd = file.into();
 
         let pool = shm.create_pool(fd.as_fd(), size as i32, &self.qh, ());
