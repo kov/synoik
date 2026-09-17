@@ -266,17 +266,11 @@ fn overview_fixture() -> Option<(Fixture, Output)> {
 /// by construction. At scale 1 that cannot happen, so anything off the grid there is a size
 /// computed and then never re-snapped — which is what the inactive shrink does.
 ///
-/// Ignored, and the reason is worth more than the test: the row's own layout is on the grid now,
-/// but a thumbnail is drawn shrunk by `WORKSPACE_INACTIVE_SCALE` and re-centred in its slot, and
-/// that product is not a whole pixel. Snapping it is a small change, and it was written, measured
-/// and taken back out again, because exactly-integral geometry is what the damage tracking cannot
-/// currently carry: with a fractional rect an element's integer geometry rounds outward and
-/// happens to cover the antialiased fringe of its rounded corners, and with an exact one it does
-/// not, so an incrementally-repainted frame keeps stale corner pixels — which is what
-/// `moving_a_window_between_workspaces_repaints_the_strip` catches. The snap has to land together
-/// with element geometry that covers what is actually painted, not before it.
+/// A thumbnail is drawn shrunk by `WORKSPACE_INACTIVE_SCALE` and re-centred in its slot, and that
+/// product is not a whole pixel. `thumbnail_drawn_rect` therefore snaps the two *ends* of the
+/// shrink to the grid and interpolates between them: a thumbnail at rest lands on whole pixels,
+/// while a moving one stays free to sit between them instead of having its motion quantised.
 #[test]
-#[ignore = "needs element geometry that covers the corner antialiasing; see the note above"]
 fn a_resting_thumbnail_sits_on_whole_physical_pixels() {
     for scale in [1., 1.5] {
         let (mut f, output) = build_overview(scale, false).expect("a fixture without a renderer");

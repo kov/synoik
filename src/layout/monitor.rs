@@ -1294,7 +1294,12 @@ impl<W: LayoutElement> Monitor<W> {
             .enumerate()
             .filter(|(idx, _)| self.workspace_is_closable(*idx))
             .map(|(idx, (ws, slot))| {
-                let thumb = thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), slide);
+                let thumb = thumbnail_drawn_rect(
+                    *slot,
+                    self.strip_render_scale(idx),
+                    slide,
+                    self.scale.fractional_scale(),
+                );
                 (ws.id(), thumbnails::close_rect(thumb, ramp))
             })
             .collect()
@@ -1314,7 +1319,12 @@ impl<W: LayoutElement> Monitor<W> {
             .enumerate()
             .filter_map(|(idx, (ws, slot))| {
                 let name = ws.name.clone()?;
-                let thumb = thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), slide);
+                let thumb = thumbnail_drawn_rect(
+                    *slot,
+                    self.strip_render_scale(idx),
+                    slide,
+                    self.scale.fractional_scale(),
+                );
                 Some((ws.id(), thumb, name))
             })
             .collect()
@@ -1330,6 +1340,7 @@ impl<W: LayoutElement> Monitor<W> {
             *slot,
             self.strip_render_scale(idx),
             self.strip_slide(&strip),
+            self.scale.fractional_scale(),
         ))
     }
 
@@ -2870,7 +2881,12 @@ impl<W: LayoutElement> Monitor<W> {
         strip: &Strip,
         slide: Point<f64, Logical>,
     ) -> Rectangle<f64, Logical> {
-        thumbnail_drawn_rect(strip.thumbs[idx], self.strip_render_scale(idx), slide)
+        thumbnail_drawn_rect(
+            strip.thumbs[idx],
+            self.strip_render_scale(idx),
+            slide,
+            self.scale.fractional_scale(),
+        )
     }
 
     pub fn strip_progress(&self) -> Option<f64> {
@@ -2950,7 +2966,12 @@ impl<W: LayoutElement> Monitor<W> {
         };
         let drawn = |i: usize| {
             strip.thumbs.get(i).map(|slot| {
-                thumbnail_drawn_rect(*slot, self.strip_render_scale(i), Point::default())
+                thumbnail_drawn_rect(
+                    *slot,
+                    self.strip_render_scale(i),
+                    Point::default(),
+                    self.scale.fractional_scale(),
+                )
             })
         };
         let prev = idx.checked_sub(1);
@@ -4308,9 +4329,17 @@ impl<W: LayoutElement> Monitor<W> {
         let n = self.workspaces.len().min(strip.thumbs.len());
         for idx in 0..n {
             let ws = &self.workspaces[idx];
-            let shrink = self.strip_render_scale(idx);
             let thumb = self.thumbnail_drawn_rect_at(idx, &strip, slide);
-            let thumb_scale = strip.scale * shrink;
+            // Taken from the rect actually being drawn, not from the shrink that suggested it.
+            // The rect is snapped to whole physical pixels at its resting sizes, so the ratio it
+            // ends up at is not exactly the shrink; scaling the contents by the shrink instead
+            // would fill a 262px rect with 262.66px of workspace, and the mismatch shows up as a
+            // seam at the edges and as corners that land a fraction off where the damage
+            // geometry says they will.
+            let thumb_scale = thumb.size.h / self.view_size.h;
+            // Reported as well as the ratio above, since the two no longer have to agree and a
+            // dump that showed only one of them could not say which was wrong.
+            let shrink = self.strip_render_scale(idx);
             let glow_crop = Rectangle::new(
                 Point::from((
                     (glow_bounds_logical.loc.x - thumb.loc.x) / thumb_scale,
@@ -4424,9 +4453,14 @@ impl<W: LayoutElement> Monitor<W> {
             .chain((0..n).filter(|i| carried != Some(*i)));
         for idx in order {
             let ws = &self.workspaces[idx];
-            let shrink = self.strip_render_scale(idx);
             let thumb = self.thumbnail_drawn_rect_at(idx, &strip, slide);
-            let thumb_scale = strip.scale * shrink;
+            // Taken from the rect actually being drawn, not from the shrink that suggested it.
+            // The rect is snapped to whole physical pixels at its resting sizes, so the ratio it
+            // ends up at is not exactly the shrink; scaling the contents by the shrink instead
+            // would fill a 262px rect with 262.66px of workspace, and the mismatch shows up as a
+            // seam at the edges and as corners that land a fraction off where the damage
+            // geometry says they will.
+            let thumb_scale = thumb.size.h / self.view_size.h;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
 
             // Clip each miniature to its workspace, to the part of it the band leaves visible,
@@ -5411,15 +5445,38 @@ fn thumbnail_crop(
     ))
 }
 
+/// Where a thumbnail is drawn inside its slot, shrunk by `shrink` and re-centred.
+///
+/// The two ends of the shrink are put on the pixel grid and the *interpolation* runs between
+/// them, rather than the interpolated rect being rounded at the end. Rounding the result would
+/// quantise the motion, which is the thing being taken apart here; rounding neither would leave
+/// a resting inactive thumbnail between pixels, since the shrink is an arbitrary ratio and the
+/// re-centring halves whatever it leaves over. Snapping only the ends gets both: still
+/// thumbnails land on whole pixels, and moving ones are free to sit between them.
 fn thumbnail_drawn_rect(
     slot: Rectangle<f64, Logical>,
     shrink: f64,
     slide: Point<f64, Logical>,
+    scale: f64,
 ) -> Rectangle<f64, Logical> {
-    let size = slot.size.downscale(1. / shrink);
+    let rest = |shrink: f64| {
+        let snap = |v: f64| round_logical_in_physical(scale, v);
+        let size = Size::from((snap(slot.size.w * shrink), snap(slot.size.h * shrink)));
+        let inset = Point::from((
+            snap((slot.size.w - size.w) / 2.),
+            snap((slot.size.h - size.h) / 2.),
+        ));
+        Rectangle::new(slot.loc + inset, size)
+    };
+    let (small, full) = (rest(WORKSPACE_INACTIVE_SCALE), rest(1.));
+    let t = ((shrink - WORKSPACE_INACTIVE_SCALE) / (1. - WORKSPACE_INACTIVE_SCALE)).clamp(0., 1.);
+    let lerp = |a: f64, b: f64| a + (b - a) * t;
     Rectangle::new(
-        slot.loc + slide + Point::from(((slot.size.w - size.w) / 2., (slot.size.h - size.h) / 2.)),
-        size,
+        Point::from((lerp(small.loc.x, full.loc.x), lerp(small.loc.y, full.loc.y))) + slide,
+        Size::from((
+            lerp(small.size.w, full.size.w),
+            lerp(small.size.h, full.size.h),
+        )),
     )
 }
 
