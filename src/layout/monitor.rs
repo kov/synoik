@@ -2996,10 +2996,22 @@ impl<W: LayoutElement> Monitor<W> {
             self.controls_layout().workspace_row
         };
         let zoom = band.size.h / self.view_size.h;
-        let thumb_w = (self.view_size.w * zoom).round();
+        let scale = self.scale.fractional_scale();
+        let thumb_w = round_logical_in_physical(scale, self.view_size.w * zoom);
         let gap = self.workspace_gap(zoom, FitMode::All);
         let lay = |n: usize, focus: f64| {
-            thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, insert, focus)
+            thumbnails::strip_geometry(
+                thumbnails::Metrics {
+                    view_size: self.view_size,
+                    band,
+                    thumb_w,
+                    gap,
+                    scale,
+                },
+                n,
+                insert,
+                focus,
+            )
         };
         let focus = self.strip_focus();
         let strip = lay(self.workspaces.len(), focus);

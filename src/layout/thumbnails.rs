@@ -18,6 +18,7 @@
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::monitor::scroll_to_follow;
+use crate::utils::round_logical_in_physical;
 
 /// The active-workspace indicator's border width
 /// (`.workspace-thumbnail-indicator` in the shell theme).
@@ -195,20 +196,35 @@ pub struct Strip {
 ///
 /// An [`Insert`] lengthens the run like an extra slot, marking where a drop would put a
 /// new workspace.
-pub fn strip_geometry(
-    view_size: Size<f64, Logical>,
-    band: Rectangle<f64, Logical>,
-    thumb_w: f64,
-    gap: f64,
-    n: usize,
-    insert: Option<Insert>,
-    focus: f64,
-) -> Strip {
+/// What a row is laid out against: the measurements that come from the output and the band,
+/// rather than from the workspaces in the row.
+#[derive(Clone, Copy, Debug)]
+pub struct Metrics {
+    pub view_size: Size<f64, Logical>,
+    pub band: Rectangle<f64, Logical>,
+    pub thumb_w: f64,
+    pub gap: f64,
+    /// The output's fractional scale.
+    pub scale: f64,
+}
+
+pub fn strip_geometry(metrics: Metrics, n: usize, insert: Option<Insert>, focus: f64) -> Strip {
+    let Metrics {
+        view_size,
+        band,
+        thumb_w,
+        gap,
+        scale,
+    } = metrics;
+    // Every rounding here is to a whole *physical* pixel, not a whole logical one. At a
+    // fractional output scale those are not the same thing, and a row rounded in logical units
+    // rests between pixels by construction.
+    let snap = |v: f64| round_logical_in_physical(scale, v);
     // A thumbnail is the band's full height: the band is allocated exactly one workspace
     // tall. Its width is the caller's, since that is what the row's zoom decides.
-    let thumb = Size::from((thumb_w.round(), band.size.h.round()));
-    let gap = gap.round();
-    let y = band.loc.y.round();
+    let thumb = Size::from((snap(thumb_w), snap(band.size.h)));
+    let gap = snap(gap);
+    let y = snap(band.loc.y);
 
     // Laid out from the row's own origin first, so the scroll can be computed from
     // where the focused thumbnail actually landed — the placeholder displaces it.
@@ -243,7 +259,7 @@ pub fn strip_geometry(
     let t = idx.fract();
     let focus_x = thumbs[lo].loc.x + (thumbs[hi].loc.x - thumbs[lo].loc.x) * t + thumb.w / 2.;
 
-    let x0 = (band.loc.x + gap + scroll_to_follow(band.size.w - gap * 2., run, focus_x)).round();
+    let x0 = snap(band.loc.x + gap + scroll_to_follow(band.size.w - gap * 2., run, focus_x));
     for rect in &mut thumbs {
         rect.loc.x += x0;
     }
@@ -261,7 +277,7 @@ pub fn strip_geometry(
         Some(Insert::Phantom(ph)) => {
             let last = thumbs[n - 1];
             let collapse = 1. - ph.reveal.clamp(0., 1.);
-            let w = thumb.w - (thumb.w * collapse).round();
+            let w = thumb.w - snap(thumb.w * collapse);
             Some((
                 Rectangle::new(
                     Point::from((last.loc.x + last.size.w + gap, y)),
@@ -370,6 +386,17 @@ mod tests {
         Size::from((1920., 1080.))
     }
 
+    /// The reference row's metrics at scale 1, where every pinned position below was taken.
+    fn metrics(thumb_w: f64, gap: f64) -> Metrics {
+        Metrics {
+            view_size: view(),
+            band: band(),
+            thumb_w,
+            gap,
+            scale: 1.,
+        }
+    }
+
     /// The band [`crate::ui::overview_layout`] allocates the row at the 1920x1080 /
     /// 35px-strut reference: full width, top on the search puck's midline (35 + 40), one
     /// small workspace tall (`round(1045 * SMALL_WORKSPACE_RATIO)`).
@@ -388,7 +415,7 @@ mod tests {
     /// not about scrolling wants to be.
     fn strip(n: usize, placeholder: Option<usize>) -> Strip {
         let insert = placeholder.map(Insert::Placeholder);
-        strip_geometry(view(), band(), THUMB_W, GAP, n, insert, 0.)
+        strip_geometry(metrics(THUMB_W, GAP), n, insert, 0.)
     }
 
     /// The row with a phantom slot at `idx` open by `reveal`.
@@ -398,13 +425,13 @@ mod tests {
             reveal,
             emerge: 0.,
         }));
-        strip_geometry(view(), band(), THUMB_W, GAP, n, insert, 0.)
+        strip_geometry(metrics(THUMB_W, GAP), n, insert, 0.)
     }
 
     /// Positions of a row of `n` at an arbitrary thumbnail width and gap — the sweep the
     /// row rule's own tests want, independent of the reference canvas.
     fn positions_at(thumb_w: f64, gap: f64, n: usize, focus: f64) -> Vec<f64> {
-        strip_geometry(view(), band(), thumb_w, gap, n, None, focus)
+        strip_geometry(metrics(thumb_w, gap), n, None, focus)
             .thumbs
             .iter()
             .map(|r| r.loc.x)
@@ -497,7 +524,7 @@ mod tests {
         // Every workspace, selected in turn, is fully on screen — and the size never
         // gives way to the count.
         for active in 0..n {
-            let strip = strip_geometry(view(), band(), thumb_w, gap, n, None, active as f64);
+            let strip = strip_geometry(metrics(thumb_w, gap), n, None, active as f64);
             assert_eq!(strip.scale, THUMB_H / 1080.);
             let rect = strip.thumbs[active];
             assert!(
@@ -531,7 +558,7 @@ mod tests {
     #[test]
     fn a_scrolled_thumbnail_is_not_hit_outside_the_band() {
         let n = 10;
-        let strip = strip_geometry(view(), band(), THUMB_W, GAP, n, None, 0.);
+        let strip = strip_geometry(metrics(THUMB_W, GAP), n, None, 0.);
         let y = BAND_Y + 40.;
 
         let outside = strip
@@ -568,7 +595,15 @@ mod tests {
 
         // Move the band and the whole row follows.
         let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., THUMB_H)));
-        let strip = strip_geometry(view(), moved, THUMB_W, GAP, 3, None, 0.);
+        let strip = strip_geometry(
+            Metrics {
+                band: moved,
+                ..metrics(THUMB_W, GAP)
+            },
+            3,
+            None,
+            0.,
+        );
         assert_eq!(strip.thumbs[0].loc.y, 300.);
         // 800 is not wide enough for three, so the row scrolls to the active workspace
         // inside the moved band rather than fitting into it.
