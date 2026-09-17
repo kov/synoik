@@ -183,6 +183,18 @@ pub struct Strip {
     pub gap: f64,
 }
 
+/// What a row is laid out against: the measurements that come from the output and the band,
+/// rather than from the workspaces in the row.
+#[derive(Clone, Copy, Debug)]
+pub struct Metrics {
+    pub view_size: Size<f64, Logical>,
+    pub band: Rectangle<f64, Logical>,
+    pub thumb_w: f64,
+    pub gap: f64,
+    /// The output's fractional scale.
+    pub scale: f64,
+}
+
 /// Lays the row out inside its allocated `band`: `n` thumbnails one band tall, `gap` apart,
 /// with the same `gap` before the first and after the last so the run never touches the
 /// band's edges (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`). A run that
@@ -196,18 +208,6 @@ pub struct Strip {
 ///
 /// An [`Insert`] lengthens the run like an extra slot, marking where a drop would put a
 /// new workspace.
-/// What a row is laid out against: the measurements that come from the output and the band,
-/// rather than from the workspaces in the row.
-#[derive(Clone, Copy, Debug)]
-pub struct Metrics {
-    pub view_size: Size<f64, Logical>,
-    pub band: Rectangle<f64, Logical>,
-    pub thumb_w: f64,
-    pub gap: f64,
-    /// The output's fractional scale.
-    pub scale: f64,
-}
-
 pub fn strip_geometry(metrics: Metrics, n: usize, insert: Option<Insert>, focus: f64) -> Strip {
     let Metrics {
         view_size,
