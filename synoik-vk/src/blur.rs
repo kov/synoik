@@ -75,6 +75,10 @@ pub struct BlurChain {
     /// Descriptor set that samples the external source texture.
     source_set: vk::DescriptorSet,
     passes: usize,
+    /// `Some` for a directional chain, whose levels shrink along this axis only and which is
+    /// recorded with [`Self::record_directional`]. `None` is the isotropic pyramid
+    /// [`Self::record_gaussian`] wants.
+    axis: Option<Axis>,
     /// Where the final upsample writes, when the caller gave the chain somewhere of its own.
     ///
     /// Without it the chain's result lands in `levels[0]` and the caller copies it out with
@@ -128,6 +132,51 @@ pub fn downscale_levels(width: u32, height: u32, radius: f64) -> usize {
         levels += 1;
         w /= 2.;
         h /= 2.;
+        r /= 2.;
+    }
+    levels
+}
+
+/// Which way a directional chain smears — and, with it, the only axis its pyramid shrinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+impl Axis {
+    /// The shader's `direction` push constant for this axis.
+    fn direction(self) -> [f32; 2] {
+        match self {
+            Axis::Horizontal => [1., 0.],
+            Axis::Vertical => [0., 1.],
+        }
+    }
+
+    /// The component of `(w, h)` this axis runs along.
+    fn extent(self, w: u32, h: u32) -> u32 {
+        match self {
+            Axis::Horizontal => w,
+            Axis::Vertical => h,
+        }
+    }
+}
+
+/// [`downscale_levels`] for a chain that shrinks **one** axis.
+///
+/// The perpendicular axis keeps full resolution — that is the whole point of a directional chain —
+/// so it is not part of the stopping rule and `MIN_DOWNSCALE_SIZE` applies to `extent` alone.
+///
+/// This is what makes a motion smear affordable at radii an isotropic blur would never be asked
+/// for: a workspace switch peaks near 1200px of travel per frame, and blurring that at full size
+/// would be ~1800 taps per pixel. Five rungs down it is sigma ~19 on a thirty-second of the
+/// texels, with every pixel *across* the motion still sharp.
+pub fn downscale_levels_axis(extent: u32, radius: f64) -> usize {
+    let (mut a, mut r) = (f64::from(extent), radius);
+    let mut levels = 0;
+    while r > MAX_RADIUS && a > MIN_DOWNSCALE_SIZE {
+        levels += 1;
+        a /= 2.;
         r /= 2.;
     }
     levels
@@ -207,10 +256,16 @@ impl BlurChain {
     /// Build the chain to blur `source` (which stays owned by the caller). `passes` is clamped to
     /// at least 1; `source` must be full-size (matches level 0).
     pub fn new(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
-        Self::build(gpu, source, passes)
+        Self::build(gpu, source, passes, None)
     }
 
-    fn build(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
+    /// As [`Self::new`], but the pyramid shrinks `axis` only and the chain is recorded with
+    /// [`Self::record_directional`] — one smear along `axis`, full resolution across it.
+    pub fn new_directional(gpu: &Gpu, source: &Texture, passes: usize, axis: Axis) -> Result<Self> {
+        Self::build(gpu, source, passes, Some(axis))
+    }
+
+    fn build(gpu: &Gpu, source: &Texture, passes: usize, axis: Option<Axis>) -> Result<Self> {
         let _timed = crate::stats::creating();
         let device = &gpu.device;
         let passes = passes.max(1);
@@ -274,8 +329,18 @@ impl BlurChain {
                 h,
             )?;
             guard.levels.push(level);
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
+            // A directional chain halves only the axis it smears along. Shrinking the other one
+            // too would soften detail *across* the motion, which is exactly the "mushy" look a
+            // motion blur is supposed to avoid — the sharpness perpendicular to travel is what
+            // still reads as a workspace rather than a wash.
+            match axis {
+                None => {
+                    w = (w / 2).max(1);
+                    h = (h / 2).max(1);
+                }
+                Some(Axis::Horizontal) => w = (w / 2).max(1),
+                Some(Axis::Vertical) => h = (h / 2).max(1),
+            }
         }
 
         {
@@ -341,6 +406,7 @@ impl BlurChain {
             levels: std::mem::take(&mut guard.levels),
             source_set,
             passes,
+            axis,
             external_dst: None,
         })
     }
@@ -484,6 +550,76 @@ impl BlurChain {
         // would go missing.
         let out = self.external_dst.as_ref().unwrap_or(full);
         self.pass_gaussian(gpu, cbuf, g.scale, out, self.levels[k].set, None);
+    }
+
+    /// Record a one-directional smear of `radius` along the chain's axis — a motion blur.
+    ///
+    /// The same machinery, shader and sigma as [`Self::record_gaussian`]; what differs is that the
+    /// descent shrinks one axis only and there is a single blur pass instead of a separable pair.
+    /// So the result is smeared *along* the travel and untouched *across* it, which is what makes
+    /// it read as motion rather than as an out-of-focus frame.
+    ///
+    /// The taps stay symmetric (`±offset`). That is the correct shape rather than a compromise: a
+    /// frame samples the animation at one instant *inside* the exposure it stands for, so the
+    /// light it represents arrived both before and after that instant. A one-sided trail would be
+    /// modelling a shutter that opened where the frame was sampled.
+    ///
+    /// A no-op on a chain from [`Self::new`], which has no axis — its levels are shrunk both ways
+    /// and have no full perpendicular resolution to smear across.
+    pub fn record_directional(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        radius: f64,
+        brightness: f32,
+    ) {
+        let (Some(g), Some(axis)) = (&self.gaussian, self.axis) else {
+            return;
+        };
+        let full = &self.levels[0];
+
+        // As in `record_gaussian`: descend only as far as this radius actually needs, floored at
+        // one rung because the smear has to land in a same-size twin and only the shrinking levels
+        // have one. The floor costs a 2x resample on the axis for the last few frames of a switch,
+        // where the travel is a pixel or two — which is why the compositor stops asking below a
+        // threshold rather than driving the radius to zero.
+        let want = downscale_levels_axis(axis.extent(full.w, full.h), radius);
+        let k = want.clamp(1, self.passes);
+        let sigma = (radius / f64::from(1u32 << k) / 2.) as f32;
+
+        // Descend: source → L1 → … → Lk, one halving of the smear axis per rung.
+        for i in 1..=k {
+            let src_set = if i == 1 {
+                self.source_set
+            } else {
+                self.levels[i - 1].set
+            };
+            self.pass_gaussian(gpu, cbuf, g.scale, &self.levels[i], src_set, None);
+        }
+
+        // The one smear, at the working size, into that level's twin.
+        let work = &self.levels[k];
+        let scratch = &g.scratch[k - 1];
+        self.pass_gaussian(
+            gpu,
+            cbuf,
+            g.blur,
+            scratch,
+            work.set,
+            Some(GaussianPush {
+                direction: axis.direction(),
+                // One texel of what is being sampled, measured along the axis being sampled.
+                pixel_step: 1.0 / axis.extent(work.w, work.h) as f32,
+                sigma,
+                brightness,
+            }),
+        );
+
+        // Back up to full size in one magnifying draw — out of the twin, which is where the smear
+        // landed (`record_gaussian` magnifies out of `levels[k]` because its second direction
+        // ping-pongs back into it; there is no second direction here).
+        let out = self.external_dst.as_ref().unwrap_or(full);
+        self.pass_gaussian(gpu, cbuf, g.scale, out, scratch.set, None);
     }
 
     /// One gaussian-path pass. `push` is `None` for the resample rungs, which read no constants.

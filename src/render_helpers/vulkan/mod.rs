@@ -25,6 +25,7 @@ mod fence;
 mod frame;
 mod gaussian_backdrop;
 mod integration;
+mod motion_blur;
 mod renderer;
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,7 @@ pub use error::VulkanError;
 pub use frame::VulkanFrame;
 pub(crate) use frame::{premultiply, ClipParams};
 pub(crate) use gaussian_backdrop::GaussianBackdrop;
+pub(crate) use motion_blur::MotionBlurSlot;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;
 pub use types::{

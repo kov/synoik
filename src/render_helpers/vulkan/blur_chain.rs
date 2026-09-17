@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use synoik_vk::blur::BlurChain;
+use synoik_vk::blur::{Axis, BlurChain};
 use synoik_vk::gpu::Gpu;
 use synoik_vk::texture::Texture as SynoikTexture;
 
@@ -61,6 +61,24 @@ impl SharedBlurChain {
         Self::build(gpu, source, passes, Some(dst))
     }
 
+    /// A chain that smears along `axis` only, rendering straight into `dst` — see
+    /// [`BlurChain::record_directional`]. The motion-blur sibling of [`Self::new_gaussian_into`],
+    /// and external-destination for the same reason: it re-runs every frame of an animation.
+    pub(crate) fn new_directional_into(
+        gpu: &Arc<Gpu>,
+        source: &SynoikTexture,
+        passes: usize,
+        axis: Axis,
+        dst: &SynoikTexture,
+    ) -> Result<Arc<Self>, VulkanError> {
+        let mut chain = BlurChain::new_directional(gpu, source, passes, axis)?;
+        chain.set_external_dst(gpu, dst.view, dst.width, dst.height)?;
+        Ok(Arc::new(Self {
+            gpu: gpu.clone(),
+            chain,
+        }))
+    }
+
     fn build(
         gpu: &Arc<Gpu>,
         source: &SynoikTexture,
@@ -95,6 +113,26 @@ impl SharedBlurChain {
     ) {
         self.chain
             .record_gaussian(&self.gpu, cbuf, radius, brightness);
+        if !self.chain.has_external_dst() {
+            self.chain
+                .copy_output_to(&self.gpu, cbuf, output, width, height);
+        }
+    }
+
+    /// As [`Self::record_gaussian_into`], but the one-directional smear — see
+    /// [`BlurChain::record_directional`]. Same lifetime rule: hold this `Arc` until the submit
+    /// that recorded it retires.
+    pub(crate) fn record_directional_into(
+        &self,
+        cbuf: vk::CommandBuffer,
+        radius: f64,
+        brightness: f32,
+        output: vk::Image,
+        width: u32,
+        height: u32,
+    ) {
+        self.chain
+            .record_directional(&self.gpu, cbuf, radius, brightness);
         if !self.chain.has_external_dst() {
             self.chain
                 .copy_output_to(&self.gpu, cbuf, output, width, height);

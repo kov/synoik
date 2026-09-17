@@ -364,6 +364,10 @@ struct PendingBlur {
     /// `2σ` in the source texture's own pixels, and `ShellBlurEffect`'s dimming multiply.
     radius: f64,
     brightness: f32,
+    /// `Some` for a one-directional smear (a motion blur), `None` for GNOME's isotropic gaussian.
+    /// Must agree with how the chain was built — a directional recording is a no-op on an
+    /// isotropic chain and vice versa.
+    axis: Option<synoik_vk::blur::Axis>,
 }
 
 /// One staged texture upload waiting for a frame to record its copy, **with its destination held
@@ -3161,6 +3165,32 @@ impl VulkanRenderer {
         radius: f64,
         brightness: f32,
     ) {
+        self.queue_blur(chain, source, output, radius, brightness, None);
+    }
+
+    /// As [`Self::queue_gaussian_blur`], but the one-directional smear a motion blur wants. The
+    /// chain must have been built for the same `axis`.
+    pub(super) fn queue_directional_blur(
+        &mut self,
+        chain: Arc<SharedBlurChain>,
+        source: VkTexture,
+        output: VkTexture,
+        radius: f64,
+        brightness: f32,
+        axis: synoik_vk::blur::Axis,
+    ) {
+        self.queue_blur(chain, source, output, radius, brightness, Some(axis));
+    }
+
+    fn queue_blur(
+        &mut self,
+        chain: Arc<SharedBlurChain>,
+        source: VkTexture,
+        output: VkTexture,
+        radius: f64,
+        brightness: f32,
+        axis: Option<synoik_vk::blur::Axis>,
+    ) {
         let image = output.image();
         let entry = PendingBlur {
             chain,
@@ -3168,6 +3198,7 @@ impl VulkanRenderer {
             output,
             radius,
             brightness,
+            axis,
         };
         match self
             .pending_blurs
@@ -3193,14 +3224,24 @@ impl VulkanRenderer {
         let mut textures = Vec::with_capacity(queued.len() * 2);
         for blur in queued {
             let (w, h) = blur.output.extent();
-            blur.chain.record_gaussian_into(
-                cbuf,
-                blur.radius,
-                blur.brightness,
-                blur.output.image(),
-                w,
-                h,
-            );
+            match blur.axis {
+                None => blur.chain.record_gaussian_into(
+                    cbuf,
+                    blur.radius,
+                    blur.brightness,
+                    blur.output.image(),
+                    w,
+                    h,
+                ),
+                Some(_) => blur.chain.record_directional_into(
+                    cbuf,
+                    blur.radius,
+                    blur.brightness,
+                    blur.output.image(),
+                    w,
+                    h,
+                ),
+            }
             chains.push(blur.chain);
             textures.push(blur.source);
             textures.push(blur.output);

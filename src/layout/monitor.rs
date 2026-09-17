@@ -82,6 +82,28 @@ const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 /// WINDOW_REPOSITIONING_DELAY).
 const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 
+/// The exposure one frame's motion blur stands for.
+///
+/// A shutter time, deliberately not the output's refresh interval: the smear should describe the
+/// same motion whether the screen runs at 60 or 144 Hz, and a refresh-derived exposure would make
+/// a fast monitor look sharper for the same gesture. Deterministic, so a test can pin it.
+const MOTION_BLUR_EXPOSURE: Duration = Duration::from_micros(16_667);
+
+/// Travel below which the switch is not blurred at all.
+///
+/// The floor is not just thrift. A directional chain always descends at least one rung (the smear
+/// has to land in a same-size twin, and only the shrinking levels have one), so a one-pixel radius
+/// would still pay a halving and a resample along the axis — softening the last few frames of
+/// every switch precisely where the strip is settling and the eye is coming to rest.
+const MOTION_BLUR_MIN_TRAVEL: f64 = 6.;
+
+/// The cap on reported travel, as a multiple of the strip-axis extent.
+///
+/// Must not exceed `MotionBlur::MAX_TRAVEL_FACTOR` in
+/// `render_helpers::vulkan::motion_blur`, which is the radius the smear's pyramid is built deep
+/// enough for; asking past it would silently clamp to a shallower descent and a softer result.
+const MOTION_BLUR_MAX_TRAVEL_FACTOR: f64 = 1.5;
+
 /// How long the row's scroll stays held after the pointer leaves its band — see
 /// [`StripFreeze`]. The same `WINDOW_REPOSITIONING_DELAY` the picker's close freeze runs on,
 /// because it is the same question about the same pointer.
@@ -185,6 +207,14 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) previous_workspace_id: Option<WorkspaceId>,
     /// In-progress switch between workspaces.
     pub(super) workspace_switch: Option<WorkspaceSwitch>,
+    /// Whether the in-progress switch came from a gesture — a swipe still under the finger, or the
+    /// fling it was released into.
+    ///
+    /// Carried separately because the two become indistinguishable the moment the finger lifts:
+    /// [`Self::workspace_switch_gesture_end`] replaces the `Gesture` with a plain `Animation`, and
+    /// the only trace left in the animation is a non-zero initial velocity, which is not a
+    /// provenance. [`Self::workspace_switch_motion`] is what needs to tell them apart.
+    pub(super) workspace_switch_from_gesture: bool,
     /// Indication where an interactively-moved window is about to be placed.
     pub(super) insert_hint: Option<InsertHint>,
     /// Insert hint element for rendering.
@@ -565,6 +595,22 @@ impl WorkspaceSwitch {
         }
     }
 
+    /// [`Self::current_idx`] as of `at` rather than now — the switch's position read off the
+    /// animation curve at an arbitrary time, which is how a velocity is taken without depending on
+    /// when frames happened to land.
+    pub fn current_idx_at(&self, at: Duration) -> f64 {
+        match self {
+            WorkspaceSwitch::Animation(anim) => anim.value_at(at),
+            WorkspaceSwitch::Gesture(gesture) => {
+                gesture.current_idx
+                    + gesture
+                        .animation
+                        .as_ref()
+                        .map_or(0., |anim| anim.value_at(at))
+            }
+        }
+    }
+
     pub fn target_idx(&self) -> f64 {
         match self {
             WorkspaceSwitch::Animation(anim) => anim.to(),
@@ -729,6 +775,7 @@ impl<W: LayoutElement> Monitor<W> {
             app_grid_shown: false,
             app_grid_expand: None,
             workspace_switch: None,
+            workspace_switch_from_gesture: false,
             clock,
             base_options,
             options,
@@ -996,6 +1043,7 @@ impl<W: LayoutElement> Monitor<W> {
                     0.,
                     config,
                 )));
+                self.workspace_switch_from_gesture = false;
             }
         }
     }
@@ -2292,7 +2340,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// GNOME (40+) arranges the overview workspaces in a horizontal row with
     /// the active one centered (gnome-shell `WorkspacesView`); niri's
     /// overview is a vertical strip. Applies to all workspace-strip geometry.
-    pub(super) fn workspaces_horizontal(&self) -> bool {
+    pub fn workspaces_horizontal(&self) -> bool {
         self.options.layout.windowing_mode == WindowingMode::Floating
     }
 
@@ -3718,6 +3766,60 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// How far the workspace strip travels during one frame's exposure, in logical pixels along
+    /// the strip axis — the radius of the switch's motion blur. `None` when there should be none.
+    ///
+    /// **Divergence from gnome-shell (approved 2026-09-17).** GNOME never faces this: a keyboard
+    /// switch there lays out only the two workspaces involved, adjacent, so seven-to-one slides
+    /// exactly as far as two-to-one (`workspaceAnimation.js:436-459`). We keep niri's continuous
+    /// strip because scrolling past the workspaces in between is what tells you *where* you went,
+    /// and blur the sweep instead of shortening it. See
+    /// `docs/fork/workspace-switch-motion-blur.md`.
+    ///
+    /// The travel is read off the animation curve around `now` rather than differenced between
+    /// frames, so it does not depend on when frames actually landed — a dropped frame must not
+    /// change how the next one is blurred.
+    pub fn workspace_switch_motion(&self) -> Option<f64> {
+        let switch = self.workspace_switch.as_ref()?;
+
+        // A swipe under the finger tracks the hand exactly, and the fling it is released into is
+        // the same motion continuing; blurring either would smear something the user is steering.
+        if self.workspace_switch_from_gesture {
+            return None;
+        }
+
+        // A switch that runs *with* an overview zoom has a rendered index corrected against the
+        // zoom's own curve (see [`Self::workspace_render_idx`]), so this animation alone no longer
+        // describes what moves. Leave it alone: the workspaces are shrinking into the overview
+        // there, not sweeping past, and a smear along the strip axis would be claiming travel that
+        // is only one component of what the eye is following.
+        if matches!(self.overview_progress, Some(OverviewProgress::Animation(_))) {
+            return None;
+        }
+
+        let now = self.clock.now();
+        let half = MOTION_BLUR_EXPOSURE / 2;
+        let travel_idx = (switch.current_idx_at(now + half)
+            - switch.current_idx_at(now.saturating_sub(half)))
+        .abs();
+        let extent = self.workspace_extent_with_gap(self.overview_zoom());
+        let travel = travel_idx * extent;
+
+        if travel < MOTION_BLUR_MIN_TRAVEL {
+            return None;
+        }
+
+        // Cap so a pathological velocity cannot ask for more pyramid than the chain was built
+        // with. Past about a screen of travel per frame the smear is a uniform wash anyway, so the
+        // clamp costs nothing anyone can see.
+        let axis_extent = if self.workspaces_horizontal() {
+            self.view_size.w
+        } else {
+            self.view_size.h
+        };
+        Some(travel.min(axis_extent * MOTION_BLUR_MAX_TRAVEL_FACTOR))
+    }
+
     pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
@@ -4765,6 +4867,7 @@ impl<W: LayoutElement> Monitor<W> {
             dnd_snap_last_switch: None,
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+        self.workspace_switch_from_gesture = true;
     }
 
     pub fn dnd_scroll_gesture_begin(&mut self) {
@@ -4798,6 +4901,7 @@ impl<W: LayoutElement> Monitor<W> {
             dnd_snap_last_switch: None,
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+        self.workspace_switch_from_gesture = true;
     }
 
     pub fn workspace_switch_gesture_update(
@@ -5054,6 +5158,10 @@ impl<W: LayoutElement> Monitor<W> {
             velocity,
             self.options.animations.workspace_switch.0,
         )));
+        // The fling a swipe was released into is still the gesture, as far as the motion blur is
+        // concerned: the user has been watching the strip track their finger, so the settle is a
+        // continuation of a motion they are steering, not one sprung on them.
+        self.workspace_switch_from_gesture = true;
 
         true
     }

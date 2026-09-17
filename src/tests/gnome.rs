@@ -36717,6 +36717,103 @@ fn the_battery_indicator_reads_every_power_state() {
     );
 }
 
+/// A keyboard workspace switch is smeared along its travel; a swipe never is.
+///
+/// **Deliberate divergence from gnome-shell**, approved 2026-09-17 — see
+/// `docs/fork/workspace-switch-motion-blur.md`. GNOME never has to smear anything, because a
+/// keyboard switch there lays out only the two workspaces involved, adjacent
+/// (`js/ui/workspaceAnimation.js:436-459`), so distance costs it no extra travel at all. We keep
+/// the continuous strip — sweeping past the workspaces in between is what says *where* you went —
+/// and pay for it with a motion blur.
+///
+/// The measurement is the point: the switch is a critically damped spring, whose speed at a given
+/// moment is proportional to the distance left to cover, so a six-workspace jump must report about
+/// six times the travel of a one-workspace jump sampled at the same instant. Both switches are
+/// sampled 16 ms in, varying only the distance.
+#[test]
+fn a_keyboard_workspace_switch_is_smeared_by_how_fast_it_moves() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // Six populated workspaces plus the trailing empty one dynamic workspaces keep, leaving the
+    // active workspace at index 6 with a long way to travel back.
+    setup_n_desktops(&mut f, id, 6);
+    let output = f.synoik().global_space.outputs().next().cloned().unwrap();
+
+    // `WorkspaceReference::Index` is 1-based (`Synoik::find_output_and_workspace_index`).
+    let travel = |f: &mut Fixture, one_based: u8| -> Option<f64> {
+        f.freeze_clock();
+        f.synoik_state().do_action(
+            Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(one_based)),
+            false,
+        );
+        // Mid-animation, never at an endpoint: a spring is at rest at both ends, so sampling
+        // either one would report no motion no matter what the switch did in between.
+        f.advance_clock(Duration::from_millis(16));
+        f.turn();
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspace_switch_motion()
+    };
+
+    // Six workspaces down to the first.
+    let far = travel(&mut f, 1).expect("a six-workspace switch must be smeared");
+    assert!(f.run_until_settled(120), "the long switch must settle");
+    assert_eq!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspace_switch_motion(),
+        None,
+        "a strip that has stopped moving must not be smeared",
+    );
+
+    // One workspace, from the same standing start.
+    let near = travel(&mut f, 2).expect("a one-workspace switch is still moving, so still smeared");
+    assert!(f.run_until_settled(120), "the short switch must settle");
+
+    assert!(
+        far > near * 4.,
+        "the smear must follow how fast the strip is actually moving: six workspaces reported \
+         {far:.1}px of travel against {near:.1}px for one, and a spring's speed is proportional \
+         to the distance left",
+    );
+
+    // A swipe is the user's own hand: the strip tracks it exactly, and so does the fling it is
+    // released into. Neither is something to blur.
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let layout = &mut f.synoik_state().synoik.layout;
+    layout.workspace_switch_gesture_begin(&out, true);
+    layout.workspace_switch_gesture_update(400., Duration::from_millis(50), true);
+    assert_eq!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspace_switch_motion(),
+        None,
+        "a swipe under the finger must not be smeared",
+    );
+
+    let layout = &mut f.synoik_state().synoik.layout;
+    layout.workspace_switch_gesture_end(Some(true));
+    f.advance_clock(Duration::from_millis(16));
+    f.turn();
+    assert_eq!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspace_switch_motion(),
+        None,
+        "the fling a swipe is released into is the same motion continuing, and is not smeared \
+         either — it is an `Animation` like any other by then, so only the flag can tell",
+    );
+}
+
 /// A workspace switch holds its focus change until the animation finishes.
 ///
 /// **Deliberate divergence from GNOME.** mutter focuses synchronously at the start of the switch

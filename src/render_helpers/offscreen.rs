@@ -61,6 +61,13 @@ pub struct OffscreenRenderElement {
     src_size: Size<i32, Buffer>,
     alpha: f32,
     kind: Kind,
+    /// Report the whole element as damaged regardless of what changed inside the group.
+    ///
+    /// For post-processing that rewrites every pixel from a parameter the group itself knows
+    /// nothing about — the workspace switch's motion blur, whose radius changes every frame. The
+    /// inner damage tracker only ever sees the sliding elements, so it would happily report a
+    /// small rect while the smear that reaches the screen changed everywhere.
+    full_damage: bool,
 }
 
 #[derive(Debug)]
@@ -201,6 +208,7 @@ impl OffscreenBuffer {
             src_size,
             alpha: 1.,
             kind: Kind::Unspecified,
+            full_damage: false,
         };
 
         let data = OffscreenData {
@@ -240,6 +248,23 @@ impl OffscreenRenderElement {
         self
     }
 
+    /// Draw `texture` in place of the group's own — a post-processed copy of it, the same size.
+    ///
+    /// The element keeps its [`Id`], because it is still the same thing on screen: minting a new
+    /// one per frame would churn the damage tracker's identity for what is, to the viewer, one
+    /// group being drawn slightly differently. Pair it with [`Self::with_full_damage`], since the
+    /// inner tracker cannot see whatever the post-process did.
+    pub fn with_source_texture(mut self, texture: VkTexture) -> Self {
+        self.texture = texture;
+        self
+    }
+
+    /// See [`full_damage`](Self#structfield.full_damage).
+    pub fn with_full_damage(mut self) -> Self {
+        self.full_damage = true;
+        self
+    }
+
     pub fn logical_size(&self) -> Size<f64, Logical> {
         self.src_size
             .to_f64()
@@ -247,6 +272,9 @@ impl OffscreenRenderElement {
     }
 
     fn damage_since(&self, commit: Option<CommitCounter>) -> DamageSet<i32, Buffer> {
+        if self.full_damage {
+            return DamageSet::from_slice(&[Rectangle::from_size(self.texture.size())]);
+        }
         self.damage
             .damage_since(commit)
             .unwrap_or_else(|| DamageSet::from_slice(&[Rectangle::from_size(self.texture.size())]))

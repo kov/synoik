@@ -1203,6 +1203,12 @@ pub struct Synoik {
     /// overlap, which the group composite avoids.
     picker_offscreen: OffscreenBuffer,
     thumbnails_offscreen: OffscreenBuffer,
+    /// Per-output state for the workspace switch's motion blur, keyed by output name.
+    ///
+    /// `RefCell` for the same reason [`OffscreenBuffer`] carries one: this is reached during
+    /// element building, where `self` is already borrowed for the monitor the elements come from.
+    motion_blur:
+        RefCell<std::collections::HashMap<String, crate::render_helpers::vulkan::MotionBlurSlot>>,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
     /// Request sink for the symbolic-icon worker. Held here rather than only inside `icon_cache`
@@ -8310,6 +8316,7 @@ impl Synoik {
             overview_search_expand: None,
             overview_search_expand_target: false,
             picker_offscreen: OffscreenBuffer::default(),
+            motion_blur: RefCell::new(std::collections::HashMap::new()),
             thumbnails_offscreen: OffscreenBuffer::default(),
             icon_cache: IconCache::new("Adwaita"),
             symbolic_icon_tx: None,
@@ -12174,6 +12181,18 @@ impl Synoik {
         let mon = self.layout.monitor_for_output(output).unwrap();
         let zoom = mon.overview_zoom();
 
+        // How far the workspace strip travels in one exposure, if it is sweeping under its own
+        // steam — the workspace switch's motion blur. Logical pixels become the offscreen's own
+        // texels here, which is the scale the group is composited at.
+        let motion_axis = if mon.workspaces_horizontal() {
+            synoik_vk::blur::Axis::Horizontal
+        } else {
+            synoik_vk::blur::Axis::Vertical
+        };
+        let motion_travel = mon
+            .workspace_switch_motion()
+            .map(|travel| travel * fade_scale);
+
         // In GNOME windowing mode the org.gnome.desktop.background wallpaper
         // backs every workspace. In the overview its corners round like
         // gnome-shell's `.workspace-background`; the workspace shadow rounds on
@@ -12232,11 +12251,14 @@ impl Synoik {
             {
                 let mut group = Vec::new();
                 mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem.into()));
-                Self::push_group_at_alpha(
+                Self::push_group(
                     ctx.renderer,
                     &self.picker_offscreen,
+                    &self.motion_blur,
+                    output.name(),
                     fade_scale,
                     picker_alpha,
+                    motion_travel.map(|travel| (motion_axis, travel)),
                     group,
                     push,
                 );
@@ -12498,11 +12520,14 @@ impl Synoik {
             // Bottom of the group: the shadow each workspace casts on the backdrop.
             mon.render_workspace_shadows(&mut |elem| group.push(elem.into()));
 
-            Self::push_group_at_alpha(
+            Self::push_group(
                 ctx.renderer,
                 &self.picker_offscreen,
+                &self.motion_blur,
+                output.name(),
                 fade_scale,
                 picker_alpha,
+                motion_travel.map(|travel| (motion_axis, travel)),
                 group,
                 push,
             );
@@ -15651,6 +15676,45 @@ impl Synoik {
     /// per-element alpha would double-darken wherever two window previews overlap.
     /// Falls back to a plain push if the offscreen fails, so a fade problem can
     /// never blank the overview.
+    #[allow(clippy::too_many_arguments)]
+    fn push_group(
+        renderer: &mut VulkanRenderer,
+        buffer: &OffscreenBuffer,
+        motion_slots: &RefCell<
+            std::collections::HashMap<String, crate::render_helpers::vulkan::MotionBlurSlot>,
+        >,
+        output_name: String,
+        scale: f64,
+        alpha: f32,
+        motion: Option<(synoik_vk::blur::Axis, f64)>,
+        elements: Vec<OutputRenderElements>,
+        push: &mut dyn FnMut(OutputRenderElements),
+    ) {
+        if alpha <= 0.001 {
+            return;
+        }
+
+        // While the strip is sweeping under its own steam, the motion blur owns the composite —
+        // and for one frame after it stops, to repaint what the last smear reached. It has its own
+        // offscreen per output, so the search cross-fade's shared one is left alone; the two
+        // effects compose, since the smeared group still takes the fade's alpha.
+        {
+            let mut slots = motion_slots.borrow_mut();
+            let slot = slots.entry(output_name).or_default();
+            if motion.is_some() || slot.was_smeared() {
+                if let Some(elem) = slot.render(renderer, Scale::from(scale), motion, &elements) {
+                    push(elem.with_alpha(alpha).into());
+                    return;
+                }
+                // Compositing or the chain failed; the plain path below is still correct.
+            }
+        }
+
+        Self::push_group_at_alpha(renderer, buffer, scale, alpha, elements, push);
+    }
+
+    /// Composite `elements` as one group at `alpha`, or push them straight through at full
+    /// opacity. The plain path, for groups that never slide — the thumbnail strip's own fade.
     fn push_group_at_alpha(
         renderer: &mut VulkanRenderer,
         buffer: &OffscreenBuffer,
