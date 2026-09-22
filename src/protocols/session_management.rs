@@ -24,6 +24,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::Xdg
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
+use tracing::warn;
 use wayland_backend::server::ClientId;
 
 use super::raw::xdg_session_management::v1::server::xdg_session_manager_v1::{
@@ -588,17 +589,43 @@ fn add_toplevel<D>(
         .is_some_and(|live| live.toplevels.contains_key(&name));
 
     if already_added || name_taken {
+        // Both of these kill the client, so the message has to carry enough to name the culprit:
+        // which name collided, and — since `already_added` is checked first — a `name_in_use`
+        // report means a *different* toplevel of the same client already holds it. Without the
+        // name, a crash-looping client leaves nothing in the journal but the error text.
         let (code, msg) = if already_added {
+            let under = state
+                .session_manager_state()
+                .registration_for(&toplevel)
+                .map(|(id, name)| format!("{id}/{name}"))
+                .unwrap_or_else(|| String::from("<unknown>"));
             (
                 xdg_session_v1::Error::AlreadyAdded,
-                "toplevel is already in a session held by this client",
+                format!(
+                    "toplevel {} is already in a session held by this client, as {under} \
+                     (asked to add it as {}/{name})",
+                    toplevel.id(),
+                    data.id,
+                ),
             )
         } else {
+            let held_by = state
+                .session_manager_state()
+                .session_of(session)
+                .and_then(|live| live.toplevels.get(&name))
+                .map(|reg| reg.toplevel.id().to_string())
+                .unwrap_or_else(|| String::from("<unknown>"));
             (
                 xdg_session_v1::Error::NameInUse,
-                "a toplevel with this name is already in the session",
+                format!(
+                    "a toplevel with this name is already in the session: {}/{name} is held by \
+                     toplevel {held_by}, cannot also be toplevel {}",
+                    data.id,
+                    toplevel.id(),
+                ),
             )
         };
+        warn!("session management: {msg}");
         data_init.init(id, ToplevelSessionData::inert(name));
         session.post_error(code, msg);
         return;
