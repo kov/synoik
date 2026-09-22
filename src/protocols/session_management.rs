@@ -280,8 +280,10 @@ impl SessionManagerState {
     ///
     /// A takeover empties the previous holder's registrations, so a session that changed hands
     /// between the request and the configure simply fails to resolve here — the inertness rule
-    /// doing the work rather than a staleness check. The same lookup catches a handle that was
-    /// renamed onto a name someone else now holds.
+    /// doing the work rather than a staleness check. The identity check on the registration is
+    /// what rejects a handle whose name now answers to someone else — `remove_toplevel` followed
+    /// by a fresh `add_toplevel` under the same name. A `rename` moves the map key and the
+    /// handle's own name together, so the lookup follows it and the restore survives.
     pub fn restore_target_for(&self, handle: &XdgToplevelSessionV1) -> Option<RestoreTarget> {
         let data = handle.data::<ToplevelSessionData>()?;
         let session_id = data.session_id.clone();

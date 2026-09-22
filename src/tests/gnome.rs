@@ -31799,6 +31799,56 @@ fn a_session_that_never_restores_moves_nobody() {
     );
 }
 
+/// Two `restore_toplevel`s on one toplevel: the last one is the record that gets replayed.
+///
+/// Legal because we follow mutter in not raising `already_added`, which leaves the unmapped
+/// window holding one restore handle and a choice about which request it names. Last write wins —
+/// the only rule here that does not depend on which registration a scan happened to reach first.
+#[test]
+fn the_last_restore_request_on_a_toplevel_is_the_one_replayed() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let record = |workspace: u32| ToplevelRecord {
+        state: Some(WindowState::Floating.as_raw()),
+        floating_rect: Some([100, 100, 300, 200]),
+        workspace: Some(workspace),
+        output: Some(saved_on("headless-1")),
+        ..Default::default()
+    };
+    remember(&mut f, &session_id, "first", record(0));
+    remember(&mut f, &session_id, "second", record(2));
+
+    let before = windows_now(&mut f);
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    let _first =
+        session.restore_toplevel(&toplevel, String::from("first"), &qh, String::from("first"));
+    let _second = session.restore_toplevel(
+        &toplevel,
+        String::from("second"),
+        &qh,
+        String::from("second"),
+    );
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.settle();
+    let win = window_added_since(&mut f, &before);
+
+    assert_eq!(
+        placement_of(&mut f, &win).2,
+        2,
+        "the second request's record, not the first's"
+    );
+}
+
 /// A workspace restored for a display that was not here goes home when that display arrives.
 ///
 /// The restore tags it as that display's, with the index it was saved at, so plugging the display

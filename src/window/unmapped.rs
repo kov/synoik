@@ -34,7 +34,8 @@ pub struct Unmapped {
     /// Only the handle: the session, the name, the reason and the saved record are all re-resolved
     /// when the initial configure fires, since any of them can have gone away in between. The
     /// handle is what identifies *which* registration asked — a toplevel may hold more than one,
-    /// and `add_toplevel` never asks for anything. See
+    /// and `add_toplevel` never asks for anything, so a plain add after a restore leaves the
+    /// earlier request standing. A second `restore_toplevel` replaces it: last write wins. See
     /// `protocols::session_management::SessionManagerState::restore_target_for`.
     pub session_restore: Option<XdgToplevelSessionV1>,
 }
