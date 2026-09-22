@@ -29925,6 +29925,115 @@ fn two_toplevels_with_the_same_name_is_name_in_use() {
     f.roundtrip(id);
 }
 
+/// A name whose toplevel is gone can be claimed again — DIVERGENCE from mutter.
+///
+/// Mutter compares the name alone (`meta-wayland-xdg-session.c:295-300`), so a client that closes
+/// a window and opens a new one under the same name is killed. Firefox does exactly that for
+/// History → Recently Closed Windows, and disabled the protocol on GNOME over it (Bug 2064100).
+/// The registration stays, so the name still resolves and the saved record is untouched; it just
+/// stops *holding* the name once the window behind it is gone.
+#[test]
+fn a_dead_toplevels_name_can_be_claimed_again() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    let second = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&second, String::from("one"), &qh, String::from("one"));
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events(),
+        [SessionEvent::Created(session_id)],
+        "reclaiming a dead toplevel's name must not raise name_in_use"
+    );
+}
+
+/// Reclaiming is not forgetting: the record saved under a dead toplevel's name still replays.
+///
+/// This is what keeps the divergence above honest, and what separates it from KWin — KWin frees
+/// the name when the handle is destroyed and discards the state with it, so there would be
+/// nothing left to restore from.
+#[test]
+fn restoring_a_dead_toplevels_name_replays_its_record() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.settle();
+
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .and_then(|record| record.toplevels.get("one"))
+            .and_then(|toplevel| toplevel.workspace),
+        Some(1),
+        "the closed window's record must still be in the store"
+    );
+
+    let before = windows_now(&mut f);
+    let (restored, _handle) = restore_window(&mut f, id, &session, "one");
+    map_at_configured_size(&mut f, id, &restored);
+    f.settle();
+    let win = window_added_since(&mut f, &before);
+
+    assert_eq!(
+        placement_of(&mut f, &win).2,
+        1,
+        "the reopened window lands where the closed one was"
+    );
+}
+
 /// One toplevel added twice keeps both names, and unmapping saves its state under each.
 ///
 /// The spec defines an `already_added` error for this, but mutter never raises it

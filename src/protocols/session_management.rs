@@ -88,14 +88,16 @@ struct LiveSession {
 
     /// Toplevel names registered in this session.
     ///
-    /// A name stays taken for the lifetime of the session even after its toplevel goes away —
-    /// that is the whole point of the protocol, and it is what `name_in_use` protects.
+    /// A registration outlives its toplevel: the record is saved on unmap and the entry stays, so
+    /// the name keeps resolving for the rest of the session. It stops *holding* the name, though —
+    /// see [`add_toplevel`] on why a dead toplevel's name can be claimed again.
     toplevels: HashMap<String, RegisteredToplevel>,
 }
 
 #[derive(Debug)]
 struct RegisteredToplevel {
-    /// The toplevel registered under this name. May be dead; the name survives it.
+    /// The toplevel registered under this name. May be dead; the registration survives it, but a
+    /// dead one no longer blocks the name.
     toplevel: XdgToplevel,
 
     /// The handle handed to the client. Also may be dead — `destroy` on it is a no-op by spec.
@@ -589,9 +591,20 @@ where
     // twice, but mutter never raises it (`meta-wayland-xdg-session.c:280-317` checks the name and
     // nothing else) and our reference is mutter, not the spec — so a second registration is
     // allowed and simply gives the window a second name to be saved under.
-    let name_taken = manager
-        .session_of(session)
-        .is_some_and(|live| live.toplevels.contains_key(&name));
+    //
+    // DIVERGENCE from mutter: a name whose toplevel is dead can be claimed again. Mutter compares
+    // the name alone, so a client that closes a window and reopens it under the same name is
+    // killed — which is what Firefox does for History → Recently Closed Windows, and why it
+    // disabled the protocol on GNOME entirely (Bug 2064100). Taking over costs nothing: the
+    // record was saved when the toplevel unmapped and stays in the store untouched, so a client
+    // that wants its state back asks for the same name through `restore_toplevel`. This is
+    // narrower than KWin, which frees the name when the *handle* is destroyed and drops the
+    // saved state with it.
+    let name_taken = manager.session_of(session).is_some_and(|live| {
+        live.toplevels
+            .get(&name)
+            .is_some_and(|reg| reg.toplevel.is_alive())
+    });
 
     if name_taken {
         // This kills the client, so the message has to carry enough to name the culprit. Without
@@ -665,6 +678,10 @@ where
                     return;
                 }
 
+                // Strict here, unlike `add_toplevel`: a rename carries this handle's record onto
+                // the new name, so taking over a dead toplevel's name would overwrite the state
+                // saved under it. Reclaiming a name costs nothing only when the claimant restores
+                // from what is already there.
                 if live.toplevels.contains_key(&new_name) {
                     live.resource.post_error(
                         xdg_session_v1::Error::NameInUse,

@@ -362,6 +362,16 @@ Plus, from the staging spec text and not covered by mutter's suite:
   registration, so the window's state is saved under each of them, and we do the same
   (`SessionManagerState::registrations_for`). A restore therefore resolves from the
   `xdg_toplevel_session_v1` the request created, never by scanning for the toplevel.
+- **Divergence from mutter, approved 2026-09-22: a name whose toplevel is dead can be claimed
+  again.** Mutter compares the name alone, so a client that closes a window and opens another
+  under the same name is killed — which is what Firefox does for History → Recently Closed
+  Windows, and why it disabled the protocol on GNOME outright
+  ([bug 2064100](https://bugzilla.mozilla.org/show_bug.cgi?id=2064100)). The registration itself
+  stays, so the name keeps resolving and the record saved on unmap is untouched; a client that
+  wants that state back asks for the same name through `restore_toplevel`. This is narrower than
+  KWin, which frees the name when the *handle* is destroyed and discards the saved state with it.
+  `rename` stays strict: it carries the renamed handle's record onto the new name, so taking over
+  there would overwrite what was saved under it.
 - `rename` preserves the toplevel's saved state
 - workspace index that no longer exists grows the strip; a nonsense one is capped
 - a set of windows restores onto the right desktops in any order the client asks in
@@ -470,7 +480,8 @@ placement picks. Without that pairing these are screenshots of a default.
    unknown-id-is-new, `replace` (restored to the taker, replaced to the loser), `in_use`,
    `already_mapped` both fresh and after a remap, restore-of-an-unknown-name-adds-without-restored,
    `name_in_use`, adding-one-toplevel-twice-saves-both-names, rename-frees-the-old-name,
-   rename-onto-a-taken-name, and
+   rename-onto-a-taken-name, a-dead-toplevels-name-can-be-claimed-again,
+   restoring-a-dead-toplevels-name-replays-its-record, and
    destroy-goes-inert.
 2. **Persistence — DONE.** `src/session_state.rs` is the store: plain data and serde, no Wayland
    types, JSON at `$XDG_DATA_HOME/synoik/session.json`, written through a temp file that is
