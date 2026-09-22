@@ -29,10 +29,10 @@ Copy it in — a **real directory, not a symlink** (the scan wants a directory) 
 so it is live the moment you log back in:
 
 ```sh
-cp -r ~/Projects/gnome-shell-rs/tools/gnome-ui-dump \
-      ~/.local/share/gnome-shell/extensions/ui-dump@gnome-shell-rs
+cp -r ~/Projects/synoik/tools/gnome-ui-dump \
+      ~/.local/share/gnome-shell/extensions/ui-dump@synoik
 # `gnome-extensions enable` fails before the shell knows the uuid; write the setting directly.
-gsettings get org.gnome.shell enabled-extensions   # then append 'ui-dump@gnome-shell-rs'
+gsettings get org.gnome.shell enabled-extensions   # then append 'ui-dump@synoik'
 ```
 
 Then log out and back in. Check it is up:

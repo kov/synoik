@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pre-commit checks for gnome-shell-rs. To enable in this clone:
+# Pre-commit checks for synoik. To enable in this clone:
 #   git config core.hooksPath .githooks
 #
 # Formatting and clippy cover the WHOLE workspace (--all / --workspace): the

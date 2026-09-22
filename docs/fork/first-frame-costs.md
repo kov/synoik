@@ -157,7 +157,7 @@ font directory's mtime changes. Startup is a cache read, not a scan. `fontdb` ha
 it rescans every process.
 
 The shape of the fix: serialize the resolved face index (path, index, family, weight, style,
-stretch — not the font data) into `$XDG_CACHE_HOME/gnome-shell-rs/fonts.<version>.bin`, keyed on
+stretch — not the font data) into `$XDG_CACHE_HOME/synoik/fonts.<version>.bin`, keyed on
 the font directories' mtimes plus a format version, and load faces lazily by path on first use.
 Invalidate wholesale on any mtime change; a stale-cache bug shows as a missing family, so
 correctness must come from the key, never from patching entries. Worth measuring the split first —

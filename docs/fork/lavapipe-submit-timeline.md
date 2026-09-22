@@ -3,7 +3,7 @@
 **Audience:** whoever works on the VM / host graphics stack (guest Mesa, our `virglrenderer` fork's
 Venus backend, the VMM's virtio-gpu device) — and equally anyone who knows Mesa's **lavapipe**
 timeline-semaphore implementation, since that is the device this shows up on. Written from inside
-the guest (`gnome-shell-rs` dev VM) on 2026-08-06.
+the guest (`synoik` dev VM) on 2026-08-06.
 
 **Status: OPEN, and deliberately small.** One test is `#[ignore]`d. Nothing user-visible is known to
 be affected. This exists so the VM/host side can say "that's us" or "that's you" before we spend

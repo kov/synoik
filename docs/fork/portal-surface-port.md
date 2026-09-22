@@ -172,8 +172,8 @@ time. So by the tenet this is an **additional capability**, kept.
 Decided 2026-08-02: the visible label is **"Dynamic Target"** — it says what the entry does rather
 than who built it, since it sits beside the user's real windows in a shell presenting itself as
 GNOME. The **app id is still `rs.bxt.niri.desktop`**, which resolves to nothing and so draws with no
-icon; that waits on the wider naming decision (neither "niri" nor "gnome-shell-rs" is the intended
-product name). Fix the app id, the desktop file and the icon together when that lands.
+icon. The product is now named **synoik**, so fix the app id, the desktop file and the icon
+together against that name.
 
 ## Note for the seat validation
 

@@ -245,8 +245,8 @@ from a `binds{}` block.
 
 Everything in `resources/schemas/` installs to a **private** directory, never
 `/usr/share/glib-2.0/schemas`:
-`%{_datadir}/gnome-shell-rs/glib-2.0/schemas` from the RPM,
-`/usr/local/share/gnome-shell-rs/glib-2.0/schemas` from `scripts/install-test-session.sh`. The
+`%{_datadir}/synoik/glib-2.0/schemas` from the RPM,
+`/usr/local/share/synoik/glib-2.0/schemas` from `scripts/install-test-session.sh`. The
 session finds it through `GSETTINGS_SCHEMA_DIR` (`resources/niri.service`, and the systemd
 drop-in the test-session script writes), which is searched ahead of the system dir and is
 inherited by everything the session launches — so gnome-control-center sees those keys too.
@@ -254,7 +254,7 @@ inherited by everything the session launches — so gnome-control-center sees th
 To read or write them from a shell, set the same variable:
 
 ```
-GSETTINGS_SCHEMA_DIR=/usr/local/share/gnome-shell-rs/glib-2.0/schemas \
+GSETTINGS_SCHEMA_DIR=/usr/local/share/synoik/glib-2.0/schemas \
     gsettings list-recursively org.gnome.shell-rs.keybindings
 ```
 
@@ -309,7 +309,7 @@ schemas are not vendored: they come from packages we are not replacing.
 
 ### The override
 
-`resources/schemas/gnome-shell-rs.gschema.override` carries our shipped defaults. It is the
+`resources/schemas/synoik.gschema.override` carries our shipped defaults. It is the
 same mechanism GNOME uses on itself — gnome-shell's `00_org.gnome.shell.gschema.override` sets
 the mutter defaults a GNOME session wants, and **GNOME Classic's**
 `00_org.gnome.shell.extensions.classic.gschema.override` gives `<Alt>Tab` to `switch-windows`,

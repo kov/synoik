@@ -15,7 +15,7 @@ curl -O https://raw.githubusercontent.com/unicode-org/cldr/$CLDR/common/annotati
 curl -o derived-en.xml \
   https://raw.githubusercontent.com/unicode-org/cldr/$CLDR/common/annotationsDerived/en.xml
 
-cd ~/Projects/gnome-shell-rs
+cd ~/Projects/synoik
 cargo run --manifest-path tools/emoji-table/Cargo.toml -- \
   /tmp/emoji-test.txt /tmp/en.xml /tmp/derived-en.xml 48.2 resources/emoji-table.txt
 cargo test --workspace emoji::

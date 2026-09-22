@@ -119,7 +119,7 @@ This is the way to test the overlay key and anything input- or display-specific.
    on F1/F2). Log in.
 3. Run it:
    ```sh
-   cd ~/Projects/gnome-shell-rs
+   cd ~/Projects/synoik
    ./target/release/synoik
    ```
    Tap `Super` — the overview should open.
