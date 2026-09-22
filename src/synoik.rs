@@ -5152,23 +5152,30 @@ impl State {
             return;
         };
         let toplevel = toplevel.xdg_toplevel().clone();
-        let Some((session_id, name)) = self
+        let registrations = self
             .synoik
             .session_manager_state
-            .registration_for(&toplevel)
-        else {
+            .registrations_for(&toplevel);
+        if registrations.is_empty() {
             return;
-        };
+        }
 
         let Some(record) = self.session_record_for(window) else {
             return;
         };
 
-        log_session_record(&session_id, &name, &record);
-        self.synoik
-            .session_manager_state
-            .store
-            .save_toplevel(&session_id, &name, record);
+        // Every name the toplevel answers to, not one of them: mutter connects
+        // `on_window_unmanaging` per registration, so a window registered twice is saved under
+        // both names. Picking one out of a hash map would make which name won depend on iteration
+        // order.
+        for (session_id, name) in registrations {
+            log_session_record(&session_id, &name, &record);
+            self.synoik.session_manager_state.store.save_toplevel(
+                &session_id,
+                &name,
+                record.clone(),
+            );
+        }
         self.schedule_session_save();
     }
 

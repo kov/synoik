@@ -49,11 +49,18 @@ pub trait SessionManagerHandler {
     /// the very first configure the toplevel receives.
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool;
 
-    /// Marks a not-yet-configured toplevel as wanting session restore.
+    /// Marks a not-yet-configured toplevel as wanting session restore, under `handle`.
+    ///
+    /// The handle, not the toplevel, is what the configure resolves from: one toplevel may hold
+    /// several registrations, and only the one `restore_toplevel` created asked for anything.
     ///
     /// A no-op if the toplevel is not in `unmapped_windows` — a client can register a toplevel it
     /// never commits.
-    fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel);
+    fn note_session_restore_requested(
+        &mut self,
+        toplevel: &XdgToplevel,
+        handle: XdgToplevelSessionV1,
+    );
 
     /// Snapshots the state of every still-mapped toplevel registered under `session_id`.
     ///
@@ -246,48 +253,46 @@ impl SessionManagerState {
         (&live.resource == resource).then_some(live)
     }
 
-    /// Whether this toplevel is already registered in any session held by `client`.
+    /// Every `(session id, name)` this toplevel is registered under.
     ///
-    /// The spec scopes `already_added` to the client, not to the session, so this walks every
-    /// session the client holds rather than just the one being added to.
-    fn client_already_added(&self, client: &Client, toplevel: &XdgToplevel) -> bool {
-        self.live.values().any(|live| {
-            live.resource.client().as_ref() == Some(client)
-                && live.toplevels.values().any(|reg| &reg.toplevel == toplevel)
-        })
+    /// Usually one, but the spec's `already_added` error is the client's to avoid and mutter never
+    /// raises it (`meta-wayland-xdg-session.c` checks only the name), so a toplevel may legally
+    /// hold several registrations. Mutter connects `on_window_unmanaging` once per registration,
+    /// which saves the window's state under each of its names; returning all of them is what lets
+    /// us do the same instead of picking one out of a hash map at random.
+    pub fn registrations_for(&self, toplevel: &XdgToplevel) -> Vec<(String, String)> {
+        self.live
+            .iter()
+            .flat_map(|(id, live)| {
+                live.toplevels
+                    .iter()
+                    .filter(|(_, reg)| &reg.toplevel == toplevel)
+                    .map(move |(name, _)| (id.clone(), name.clone()))
+            })
+            .collect()
     }
 
-    /// The `(session id, name)` this toplevel is registered under, if any.
+    /// Resolves what it takes to restore the toplevel `handle` was created for, or `None` if it is
+    /// no longer restorable.
     ///
-    /// A toplevel belongs to one client and `already_added` is client-scoped, so there is at most
-    /// one registration to find.
-    pub fn registration_for(&self, toplevel: &XdgToplevel) -> Option<(String, String)> {
-        self.live.iter().find_map(|(id, live)| {
-            let (name, _) = live
-                .toplevels
-                .iter()
-                .find(|(_, reg)| &reg.toplevel == toplevel)?;
-            Some((id.clone(), name.clone()))
-        })
-    }
-
-    /// Resolves what it takes to restore `toplevel`, or `None` if it is no longer restorable.
+    /// Keyed on the handle rather than on the toplevel because only the registration that
+    /// `restore_toplevel` created asked to be restored, and a toplevel can hold more than one.
     ///
     /// A takeover empties the previous holder's registrations, so a session that changed hands
     /// between the request and the configure simply fails to resolve here — the inertness rule
-    /// doing the work rather than a staleness check.
-    pub fn restore_target_for(&self, toplevel: &XdgToplevel) -> Option<RestoreTarget> {
-        self.live.iter().find_map(|(session_id, live)| {
-            let (name, reg) = live
-                .toplevels
-                .iter()
-                .find(|(_, reg)| &reg.toplevel == toplevel)?;
-            Some(RestoreTarget {
-                session_id: session_id.clone(),
-                name: name.clone(),
-                reason: live.reason,
-                handle: reg.handle.clone(),
-            })
+    /// doing the work rather than a staleness check. The same lookup catches a handle that was
+    /// renamed onto a name someone else now holds.
+    pub fn restore_target_for(&self, handle: &XdgToplevelSessionV1) -> Option<RestoreTarget> {
+        let data = handle.data::<ToplevelSessionData>()?;
+        let session_id = data.session_id.clone();
+        let name = data.name.lock().unwrap().clone();
+        let live = self.live.get(&session_id)?;
+        let reg = live.toplevels.get(&name)?;
+        (&reg.handle == handle).then(|| RestoreTarget {
+            session_id,
+            name,
+            reason: live.reason,
+            handle: reg.handle.clone(),
         })
     }
 
@@ -450,7 +455,7 @@ where
 {
     fn request(
         state: &mut D,
-        client: &Client,
+        _client: &Client,
         session: &XdgSessionV1,
         request: <XdgSessionV1 as Resource>::Request,
         data: &SessionData,
@@ -473,7 +478,7 @@ where
                 }
             }
             xdg_session_v1::Request::AddToplevel { id, toplevel, name } => {
-                add_toplevel(state, client, session, data, id, toplevel, name, data_init);
+                add_toplevel(state, session, data, id, toplevel, name, data_init);
             }
             xdg_session_v1::Request::RestoreToplevel { id, toplevel, name } => {
                 // Restoring is only meaningful before the toplevel's first commit, since it
@@ -496,18 +501,10 @@ where
                     .store
                     .get(&data.id)
                     .is_some_and(|record| record.toplevels.contains_key(&name));
-                add_toplevel(
-                    state,
-                    client,
-                    session,
-                    data,
-                    id,
-                    toplevel.clone(),
-                    name,
-                    data_init,
-                );
-                if known {
-                    state.note_session_restore_requested(&toplevel);
+                let handle =
+                    add_toplevel(state, session, data, id, toplevel.clone(), name, data_init);
+                if let Some(handle) = handle.filter(|_| known) {
+                    state.note_session_restore_requested(&toplevel, handle);
                 }
             }
             xdg_session_v1::Request::RemoveToplevel { name } => {
@@ -561,16 +558,19 @@ impl ToplevelSessionData {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Registers `toplevel` under `name`, returning the handle it was registered with.
+///
+/// `None` when nothing was registered: an inert session, or a name already taken.
 fn add_toplevel<D>(
     state: &mut D,
-    client: &Client,
     session: &XdgSessionV1,
     data: &SessionData,
     id: New<XdgToplevelSessionV1>,
     toplevel: XdgToplevel,
     name: String,
     data_init: &mut DataInit<'_, D>,
-) where
+) -> Option<XdgToplevelSessionV1>
+where
     D: Dispatch<XdgToplevelSessionV1, ToplevelSessionData>,
     D: SessionManagerHandler,
     D: 'static,
@@ -580,55 +580,36 @@ fn add_toplevel<D>(
     // An inert session accepts the request but does nothing with it.
     if manager.session_of(session).is_none() {
         data_init.init(id, ToplevelSessionData::inert(name));
-        return;
+        return None;
     }
 
-    let already_added = manager.client_already_added(client, &toplevel);
+    // Only the name is guarded. The spec also defines `already_added` for a toplevel registered
+    // twice, but mutter never raises it (`meta-wayland-xdg-session.c:280-317` checks the name and
+    // nothing else) and our reference is mutter, not the spec — so a second registration is
+    // allowed and simply gives the window a second name to be saved under.
     let name_taken = manager
         .session_of(session)
         .is_some_and(|live| live.toplevels.contains_key(&name));
 
-    if already_added || name_taken {
-        // Both of these kill the client, so the message has to carry enough to name the culprit:
-        // which name collided, and — since `already_added` is checked first — a `name_in_use`
-        // report means a *different* toplevel of the same client already holds it. Without the
-        // name, a crash-looping client leaves nothing in the journal but the error text.
-        let (code, msg) = if already_added {
-            let under = state
-                .session_manager_state()
-                .registration_for(&toplevel)
-                .map(|(id, name)| format!("{id}/{name}"))
-                .unwrap_or_else(|| String::from("<unknown>"));
-            (
-                xdg_session_v1::Error::AlreadyAdded,
-                format!(
-                    "toplevel {} is already in a session held by this client, as {under} \
-                     (asked to add it as {}/{name})",
-                    toplevel.id(),
-                    data.id,
-                ),
-            )
-        } else {
-            let held_by = state
-                .session_manager_state()
-                .session_of(session)
-                .and_then(|live| live.toplevels.get(&name))
-                .map(|reg| reg.toplevel.id().to_string())
-                .unwrap_or_else(|| String::from("<unknown>"));
-            (
-                xdg_session_v1::Error::NameInUse,
-                format!(
-                    "a toplevel with this name is already in the session: {}/{name} is held by \
-                     toplevel {held_by}, cannot also be toplevel {}",
-                    data.id,
-                    toplevel.id(),
-                ),
-            )
-        };
+    if name_taken {
+        // This kills the client, so the message has to carry enough to name the culprit. Without
+        // the name, a crash-looping client leaves nothing in the journal but the error text.
+        let held_by = state
+            .session_manager_state()
+            .session_of(session)
+            .and_then(|live| live.toplevels.get(&name))
+            .map(|reg| reg.toplevel.id().to_string())
+            .unwrap_or_else(|| String::from("<unknown>"));
+        let msg = format!(
+            "a toplevel with this name is already in the session: {}/{name} is held by \
+             toplevel {held_by}, cannot also be toplevel {}",
+            data.id,
+            toplevel.id(),
+        );
         warn!("session management: {msg}");
         data_init.init(id, ToplevelSessionData::inert(name));
-        session.post_error(code, msg);
-        return;
+        session.post_error(xdg_session_v1::Error::NameInUse, msg);
+        return None;
     }
 
     let handle = data_init.init(id, ToplevelSessionData::new(data.id.clone(), name.clone()));
@@ -643,6 +624,7 @@ fn add_toplevel<D>(
             handle: handle.clone(),
         },
     );
+    Some(handle)
 }
 
 impl<D> Dispatch<XdgToplevelSessionV1, ToplevelSessionData, D> for SessionManagerState

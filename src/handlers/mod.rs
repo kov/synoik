@@ -90,6 +90,7 @@ use crate::protocols::foreign_toplevel::{
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
 use crate::protocols::session_management::{SessionManagerHandler, SessionManagerState};
 use crate::protocols::virtual_pointer::{
@@ -1028,7 +1029,11 @@ impl SessionManagerHandler for State {
         let _ = self.save_live_session_toplevels_matching(Some(session_id));
     }
 
-    fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel) {
+    fn note_session_restore_requested(
+        &mut self,
+        toplevel: &XdgToplevel,
+        handle: XdgToplevelSessionV1,
+    ) {
         let Some(unmapped) = self
             .synoik
             .unmapped_windows
@@ -1037,7 +1042,7 @@ impl SessionManagerHandler for State {
         else {
             return;
         };
-        unmapped.wants_session_restore = true;
+        unmapped.session_restore = Some(handle);
     }
 
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool {

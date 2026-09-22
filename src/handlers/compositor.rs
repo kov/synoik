@@ -185,7 +185,7 @@ impl State {
                         activation_token_data,
                         activation_token,
                         had_initial_commit: _,
-                        wants_session_restore: _,
+                        session_restore: _,
                     } = entry.remove();
 
                     window.on_commit();

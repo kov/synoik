@@ -29925,22 +29925,55 @@ fn two_toplevels_with_the_same_name_is_name_in_use() {
     f.roundtrip(id);
 }
 
-/// One toplevel cannot be added twice, even under a different name.
+/// One toplevel added twice keeps both names, and unmapping saves its state under each.
+///
+/// The spec defines an `already_added` error for this, but mutter never raises it
+/// (`meta-wayland-xdg-session.c:280-317` guards the name and nothing else) and connects
+/// `on_window_unmanaging` once per registration, so the window is saved under every name it
+/// answers to. Our reference is mutter, so the second registration is allowed — and the save has
+/// to reach both names rather than whichever one a hash map yields first.
 #[test]
-#[should_panic(expected = "Protocol error 4 on object xdg_session_v1")]
-fn adding_one_toplevel_twice_is_already_added() {
+fn adding_one_toplevel_twice_saves_it_under_both_names() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
 
     let id = f.add_client();
     f.roundtrip(id);
-    let (session, _session_id) = new_session(&mut f, id);
+    let (session, session_id) = new_session(&mut f, id);
 
     let qh = f.client(id).qh.clone();
-    let toplevel = f.client(id).create_window().xdg_toplevel.clone();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
     session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
     session.add_toplevel(&toplevel, String::from("two"), &qh, String::from("two"));
+    f.client(id).window(&surface).commit();
     f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.settle();
+
+    f.client(id).window(&surface).attach_null_buffer();
+    f.client(id).window(&surface).commit();
+    f.double_roundtrip(id);
+
+    let saved = |f: &mut Fixture, name: &str| {
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .and_then(|record| record.toplevels.get(name))
+            .and_then(|toplevel| toplevel.workspace)
+    };
+    assert_eq!(saved(&mut f, "one"), Some(1));
+    assert_eq!(saved(&mut f, "two"), Some(1), "both names, not just one");
 }
 
 /// `rename` frees the old name, so a later toplevel may take it.

@@ -1048,15 +1048,16 @@ impl State {
     ///
     /// Nothing here is trusted from when the request was made: the session can have been taken
     /// over, the record removed, or the handle destroyed in between. A takeover empties the
-    /// previous holder's registrations, so it simply fails to resolve.
-    fn resolve_session_restore(&self, toplevel: &ToplevelSurface) -> Option<SessionRestore> {
+    /// previous holder's registrations, so it simply fails to resolve. `handle` is the one the
+    /// request created, which is what says *which* of a toplevel's registrations asked.
+    fn resolve_session_restore(&self, handle: &XdgToplevelSessionV1) -> Option<SessionRestore> {
+        if !handle.is_alive() {
+            return None;
+        }
         let target = self
             .synoik
             .session_manager_state
-            .restore_target_for(toplevel.xdg_toplevel())?;
-        if !target.handle.is_alive() {
-            return None;
-        }
+            .restore_target_for(handle)?;
 
         // Both misses are logged rather than swallowed: a client asking under a session id or a
         // name the store has never seen is indistinguishable, from the outside, from a restore
@@ -1213,14 +1214,14 @@ impl State {
         // Resolved before the `unmapped_windows` borrow below, like `pointer_output`. `None` for
         // every window that did not ask to be restored, which is what keeps this whole branch
         // additive: without it, everything below runs exactly as it did before.
-        let wants_restore = self
+        let restore_handle = self
             .synoik
             .unmapped_windows
             .get(toplevel.wl_surface())
-            .is_some_and(|unmapped| unmapped.wants_session_restore);
-        let restore = wants_restore
-            .then(|| self.resolve_session_restore(toplevel))
-            .flatten();
+            .and_then(|unmapped| unmapped.session_restore.clone());
+        let restore = restore_handle
+            .as_ref()
+            .and_then(|handle| self.resolve_session_restore(handle));
         let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;

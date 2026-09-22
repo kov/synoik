@@ -29,15 +29,18 @@ pub struct Unmapped {
     /// spec pins to "before the first commit" — `xdg_toplevel_session_v1`'s `already_mapped`
     /// error — need the commit itself, not the configure.
     pub had_initial_commit: bool,
-    /// Whether the client asked to *restore* this toplevel rather than merely add it to a session.
+    /// The registration the client asked to *restore* through, if it asked at all.
     ///
-    /// Only the flag: everything else — the session, the name, the handle, the saved record — is
-    /// re-resolved when the initial configure fires, since any of it can have gone away in
-    /// between. See `protocols::session_management::SessionManagerState::restore_target_for`.
-    pub wants_session_restore: bool,
+    /// Only the handle: the session, the name, the reason and the saved record are all re-resolved
+    /// when the initial configure fires, since any of them can have gone away in between. The
+    /// handle is what identifies *which* registration asked — a toplevel may hold more than one,
+    /// and `add_toplevel` never asks for anything. See
+    /// `protocols::session_management::SessionManagerState::restore_target_for`.
+    pub session_restore: Option<XdgToplevelSessionV1>,
 }
 
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
 
 /// The part of a session restore that can only be applied once the window maps.
 #[derive(Debug, Clone)]
@@ -231,7 +234,7 @@ impl Unmapped {
             activation_token_data: None,
             activation_token: None,
             had_initial_commit: false,
-            wants_session_restore: false,
+            session_restore: None,
         }
     }
 

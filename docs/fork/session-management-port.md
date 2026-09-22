@@ -32,7 +32,7 @@ They are the same design; diffing them (modulo the `xx_`→`xdg_` rename) the de
 | `xdg_session_v1.remove_toplevel(name)` | `xx_toplevel_session_v1.remove` (destructor) |
 | `xdg_toplevel_session_v1.rename(name)` | — |
 | `restored` event has no args | `restored` carries the `xdg_toplevel` |
-| errors `invalid_name`, `already_added` | error `invalid_restore` |
+| errors `invalid_name`, `already_added` (mutter has no `already_added`, and neither do we) | error `invalid_restore` |
 | manager errors `invalid_session_id`, `invalid_reason` | — |
 | `get_session` arg `session_id` | arg `session` |
 
@@ -356,7 +356,12 @@ Plus, from the staging spec text and not covered by mutter's suite:
 - `in_use` when the *same* client re-requests a live session
 - `restore_toplevel` with an unknown name → behaves as `add_toplevel`, **no** `restored` event
 - `restore_toplevel` after the first commit → `already_mapped`
-- `name_in_use` on duplicate name; `already_added` on double-add
+- `name_in_use` on duplicate name. **No `already_added`:** the spec defines the error, and KWin
+  raises it, but mutter's `xdg_session_add_toplevel` guards the name and nothing else, so a
+  toplevel registered twice keeps both names. Mutter connects `on_window_unmanaging` once per
+  registration, so the window's state is saved under each of them, and we do the same
+  (`SessionManagerState::registrations_for`). A restore therefore resolves from the
+  `xdg_toplevel_session_v1` the request created, never by scanning for the toplevel.
 - `rename` preserves the toplevel's saved state
 - workspace index that no longer exists grows the strip; a nonsense one is capped
 - a set of windows restores onto the right desktops in any order the client asks in
@@ -464,7 +469,8 @@ placement picks. Without that pairing these are screenshots of a default.
    Landed in `src/tests/gnome.rs`: `basic` (created, and an added toplevel is never restored),
    unknown-id-is-new, `replace` (restored to the taker, replaced to the loser), `in_use`,
    `already_mapped` both fresh and after a remap, restore-of-an-unknown-name-adds-without-restored,
-   `name_in_use`, `already_added`, rename-frees-the-old-name, rename-onto-a-taken-name, and
+   `name_in_use`, adding-one-toplevel-twice-saves-both-names, rename-frees-the-old-name,
+   rename-onto-a-taken-name, and
    destroy-goes-inert.
 2. **Persistence — DONE.** `src/session_state.rs` is the store: plain data and serde, no Wayland
    types, JSON at `$XDG_DATA_HOME/synoik/session.json`, written through a temp file that is
