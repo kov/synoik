@@ -168,6 +168,20 @@ its rectangle across a close. `ScreenshotUi::new` names that type, which is why 
 Restoring a remembered type is a plain assignment in `open`, with GNOME's one guard: `Window` with
 nothing left to pick falls back to `Selection` (`js/ui/screenshot.js:1662-1664`).
 
+## Divergence: a blurring window is shot over its wallpaper
+
+GNOME shoots a window alone (`shell_screenshot_screenshot_window`), which loses nothing there
+because mutter has no client blur. Ours has `ext-background-effect-v1`, and a translucent client
+shot alone comes out see-through, reading as whatever the image is later pasted onto. So when the
+window blurs, `render_window_to_pixels` draws the effect itself (the live scene's is pushed by the
+tile, which a window shot never renders) and backs the **whole** shot — window plus its CSD shadow
+margin — with the slice of wallpaper the window sits on in its workspace. Whole-shot rather than
+geometry-shaped because a CSD client never states its corner radius, so a geometry backing would
+show square corners under every rounded window. The wallpaper ends where the workspace does: a
+shadow margin hanging off the screen edge stays transparent. Windows that do not blur are shot
+alone, as in GNOME. The picker's Window-mode captures share the path. Pinned by
+`a_window_shot_backs_a_blurred_window_with_the_wallpaper`.
+
 ## Addition: the crosshair (`screenshot-quick`, `<Alt><Shift>4`)
 
 Requested 2026-09-10, after macOS' Cmd+Shift+4. All three of GNOME's screenshot keys open the
