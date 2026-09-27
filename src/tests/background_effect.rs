@@ -1216,3 +1216,183 @@ fn a_color_scheme_flip_redraws_a_blurred_surface() {
          captures: {captures:?}",
     );
 }
+
+/// A window shot of a blurring window is taken over the wallpaper it sits on, blurred.
+///
+/// Alone, the shot has nothing behind the window: the root surface's effect is pushed by the tile,
+/// which a window shot never renders, and a blur over an empty offscreen would blur transparency
+/// anyway — so the translucent parts came out see-through. The client here is *fully* transparent,
+/// so every pixel of the shot is backdrop and nothing else.
+///
+/// Blurring only the left half makes one shot check both halves of the fix. The right half is
+/// the plain wallpaper, which must match what the live output draws at the window's rect pixel
+/// for pixel — that is the alignment. The left half must be opaque *and* smoother than that same
+/// wallpaper: opaque alone would pass with the wallpaper backed but the blur skipped.
+#[test]
+fn a_window_shot_backs_a_blurred_window_with_the_wallpaper() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::utils::Transform;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+    if !add_wallpaper(&mut f) {
+        eprintln!("skipping: no wallpaper picture installed");
+        return;
+    }
+
+    let (w, h) = (400, 300);
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, 0, 0, 0);
+    window.set_size(w as u16, h as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    // The reference: the live output, where the transparent window shows the wallpaper as is.
+    let output = f.synoik_output(1);
+    let out_w = output.current_mode().unwrap().size.w;
+    let state = f.synoik_state();
+    let win_id = state
+        .synoik
+        .layout
+        .windows()
+        .next()
+        .unwrap()
+        .1
+        .window
+        .clone();
+    let rect = state
+        .synoik
+        .layout
+        .window_render_rect(&win_id, &output)
+        .expect("the window is on the output")
+        .to_i32_round::<i32>();
+    let screen = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let size = output.current_mode().unwrap().size;
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, &output, false);
+            crate::render_helpers::render_to_vec(
+                vk,
+                size,
+                smithay::utils::Scale::from(1.),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+            .expect("render the output")
+        })
+        .expect("the fixture must have a Vulkan renderer");
+    let reference = |x: i32, y: i32| {
+        let i = (((rect.loc.y + y) * out_w + rect.loc.x + x) * 4) as usize;
+        [screen[i], screen[i + 1], screen[i + 2], screen[i + 3]]
+    };
+
+    f.client(id).set_blur_region(&surface, (0, 0, w / 2, h));
+    f.double_roundtrip(id);
+    f.settle();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
+    let (size, shot) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &state.synoik;
+            let mapped = synoik.layout.windows().next().unwrap().1;
+            synoik
+                .render_window_to_pixels(vk, &output, mapped, false)
+                .expect("render the window shot")
+        })
+        .expect("the fixture must have a Vulkan renderer");
+    assert_eq!(
+        (size.w, size.h),
+        (w, h),
+        "the shot must be the window alone"
+    );
+    let px = |x: i32, y: i32| {
+        let i = ((y * size.w + x) * 4) as usize;
+        [shot[i], shot[i + 1], shot[i + 2], shot[i + 3]]
+    };
+
+    // Opaque everywhere: nothing of the empty offscreen shows through.
+    let translucent = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| px(x, y)[3] != 255)
+        .count();
+    assert_eq!(
+        translucent, 0,
+        "{translucent} px of the shot are not opaque — the transparent window was shot over \
+         nothing instead of over the wallpaper"
+    );
+
+    // Aligned: the unblurred half is the wallpaper the output draws at that very spot. Kept clear
+    // of the blur's edge, which a gaussian is entitled to bleed across.
+    let mut worst = 0;
+    for y in 0..h {
+        for x in w / 2 + 40..w {
+            let (got, want) = (px(x, y), reference(x, y));
+            for c in 0..3 {
+                worst = worst.max((i32::from(got[c]) - i32::from(want[c])).abs());
+            }
+        }
+    }
+    assert!(
+        worst <= 3,
+        "the wallpaper behind the shot differs from the output's by up to {worst} per channel — \
+         it is not the slice the window sits on"
+    );
+
+    // Blurred: the left half is smoother than the wallpaper under it.
+    let contrast = |sample: &dyn Fn(i32, i32) -> [u8; 4]| {
+        let mut sum = 0u64;
+        for y in 0..h {
+            for x in 0..w / 2 - 41 {
+                let (a, b) = (sample(x, y), sample(x + 1, y));
+                for c in 0..3 {
+                    sum += u64::from(a[c].abs_diff(b[c]));
+                }
+            }
+        }
+        sum
+    };
+    let (blurred, raw) = (contrast(&px), contrast(&reference));
+    assert!(
+        raw > 0,
+        "the wallpaper slice is flat, so this cannot tell a blur from none"
+    );
+    assert!(
+        blurred * 2 < raw,
+        "the blurred half has local contrast {blurred} against the raw wallpaper's {raw} — \
+         the backdrop was backed but not blurred"
+    );
+}

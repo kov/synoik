@@ -13999,7 +13999,7 @@ impl Synoik {
         Ok(())
     }
 
-    fn render_window_to_pixels(
+    pub(crate) fn render_window_to_pixels(
         &self,
         renderer: &mut VulkanRenderer,
         output: &Output,
@@ -14032,22 +14032,65 @@ impl Synoik {
         }
         let pointer_count = elements.len();
 
-        let ctx = RenderCtx {
+        let mut ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
             appearance: Some(self.appearance()),
         };
-        mapped.render(
-            ctx,
-            mapped.window.geometry().loc.to_f64(),
-            scale,
-            alpha,
-            &mut |elem| elements.push(elem.into()),
+        // Lands the buffer at the origin, so the window geometry sits at its own `loc`.
+        let window_loc = mapped.window.geometry().loc.to_f64();
+        mapped.render(ctx.r(), window_loc, scale, alpha, &mut |elem| {
+            elements.push(elem.into())
+        });
+
+        // The root surface's blur is the tile's to push in the live scene (it goes under the whole
+        // tile), so a window rendered on its own has to ask for it here.
+        let radius = if mapped.sizing_mode().is_normal() {
+            mapped.geometry_corner_radius()
+        } else {
+            synoik_config::CornerRadius::default()
+        };
+        mapped.render_background_effect(
+            ctx.r(),
+            Rectangle::new(window_loc, mapped.size().to_f64()),
+            scale.x,
+            Scale::from(1.),
+            radius,
+            &mut |elem| elements.push(LayoutElementRenderElement::from(elem).into()),
         );
 
         // The pointer is not included in encompassing_geo because we don't want it to expand the
         // screenshot size.
         let geo = encompassing_geo(scale, elements.iter().skip(pointer_count));
+
+        // A blurred window captured over nothing blurs nothing: its translucent parts come out
+        // transparent, and read as whatever the image is later pasted onto. So a window that
+        // blurs is shot over the slice of wallpaper it sits on, the whole shot backed — a
+        // geometry-shaped backing would show square corners under every rounded CSD window, which
+        // never tells us its radius. Pushed last: it goes at the back, and must not widen `geo`.
+        // GNOME shoots the window alone (`shell_screenshot_screenshot_window`), but mutter has no
+        // client blur to lose.
+        let blurs = elements.iter().skip(pointer_count).any(|elem| {
+            matches!(
+                elem,
+                WindowScreenshotRenderElement::Layout(
+                    LayoutElementRenderElement::BackgroundEffect(_)
+                )
+            )
+        });
+        if blurs {
+            if let Some((ws_loc, view_size)) =
+                self.layout.window_workspace_placement(&mapped.window)
+            {
+                if let Some(elem) =
+                    self.wallpaper
+                        .render(ctx.renderer, window_loc - ws_loc, view_size, 0., scale)
+                {
+                    elements.push(elem.into());
+                }
+            }
+        }
+
         let elements = elements.iter().rev().map(|elem| {
             RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
         });
@@ -16990,6 +17033,7 @@ synoik_render_elements! {
     WindowScreenshotRenderElement => {
         Layout = LayoutElementRenderElement,
         Pointer = RelocateRenderElement<PointerRenderElements>,
+        Wallpaper = RoundedTextureRenderElement<crate::render_helpers::vulkan::VkTexture>,
     }
 }
 

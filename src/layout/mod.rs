@@ -5350,6 +5350,22 @@ impl<W: LayoutElement> Layout<W> {
         Some(Rectangle::new(loc, tile.window_size().upscale(zoom)))
     }
 
+    /// Where `id` sits on its own workspace, unzoomed, with that workspace's view size: the frame
+    /// a window screenshot lines the wallpaper up in. Unlike [`Self::window_render_rect`], neither
+    /// the overview zoom nor the workspace's place on the output enter into it, and it answers for
+    /// a window on any workspace, shown or not.
+    pub fn window_workspace_placement(
+        &self,
+        id: &W::Id,
+    ) -> Option<(Point<f64, Logical>, Size<f64, Logical>)> {
+        self.workspaces().find_map(|(_, _, ws)| {
+            let (tile, tile_offset, _visible) = ws
+                .tiles_with_render_positions()
+                .find(|(tile, _, _)| tile.window().id() == id)?;
+            Some((tile_offset + tile.window_loc(), ws.view_size()))
+        })
+    }
+
     pub fn interactive_move_begin(
         &mut self,
         window_id: W::Id,
