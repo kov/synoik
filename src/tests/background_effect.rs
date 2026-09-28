@@ -1248,10 +1248,48 @@ fn a_window_shot_backs_a_blurred_window_with_the_wallpaper() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1280, 720));
-    if !add_wallpaper(&mut f) {
-        eprintln!("skipping: no wallpaper picture installed");
-        return;
+
+    // A generated checkerboard, not an installed picture: the blur assertion needs detail under
+    // the window, and what an installed wallpaper holds there is the distro's choice — CI's is flat
+    // exactly where the window lands. Same size as the output, so it is drawn 1:1.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
+    let picture = RemoveOnDrop(std::env::temp_dir().join(format!(
+        "synoik-window-shot-wallpaper-{}.png",
+        std::process::id()
+    )));
+    let (pic_w, pic_h) = (1280u32, 720u32);
+    let checker: Vec<u8> = (0..pic_h)
+        .flat_map(|y| (0..pic_w).map(move |x| (x / 16 + y / 16) % 2 == 0))
+        .flat_map(|light| {
+            if light {
+                [230, 230, 230, 255]
+            } else {
+                [20, 20, 20, 255]
+            }
+        })
+        .collect();
+    crate::utils::write_png_rgba8(
+        std::fs::File::create(&picture.0).expect("create the wallpaper file"),
+        pic_w,
+        pic_h,
+        &checker,
+    )
+    .expect("encode the wallpaper");
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some(picture.0.clone()),
+        options: crate::gnome::BackgroundOptions::default(),
+    };
+    let gpu = f
+        .synoik_state()
+        .backend
+        .with_vulkan_renderer(|r| r.gpu().clone());
+    f.synoik().wallpaper.update(&settings, gpu.as_ref());
+    f.settle();
 
     let (w, h) = (400, 300);
     let id = f.add_client();
