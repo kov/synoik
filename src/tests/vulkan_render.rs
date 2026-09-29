@@ -6814,12 +6814,14 @@ fn vulkan_shm_cache_uploads_only_the_damage() {
     );
 }
 
-/// A buffer whose whole-buffer copy is past the off-thread threshold (the staging pool's 16 MiB
-/// shared chunk): 2100×2100×4 is ~16.8 MiB.
-const BIG_SHM: i32 = 2100;
+/// A buffer whose whole-buffer copy is well past the off-thread threshold (the staging pool's
+/// 16 MiB shared chunk): 3000×2000×4 is ~23 MiB, and three quarters of it still clears it.
+const BIG_W: i32 = 3000;
+const BIG_H: i32 = 2000;
 
-/// A mapped green shm window of [`BIG_SHM`]², on a fixture whose renderer copies big shm commits
-/// off the frame. The map itself is a fresh import, which always copies on the frame.
+/// A mapped green shm window of [`BIG_W`]×[`BIG_H`] on a 4K output, on a fixture whose renderer
+/// copies big shm commits off the frame. The map itself is a fresh import, which always copies on
+/// the frame.
 fn big_shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
     if VulkanRenderer::new().is_err() {
         eprintln!("skipping off-thread shm test: no Vulkan device");
@@ -6832,7 +6834,7 @@ fn big_shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.synoik_state().enable_async_shm_uploads();
-    f.add_output(1, (OUT_W, OUT_H));
+    f.add_output(1, (3840, 2160));
 
     let id = f.add_client();
     let window = f.client(id).create_window();
@@ -6840,12 +6842,11 @@ fn big_shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
     window.commit();
     f.roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 0, 255, 0, 255);
-    window.set_size(BIG_SHM as u16, BIG_SHM as u16);
+    window.attach_shm_buffer(BIG_W, BIG_H, 0, 255, 0, 255);
+    window.set_size(BIG_W as u16, BIG_H as u16);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
-    f.double_roundtrip(id);
+    f.settle();
     let output = f.synoik_output(1);
     Some((f, id, surface, output))
 }
@@ -6881,39 +6882,54 @@ fn count_px(pixels: &[u8], w: i32, h: i32, pred: impl Fn([u8; 4]) -> bool) -> us
 }
 
 /// A commit too big for the frame is copied off it: the frame that imports it copies nothing and
-/// keeps showing the previous contents, and when the copy lands the new contents show **and the
-/// surface is damaged** — without that, a damage-tracked output would never repaint the window,
-/// and a screenshot (which redraws everything) could not tell.
+/// the screen keeps showing the previous contents, and when the copy lands the screen shows the new
+/// contents. The client repaints the top three quarters of its window and damages exactly that, so
+/// the check is on the **screen's own slot** against a full redraw: only the landing's damage gets
+/// the window repainted there, and damage in the wrong place leaves a stale band that a
+/// screenshot, which redraws everything, could never show.
 #[test]
 fn a_big_shm_commit_is_copied_off_the_frame() {
     let Some((mut f, id, surface, output)) = big_shm_window_fixture() else {
         return;
     };
-    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
     let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
-    let full = (BIG_SHM * BIG_SHM * 4) as u64;
+    let full = (BIG_W * BIG_H * 4) as u64;
+    let redrawn_rows = BIG_H * 3 / 4;
 
-    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
-    let window_px = count_px(&pixels, w, h, is_green);
-    assert!(window_px > 0, "green window absent from the first frame");
+    // Argb8888 memory order: [B, G, R, A].
+    let mut pixels = Vec::with_capacity(full as usize);
+    for row in 0..BIG_H {
+        let texel: [u8; 4] = if row < redrawn_rows {
+            [0, 0, 255, 255]
+        } else {
+            [0, 255, 0, 255]
+        };
+        for _ in 0..BIG_W {
+            pixels.extend_from_slice(&texel);
+        }
+    }
 
     with_vk(&mut f, |vk| vk.hold_shm_uploads());
     synoik_vk::stats::take_uploaded_bytes();
     let window = f.client(id).window(&surface);
-    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.attach_shm_pixels_damaging(BIG_W, BIG_H, &pixels, (0, 0, BIG_W, redrawn_rows));
     window.commit();
     f.double_roundtrip(id);
-
     assert!(
         synoik_vk::stats::take_uploaded_bytes() < full / 4,
         "the big commit was copied on the frame"
     );
     assert_eq!(with_vk(&mut f, |vk| vk.shm_uploads_in_flight()), 1);
-    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    // Enough frames for every swapchain slot to have drawn the commit's damage.
+    for _ in 0..4 {
+        f.synoik().queue_redraw_all();
+        f.turn();
+    }
+    let (screen, w, h) = crate::tests::fixture::screen_pixels(&mut f, &output);
     assert_eq!(
-        count_px(&pixels, w, h, is_green),
-        window_px,
-        "until its copy lands, the frame shows the previous contents"
+        count_px(&screen, w, h, is_red),
+        0,
+        "until its copy lands, the screen shows the previous contents"
     );
 
     let server_surface = {
@@ -6935,19 +6951,22 @@ fn a_big_shm_commit_is_copied_off_the_frame() {
     let before = commit();
     with_vk(&mut f, |vk| vk.release_shm_uploads());
     land_shm_uploads(&mut f);
-    let after = commit();
     assert_ne!(
-        before, after,
+        before,
+        commit(),
         "a landed copy must damage its surface, or nothing repaints it"
     );
+    f.turn();
 
-    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let (screen, w, h) = crate::tests::fixture::screen_pixels(&mut f, &output);
+    let (capture, _, _) = crate::tests::fixture::capture_pixels(&mut f, &output);
+    assert!(count_px(&screen, w, h, is_red) > 0, "the landed copy shows");
     assert_eq!(
-        count_px(&pixels, w, h, is_red),
-        window_px,
-        "the landed copy shows"
+        crate::tests::fixture::never_painted(&screen, &capture, w, h),
+        None,
+        "the screen disagrees with a full redraw: the landed copy was not repainted where it \
+         changed"
     );
-    assert_eq!(count_px(&pixels, w, h, is_green), 0);
 }
 
 /// A commit that arrives while the previous one is still being copied waits for it, and then the
@@ -6965,17 +6984,17 @@ fn an_overtaken_shm_copy_is_discarded() {
     };
     let is_blue = |p: [u8; 4]| p[2] > 200 && p[0] < 40 && p[1] < 40;
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
-    let full = (BIG_SHM * BIG_SHM * 4) as u64;
+    let full = (BIG_W * BIG_H * 4) as u64;
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     let window_px = count_px(&pixels, w, h, is_green);
 
     with_vk(&mut f, |vk| vk.hold_shm_uploads());
     let window = f.client(id).window(&surface);
-    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.attach_shm_buffer(BIG_W, BIG_H, 255, 0, 0, 255);
     window.commit();
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 0, 0, 255, 255);
+    window.attach_shm_buffer(BIG_W, BIG_H, 0, 0, 255, 255);
     window.commit();
     f.double_roundtrip(id);
 
@@ -7003,7 +7022,7 @@ fn an_shm_copy_outlives_its_surface_harmlessly() {
     };
     with_vk(&mut f, |vk| vk.hold_shm_uploads());
     let window = f.client(id).window(&surface);
-    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.attach_shm_buffer(BIG_W, BIG_H, 255, 0, 0, 255);
     window.commit();
     f.double_roundtrip(id);
     assert_eq!(with_vk(&mut f, |vk| vk.shm_uploads_in_flight()), 1);

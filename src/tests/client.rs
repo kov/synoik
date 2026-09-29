@@ -1091,6 +1091,19 @@ impl Window {
         self.attach_shm_pixels(w, h, &data, wl_shm::Format::Argb8888, None);
     }
 
+    /// Attach a `w`×`h` `Argb8888` shm buffer holding `data` verbatim (`[B, G, R, A]` per pixel),
+    /// reporting damage over `damage` (`x, y, w, h` in buffer coordinates) only — a client that
+    /// repainted part of itself, with the pixels to match.
+    pub fn attach_shm_pixels_damaging(
+        &self,
+        w: i32,
+        h: i32,
+        data: &[u8],
+        damage: (i32, i32, i32, i32),
+    ) {
+        self.attach_shm_pixels(w, h, data, wl_shm::Format::Argb8888, Some(damage));
+    }
+
     /// Attach a `w`×`h` shm buffer holding `data` verbatim — 4 bytes per pixel, in `format`'s
     /// memory order. `damage` is the buffer-coordinate rect to report; `None` damages all of it.
     fn attach_shm_pixels(
