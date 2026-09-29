@@ -138,6 +138,12 @@ pub(crate) struct MotionBlurSlot {
 }
 
 impl MotionBlurSlot {
+    /// The image the strip is composited into — see [`OffscreenBuffer::image`].
+    #[cfg(test)]
+    pub(crate) fn offscreen_image(&self) -> Option<vk::Image> {
+        self.offscreen.image()
+    }
+
     /// Whether the previous frame left a smear on screen, and so still owes it a repaint.
     pub(crate) fn was_smeared(&self) -> bool {
         self.was_smeared

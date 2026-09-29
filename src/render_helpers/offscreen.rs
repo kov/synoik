@@ -78,7 +78,39 @@ pub struct OffscreenData {
     pub states: RenderElementStates,
 }
 
+/// How far a regrown offscreen rounds each axis up. See [`regrown_size`].
+const REGROWTH_ALIGN: i32 = 128;
+
+/// The size to reallocate an offscreen at once `wanted` no longer fits in `old`.
+///
+/// A reallocation is not just a texture: it also replaces the damage tracker, and with it every
+/// inner element's per-element state — each blurred window's cached backdrop bundle included,
+/// which is dropped rather than pooled. So a group whose bounds creep is the expensive case, and
+/// it is the common one: the workspace strip under a switch grows a few pixels on one axis per
+/// frame while shrinking on the other, and reallocating to the exact new size lost every inner
+/// blur on nearly every frame of the switch. Taking the union with the old size and rounding it
+/// up means a creeping group reallocates once rather than per frame. The first allocation stays
+/// exact: only a group that has already outgrown its texture pays the slack.
+///
+/// This makes the drop rare, not harmless: an element that leaves the group (or a tracker that is
+/// replaced anyway) still drops its bundle instead of pooling it, so re-entering rebuilds. Fixing
+/// that means a `BackdropBlur` whose drop returns it to `VulkanRenderer`'s pool.
+fn regrown_size(old: Size<i32, Buffer>, wanted: Size<i32, Buffer>) -> Size<i32, Buffer> {
+    let up = |v: i32| (v + REGROWTH_ALIGN - 1) / REGROWTH_ALIGN * REGROWTH_ALIGN;
+    Size::new(up(old.w.max(wanted.w)), up(old.h.max(wanted.h)))
+}
+
 impl OffscreenBuffer {
+    /// The image currently backing this offscreen, if it has rendered. Test-only: identity is
+    /// what says whether a render reallocated.
+    #[cfg(test)]
+    pub(crate) fn image(&self) -> Option<ash::vk::Image> {
+        self.inner
+            .borrow()
+            .as_ref()
+            .map(|inner| inner.texture.image())
+    }
+
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -106,6 +138,7 @@ impl OffscreenBuffer {
         // Check if we need to create or recreate the texture.
         let size_string;
         let mut reason = "";
+        let mut grown_from = None;
         if let Some(Inner {
             texture,
             renderer_context_id,
@@ -119,6 +152,7 @@ impl OffscreenBuffer {
                     old_size.w, old_size.h, src_size.w, src_size.h
                 );
                 reason = &size_string;
+                grown_from = Some(old_size);
 
                 *inner = None;
             } else if !renderer.offscreen_is_reusable(texture) {
@@ -141,11 +175,12 @@ impl OffscreenBuffer {
             let span = tracy_client::span!("creating offscreen buffer");
             span.emit_text(reason);
 
+            let alloc_size = grown_from.map_or(src_size, |old| regrown_size(old, src_size));
             let texture: VkTexture = renderer
-                .create_buffer(NATIVE_FOURCC, src_size)
+                .create_buffer(NATIVE_FOURCC, alloc_size)
                 .context("error creating texture")?;
 
-            let buffer_size = src_size.to_logical(1, Transform::Normal).to_physical(1);
+            let buffer_size = alloc_size.to_logical(1, Transform::Normal).to_physical(1);
             let damage = OutputDamageTracker::new(buffer_size, scale, Transform::Normal);
 
             inner.insert(Inner {

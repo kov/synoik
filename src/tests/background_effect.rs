@@ -1434,3 +1434,127 @@ fn a_window_shot_backs_a_blurred_window_with_the_wallpaper() {
          the backdrop was backed but not blurred"
     );
 }
+
+/// A warm workspace switch in the overview must not reallocate the strip's offscreen.
+///
+/// The motion blur composites the sliding strip into one offscreen, and during a switch that
+/// group's bounds creep: a few pixels taller per frame while it narrows. Reallocating to the exact
+/// new size replaced the offscreen's damage tracker on nearly every frame, and with it the cached
+/// backdrop of every blurred window inside — dropped, not pooled — so each frame rebuilt one blur
+/// bundle per window plus the smear's own chain. On the live seat (3840x2160 at 1.25, blurred
+/// terminals) that was 4-6 rebuilds a frame and most of the switch's over-budget frames.
+///
+/// Measured at the seat's shape, because the bounds only creep that way with real workspace
+/// geometry. The first switch in each direction may still grow it; after that, the same
+/// switches must reuse the same image on every frame — an absolute check, since the defect
+/// reallocated on almost every frame and a relative bound would pass under it.
+#[test]
+fn a_warm_overview_switch_keeps_its_strip_offscreen() {
+    use synoik_config::Action;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    let _ = add_wallpaper(&mut f);
+    let id = f.add_client();
+
+    // Five workspaces of three blurred windows each, of different sizes so the strip's bounds
+    // are set by more than one of them.
+    const WORKSPACES: u8 = 5;
+    for _ in 0..WORKSPACES {
+        for k in 0..3 {
+            let window = f.client(id).create_window();
+            let surface = window.surface.clone();
+            window.commit();
+            f.roundtrip(id);
+            let (w, h) = (1000 + 150 * k, 700 + 100 * k);
+            let window = f.client(id).window(&surface);
+            window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+            window.set_size(w as u16, h as u16);
+            window.ack_last_and_commit();
+            f.double_roundtrip(id);
+            f.client(id).set_blur_region(&surface, (0, 0, w, h));
+            f.double_roundtrip(id);
+        }
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
+        f.settle();
+    }
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    for _ in 0..5 {
+        compositor_frame(&mut f, |_| {});
+    }
+
+    let output = f.synoik_output(1);
+    // One frame of the switch toward `target` (1-based): whether the strip was smeared, and the
+    // offscreen image it was composited into.
+    let switch = |f: &mut Fixture, target: u8, mut each: Box<dyn FnMut(Option<ash::vk::Image>)>| {
+        f.freeze_clock();
+        f.synoik_state().do_action(
+            Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(target)),
+            false,
+        );
+        let mut smeared = 0;
+        for _ in 0..30 {
+            compositor_frame(f, |_| {});
+            let moving = f
+                .synoik()
+                .layout
+                .monitor_for_output(&output)
+                .unwrap()
+                .workspace_switch_motion()
+                .is_some();
+            if moving {
+                smeared += 1;
+                each(f.synoik().motion_blur_offscreen_image(&output));
+            }
+        }
+        smeared
+    };
+
+    // Warm up: one switch each way, which is allowed to size the offscreen.
+    assert!(
+        switch(&mut f, 1, Box::new(|_| {})) > 0,
+        "precondition: the switch must smear"
+    );
+    switch(&mut f, WORKSPACES, Box::new(|_| {}));
+
+    let warm = f
+        .synoik()
+        .motion_blur_offscreen_image(&output)
+        .expect("precondition: the smear must have composited the strip");
+    for target in [1, WORKSPACES, 1] {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let smeared = switch(
+            &mut f,
+            target,
+            Box::new(move |image| sink.borrow_mut().push(image)),
+        );
+        assert!(
+            smeared > 0,
+            "precondition: the switch to {target} must smear"
+        );
+        let reallocated = seen.borrow().iter().filter(|&&i| i != Some(warm)).count();
+        assert_eq!(
+            reallocated, 0,
+            "a warm switch to workspace {target} reallocated the strip's offscreen on \
+             {reallocated} of {smeared} smeared frames, dropping every blurred window's cached \
+             backdrop with it",
+        );
+    }
+}

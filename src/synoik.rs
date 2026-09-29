@@ -10288,6 +10288,16 @@ impl Synoik {
     ///
     /// See [`crate::ui::widget::style::Appearance`] for why this is the *only* thing in the
     /// shell that follows it.
+    /// The image the workspace switch's motion blur composites `output`'s strip into, if it has
+    /// rendered — see `MotionBlurSlot::offscreen_image`.
+    #[cfg(test)]
+    pub fn motion_blur_offscreen_image(&self, output: &Output) -> Option<ash::vk::Image> {
+        self.motion_blur
+            .borrow()
+            .get(&output.name())
+            .and_then(|slot| slot.offscreen_image())
+    }
+
     pub fn appearance(&self) -> crate::ui::widget::style::Appearance {
         crate::ui::widget::style::Appearance::from_dark_style(
             self.gnome_settings.quick_toggles.dark_style,

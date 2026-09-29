@@ -323,7 +323,7 @@ impl VkTexture {
         &self.0.tex
     }
 
-    pub(super) fn image(&self) -> vk::Image {
+    pub(crate) fn image(&self) -> vk::Image {
         self.0.tex.image
     }
 
