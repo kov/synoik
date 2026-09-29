@@ -10982,7 +10982,7 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
 ///
 /// Retried, because `stats::set_enabled` is a process-wide flag and the counters it gates are
 /// per-thread: **every** `Fixture::new` on any test thread runs `FrameLog::from_env`, which turns
-/// timing back off (`SYNOIK_FRAME_LOG` is unset under libtest). A neighbour constructing a fixture
+/// timing back off (a test build ignores `SYNOIK_FRAME_LOG`). A neighbour constructing a fixture
 /// mid-measurement therefore reads as "attributed nothing", which is exactly what a broken guard
 /// looks like. Losing that race every attempt is vanishingly unlikely; an unwired guard loses it
 /// every time — mutation-checked. The `<=` invariant needs no retry: it holds whatever the flag is.

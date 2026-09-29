@@ -381,8 +381,21 @@ pub fn bakes() -> u64 {
 /// unallocated for the whole session, so `gpu` logged nothing — no samples and no
 /// losses, which reads exactly like a device that cannot timestamp.
 pub fn gpu_timing() -> bool {
-    *GPU_TIMING
-        .get_or_init(|| std::env::var("SYNOIK_FRAME_LOG").is_ok_and(|raw| wants_gpu_timing(&raw)))
+    *GPU_TIMING.get_or_init(|| frame_log_var().is_some_and(|raw| wants_gpu_timing(&raw)))
+}
+
+/// `SYNOIK_FRAME_LOG`, except in a test build, which never sees it.
+///
+/// Every `Fixture` builds a `State`, and a `State` reads its frame log from here; so did the
+/// renderer's GPU timer. A test run from a terminal inside a synoik session inherits the seat's
+/// `SYNOIK_FRAME_LOG=ring,gpu,autodump`, and the suite went red on counters the frame log drains
+/// per frame — tests that pass or fail by the shell they were started from. A test that wants the
+/// log turns it on itself.
+fn frame_log_var() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var("SYNOIK_FRAME_LOG").ok()
 }
 
 /// Does this `SYNOIK_FRAME_LOG` value ask for GPU timing? Split out from
@@ -2601,9 +2614,7 @@ impl FrameLog {
     /// than failing the session — this is a debugging aid, and a typo in a
     /// session file should not cost you a desktop.
     pub fn from_env() -> Self {
-        let settings = std::env::var("SYNOIK_FRAME_LOG")
-            .ok()
-            .and_then(|raw| Self::parse(&raw));
+        let settings = frame_log_var().and_then(|raw| Self::parse(&raw));
 
         ENABLED.store(settings.is_some(), Ordering::Relaxed);
         synoik_vk::stats::set_enabled(settings.is_some());
