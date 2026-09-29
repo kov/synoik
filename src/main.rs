@@ -43,6 +43,8 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything allocates big or spawns a thread: see the function.
+    synoik::utils::memory::configure_allocator();
     synoik::gnome::init_collation();
 
     // Set backtrace defaults if not set.

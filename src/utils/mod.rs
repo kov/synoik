@@ -43,6 +43,7 @@ use crate::handlers::KdeDecorationsModeState;
 use crate::synoik::ClientState;
 
 pub mod id;
+pub mod memory;
 pub mod region;
 pub mod scale;
 pub mod signals;
