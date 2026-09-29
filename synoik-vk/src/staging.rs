@@ -184,11 +184,12 @@ const MIN_CHUNK: vk::DeviceSize = 4 << 20;
 /// killed), and it cost twice over — the create/allocate/map round trips, and then a memcpy into
 /// pages the host had never touched, which this VM serves at ~5 GB/s against ~56 GB/s warm.
 ///
-/// So size decides the chunk's *shape*, and idleness decides its *lifetime*. A streaming client
-/// keeps its chunk warm; a wallpaper's is handed back a second later.
+/// So size decides the chunk's *shape*, and use decides its *lifetime*: the most recently used
+/// oversized chunks stay resident up to [`OVERSIZED_RESIDENT_BYTES`], and any past that budget are
+/// handed back after [`OVERSIZED_IDLE`] unused.
 const MAX_POOLED_CHUNK: vk::DeviceSize = 16 << 20;
 
-/// How long an oversized chunk survives without being used.
+/// How long an oversized chunk *outside the resident budget* survives without being used.
 ///
 /// **Wall clock, not frames.** Counting frames made a chunk's lifetime depend on how much
 /// *unrelated* drawing happened in between: a client repainting on focus changes ~85 frames apart
@@ -205,6 +206,19 @@ const OVERSIZED_IDLE: Duration = Duration::from_secs(2);
 /// by a few rows — a window being resized — reuses its chunk instead of allocating a new one and
 /// leaving the old to idle out.
 const OVERSIZED_GRANULARITY: vk::DeviceSize = 4 << 20;
+
+/// How many bytes of oversized chunks the pool keeps however long they sit unused.
+///
+/// The most recently used oversized chunks up to this total are **resident**: exempt from
+/// [`OVERSIZED_IDLE`] and from [`StagingPool::sweep`]. The idle rule alone lost them at a human
+/// cadence — Firefox repaints its whole-window shm chrome surface on every keyboard-focus change
+/// (~40 MiB a window on a 4K output at 1.25), and opening the overview ten seconds after the last
+/// one found its chunks retired. Re-creating them is cheap; the cost is the memcpy into pages the
+/// host has never touched, measured on the seat at 1.6-4.5 GB/s against ~12 GB/s warm: 17-49 ms
+/// of an overview-open frame for 79.7 MiB, where a warm copy is ~7 ms. Sized so the two chunks of
+/// that case fit with room to spare. Past it, the least recently used ones fall back to the idle
+/// rule, so a one-off giant upload still cannot pin its peak.
+const OVERSIZED_RESIDENT_BYTES: vk::DeviceSize = 128 << 20;
 
 /// How many chunks the pool keeps. It only needs more than one while an earlier frame's submit is
 /// still reading the previous chunk, so this is already generous; past it, free chunks are dropped
@@ -361,6 +375,9 @@ pub struct StagingPool {
     /// was *kept* from one that was retired and replaced — Vulkan recycles buffer handles, so
     /// the handle cannot tell those apart.
     allocations: u64,
+    /// See [`OVERSIZED_RESIDENT_BYTES`]; a field only so the tests can exercise the budget without
+    /// allocating past it.
+    resident_budget: vk::DeviceSize,
 }
 
 /// A chunk and how long it has gone unused, which is what [`StagingPool::end_frame`] retires
@@ -380,7 +397,30 @@ impl StagingPool {
             used: 0,
             align: gpu.buffer_copy_offset_alignment,
             allocations: 0,
+            resident_budget: OVERSIZED_RESIDENT_BYTES,
         }
+    }
+
+    /// Which chunks are resident: every ordinary chunk, plus the most recently used oversized ones
+    /// whose capacities fit in the resident budget together. See [`OVERSIZED_RESIDENT_BYTES`].
+    fn resident(&self) -> Vec<bool> {
+        let mut resident: Vec<bool> = self
+            .chunks
+            .iter()
+            .map(|entry| entry.chunk.capacity() <= MAX_POOLED_CHUNK)
+            .collect();
+        let mut oversized: Vec<usize> = (0..self.chunks.len()).filter(|&i| !resident[i]).collect();
+        oversized.sort_by_key(|&i| self.chunks[i].idle);
+        let mut total: vk::DeviceSize = 0;
+        for i in oversized {
+            let capacity = self.chunks[i].chunk.capacity();
+            if total + capacity > self.resident_budget {
+                break;
+            }
+            total += capacity;
+            resident[i] = true;
+        }
+        resident
     }
 
     /// Copy `data` into the pool and return the chunk it landed in, plus the offset to hand a
@@ -480,8 +520,8 @@ impl StagingPool {
         Ok((entry.chunk.clone(), offset))
     }
 
-    /// Age the pool by `elapsed`, retiring oversized chunks nothing has wanted for
-    /// [`OVERSIZED_IDLE`].
+    /// Age the pool by `elapsed`, retiring oversized chunks outside the resident budget that
+    /// nothing has wanted for [`OVERSIZED_IDLE`].
     ///
     /// Called once per frame from the render path, which owns the clock — the pool takes the
     /// duration so its behaviour is a pure function of it. Without this an oversized chunk would be
@@ -495,8 +535,9 @@ impl StagingPool {
         let current = self
             .current
             .map(|index| Arc::as_ptr(&self.chunks[index].chunk));
+        let mut resident = self.resident().into_iter();
         self.chunks.retain(|entry| {
-            let keep = entry.chunk.capacity() <= MAX_POOLED_CHUNK
+            let keep = resident.next().expect("one flag per chunk")
                 || entry.idle <= OVERSIZED_IDLE
                 || Arc::strong_count(&entry.chunk) > 1;
             retired |= !keep;
@@ -509,7 +550,8 @@ impl StagingPool {
 
     /// Drop free chunks once the pool has grown past [`MAX_POOLED_CHUNKS`], before adding another.
     /// A chunk still referenced by an in-flight upload is never touched — dropping it is not the
-    /// pool's call, and cannot be: `Arc` decides.
+    /// pool's call, and cannot be: `Arc` decides. Resident oversized chunks are spared too: they
+    /// are bounded by their own budget, and sweeping them would put the cold copy right back.
     fn sweep(&mut self) {
         if self.chunks.len() < MAX_POOLED_CHUNKS {
             return;
@@ -517,8 +559,12 @@ impl StagingPool {
         let current = self
             .current
             .map(|index| Arc::as_ptr(&self.chunks[index].chunk));
+        let mut resident = self.resident().into_iter();
         self.chunks.retain(|entry| {
-            Arc::strong_count(&entry.chunk) > 1 || Some(Arc::as_ptr(&entry.chunk)) == current
+            let resident = resident.next().expect("one flag per chunk");
+            (resident && entry.chunk.capacity() > MAX_POOLED_CHUNK)
+                || Arc::strong_count(&entry.chunk) > 1
+                || Some(Arc::as_ptr(&entry.chunk)) == current
         });
         self.reindex(current);
     }
@@ -694,7 +740,9 @@ mod tests {
         assert_eq!(pool.chunk_count(), 1, "the repaint grew the pool");
     }
 
-    /// ...and gives it back once nothing wants it, so a one-off upload does not pin its peak.
+    /// ...and gives it back once nothing wants it and it is outside the resident budget, so a
+    /// one-off upload does not pin its peak. The budget is zero here so the idle rule is all that
+    /// decides; [`a_pool_keeps_recent_oversized_chunks_resident`] covers the budget.
     #[test]
     fn a_pool_retires_an_oversized_chunk_that_goes_idle() {
         let Ok(gpu) = Gpu::new() else {
@@ -705,6 +753,7 @@ mod tests {
         };
         let gpu = Arc::new(gpu);
         let mut pool = StagingPool::new(&gpu);
+        pool.resident_budget = 0;
 
         let huge = vec![0u8; (MAX_POOLED_CHUNK + 4096) as usize];
         let (chunk, _) = pool.stage(&gpu, &huge).expect("stage");
@@ -735,6 +784,78 @@ mod tests {
             pool.chunk_count(),
             1,
             "an ordinary chunk is never retired on idleness"
+        );
+    }
+
+    /// Oversized chunks inside the resident budget survive any idle gap, most recently used first;
+    /// the one that no longer fits falls back to the idle rule.
+    ///
+    /// The live case is Firefox repainting its shm chrome on a keyboard-focus change: two ~40 MiB
+    /// uploads in one frame, ten seconds apart at a human pace. With only the idle rule both chunks
+    /// were gone by the next repaint and the copy ran into cold pages. Scaled down here by a
+    /// 48 MiB budget, which holds two of these 20 MiB chunks and not three.
+    #[test]
+    fn a_pool_keeps_recent_oversized_chunks_resident() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping a_pool_keeps_recent_oversized_chunks_resident: no Vulkan device");
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let mut pool = StagingPool::new(&gpu);
+        pool.resident_budget = 48 << 20;
+
+        let huge = vec![0u8; (MAX_POOLED_CHUNK + 4096) as usize];
+        // Two uploads in flight at once, as one frame's: each takes a chunk of its own.
+        let pair = [
+            pool.stage(&gpu, &huge).expect("stage"),
+            pool.stage(&gpu, &huge).expect("stage"),
+        ];
+        let capacity = pair[0].0.capacity();
+        assert!(2 * capacity <= pool.resident_budget && 3 * capacity > pool.resident_budget);
+        drop(pair);
+        assert_eq!(pool.allocations(), 2);
+
+        // Far past the idle window: both are resident, so both survive.
+        pool.end_frame(OVERSIZED_IDLE * 30);
+        assert_eq!(
+            pool.chunk_count(),
+            2,
+            "resident chunks must survive any idle gap"
+        );
+        let pair = [
+            pool.stage(&gpu, &huge).expect("stage"),
+            pool.stage(&gpu, &huge).expect("stage"),
+        ];
+        assert_eq!(
+            pool.allocations(),
+            2,
+            "the repaint must land in the kept chunks"
+        );
+
+        // A third, a second later and while the pair is still in flight, overflows the budget.
+        // Only the two most recently used stay resident: the third and one of the pair. The
+        // other falls back to the idle rule and retires.
+        pool.end_frame(Duration::from_secs(1));
+        let third = pool.stage(&gpu, &huge).expect("stage");
+        assert_eq!(pool.allocations(), 3);
+        drop(pair);
+        drop(third);
+        pool.end_frame(OVERSIZED_IDLE + Duration::from_millis(1));
+        assert_eq!(
+            pool.chunk_count(),
+            2,
+            "past the budget, the least recently used chunk must fall back to the idle rule",
+        );
+        pool.end_frame(OVERSIZED_IDLE * 30);
+        assert_eq!(pool.chunk_count(), 2, "the two inside the budget stay");
+        let _pair = [
+            pool.stage(&gpu, &huge).expect("stage"),
+            pool.stage(&gpu, &huge).expect("stage"),
+        ];
+        assert_eq!(
+            pool.allocations(),
+            3,
+            "the survivors must still serve a pair of uploads"
         );
     }
 
