@@ -1328,6 +1328,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dev = &self.renderer.gpu.device;
         unsafe {
             dev.cmd_end_render_pass(cbuf);
+            self.renderer.gpu_timer_capture(cbuf, self.gpu_slot, true);
 
             // Capture destination: contents are fully overwritten by the blit, so discard from
             // UNDEFINED. (Reused across frames — safe because `finish` fence-waits, so the previous
@@ -1418,6 +1419,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // the barrier above orders them after the blit. No submit, no wait, no second command
             // buffer — this is the gap the doc comment is about.
             record_gap(cbuf);
+            self.renderer.gpu_timer_capture(cbuf, self.gpu_slot, false);
 
             // Re-open on the LOAD-variant continuation pass so the preserved scene can be drawn
             // over. Same command buffer: ending a pass and beginning another is ordinary

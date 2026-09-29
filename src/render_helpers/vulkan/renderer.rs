@@ -2001,7 +2001,7 @@ struct GpuTimer {
     /// also completion order (`Gpu::submit` chains every submit on the queue
     /// timeline). Its length is what bounds the ring: a submit that would take a
     /// slot still in here goes untimed rather than clobbering it.
-    pending: RefCell<VecDeque<GpuTimerSlot>>,
+    pending: RefCell<VecDeque<PendingGpuSlot>>,
     /// Set when the device turns out not to write timestamps despite advertising
     /// them, after which the whole thing goes quiet. See
     /// [`VulkanRenderer::gpu_timer_collect_through`].
@@ -2033,6 +2033,23 @@ pub(super) struct GpuTimerSlot {
     site: synoik_vk::stats::SubmitSite,
 }
 
+/// A slot in [`GpuTimer::pending`], and how many capture marks its submit wrote.
+///
+/// The count lives here rather than in the `Copy` slot the frame carries, because the read must
+/// know it: a reset query that was never written makes a `WAIT` read block forever, so only the
+/// marks actually recorded may be read.
+#[derive(Debug, Clone, Copy)]
+struct PendingGpuSlot {
+    slot: GpuTimerSlot,
+    /// Capture marks written, two per capture: one closing the draw segment before it, one
+    /// closing the capture itself. Odd while a capture is open.
+    capture_marks: u32,
+    /// Captures past [`GpuTimer::CAPTURES`], left unmarked.
+    unmarked: u32,
+    /// An unmarked capture is open, so its closing edge is not marked either.
+    skipping: bool,
+}
+
 impl GpuTimer {
     /// Timestamp series in the ring. Deferral keeps one or two submits
     /// outstanding, so this is slack rather than a working limit; the cost is
@@ -2042,7 +2059,16 @@ impl GpuTimer {
     /// Timestamps per submit: one at the start, then one closing each
     /// [`synoik_vk::stats::GpuPhase`]. Consecutive deltas are the phases; first to
     /// last is the submit's total, which is what the pair used to give.
-    const MARKS: u64 = 1 + synoik_vk::stats::GpuPhase::ALL.len() as u64;
+    const PHASE_MARKS: u64 = 1 + synoik_vk::stats::GpuPhase::ALL.len() as u64;
+
+    /// Captures per submit that get marks of their own; later ones fold into the last draw
+    /// segment. The overview's busiest frames split the render pass for a few dozen blurred
+    /// elements at most, spread over several submits.
+    const CAPTURES: u64 = 16;
+
+    /// Queries per submit: the phase marks, then two per capture. See
+    /// [`VulkanRenderer::gpu_timer_capture`].
+    const MARKS: u64 = Self::PHASE_MARKS + 2 * Self::CAPTURES;
 }
 
 impl GpuTimer {
@@ -2421,6 +2447,12 @@ impl VulkanRenderer {
         self.gpu_timer.is_some()
     }
 
+    /// How many captures per submit get marks of their own. See [`GpuTimer::CAPTURES`].
+    #[cfg(test)]
+    pub(crate) fn gpu_timer_captures(&self) -> u64 {
+        GpuTimer::CAPTURES
+    }
+
     /// How many timestamp pairs the ring holds. See [`GpuTimer::SLOTS`].
     #[cfg(test)]
     pub(crate) fn gpu_timer_slots(&self) -> u64 {
@@ -2465,7 +2497,12 @@ impl VulkanRenderer {
             seq: crate::frame_log::current_frame_seq(),
             site,
         };
-        timer.pending.borrow_mut().push_back(slot);
+        timer.pending.borrow_mut().push_back(PendingGpuSlot {
+            slot,
+            capture_marks: 0,
+            unmarked: 0,
+            skipping: false,
+        });
         crate::frame_log::expect_gpu_sample();
 
         let first = timer.query(index);
@@ -2491,6 +2528,55 @@ impl VulkanRenderer {
             return;
         };
         let query = timer.query(slot.index) + 1 + phase.index() as u32;
+        unsafe {
+            self.gpu.device.cmd_write_timestamp(
+                cbuf,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                timer.pool,
+                query,
+            );
+        }
+    }
+
+    /// Stamp one edge of a capture inside the render phase: `opening` right after the render pass
+    /// ends for it, `!opening` right before the continuation pass begins. The stretch between the
+    /// two is the capture's blit and whatever it recorded in the gap; the stretches around them
+    /// are scene drawing. Must come in pairs, outside a render pass (a timestamp is legal inside
+    /// one, but these edges are where the pass is closed anyway).
+    ///
+    /// Past [`GpuTimer::CAPTURES`] a capture is counted and not marked, both edges alike, so the
+    /// marks written always pair up.
+    pub(super) fn gpu_timer_capture(
+        &self,
+        cbuf: vk::CommandBuffer,
+        slot: Option<GpuTimerSlot>,
+        opening: bool,
+    ) {
+        let (Some(timer), Some(slot)) = (self.gpu_timer.as_ref(), slot) else {
+            return;
+        };
+        let mut pending = timer.pending.borrow_mut();
+        let Some(entry) = pending.iter_mut().find(|p| p.slot.index == slot.index) else {
+            return;
+        };
+        if opening {
+            if u64::from(entry.capture_marks) >= 2 * GpuTimer::CAPTURES {
+                entry.unmarked += 1;
+                entry.skipping = true;
+                return;
+            }
+        } else if std::mem::take(&mut entry.skipping) {
+            return;
+        }
+        debug_assert_eq!(
+            entry.capture_marks % 2 == 0,
+            opening,
+            "capture marks must pair up"
+        );
+        let query = timer.query(slot.index)
+            + u32::try_from(GpuTimer::PHASE_MARKS).expect("small")
+            + entry.capture_marks;
+        entry.capture_marks += 1;
         unsafe {
             self.gpu.device.cmd_write_timestamp(
                 cbuf,
@@ -2530,7 +2616,7 @@ impl VulkanRenderer {
             let Some(next) = timer.pending.borrow().front().copied() else {
                 return;
             };
-            if next.index > slot.index {
+            if next.slot.index > slot.index {
                 return;
             }
             timer.pending.borrow_mut().pop_front();
@@ -2538,16 +2624,20 @@ impl VulkanRenderer {
         }
     }
 
-    fn gpu_timer_read(&self, timer: &GpuTimer, slot: GpuTimerSlot) {
-        let mut ticks = [0u64; GpuTimer::MARKS as usize];
+    fn gpu_timer_read(&self, timer: &GpuTimer, pending: PendingGpuSlot) {
+        let slot = pending.slot;
+        let mut marks = [0u64; GpuTimer::MARKS as usize];
+        // Only what was written: a reset query that never was makes this `WAIT` block forever.
+        let written = GpuTimer::PHASE_MARKS as usize + pending.capture_marks as usize;
         let res = unsafe {
             self.gpu.device.get_query_pool_results(
                 timer.pool,
                 timer.query(slot.index),
-                &mut ticks,
+                &mut marks[..written],
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )
         };
+        let (ticks, captures) = marks[..written].split_at(GpuTimer::PHASE_MARKS as usize);
         if let Err(err) = res {
             warn!("error reading GPU timestamps: {err}");
             crate::frame_log::add_gpu_lost(slot.seq, slot.site);
@@ -2567,7 +2657,8 @@ impl VulkanRenderer {
                 // so it is a lost sample too, not a very slow pass.
                 if duration <= GpuTimer::SANE_LIMIT {
                     crate::frame_log::add_gpu_time(slot.seq, slot.site, duration);
-                    self.report_gpu_phases(&ticks, slot, duration);
+                    self.report_gpu_phases(ticks, slot, duration);
+                    self.report_gpu_segments(ticks, captures, pending);
                 } else {
                     crate::frame_log::add_gpu_lost(slot.seq, slot.site);
                 }
@@ -2631,6 +2722,65 @@ impl VulkanRenderer {
             crate::frame_log::add_gpu_phase(slot.seq, phase, phases[phase.index()]);
         }
     }
+}
+
+impl VulkanRenderer {
+    /// Cut a submit's render phase at its captures, when it had any. See
+    /// [`GpuSegments`](crate::frame_log::GpuSegments).
+    ///
+    /// Checked on its own rather than as part of [`Self::report_gpu_phases`]: a dropped capture
+    /// mark loses this breakdown, and must not also take the three-phase split with it.
+    fn report_gpu_segments(&self, ticks: &[u64], captures: &[u64], pending: PendingGpuSlot) {
+        use synoik_vk::stats::GpuPhase;
+
+        if captures.is_empty() {
+            return;
+        }
+        // The render phase runs from the prepass mark to the render mark; the captures sit in
+        // between, in the order they were written.
+        let mut edges = Vec::with_capacity(captures.len() + 2);
+        edges.push(ticks[1 + GpuPhase::Prepass.index()]);
+        edges.extend_from_slice(captures);
+        edges.push(ticks[1 + GpuPhase::Render.index()]);
+        let Some(deltas) = segment_tick_deltas(&edges, self.gpu.timestamp_valid_bits) else {
+            return;
+        };
+        crate::frame_log::add_gpu_segments(
+            pending.slot.seq,
+            crate::frame_log::GpuSegments {
+                site: pending.slot.site,
+                durations: deltas
+                    .into_iter()
+                    .map(|d| self.gpu.timestamp_delta(d))
+                    .collect(),
+                unmarked: pending.unmarked,
+            },
+        );
+    }
+}
+
+/// The tick deltas between consecutive `edges`, or `None` when any edge is unwritten (a zero) or
+/// the sequence runs backwards. A zero *delta* is a real answer, as in [`phase_tick_deltas`].
+pub(super) fn segment_tick_deltas(edges: &[u64], valid_bits: u32) -> Option<Vec<u64>> {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let mut out = Vec::with_capacity(edges.len().saturating_sub(1));
+    let mut prev = *edges.first()? & mask;
+    if prev == 0 {
+        return None;
+    }
+    for tick in &edges[1..] {
+        let tick = tick & mask;
+        if tick == 0 || tick < prev {
+            return None;
+        }
+        out.push(tick - prev);
+        prev = tick;
+    }
+    Some(out)
 }
 
 /// What one collection of a start/end timestamp pair yielded.

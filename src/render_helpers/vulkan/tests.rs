@@ -6133,6 +6133,156 @@ fn vulkan_gpu_phases_subdivide_the_frame_they_belong_to() {
     );
 }
 
+/// The capture marks cut the render phase where the work actually is.
+///
+/// This is the check the marks' whole value rests on, because this stack has shown a timestamp
+/// that does not move with the work between it and its neighbour (a 16 MiB fill reads as zero).
+/// Summing correctly is not enough: a mark that resolved at the end of the command buffer, or at
+/// its start, would still sum to the total. So the heavy drawing is put first on one side of a
+/// capture and then on the other, and the segment carrying it must move with it.
+#[test]
+fn vulkan_capture_marks_follow_the_work() {
+    use smithay::backend::renderer::Offscreen;
+
+    let skip = |why: &str| eprintln!("skipping vulkan_capture_marks_follow_the_work: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no device ({e})")),
+    };
+    if !vk.enable_gpu_timing() {
+        return skip("no timestamp support");
+    }
+
+    const S: i32 = 2048;
+    const HEAVY: usize = 150;
+    let size = Size::<i32, Physical>::from((S, S));
+    let full = Rectangle::<i32, Physical>::from_size(size);
+    let buf_size = Size::<i32, BufferCoord>::from((S, S));
+    let small = Size::<i32, BufferCoord>::from((64, 64));
+    let dest = vk
+        .create_buffer(NATIVE_FOURCC, small)
+        .expect("capture dest");
+    let mut target = vk.create_buffer(NATIVE_FOURCC, buf_size).expect("target");
+    let translucent = Color32F::new(0.2, 0.3, 0.4, 0.5);
+
+    // One frame: `before` translucent full-target draws, a capture, `after` more.
+    let mut frame_segments = |before: usize, after: usize| -> Option<Vec<Duration>> {
+        let _ = crate::frame_log::take_gpu_samples();
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame.clear(Color32F::from(CLEAR), &[full]).expect("clear");
+            for _ in 0..before {
+                frame.draw_solid(full, &[full], translucent).expect("draw");
+            }
+            let region = Rectangle::<i32, Physical>::from_size(Size::from((64, 64)));
+            frame
+                .capture_region(region, &dest, |_| {})
+                .expect("capture");
+            for _ in 0..after {
+                frame.draw_solid(full, &[full], translucent).expect("draw");
+            }
+            let _ = frame.finish().expect("finish");
+        }
+        let samples = crate::frame_log::take_gpu_samples();
+        samples.segments.into_iter().next().map(|s| s.durations)
+    };
+
+    // The median over a few frames of each shape: one frame on a shared device is noise.
+    let mut runs = |before: usize, after: usize| -> Option<(Duration, Duration)> {
+        let mut firsts = Vec::new();
+        let mut lasts = Vec::new();
+        for _ in 0..7 {
+            let d = frame_segments(before, after)?;
+            assert_eq!(
+                d.len(),
+                3,
+                "one capture cuts the render phase in three: {d:?}"
+            );
+            firsts.push(d[0]);
+            lasts.push(d[2]);
+        }
+        firsts.sort();
+        lasts.sort();
+        Some((firsts[3], lasts[3]))
+    };
+
+    let Some((heavy_first, light_after)) = runs(HEAVY, 1) else {
+        return skip("the device dropped capture marks");
+    };
+    let Some((light_first, heavy_after)) = runs(1, HEAVY) else {
+        return skip("the device dropped capture marks");
+    };
+    eprintln!(
+        "vulkan_capture_marks_follow_the_work: heavy|light {heavy_first:?} | {light_after:?}, \
+         light|heavy {light_first:?} | {heavy_after:?}"
+    );
+    assert!(
+        heavy_first > light_after * 4,
+        "{HEAVY} full-target draws before the capture must outweigh one after it: \
+         {heavy_first:?} vs {light_after:?}"
+    );
+    assert!(
+        heavy_after > light_first * 4,
+        "{HEAVY} full-target draws after the capture must outweigh one before it: \
+         {heavy_after:?} vs {light_first:?}"
+    );
+}
+
+/// Captures past the ring's capacity are counted, not marked, and the read stops at what was
+/// written. Reading the whole capacity would `WAIT` on queries no submit ever wrote, which does not
+/// fail: it hangs the frame forever.
+#[test]
+fn vulkan_captures_past_capacity_are_counted_not_marked() {
+    use smithay::backend::renderer::Offscreen;
+
+    let skip = |why: &str| eprintln!("skipping vulkan_captures_past_capacity_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no device ({e})")),
+    };
+    if !vk.enable_gpu_timing() {
+        return skip("no timestamp support");
+    }
+    let capacity = vk.gpu_timer_captures();
+    let captures = capacity + 2;
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+    let full = Rectangle::<i32, Physical>::from_size(size);
+    let buf_size = Size::<i32, BufferCoord>::from((S, S));
+    let dest = vk
+        .create_buffer(NATIVE_FOURCC, buf_size)
+        .expect("capture dest");
+    let mut target = vk.create_buffer(NATIVE_FOURCC, buf_size).expect("target");
+    let _ = crate::frame_log::take_gpu_samples();
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame.clear(Color32F::from(CLEAR), &[full]).expect("clear");
+        for _ in 0..captures {
+            frame.capture_region(full, &dest, |_| {}).expect("capture");
+            frame
+                .draw_solid(full, &[full], Color32F::new(0.1, 0.2, 0.3, 0.5))
+                .expect("draw");
+        }
+        let _ = frame.finish().expect("finish");
+    }
+    let samples = crate::frame_log::take_gpu_samples();
+    if samples.time.is_zero() {
+        return skip("the device wrote none of this frame's timestamps");
+    }
+    let Some(segments) = samples.segments.first() else {
+        return skip("the device dropped capture marks");
+    };
+    assert_eq!(
+        segments.durations.len() as u64,
+        2 * capacity + 1,
+        "the marked captures cut the render phase, and no more: {segments:?}"
+    );
+    assert_eq!(u64::from(segments.unmarked), captures - capacity);
+}
+
 /// **Partial redraw into a scanout dmabuf must preserve what it does not redraw.**
 ///
 /// This is the contract every frame on the live seat depends on and no other test states: the tty
@@ -6379,6 +6529,36 @@ fn vulkan_partial_redraw_into_a_persistent_offscreen_preserves_the_rest() {
 ///
 /// No device needed, which is the point: the real-device test can only fail when the timing lands
 /// that way.
+/// Capture segments get the same reading as phases: an idle segment is zero ticks and still a
+/// measurement, while an unwritten edge or one running backwards loses the whole breakdown.
+#[test]
+fn segment_deltas_lose_the_breakdown_not_a_segment() {
+    use super::renderer::segment_tick_deltas;
+
+    let t = 13_228_841_211_594u64;
+    assert_eq!(
+        segment_tick_deltas(&[t, t + 5, t + 5, t + 9], 64),
+        Some(vec![5, 0, 4]),
+        "a capture that recorded nothing took zero ticks"
+    );
+    assert_eq!(
+        segment_tick_deltas(&[t, 0, t + 9], 64),
+        None,
+        "an unwritten edge"
+    );
+    assert_eq!(
+        segment_tick_deltas(&[t, t + 7, t + 3], 64),
+        None,
+        "a backwards edge"
+    );
+    // Masked like every other timestamp: only the low `valid_bits` are defined.
+    let high = 1u64 << 40;
+    assert_eq!(
+        segment_tick_deltas(&[high | 10, 12, high | 15], 36),
+        Some(vec![2, 3])
+    );
+}
+
 #[test]
 fn phase_deltas_accept_a_phase_that_took_no_time() {
     use synoik_vk::stats::GpuPhase;

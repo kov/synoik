@@ -162,6 +162,11 @@ thread_local! {
     static GPU_PHASE_SAMPLES: RefCell<Vec<(u64, synoik_vk::stats::GpuPhase, Duration)>> =
         const { RefCell::new(Vec::new()) };
 
+    /// A submit's render phase cut at its blur captures, when it had any. A subdivision of the
+    /// render phase, for the same reason and under the same rule as [`GPU_PHASE_SAMPLES`].
+    static GPU_SEGMENT_SAMPLES: RefCell<Vec<(u64, GpuSegments)>> =
+        const { RefCell::new(Vec::new()) };
+
     /// How many samples the renderer has promised for the frame being built —
     /// one per submit it stamped. [`FrameLog::end`] waits for exactly this many
     /// before emitting the line, so a frame is never reported with a partial GPU
@@ -435,6 +440,17 @@ pub fn add_gpu_phase(seq: u64, phase: synoik_vk::stats::GpuPhase, duration: Dura
     });
 }
 
+/// Report the render phase of one submit cut at its captures. See [`GpuSegments`].
+pub fn add_gpu_segments(seq: u64, segments: GpuSegments) {
+    GPU_SEGMENT_SAMPLES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() >= MAX_PENDING_SAMPLES {
+            s.remove(0);
+        }
+        s.push((seq, segments));
+    });
+}
+
 fn push_gpu_sample(seq: u64, site: synoik_vk::stats::SubmitSite, sample: Option<Duration>) {
     GPU_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
@@ -445,8 +461,25 @@ fn push_gpu_sample(seq: u64, site: synoik_vk::stats::SubmitSite, sample: Option<
     });
 }
 
+/// One submit's render phase, cut where `capture_region` ended and re-opened the render pass.
+///
+/// `durations` alternates draw, capture, draw, … and always starts and ends on a draw: a draw
+/// segment is scene drawing inside a render pass, and a capture segment is the blit out of the
+/// target plus whatever the capture recorded in the gap (a blur chain). The three-phase split can
+/// only say "render"; this says *which stretch* of the render phase, so a cost that sits in one
+/// segment (that pass, or that chain) reads differently from one spread over all of them (the
+/// whole queue running slow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuSegments {
+    pub site: synoik_vk::stats::SubmitSite,
+    pub durations: Vec<Duration>,
+    /// Captures past the ring's capacity, left unmarked: their time is inside the last draw
+    /// segment, not missing.
+    pub unmarked: u32,
+}
+
 /// What the renderer measured for one frame.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GpuSamples {
     /// Summed duration of the pairs that came back usable.
     pub time: Duration,
@@ -463,6 +496,8 @@ pub struct GpuSamples {
     /// could only ever answer "scanout", so this is the split that can name what
     /// to attack. Indexed by `GpuPhase::index`.
     pub by_phase: [Duration; synoik_vk::stats::GpuPhase::ALL.len()],
+    /// The render phase of each submit that captured, cut at its captures, in submit order.
+    pub segments: Vec<GpuSegments>,
     /// Pairs that came back unusable.
     pub lost: u64,
     /// Pairs of either kind, i.e. how many of the promised samples have landed.
@@ -511,6 +546,13 @@ fn take_gpu_samples_for(seq: u64) -> GpuSamples {
                 }
             })
         });
+        GPU_SEGMENT_SAMPLES.with(|g| {
+            let mut g = g.borrow_mut();
+            let (mine, rest): (Vec<_>, Vec<_>) = g.drain(..).partition(|(at, _)| *at == seq);
+            *g = rest;
+            out.segments
+                .extend(mine.into_iter().map(|(_, segments)| segments));
+        });
         out
     })
 }
@@ -527,6 +569,10 @@ pub fn take_gpu_samples() -> GpuSamples {
             for (_, phase, d) in p.borrow_mut().drain(..) {
                 out.add_phase(phase, d);
             }
+        });
+        GPU_SEGMENT_SAMPLES.with(|g| {
+            out.segments
+                .extend(g.borrow_mut().drain(..).map(|(_, segments)| segments));
         });
         out
     })
@@ -1250,6 +1296,8 @@ struct Totals {
     /// `gpu`, split by where inside the command buffer it went. Indexed by
     /// `GpuPhase::index`.
     gpu_phases: [Duration; synoik_vk::stats::GpuPhase::ALL.len()],
+    /// The render phase of each capturing submit, cut at its captures. See [`GpuSegments`].
+    gpu_segments: Vec<GpuSegments>,
     /// Timestamp pairs the renderer could not use. Nonzero means `gpu` is a
     /// floor, not a total. See [`GPU_LOST`].
     gpu_lost: u64,
@@ -2863,6 +2911,7 @@ impl FrameLog {
             gpu: samples.time,
             gpu_sites: samples.by_site,
             gpu_phases: samples.by_phase,
+            gpu_segments: samples.segments,
             gpu_lost: samples.lost,
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
@@ -2946,6 +2995,7 @@ impl FrameLog {
                 for (dst, add) in parked.totals.gpu_sites.iter_mut().zip(late.by_site.iter()) {
                     *dst += *add;
                 }
+                parked.totals.gpu_segments.extend(late.segments);
                 parked.totals.gpu_lost += late.lost;
                 parked.arrived += late.count;
             }
@@ -3093,6 +3143,9 @@ impl FrameLog {
                     let _ = write!(line, "{} {}", phase.label(), ms(*d));
                 }
                 line.push(']');
+            }
+            for segments in &totals.gpu_segments {
+                write_gpu_segments(&mut line, segments);
             }
             line.push(')');
         } else if totals.gpu_lost > 0 {
@@ -4010,6 +4063,21 @@ fn split_at_most<T>(all: &[T], n: usize) -> Option<(&[T], usize)> {
 
 /// Milliseconds with two decimals — the resolution that matters against a 16.7ms
 /// budget, without the noise of `Duration`'s own formatting.
+/// ` {site: d 0.31 | c 1.20 | d 0.10}`, in execution order. Every segment rather than a sum per
+/// kind: which stretch of the render phase carries a cost is the question this answers.
+fn write_gpu_segments(line: &mut String, segments: &GpuSegments) {
+    let _ = write!(line, " {{{}:", segments.site.label());
+    for (i, d) in segments.durations.iter().enumerate() {
+        let kind = if i % 2 == 0 { 'd' } else { 'c' };
+        let sep = if i == 0 { " " } else { " | " };
+        let _ = write!(line, "{sep}{kind} {:.2}", d.as_secs_f64() * 1000.);
+    }
+    if segments.unmarked > 0 {
+        let _ = write!(line, " +{} unmarked", segments.unmarked);
+    }
+    line.push('}');
+}
+
 fn ms(duration: Duration) -> String {
     format!("{:.2}ms", duration.as_secs_f64() * 1000.)
 }
