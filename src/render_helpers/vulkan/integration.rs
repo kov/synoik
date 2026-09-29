@@ -23,8 +23,10 @@ use smithay::backend::renderer::{
 };
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Resource, Weak};
 use smithay::utils::{Buffer as BufferCoord, Rectangle, Size};
-use smithay::wayland::compositor::SurfaceData;
+use smithay::wayland::compositor::{self, SurfaceData};
 use smithay::wayland::shm::with_buffer_contents;
 
 use super::error::VulkanError;
@@ -71,7 +73,57 @@ impl OffscreenRenderer for VulkanRenderer {
 /// `VkImage` — and the whole `Arc<Gpu>` it holds — alive until the surface is destroyed; that is a
 /// bounded, surface-lifetime retention, not a growing leak.
 #[derive(Default)]
-struct ShmTextureCache(Mutex<HashMap<ContextId<VkTexture>, VkTexture>>);
+struct ShmTextureCache(Mutex<HashMap<ContextId<VkTexture>, ShmCacheEntry>>);
+
+struct ShmCacheEntry {
+    tex: VkTexture,
+    /// Damage smithay already handed us for commits whose pixels never reached `tex` — an
+    /// off-thread copy that was discarded because a newer commit overtook it. Smithay reports each
+    /// commit's damage once, so the next import owes these rectangles on top of its own.
+    carry: Vec<Rectangle<i32, BufferCoord>>,
+}
+
+/// A surface's own handle, kept in its `data_map` so an import — which smithay hands only the
+/// [`SurfaceData`] — can name the surface an off-thread copy belongs to. Recorded on every commit
+/// by [`note_surface_handle`]; weak, so it cannot keep a destroyed surface alive.
+struct SurfaceHandle(Weak<WlSurface>);
+
+/// Remember `surface`'s handle for its shm imports. Called from the commit handler, before the
+/// commit reaches smithay's buffer handling.
+pub fn note_surface_handle(surface: &WlSurface) {
+    compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .insert_if_missing_threadsafe(|| SurfaceHandle(surface.downgrade()));
+    });
+}
+
+/// `surface`'s cached shm texture for renderer context `id`.
+pub(super) fn cached_shm_texture(
+    surface: &WlSurface,
+    id: &ContextId<VkTexture>,
+) -> Option<VkTexture> {
+    compositor::with_states(surface, |states| {
+        let cache = states.data_map.get::<ShmTextureCache>()?;
+        let cache = cache.0.lock().unwrap();
+        cache.get(id).map(|entry| entry.tex.clone())
+    })
+}
+
+/// Owe `damage` to `surface`'s next import for context `id` — see [`ShmCacheEntry::carry`].
+pub(super) fn carry_shm_damage(
+    surface: &WlSurface,
+    id: &ContextId<VkTexture>,
+    damage: Vec<Rectangle<i32, BufferCoord>>,
+) {
+    compositor::with_states(surface, |states| {
+        if let Some(cache) = states.data_map.get::<ShmTextureCache>() {
+            if let Some(entry) = cache.0.lock().unwrap().get_mut(id) {
+                entry.carry.extend(damage);
+            }
+        }
+    });
+}
 
 impl ImportMemWl for VulkanRenderer {
     fn import_shm_buffer(
@@ -93,14 +145,24 @@ impl ImportMemWl for VulkanRenderer {
         //
         // Everything that touches the mapped pool happens inside `with_buffer_contents`, which is
         // the only place smithay guarantees it is valid and SIGBUS-guarded.
+        //
+        // A commit too big to copy on the frame is handed to the off-thread uploader instead
+        // (`shm_upload`), and the frame shows the image's previous contents until it lands.
         let id = self.context_id();
         let cached = surface.and_then(|surface| {
             let cache = surface
                 .data_map
                 .get_or_insert_threadsafe(ShmTextureCache::default);
-            let cache = cache.0.lock().unwrap();
-            cache.get(&id).cloned()
+            let mut cache = cache.0.lock().unwrap();
+            cache
+                .get_mut(&id)
+                .map(|entry| (entry.tex.clone(), std::mem::take(&mut entry.carry)))
         });
+        // Only a surface we can name again when its copy lands can have one off the frame.
+        let handle = surface
+            .filter(|_| self.shm_uploads_enabled())
+            .and_then(|surface| surface.data_map.get::<SurfaceHandle>())
+            .map(|handle| handle.0.clone());
 
         enum Imported {
             /// The cached image was refreshed in place; nothing more to do.
@@ -132,9 +194,31 @@ impl ImportMemWl for VulkanRenderer {
 
             // Reuse keys on `Fourcc`, not VkFormat: Argb/Xrgb8888 share `B8G8R8A8_UNORM` but
             // differ in the view's alpha swizzle, so a same-size fourcc switch must re-import.
-            if let Some(tex) = cached {
+            if let Some((tex, carry)) = cached {
                 if tex.size() == size && tex.format() == Some(fourcc) {
-                    match damage_regions(damage, size) {
+                    let mut damage = damage.to_vec();
+                    damage.extend(carry);
+                    if let Some(handle) = &handle {
+                        // One copy in flight per surface: a commit arriving meanwhile waits
+                        // for it, and is the one copied next.
+                        if self.shm_upload_in_flight(handle) {
+                            self.defer_shm_upload(handle, buffer, size, damage);
+                            return Ok(Imported::Reused(tex));
+                        }
+                        let bytes = match damage_regions(&damage, size) {
+                            Some(regions) => regions
+                                .iter()
+                                .map(|r| u64::from(r.extent.width) * u64::from(r.extent.height) * 4)
+                                .sum(),
+                            None => rows.packed_len() as u64,
+                        };
+                        if bytes > super::shm_upload::OFF_THREAD_MIN_BYTES
+                            && self.start_shm_upload(handle, buffer, size, damage.clone())
+                        {
+                            return Ok(Imported::Reused(tex));
+                        }
+                    }
+                    match damage_regions(&damage, size) {
                         // Damage says nothing changed; the image already holds these pixels.
                         Some(regions) if regions.is_empty() => {}
                         Some(regions) => {
@@ -172,7 +256,16 @@ impl ImportMemWl for VulkanRenderer {
             .get_or_insert_threadsafe(ShmTextureCache::default);
         let mut cache = cache.0.lock().unwrap();
         let tex = self.import_memory(&packed, fourcc, size, false)?;
-        cache.insert(id, tex.clone());
+        if let Some(handle) = &handle {
+            self.forget_deferred_shm_upload(handle);
+        }
+        cache.insert(
+            id,
+            ShmCacheEntry {
+                tex: tex.clone(),
+                carry: Vec::new(),
+            },
+        );
         Ok(tex)
     }
 }
@@ -238,7 +331,7 @@ fn damage_regions(
 /// Holds the geometry checks in one place so the two consumers — writing straight into a staging
 /// mapping, and building a tight `Vec` for a fresh import — cannot disagree about what is in
 /// bounds. Constructing one proves every row lies inside `pool`, so writing is infallible.
-struct ShmRows<'a> {
+pub(super) struct ShmRows<'a> {
     pool: &'a [u8],
     offset: usize,
     stride: usize,
@@ -247,7 +340,7 @@ struct ShmRows<'a> {
 }
 
 impl<'a> ShmRows<'a> {
-    fn new(
+    pub(super) fn new(
         pool: &'a [u8],
         offset: i32,
         stride: i32,
@@ -298,9 +391,19 @@ impl<'a> ShmRows<'a> {
     ///
     /// The whole point of the type: this is the *only* copy of the pixels on the re-upload path,
     /// straight into the staging mapping.
-    fn write_into(&self, dst: &mut [u8]) {
+    pub(super) fn write_into(&self, dst: &mut [u8]) {
         debug_assert_eq!(dst.len(), self.packed_len());
         for (row, out) in dst.chunks_exact_mut(self.row_bytes).enumerate() {
+            let start = self.offset + row * self.stride;
+            out.copy_from_slice(&self.pool[start..start + self.row_bytes]);
+        }
+    }
+
+    /// Write rows `rows` tightly packed into `dst`, which must be exactly their size — one band of
+    /// an off-thread copy, which re-enters the pool band by band.
+    pub(super) fn write_rows_into(&self, rows: std::ops::Range<usize>, dst: &mut [u8]) {
+        debug_assert_eq!(dst.len(), rows.len() * self.row_bytes);
+        for (row, out) in rows.zip(dst.chunks_exact_mut(self.row_bytes)) {
             let start = self.offset + row * self.stride;
             out.copy_from_slice(&self.pool[start..start + self.row_bytes]);
         }

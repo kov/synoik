@@ -158,6 +158,7 @@ impl State {
         let _span = trace_span!("commit", surface = %surface.id()).entered();
         trace!("commit");
 
+        crate::render_helpers::vulkan::note_surface_handle(surface);
         on_commit_buffer_handler::<Self>(surface);
 
         let mut root_surface = surface.clone();

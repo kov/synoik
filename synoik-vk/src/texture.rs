@@ -371,6 +371,36 @@ impl StagedTexture {
         })
     }
 
+    /// [`Self::reupload_32bpp_with`] from pixels already written into a [`StagingReservation`] —
+    /// by a worker thread, typically, so the render thread only queues the copy. The reservation
+    /// must hold exactly `width*height*4` bytes, every one of them written.
+    ///
+    /// The bytes are not counted as [`crate::stats::uploaded`]: that number is what the frame
+    /// spent writing staging, and these were written off it
+    /// ([`crate::stats::uploaded_off_thread`]).
+    pub fn reupload_32bpp_reserved(
+        reservation: crate::staging::StagingReservation,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+        anyhow::ensure!(
+            reservation.len() == size,
+            "reserved {} bytes for {width}x{height}, need {size}",
+            reservation.len()
+        );
+        crate::stats::uploaded_off_thread(size);
+        let (chunk, offset) = reservation.into_parts();
+        Ok(StagedTexture {
+            source: StagedSource::Pool(chunk, offset),
+            image,
+            width,
+            height,
+            regions: None,
+        })
+    }
+
     /// [`Self::reupload_32bpp_with`] for only the `regions` of the image that changed — an shm
     /// commit's damage, which is what mutter uploads (`process_shm_buffer_damage`) and usually a
     /// small fraction of a window.

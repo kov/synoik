@@ -302,6 +302,7 @@ thread_local! {
     static FIRST_SITE: Cell<Option<SubmitSite>> = const { Cell::new(None) };
     static UPLOADED_BYTES: Cell<u64> = const { Cell::new(0) };
     static UNDAMAGED_BYTES: Cell<u64> = const { Cell::new(0) };
+    static OFF_THREAD_BYTES: Cell<u64> = const { Cell::new(0) };
     /// Wall time inside GPU resource creation this frame, and how many creations. See [`creating`].
     static CREATE_NANOS: Cell<u64> = const { Cell::new(0) };
     static CREATES: Cell<u64> = const { Cell::new(0) };
@@ -457,6 +458,18 @@ pub fn uploaded(bytes: u64) {
 /// says how much of a commit's buffer its damage spared.
 pub fn take_undamaged_bytes() -> u64 {
     UNDAMAGED_BYTES.with(|c| c.replace(0))
+}
+
+/// Bytes whose upload the render thread only queued because another thread wrote the staging,
+/// since the last call, clearing the counter. Kept apart from [`take_uploaded_bytes`] so that
+/// number stays what the frame itself spent writing.
+pub fn take_uploaded_off_thread_bytes() -> u64 {
+    OFF_THREAD_BYTES.with(|c| c.replace(0))
+}
+
+/// Record `bytes` of staging written off the render thread, counted when its copy is queued.
+pub fn uploaded_off_thread(bytes: u64) {
+    add(&OFF_THREAD_BYTES, bytes);
 }
 
 /// Record `bytes` of an image a partial re-upload skipped as undamaged.

@@ -3416,18 +3416,19 @@ fn sample_texture_1to1(vk: &mut VulkanRenderer, tex: &VkTexture) -> Vec<u8> {
 }
 
 /// A damage-only shm re-upload copies its rectangles and **keeps every other pixel**: import red,
-/// let a frame land it, then re-upload green over two disjoint rectangles and read back green in
-/// both and red everywhere else. One that ignored its offsets would put the green in the corner.
+/// re-upload green over two disjoint rectangles and read back green in both and red everywhere
+/// else. One that ignored its offsets would put the green in the corner.
 ///
 /// It **cannot** catch a partial copy that transitions from `UNDEFINED`: that is legal, silent
 /// under the validation layer, and on venus the old pixels happen to survive it. The spec lets a
 /// driver discard them, so `record_region_copies_at` transitions from the layout the image is
 /// actually in, and only review holds it there.
 ///
-/// It also pins when a partial copy must decline. Straight after the import, the import's own
-/// whole-extent copy is still queued, and a partial one queued behind it would either be replaced
-/// by the queue's superseding or have to be ordered after it: the call has to say no, so the
-/// caller uploads the whole buffer instead.
+/// It also pins the queue's ordering. The partial copy is staged while the import's own
+/// whole-extent copy is still queued, so it must be recorded *after* it: replacing the import —
+/// the rule for a whole-extent copy — would leave everything outside the rectangles blank, and
+/// recording it first would paint red over the green. Past `MAX_QUEUED_PARTIALS` for the image it
+/// declines, so the caller's whole-buffer copy collapses the queue instead of growing it.
 #[test]
 fn vulkan_shm_partial_reupload_keeps_the_undamaged_pixels() {
     let mut vk = match VulkanRenderer::new() {
@@ -3465,21 +3466,8 @@ fn vulkan_shm_partial_reupload_keeps_the_undamaged_pixels() {
     let staged = vk
         .reupload_shm_regions_with(&tex, regions.clone(), |dst| dst.copy_from_slice(&green))
         .expect("partial re-upload behind a queued import");
-    assert!(
-        !staged,
-        "a partial copy must decline while the image's whole-extent copy is still queued"
-    );
-
-    // A frame drains the import; now the image holds red and the partial copy can go.
-    let before = sample_texture_1to1(&mut vk, &tex);
-    assert!(close_px(px(&before, W / 2, H / 2), RED, 3));
-    let staged = vk
-        .reupload_shm_regions_with(&tex, regions.clone(), |dst| dst.copy_from_slice(&green))
-        .expect("partial re-upload");
-    assert!(
-        staged,
-        "a landed image with nothing queued takes a partial copy"
-    );
+    assert!(staged, "a partial copy queues behind the import's");
+    assert_eq!(vk.pending_texture_uploads_len(), 2);
 
     let pixels = sample_texture_1to1(&mut vk, &tex);
     let inside = |x: i32, y: i32| {
@@ -3506,11 +3494,26 @@ fn vulkan_shm_partial_reupload_keeps_the_undamaged_pixels() {
         wrong.len(),
         wrong.first()
     );
+
+    // An undrained queue takes a bounded number of partial copies per image, then declines.
+    let mut taken = 0;
+    while vk
+        .reupload_shm_regions_with(&tex, regions.clone(), |dst| dst.copy_from_slice(&green))
+        .expect("partial re-upload")
+    {
+        taken += 1;
+        assert!(taken <= 16, "the partial queue has no cap");
+    }
+    assert!(
+        taken >= 1,
+        "an image with nothing queued takes a partial copy"
+    );
+    assert_eq!(vk.pending_texture_uploads_len(), taken);
 }
 
-/// Several commits of the same surface between two frames must cost **one** upload, not one per
-/// commit: every entry in the queue covers its image's full extent, so a copy that is followed by
-/// another copy into the same image is dead before it is ever recorded.
+/// Several whole-buffer commits of the same surface between two frames must cost **one** upload,
+/// not one per commit: a whole-extent copy that is followed by another into the same image is dead
+/// before it is ever recorded.
 ///
 /// Pin both halves — the queue holds one entry however many times the client commits, and the
 /// pixels are the *last* commit's, not the first's. The count is what bounds the queue when a

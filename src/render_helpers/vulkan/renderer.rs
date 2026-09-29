@@ -343,7 +343,11 @@ pub struct VulkanRenderer {
     /// rewound per frame, rather than a mappable blob per upload. See
     /// [`synoik_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of
     /// blobs two minutes into a live session.
-    staging_pool: synoik_vk::staging::StagingPool,
+    pub(super) staging_pool: synoik_vk::staging::StagingPool,
+    /// Copies big shm commits into staging off the render thread, once the event loop has wired a
+    /// waker ([`Self::enable_async_shm_uploads`]); `None` copies every commit on the frame. See
+    /// [`super::shm_upload`].
+    pub(super) shm_uploads: Option<super::shm_upload::ShmUploader>,
     /// When the staging pool was last aged. The pool retires an idle oversized chunk on a wall
     /// clock, and this is the clock — it lives here because the pool takes a duration, so its
     /// behaviour stays a pure function of what it is handed.
@@ -388,6 +392,11 @@ struct PendingTextureUpload {
     tex: VkTexture,
     staged: synoik_vk::texture::StagedTexture,
 }
+
+/// How many damage-only copies one image may have queued before a further commit's damage is
+/// uploaded whole instead, collapsing them. Bounds the queue on a frame path that cannot drain it,
+/// while still letting the commit right after an off-thread copy lands stay partial.
+const MAX_QUEUED_PARTIALS: usize = 4;
 
 /// How many differently-sized present-blit shadows to keep. Comfortably covers what a live session
 /// binds within one frame (a scanout buffer per output, a screencast buffer, a screencopy region)
@@ -686,6 +695,7 @@ impl VulkanRenderer {
             pending_blurs: Vec::new(),
             pending_sampleable: Vec::new(),
             staging_pool,
+            shm_uploads: None,
             staging_pool_aged: None,
         })
     }
@@ -3288,38 +3298,33 @@ impl VulkanRenderer {
     /// Queue `staged`'s copy into `tex`'s image for the next frame to record, holding `tex` alive
     /// until then and past the submit ([`PendingTextureUpload`]).
     ///
-    /// An upload already queued for the *same image* is **replaced**, not appended to. A
-    /// whole-extent copy (`stage_32bpp`, `reupload_32bpp`) makes an earlier copy to the same image
-    /// dead the moment it is queued: recording it would only write pixels the next command
-    /// overwrites, and its staging is bytes we already paid to fill. A partial copy (an shm
-    /// commit's damage) is never queued behind another — [`Self::reupload_shm_regions_with`]
-    /// declines and the caller uploads the whole buffer — so replacing stays sound for it too.
+    /// A whole-extent copy (`stage_32bpp`, `reupload_32bpp`) **replaces** every copy already
+    /// queued for the same image: they are dead the moment it is queued, since recording them
+    /// would only write pixels the next command overwrites, and their staging is bytes we already
+    /// paid to fill. A partial copy (an shm commit's damage) is appended instead, because the
+    /// pixels outside its rectangles are the earlier copies' — recording keeps queue order.
+    /// [`Self::reupload_shm_regions_with`] caps how many partials one image may queue.
     ///
     /// That also bounds the queue. A frame that fails before it can drain leaves everything
     /// queued for the next one — correct for a transient failure, but the live wedge was a
     /// *permanent* one, where clients kept committing into a queue that would never drain again.
-    /// Superseding caps it at one entry per live image instead of one per commit, so the failure
-    /// stops feeding itself.
-    fn queue_texture_upload(&mut self, tex: &VkTexture, staged: synoik_vk::texture::StagedTexture) {
+    /// Superseding plus the partial cap bound it at a handful of entries per live image instead of
+    /// one per commit, so the failure stops feeding itself.
+    pub(super) fn queue_texture_upload(
+        &mut self,
+        tex: &VkTexture,
+        staged: synoik_vk::texture::StagedTexture,
+    ) {
         let entry = PendingTextureUpload {
             tex: tex.clone(),
             staged,
         };
-        let image = tex.image();
-        match self
-            .pending_texture_uploads
-            .iter_mut()
-            .find(|queued| queued.tex.image() == image)
-        {
-            Some(superseded) => {
-                debug_assert!(
-                    entry.staged.is_full_extent(),
-                    "a partial copy would replace one it does not cover"
-                );
-                *superseded = entry;
-            }
-            None => self.pending_texture_uploads.push(entry),
+        if entry.staged.is_full_extent() {
+            let image = tex.image();
+            self.pending_texture_uploads
+                .retain(|queued| queued.tex.image() != image);
         }
+        self.pending_texture_uploads.push(entry);
     }
 
     /// Record every staged texture upload into `cbuf` and hand back what must outlive that command
@@ -3751,13 +3756,14 @@ impl VulkanRenderer {
     /// partial copy — the caller then re-uploads the whole buffer.
     ///
     /// A partial copy keeps the image's pixels outside `regions`, so it needs them to be there:
-    /// the image must have been uploaded already (a layout still `UNDEFINED` holds nothing), and
-    /// no copy may be queued for it yet. The second is what keeps the queue's superseding sound —
-    /// a whole-extent copy replaces whatever was queued for its image, so a partial one queued
-    /// behind another would either be replaced and lose its rectangles, or have to be recorded in
-    /// order and grow the queue by one entry per commit on a frame that cannot drain it. Commits
-    /// between two frames share one import anyway (smithay accumulates their damage), so this only
-    /// declines when a queue is left undrained across frames.
+    /// the image must have been given content already (a layout still `UNDEFINED` holds nothing).
+    /// It is queued *behind* any copy already waiting for the same image rather than replacing it,
+    /// and recording keeps queue order, so the rectangles land on top of what came before. That
+    /// matters most right after an off-thread copy lands between frames: the next commit's small
+    /// damage must not turn into a whole-buffer copy on the frame just because the landed copy has
+    /// not been recorded yet. Past [`MAX_QUEUED_PARTIALS`] for one image it declines, so a queue
+    /// that cannot drain grows by at most that many entries per image, and the whole-extent copy
+    /// the caller makes instead collapses them.
     pub(super) fn reupload_shm_regions_with(
         &mut self,
         tex: &VkTexture,
@@ -3768,8 +3774,11 @@ impl VulkanRenderer {
         let queued = self
             .pending_texture_uploads
             .iter()
-            .any(|queued| queued.tex.image() == image);
-        if queued || tex.layout() != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            .filter(|queued| queued.tex.image() == image)
+            .count();
+        if queued >= MAX_QUEUED_PARTIALS
+            || tex.layout() != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        {
             return Ok(false);
         }
         let staged = tex

@@ -1288,6 +1288,9 @@ struct Totals {
     /// `uploaded` it says how much damage-only uploading saved, and a commit that comes in with
     /// none spared is one that damaged its whole buffer.
     undamaged: u64,
+    /// Bytes whose copy this frame queued but whose staging another thread wrote — an shm commit
+    /// big enough to be copied off the frame. Not in `uploaded`, which is what the frame spent.
+    uploaded_off_thread: u64,
     /// GPU resources created, and the wall time it took. Not a submit and not free: on a
     /// virtualized driver a `vkCreateImage` round-trips to the host whenever venus misses its
     /// image-requirements cache, so this is collect time that the submit breakdown structurally
@@ -2873,6 +2876,7 @@ impl FrameLog {
             first_wait: synoik_vk::stats::take_first_wait(),
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
             undamaged: synoik_vk::stats::take_undamaged_bytes(),
+            uploaded_off_thread: synoik_vk::stats::take_uploaded_off_thread_bytes(),
             creates: synoik_vk::stats::take_creates(),
             host_calls: synoik_vk::stats::take_host_calls(),
             render_passes: synoik_vk::stats::take_render_passes(),
@@ -3207,6 +3211,13 @@ impl FrameLog {
                     );
                 }
                 let _ = write!(line, " in {}", ms(totals.staging_write));
+            }
+            if totals.uploaded_off_thread > 0 {
+                let _ = write!(
+                    line,
+                    ", {:.1}MiB uploaded off-thread",
+                    totals.uploaded_off_thread as f64 / (1 << 20) as f64,
+                );
             }
             if totals.creates.0 > 0 {
                 let _ = write!(
@@ -4464,6 +4475,19 @@ mod tests {
             partial.contains("1.0MiB uploaded (38.0MiB undamaged) in 0.30ms"),
             "{partial}"
         );
+        // A copy whose staging a worker wrote is reported apart: the frame only queued it.
+        let off_thread = Totals {
+            submits: 1,
+            uploaded_off_thread: 40 << 20,
+            ..Totals::default()
+        };
+        let off_thread =
+            FrameLog::format_frame(&frame, Duration::from_millis(17), &off_thread, None);
+        assert!(
+            off_thread.contains(", 40.0MiB uploaded off-thread"),
+            "{off_thread}"
+        );
+        assert!(!off_thread.contains("MiB uploaded in"), "{off_thread}");
         // Resource creation is neither a submit nor a bake, so it has to say so itself or it is
         // invisible — which is exactly how ~50ms hid on the seat's worst frames.
         assert!(line.contains("7 created in 4.30ms"), "{line}");

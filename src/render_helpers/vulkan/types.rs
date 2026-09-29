@@ -379,6 +379,23 @@ impl VkTexture {
         Ok(staged)
     }
 
+    /// [`Self::stage_reupload_shm_with`] from a whole buffer of pixels already written into
+    /// `reservation` off the render thread ([`super::shm_upload`]). Advances the tracked layout the
+    /// same way, so a later damage-only copy sees an image that has content.
+    pub(super) fn stage_reupload_shm_reserved(
+        &self,
+        reservation: synoik_vk::staging::StagingReservation,
+    ) -> anyhow::Result<synoik_vk::texture::StagedTexture> {
+        let staged = synoik_vk::texture::StagedTexture::reupload_32bpp_reserved(
+            reservation,
+            self.image(),
+            self.0.width,
+            self.0.height,
+        )?;
+        self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(staged)
+    }
+
     /// [`Self::stage_reupload_shm_with`] for only the damaged `regions`, packed tightly in order by
     /// `fill`. The image must already be `SHADER_READ_ONLY_OPTIMAL` and hold everything outside
     /// them — see [`synoik_vk::texture::StagedTexture::reupload_32bpp_regions_with`], and

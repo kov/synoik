@@ -187,7 +187,7 @@ const MIN_CHUNK: vk::DeviceSize = 4 << 20;
 /// So size decides the chunk's *shape*, and use decides its *lifetime*: the most recently used
 /// oversized chunks stay resident up to [`OVERSIZED_RESIDENT_BYTES`], and any past that budget are
 /// handed back after [`OVERSIZED_IDLE`] unused.
-const MAX_POOLED_CHUNK: vk::DeviceSize = 16 << 20;
+pub const MAX_POOLED_CHUNK: vk::DeviceSize = 16 << 20;
 
 /// How long an oversized chunk *outside the resident budget* survives without being used.
 ///
@@ -244,8 +244,9 @@ pub struct StagingChunk {
 }
 
 // SAFETY: the same argument as `HostStaging` above — every handle is owned exclusively by this
-// value and `ptr` maps only its own memory. Writes go through `&mut StagingPool`, so the pool's
-// borrow is what serializes them; a shared `Arc<StagingChunk>` only ever reads `buffer`.
+// value and `ptr` maps only its own memory. Writes go through `&mut StagingPool` or through a
+// `&mut StagingReservation`, each to a range the pool claimed for it alone, so two writers never
+// touch the same bytes; a shared `Arc<StagingChunk>` otherwise only ever reads `buffer`.
 unsafe impl Send for StagingChunk {}
 unsafe impl Sync for StagingChunk {}
 
@@ -343,6 +344,46 @@ impl Drop for StagingChunk {
             crate::devmem::untrack(self.memory);
             self.gpu.device.free_memory(self.memory, None);
         }
+    }
+}
+
+/// A range of a [`StagingChunk`] handed out by [`StagingPool::reserve`] to be written later,
+/// possibly on another thread. It owns the range exclusively, and holds the chunk so the pool
+/// neither rewinds nor retires it; dropping it unused simply gives the range back.
+pub struct StagingReservation {
+    chunk: Arc<StagingChunk>,
+    offset: vk::DeviceSize,
+    len: vk::DeviceSize,
+}
+
+impl StagingReservation {
+    pub fn len(&self) -> vk::DeviceSize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The reserved bytes, to write in place. Same contract as [`StagingPool::stage_with`]'s
+    /// `fill`: by the time this becomes an upload every byte must have been written, and none
+    /// should be read — the mapping holds whatever an earlier upload left.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the pool claimed `offset..offset + len` inside the chunk for this reservation
+        // alone, and nothing reads it on the GPU until the reservation is consumed into an
+        // upload, which takes it by value. The chunk (and so the mapping) is held by `self`.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.chunk.ptr.add(self.offset as usize),
+                self.len as usize,
+            )
+        }
+    }
+
+    /// The chunk and offset, for the upload that reads the range. Consumes the reservation: from
+    /// here on the GPU may be reading it.
+    pub(crate) fn into_parts(self) -> (Arc<StagingChunk>, vk::DeviceSize) {
+        (self.chunk, self.offset)
     }
 }
 
@@ -448,6 +489,35 @@ impl StagingPool {
         len: vk::DeviceSize,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<(Arc<StagingChunk>, vk::DeviceSize)> {
+        let (index, offset) = self.claim(gpu, len)?;
+        let chunk = &self.chunks[index].chunk;
+        // SAFETY: `claim` bump-allocated `offset..offset + len` inside the chunk, in a chunk that
+        // is either freshly created or one nothing else references — so no GPU read of the range
+        // is in flight, and no reservation overlaps it.
+        unsafe { chunk.fill_at(offset, len as usize, fill) };
+        Ok((chunk.clone(), offset))
+    }
+
+    /// Reserve `len` bytes for a producer that fills them **later, on another thread** — an shm
+    /// commit copied off the render thread. The returned [`StagingReservation`] owns its range
+    /// exclusively until it is turned into an upload, and holds its chunk the way a queued upload
+    /// does, so the pool neither rewinds nor retires it meanwhile.
+    ///
+    /// A reservation that shares a chunk keeps that chunk from rewinding for as long as it lives,
+    /// so a long-lived one should be big enough to get a chunk of its own (over
+    /// [`MAX_POOLED_CHUNK`]).
+    pub fn reserve(&mut self, gpu: &Arc<Gpu>, len: vk::DeviceSize) -> Result<StagingReservation> {
+        let (index, offset) = self.claim(gpu, len)?;
+        Ok(StagingReservation {
+            chunk: self.chunks[index].chunk.clone(),
+            offset,
+            len,
+        })
+    }
+
+    /// Find room for `len` bytes and bump past it, returning the chunk's index and the offset.
+    /// The range is unread by the GPU and claimed by nobody else — the caller's to fill.
+    fn claim(&mut self, gpu: &Arc<Gpu>, len: vk::DeviceSize) -> Result<(usize, vk::DeviceSize)> {
         assert!(len > 0, "staging an empty upload");
 
         // Rewind: the chunk we were filling is free the moment nothing else references it — no
@@ -505,19 +575,17 @@ impl StagingPool {
             }
         };
 
+        // `offset + len` is within capacity — either bump-allocated inside the current chunk or
+        // offset 0 of one sized to fit.
         let offset = self.used;
         let entry = &mut self.chunks[index];
         entry.idle = Duration::ZERO;
-        // SAFETY: `offset + len` is within capacity — either bump-allocated inside the current
-        // chunk or offset 0 of one sized to fit — and the chunk is either freshly created or one
-        // nothing else references, so no GPU read of the range is in flight.
-        unsafe { entry.chunk.fill_at(offset, len as usize, fill) };
         // Bump past this upload, aligned for the next `bufferOffset`. Saturating at the capacity
         // keeps the arithmetic honest when the last upload ends flush with the end of the chunk.
         self.used = (offset + len)
             .next_multiple_of(self.align)
             .min(entry.chunk.capacity());
-        Ok((entry.chunk.clone(), offset))
+        Ok((index, offset))
     }
 
     /// Age the pool by `elapsed`, retiring oversized chunks outside the resident budget that
@@ -868,6 +936,43 @@ mod tests {
     /// this stages twice into the same rewound chunk, writes only half the second time, and reads
     /// back the first upload's bytes underneath. A scratch-buffer implementation would hand back
     /// zeroes (or fresh garbage) there and fail.
+    /// A reservation keeps its bytes for as long as it lives: the pool must neither rewind onto
+    /// it nor hand its range to a later upload — the worker filling it may still be writing, and
+    /// the copy that reads it has not been queued yet. Once dropped, the range is the pool's again.
+    #[test]
+    fn a_reservation_holds_its_range_until_it_is_dropped() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!(
+                "skipping a_reservation_holds_its_range_until_it_is_dropped: no Vulkan device"
+            );
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let mut pool = StagingPool::new(&gpu);
+
+        let mut reserved = pool.reserve(&gpu, 8).expect("reserve");
+        reserved.bytes_mut().copy_from_slice(&[7; 8]);
+        pool.end_frame(Duration::from_millis(16));
+        let (chunk, offset) = pool.stage(&gpu, &[1; 8]).expect("stage");
+        assert!(
+            !(Arc::ptr_eq(&chunk, &reserved.chunk) && offset == reserved.offset),
+            "a later upload landed on a live reservation"
+        );
+        assert_eq!(
+            reserved.bytes_mut(),
+            &[7; 8],
+            "the reserved bytes were overwritten"
+        );
+
+        let (reserved_chunk, reserved_offset) = reserved.into_parts();
+        drop((chunk, reserved_chunk));
+        let (_, offset) = pool.stage(&gpu, &[2; 8]).expect("stage");
+        assert_eq!(
+            offset, reserved_offset,
+            "with nothing holding the chunk the pool rewinds onto the reservation's range"
+        );
+    }
+
     #[test]
     fn stage_with_fills_the_mapping_in_place() {
         let Ok(gpu) = Gpu::new() else {

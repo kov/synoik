@@ -52,6 +52,11 @@ precisely because one thread hands out the numbers.
    The order within `begin` is the order of dependencies: barriers before the blurs that sample them,
    and everything before the render pass.
 
+   Work whose *host* half is big still enters here, just later: a big shm commit's staging is filled
+   on a worker (`render_helpers/vulkan/shm_upload.rs`, into a `StagingPool::reserve` range) and its
+   copy is queued into `pending_texture_uploads` when it lands, between frames. No submit of its own
+   — the frame shows the previous contents until then.
+
 2. **The mid-frame gap in `capture_region`** — it ends the frame's render pass, records a blit, and
    opens a continuation pass. Work that has to run *between* the frame's own passes belongs in that
    gap, via its `record_gap` closure; the backdrop blur is what it exists for.

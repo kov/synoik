@@ -6814,6 +6814,212 @@ fn vulkan_shm_cache_uploads_only_the_damage() {
     );
 }
 
+/// A buffer whose whole-buffer copy is past the off-thread threshold (the staging pool's 16 MiB
+/// shared chunk): 2100×2100×4 is ~16.8 MiB.
+const BIG_SHM: i32 = 2100;
+
+/// A mapped green shm window of [`BIG_SHM`]², on a fixture whose renderer copies big shm commits
+/// off the frame. The map itself is a fresh import, which always copies on the frame.
+fn big_shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping off-thread shm test: no Vulkan device");
+        return None;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.synoik_state().enable_async_shm_uploads();
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 0, 255, 0, 255);
+    window.set_size(BIG_SHM as u16, BIG_SHM as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    let output = f.synoik_output(1);
+    Some((f, id, surface, output))
+}
+
+fn with_vk<T>(f: &mut Fixture, cb: impl FnOnce(&mut VulkanRenderer) -> T) -> T {
+    f.synoik_state()
+        .backend
+        .headless()
+        .with_vulkan_renderer(cb)
+        .expect("headless backend holds a Vulkan renderer")
+}
+
+/// Take turns until every off-thread copy has come back and landed, or fail after five seconds of
+/// wall clock — the worker is a real thread, so this is the one wait in these tests that is not
+/// on the compositor's clock.
+fn land_shm_uploads(f: &mut Fixture) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while with_vk(f, |vk| vk.shm_uploads_in_flight()) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an off-thread shm copy never landed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        f.turn();
+    }
+    f.turn();
+}
+
+fn count_px(pixels: &[u8], w: i32, h: i32, pred: impl Fn([u8; 4]) -> bool) -> usize {
+    (0..w * h)
+        .filter(|i| pred(px(pixels, w, i % w, i / w)))
+        .count()
+}
+
+/// A commit too big for the frame is copied off it: the frame that imports it copies nothing and
+/// keeps showing the previous contents, and when the copy lands the new contents show **and the
+/// surface is damaged** — without that, a damage-tracked output would never repaint the window,
+/// and a screenshot (which redraws everything) could not tell.
+#[test]
+fn a_big_shm_commit_is_copied_off_the_frame() {
+    let Some((mut f, id, surface, output)) = big_shm_window_fixture() else {
+        return;
+    };
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let full = (BIG_SHM * BIG_SHM * 4) as u64;
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let window_px = count_px(&pixels, w, h, is_green);
+    assert!(window_px > 0, "green window absent from the first frame");
+
+    with_vk(&mut f, |vk| vk.hold_shm_uploads());
+    synoik_vk::stats::take_uploaded_bytes();
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        synoik_vk::stats::take_uploaded_bytes() < full / 4,
+        "the big commit was copied on the frame"
+    );
+    assert_eq!(with_vk(&mut f, |vk| vk.shm_uploads_in_flight()), 1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(
+        count_px(&pixels, w, h, is_green),
+        window_px,
+        "until its copy lands, the frame shows the previous contents"
+    );
+
+    let server_surface = {
+        let mapped = f
+            .synoik()
+            .layout
+            .windows()
+            .next()
+            .expect("a mapped window")
+            .1;
+        mapped.toplevel().wl_surface().clone()
+    };
+    let commit = || {
+        smithay::backend::renderer::utils::with_renderer_surface_state(&server_surface, |s| {
+            s.current_commit()
+        })
+        .unwrap()
+    };
+    let before = commit();
+    with_vk(&mut f, |vk| vk.release_shm_uploads());
+    land_shm_uploads(&mut f);
+    let after = commit();
+    assert_ne!(
+        before, after,
+        "a landed copy must damage its surface, or nothing repaints it"
+    );
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(
+        count_px(&pixels, w, h, is_red),
+        window_px,
+        "the landed copy shows"
+    );
+    assert_eq!(count_px(&pixels, w, h, is_green), 0);
+}
+
+/// A commit that arrives while the previous one is still being copied waits for it, and then the
+/// first copy is **discarded** rather than landed: the second commit released the first buffer, so
+/// the client may have been writing it while the worker read. Only the last commit's copy lands,
+/// and it shows.
+///
+/// Two guards catch this — a newer import waiting, and the surface no longer holding the buffer
+/// the copy read — and this client, which attaches a fresh buffer each time, trips both. Only a
+/// client re-attaching the buffer it was just given back needs the first alone.
+#[test]
+fn an_overtaken_shm_copy_is_discarded() {
+    let Some((mut f, id, surface, output)) = big_shm_window_fixture() else {
+        return;
+    };
+    let is_blue = |p: [u8; 4]| p[2] > 200 && p[0] < 40 && p[1] < 40;
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let full = (BIG_SHM * BIG_SHM * 4) as u64;
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let window_px = count_px(&pixels, w, h, is_green);
+
+    with_vk(&mut f, |vk| vk.hold_shm_uploads());
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 0, 0, 255, 255);
+    window.commit();
+    f.double_roundtrip(id);
+
+    synoik_vk::stats::take_uploaded_off_thread_bytes();
+    with_vk(&mut f, |vk| vk.release_shm_uploads());
+    land_shm_uploads(&mut f);
+    assert_eq!(
+        synoik_vk::stats::take_uploaded_off_thread_bytes(),
+        full,
+        "exactly one copy lands: the overtaken one is discarded"
+    );
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(
+        count_px(&pixels, w, h, is_blue),
+        window_px,
+        "the last commit shows"
+    );
+}
+
+/// A surface destroyed while its copy is in flight: the copy comes back to nothing and is dropped.
+#[test]
+fn an_shm_copy_outlives_its_surface_harmlessly() {
+    let Some((mut f, id, surface, _output)) = big_shm_window_fixture() else {
+        return;
+    };
+    with_vk(&mut f, |vk| vk.hold_shm_uploads());
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(BIG_SHM, BIG_SHM, 255, 0, 0, 255);
+    window.commit();
+    f.double_roundtrip(id);
+    assert_eq!(with_vk(&mut f, |vk| vk.shm_uploads_in_flight()), 1);
+
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+
+    synoik_vk::stats::take_uploaded_off_thread_bytes();
+    with_vk(&mut f, |vk| vk.release_shm_uploads());
+    land_shm_uploads(&mut f);
+    assert_eq!(synoik_vk::stats::take_uploaded_off_thread_bytes(), 0);
+}
+
 /// Compositing for a screencast must work on the owned Vulkan renderer.
 ///
 /// Screencast used to render through the co-resident GLES renderer even on a Vulkan session (the

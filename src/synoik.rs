@@ -1897,6 +1897,42 @@ pub struct State {
 }
 
 impl State {
+    /// Let the renderer copy big shm commits into staging off the frame
+    /// ([`VulkanRenderer::enable_async_shm_uploads`]), waking this loop when one finishes so it
+    /// can land and the outputs repaint. The renderer must already exist; without this every shm
+    /// copy stays on the frame, which is where headless tests keep it unless they ask.
+    pub fn enable_async_shm_uploads(&mut self) {
+        let (ping, source) = match calloop::ping::make_ping() {
+            Ok(pair) => pair,
+            Err(err) => {
+                warn!("could not make the shm upload waker: {err}; copying on the frame");
+                return;
+            }
+        };
+        let wired = self
+            .backend
+            .with_vulkan_renderer(|vk| vk.enable_async_shm_uploads(ping))
+            .is_some();
+        if !wired {
+            return;
+        }
+        let inserted = self
+            .synoik
+            .event_loop
+            .insert_source(source, |(), (), state| {
+                let landed = state
+                    .backend
+                    .with_vulkan_renderer(|vk| vk.land_shm_uploads())
+                    .unwrap_or(false);
+                if landed {
+                    state.synoik.queue_redraw_all();
+                }
+            });
+        if let Err(err) = inserted {
+            warn!("could not watch the shm upload waker: {err}");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
@@ -2129,6 +2165,10 @@ impl State {
                     }
                 })
                 .unwrap();
+
+            // Copy big shm commits off the frame (a HiDPI client's full-window repaint is tens of
+            // MiB), landing them back here between frames.
+            state.enable_async_shm_uploads();
 
             // Decode wallpapers on a worker thread (a 4K JPEG-XL decode would
             // otherwise stall the main loop, e.g. on a color-scheme flip), and
