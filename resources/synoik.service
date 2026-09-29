@@ -16,4 +16,7 @@ Type=notify
 # searched ahead of the system one, and inherited by everything the session
 # launches, so gnome-control-center sees those keys too.
 Environment=GSETTINGS_SCHEMA_DIR=/usr/share/synoik/glib-2.0/schemas
+# Room for synoik to lock its own memory out of swap (utils::memory::MemoryLocker);
+# the default 8M is spent on its code alone.
+LimitMEMLOCK=768M
 ExecStart=synoik --session

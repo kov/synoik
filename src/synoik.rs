@@ -555,6 +555,9 @@ pub struct Synoik {
     /// ordinary picture, which must not cost a wake-up. See
     /// [`refresh_wallpaper_timer`](Synoik::refresh_wallpaper_timer).
     pub wallpaper_timer: Option<TimerToken>,
+    /// Keeps synoik's own memory out of swap; `None` headless, where the process is a test
+    /// binary's. See [`State::start_memory_locker`].
+    pub memory_locker: Option<crate::utils::memory::MemoryLocker>,
     pub data_device_state: DataDeviceState,
     /// Mime types whoever owns the clipboard right now is offering.
     ///
@@ -1897,6 +1900,22 @@ pub struct State {
 }
 
 impl State {
+    /// Start the [`MemoryLocker`](crate::utils::memory::MemoryLocker) and ask it for a scan now
+    /// and every [`LOCK_RESCAN`](crate::utils::memory::LOCK_RESCAN) after.
+    pub fn start_memory_locker(&mut self) {
+        use crate::utils::memory::{MemoryLocker, LOCK_RESCAN};
+
+        let Some(locker) = MemoryLocker::start() else {
+            return;
+        };
+        self.synoik.memory_locker = Some(locker);
+        self.synoik.timer_after(Duration::ZERO, |state| {
+            let locker = state.synoik.memory_locker.as_ref()?;
+            locker.rescan();
+            Some(LOCK_RESCAN)
+        });
+    }
+
     /// Let the renderer copy big shm commits into staging off the frame
     /// ([`VulkanRenderer::enable_async_shm_uploads`]), waking this loop when one finishes so it
     /// can land and the outputs repaint. The renderer must already exist; without this every shm
@@ -2169,6 +2188,9 @@ impl State {
             // Copy big shm commits off the frame (a HiDPI client's full-window repaint is tens of
             // MiB), landing them back here between frames.
             state.enable_async_shm_uploads();
+
+            // Keep synoik's own memory out of swap, rescanning for new mappings as they appear.
+            state.start_memory_locker();
 
             // Decode wallpapers on a worker thread (a 4K JPEG-XL decode would
             // otherwise stall the main loop, e.g. on a color-scheme flip), and
@@ -5803,6 +5825,11 @@ impl State {
                 // descent that `prepare_for_sleep` just started and never distinguish the two.
                 // `apply_shield_effects` ends in `sync_sleep_inhibitor`, which reads this.
                 if about_to_suspend {
+                    // Whatever mapped since the last scan is locked before the machine goes down,
+                    // not up to five seconds after it comes back.
+                    if let Some(locker) = &self.synoik.memory_locker {
+                        locker.rescan();
+                    }
                     if !self.synoik.shield_curtain_landed() {
                         self.synoik.arm_shield_present_wait();
                     }
@@ -8156,6 +8183,7 @@ impl Synoik {
             offline_update_tx: None,
             recording_tick: None,
             wallpaper_timer: None,
+            memory_locker: None,
             idle_inhibit_manager_state,
             data_device_state,
             clipboard_mime_types: Vec::new(),
