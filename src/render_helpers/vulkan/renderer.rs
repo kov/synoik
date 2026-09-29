@@ -3288,11 +3288,12 @@ impl VulkanRenderer {
     /// Queue `staged`'s copy into `tex`'s image for the next frame to record, holding `tex` alive
     /// until then and past the submit ([`PendingTextureUpload`]).
     ///
-    /// An upload already queued for the *same image* is **replaced**, not appended to. Every entry
-    /// in this queue covers its image's full extent (both producers, `stage_32bpp` and
-    /// `reupload_32bpp`, write `w*h*4` bytes), so an earlier copy to the same image is dead the
-    /// moment a later one is queued: recording it would only write pixels the next command
-    /// overwrites, and its staging is bytes we already paid to fill.
+    /// An upload already queued for the *same image* is **replaced**, not appended to. A
+    /// whole-extent copy (`stage_32bpp`, `reupload_32bpp`) makes an earlier copy to the same image
+    /// dead the moment it is queued: recording it would only write pixels the next command
+    /// overwrites, and its staging is bytes we already paid to fill. A partial copy (an shm
+    /// commit's damage) is never queued behind another — [`Self::reupload_shm_regions_with`]
+    /// declines and the caller uploads the whole buffer — so replacing stays sound for it too.
     ///
     /// That also bounds the queue. A frame that fails before it can drain leaves everything
     /// queued for the next one — correct for a transient failure, but the live wedge was a
@@ -3310,7 +3311,13 @@ impl VulkanRenderer {
             .iter_mut()
             .find(|queued| queued.tex.image() == image)
         {
-            Some(superseded) => *superseded = entry,
+            Some(superseded) => {
+                debug_assert!(
+                    entry.staged.is_full_extent(),
+                    "a partial copy would replace one it does not cover"
+                );
+                *superseded = entry;
+            }
             None => self.pending_texture_uploads.push(entry),
         }
     }
@@ -3737,6 +3744,39 @@ impl VulkanRenderer {
             .map_err(|e| VulkanError::Other(format!("staging shm re-upload: {e:#}")))?;
         self.queue_texture_upload(tex, staged);
         Ok(())
+    }
+
+    /// [`Self::reupload_shm_with`] for only the `regions` a commit damaged, which `fill` writes
+    /// tightly packed in order. Returns `Ok(false)`, staging nothing, when `tex` cannot take a
+    /// partial copy — the caller then re-uploads the whole buffer.
+    ///
+    /// A partial copy keeps the image's pixels outside `regions`, so it needs them to be there:
+    /// the image must have been uploaded already (a layout still `UNDEFINED` holds nothing), and
+    /// no copy may be queued for it yet. The second is what keeps the queue's superseding sound —
+    /// a whole-extent copy replaces whatever was queued for its image, so a partial one queued
+    /// behind another would either be replaced and lose its rectangles, or have to be recorded in
+    /// order and grow the queue by one entry per commit on a frame that cannot drain it. Commits
+    /// between two frames share one import anyway (smithay accumulates their damage), so this only
+    /// declines when a queue is left undrained across frames.
+    pub(super) fn reupload_shm_regions_with(
+        &mut self,
+        tex: &VkTexture,
+        regions: Vec<vk::Rect2D>,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<bool, VulkanError> {
+        let image = tex.image();
+        let queued = self
+            .pending_texture_uploads
+            .iter()
+            .any(|queued| queued.tex.image() == image);
+        if queued || tex.layout() != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return Ok(false);
+        }
+        let staged = tex
+            .stage_reupload_shm_regions_with(&mut self.staging_pool, regions, fill)
+            .map_err(|e| VulkanError::Other(format!("staging shm partial re-upload: {e:#}")))?;
+        self.queue_texture_upload(tex, staged);
+        Ok(true)
     }
 }
 

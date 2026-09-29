@@ -379,6 +379,27 @@ impl VkTexture {
         Ok(staged)
     }
 
+    /// [`Self::stage_reupload_shm_with`] for only the damaged `regions`, packed tightly in order by
+    /// `fill`. The image must already be `SHADER_READ_ONLY_OPTIMAL` and hold everything outside
+    /// them — see [`synoik_vk::texture::StagedTexture::reupload_32bpp_regions_with`], and
+    /// [`super::renderer::VulkanRenderer::reupload_shm_regions_with`] for who checks.
+    pub(super) fn stage_reupload_shm_regions_with(
+        &self,
+        pool: &mut synoik_vk::staging::StagingPool,
+        regions: Vec<vk::Rect2D>,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> anyhow::Result<synoik_vk::texture::StagedTexture> {
+        synoik_vk::texture::StagedTexture::reupload_32bpp_regions_with(
+            &self.0.gpu,
+            pool,
+            self.image(),
+            self.0.width,
+            self.0.height,
+            regions,
+            fill,
+        )
+    }
+
     /// Whether two handles refer to the *same* underlying texture (ref-counted inner). Used by the
     /// dmabuf-import-cache test to prove a cache hit returns the reused image, not a fresh import.
     #[cfg(test)]

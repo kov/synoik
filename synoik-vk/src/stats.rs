@@ -301,6 +301,7 @@ thread_local! {
     static FIRST_WAIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     static FIRST_SITE: Cell<Option<SubmitSite>> = const { Cell::new(None) };
     static UPLOADED_BYTES: Cell<u64> = const { Cell::new(0) };
+    static UNDAMAGED_BYTES: Cell<u64> = const { Cell::new(0) };
     /// Wall time inside GPU resource creation this frame, and how many creations. See [`creating`].
     static CREATE_NANOS: Cell<u64> = const { Cell::new(0) };
     static CREATES: Cell<u64> = const { Cell::new(0) };
@@ -449,6 +450,18 @@ pub fn take_uploaded_bytes() -> u64 {
 /// takes; unlike the timers this is never gated, since it costs an add.
 pub fn uploaded(bytes: u64) {
     add(&UPLOADED_BYTES, bytes);
+}
+
+/// Bytes of re-uploaded images that a partial upload left alone because the client did not damage
+/// them, since the last call, clearing the counter. Read beside [`take_uploaded_bytes`]: the pair
+/// says how much of a commit's buffer its damage spared.
+pub fn take_undamaged_bytes() -> u64 {
+    UNDAMAGED_BYTES.with(|c| c.replace(0))
+}
+
+/// Record `bytes` of an image a partial re-upload skipped as undamaged.
+pub fn undamaged(bytes: u64) {
+    add(&UNDAMAGED_BYTES, bytes);
 }
 
 /// Times the creation of a GPU resource — an image plus its memory, a descriptor set, a

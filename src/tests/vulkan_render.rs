@@ -6748,6 +6748,72 @@ fn vulkan_shm_cache_reimports_on_format_change() {
     );
 }
 
+/// A cache hit re-uploads only what the client damaged, as mutter does
+/// (`process_shm_buffer_damage`). Commit a buffer that is red **everywhere** but damage only a
+/// 50×50 corner, and one hanging off the far corner: the frame shows red in exactly those two
+/// squares and the old green everywhere else. Red over the whole window means the damage was
+/// ignored and the whole buffer copied; green over all of it means the copy never landed.
+///
+/// The frame log's counters are read too, because they are what the live seat reports: the
+/// upload is the damaged bytes, and the rest of the buffer is counted as spared.
+#[test]
+fn vulkan_shm_cache_uploads_only_the_damage() {
+    let Some((mut f, id, surface, output)) = shm_window_fixture() else {
+        return;
+    };
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let count = |pixels: &[u8], w: i32, h: i32, pred: &dyn Fn([u8; 4]) -> bool| {
+        (0..w * h)
+            .filter(|i| pred(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let window_px = count(&pixels, w, h, &is_green);
+    assert!(window_px > 0, "green window absent from the first frame");
+
+    // The loop's own turns import the commits below, so the counters start here.
+    synoik_vk::stats::take_uploaded_bytes();
+    synoik_vk::stats::take_undamaged_bytes();
+    let win = WIN as i32;
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer_damaging(win, win, [255, 0, 0, 255], (0, 0, 50, 50));
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer_damaging(win, win, [255, 0, 0, 255], (win - 50, win - 50, 500, 500));
+    window.commit();
+    f.double_roundtrip(id);
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let red = count(&pixels, w, h, &is_red);
+    let green = count(&pixels, w, h, &is_green);
+    assert_eq!(
+        red,
+        2 * 50 * 50,
+        "exactly the two damaged squares must refresh ({green} green px left)"
+    );
+    assert_eq!(
+        green,
+        window_px - red,
+        "everything outside the damage must keep the old pixels"
+    );
+
+    // Each commit's roundtrip ran a turn of its own, so each was imported apart: two partial
+    // uploads, each sparing all but its own square.
+    let spared = synoik_vk::stats::take_undamaged_bytes();
+    assert_eq!(
+        spared,
+        (2 * (win * win - 50 * 50) * 4) as u64,
+        "the frame log must count what the damage spared"
+    );
+    assert!(
+        synoik_vk::stats::take_uploaded_bytes() >= (2 * 50 * 50 * 4) as u64,
+        "the damaged squares are uploaded"
+    );
+}
+
 /// Compositing for a screencast must work on the owned Vulkan renderer.
 ///
 /// Screencast used to render through the co-resident GLES renderer even on a Vulkan session (the

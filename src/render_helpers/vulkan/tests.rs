@@ -3388,6 +3388,126 @@ fn vulkan_shm_reupload_overwrites_in_place() {
     );
 }
 
+/// Sample `tex` 1:1 into a fresh `W`×`H` offscreen and read it back tight, `Abgr8888`.
+fn sample_texture_1to1(vk: &mut VulkanRenderer, tex: &VkTexture) -> Vec<u8> {
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let src = Rectangle::<f64, BufferCoord>::from_size(Size::from((W as f64, H as f64)));
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        frame
+            .render_texture_from_to(tex, src, dst, &[dst], &[], Transform::Normal, 1.0)
+            .expect("sample texture");
+        let _sync = frame.finish().expect("finish");
+    }
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    vk.map_texture(&mapping).expect("map_texture").to_vec()
+}
+
+/// A damage-only shm re-upload copies its rectangles and **keeps every other pixel**: import red,
+/// let a frame land it, then re-upload green over two disjoint rectangles and read back green in
+/// both and red everywhere else. One that ignored its offsets would put the green in the corner.
+///
+/// It **cannot** catch a partial copy that transitions from `UNDEFINED`: that is legal, silent
+/// under the validation layer, and on venus the old pixels happen to survive it. The spec lets a
+/// driver discard them, so `record_region_copies_at` transitions from the layout the image is
+/// actually in, and only review holds it there.
+///
+/// It also pins when a partial copy must decline. Straight after the import, the import's own
+/// whole-extent copy is still queued, and a partial one queued behind it would either be replaced
+/// by the queue's superseding or have to be ordered after it: the call has to say no, so the
+/// caller uploads the whole buffer instead.
+#[test]
+fn vulkan_shm_partial_reupload_keeps_the_undamaged_pixels() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_shm_partial_reupload_keeps_the_undamaged_pixels: ({e})");
+            return;
+        }
+    };
+
+    const RED: [u8; 4] = [220, 30, 30, 255];
+    const GREEN: [u8; 4] = [30, 200, 60, 255];
+    let rect = |x: i32, y: i32, w: u32, h: u32| ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x, y },
+        extent: ash::vk::Extent2D {
+            width: w,
+            height: h,
+        },
+    };
+    let regions = vec![rect(4, 8, 16, 12), rect(40, 30, 20, 24)];
+    let packed_len: usize = regions
+        .iter()
+        .map(|r| (r.extent.width * r.extent.height * 4) as usize)
+        .sum();
+    let green: Vec<u8> = GREEN.iter().copied().cycle().take(packed_len).collect();
+
+    let tex = vk
+        .import_memory(
+            &solid_texels(RED),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import red source");
+    let staged = vk
+        .reupload_shm_regions_with(&tex, regions.clone(), |dst| dst.copy_from_slice(&green))
+        .expect("partial re-upload behind a queued import");
+    assert!(
+        !staged,
+        "a partial copy must decline while the image's whole-extent copy is still queued"
+    );
+
+    // A frame drains the import; now the image holds red and the partial copy can go.
+    let before = sample_texture_1to1(&mut vk, &tex);
+    assert!(close_px(px(&before, W / 2, H / 2), RED, 3));
+    let staged = vk
+        .reupload_shm_regions_with(&tex, regions.clone(), |dst| dst.copy_from_slice(&green))
+        .expect("partial re-upload");
+    assert!(
+        staged,
+        "a landed image with nothing queued takes a partial copy"
+    );
+
+    let pixels = sample_texture_1to1(&mut vk, &tex);
+    let inside = |x: i32, y: i32| {
+        regions.iter().any(|r| {
+            x >= r.offset.x
+                && y >= r.offset.y
+                && x < r.offset.x + r.extent.width as i32
+                && y < r.offset.y + r.extent.height as i32
+        })
+    };
+    let mut wrong = Vec::new();
+    for y in 0..H {
+        for x in 0..W {
+            let want = if inside(x, y) { GREEN } else { RED };
+            let got = px(&pixels, x, y);
+            if !close_px(got, want, 3) {
+                wrong.push((x, y, got, want));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} pixels wrong after a partial re-upload, first {:?}",
+        wrong.len(),
+        wrong.first()
+    );
+}
+
 /// Several commits of the same surface between two frames must cost **one** upload, not one per
 /// commit: every entry in the queue covers its image's full extent, so a copy that is followed by
 /// another copy into the same image is dead before it is ever recorded.

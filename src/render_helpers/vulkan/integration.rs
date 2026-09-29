@@ -78,17 +78,18 @@ impl ImportMemWl for VulkanRenderer {
         &mut self,
         buffer: &WlBuffer,
         surface: Option<&SurfaceData>,
-        _damage: &[Rectangle<i32, BufferCoord>],
+        damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<VkTexture, VulkanError> {
         // Read the shm pool, validate its geometry, and either refresh the cached image in place
         // or import a new one. The rows are written **into** their destination — the staging
         // mapping on the cache-hit path — rather than repacked into an intermediate `Vec` first:
         // a HiDPI client shipping tens of MiB per commit paid for that `Vec` twice over, once to
         // allocate and fill it and once to copy it in, both into never-touched pages, on the
-        // compositor thread, every frame. (`_damage` is still ignored — damage-based partial
-        // upload is a bandwidth follow-up. The per-surface cache below is the win that matters:
-        // it reuses the `VkImage` and its staging so an actively-updating client allocates
-        // nothing per commit.)
+        // compositor thread, every frame. The per-surface cache below reuses the `VkImage` and
+        // its staging so an actively-updating client allocates nothing per commit, and on a hit
+        // only the rectangles the client damaged are copied, as mutter does
+        // (`process_shm_buffer_damage`): the damage is what changed since the commit this image
+        // last took, which is exactly what the cached image is missing.
         //
         // Everything that touches the mapped pool happens inside `with_buffer_contents`, which is
         // the only place smithay guarantees it is valid and SIGBUS-guarded.
@@ -133,7 +134,20 @@ impl ImportMemWl for VulkanRenderer {
             // differ in the view's alpha swizzle, so a same-size fourcc switch must re-import.
             if let Some(tex) = cached {
                 if tex.size() == size && tex.format() == Some(fourcc) {
-                    self.reupload_shm_with(&tex, |dst| rows.write_into(dst))?;
+                    match damage_regions(damage, size) {
+                        // Damage says nothing changed; the image already holds these pixels.
+                        Some(regions) if regions.is_empty() => {}
+                        Some(regions) => {
+                            let partial =
+                                self.reupload_shm_regions_with(&tex, regions.clone(), |dst| {
+                                    rows.write_regions_into(&regions, dst)
+                                })?;
+                            if !partial {
+                                self.reupload_shm_with(&tex, |dst| rows.write_into(dst))?;
+                            }
+                        }
+                        None => self.reupload_shm_with(&tex, |dst| rows.write_into(dst))?,
+                    }
                     return Ok(Imported::Reused(tex));
                 }
             }
@@ -163,10 +177,62 @@ impl ImportMemWl for VulkanRenderer {
     }
 }
 
-/// Copy the `width`×`height` 32-bpp region at `offset` (rows `stride` bytes apart) out of an shm
-/// `pool` into a tight `width*height*4` buffer. Every access is bounds-checked against `pool` with
-/// checked arithmetic — a malicious or buggy client controls these numbers. Pure and slice-based so
-/// the stride/offset/bounds logic is unit-testable without a live wl_shm buffer.
+/// Past this many damage rectangles a commit's upload copies their bounding box instead: a region
+/// is a `VkBufferImageCopy` and a row loop each, and a client that damages a scatter of glyphs
+/// should not turn into hundreds of them. Mutter has no cap; it has no per-region command either.
+const MAX_DAMAGE_REGIONS: usize = 32;
+
+/// The rectangles of a `size` buffer an shm re-upload has to copy for `damage`, or `None` for the
+/// whole buffer.
+///
+/// The damage is the client's, so every rectangle is clamped to the buffer and the empty ones
+/// dropped — which can leave none at all: a commit that damaged nothing needs no upload. A
+/// rectangle covering the whole buffer means a whole upload, which also skips the partial copy's
+/// layout round trip. Overlapping rectangles are copied twice rather than merged; the bytes are
+/// the same either way.
+fn damage_regions(
+    damage: &[Rectangle<i32, BufferCoord>],
+    size: Size<i32, BufferCoord>,
+) -> Option<Vec<ash::vk::Rect2D>> {
+    let bounds = Rectangle::from_size(size);
+    let clamped: Vec<Rectangle<i32, BufferCoord>> = damage
+        .iter()
+        .filter_map(|rect| rect.intersection(bounds))
+        .filter(|rect| !rect.is_empty())
+        .collect();
+    if clamped.contains(&bounds) {
+        return None;
+    }
+    let clamped = if clamped.len() > MAX_DAMAGE_REGIONS {
+        let bbox = clamped
+            .iter()
+            .copied()
+            .reduce(|a, b| a.merge(b))
+            .expect("more than the cap is not empty");
+        if bbox == bounds {
+            return None;
+        }
+        vec![bbox]
+    } else {
+        clamped
+    };
+    Some(
+        clamped
+            .into_iter()
+            .map(|rect| ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: rect.loc.x,
+                    y: rect.loc.y,
+                },
+                extent: ash::vk::Extent2D {
+                    width: rect.size.w as u32,
+                    height: rect.size.h as u32,
+                },
+            })
+            .collect(),
+    )
+}
+
 /// A validated view of an shm pool's pixel rows: where each row starts and how many bytes it is.
 ///
 /// Holds the geometry checks in one place so the two consumers — writing straight into a staging
@@ -240,6 +306,25 @@ impl<'a> ShmRows<'a> {
         }
     }
 
+    /// Write each of `regions` tightly packed into `dst`, one after another in order — the layout
+    /// a partial re-upload's copies read ([`synoik_vk::texture::StagedTexture::record`]). `dst`
+    /// must be exactly their total size, and every region inside the buffer, which
+    /// [`damage_regions`] guarantees by clamping; a row inside the buffer is inside the pool, so
+    /// this cannot read out of bounds.
+    fn write_regions_into(&self, regions: &[ash::vk::Rect2D], dst: &mut [u8]) {
+        let mut at = 0;
+        for r in regions {
+            let (x, y) = (r.offset.x as usize, r.offset.y as usize);
+            let bytes = r.extent.width as usize * 4;
+            for row in y..y + r.extent.height as usize {
+                let start = self.offset + row * self.stride + x * 4;
+                dst[at..at + bytes].copy_from_slice(&self.pool[start..start + bytes]);
+                at += bytes;
+            }
+        }
+        debug_assert_eq!(at, dst.len(), "regions must fill the staging exactly");
+    }
+
     /// The rows as a fresh tight buffer, for the import path — which allocates an image anyway, so
     /// there is nothing yet to write into.
     fn to_packed(&self) -> Vec<u8> {
@@ -269,7 +354,9 @@ impl ImportDmaWl for VulkanRenderer {}
 
 #[cfg(test)]
 mod tests {
-    use super::ShmRows;
+    use smithay::utils::{Buffer as BufferCoord, Rectangle, Size};
+
+    use super::{damage_regions, ShmRows, MAX_DAMAGE_REGIONS};
 
     /// `to_packed`, for the assertions below. The two producers share `write_into`, so exercising
     /// either exercises the packing; this is simply the one that returns something to compare.
@@ -355,5 +442,88 @@ mod tests {
             dst, tight,
             "every byte must be written, not just the changed ones"
         );
+    }
+
+    fn damage(rects: &[(i32, i32, i32, i32)]) -> Vec<Rectangle<i32, BufferCoord>> {
+        rects
+            .iter()
+            .map(|&(x, y, w, h)| Rectangle::new((x, y).into(), (w, h).into()))
+            .collect()
+    }
+
+    fn as_tuples(regions: &[ash::vk::Rect2D]) -> Vec<(i32, i32, u32, u32)> {
+        regions
+            .iter()
+            .map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+            .collect()
+    }
+
+    /// The damage is the client's to get wrong: a rectangle hanging off the buffer is clamped to
+    /// it, one wholly outside it (or empty) is dropped — so a commit can end up needing no upload
+    /// at all — and one covering the whole buffer asks for a whole upload.
+    #[test]
+    fn damage_regions_clamps_the_clients_rectangles() {
+        let size = Size::<i32, BufferCoord>::from((100, 80));
+
+        let regions = damage_regions(&damage(&[(90, 70, 50, 50), (-10, 5, 20, 10)]), size);
+        assert_eq!(
+            as_tuples(&regions.expect("partial")),
+            vec![(90, 70, 10, 10), (0, 5, 10, 10)]
+        );
+
+        let regions = damage_regions(&damage(&[(200, 200, 10, 10), (5, 5, 0, 10)]), size);
+        assert_eq!(regions.map(|r| r.len()), Some(0), "nothing left to copy");
+
+        assert!(damage_regions(&damage(&[(0, 0, i32::MAX, i32::MAX)]), size).is_none());
+        assert!(damage_regions(&damage(&[(10, 10, 5, 5), (-5, -5, 200, 200)]), size).is_none());
+    }
+
+    /// Past the cap a scatter of damage becomes its bounding box, and a bounding box that is the
+    /// whole buffer is a whole upload.
+    #[test]
+    fn damage_regions_caps_a_scatter_at_its_bounding_box() {
+        let size = Size::<i32, BufferCoord>::from((1000, 1000));
+        let scatter: Vec<_> = (0..=MAX_DAMAGE_REGIONS as i32)
+            .map(|i| (10 + i * 10, 20 + i * 5, 4, 4))
+            .collect();
+        let regions = damage_regions(&damage(&scatter), size).expect("partial");
+        let last = MAX_DAMAGE_REGIONS as i32;
+        assert_eq!(
+            as_tuples(&regions),
+            vec![(10, 20, (last * 10 + 4) as u32, (last * 5 + 4) as u32)]
+        );
+
+        let mut corners = scatter.clone();
+        corners.push((0, 0, 1, 1));
+        corners.push((999, 999, 1, 1));
+        assert!(damage_regions(&damage(&corners), size).is_none());
+    }
+
+    /// Each region's rows land tightly packed and in order, from the right place in a strided
+    /// pool — over a destination pre-filled with a value the source never has, so a byte left
+    /// unwritten shows.
+    #[test]
+    fn write_regions_into_packs_each_region_in_order() {
+        // 4x3 pixels, 4 bytes of row padding; pixel (x, y) is [10*y + x, 0, 0, 255].
+        let (w, h, stride) = (4usize, 3usize, 20usize);
+        let mut pool = vec![0xEE; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                pool[y * stride + x * 4..y * stride + x * 4 + 4].copy_from_slice(&[
+                    (10 * y + x) as u8,
+                    0,
+                    0,
+                    255,
+                ]);
+            }
+        }
+        let rows = ShmRows::new(&pool, 0, stride as i32, w as i32, h as i32).unwrap();
+        let regions =
+            damage_regions(&damage(&[(1, 1, 2, 2), (3, 0, 1, 1)]), Size::from((4, 3))).unwrap();
+        let mut dst = vec![0xCD; (2 * 2 + 1) * 4];
+        rows.write_regions_into(&regions, &mut dst);
+        let firsts: Vec<u8> = dst.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        assert_eq!(firsts, vec![11, 12, 21, 22, 3]);
+        assert!(dst.as_chunks::<4>().0.iter().all(|p| p[1..] == [0, 0, 255]));
     }
 }

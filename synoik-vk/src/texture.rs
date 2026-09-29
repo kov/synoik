@@ -196,6 +196,10 @@ pub struct StagedTexture {
     image: vk::Image,
     width: u32,
     height: u32,
+    /// `None` for a copy of the whole extent; otherwise the rectangles this copy refreshes, their
+    /// pixels packed tightly one after another in the staging. See
+    /// [`Self::reupload_32bpp_regions_with`].
+    regions: Option<Vec<vk::Rect2D>>,
 }
 
 /// Where a staged upload's pixels sit, and what keeps them there until the copy has been
@@ -236,16 +240,33 @@ impl StagedTexture {
     pub fn record(&self, cbuf: vk::CommandBuffer) {
         let (buffer, offset) = self.source.buffer_and_offset();
         unsafe {
-            record_upload_copy_at(
-                self.source.device(),
-                cbuf,
-                self.image,
-                buffer,
-                offset,
-                self.width,
-                self.height,
-            );
+            match &self.regions {
+                None => record_upload_copy_at(
+                    self.source.device(),
+                    cbuf,
+                    self.image,
+                    buffer,
+                    offset,
+                    self.width,
+                    self.height,
+                ),
+                Some(regions) => record_region_copies_at(
+                    self.source.device(),
+                    cbuf,
+                    self.image,
+                    buffer,
+                    offset,
+                    regions,
+                ),
+            }
         }
+    }
+
+    /// Whether this copy writes the image's whole extent — and so makes any earlier copy into the
+    /// same image dead. A partial one does not: the pixels outside its rectangles are the earlier
+    /// copy's.
+    pub fn is_full_extent(&self) -> bool {
+        self.regions.is_none()
     }
 }
 
@@ -346,6 +367,55 @@ impl StagedTexture {
             image,
             width,
             height,
+            regions: None,
+        })
+    }
+
+    /// [`Self::reupload_32bpp_with`] for only the `regions` of the image that changed — an shm
+    /// commit's damage, which is what mutter uploads (`process_shm_buffer_damage`) and usually a
+    /// small fraction of a window.
+    ///
+    /// `fill` is handed `Σ w*h*4` staging bytes and must write each region's pixels tightly packed,
+    /// in `regions` order, every byte and no reads. Every region must be non-empty and inside the
+    /// `width`×`height` extent.
+    ///
+    /// The image must already hold the pixels outside `regions` and be `SHADER_READ_ONLY_OPTIMAL`
+    /// when the copy is recorded: unlike a whole-extent copy, which transitions from `UNDEFINED`
+    /// because it overwrites everything, this one has to keep what it does not write. No
+    /// validation layer catches a partial copy from `UNDEFINED` — it is legal, and discards the
+    /// rest of the image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reupload_32bpp_regions_with(
+        gpu: &Arc<Gpu>,
+        pool: &mut StagingPool,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        regions: Vec<vk::Rect2D>,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Self> {
+        anyhow::ensure!(!regions.is_empty(), "a partial re-upload of no regions");
+        let mut size: vk::DeviceSize = 0;
+        for r in &regions {
+            let inside = r.offset.x >= 0
+                && r.offset.y >= 0
+                && r.extent.width > 0
+                && r.extent.height > 0
+                && r.offset.x as u32 + r.extent.width <= width
+                && r.offset.y as u32 + r.extent.height <= height;
+            anyhow::ensure!(inside, "re-upload region {r:?} outside {width}x{height}");
+            size += (r.extent.width as vk::DeviceSize) * (r.extent.height as vk::DeviceSize) * 4;
+        }
+        let full = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+        crate::stats::uploaded(size);
+        crate::stats::undamaged(full.saturating_sub(size));
+        let (chunk, offset) = pool.stage_with(gpu, size, fill)?;
+        Ok(StagedTexture {
+            source: StagedSource::Pool(chunk, offset),
+            image,
+            width,
+            height,
+            regions: Some(regions),
         })
     }
 }
@@ -416,6 +486,7 @@ impl Texture {
             image: texture.image,
             width,
             height,
+            regions: None,
         };
         Ok((texture, staged))
     }
@@ -1217,6 +1288,7 @@ impl Texture {
             image: texture.image,
             width,
             height,
+            regions: None,
         };
         Ok((texture, staged))
     }
@@ -1960,6 +2032,75 @@ unsafe fn record_upload_copy_at(
         image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &[region],
+    );
+    transition(
+        device,
+        cbuf,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+    );
+}
+
+/// Record a copy of `regions` into an image that is already `SHADER_READ_ONLY_OPTIMAL` and keeps
+/// its pixels outside them: barrier to `TRANSFER_DST` from the shader reads that may still be
+/// sampling it, one `VkBufferImageCopy` per region reading tightly packed rows from
+/// `buffer_offset` on, barrier back. See [`StagedTexture::reupload_32bpp_regions_with`].
+unsafe fn record_region_copies_at(
+    device: &ash::Device,
+    cbuf: vk::CommandBuffer,
+    image: vk::Image,
+    staging: vk::Buffer,
+    buffer_offset: vk::DeviceSize,
+    regions: &[vk::Rect2D],
+) {
+    transition(
+        device,
+        cbuf,
+        image,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::SHADER_READ,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    let mut offset = buffer_offset;
+    let copies: Vec<vk::BufferImageCopy> = regions
+        .iter()
+        .map(|r| {
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D {
+                    x: r.offset.x,
+                    y: r.offset.y,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: r.extent.width,
+                    height: r.extent.height,
+                    depth: 1,
+                });
+            offset += (r.extent.width as vk::DeviceSize) * (r.extent.height as vk::DeviceSize) * 4;
+            copy
+        })
+        .collect();
+    device.cmd_copy_buffer_to_image(
+        cbuf,
+        staging,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &copies,
     );
     transition(
         device,

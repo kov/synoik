@@ -1284,6 +1284,10 @@ struct Totals {
     /// Bytes staged into GPU images. Separates a frame that made many small round trips from one
     /// that moved a wallpaper — different costs, different fixes.
     uploaded: u64,
+    /// Bytes of re-uploaded images left alone because the client did not damage them. Beside
+    /// `uploaded` it says how much damage-only uploading saved, and a commit that comes in with
+    /// none spared is one that damaged its whole buffer.
+    undamaged: u64,
     /// GPU resources created, and the wall time it took. Not a submit and not free: on a
     /// virtualized driver a `vkCreateImage` round-trips to the host whenever venus misses its
     /// image-requirements cache, so this is collect time that the submit breakdown structurally
@@ -2868,6 +2872,7 @@ impl FrameLog {
             sites: synoik_vk::stats::take_sites(),
             first_wait: synoik_vk::stats::take_first_wait(),
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
+            undamaged: synoik_vk::stats::take_undamaged_bytes(),
             creates: synoik_vk::stats::take_creates(),
             host_calls: synoik_vk::stats::take_host_calls(),
             render_passes: synoik_vk::stats::take_render_passes(),
@@ -3191,10 +3196,17 @@ impl FrameLog {
             if totals.uploaded > 0 {
                 let _ = write!(
                     line,
-                    ", {:.1}MiB uploaded in {}",
+                    ", {:.1}MiB uploaded",
                     totals.uploaded as f64 / (1 << 20) as f64,
-                    ms(totals.staging_write)
                 );
+                if totals.undamaged > 0 {
+                    let _ = write!(
+                        line,
+                        " ({:.1}MiB undamaged)",
+                        totals.undamaged as f64 / (1 << 20) as f64,
+                    );
+                }
+                let _ = write!(line, " in {}", ms(totals.staging_write));
             }
             if totals.creates.0 > 0 {
                 let _ = write!(
@@ -4438,6 +4450,20 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("3.0MiB uploaded in 1.20ms"), "{line}");
+        // A damage-only re-upload says what its damage spared, so a whole-buffer repaint reads as
+        // one rather than hiding behind a small total.
+        let partial = Totals {
+            submits: 1,
+            uploaded: 1 << 20,
+            undamaged: 38 << 20,
+            staging_write: Duration::from_micros(300),
+            ..Totals::default()
+        };
+        let partial = FrameLog::format_frame(&frame, Duration::from_millis(17), &partial, None);
+        assert!(
+            partial.contains("1.0MiB uploaded (38.0MiB undamaged) in 0.30ms"),
+            "{partial}"
+        );
         // Resource creation is neither a submit nor a bake, so it has to say so itself or it is
         // invisible — which is exactly how ~50ms hid on the seat's worst frames.
         assert!(line.contains("7 created in 4.30ms"), "{line}");
