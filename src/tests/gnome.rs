@@ -16932,6 +16932,47 @@ fn dash_tile_center(
         .expect("tile index in range")
 }
 
+/// The overview's dash slides up from below the bottom edge as the overview opens, and back
+/// down as it closes — the strip's slide from the top, mirrored (divergence: gnome-shell fades
+/// it, see `Monitor::dash_slide_offset`). The slide lives in the layout box, so the dash that
+/// is hit-tested is the dash that is drawn: `dash_area` must agree with it mid-slide.
+#[test]
+fn overview_dash_slides_in_from_the_bottom() {
+    let (mut f, _) = dash_fixture(&["org.gnome.Nautilus.desktop"]);
+    let output = f.synoik_output(1);
+    let step = |f: &mut Fixture| {
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
+    };
+
+    step(&mut f);
+    let opening = overview_controls(&mut f).dash;
+    assert_eq!(f.synoik().dash_area(&output), Some(opening));
+
+    f.settle();
+    let rest = overview_controls(&mut f).dash;
+    assert_eq!(
+        rest.loc.y,
+        1080. - rest.size.h,
+        "at rest the dash sits on the bottom edge"
+    );
+    assert!(
+        rest.loc.y < opening.loc.y && opening.loc.y < 1080.,
+        "mid-open the dash is part-way up: rest={rest:?} opening={opening:?}"
+    );
+    assert_eq!(opening.size, rest.size, "it slides, it does not resize");
+
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    step(&mut f);
+    let closing = overview_controls(&mut f).dash;
+    assert!(
+        rest.loc.y < closing.loc.y && closing.loc.y < 1080.,
+        "mid-close the dash is part-way down: rest={rest:?} closing={closing:?}"
+    );
+}
+
 /// `org.gnome.ScreenSaver.Lock` puts the shield down, and `SetActive(false)` raises it.
 ///
 /// Driven through `State::on_screen_saver_msg` — the same entry point the bus task calls — rather
@@ -22584,6 +22625,8 @@ fn overview_dash_shows_running_apps_after_a_separator() {
         .set_favorites(vec!["fav.desktop".to_owned()]);
     f.synoik().sync_dash_favorites();
     f.synoik_state().do_action(Action::OpenOverview, false);
+    // The dash slides in with the overview; aim at it once it has landed.
+    f.settle();
 
     let area = overview_controls(&mut f).dash;
     assert!(

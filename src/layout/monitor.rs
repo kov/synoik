@@ -2750,7 +2750,25 @@ impl<W: LayoutElement> Monitor<W> {
         // the picker the chrome keeps its picker layout and the *zoom* blends it
         // toward the desktop, which is how gnome-shell's HIDDEN box relates to the
         // WINDOW_PICKER one (`overviewControls.js:207-216`).
-        self.controls_layout_at(overview_layout::state::WINDOW_PICKER + self.app_grid_leg())
+        let mut layout =
+            self.controls_layout_at(overview_layout::state::WINDOW_PICKER + self.app_grid_leg());
+        layout.dash.loc.y += self.dash_slide_offset(layout.dash);
+        layout
+    }
+
+    /// How far below its resting place the overview transition holds the dash — the strip's
+    /// slide from the top ([`Self::thumbnail_slide_offset`]), mirrored at the bottom edge.
+    ///
+    /// **Divergence.** gnome-shell fades the dash with the rest of the overview; it only rises
+    /// from the bottom in the session-startup animation (`translation_y = dash.height +
+    /// margin_bottom`, `overviewControls.js:845-853`), which is the motion borrowed here. Applied
+    /// to the layout's box rather than at the draw, so every hit-test, hover and menu anchor
+    /// follows the dash that is on screen.
+    fn dash_slide_offset(&self, dash: Rectangle<f64, Logical>) -> f64 {
+        let Some(progress) = self.expose_progress() else {
+            return 0.;
+        };
+        (self.view_size.h - dash.loc.y) * (1. - progress)
     }
 
     /// The `WINDOW_PICKER` → `APP_GRID` leg of [`Self::overview_state`]: 0 at the picker,

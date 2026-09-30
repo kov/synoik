@@ -290,7 +290,9 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
 - **S3 — Dash chrome (favorites) + `widget::AppIcon` + click-to-launch. ✅ DONE.** `src/ui/dash.rs`:
   the `Dash` widget (rounded `dash-background` pill bottom-center, favorites app-well of `widget::AppIcon`
   tiles, trailing show-apps button), `layout`/`hit_test` sharing one `DashLayout`, `render` baking the
-  pill (hover fill) with full-color icons on top, faded by `expose_progress`. Click intercept in
+  pill (hover fill) with full-color icons on top. **Divergence:** it slides up from below the bottom
+  edge on `expose_progress` (`Monitor::dash_slide_offset`, mirroring the strip's slide from the top)
+  rather than fading with the overview; the offset is in the layout box, so hit-tests follow it. Click intercept in
   `on_pointer_button` (inside the gnome-mode block): a favorite launches (`LaunchMode::Activate` — all
   apps are stopped in S3) + closes the overview; show-apps/background consumed inertly; every button
   consumed on a hit so nothing falls through to the overview pan grabs. Gated to when the dash is

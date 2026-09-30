@@ -12167,7 +12167,7 @@ impl Synoik {
                 }
             }
 
-            // The overview dash (favorites) fades in with the overview — above the
+            // The overview dash (favorites) slides up with the overview — above the
             // zoomed workspaces (pushed later, below), below the panel/popover/banner.
             if let Some((progress, controls)) = self
                 .layout
@@ -12203,7 +12203,8 @@ impl Synoik {
                     &self.icon_cache,
                     output,
                     controls.dash,
-                    progress,
+                    // Opaque all the way: it slides in rather than fading, like the strip.
+                    1.,
                     false,
                     self.appearance(),
                     self.gnome_settings.accent_color,
