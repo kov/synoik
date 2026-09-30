@@ -1099,6 +1099,23 @@ pub enum Action {
     /// session: a re-login changes what else is running, and that difference is larger than the
     /// effect.
     DebugToggleDeadlineDispatch {},
+    /// Toggle the frame stamp: the frame log's sequence number drawn into the four corners of
+    /// every screen frame, so a host-side recording can be matched to the frame log frame by
+    /// frame.
+    ///
+    /// Turns the frame log's ring on first if the session started without it — a stamp is only
+    /// worth reading against a banked record. Same as `SYNOIK_FRAME_LOG=…,stamp`.
+    DebugToggleFrameStamp {},
+    /// Toggle the draw ledger: every draw of the last `frames` frames — target, render pass,
+    /// material, where — written beside the next frame-log dump.
+    ///
+    /// Turns the frame log's ring on first if the session started without it. Turning it off drops
+    /// what it held. Same as `SYNOIK_FRAME_LOG=…,ledger[=frames]`.
+    DebugToggleDrawLedger {
+        /// How many frames to keep, shared by all outputs. Defaults to 2400.
+        #[cfg_attr(feature = "clap", arg(long))]
+        frames: Option<usize>,
+    },
     /// Set the slack added on top of the measured render time when picking a dispatch deadline.
     ///
     /// This is the dial the 0.33%-vs-0.09% dropped-frame result hangs on: 1 ms is mutter's

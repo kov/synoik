@@ -132,6 +132,8 @@ pub enum Action {
     DebugDumpScanout,
     DebugDumpThumbnailGeometry,
     DebugToggleDeadlineDispatch,
+    DebugToggleFrameStamp,
+    DebugToggleDrawLedger(Option<usize>),
     DebugSetRenderTimeMargin(f64),
     DebugSetSceneBreakdown(synoik_ipc::SceneBreakdown),
     /// Percentage, UPower state spelling, UPower warning-level spelling.
@@ -760,6 +762,10 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::DebugDumpScanout {} => Self::DebugDumpScanout,
             synoik_ipc::Action::DebugDumpThumbnailGeometry {} => Self::DebugDumpThumbnailGeometry,
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
+            synoik_ipc::Action::DebugToggleFrameStamp {} => Self::DebugToggleFrameStamp,
+            synoik_ipc::Action::DebugToggleDrawLedger { frames } => {
+                Self::DebugToggleDrawLedger(frames)
+            }
             synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {
                 Self::DebugSetRenderTimeMargin(millis)
             }

@@ -15662,3 +15662,61 @@ fn a_redraw_banks_its_draws_under_its_frame_number() {
         "the stamp is among the frame's draws: {events:?}"
     );
 }
+
+/// Both instruments switch on at runtime in a session that started with the frame log off — the
+/// action turns the ring on for them — and off again.
+#[test]
+fn the_frame_stamp_and_the_draw_ledger_toggle_at_runtime() {
+    use crate::draw_ledger;
+    use crate::render_helpers::frame_stamp;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping the_frame_stamp_and_the_draw_ledger_toggle_at_runtime: no Vulkan");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    f.settle();
+    let output = f.synoik_output(1);
+    assert!(
+        !f.synoik().frame_log.is_enabled(),
+        "the session starts with the log off"
+    );
+
+    let stamp = |f: &mut Fixture| {
+        f.synoik().queue_redraw_all();
+        f.turn();
+        let (screen, w, _) = crate::tests::fixture::screen_pixels(f, &output);
+        frame_stamp::decode(&screen, w, (0, 0))
+    };
+    assert_eq!(stamp(&mut f), None);
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleFrameStamp, false);
+    f.synoik_state()
+        .do_action(Action::DebugToggleDrawLedger(Some(4)), false);
+    let seq = stamp(&mut f).expect("the stamp is on");
+    assert!(
+        draw_ledger::events_of(seq).is_some(),
+        "the ledger banked the stamped frame: {:?}",
+        draw_ledger::seqs()
+    );
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleFrameStamp, false);
+    f.synoik_state()
+        .do_action(Action::DebugToggleDrawLedger(None), false);
+    assert!(!draw_ledger::is_enabled(), "the ledger is off again");
+    // The stamp's last pixels stay in the slot until something repaints under them; a full
+    // redraw of every slot is what "off" has to look like.
+    for _ in 0..4 {
+        f.synoik().queue_redraw_all();
+        f.turn();
+    }
+    assert_eq!(stamp(&mut f), None, "the stamp is off again");
+}

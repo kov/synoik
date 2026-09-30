@@ -28,6 +28,10 @@
 //! | `ledger[=frames]` | keep every draw of the last `frames` frames (default 2400) — target, render pass, material, where — and write it beside a `SIGUSR1` dump (see [`crate::draw_ledger`]); implies `ring` |
 //! | `stamp` | draw each frame's number into the output's four corners, to match a host-side recording to the ring (see [`crate::render_helpers::frame_stamp`]); implies `ring` |
 //!
+//! `stamp` and `ledger` also switch at runtime — `synoik msg action debug-toggle-frame-stamp` and
+//! `debug-toggle-draw-ledger [--frames N]` — turning the ring on first if the session started
+//! without it.
+//!
 //! So `SYNOIK_FRAME_LOG=1` for everyday use, `SYNOIK_FRAME_LOG=8,summary=5,gpu` to
 //! chase something specific, `SYNOIK_FRAME_LOG=all` to capture a few seconds in
 //! full, and **`SYNOIK_FRAME_LOG=ring,gpu,autodump`** to leave running on a session
@@ -2791,6 +2795,44 @@ impl FrameLog {
 
     pub fn is_enabled(&self) -> bool {
         self.settings.is_some()
+    }
+
+    /// Turn the frame log on with its ring, for a runtime switch that needs a banked record to be
+    /// read against. A no-op when the log is already on — whatever the session asked for stays.
+    fn ensure_ring(&mut self) -> &mut Settings {
+        if self.settings.is_none() {
+            ENABLED.store(true, Ordering::Relaxed);
+            synoik_vk::stats::set_enabled(true);
+            tracing::info!("frame log turned on at runtime, ring of {DEFAULT_RING} records");
+        }
+        let settings = self.settings.get_or_insert_with(Settings::default);
+        if settings.ring.is_none() {
+            settings.ring = Some(DEFAULT_RING);
+            // Once, here, rather than growing by doubling inside `end()` on the frame path.
+            self.ring.reserve(DEFAULT_RING);
+        }
+        settings
+    }
+
+    /// Flip the frame stamp at runtime; returns whether it is now on. See
+    /// [`crate::render_helpers::frame_stamp`].
+    pub fn toggle_stamp(&mut self) -> bool {
+        let settings = self.ensure_ring();
+        settings.stamp = !settings.stamp;
+        settings.stamp
+    }
+
+    /// Flip the draw ledger at runtime, keeping `frames` frames (default
+    /// [`crate::draw_ledger::DEFAULT_FRAMES`]); returns the capacity now in effect, `None` = off.
+    pub fn toggle_ledger(&mut self, frames: Option<usize>) -> Option<usize> {
+        let settings = self.ensure_ring();
+        settings.ledger = match settings.ledger {
+            Some(_) => None,
+            None => Some(frames.unwrap_or(crate::draw_ledger::DEFAULT_FRAMES).max(1)),
+        };
+        let ledger = settings.ledger;
+        crate::draw_ledger::set_capacity(ledger.unwrap_or(0));
+        ledger
     }
 
     /// The number to stamp on the frame being built, if stamping is on and a frame is in flight.

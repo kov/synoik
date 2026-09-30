@@ -3891,6 +3891,21 @@ impl State {
                 self.synoik.debug_draw_opaque_regions = !self.synoik.debug_draw_opaque_regions;
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugToggleFrameStamp => {
+                let on = self.synoik.frame_log.toggle_stamp();
+                warn!("frame stamp is now {}", if on { "on" } else { "off" });
+                self.synoik.queue_redraw_all();
+            }
+            Action::DebugToggleDrawLedger(frames) => {
+                let on = self.synoik.frame_log.toggle_ledger(frames);
+                warn!(
+                    "draw ledger is now {}",
+                    match on {
+                        Some(n) => format!("on, keeping {n} frames"),
+                        None => "off".to_owned(),
+                    }
+                );
+            }
             Action::DebugToggleDeadlineDispatch => {
                 let on = crate::frame_clock::set_deadline_dispatch(
                     !crate::frame_clock::deadline_dispatch_enabled(),
@@ -11873,6 +11888,8 @@ fn is_debug_action(action: &Action) -> bool {
             | Action::DebugDumpScanout
             | Action::DebugDumpThumbnailGeometry
             | Action::DebugToggleDeadlineDispatch
+            | Action::DebugToggleFrameStamp
+            | Action::DebugToggleDrawLedger(_)
             | Action::DebugSetRenderTimeMargin(_)
             | Action::DebugSetSceneBreakdown(_)
             | Action::DebugSetBattery(..)
