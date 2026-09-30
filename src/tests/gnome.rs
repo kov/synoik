@@ -23488,6 +23488,254 @@ fn overview_app_grid_swipes_between_pages() {
     assert_eq!(f.synoik().app_grid.current_page(), 0);
 }
 
+/// A three-finger swipe of `n` updates of `(dx, dy)`, `gap` ms apart, then the fingers lift
+/// and whatever it released settles. The synthetic touchpad has natural scrolling off, so
+/// `+dy` is the way to the app grid and `+dx` the way to the next workspace.
+fn touchpad_swipe(f: &mut Fixture, fingers: u32, (dx, dy): (f64, f64), n: usize, gap: u32) {
+    f.swipe_begin(fingers);
+    for _ in 0..n {
+        f.advance_input_time(gap);
+        f.swipe_update(dx, dy);
+    }
+    f.advance_input_time(1);
+    f.swipe_end(false);
+    f.settle_animations();
+}
+
+/// Where the only monitor is on gnome-shell's overview state axis: 0 the desktop, 1 the
+/// window picker, 2 the app grid.
+fn overview_state(f: &mut Fixture) -> f64 {
+    f.synoik()
+        .layout
+        .active_monitor_ref()
+        .and_then(|mon| mon.overview_state_value())
+        .unwrap_or(0.)
+}
+
+/// A vertical three-finger swipe walks gnome-shell's overview state axis one state at a time:
+/// up from the desktop to the window picker, up again to the app grid, and down back through
+/// both. `Overview` gives its `SwipeTracker` the snap points HIDDEN, WINDOW_PICKER, APP_GRID
+/// (`overview.js:226-239`, `overviewControls.js:760-778`), with 300 px of travel per state
+/// (`TOUCHPAD_BASE_HEIGHT`), and a swipe reaches at most the states either side of where it
+/// began (`_getBounds`, `swipeTracker.js:547-565`) — so however far the fingers go, one swipe
+/// from the desktop stops at the picker.
+#[test]
+fn touchpad_swipe_walks_the_overview_states() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // Off the hot corner, which would open the overview by itself.
+    pointer_motion_to(&mut f, 960., 540.);
+
+    // Slowly (0.2 px/ms, under the release threshold), and far past two states' worth.
+    touchpad_swipe(&mut f, 3, (0., 10.), 80, 50);
+    assert!(f.synoik().layout.is_overview_open());
+    assert!(
+        !f.synoik().layout.is_app_grid_open(),
+        "one swipe from the desktop reaches the window picker and no further"
+    );
+    assert_eq!(overview_state(&mut f), 1.);
+
+    touchpad_swipe(&mut f, 3, (0., 10.), 40, 50);
+    assert!(
+        f.synoik().layout.is_app_grid_open(),
+        "up again from the picker is the app grid"
+    );
+    assert_eq!(overview_state(&mut f), 2.);
+
+    touchpad_swipe(&mut f, 3, (0., -10.), 80, 50);
+    assert!(f.synoik().layout.is_overview_open());
+    assert!(
+        !f.synoik().layout.is_app_grid_open(),
+        "down from the app grid is the picker, however far it goes"
+    );
+    assert_eq!(overview_state(&mut f), 1.);
+
+    touchpad_swipe(&mut f, 3, (0., -10.), 40, 50);
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "down again closes it"
+    );
+    assert_eq!(overview_state(&mut f), 0.);
+
+    // Four fingers are three: the tracker only turns away fewer than `GESTURE_FINGER_COUNT`
+    // (`swipeTracker.js:127`).
+    touchpad_swipe(&mut f, 4, (0., 10.), 40, 50);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "four fingers open it too"
+    );
+    touchpad_swipe(&mut f, 4, (0., -10.), 40, 50);
+    assert!(!f.synoik().layout.is_overview_open());
+
+    // Two fingers are the client's.
+    touchpad_swipe(&mut f, 2, (0., 10.), 40, 50);
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "two fingers are not the shell's"
+    );
+}
+
+/// The overview follows the fingers 1:1 and settles by the release: a slow one to the nearest
+/// state, a flick on to the next state however little it travelled (`_getEndProgress`,
+/// `swipeTracker.js:601-631`, 0.6 px/ms). Nothing but the release commits the show-apps state —
+/// `showAppsButton.checked` is set in `gestureEnd` (`overviewControls.js:785-800`) — so a swipe
+/// that turns back short of the grid leaves the picker exactly as it was.
+#[test]
+fn touchpad_swipe_tracks_the_fingers_and_settles_by_the_release() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    pointer_motion_to(&mut f, 960., 540.);
+
+    // A flick: four 20 px updates 5 ms apart is 4 px/ms, and 60 px past the threshold is a
+    // fifth of the way — yet it lands in the picker.
+    touchpad_swipe(&mut f, 3, (0., 20.), 4, 5);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "a flick carries a whole state"
+    );
+    assert_eq!(overview_state(&mut f), 1.);
+
+    // Mid-swipe, the state is exactly where the fingers put it. The first 16 px only decide the
+    // orientation; the update that crosses it is the first to move anything.
+    f.swipe_begin(3);
+    f.advance_input_time(50);
+    f.swipe_update(0., 10.);
+    for _ in 0..15 {
+        f.advance_input_time(50);
+        f.swipe_update(0., 10.);
+    }
+    let state = overview_state(&mut f);
+    assert!(
+        (state - 1.5).abs() < 1e-6,
+        "150 px is half a state past the picker, got {state}"
+    );
+    assert!(
+        !f.synoik().layout.is_app_grid_open(),
+        "the grid is not open until the swipe commits to it"
+    );
+
+    // Back down, slowly, to a little past where it started: it falls back to the picker, and the
+    // show-apps half of the state goes with it rather than freezing where the fingers left it.
+    for _ in 0..16 {
+        f.advance_input_time(50);
+        f.swipe_update(0., -10.);
+    }
+    f.advance_input_time(1);
+    f.swipe_end(false);
+    f.settle_animations();
+    assert!(f.synoik().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_app_grid_open());
+    assert_eq!(overview_state(&mut f), 1.);
+    let leg = f
+        .synoik()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .app_grid_leg();
+    assert_eq!(leg, 0., "the grid must ease all the way back out");
+
+    // A swipe libinput cancels is released like any other — the touchpad gesture emits the same
+    // `end` for CANCEL as for END (`swipeTracker.js:190-197`) — so one that got past halfway
+    // lands in the grid rather than snapping back.
+    f.swipe_begin(3);
+    for _ in 0..20 {
+        f.advance_input_time(50);
+        f.swipe_update(0., 10.);
+    }
+    f.advance_input_time(1);
+    f.swipe_end(true);
+    f.settle_animations();
+    assert!(
+        f.synoik().layout.is_app_grid_open(),
+        "a cancelled swipe settles where it was released towards"
+    );
+    assert_eq!(overview_state(&mut f), 2.);
+}
+
+/// A horizontal three-finger swipe switches workspaces, 400 px of travel to a workspace
+/// (`TOUCHPAD_BASE_WIDTH`). On the desktop it moves one workspace at most
+/// (`workspaceAnimation.js:359-369`, bounded by `_getBounds`); in the overview the
+/// workspaces view allows long swipes (`workspacesView.js:839-848`).
+#[test]
+fn touchpad_swipe_sideways_switches_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 4);
+    pointer_motion_to(&mut f, 960., 540.);
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(1)),
+        false,
+    );
+    f.settle();
+    assert_eq!(active_idx(&mut f), 0);
+
+    // Three quarters of a workspace, slowly: it lands on the next one.
+    touchpad_swipe(&mut f, 3, (10., 0.), 30, 50);
+    f.settle();
+    assert_eq!(
+        active_idx(&mut f),
+        1,
+        "a swipe to the side is a workspace switch"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "…and nothing to do with the overview"
+    );
+
+    // Three workspaces' worth on the desktop is still one.
+    touchpad_swipe(&mut f, 3, (10., 0.), 120, 50);
+    f.settle();
+    assert_eq!(
+        active_idx(&mut f),
+        2,
+        "the desktop swipe moves one workspace at most"
+    );
+
+    // The other way goes back.
+    touchpad_swipe(&mut f, 3, (-10., 0.), 30, 50);
+    f.settle();
+    assert_eq!(active_idx(&mut f), 1);
+
+    // In the overview, the same travel runs on past the neighbour.
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    touchpad_swipe(&mut f, 3, (10., 0.), 80, 50);
+    f.settle();
+    assert_eq!(
+        active_idx(&mut f),
+        3,
+        "the overview's workspace swipe is a long one"
+    );
+    assert!(f.synoik().layout.is_overview_open());
+}
+
+/// With the app grid up, a horizontal three-finger swipe pages the grid instead: `AppDisplay`
+/// runs its own horizontal `SwipeTracker` (`appDisplay.js:603-614`) at 400 px a page.
+#[test]
+fn touchpad_swipe_sideways_pages_the_app_grid() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&[], &others);
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(f.synoik().app_grid.page_count(area), 2);
+    pointer_motion_to(&mut f, 960., 540.);
+    let before = active_idx(&mut f);
+
+    touchpad_swipe(&mut f, 3, (10., 0.), 30, 50);
+    assert_eq!(
+        f.synoik().app_grid.current_page(),
+        1,
+        "the swipe pages the grid"
+    );
+    assert_eq!(
+        active_idx(&mut f),
+        before,
+        "…and leaves the workspaces alone"
+    );
+    assert!(f.synoik().layout.is_app_grid_open());
+}
+
 /// Dragging the app grid's background with the mouse pages it. gnome-shell's swipe
 /// tracker attaches a `Clutter.PanGesture` with `min_n_points: 1` and `allowDrag` on by
 /// default (`swipeTracker.js:367-404`), so a plain click-drag pans the same adjustment a

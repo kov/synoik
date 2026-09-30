@@ -122,13 +122,10 @@ const WINDOW_DND_SIZE: f64 = 256.;
 /// whether animations run at all is inherited.
 const DND_SCALE_ANIMATION_TIME_MS: u32 = 250;
 
-/// Amount of touchpad movement to toggle the overview.
+/// Touchpad travel for one step along the overview's state axis — gnome-shell's
+/// `TOUCHPAD_BASE_HEIGHT` (`swipeTracker.js:13`), the distance the vertical touchpad
+/// gesture reports with every update (`:181-190`).
 const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
-
-const OVERVIEW_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
-    stiffness: 0.5,
-    limit: 0.05,
-};
 
 /// Size-relative units.
 pub struct SizeFrac;
@@ -770,13 +767,82 @@ enum OverviewProgress {
     Open,
 }
 
+/// A touchpad swipe along gnome-shell's overview state axis: `HIDDEN` (0) →
+/// `WINDOW_PICKER` (1) → `APP_GRID` (2), the snap points `gestureBegin` hands the
+/// tracker (`overviewControls.js:760-778`).
 #[derive(Debug)]
 struct OverviewGesture {
     tracker: SwipeTracker,
-    /// Start point.
+    /// Where on the state axis the swipe began (`_initialProgress`).
     start: f64,
-    /// Current progress.
-    value: f64,
+    /// How far along the state axis the swipe may go: one snap point either side of
+    /// where it began (`_getBounds`, `swipeTracker.js:547-565`).
+    bounds: (f64, f64),
+    /// The current point on the state axis.
+    state: f64,
+}
+
+impl OverviewGesture {
+    /// The open-progress half of [`Self::state`]: the overview is fully open over the
+    /// whole `WINDOW_PICKER` → `APP_GRID` leg.
+    fn value(&self) -> f64 {
+        self.state.min(1.)
+    }
+
+    /// The show-apps half of [`Self::state`] (0 = window picker, 1 = app grid).
+    fn app_grid(&self) -> f64 {
+        (self.state - 1.).clamp(0., 1.)
+    }
+}
+
+/// gnome-shell's `_getBounds` with `allowLongSwipes` off (`swipeTracker.js:547-565`): a
+/// swipe that begins on a snap point may reach its neighbours, one that begins between
+/// two may reach one beyond each.
+fn overview_gesture_bounds(start: f64) -> (f64, f64) {
+    const EPSILON: f64 = 0.005;
+    let closest = start.round();
+    let (prev, next) = if (closest - start).abs() < EPSILON {
+        (closest, closest)
+    } else {
+        (start.floor(), start.ceil())
+    };
+    ((prev - 1.).max(0.), (next + 1.).min(2.))
+}
+
+/// Where a released swipe settles — gnome-shell's `_getEndProgress` and
+/// `_findPointForProjection` (`swipeTracker.js:536-631`) over the snap points 0, 1, 2.
+/// `velocity` is in touchpad pixels per millisecond, the unit the reference compares
+/// against its threshold *and* projects with before normalizing.
+fn overview_gesture_target(start: f64, state: f64, bounds: (f64, f64), velocity: f64) -> f64 {
+    const VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
+    const DECELERATION_TOUCHPAD: f64 = 0.997;
+    const VELOCITY_CURVE_THRESHOLD: f64 = 2.;
+    const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;
+
+    if velocity.abs() < VELOCITY_THRESHOLD_TOUCHPAD {
+        return state.round();
+    }
+
+    let slope = DECELERATION_TOUCHPAD / (1. - DECELERATION_TOUCHPAD) / 1000.;
+    let pos = if velocity.abs() > VELOCITY_CURVE_THRESHOLD {
+        let c = slope / 2. / DECELERATION_PARABOLA_MULTIPLIER;
+        let x = velocity.abs() - VELOCITY_CURVE_THRESHOLD + c;
+        slope * VELOCITY_CURVE_THRESHOLD + DECELERATION_PARABOLA_MULTIPLIER * x * x
+            - DECELERATION_PARABOLA_MULTIPLIER * c * c
+    } else {
+        velocity.abs() * slope
+    };
+    let pos = (pos * velocity.signum() + state).clamp(bounds.0, bounds.1);
+
+    let initial = start.round();
+    let (prev, next) = (pos.floor(), pos.ceil());
+    if velocity > 0. && prev == initial {
+        next
+    } else if velocity < 0. && next == initial {
+        prev
+    } else {
+        pos.round()
+    }
 }
 
 /// A window's persistable layout state, from [`Layout::session_snapshot`].
@@ -1001,7 +1067,7 @@ impl OverviewProgress {
     fn value(&self) -> f64 {
         match self {
             OverviewProgress::Animation(anim) => anim.value(),
-            OverviewProgress::Gesture(gesture) => gesture.value,
+            OverviewProgress::Gesture(gesture) => gesture.value(),
             OverviewProgress::Open => 1.,
         }
     }
@@ -5137,73 +5203,93 @@ impl<W: LayoutElement> Layout<W> {
         None
     }
 
+    /// Begin a touchpad swipe along the overview's state axis — gnome-shell's
+    /// `ControlsManager.gestureBegin` (`overviewControls.js:760-778`). It picks up wherever
+    /// the overview is, an animation in flight included, and may travel one snap point
+    /// either way from there: from the desktop only as far as the window picker, from the
+    /// picker to either end, from the app grid only back to the picker.
     pub fn overview_gesture_begin(&mut self) {
         // A gesture that begins while the overview is already open is on its way *out* of
         // it, and is not an entry: re-deciding there would re-seat previews at the moment
         // the user starts swiping away, and again if the swipe is cancelled.
         let entering = !self.overview_open;
+
+        let start = self
+            .active_monitor_ref()
+            .and_then(|mon| mon.overview_state_value())
+            .unwrap_or(0.);
         self.overview_open = true;
         if entering {
             self.forget_expose_layouts();
         }
 
-        let value = self.overview_progress.take().map_or(0., |p| p.value());
-        let gesture = OverviewGesture {
+        let bounds = overview_gesture_bounds(start);
+        self.overview_progress = Some(OverviewProgress::Gesture(OverviewGesture {
             tracker: SwipeTracker::new(),
-            start: value,
-            value,
-        };
-        self.overview_progress = Some(OverviewProgress::Gesture(gesture));
+            start,
+            bounds,
+            state: start,
+        }));
 
         self.set_monitors_overview_state();
     }
 
-    pub fn overview_gesture_update(&mut self, delta_y: f64, timestamp: Duration) -> Option<bool> {
+    /// Move a swipe along the state axis by `delta` touchpad pixels, positive towards the
+    /// app grid. Hard-clamped to the gesture's bounds, as `_updateGesture` does
+    /// (`swipeTracker.js:567-576`). Returns `None` when no overview swipe is running,
+    /// otherwise whether anything moved.
+    pub fn overview_gesture_update(&mut self, delta: f64, timestamp: Duration) -> Option<bool> {
         let Some(OverviewProgress::Gesture(gesture)) = &mut self.overview_progress else {
             return None;
         };
 
-        gesture.tracker.push(delta_y, timestamp);
+        gesture.tracker.push(delta, timestamp);
 
-        let total_height = OVERVIEW_GESTURE_MOVEMENT;
-        let pos = gesture.tracker.pos() / total_height;
-        let new_value = gesture.start + pos;
-        let new_value = OVERVIEW_GESTURE_RUBBER_BAND.clamp(0., 1., new_value);
+        let state = gesture.start + gesture.tracker.pos() / OVERVIEW_GESTURE_MOVEMENT;
+        let state = state.clamp(gesture.bounds.0, gesture.bounds.1);
 
-        if gesture.value == new_value {
+        if gesture.state == state {
             return Some(false);
         }
 
-        gesture.value = new_value;
+        gesture.state = state;
         self.set_monitors_overview_state();
 
         Some(true)
     }
 
-    pub fn overview_gesture_end(&mut self) -> bool {
+    /// Release a swipe at `timestamp`, easing to the snap point it projects to
+    /// (`gestureEnd`, `overviewControls.js:785-800`). A touchpad swipe libinput cancels is
+    /// released the same way (`swipeTracker.js:190-197`). The show-apps state only commits
+    /// here, as `showAppsButton.checked` does in the reference.
+    pub fn overview_gesture_end(&mut self, timestamp: Duration) -> bool {
         let Some(OverviewProgress::Gesture(gesture)) = &mut self.overview_progress else {
             return false;
         };
 
-        // Take into account any idle time between the last event and now.
-        let now = self.clock.now_unadjusted();
-        gesture.tracker.push(0., now);
+        // Take into account any idle time between the last event and the release.
+        gesture.tracker.push(0., timestamp);
 
-        let total_height = OVERVIEW_GESTURE_MOVEMENT;
+        // `velocity()` is per second; the reference judges pixels per millisecond.
+        let velocity = gesture.tracker.velocity() / 1000.;
+        let target =
+            overview_gesture_target(gesture.start, gesture.state, gesture.bounds, velocity);
 
-        let mut velocity = gesture.tracker.velocity() / total_height;
-        let current_pos = gesture.tracker.pos() / total_height;
-        let pos = gesture.tracker.projected_end_pos() / total_height;
+        let from = gesture.value();
+        let to = target.min(1.);
+        // Only a fling towards where the open progress is going carries into its ease.
+        let velocity = gesture.tracker.velocity() / OVERVIEW_GESTURE_MOVEMENT;
+        let velocity = if (to - from) * velocity > 0. {
+            velocity
+        } else {
+            0.
+        };
 
-        let new_value = gesture.start + pos;
-        let new_value = new_value.clamp(0., 1.).round();
-
-        velocity *=
-            OVERVIEW_GESTURE_RUBBER_BAND.clamp_derivative(0., 1., gesture.start + current_pos);
-
-        let from = gesture.value;
-
-        self.overview_open = new_value == 1.;
+        self.overview_open = target >= 1.;
+        self.app_grid_open = target == 2.;
+        for mon in self.monitors_mut() {
+            mon.finish_app_grid_gesture(target == 2.);
+        }
         if !self.overview_open {
             // See `Workspace::hold_expose_freeze_through_exit` — a swipe out is an exit like
             // any other, and a hold that ran out partway through it would shuffle the picker.
@@ -5214,7 +5300,7 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_progress = Some(OverviewProgress::Animation(Animation::new(
             self.clock.clone(),
             from,
-            new_value,
+            to,
             velocity,
             self.options.animations.overview_open_close.0,
         )));
@@ -6474,9 +6560,16 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
 
+        // A swipe along the state axis drives the show-apps fraction directly; anything
+        // else hands it back to the monitor's own ease.
+        let app_grid_gesture = match &self.overview_progress {
+            Some(OverviewProgress::Gesture(gesture)) => Some(gesture.app_grid()),
+            _ => None,
+        };
         for mon in monitors {
             mon.overview_open = self.overview_open;
             mon.set_overview_progress(self.overview_progress.as_ref());
+            mon.set_app_grid_gesture(app_grid_gesture);
         }
 
         if !self.overview_open {
@@ -6959,6 +7052,11 @@ impl<W: LayoutElement> Layout<W> {
     /// overview that is the picker preview it was picked up as, shrunk toward
     /// [`WINDOW_DND_SIZE`] as the drag gets going. Same geometry
     /// [`Self::render_interactive_move_for_output`] draws.
+    /// Whether a window is being dragged.
+    pub fn interactive_move_is_active(&self) -> bool {
+        self.interactive_move.is_some()
+    }
+
     pub fn interactive_move_drawn_size(&self) -> Option<Size<f64, Logical>> {
         let InteractiveMoveState::Moving(move_) = self.interactive_move.as_ref()? else {
             return None;

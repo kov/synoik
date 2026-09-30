@@ -15,9 +15,10 @@
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
-    DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
-    TouchSlot, TouchUpEvent, UnusedEvent,
+    DeviceCapability, Event, GestureBeginEvent, GestureEndEvent, GestureSwipeBeginEvent,
+    GestureSwipeEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+    KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    TouchDownEvent, TouchEvent, TouchSlot, TouchUpEvent, UnusedEvent,
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
@@ -462,6 +463,82 @@ impl TouchEvent<SyntheticInputBackend> for SyntheticTouchUpEvent {
 
 impl TouchUpEvent<SyntheticInputBackend> for SyntheticTouchUpEvent {}
 
+/// Fingers landing for a touchpad swipe.
+pub struct SyntheticGestureSwipeBeginEvent {
+    pub time: u64,
+    pub fingers: u32,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticGestureSwipeBeginEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl GestureBeginEvent<SyntheticInputBackend> for SyntheticGestureSwipeBeginEvent {
+    fn fingers(&self) -> u32 {
+        self.fingers
+    }
+}
+
+impl GestureSwipeBeginEvent<SyntheticInputBackend> for SyntheticGestureSwipeBeginEvent {}
+
+/// A touchpad swipe's travel. The synthetic device is not a libinput one, so natural
+/// scrolling never flips it: `(dx, dy)` is the delta the swipe trackers see as is.
+pub struct SyntheticGestureSwipeUpdateEvent {
+    pub time: u64,
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticGestureSwipeUpdateEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl GestureSwipeUpdateEvent<SyntheticInputBackend> for SyntheticGestureSwipeUpdateEvent {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+}
+
+/// The fingers lifting off a touchpad swipe, or libinput cancelling it.
+pub struct SyntheticGestureSwipeEndEvent {
+    pub time: u64,
+    pub cancelled: bool,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticGestureSwipeEndEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl GestureEndEvent<SyntheticInputBackend> for SyntheticGestureSwipeEndEvent {
+    fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
+impl GestureSwipeEndEvent<SyntheticInputBackend> for SyntheticGestureSwipeEndEvent {}
+
 impl InputBackend for SyntheticInputBackend {
     type Device = SyntheticInputDevice;
 
@@ -472,9 +549,9 @@ impl InputBackend for SyntheticInputBackend {
 
     type PointerMotionAbsoluteEvent = UnusedEvent;
 
-    type GestureSwipeBeginEvent = UnusedEvent;
-    type GestureSwipeUpdateEvent = UnusedEvent;
-    type GestureSwipeEndEvent = UnusedEvent;
+    type GestureSwipeBeginEvent = SyntheticGestureSwipeBeginEvent;
+    type GestureSwipeUpdateEvent = SyntheticGestureSwipeUpdateEvent;
+    type GestureSwipeEndEvent = SyntheticGestureSwipeEndEvent;
     type GesturePinchBeginEvent = UnusedEvent;
     type GesturePinchUpdateEvent = UnusedEvent;
     type GesturePinchEndEvent = UnusedEvent;

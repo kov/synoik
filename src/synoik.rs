@@ -150,7 +150,7 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, OverviewHit, TabletData,
+    mods_with_tablet_stylus_binds, mods_with_wheel_binds, OverviewHit, TabletData, TouchpadSwipe,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -1013,7 +1013,8 @@ pub struct Synoik {
     ///
     /// Read through [`Self::pointer_aim_output`]; see `docs/fork/multi-display.md` §4.
     pub pointer_used: bool,
-    pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+    /// The three-or-more-finger touchpad swipe in progress, and what it is driving.
+    pub touchpad_swipe: Option<TouchpadSwipe>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
     /// The same, for the app grid's own 1:1 page swipe — GNOME gives `AppDisplay` its own
     /// `SwipeTracker` on the grid's scroll view (`appDisplay.js:605-614`), independent of
@@ -8316,7 +8317,7 @@ impl Synoik {
             hot_corner_output: None,
             tablet_cursor_location: None,
             pointer_used: false,
-            gesture_swipe_3f_cumulative: None,
+            touchpad_swipe: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
             app_grid_scroll_swipe: ScrollSwipeGesture::new(),
             vertical_wheel_tracker: ScrollTracker::new(120),

@@ -194,6 +194,21 @@ pub enum OverviewHit {
     Folder(DialogHit),
 }
 
+/// A touchpad swipe of three or more fingers, which the shell keeps for itself.
+#[derive(Debug, Clone, Copy)]
+pub enum TouchpadSwipe {
+    /// Still under the threshold that decides its orientation; the travel so far.
+    Pending { dx: f64, dy: f64 },
+    /// Swiping along the overview's state axis.
+    Overview,
+    /// Switching workspaces.
+    Workspace,
+    /// Paging the app grid.
+    AppGrid,
+    /// Nothing runs its way; it is swallowed until the fingers lift.
+    Ignored,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
@@ -10556,16 +10571,11 @@ impl State {
             return;
         }
 
-        if event.fingers() == 3 {
-            self.synoik.gesture_swipe_3f_cumulative = Some((0., 0.));
-
-            // We handled this event.
-            return;
-        } else if event.fingers() == 4 {
-            self.synoik.layout.overview_gesture_begin();
-            self.synoik.queue_redraw_all();
-
-            // We handled this event.
+        // Three or more fingers belong to the shell (`GESTURE_FINGER_COUNT`,
+        // `swipeTracker.js:35,127`) — four are no different from three — except on the lock
+        // screen, where neither of its swipe trackers' action modes is live.
+        if event.fingers() >= 3 && !self.synoik.is_locked() {
+            self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending { dx: 0., dy: 0. });
             return;
         }
 
@@ -10592,9 +10602,27 @@ impl State {
     ) where
         I::Device: 'static,
     {
+        let Some(swipe) = self.synoik.touchpad_swipe else {
+            let pointer = self.synoik.seat.get_pointer().unwrap();
+
+            if self.update_pointer_contents() {
+                pointer.frame(self);
+            }
+
+            pointer.gesture_swipe_update(
+                self,
+                &GestureSwipeUpdateEvent {
+                    time: event.time_msec(),
+                    delta: event.delta(),
+                },
+            );
+            return;
+        };
+
+        // The swipe tracker reads `get_gesture_motion_delta_unaccelerated`
+        // (`swipeTracker.js:143`).
         let mut delta_x = event.delta_x();
         let mut delta_y = event.delta_y();
-
         if let Some(libinput_event) =
             (&event as &dyn Any).downcast_ref::<input::event::gesture::GestureSwipeUpdateEvent>()
         {
@@ -10602,8 +10630,27 @@ impl State {
             delta_y = libinput_event.dy_unaccelerated();
         }
 
-        let uninverted_delta_y = delta_y;
+        let timestamp = Duration::from_micros(event.time());
 
+        let swipe = match swipe {
+            TouchpadSwipe::Pending { dx, dy } => {
+                let (dx, dy) = (dx + delta_x, dy + delta_y);
+                // `DRAG_THRESHOLD_DISTANCE` (`swipeTracker.js:28,157-176`): the travel
+                // that decides which way the swipe goes. The motion up to it moves nothing.
+                if dx * dx + dy * dy < 16. * 16. {
+                    self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending { dx, dy });
+                    return;
+                }
+                let swipe = self.touchpad_swipe_begin(dx.abs() > dy.abs());
+                self.synoik.touchpad_swipe = Some(swipe);
+                swipe
+            }
+            swipe => swipe,
+        };
+
+        // The tracker flips the delta for natural scrolling (`swipeTracker.js:188-189`), so
+        // with it on the content follows the fingers: up opens the overview, left brings in
+        // the workspace on the right.
         let device = event.device();
         if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
             if device.config_scroll_natural_scroll_enabled() {
@@ -10612,146 +10659,129 @@ impl State {
             }
         }
 
-        let is_overview_open = self.synoik.layout.is_overview_open();
-
-        if let Some((cx, cy)) = &mut self.synoik.gesture_swipe_3f_cumulative {
-            *cx += delta_x;
-            *cy += delta_y;
-
-            // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
-            let (cx, cy) = (*cx, *cy);
-            if cx * cx + cy * cy >= 16. * 16. {
-                self.synoik.gesture_swipe_3f_cumulative = None;
-
-                if let Some(output) = self.synoik.output_under_cursor() {
-                    if cx.abs() > cy.abs() {
-                        let output_ws = if is_overview_open {
-                            self.synoik.workspace_under_cursor(true)
-                        } else {
-                            // We don't want to accidentally "catch" the wrong workspace during
-                            // animations.
-                            self.synoik.output_under_cursor().and_then(|output| {
-                                let mon = self.synoik.layout.monitor_for_output(&output)?;
-                                Some((output, mon.active_workspace_ref()))
-                            })
-                        };
-
-                        if let Some((output, ws)) = output_ws {
-                            let ws_idx =
-                                self.synoik.layout.find_workspace_by_id(ws.id()).unwrap().0;
-                            self.synoik.layout.view_offset_gesture_begin(
-                                &output,
-                                Some(ws_idx),
-                                true,
-                            );
-                        }
-                    } else {
-                        self.synoik
-                            .layout
-                            .workspace_switch_gesture_begin(&output, true);
+        match swipe {
+            TouchpadSwipe::Pending { .. } | TouchpadSwipe::Ignored => (),
+            TouchpadSwipe::Overview => {
+                if self
+                    .synoik
+                    .layout
+                    .overview_gesture_update(delta_y, timestamp)
+                    .unwrap_or(false)
+                {
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            TouchpadSwipe::Workspace => {
+                if let Some(Some(output)) = self
+                    .synoik
+                    .layout
+                    .workspace_switch_gesture_update(delta_x, timestamp, true)
+                {
+                    self.synoik.queue_redraw(&output);
+                }
+            }
+            TouchpadSwipe::AppGrid => {
+                if let Some(area) = self.app_grid_swipe_area() {
+                    if self
+                        .synoik
+                        .app_grid
+                        .gesture_update(delta_x, timestamp, area)
+                    {
+                        self.synoik.queue_redraw_all();
                     }
                 }
             }
         }
+    }
 
-        let timestamp = Duration::from_micros(event.time());
+    /// Hand a three-finger swipe that has cleared the threshold to whichever tracker
+    /// runs that way: vertical is the overview's state axis (`overview.js:226-239`, live
+    /// on the desktop and in the overview alike); horizontal pages the app grid while it
+    /// is up (`appDisplay.js:603-614`) and switches workspaces otherwise
+    /// (`workspaceAnimation.js:359-369` on the desktop, `workspacesView.js:839-848` in the
+    /// overview).
+    fn touchpad_swipe_begin(&mut self, horizontal: bool) -> TouchpadSwipe {
+        if !horizontal {
+            self.synoik.layout.overview_gesture_begin();
+            self.synoik.queue_redraw_all();
+            return TouchpadSwipe::Overview;
+        }
 
-        let mut handled = false;
-        let res = self
-            .synoik
+        if self.synoik.layout.is_app_grid_open() {
+            let Some(area) = self.app_grid_swipe_area() else {
+                return TouchpadSwipe::Ignored;
+            };
+            self.synoik
+                .app_grid
+                .gesture_begin(SwipeSource::Touchpad, area);
+            return TouchpadSwipe::AppGrid;
+        }
+
+        // A window being dragged holds the workspaces still (`_updateSwipeTracker`,
+        // `workspacesView.js:884-889`).
+        if self.synoik.layout.interactive_move_is_active() {
+            return TouchpadSwipe::Ignored;
+        }
+        let Some(output) = self.synoik.output_under_cursor() else {
+            return TouchpadSwipe::Ignored;
+        };
+        self.synoik
             .layout
-            .workspace_switch_gesture_update(delta_y, timestamp, true);
-        if let Some(output) = res {
-            if let Some(output) = output {
-                self.synoik.queue_redraw(&output);
-            }
-            handled = true;
-        }
+            .workspace_switch_gesture_begin(&output, true);
+        TouchpadSwipe::Workspace
+    }
 
-        let res = self
-            .synoik
+    fn app_grid_swipe_area(&self) -> Option<Rectangle<f64, Logical>> {
+        let output = self.synoik.layout.active_output()?.clone();
+        self.synoik
             .layout
-            .view_offset_gesture_update(delta_x, timestamp, true);
-        if let Some(output) = res {
-            if let Some(output) = output {
-                self.synoik.queue_redraw(&output);
-            }
-            handled = true;
-        }
-
-        let res = self
-            .synoik
-            .layout
-            .overview_gesture_update(-uninverted_delta_y, timestamp);
-        if let Some(redraw) = res {
-            if redraw {
-                self.synoik.queue_redraw_all();
-            }
-            handled = true;
-        }
-
-        if handled {
-            // We handled this event.
-            return;
-        }
-
-        let pointer = self.synoik.seat.get_pointer().unwrap();
-
-        if self.update_pointer_contents() {
-            pointer.frame(self);
-        }
-
-        pointer.gesture_swipe_update(
-            self,
-            &GestureSwipeUpdateEvent {
-                time: event.time_msec(),
-                delta: event.delta(),
-            },
-        );
+            .controls_layout_for_output(&output)
+            .map(|c| c.app_display)
     }
 
     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
-        self.synoik.gesture_swipe_3f_cumulative = None;
+        let Some(swipe) = self.synoik.touchpad_swipe.take() else {
+            let serial = SERIAL_COUNTER.next_serial();
+            let pointer = self.synoik.seat.get_pointer().unwrap();
 
-        let mut handled = false;
-        let res = self.synoik.layout.workspace_switch_gesture_end(Some(true));
-        if let Some(output) = res {
-            self.synoik.queue_redraw(&output);
-            handled = true;
-        }
+            if self.update_pointer_contents() {
+                pointer.frame(self);
+            }
 
-        let res = self.synoik.layout.view_offset_gesture_end(Some(true));
-        if let Some(output) = res {
-            self.synoik.queue_redraw(&output);
-            handled = true;
-        }
-
-        let res = self.synoik.layout.overview_gesture_end();
-        if res {
-            self.synoik.queue_redraw_all();
-            handled = true;
-        }
-
-        if handled {
-            // We handled this event.
+            pointer.gesture_swipe_end(
+                self,
+                &GestureSwipeEndEvent {
+                    serial,
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                },
+            );
             return;
+        };
+
+        // A cancel releases the swipe just as the fingers lifting does: the touchpad gesture
+        // emits the same `end` for both (`swipeTracker.js:190-197`).
+        match swipe {
+            TouchpadSwipe::Pending { .. } | TouchpadSwipe::Ignored => (),
+            TouchpadSwipe::Overview => {
+                let timestamp = Duration::from_micros(event.time());
+                if self.synoik.layout.overview_gesture_end(timestamp) {
+                    self.synoik.queue_redraw_all();
+                }
+            }
+            TouchpadSwipe::Workspace => {
+                if let Some(output) = self.synoik.layout.workspace_switch_gesture_end(Some(true)) {
+                    self.synoik.queue_redraw(&output);
+                }
+            }
+            TouchpadSwipe::AppGrid => {
+                if let Some(area) = self.app_grid_swipe_area() {
+                    if self.synoik.app_grid.gesture_end(area) {
+                        self.synoik.queue_redraw_all();
+                    }
+                }
+            }
         }
-
-        let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.synoik.seat.get_pointer().unwrap();
-
-        if self.update_pointer_contents() {
-            pointer.frame(self);
-        }
-
-        pointer.gesture_swipe_end(
-            self,
-            &GestureSwipeEndEvent {
-                serial,
-                time: event.time_msec(),
-                cancelled: event.cancelled(),
-            },
-        );
     }
 
     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {

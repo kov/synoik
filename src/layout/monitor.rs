@@ -65,6 +65,11 @@ pub const MAX_NUM_WORKSPACES: usize = 36;
 /// Amount of touchpad movement to scroll the height of one workspace.
 const WORKSPACE_GESTURE_MOVEMENT: f64 = 300.;
 
+/// Amount of touchpad movement to scroll the width of one workspace in GNOME's
+/// horizontal row — `TOUCHPAD_BASE_WIDTH` (`swipeTracker.js:14`), used by both the
+/// three-finger swipe and the overview's two-finger scroll (`:181-184,283-284`).
+const WORKSPACE_GESTURE_MOVEMENT_HORIZONTAL: f64 = 400.;
+
 const WORKSPACE_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
     stiffness: 0.5,
     limit: 0.05,
@@ -264,6 +269,10 @@ pub struct Monitor<W: LayoutElement> {
     app_grid_shown: bool,
     /// The ease driving [`Self::app_grid_shown`].
     app_grid_expand: Option<Animation>,
+    /// The show-apps fraction while a touchpad swipe along the overview's state axis
+    /// holds it; overrides [`Self::app_grid_expand`]. Frames come from the input
+    /// driving it, so it is not an animation.
+    app_grid_gesture: Option<f64>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -699,7 +708,7 @@ impl From<&super::OverviewProgress> for OverviewProgress {
     fn from(value: &super::OverviewProgress) -> Self {
         match value {
             super::OverviewProgress::Animation(anim) => Self::Animation(anim.clone()),
-            super::OverviewProgress::Gesture(gesture) => Self::Value(gesture.value),
+            super::OverviewProgress::Gesture(gesture) => Self::Value(gesture.value()),
             super::OverviewProgress::Open => Self::Value(1.),
         }
     }
@@ -776,6 +785,7 @@ impl<W: LayoutElement> Monitor<W> {
             peek_progress: 0.,
             app_grid_shown: false,
             app_grid_expand: None,
+            app_grid_gesture: None,
             workspace_switch: None,
             workspace_switch_from_gesture: false,
             clock,
@@ -2699,6 +2709,9 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
     pub fn app_grid_fraction(&self) -> f64 {
+        if let Some(value) = self.app_grid_gesture {
+            return value;
+        }
         match &self.app_grid_expand {
             Some(anim) => anim.clamped_value().clamp(0., 1.),
             None => {
@@ -2711,17 +2724,51 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    /// Ease the app grid in or out. gnome-shell drives the show-apps state
-    /// adjustment with `EASE_OUT_SINE` over `SIDE_CONTROLS_ANIMATION_TIME` (250ms,
-    /// `overviewControls.js:654-657`); our `Curve` has no sine, so the equivalent
-    /// cubic-bézier reproduces it. Only whether animations run is inherited from the
-    /// config (like [`Self::update_app_grid_expand`]).
+    /// Ease the app grid in or out.
     pub(super) fn set_app_grid(&mut self, shown: bool) {
-        if shown == self.app_grid_shown {
+        if shown == self.app_grid_shown && self.app_grid_gesture.is_none() {
             return;
         }
         let from = self.app_grid_fraction();
+        self.app_grid_gesture = None;
         self.app_grid_shown = shown;
+        self.ease_app_grid_from(from);
+    }
+
+    /// Hold the show-apps fraction at `value` for a swipe along the overview's state
+    /// axis, or, with `None`, let a held one ease on to [`Self::app_grid_shown`] from
+    /// wherever the swipe left it.
+    pub(super) fn set_app_grid_gesture(&mut self, value: Option<f64>) {
+        match value {
+            Some(value) => {
+                self.app_grid_gesture = Some(value);
+                self.app_grid_expand = None;
+            }
+            None => {
+                if let Some(from) = self.app_grid_gesture.take() {
+                    self.ease_app_grid_from(from);
+                }
+            }
+        }
+    }
+
+    /// Commit a released swipe's show-apps state and ease there from where it let go.
+    pub(super) fn finish_app_grid_gesture(&mut self, shown: bool) {
+        self.app_grid_shown = shown;
+        self.set_app_grid_gesture(None);
+    }
+
+    /// Ease the show-apps fraction from `from` to [`Self::app_grid_shown`]. gnome-shell
+    /// drives the show-apps state adjustment with `EASE_OUT_SINE` over
+    /// `SIDE_CONTROLS_ANIMATION_TIME` (250ms, `overviewControls.js:654-657`); our `Curve`
+    /// has no sine, so the equivalent cubic-bézier reproduces it. Only whether animations
+    /// run is inherited from the config (like [`Self::update_app_grid_expand`]).
+    fn ease_app_grid_from(&mut self, from: f64) {
+        let to = if self.app_grid_shown { 1. } else { 0. };
+        if from == to {
+            self.app_grid_expand = None;
+            return;
+        }
         let config = synoik_config::Animation {
             off: self.options.animations.overview_open_close.0.off,
             kind: synoik_config::animations::Kind::Easing(
@@ -2731,13 +2778,7 @@ impl<W: LayoutElement> Monitor<W> {
                 },
             ),
         };
-        self.app_grid_expand = Some(Animation::new(
-            self.clock.clone(),
-            from,
-            if shown { 1. } else { 0. },
-            0.,
-            config,
-        ));
+        self.app_grid_expand = Some(Animation::new(self.clock.clone(), from, to, 0., config));
     }
 
     /// Snap the app grid back to the window picker with no animation — for when the
@@ -2746,6 +2787,7 @@ impl<W: LayoutElement> Monitor<W> {
     pub(super) fn reset_app_grid(&mut self) {
         self.app_grid_shown = false;
         self.app_grid_expand = None;
+        self.app_grid_gesture = None;
     }
 
     /// The workspace zoom at an arbitrary overview progress.
@@ -4923,6 +4965,14 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    fn touchpad_workspace_gesture_movement(&self) -> f64 {
+        if self.workspaces_horizontal() {
+            WORKSPACE_GESTURE_MOVEMENT_HORIZONTAL
+        } else {
+            WORKSPACE_GESTURE_MOVEMENT
+        }
+    }
+
     pub fn workspace_switch_gesture_begin(&mut self, is_touchpad: bool) {
         let center_idx = self.active_workspace_idx;
         let current_idx = self.workspace_render_idx();
@@ -4992,8 +5042,9 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         let zoom = self.overview_zoom();
+        let horizontal = self.workspaces_horizontal();
         let total_height = if gesture.is_touchpad {
-            WORKSPACE_GESTURE_MOVEMENT
+            self.touchpad_workspace_gesture_movement()
         } else {
             self.workspace_size_with_gap(1.).h
         };
@@ -5002,9 +5053,14 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         };
 
-        // Reduce the effect of zoom on the touchpad somewhat.
+        // Reduce the effect of zoom on the touchpad somewhat. GNOME's touchpad travel is
+        // a fixed distance per workspace in and out of the overview alike.
         let delta_scale = if gesture.is_touchpad {
-            (zoom - 1.) / 2.5 + 1.
+            if horizontal {
+                1.
+            } else {
+                (zoom - 1.) / 2.5 + 1.
+            }
         } else {
             zoom
         };
@@ -5178,7 +5234,7 @@ impl<W: LayoutElement> Monitor<W> {
         let total_height = if gesture.dnd_last_event_time.is_some() {
             WORKSPACE_DND_EDGE_SCROLL_MOVEMENT
         } else if gesture.is_touchpad {
-            WORKSPACE_GESTURE_MOVEMENT
+            self.touchpad_workspace_gesture_movement()
         } else {
             self.workspace_size_with_gap(1.).h
         };

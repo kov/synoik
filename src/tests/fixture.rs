@@ -18,9 +18,10 @@ use synoik_config::Config;
 use super::client::{Client, ClientId};
 use super::server::Server;
 use crate::input::synthetic::{
-    SyntheticInputBackend, SyntheticKeyboardKeyEvent, SyntheticPointerAxisEvent,
-    SyntheticPointerButtonEvent, SyntheticPointerMotionEvent, SyntheticTouchDownEvent,
-    SyntheticTouchUpEvent,
+    SyntheticGestureSwipeBeginEvent, SyntheticGestureSwipeEndEvent,
+    SyntheticGestureSwipeUpdateEvent, SyntheticInputBackend, SyntheticKeyboardKeyEvent,
+    SyntheticPointerAxisEvent, SyntheticPointerButtonEvent, SyntheticPointerMotionEvent,
+    SyntheticTouchDownEvent, SyntheticTouchUpEvent,
 };
 use crate::synoik::{NewClient, Synoik};
 
@@ -602,6 +603,42 @@ impl Fixture {
                 time: self.next_input_micros(),
                 v120: 0.,
                 finger: Some((dx, dy)),
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    /// Land `fingers` on the touchpad for a swipe, through the real input pipeline.
+    pub fn swipe_begin(&mut self, fingers: u32) {
+        let event = InputEvent::<SyntheticInputBackend>::GestureSwipeBegin {
+            event: SyntheticGestureSwipeBeginEvent {
+                time: self.next_input_micros(),
+                fingers,
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    /// Move the fingers of a touchpad swipe by `(dx, dy)`. The synthetic touchpad has
+    /// natural scrolling off, so this is the delta the swipe trackers see: `+dy` heads
+    /// for the app grid, `+dx` for the next workspace.
+    pub fn swipe_update(&mut self, dx: f64, dy: f64) {
+        let event = InputEvent::<SyntheticInputBackend>::GestureSwipeUpdate {
+            event: SyntheticGestureSwipeUpdateEvent {
+                time: self.next_input_micros(),
+                dx,
+                dy,
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    /// Lift the fingers off a touchpad swipe (or have libinput cancel it).
+    pub fn swipe_end(&mut self, cancelled: bool) {
+        let event = InputEvent::<SyntheticInputBackend>::GestureSwipeEnd {
+            event: SyntheticGestureSwipeEndEvent {
+                time: self.next_input_micros(),
+                cancelled,
             },
         };
         self.synoik_state().process_input_event(event);

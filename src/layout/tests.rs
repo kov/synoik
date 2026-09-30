@@ -1580,7 +1580,7 @@ impl Op {
                 layout.overview_gesture_update(delta, timestamp);
             }
             Op::OverviewGestureEnd => {
-                layout.overview_gesture_end();
+                layout.overview_gesture_end(layout.clock.now_unadjusted());
             }
             Op::InteractiveMoveBegin {
                 window,
