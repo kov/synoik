@@ -26,6 +26,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -83,8 +84,10 @@ def main():
         cmd += ["-to", str(args.end)]
     cmd += ["-i", args.recording, "-fps_mode", "passthrough", "-vf", "showinfo",
             "-f", "rawvideo", "-pix_fmt", "gray", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # showinfo reports each frame's pts on stderr; read it after the frames.
+    # showinfo reports each frame's pts on stderr. It goes to a file, not a pipe: a pipe nobody
+    # reads until the frames are done fills up, and ffmpeg then blocks with the frames half out.
+    log = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log)
     frames = []
     while True:
         buf = proc.stdout.read(w * h)
@@ -92,8 +95,9 @@ def main():
             break
         luma = np.frombuffer(buf, np.uint8).reshape(h, w)
         frames.append([decode(luma, c, args.scale) for c in corners])
-    stderr = proc.stderr.read().decode(errors="replace")
     proc.wait()
+    log.seek(0)
+    stderr = log.read().decode(errors="replace")
     times = [
         float(part.split(":", 1)[1])
         for line in stderr.splitlines()
