@@ -34676,16 +34676,14 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
     }
 }
 
-/// An app with a window demanding attention is flagged in the dash, so the dock can poke its icon
-/// above the bottom edge — our affordance for urgency, which GNOME has no equivalent of
-/// (`windowAttentionHandler.js` shows a notification and touches nothing in the dash).
-#[test]
-fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
-    let mut f = Fixture::new();
+/// App "a" (a dash favorite) maps a window on the second desktop while another window holds
+/// focus on the first — mapping where the user is not looking is what marks it urgent. Returns
+/// the session objects, which must outlive the window.
+fn map_an_urgent_window(f: &mut Fixture) -> impl Sized {
     f.add_output(1, (1280, 720));
     // The catalog is keyed by desktop id; a toplevel `app_id` of "a" resolves through
     // `lookup_desktop_wmclass` to "a.desktop".
-    seed_favorites(&mut f, &["a.desktop"]);
+    seed_favorites(f, &["a.desktop"]);
 
     let id = f.add_client();
     f.roundtrip(id);
@@ -34702,9 +34700,9 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    let (session, session_id) = new_session(&mut f, id);
+    let (session, session_id) = new_session(f, id);
     remember(
-        &mut f,
+        f,
         &session_id,
         "main",
         ToplevelRecord {
@@ -34724,11 +34722,11 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
             f.client(id).qh.clone(),
         )
     };
-    let _handle =
+    let handle =
         session.restore_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
     f.client(id).window(&surface).commit();
     f.roundtrip(id);
-    map_at_configured_size(&mut f, id, &surface);
+    map_at_configured_size(f, id, &surface);
     f.settle();
 
     assert!(
@@ -34738,6 +34736,75 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
             .any(|(_, mapped)| mapped.is_urgent()),
         "a window mapping on another desktop demands attention"
     );
+    (session, handle)
+}
+
+/// Clicking a poked icon ends the poke by sliding the *icon* back under the edge, its glow
+/// fading as it goes — not by drawing the whole dash for the slide down. Activating the app clears
+/// its urgency, and with it the poke; the retreat must still draw as a poke until it lands.
+#[test]
+fn clicking_a_poked_icon_retreats_it_without_the_dash() {
+    let mut f = Fixture::new();
+    let _session = map_an_urgent_window(&mut f);
+    let output = f.synoik_output(1);
+    let step = |f: &mut Fixture| {
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
+    };
+
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_dock_urgency();
+    f.settle();
+    assert!(f.synoik().dock.is_poking(), "the urgent app pokes");
+    let poked = f
+        .synoik()
+        .dash_area(&output)
+        .expect("the poke is on screen");
+
+    let tile = f.synoik().dash.tile_center(0, poked).expect("tile 0");
+    pointer_motion_to(&mut f, tile.x, tile.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_dock_urgency();
+    assert!(
+        !f.synoik().dash.items().iter().any(|item| item.urgent),
+        "activating the app answers its demand for attention"
+    );
+
+    step(&mut f);
+    let retreating = f.synoik().dash_area(&output).expect("still sliding down");
+    assert!(
+        retreating.loc.y > poked.loc.y,
+        "the icon slides down: poked={poked:?} retreating={retreating:?}"
+    );
+    assert!(
+        f.synoik().dock.is_poking(),
+        "the retreat draws the poke, not the whole dash"
+    );
+    let fade = f.synoik().dock.poke_fade();
+    assert!(0. < fade && fade < 1., "the glow fades on the way: {fade}");
+
+    f.settle();
+    assert_eq!(
+        f.synoik().dash_area(&output),
+        None,
+        "and it lands off screen"
+    );
+}
+
+/// An app with a window demanding attention is flagged in the dash, so the dock can poke its icon
+/// above the bottom edge — our affordance for urgency, which GNOME has no equivalent of
+/// (`windowAttentionHandler.js` shows a notification and touches nothing in the dash).
+#[test]
+fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
+    let mut f = Fixture::new();
+    let _session = map_an_urgent_window(&mut f);
 
     f.synoik().sync_running_apps();
     f.synoik().sync_dash_favorites();

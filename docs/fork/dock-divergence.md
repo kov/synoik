@@ -87,6 +87,15 @@ pulling the dock the rest of the way out is exactly the moment you are reaching 
 that is the wrong moment for the only mark identifying it to disappear. It sits above the pill
 plate and below the icons, which is what the push order buys — first element pushed is topmost.
 
+A poke that ends — typically because you clicked the icon and the app took focus — **retreats as a
+poke**: the icons that were poking slide back under the edge with their glow fading in step with
+the slide (`Dock::retreating`, `Dock::poke_fade`; the dash remembers the poked ids in
+`Dash::poked`, since by then nothing is urgent). Answering the icon is not asking for the dock, so
+the chrome never appears. Pushing into the edge mid-retreat pulls out the whole dash as usual. A
+retreating poke is inert: nothing in it is urgent, so `filter_poke` passes no hits. The poke
+starting or ending mid-slide retargets the slide to the new floor rather than landing on the old
+one and snapping.
+
 ### Urgency is per window; an app you are looking at is not urgent
 
 Urgency stays per window, as mutter keeps it: focusing a window unsets its own
@@ -124,6 +133,8 @@ which is no signal at all.
 - `src/tests/vulkan_render.rs` — `a_poking_dash_draws_glowing_icons_and_no_chrome`, which is also
   the only exercise of the padded glow bake under `SYNOIK_VK_VALIDATION=1`.
 - `src/tests/gnome.rs` — `an_app_you_are_looking_at_does_not_demand_attention`.
+- `src/tests/gnome.rs` — `clicking_a_poked_icon_retreats_it_without_the_dash`, and in
+  `src/ui/dock.rs` `an_ended_poke_retreats_as_a_poke` / `a_poke_ending_mid_hide_does_not_snap`.
 - `src/ui/dock.rs` — the state machine: pressure, the slide, the grace period, the drag hold.
 - `src/tests/gnome.rs` — `the_dock_needs_pressure_on_the_bottom_edge`,
   `a_fullscreen_window_owns_the_bottom_edge`,

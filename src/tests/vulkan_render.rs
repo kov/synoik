@@ -7784,7 +7784,7 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                false,
+                None,
             )
             .len();
         // Nothing is urgent yet: a poke with no urgent app draws nothing at all.
@@ -7800,7 +7800,7 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                true,
+                Some(1.),
             )
             .len();
         (whole, empty_poke)
@@ -7837,7 +7837,7 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                true,
+                Some(1.),
             )
             .len();
         // The same urgency with the dock all the way out: the whole dash *plus* the glow.
@@ -7853,7 +7853,7 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                false,
+                None,
             )
             .len();
         (poked, full)
@@ -7878,6 +7878,46 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
         "pulling the dock the rest of the way out keeps the glow — exactly one layer more than \
          the same dash with nothing urgent, or the mark saying which icon you came for vanishes \
          at the moment you reach for it"
+    );
+
+    // The urgency clears — the user answered it — while the poke slides back under the edge.
+    // That retreat still draws the icon that was poking and its (fading) glow, not nothing and
+    // not the dash; and the whole dash has no glow left to draw.
+    let mut items = f.synoik().dash.items().to_vec();
+    items[0].urgent = false;
+    let n = items.len();
+    f.synoik().dash.set_items(items, n);
+
+    let state = f.synoik_state();
+    let answered = state.backend.headless().with_vulkan_renderer(|vk| {
+        let synoik = &mut state.synoik;
+        let mut render = |poke| {
+            synoik
+                .dash
+                .render(
+                    vk,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
+                    &output,
+                    controls.dash,
+                    1.0,
+                    false,
+                    synoik.appearance(),
+                    ACCENT,
+                    poke,
+                )
+                .len()
+        };
+        (render(Some(0.5)), render(None))
+    });
+    let (retreating, full) = answered.expect("the renderer was there a moment ago");
+    assert_eq!(
+        retreating, poked,
+        "the retreat draws what the poke drew: the icon and its glow"
+    );
+    assert_eq!(
+        full, whole,
+        "with nothing urgent, the whole dash draws no glow"
     );
 }
 
@@ -7931,7 +7971,7 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
             false,
             synoik.appearance(),
             ACCENT,
-            false,
+            None,
         );
     });
     if rendered.is_none() {
@@ -8034,7 +8074,7 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
                         false,
                         synoik.appearance(),
                         ACCENT,
-                        false,
+                        None,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8151,7 +8191,7 @@ fn vulkan_dash_hover_lightens_the_tile() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                false,
+                None,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8261,7 +8301,7 @@ fn vulkan_dark_style_repaints_the_dash_pill() {
                     false,
                     synoik.appearance(),
                     ACCENT,
-                    false,
+                    None,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -10010,7 +10050,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
                 false,
                 synoik.appearance(),
                 ACCENT,
-                false,
+                None,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());

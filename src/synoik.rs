@@ -12161,7 +12161,7 @@ impl Synoik {
                     true,
                     self.appearance(),
                     self.gnome_settings.accent_color,
-                    self.dock.is_poking(),
+                    self.dock.is_poking().then(|| self.dock.poke_fade()),
                 ) {
                     push(element.into());
                 }
@@ -12209,7 +12209,7 @@ impl Synoik {
                     self.appearance(),
                     self.gnome_settings.accent_color,
                     // The overview always shows the whole dash.
-                    false,
+                    None,
                 ) {
                     push(element.into());
                 }

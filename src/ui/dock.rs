@@ -66,6 +66,11 @@ pub struct Dock {
     /// the edge instead of fully hidden. Not a hold: the dock still slides freely between the
     /// poke and fully out, the poke is just where "away" now means.
     poking: bool,
+    /// The poke ended while the dock was on its way to it or resting on it, and it is sliding
+    /// back under the edge. That slide still draws as a poke — the icons that were poking, their
+    /// glow fading as they go — rather than as the whole dash: the user answered the icon, they
+    /// did not ask for the dock.
+    retreating: bool,
     /// Held open the same way while one of its icons has its context menu up — the menu pops
     /// *upward* out of the dash, so reaching it takes the pointer off the dock, and without
     /// this the dock slides away from under the menu a moment later.
@@ -84,6 +89,7 @@ impl Dock {
             dragging: false,
             peeked: false,
             poking: false,
+            retreating: false,
             menu_open: false,
             barrier: Barrier::new(THRESHOLD, TIMEOUT),
             clock,
@@ -159,6 +165,8 @@ impl Dock {
     /// Slide the dock out on `output`, or restart its hide timer if it is already out.
     pub fn show(&mut self, output: &Output) {
         self.leave_at = None;
+        // Pulled out for real: from here on it is the dock, not a retreating poke.
+        self.retreating = false;
 
         if self.output.as_ref() != Some(output) {
             self.output = Some(output.clone());
@@ -205,6 +213,7 @@ impl Dock {
         self.dragging = false;
         self.peeked = false;
         self.poking = false;
+        self.retreating = false;
         self.menu_open = false;
         self.barrier.leave();
     }
@@ -236,8 +245,24 @@ impl Dock {
     /// whenever the dock is out for its own reasons. Keying this on `Hidden` alone meant the
     /// rise into a poke was drawn as the full dash and only snapped to icons when the slide
     /// finished — chrome flashing up the screen edge on every urgent window.
+    ///
+    /// Also true for the slide back under the edge once the poke has ended (see
+    /// [`Self::retreating`]), which is what [`Self::poke_fade`] fades out.
     pub fn is_poking(&self) -> bool {
-        self.poking && !matches!(self.state, State::Shown | State::Showing(_))
+        (self.poking || self.retreating) && !matches!(self.state, State::Shown | State::Showing(_))
+    }
+
+    /// How strongly a poke's glow is drawn: full while an app wants attention, and fading with
+    /// the slide once the poke has ended, so the highlight is gone by the time the icon is
+    /// under the edge.
+    pub fn poke_fade(&self) -> f64 {
+        if self.poking {
+            1.
+        } else if self.retreating {
+            (self.progress() / POKE_PROGRESS).clamp(0., 1.)
+        } else {
+            0.
+        }
     }
 
     /// How far out "away" is: the bottom edge normally, the poke while an app wants attention.
@@ -261,18 +286,30 @@ impl Dock {
         self.poking = poking;
 
         if poking {
+            self.retreating = false;
             if self.output.is_none() {
                 self.output = output.cloned();
             }
-            // Rise into the poke only from rest; mid-slide or fully out, the floor change is
-            // enough and the current animation still lands somewhere sensible.
-            if matches!(self.state, State::Hidden) {
-                self.state = State::Hiding(self.slide(0., POKE_PROGRESS));
-            }
-        } else if matches!(self.state, State::Hidden) {
-            // Resting on the poke with the urgency gone: slide the rest of the way away.
-            self.state = State::Hiding(self.slide(POKE_PROGRESS, 0.));
         }
+
+        // Settle on the new floor. Out (or on the way out) the floor change is enough: the
+        // next hide heads for it. Away, or on the way away, the slide is retargeted — an
+        // animation left aiming at the old floor would land there and then snap to the new one.
+        let from = match &self.state {
+            State::Shown | State::Showing(_) => return,
+            State::Hidden => {
+                if poking {
+                    0.
+                } else {
+                    POKE_PROGRESS
+                }
+            }
+            State::Hiding(anim) => anim.clamped_value(),
+        };
+        if !poking {
+            self.retreating = true;
+        }
+        self.state = State::Hiding(self.slide(from, self.floor()));
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -424,6 +461,7 @@ impl Dock {
                 self.state = State::Hidden;
                 self.hovered = false;
                 self.leave_at = None;
+                self.retreating = false;
                 // A poking dock is still on screen and still belongs to its output.
                 if !self.poking {
                     self.output = None;
@@ -513,6 +551,78 @@ mod tests {
             dock.area(&output).is_none(),
             "and clearing the urgency puts it away"
         );
+    }
+
+    /// A poke that ends slides its icon back under the edge *as a poke*, the glow fading with
+    /// the slide — and pulling the dock out mid-retreat makes it the whole dash again.
+    #[test]
+    fn an_ended_poke_retreats_as_a_poke() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        dock.set_poking(Some(&output), true);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+        let poked = dock.area(&output).expect("poking").loc.y;
+        assert_eq!(dock.poke_fade(), 1.);
+
+        dock.set_poking(Some(&output), false);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS + SLIDE_MS / 4));
+        dock.advance_animations();
+        let retreating = dock.area(&output).expect("still on screen").loc.y;
+        assert!(retreating > poked, "it slides down: {poked} → {retreating}");
+        assert!(dock.is_poking(), "the retreat draws the poke, not the dash");
+        let fade = dock.poke_fade();
+        assert!(
+            0. < fade && fade < 1.,
+            "the glow fades with the slide: {fade}"
+        );
+
+        dock.show(&output);
+        assert!(!dock.is_poking(), "pulled out, it is the whole dash again");
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS * 3));
+        dock.advance_animations();
+        dock.hide();
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS * 5));
+        dock.advance_animations();
+        assert!(dock.area(&output).is_none(), "and it hides all the way");
+        assert!(!dock.is_poking());
+    }
+
+    /// The poke ending while the dock is sliding down *to* it retargets the slide to the edge,
+    /// rather than landing on the poke and then snapping away.
+    #[test]
+    fn a_poke_ending_mid_hide_does_not_snap() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        dock.set_poking(Some(&output), true);
+        dock.show(&output);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+        dock.hide();
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS + SLIDE_MS / 4));
+        dock.advance_animations();
+
+        dock.set_poking(Some(&output), false);
+        let mut last = dock.area(&output).expect("mid-hide").loc.y;
+        for i in 1..=8 {
+            clock.set_unadjusted(Duration::from_millis(SLIDE_MS + SLIDE_MS / 4 + i * 30));
+            dock.advance_animations();
+            let Some(area) = dock.area(&output) else {
+                break;
+            };
+            assert!(area.loc.y >= last, "it only ever moves down");
+            last = area.loc.y;
+        }
+        let h = crate::ui::dash::preferred_height(output_size(&output));
+        assert!(
+            last > 1080. - h * POKE_PROGRESS,
+            "its last frame on screen is below the poke, not on it: {last}"
+        );
+        assert!(dock.area(&output).is_none(), "and it lands off screen");
     }
 
     /// Pushing into the bottom edge builds pressure the same way the hot corner does: contact

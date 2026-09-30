@@ -362,6 +362,12 @@ pub struct Dash {
     n_favorites: usize,
     /// Bumped when `items` changes — the bake revision's content part.
     content_rev: u64,
+    /// The apps that were demanding attention the last time any was — by id, because an index
+    /// goes stale across a content change. A poke that has ended still slides its icons back
+    /// under the edge (`Dock::retreating`), and by then no item is urgent any more; this is what
+    /// it draws. Only [`Self::set_items`] writes it, which bumps `content_rev`, so the glow
+    /// bake keyed on that revision cannot go stale behind it.
+    poked: Vec<String>,
     /// While a drag hovers the dash, the favourites index the drop would land at.
     /// The run opens a gap there so the icons part around the incoming app
     /// (gnome-shell's `_dragPlaceholder`, `dash.js:926-932`). The placeholder is a
@@ -405,6 +411,7 @@ impl Dash {
             items: Vec::new(),
             n_favorites: 0,
             content_rev: 0,
+            poked: Vec::new(),
             drop_slot: None,
             gap: settled(&clock, 0.),
             gap_slot: 0,
@@ -427,6 +434,13 @@ impl Dash {
     pub fn set_items(&mut self, items: Vec<DashEntry>, n_favorites: usize) -> bool {
         if items == self.items && n_favorites == self.n_favorites {
             return false;
+        }
+        if items.iter().any(|entry| entry.urgent) {
+            self.poked = items
+                .iter()
+                .filter(|entry| entry.urgent)
+                .map(|entry| entry.id.clone())
+                .collect();
         }
         self.items = items;
         self.n_favorites = n_favorites;
@@ -939,17 +953,24 @@ impl Dash {
         // `org.gnome.desktop.interface accent-color` — what an urgent app's icon glows in,
         // wherever the dash is drawn.
         accent: [u8; 3],
-        // Drawing the *poke*: only the apps demanding attention, and no pill, blur, separator,
-        // dots or show-apps button — the dock rests part-way out in this mode, so what shows
-        // above the screen edge is icons rather than a slab of dash. They keep their normal
-        // horizontal positions, so pushing into the edge lands the pointer on the one you are
-        // about to click.
-        poking: bool,
+        // Drawing the *poke*, with its glow at this strength (`Dock::poke_fade`): only the apps
+        // demanding attention, and no pill, blur, separator, dots or show-apps button — the dock
+        // rests part-way out in this mode, so what shows above the screen edge is icons rather
+        // than a slab of dash. They keep their normal horizontal positions, so pushing into the
+        // edge lands the pointer on the one you are about to click.
+        poke: Option<f64>,
     ) -> Vec<DashElement> {
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
         let metrics = layout.metrics;
         let alpha = progress as f32;
+        let poking = poke.is_some();
+        // What glows: the urgent apps, wherever the dash is drawn — or, in a poke retreating
+        // after the urgency cleared, the apps that were poking.
+        let any_urgent = self.items.iter().any(|entry| entry.urgent);
+        let glows = |entry: &DashEntry| {
+            entry.urgent || (poking && !any_urgent && self.poked.contains(&entry.id))
+        };
 
         let mut cache = self.cache.borrow_mut();
         // Cached uploads belong to one renderer context; drop them if it changed. Shared map,
@@ -1018,7 +1039,7 @@ impl Dash {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !poking || entry.urgent)
+            .filter(|(_, entry)| !poking || glows(entry))
         {
             if let Some(el) = widget::app_icon_element(
                 renderer,
@@ -1044,13 +1065,13 @@ impl Dash {
         // would drop the only mark saying which icon you came for. There is no GNOME reference
         // — attention on the dash is ours (`dock-divergence.md`); GNOME posts a notification
         // and leaves the dash alone.
-        if self.items.iter().any(|entry| entry.urgent) {
+        if self.items.iter().any(glows) {
             let accent = widget::style::accent_rgba(accent);
             let tiles: Vec<Rectangle<f64, Logical>> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, entry)| entry.urgent)
+                .filter(|(_, entry)| glows(entry))
                 .map(|(i, _)| {
                     let t = layout.tiles[i];
                     Rectangle::new(
@@ -1096,7 +1117,7 @@ impl Dash {
                         TextureRenderElement::from_texture_buffer(
                             buffer,
                             layout.pill.loc - Point::from((GLOW_PAD, GLOW_PAD)),
-                            alpha,
+                            alpha * poke.unwrap_or(1.) as f32,
                             None,
                             None,
                             Kind::Unspecified,
