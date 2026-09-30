@@ -46,13 +46,16 @@ Travel is read off the animation curve across one fixed **exposure** either side
 does not get a sharper picture of the same gesture), never differenced between frames: a dropped
 frame must not change how the next one is blurred.
 
-A swipe under the finger has no curve. The gesture records where the *strip* has been — after
-clamping and rubber-banding, so a finger pushing against the end of the row blurs nothing — and
-the travel is the strip's movement over the exposure just ended, interpolated from those samples.
-A reversal inside the exposure cancels against itself and a stall runs down to zero within one, so
-the smear follows the hand as it is now. That run-down happens with no input to repaint it, so a
-gesture that moved within the last exposure keeps asking for frames until the strip has been
-still for a whole one and the frame on screen is sharp.
+A swipe under the finger has no curve. Each input event records where it left the *strip* —
+after clamping and rubber-banding, so a finger pushing against the end of the row blurs nothing —
+stamped with the event's own timestamp, and the travel is the strip's movement over the exposure
+ending at the **latest event**, interpolated from those samples. Not the exposure ending at the
+frame: a frame's clock is pinned at its target presentation time, about a frame ahead of the input
+it shows, so a window ending there has slid past the latest event and reads a steady 60 Hz swipe
+as standing still. A reversal inside the exposure cancels against itself, so the smear follows the
+hand as it is now; fingers that stop on the pad send still events, which end the smear at once.
+Input that simply ends leaves the speed standing for `MOTION_BLUR_STALE` (two exposures) of frame
+time, and a gesture keeps asking for frames until then, so the frame left on screen is sharp.
 
 ### Swipes blur only when fast
 
@@ -68,15 +71,15 @@ exposure. A slow swipe is the hand tracking content it wants to read. Above the 
 radius ramps from nothing to the full travel at twice the threshold, so a swipe that speeds up
 eases into the smear rather than popping into it.
 
-Why a release speed and not a travel threshold alone: the fling carries almost all of a flick's
-motion (the finger phase is 0-3 frames), and it peaks at 0.13-0.18 of a workspace per exposure
-against a keyboard switch's 0.19, so no travel threshold that keeps slow drags sharp gives a flick
-the keyboard's smear. At a slowed `org.synoik.animations speed` the fling slows too, and a travel
-threshold would drop it entirely. The release speeds, by contrast, do not overlap: measured on a
-touchpad (400 px per workspace), slow drags release at ≤0.28 px/ms and flicks at ≥1.03 px/ms.
+Why a release speed and not a travel threshold alone: a flick's fling peaks at 0.13-0.18 of a
+workspace per exposure against a keyboard switch's 0.19, and ramps down from there, so a threshold
+that keeps slow drags sharp takes most of a flick's smear away. At a slowed
+`org.synoik.animations speed` the fling slows too, and a travel threshold would drop it entirely.
+The release speeds, by contrast, do not overlap: measured on a touchpad (400 px per workspace),
+slow drags release at ≤0.28 px/ms and flicks at ≥1.03 px/ms.
 
-`SYNOIK_SWIPE_BLUR_THRESHOLD` overrides the travel threshold on a live seat while it is being
-confirmed by feel (a test build never reads it); it goes away once the value is settled.
+The threshold itself (0.075) sits over what slow drags do under the finger — up to 0.06 per
+exposure, with lone frames up to 0.11 that were not visible — and under fast drags, 0.19-0.48.
 
 The render side composites everything that slides into a per-output offscreen and smears it —
 `MotionBlurSlot::render`, `src/render_helpers/vulkan/motion_blur.rs`. The smear is

@@ -37574,22 +37574,39 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
         "the full travel of a fast swipe, got {fast:.1}px"
     );
 
-    // The fingers stop. Nothing repaints on its own, so the compositor must keep drawing until
-    // the smear has run down — and it runs down within one exposure.
+    // A frame's clock is pinned at its target presentation time, about a frame ahead of the
+    // input it shows. The swipe is still moving as far as that frame is concerned.
+    f.advance_clock(Duration::from_millis(16));
+    assert!(
+        motion(&mut f).is_some(),
+        "a frame drawn ahead of the latest event still sees the swipe's speed"
+    );
+
+    // The input just ends. Nothing repaints on its own, so the compositor must keep drawing until
+    // the smear has run down — and it runs down within two exposures of the last event.
     assert!(
         frames_wanted(&mut f),
-        "a smeared swipe must keep frames coming after the fingers stop"
+        "a smeared swipe must keep frames coming after the input ends"
     );
-    f.advance_clock(Duration::from_millis(17));
+    f.advance_clock(Duration::from_millis(18));
     assert_eq!(
         motion(&mut f),
         None,
-        "a swipe held still is sharp within one exposure"
+        "a swipe with no input is sharp within two exposures"
     );
     assert!(
         !frames_wanted(&mut f),
         "…and asks for no more frames once still"
     );
+
+    // Fingers that stop on the pad report it: the first still event ends the smear.
+    // Back the other way, so the strip stays clear of the one-workspace bound.
+    step(&mut f, 0., 8);
+    step(&mut f, -100., 8);
+    step(&mut f, -100., 8);
+    assert!(motion(&mut f).is_some(), "moving again smears again");
+    step(&mut f, 0., 17);
+    assert_eq!(motion(&mut f), None, "a still event is sharp");
 
     // Out and straight back inside one exposure: the strip ends where it started, and the smear
     // says so rather than adding up the two legs.

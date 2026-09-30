@@ -10,7 +10,6 @@ use std::cmp::min;
 use std::collections::VecDeque;
 use std::iter::zip;
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use smithay::backend::renderer::element::utils::{
@@ -106,6 +105,13 @@ const MOTION_BLUR_EXPOSURE: Duration = Duration::from_micros(16_667);
 /// every switch precisely where the strip is settling and the eye is coming to rest.
 const MOTION_BLUR_MIN_TRAVEL: f64 = 6.;
 
+/// How long after its latest input event a swipe's speed still stands, in frame time.
+///
+/// Two exposures: a frame is drawn about one ahead of the input it shows, and the next event of a
+/// moving finger is up to one more away. A finger that stops sends stationary events, which run
+/// the speed down on their own; this is only for input that simply ends.
+const MOTION_BLUR_STALE: Duration = Duration::from_micros(2 * 16_667);
+
 /// The cap on reported travel, as a multiple of the strip-axis extent.
 ///
 /// Must not exceed `MotionBlur::MAX_TRAVEL_FACTOR` in
@@ -122,26 +128,10 @@ const MOTION_BLUR_MAX_TRAVEL_FACTOR: f64 = 1.5;
 /// popping into it. A release past gnome-shell's flick speed skips this entirely: a flick asks
 /// for the next workspace the way Super+Page Down does, and its fling smears the same way.
 ///
-/// Measured on a touchpad at 400 px per workspace: slow drags peak at 0.055 under the finger and
-/// 0.064 in the settle; a flick peaks at 0.07–0.14 under the finger, for at most three frames.
+/// Measured on a touchpad at 400 px per workspace: slow drags run at up to 0.06 under the finger,
+/// with lone frames up to 0.11 that nobody sees, and 0.064 in the settle; fast drags run at
+/// 0.19–0.48.
 const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.075;
-
-/// [`SWIPE_MOTION_BLUR_THRESHOLD`], overridable on a live seat through
-/// `SYNOIK_SWIPE_BLUR_THRESHOLD` while the value is being chosen by feel. A test build never
-/// reads the environment, so a suite started from inside a tuned session cannot see the knob.
-fn swipe_motion_blur_threshold() -> f64 {
-    static THRESHOLD: OnceLock<f64> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        if cfg!(test) {
-            return SWIPE_MOTION_BLUR_THRESHOLD;
-        }
-        std::env::var("SYNOIK_SWIPE_BLUR_THRESHOLD")
-            .ok()
-            .and_then(|raw| raw.parse::<f64>().ok())
-            .filter(|t| t.is_finite() && *t >= 0.)
-            .unwrap_or(SWIPE_MOTION_BLUR_THRESHOLD)
-    })
-}
 
 /// How long the row's scroll stays held after the pointer leaves its band — see
 /// [`StripFreeze`]. The same `WINDOW_REPOSITIONING_DELAY` the picker's close freeze runs on,
@@ -355,10 +345,22 @@ pub struct WorkspaceSwitchGesture {
     // When the last GNOME-mode DnD edge snap switched workspaces; the next
     // snap waits out [`WORKSPACE_DND_EDGE_SNAP_GRACE`] from here.
     dnd_snap_last_switch: Option<Duration>,
-    /// Where the strip has been over the last couple of exposures: `(unadjusted clock time,
-    /// current_idx)`, oldest first. What the motion blur reads a finger-driven switch's speed
-    /// off — the *strip's* travel, after clamping and rubber-banding, not the finger's.
-    motion: VecDeque<(Duration, f64)>,
+    /// Where the strip has been over the last couple of exposures, oldest first. What the motion
+    /// blur reads a finger-driven switch's speed off — the *strip's* travel, after clamping and
+    /// rubber-banding, not the finger's.
+    motion: VecDeque<MotionSample>,
+}
+
+/// One input event's effect on the strip, for [`WorkspaceSwitchGesture::travel_idx`].
+#[derive(Debug, Clone, Copy)]
+struct MotionSample {
+    /// The input event's own timestamp: the finger's cadence, which a burst of events handled
+    /// together does not flatten.
+    event_time: Duration,
+    /// The unadjusted clock when the event was handled — the frames' timebase, which event
+    /// timestamps need not share.
+    received: Duration,
+    idx: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,45 +700,70 @@ impl WorkspaceSwitch {
 }
 
 impl WorkspaceSwitchGesture {
-    /// Record where the strip is at `now`, dropping samples no exposure window can reach.
-    fn record_motion(&mut self, now: Duration) {
-        self.motion.push_back((now, self.current_idx));
-        let horizon = now.saturating_sub(MOTION_BLUR_EXPOSURE * 2);
+    /// Record where an input event left the strip, dropping samples no exposure window can reach.
+    ///
+    /// The first event of a swipe also records where the strip stood before it, so the travel
+    /// that event caused counts.
+    fn record_motion(&mut self, event_time: Duration, received: Duration, idx_before: f64) {
+        if self.motion.is_empty() {
+            self.motion.push_back(MotionSample {
+                event_time,
+                received,
+                idx: idx_before,
+            });
+        }
+        self.motion.push_back(MotionSample {
+            event_time,
+            received,
+            idx: self.current_idx,
+        });
+        let horizon = event_time.saturating_sub(MOTION_BLUR_EXPOSURE * 2);
         // Keep one sample at or before the horizon, so a window starting there can interpolate.
-        while self.motion.len() > 2 && self.motion[1].0 <= horizon {
+        while self.motion.len() > 2 && self.motion[1].event_time <= horizon {
             self.motion.pop_front();
         }
     }
 
-    /// Where the strip was at `at`, interpolated between recorded samples; before the first
-    /// sample it was where the swipe began, after the last it has not moved since.
+    /// Where the strip was at event time `at`, interpolated between recorded samples; before the
+    /// first sample it was where the swipe began.
     fn idx_at(&self, at: Duration) -> f64 {
-        let Some(&(last_t, last_idx)) = self.motion.back() else {
+        let Some(last) = self.motion.back() else {
             return self.current_idx;
         };
-        if at >= last_t {
-            return last_idx;
+        if at >= last.event_time {
+            return last.idx;
         }
-        let mut later = (last_t, last_idx);
-        for &(t, idx) in self.motion.iter().rev().skip(1) {
-            if t <= at {
-                let span = (later.0 - t).as_secs_f64();
+        let mut later = last;
+        for sample in self.motion.iter().rev().skip(1) {
+            if sample.event_time <= at {
+                let span = (later.event_time - sample.event_time).as_secs_f64();
                 if span == 0. {
-                    return later.1;
+                    return later.idx;
                 }
-                let f = (at - t).as_secs_f64() / span;
-                return idx + (later.1 - idx) * f;
+                let f = (at - sample.event_time).as_secs_f64() / span;
+                return sample.idx + (later.idx - sample.idx) * f;
             }
-            later = (t, idx);
+            later = sample;
         }
-        later.1
+        later.idx
     }
 
-    /// How many workspaces the strip moved across the exposure ending at `now`. A reversal
-    /// inside the window cancels against itself and a stall runs down to zero within one
-    /// exposure, which is what makes the smear follow the hand rather than its history.
+    /// How many workspaces the strip moved across the exposure ending at the latest input event,
+    /// or nothing once no event has come for [`MOTION_BLUR_STALE`] of frame time `now`.
+    ///
+    /// The window ends at the *event*, not at `now`, because a frame's clock is pinned at its
+    /// target presentation time, about a frame ahead of the input it shows: a window ending at
+    /// `now` has slid past the latest event by the time the frame draws, and read a swipe at a
+    /// steady 60 Hz of events as standing still. A reversal inside the window cancels against
+    /// itself, which is what makes the smear follow the hand rather than its history.
     fn travel_idx(&self, now: Duration) -> f64 {
-        (self.idx_at(now) - self.idx_at(now.saturating_sub(MOTION_BLUR_EXPOSURE))).abs()
+        let Some(last) = self.motion.back() else {
+            return 0.;
+        };
+        if now.saturating_sub(last.received) > MOTION_BLUR_STALE {
+            return 0.;
+        }
+        (last.idx - self.idx_at(last.event_time.saturating_sub(MOTION_BLUR_EXPOSURE))).abs()
     }
 
     fn min_max(&self, workspace_count: usize) -> (f64, f64) {
@@ -4010,7 +4037,7 @@ impl<W: LayoutElement> Monitor<W> {
         // hand, and only smears once it moves fast enough to strobe; a flick's fling smears like
         // a keyboard switch. See [`SWIPE_MOTION_BLUR_THRESHOLD`].
         if self.workspace_switch_from_gesture && !self.workspace_switch_flung {
-            let threshold = swipe_motion_blur_threshold() * extent;
+            let threshold = SWIPE_MOTION_BLUR_THRESHOLD * extent;
             if threshold > 0. {
                 travel *= ((travel - threshold) / threshold).clamp(0., 1.);
             }
@@ -5085,7 +5112,7 @@ impl<W: LayoutElement> Monitor<W> {
         let center_idx = self.active_workspace_idx;
         let current_idx = self.workspace_render_idx();
 
-        let mut gesture = WorkspaceSwitchGesture {
+        let gesture = WorkspaceSwitchGesture {
             center_idx,
             start_idx: current_idx,
             current_idx,
@@ -5098,7 +5125,6 @@ impl<W: LayoutElement> Monitor<W> {
             dnd_snap_last_switch: None,
             motion: VecDeque::new(),
         };
-        gesture.record_motion(self.clock.now_unadjusted());
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
         self.workspace_switch_from_gesture = true;
         self.workspace_switch_flung = false;
@@ -5190,11 +5216,12 @@ impl<W: LayoutElement> Monitor<W> {
         let new_idx = gesture.start_idx + pos;
         let new_idx = rubber_band.clamp(min, max, new_idx);
 
-        let changed = gesture.current_idx != new_idx;
+        let idx_before = gesture.current_idx;
+        let changed = idx_before != new_idx;
         gesture.current_idx = new_idx;
         // Stationary updates are recorded too: they are what says the strip has been standing
         // still, so a swipe that resumes after a pause measures its speed from the pause.
-        gesture.record_motion(self.clock.now_unadjusted());
+        gesture.record_motion(timestamp, self.clock.now_unadjusted(), idx_before);
         Some(changed)
     }
 
