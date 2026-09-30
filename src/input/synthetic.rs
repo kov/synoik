@@ -18,11 +18,12 @@ use smithay::backend::input::{
     DeviceCapability, Event, GestureBeginEvent, GestureEndEvent, GestureHoldBeginEvent,
     GestureHoldEndEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent,
-    PointerButtonEvent, PointerMotionEvent, TouchDownEvent, TouchEvent, TouchSlot, TouchUpEvent,
-    UnusedEvent,
+    PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
+    TouchSlot, TouchUpEvent, UnusedEvent,
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
+use smithay::utils::{Logical, Point};
 use synoik_ipc::InjectedEvent;
 
 use crate::synoik::State;
@@ -72,6 +73,23 @@ pub fn inject(state: &mut State, event: &InjectedEvent) -> Result<(), String> {
                     time: now(),
                     dx: *dx,
                     dy: *dy,
+                },
+            };
+            state.process_input_event(event);
+        }
+        InjectedEvent::PointerMoveTo { x, y } => {
+            let pos = Point::<f64, Logical>::from((*x, *y));
+            if state.synoik.output_under(pos).is_none() {
+                return Err(format!("({x}, {y}) is not on any output"));
+            }
+            // The pipeline maps an absolute event with no output of its own into the bounding
+            // rectangle of all outputs, so hand it the position relative to that.
+            let origin = state.global_bounding_rectangle().unwrap().loc.to_f64();
+            let event = InputEvent::<SyntheticInputBackend>::PointerMotionAbsolute {
+                event: SyntheticPointerMotionAbsoluteEvent {
+                    time: now(),
+                    x: x - origin.x,
+                    y: y - origin.y,
                 },
             };
             state.process_input_event(event);
@@ -379,6 +397,44 @@ impl PointerMotionEvent<SyntheticInputBackend> for SyntheticPointerMotionEvent {
     }
 }
 
+/// An absolute pointer position, relative to the origin of the outputs' bounding rectangle
+/// (which is where the pipeline maps an absolute event from a device with no output).
+pub struct SyntheticPointerMotionAbsoluteEvent {
+    pub time: u64,
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticPointerMotionAbsoluteEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticPointerMotionAbsoluteEvent {
+    fn x(&self) -> f64 {
+        self.x
+    }
+
+    fn y(&self) -> f64 {
+        self.y
+    }
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        self.x
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        self.y
+    }
+}
+
+impl PointerMotionAbsoluteEvent<SyntheticInputBackend> for SyntheticPointerMotionAbsoluteEvent {}
+
 /// A scroll: either a discrete wheel notch (`v120 / 120` notches on the vertical axis)
 /// or a continuous finger scroll, which is what a touchpad two-finger swipe produces and
 /// what the app grid's page swipe rides on.
@@ -638,7 +694,7 @@ impl InputBackend for SyntheticInputBackend {
     type PointerAxisEvent = SyntheticPointerAxisEvent;
     type PointerMotionEvent = SyntheticPointerMotionEvent;
 
-    type PointerMotionAbsoluteEvent = UnusedEvent;
+    type PointerMotionAbsoluteEvent = SyntheticPointerMotionAbsoluteEvent;
 
     type GestureSwipeBeginEvent = SyntheticGestureSwipeBeginEvent;
     type GestureSwipeUpdateEvent = SyntheticGestureSwipeUpdateEvent;
@@ -760,7 +816,6 @@ mod tests {
     fn finger_scroll_stop_and_hold_reach_the_client() {
         use wayland_client::protocol::wl_pointer::{Axis as WlAxis, AxisSource as WlAxisSource};
 
-        use crate::synoik::CenterCoords;
         use crate::tests::client::PointerEvent;
 
         let mut f = Fixture::new();
@@ -777,13 +832,20 @@ mod tests {
         f.double_roundtrip(id);
         f.client(id).get_pointer();
         f.roundtrip(id);
-        assert!(
-            f.synoik_state()
-                .move_cursor_to_focused_tile(CenterCoords::Both),
-            "precondition: the pointer is over the window"
-        );
+        // Placed the way a `synoik msg` rig does it, onto the (centred) window. Not by slamming
+        // into the top-left first: resting there fires the hot corner, and the overview it opens
+        // consumes finger scrolls.
+        inject(
+            f.synoik_state(),
+            &InjectedEvent::PointerMoveTo { x: 960., y: 540. },
+        )
+        .unwrap();
         f.double_roundtrip(id);
-        let _ = f.client(id).take_pointer_events();
+        assert_eq!(
+            f.client(id).take_pointer_events(),
+            vec![PointerEvent::Enter],
+            "precondition: the pointer entered the window"
+        );
 
         inject(
             f.synoik_state(),

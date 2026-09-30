@@ -232,6 +232,18 @@ pub enum InputCmd {
         #[arg(allow_negative_numbers = true)]
         dy: f64,
     },
+    /// Move the pointer to an absolute position in global logical pixels.
+    ///
+    /// Unlike slamming pointer-motion into a corner first, this never rests on the hot corner
+    /// (unless asked to land on it), which would open the overview.
+    PointerMoveTo {
+        /// Horizontal position.
+        #[arg(allow_negative_numbers = true)]
+        x: f64,
+        /// Vertical position.
+        #[arg(allow_negative_numbers = true)]
+        y: f64,
+    },
     /// Click: press, then release a pointer button.
     Click {
         /// The button to click.
@@ -301,6 +313,7 @@ impl InputCmd {
             InputCmd::PointerMotion { dx, dy } => {
                 vec![InjectedEvent::PointerMotion { dx: *dx, dy: *dy }]
             }
+            InputCmd::PointerMoveTo { x, y } => vec![InjectedEvent::PointerMoveTo { x: *x, y: *y }],
             InputCmd::Click { button } => vec![
                 InjectedEvent::ButtonPress {
                     button: button.clone(),

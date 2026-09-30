@@ -1855,10 +1855,11 @@ impl Dispatch<WlSeat, ()> for State {
     }
 }
 
-/// A `wl_pointer` scroll or hold-gesture event, as the client saw it. Motion, buttons and
-/// enter/leave are left out: no test needs them yet.
+/// A `wl_pointer` enter, scroll or hold-gesture event, as the client saw it. Motion, buttons and
+/// leave are left out: no test needs them yet.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PointerEvent {
+    Enter,
     AxisSource(wl_pointer::AxisSource),
     Axis { axis: wl_pointer::Axis, value: f64 },
     AxisStop(wl_pointer::Axis),
@@ -1876,6 +1877,7 @@ impl Dispatch<WlPointer, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         let event = match event {
+            wl_pointer::Event::Enter { .. } => PointerEvent::Enter,
             wl_pointer::Event::AxisSource { axis_source } => {
                 PointerEvent::AxisSource(axis_source.into_result().unwrap())
             }

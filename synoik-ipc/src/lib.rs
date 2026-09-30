@@ -189,6 +189,15 @@ pub enum InjectedEvent {
         /// Vertical delta.
         dy: f64,
     },
+    /// Move the pointer to an absolute position in global logical coordinates, as a tablet or a
+    /// VM's absolute pointer does. Nothing is clamped away, so no edge pressure builds up — but
+    /// landing exactly on the hot corner still fires it, as it would for such a device.
+    PointerMoveTo {
+        /// Horizontal position.
+        x: f64,
+        /// Vertical position.
+        y: f64,
+    },
     /// Press (and hold) a pointer button.
     ButtonPress {
         /// The button to press.
