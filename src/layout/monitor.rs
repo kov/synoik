@@ -114,13 +114,17 @@ const MOTION_BLUR_MIN_TRAVEL: f64 = 6.;
 const MOTION_BLUR_MAX_TRAVEL_FACTOR: f64 = 1.5;
 
 /// Travel per exposure, as a fraction of one workspace, below which a switch the user is steering
-/// — a swipe, or the fling it was released into — is not blurred.
+/// — a swipe under the finger, or the fling a slow release eases into — is not blurred.
 ///
 /// A slow, deliberate swipe is the hand tracking content it wants to read, and a smear would
-/// blur what it is looking for; a fast one strobes just like a long keyboard switch. Above the
-/// threshold the radius ramps from nothing up to the full travel at twice the threshold, so a
-/// swipe that speeds up eases into the smear instead of popping into it.
-const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.125;
+/// blur what it is looking for. Above the threshold the radius ramps from nothing up to the full
+/// travel at twice the threshold, so a swipe that speeds up eases into the smear instead of
+/// popping into it. A release past gnome-shell's flick speed skips this entirely: a flick asks
+/// for the next workspace the way Super+Page Down does, and its fling smears the same way.
+///
+/// Measured on a touchpad at 400 px per workspace: slow drags peak at 0.055 under the finger and
+/// 0.064 in the settle; a flick peaks at 0.07–0.14 under the finger, for at most three frames.
+const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.075;
 
 /// [`SWIPE_MOTION_BLUR_THRESHOLD`], overridable on a live seat through
 /// `SYNOIK_SWIPE_BLUR_THRESHOLD` while the value is being chosen by feel. A test build never
@@ -250,6 +254,9 @@ pub struct Monitor<W: LayoutElement> {
     /// the only trace left in the animation is a non-zero initial velocity, which is not a
     /// provenance. [`Self::workspace_switch_motion`] is what needs to tell them apart.
     pub(super) workspace_switch_from_gesture: bool,
+    /// Whether the gesture was released as a flick — past gnome-shell's own flick speed — so the
+    /// fling it became smears like a keyboard switch; see [`SWIPE_MOTION_BLUR_THRESHOLD`].
+    pub(super) workspace_switch_flung: bool,
     /// Indication where an interactively-moved window is about to be placed.
     pub(super) insert_hint: Option<InsertHint>,
     /// Insert hint element for rendering.
@@ -861,6 +868,7 @@ impl<W: LayoutElement> Monitor<W> {
             app_grid_gesture: None,
             workspace_switch: None,
             workspace_switch_from_gesture: false,
+            workspace_switch_flung: false,
             clock,
             base_options,
             options,
@@ -1129,6 +1137,7 @@ impl<W: LayoutElement> Monitor<W> {
                     config,
                 )));
                 self.workspace_switch_from_gesture = false;
+                self.workspace_switch_flung = false;
             }
         }
     }
@@ -3997,10 +4006,10 @@ impl<W: LayoutElement> Monitor<W> {
         let extent = self.workspace_extent_with_gap(self.overview_zoom());
         let mut travel = travel_idx * extent;
 
-        // A switch the user is steering — the swipe, or the fling it was released into — tracks
-        // their hand, and only smears once it moves fast enough to strobe; see
-        // [`SWIPE_MOTION_BLUR_THRESHOLD`].
-        if self.workspace_switch_from_gesture {
+        // A switch the user is steering — the swipe, or a fling it was eased into — tracks their
+        // hand, and only smears once it moves fast enough to strobe; a flick's fling smears like
+        // a keyboard switch. See [`SWIPE_MOTION_BLUR_THRESHOLD`].
+        if self.workspace_switch_from_gesture && !self.workspace_switch_flung {
             let threshold = swipe_motion_blur_threshold() * extent;
             if threshold > 0. {
                 travel *= ((travel - threshold) / threshold).clamp(0., 1.);
@@ -5092,6 +5101,7 @@ impl<W: LayoutElement> Monitor<W> {
         gesture.record_motion(self.clock.now_unadjusted());
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
         self.workspace_switch_from_gesture = true;
+        self.workspace_switch_flung = false;
     }
 
     pub fn dnd_scroll_gesture_begin(&mut self) {
@@ -5127,6 +5137,7 @@ impl<W: LayoutElement> Monitor<W> {
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
         self.workspace_switch_from_gesture = true;
+        self.workspace_switch_flung = false;
     }
 
     pub fn workspace_switch_gesture_update(
@@ -5352,6 +5363,15 @@ impl<W: LayoutElement> Monitor<W> {
         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
         rubber_band.limit /= zoom;
 
+        // Read before the rubber band damps it: a flick is a flick wherever it lands.
+        let flick_threshold = if gesture.is_touchpad {
+            super::VELOCITY_THRESHOLD_TOUCHPAD
+        } else {
+            super::VELOCITY_THRESHOLD_TOUCH
+        };
+        let flung = gesture.dnd_last_event_time.is_none()
+            && gesture.tracker.velocity().abs() >= flick_threshold * 1000.;
+
         let mut velocity = gesture.tracker.velocity() / total_height;
         let current_pos = gesture.tracker.pos() / total_height;
         let pos = gesture.tracker.projected_end_pos() / total_height;
@@ -5393,6 +5413,7 @@ impl<W: LayoutElement> Monitor<W> {
         // concerned: the user has been watching the strip track their finger, so the settle is a
         // continuation of a motion they are steering, not one sprung on them.
         self.workspace_switch_from_gesture = true;
+        self.workspace_switch_flung = flung;
 
         true
     }

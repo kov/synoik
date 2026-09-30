@@ -56,16 +56,27 @@ still for a whole one and the frame on screen is sharp.
 
 ### Swipes blur only when fast
 
-A switch the user is steering — the swipe, or the fling it is released into — is smeared only past
-`SWIPE_MOTION_BLUR_THRESHOLD`, a fraction of one workspace per exposure. A slow swipe is the hand
-tracking content it wants to read; a fast one strobes exactly like a long keyboard switch. Above
-the threshold the radius ramps from nothing to the full travel at twice the threshold, so a swipe
-that speeds up eases into the smear rather than popping into it, and a fling fades back out as the
-spring slows. Keyboard switches have no threshold beyond the travel floor.
+What decides it is the **release**. A swipe let go faster than gnome-shell's own flick speed
+(`VELOCITY_THRESHOLD_TOUCHPAD` 0.6 px/ms, `VELOCITY_THRESHOLD_TOUCH` 0.3 px/ms,
+`swipeTracker.js:22-23`: the speed past which GNOME carries a release on to the next snap point)
+is a flick. A flick asks for the next workspace the way Super+Page Down does, so its fling is
+smeared like a keyboard switch: no threshold beyond the travel floor.
 
-The value is being chosen by feel on the live seat: `SYNOIK_SWIPE_BLUR_THRESHOLD` overrides it
-there (a test build never reads it). Once the value is settled it gets hard-coded and the variable
-goes away.
+Everything else the user steers — the swipe under the finger, and the fling a slower release
+eases into — is smeared only past `SWIPE_MOTION_BLUR_THRESHOLD`, a fraction of one workspace per
+exposure. A slow swipe is the hand tracking content it wants to read. Above the threshold the
+radius ramps from nothing to the full travel at twice the threshold, so a swipe that speeds up
+eases into the smear rather than popping into it.
+
+Why a release speed and not a travel threshold alone: the fling carries almost all of a flick's
+motion (the finger phase is 0-3 frames), and it peaks at 0.13-0.18 of a workspace per exposure
+against a keyboard switch's 0.19, so no travel threshold that keeps slow drags sharp gives a flick
+the keyboard's smear. At a slowed `org.synoik.animations speed` the fling slows too, and a travel
+threshold would drop it entirely. The release speeds, by contrast, do not overlap: measured on a
+touchpad (400 px per workspace), slow drags release at ≤0.28 px/ms and flicks at ≥1.03 px/ms.
+
+`SYNOIK_SWIPE_BLUR_THRESHOLD` overrides the travel threshold on a live seat while it is being
+confirmed by feel (a test build never reads it); it goes away once the value is settled.
 
 The render side composites everything that slides into a per-output offscreen and smears it —
 `MotionBlurSlot::render`, `src/render_helpers/vulkan/motion_blur.rs`. The smear is
@@ -103,7 +114,7 @@ and after that instant. A one-sided trail would model a shutter that opened wher
 
 On the desktop the strip is normally pushed straight through — `push_group_at_alpha` only routes
 through an offscreen at partial alpha — so a blurred frame adds one full-output composite plus the
-smear: the fast part of ~290 ms for a keyboard switch, and only the fast stretches of a swipe. `OffscreenRenderElement` declares no opaque
+smear: the fast part of ~290 ms for a keyboard switch, the fast part of a flick's fling, and only the fast stretches of a slower swipe. `OffscreenRenderElement` declares no opaque
 regions, so the backdrop below is filled for those frames too.
 
 ## Not done

@@ -809,12 +809,17 @@ fn overview_gesture_bounds(start: f64) -> (f64, f64) {
     ((prev - 1.).max(0.), (next + 1.).min(2.))
 }
 
+/// The release speed, in pixels per millisecond, past which gnome-shell treats a swipe as a flick
+/// that carries on to the next snap point rather than settling on the nearest one
+/// (`swipeTracker.js:22-23`, read by `_getEndProgress`).
+pub(super) const VELOCITY_THRESHOLD_TOUCH: f64 = 0.3;
+pub(super) const VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
+
 /// Where a released swipe settles — gnome-shell's `_getEndProgress` and
 /// `_findPointForProjection` (`swipeTracker.js:536-631`) over the snap points 0, 1, 2.
 /// `velocity` is in touchpad pixels per millisecond, the unit the reference compares
 /// against its threshold *and* projects with before normalizing.
 fn overview_gesture_target(start: f64, state: f64, bounds: (f64, f64), velocity: f64) -> f64 {
-    const VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
     const DECELERATION_TOUCHPAD: f64 = 0.997;
     const VELOCITY_CURVE_THRESHOLD: f64 = 2.;
     const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;

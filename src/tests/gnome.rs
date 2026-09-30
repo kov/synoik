@@ -37521,8 +37521,9 @@ fn a_keyboard_workspace_switch_is_smeared_by_how_fast_it_moves() {
 /// Part of the same divergence (`docs/fork/workspace-switch-motion-blur.md`). A slow swipe is the
 /// hand tracking content it wants to read, so it stays sharp; a fast one jumps as far between
 /// frames as a long keyboard switch does, so it smears. The speed is the *strip's* over the
-/// exposure just ended, so a swipe that slows, stops or turns back loses its smear with it, and
-/// the fling it is released into fades out as the spring slows.
+/// exposure just ended, so a swipe that slows, stops or turns back loses its smear with it. A
+/// release past gnome-shell's flick speed is a flick, and its fling smears like a keyboard switch;
+/// a slower release eases home under the same threshold as the finger.
 #[test]
 fn a_swipe_is_smeared_only_while_it_moves_fast() {
     let mut f = Fixture::new();
@@ -37600,9 +37601,29 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
         "turning back cancels travel instead of doubling it"
     );
 
-    // A fast release flings on under the spring, smeared while it is fast and sharp once it
-    // slows — well before it has settled. A fresh swipe, so the desktop's one-workspace bound
-    // does not rubber-band it.
+    // A flick — released past gnome-shell's own flick speed — asks for the next workspace the way
+    // Super+Page Down does, so its fling smears the way a keyboard switch does: on every frame the
+    // strip still visibly moves, deep into the tail the slow-swipe threshold would call sharp. A
+    // fresh swipe, so the desktop's one-workspace bound does not rubber-band it.
+    let exposure = Duration::from_micros(16_667);
+    let render_idx = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspace_render_idx()
+    };
+    let fling = |f: &mut Fixture| -> Vec<(f64, Option<f64>)> {
+        let mut frames = Vec::new();
+        let mut prev = render_idx(f);
+        for _ in 0..60 {
+            f.advance_clock(exposure);
+            let idx = render_idx(f);
+            frames.push(((idx - prev).abs(), motion(f)));
+            prev = idx;
+        }
+        frames
+    };
     f.synoik().layout.workspace_switch_gesture_end(Some(true));
     f.advance_clock(Duration::from_millis(1000));
     f.synoik()
@@ -37612,32 +37633,42 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
         step(&mut f, 60., 8);
     }
     f.synoik().layout.workspace_switch_gesture_end(Some(true));
-    let mut smeared = false;
-    let mut sharp_while_moving = false;
-    for _ in 0..30 {
-        f.advance_clock(Duration::from_millis(16));
-        let moving = f
-            .synoik()
-            .layout
-            .monitor_for_output(&output)
-            .unwrap()
-            .workspace_switch_in_progress();
-        match motion(&mut f) {
-            Some(_) => {
-                assert!(
-                    !sharp_while_moving,
-                    "once the fling is sharp it stays sharp"
-                );
-                smeared = true;
-            }
-            None if moving => sharp_while_moving = true,
-            None => break,
+    let frames = fling(&mut f);
+    assert!(
+        frames
+            .iter()
+            .any(|&(moved, _)| moved < 0.05 && moved > 0.01),
+        "the fling must pass through the slow tail this checks: {frames:?}"
+    );
+    for &(moved, smear) in &frames {
+        // A hundredth of a workspace is ~20 px, well clear of the 6 px floor every switch has.
+        if moved > 0.01 {
+            assert!(
+                smear.is_some(),
+                "a flick's fling is smeared while it visibly moves: {frames:?}"
+            );
         }
     }
-    assert!(smeared, "a fast fling is smeared");
+
+    // A slow drag most of the way over, released slowly, eases the last stretch home sharp: the
+    // hand placed it there, so the settle is not a flick.
+    f.advance_clock(Duration::from_millis(1000));
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_begin(&output, true);
+    // 5 px every 16 ms is ~310 px/s, about half the flick speed; 64 of them is 0.8 of a workspace.
+    for _ in 0..64 {
+        step(&mut f, 5., 16);
+    }
+    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    let frames = fling(&mut f);
     assert!(
-        sharp_while_moving,
-        "the fling goes sharp while it is still settling"
+        frames.iter().any(|&(moved, _)| moved > 0.01),
+        "the settle must move visibly, or this checks nothing: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|&(_, smear)| smear.is_none()),
+        "a slow release settles sharp: {frames:?}"
     );
 }
 
