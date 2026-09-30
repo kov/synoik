@@ -25,6 +25,7 @@
 //! | `gpu` | also time the GPU passes (see [`gpu_timing`]) |
 //! | `ring[=N]` | bank raw frame records in a bounded ring; dump on `SIGUSR1` |
 //! | `autodump[=cycles]` | dump the ring's tail by itself on a miss of `cycles` or more (default 2); implies `ring` |
+//! | `stamp` | draw each frame's number into the output's four corners, to match a host-side recording to the ring (see [`crate::render_helpers::frame_stamp`]); implies `ring` |
 //!
 //! So `SYNOIK_FRAME_LOG=1` for everyday use, `SYNOIK_FRAME_LOG=8,summary=5,gpu` to
 //! chase something specific, `SYNOIK_FRAME_LOG=all` to capture a few seconds in
@@ -843,6 +844,9 @@ struct Settings {
     /// on that would dump continuously and tell you nothing. Two cycles (33ms at
     /// 60Hz) is past the point where a person sees a hitch rather than a statistic.
     autodump: Option<u64>,
+    /// Draw each frame's sequence number into the output's corners, so a host-side recording
+    /// can be matched to this log frame by frame. See [`crate::render_helpers::frame_stamp`].
+    stamp: bool,
 }
 
 impl Default for Settings {
@@ -853,6 +857,7 @@ impl Default for Settings {
             summary_every: Some(Duration::from_secs(10)),
             ring: None,
             autodump: None,
+            stamp: false,
         }
     }
 }
@@ -2735,6 +2740,13 @@ impl FrameLog {
                         tracing::warn!("SYNOIK_FRAME_LOG: bad autodump threshold {v:?}, ignoring")
                     }
                 },
+                // Implies `ring`: a stamp is only worth reading back against a banked record,
+                // and a frame line carries the number the stamp shows.
+                ("stamp", None) => {
+                    enabled = true;
+                    settings.stamp = true;
+                    settings.ring.get_or_insert(DEFAULT_RING);
+                }
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
                     Ok(secs) => settings.summary_every = Some(Duration::from_secs(secs)),
@@ -2757,6 +2769,26 @@ impl FrameLog {
 
     pub fn is_enabled(&self) -> bool {
         self.settings.is_some()
+    }
+
+    /// The number to stamp on the frame being built, if stamping is on and a frame is in flight.
+    /// See [`crate::render_helpers::frame_stamp`].
+    pub fn stamp_seq(&self) -> Option<u64> {
+        self.settings
+            .is_some_and(|s| s.stamp)
+            .then(|| self.in_flight.as_ref().map(|f| f.seq))
+            .flatten()
+    }
+
+    /// Turn stamping on for a test, which cannot set the environment without racing its
+    /// neighbours.
+    #[cfg(test)]
+    pub fn enable_stamp_for_test(&mut self) {
+        let settings = self.settings.get_or_insert(Settings {
+            summary_every: None,
+            ..Settings::default()
+        });
+        settings.stamp = true;
     }
 
     /// Start timing a frame for `output`. Any frame still in flight is dropped —
@@ -3354,6 +3386,9 @@ impl FrameLog {
         if let Some(state) = ctx.peek_state {
             let _ = write!(line, ", peek {state:.2}");
         }
+        // Last, so every earlier field keeps its place: the number a frame stamp shows, which
+        // is how a frame in a host recording finds its line here.
+        let _ = write!(line, ", seq {}", frame.seq);
         line
     }
 
@@ -4291,6 +4326,15 @@ mod tests {
         // An explicit off anywhere wins, so a session file can disable an
         // inherited setting by appending to it.
         assert!(FrameLog::parse("all,off").is_none());
+
+        let stamp = FrameLog::parse("stamp").unwrap();
+        assert!(stamp.stamp);
+        assert_eq!(
+            stamp.ring,
+            Some(DEFAULT_RING),
+            "a stamp implies a ring to read it against"
+        );
+        assert!(!FrameLog::parse("ring").unwrap().stamp);
 
         // `gpu` turns logging on by itself, but it does *not* carry the GPU-timing
         // flag — see `wants_gpu_timing` and the test below for why that is split.

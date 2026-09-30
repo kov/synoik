@@ -15471,3 +15471,52 @@ fn a_minimized_preview_whose_buffer_shrinks_repaints_what_it_vacated() {
          preview keeps a ring of stale pixels that no later frame damages"
     );
 }
+
+/// The frame stamp is on the glass in all four corners, reads back as one number, and that number
+/// is the next frame's minus one — so a host recording joins the frame log frame by frame. Read
+/// off the swapchain slot, not a capture: a capture has no frame number to show.
+#[test]
+fn every_screen_frame_carries_its_frame_log_number_in_all_four_corners() {
+    use crate::render_helpers::frame_stamp;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping frame stamp test: no Vulkan device");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    f.synoik().frame_log.enable_stamp_for_test();
+    f.settle();
+    let output = f.synoik_output(1);
+
+    let read = |f: &mut Fixture| {
+        f.synoik().queue_redraw_all();
+        f.turn();
+        let (screen, w, h) = crate::tests::fixture::screen_pixels(f, &output);
+        let seqs: Vec<_> = frame_stamp::corners(w, h)
+            .into_iter()
+            .map(|origin| frame_stamp::decode(&screen, w, origin))
+            .collect();
+        let first = seqs[0].expect("the top-left corner carries a stamp");
+        assert!(
+            seqs.iter().all(|s| *s == Some(first)),
+            "every corner shows the same frame: {seqs:?}"
+        );
+        first
+    };
+    let a = read(&mut f);
+    let b = read(&mut f);
+    assert_eq!(b, a + 1, "one frame later, the stamp is one higher");
+
+    // And it is the screen only: a capture of the same scene carries no stamp.
+    let (capture, w, h) = crate::tests::fixture::capture_pixels(&mut f, &output);
+    assert_eq!(
+        frame_stamp::decode(&capture, w, frame_stamp::corners(w, h)[0]),
+        None
+    );
+}

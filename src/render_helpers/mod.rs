@@ -33,6 +33,7 @@ pub mod clipped_surface;
 pub mod custom_anim;
 pub mod damage;
 pub mod debug;
+pub mod frame_stamp;
 pub mod framebuffer_effect;
 pub mod gradient_fade_texture;
 pub mod icon;

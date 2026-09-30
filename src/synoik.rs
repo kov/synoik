@@ -11597,6 +11597,20 @@ impl Synoik {
             push
         };
 
+        // Above everything, the pointer included: the frame stamp is the frame's last draw, so
+        // a recording that shows it shows that the whole frame landed in that corner. On the
+        // screen only — a capture re-renders the scene and has no frame number to show.
+        if ctx.target == RenderTarget::Output {
+            if let Some(seq) = self.frame_log.stamp_seq() {
+                crate::render_helpers::frame_stamp::render(
+                    seq,
+                    output_size(output),
+                    output_scale.x,
+                    &mut |elem| push(elem.into()),
+                );
+            }
+        }
+
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
