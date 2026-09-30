@@ -25,6 +25,7 @@
 //! | `gpu` | also time the GPU passes (see [`gpu_timing`]) |
 //! | `ring[=N]` | bank raw frame records in a bounded ring; dump on `SIGUSR1` |
 //! | `autodump[=cycles]` | dump the ring's tail by itself on a miss of `cycles` or more (default 2); implies `ring` |
+//! | `ledger[=frames]` | keep every draw of the last `frames` frames (default 2400) — target, render pass, material, where — and write it beside a `SIGUSR1` dump (see [`crate::draw_ledger`]); implies `ring` |
 //! | `stamp` | draw each frame's number into the output's four corners, to match a host-side recording to the ring (see [`crate::render_helpers::frame_stamp`]); implies `ring` |
 //!
 //! So `SYNOIK_FRAME_LOG=1` for everyday use, `SYNOIK_FRAME_LOG=8,summary=5,gpu` to
@@ -847,6 +848,9 @@ struct Settings {
     /// Draw each frame's sequence number into the output's corners, so a host-side recording
     /// can be matched to this log frame by frame. See [`crate::render_helpers::frame_stamp`].
     stamp: bool,
+    /// Keep every draw of the last this-many frames: target, render pass, material, where. See
+    /// [`crate::draw_ledger`]. `None` = off.
+    ledger: Option<usize>,
 }
 
 impl Default for Settings {
@@ -858,6 +862,7 @@ impl Default for Settings {
             ring: None,
             autodump: None,
             stamp: false,
+            ledger: None,
         }
     }
 }
@@ -2623,6 +2628,7 @@ impl FrameLog {
 
         ENABLED.store(settings.is_some(), Ordering::Relaxed);
         synoik_vk::stats::set_enabled(settings.is_some());
+        crate::draw_ledger::set_capacity(settings.and_then(|s| s.ledger).unwrap_or(0));
 
         if let Some(settings) = &settings {
             tracing::info!(
@@ -2747,6 +2753,22 @@ impl FrameLog {
                     settings.stamp = true;
                     settings.ring.get_or_insert(DEFAULT_RING);
                 }
+                // Implies `ring`: the ledger is written beside a ring dump, and its frames are
+                // joined to the ring's lines by `seq`.
+                ("ledger", None) => {
+                    enabled = true;
+                    settings.ledger = Some(crate::draw_ledger::DEFAULT_FRAMES);
+                    settings.ring.get_or_insert(DEFAULT_RING);
+                }
+                ("ledger", Some(v)) => match v.parse::<usize>() {
+                    Ok(0) => settings.ledger = None,
+                    Ok(n) => {
+                        enabled = true;
+                        settings.ledger = Some(n);
+                        settings.ring.get_or_insert(DEFAULT_RING);
+                    }
+                    Err(_) => tracing::warn!("SYNOIK_FRAME_LOG: bad ledger size {v:?}, ignoring"),
+                },
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
                     Ok(secs) => settings.summary_every = Some(Duration::from_secs(secs)),
@@ -2783,6 +2805,16 @@ impl FrameLog {
     /// Turn stamping on for a test, which cannot set the environment without racing its
     /// neighbours.
     #[cfg(test)]
+    pub fn enable_ledger_for_test(&mut self, frames: usize) {
+        let settings = self.settings.get_or_insert(Settings {
+            summary_every: None,
+            ..Settings::default()
+        });
+        settings.ledger = Some(frames);
+        crate::draw_ledger::set_capacity(frames);
+    }
+
+    #[cfg(test)]
     pub fn enable_stamp_for_test(&mut self) {
         let settings = self.settings.get_or_insert(Settings {
             summary_every: None,
@@ -2808,6 +2840,7 @@ impl FrameLog {
 
         let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         CURRENT_SEQ.store(seq, Ordering::Relaxed);
+        crate::draw_ledger::begin(seq, output);
 
         let now = Instant::now();
         self.in_flight = Some(InFlight {
@@ -2930,6 +2963,7 @@ impl FrameLog {
         let Some(mut frame) = self.in_flight.take() else {
             return;
         };
+        crate::draw_ledger::end();
         // Whatever renders next — a screenshot, a screencast, the next frame's own bakes before
         // its `begin` — is not this frame's. See `CURRENT_SEQ`.
         CURRENT_SEQ.store(0, Ordering::Relaxed);
@@ -3889,6 +3923,15 @@ impl FrameLog {
             return Ok((path, 0));
         }
         let entries = self.write_ring(&path, self.ring.len())?;
+        // Beside it, on the manual dump only: the ledger is tens of MB, and an automatic dump
+        // fires when the session is already behind.
+        if crate::draw_ledger::is_enabled() {
+            let draws = path.with_extension("draws.txt");
+            let tmp = path.with_extension("draws.txt.partial");
+            std::fs::write(&tmp, crate::draw_ledger::format())?;
+            std::fs::rename(&tmp, &draws)?;
+            tracing::info!("draw ledger written to {}", draws.display());
+        }
 
         self.ring.clear();
         self.dumps += 1;
@@ -4335,6 +4378,12 @@ mod tests {
             "a stamp implies a ring to read it against"
         );
         assert!(!FrameLog::parse("ring").unwrap().stamp);
+
+        let ledger = FrameLog::parse("ledger").unwrap();
+        assert_eq!(ledger.ledger, Some(crate::draw_ledger::DEFAULT_FRAMES));
+        assert_eq!(ledger.ring, Some(DEFAULT_RING));
+        assert_eq!(FrameLog::parse("ledger=10").unwrap().ledger, Some(10));
+        assert_eq!(FrameLog::parse("ring,ledger=0").unwrap().ledger, None);
 
         // `gpu` turns logging on by itself, but it does *not* carry the GPU-timing
         // flag — see `wants_gpu_timing` and the test below for why that is split.

@@ -200,7 +200,10 @@ mod vulkan_impl {
             // Clamp to the framebuffer (an effect near an edge spills off-screen).
             let clamped_dst = match dst.intersection(output_rect) {
                 Some(clamped) => clamped,
-                None => return Ok(()),
+                None => {
+                    crate::draw_ledger::skipped("backdrop capture: off the target");
+                    return Ok(());
+                }
             };
             let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
 
@@ -243,22 +246,28 @@ mod vulkan_impl {
             _opaque_regions: &[Rectangle<i32, Physical>],
             cache: Option<&UserDataMap>,
         ) -> Result<(), VulkanError> {
+            // Every early return is recorded: a blurred surface that drew nothing this frame is
+            // the question the draw ledger exists to answer.
+            let skip = |reason| {
+                crate::draw_ledger::skipped(reason);
+                Ok(())
+            };
             let Some(cache) = cache else {
-                return Ok(());
+                return skip("backdrop draw: no element cache");
             };
             let Some(inner) = cache.get::<RefCell<Option<BackdropBlur>>>() else {
-                return Ok(());
+                return skip("backdrop draw: never captured");
             };
             let slot = inner.borrow();
             let Some(blur) = slot.as_ref() else {
-                return Ok(());
+                return skip("backdrop draw: no capture in the slot");
             };
 
             // Clamp exactly as capture_framebuffer did.
             let output_rect = Rectangle::from_size(frame.output_size());
             let clamped_dst = match dst.intersection(output_rect) {
                 Some(clamped) => clamped,
-                None => return Ok(()),
+                None => return skip("backdrop draw: off the target"),
             };
             let clamp_offset = clamped_dst.loc - dst.loc;
 
@@ -303,7 +312,7 @@ mod vulkan_impl {
             }
 
             if filtered.is_empty() {
-                return Ok(());
+                return skip("backdrop draw: no damage inside the blur region");
             }
 
             let push = self.postprocess_push(crop, frame.transform());

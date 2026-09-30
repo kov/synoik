@@ -5094,6 +5094,83 @@ fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
     );
 }
 
+/// The draw ledger sees the pass a backdrop capture opens: what the frame drew before the capture
+/// is in pass 0 of its target, the capture is a split, and the backdrop's composite lands in
+/// pass 1. That boundary is what the ledger is for — a surface that vanishes on the glass is
+/// checked against "everything this target drew after split k".
+#[test]
+fn the_draw_ledger_puts_a_backdrop_composite_after_its_capture() {
+    use crate::draw_ledger::{self, Event, Material};
+
+    let Ok(mut vk) = VulkanRenderer::new() else {
+        eprintln!(
+            "skipping the_draw_ledger_puts_a_backdrop_composite_after_its_capture: no Vulkan"
+        );
+        return;
+    };
+    let fbe = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
+    let elem = fbe.render(
+        None,
+        crate::render_helpers::background_effect::RenderParams {
+            geometry: Rectangle::from_size(Size::from((200., 200.))),
+            subregion: None,
+            clip: None,
+            scale: 1.0,
+        },
+        Some(62.0),
+        crate::render_helpers::blur::Finish::NONE,
+    );
+
+    draw_ledger::set_capacity(4);
+    draw_ledger::begin(1, "test");
+    render_to_vec(
+        &mut vk,
+        Size::from((256, 256)),
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(elem),
+    )
+    .expect("render the blurred element");
+    draw_ledger::end();
+    let events = draw_ledger::events_of(1).expect("the frame was banked");
+    draw_ledger::set_capacity(0);
+
+    let split = events
+        .iter()
+        .position(|(_, _, e)| matches!(e, Event::Split { .. }))
+        .unwrap_or_else(|| panic!("the capture split the pass: {events:?}"));
+    let (target, pass, _) = events[split];
+    assert_eq!(pass, 0, "the split closes the target's first pass");
+    let composite = events
+        .iter()
+        .find(|(_, _, e)| {
+            matches!(
+                e,
+                Event::Draw {
+                    material: Material::Postprocess(_),
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("the backdrop was composited: {events:?}"));
+    assert_eq!(
+        (composite.0, composite.1),
+        (target, 1),
+        "the composite is drawn into the same target, in the pass the split opened"
+    );
+    assert!(
+        events[..split]
+            .iter()
+            .any(|(t, p, e)| *t == target && *p == 0 && matches!(e, Event::Draw { .. })),
+        "what the frame drew before the capture is in pass 0: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some((t, _, Event::Finished)) if *t == target),
+        "the target's frame finished last: {events:?}"
+    );
+}
+
 /// A blurred frame must cost the **same number of submits** as an unblurred one.
 ///
 /// The backdrop blur used to cost two round trips of its own on top of the frame: the capture ended
@@ -15518,5 +15595,70 @@ fn every_screen_frame_carries_its_frame_log_number_in_all_four_corners() {
     assert_eq!(
         frame_stamp::decode(&capture, w, frame_stamp::corners(w, h)[0]),
         None
+    );
+}
+
+/// Through the real loop: with the ledger on, a redraw is banked under the frame log's own number,
+/// and its first target is the screen's — so a stamp read off a recording finds its draws.
+#[test]
+fn a_redraw_banks_its_draws_under_its_frame_number() {
+    use crate::draw_ledger::{self, Event};
+    use crate::render_helpers::frame_stamp;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping a_redraw_banks_its_draws_under_its_frame_number: no Vulkan device");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    f.synoik().frame_log.enable_ledger_for_test(8);
+    f.synoik().frame_log.enable_stamp_for_test();
+    f.settle();
+    let output = f.synoik_output(1);
+
+    f.synoik().queue_redraw_all();
+    f.turn();
+    let (screen, w, _) = crate::tests::fixture::screen_pixels(&mut f, &output);
+    let seq = frame_stamp::decode(&screen, w, (0, 0)).expect("the frame is stamped");
+    let events = draw_ledger::events_of(seq).unwrap_or_else(|| {
+        panic!(
+            "the stamped frame {seq} is in the ledger: {:?}",
+            draw_ledger::seqs()
+        )
+    });
+    draw_ledger::set_capacity(0);
+    // Headless renders the screen into an offscreen, so the screen's target is the frame's first
+    // one by size, not by kind.
+    assert!(
+        matches!(
+            events.first(),
+            Some((
+                0,
+                0,
+                Event::Target {
+                    w: 1920,
+                    h: 1080,
+                    ..
+                }
+            ))
+        ),
+        "the frame opens on the screen's target: {events:?}"
+    );
+    // The stamp's lead-in cell, drawn into that target: the ledger and the glass agree on which
+    // frame this is.
+    let lead_in = Rectangle::<i32, Physical>::new(
+        Point::from((frame_stamp::CELL_PX, frame_stamp::CELL_PX)),
+        Size::from((frame_stamp::CELL_PX, frame_stamp::CELL_PX)),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(t, _, e)| *t == 0 && matches!(e, Event::Draw { bbox, .. } if *bbox == lead_in)),
+        "the stamp is among the frame's draws: {events:?}"
     );
 }

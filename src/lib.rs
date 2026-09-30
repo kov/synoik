@@ -20,6 +20,7 @@ pub mod clipboard;
 pub mod cursor;
 pub mod dbus;
 pub mod dbusmenu;
+pub mod draw_ledger;
 pub mod emoji;
 pub mod end_session;
 pub mod frame_clock;

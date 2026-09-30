@@ -23,6 +23,7 @@ use super::error::VulkanError;
 use super::fence::VkSubmitFence;
 use super::renderer::{transition_image, GpuTimerSlot, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
+use crate::draw_ledger::Material;
 
 /// How many consecutive frames must ask for the same intermediate size before an effect counts as
 /// settled and gets its full-resolution blur back.
@@ -401,6 +402,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             }
         }
 
+        crate::draw_ledger::target(
+            vk::Handle::as_raw(fb.buffer.image()),
+            fb.offscreen,
+            preserve,
+            fb_w,
+            fb_h,
+        );
+
         Ok(VulkanFrame {
             renderer,
             fb,
@@ -492,7 +501,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     ///
     /// # Safety
     /// `cbuf` must be in the recording state with a compatible pipeline bound.
-    unsafe fn draw_quad(dev: &ash::Device, cbuf: vk::CommandBuffer, scissors: &[vk::Rect2D]) {
+    unsafe fn draw_quad(
+        dev: &ash::Device,
+        cbuf: vk::CommandBuffer,
+        scissors: &[vk::Rect2D],
+        material: Material,
+    ) {
+        crate::draw_ledger::draw(material, scissors.iter().map(rect_of));
         for s in scissors {
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(s));
             dev.cmd_draw(cbuf, 6, 1, 0, 0);
@@ -579,7 +594,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::ClippedTexture(raw(texture)),
+            );
         }
         Ok(())
     }
@@ -626,7 +646,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::ClippedSolid);
         }
         Ok(())
     }
@@ -688,7 +708,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::RoundedTexture(raw(texture)),
+            );
         }
         Ok(())
     }
@@ -788,7 +813,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Triangle);
         }
         Ok(())
     }
@@ -832,7 +857,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::RoundedRect);
         }
         Ok(())
     }
@@ -889,7 +914,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::GradientFade(raw(texture)),
+            );
         }
         Ok(())
     }
@@ -966,6 +996,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         if scissors.is_empty() || run.glyphs().is_empty() {
             return Ok(());
         }
+        // Once per run, not per glyph: the run is the unit that lands or does not.
+        crate::draw_ledger::draw(Material::Glyphs, scissors.iter().map(rect_of));
         let target = self.target_dims();
         self.retain(run.atlas());
         if let Some((atlas, _)) = run.color_atlas() {
@@ -1074,7 +1106,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Border);
         }
         Ok(())
     }
@@ -1106,7 +1138,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Shadow);
         }
         Ok(())
     }
@@ -1231,7 +1263,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::Postprocess(raw(texture)),
+            );
         }
         Ok(())
     }
@@ -1285,6 +1322,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // on its current pass and `dest` untouched. Mirrors GLES `capture_framebuffer` returning
         // early on an empty clamp (its `draw` then finds no intermediate and composites nothing).
         if sx1 <= sx0 || sy1 <= sy0 || d_w == 0 || d_h == 0 {
+            crate::draw_ledger::skipped("capture: empty source or destination");
             return Ok(());
         }
 
@@ -1434,6 +1472,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.cmd_set_viewport(cbuf, 0, std::slice::from_ref(&viewport));
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(&render_area));
         };
+        crate::draw_ledger::split(
+            Rectangle::new((sx0, sy0).into(), (sx1 - sx0, sy1 - sy0).into()),
+            d_w,
+            d_h,
+        );
 
         // The ended base pass left the target in TRANSFER_SRC; the blit left `dest` sampleable.
         // (The continuation pass restores the target to TRANSFER_SRC again at `finish`.)
@@ -1481,6 +1524,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // `draw` clamps to the same degenerate `dst`, so it contributes ~nothing. (A reused cache
         // keeps last frame's content untouched — we skip capture AND blur, so it stays consistent.)
         if size.w <= 0 || size.h <= 0 {
+            crate::draw_ledger::skipped("backdrop capture: zero-size intermediate");
             return Ok(());
         }
 
@@ -1708,7 +1752,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Resize(raw(tex_next)));
         }
         Ok(())
     }
@@ -1764,7 +1808,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::CustomResize(raw(tex_next)),
+            );
         }
         Ok(())
     }
@@ -1823,7 +1872,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::CustomAnim(raw(texture)),
+            );
         }
         Ok(())
     }
@@ -1892,6 +1946,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .collect();
         rects.sort_unstable_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
         rects.dedup_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
+        crate::draw_ledger::draw(
+            Material::PresentBlit(raw(present)),
+            rects.iter().map(rect_of),
+        );
         if rects.is_empty() {
             return;
         }
@@ -2028,7 +2086,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     }
 
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
+        let first = !self.finished;
         let result = self.finish_internal_impl();
+        if first {
+            crate::draw_ledger::finished();
+        }
         if result.is_err() {
             self.abandon_glyph_copies();
         }
@@ -2251,6 +2313,7 @@ impl Frame for VulkanFrame<'_, '_> {
         // Record the cleared regions so the present-blit copies them (they are the non-opaque part
         // of the frame's damage; the draws cover the rest).
         self.present_damage.extend(rects.iter().map(|r| r.rect));
+        crate::draw_ledger::draw(Material::Clear, rects.iter().map(|r| rect_of(&r.rect)));
         unsafe {
             self.renderer.gpu.device.cmd_clear_attachments(
                 self.cbuf,
@@ -2298,7 +2361,7 @@ impl Frame for VulkanFrame<'_, '_> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Solid);
         }
         Ok(())
     }
@@ -2374,7 +2437,7 @@ impl Frame for VulkanFrame<'_, '_> {
                 0,
                 as_bytes(&push),
             );
-            Self::draw_quad(dev, self.cbuf, &scissors);
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Texture(raw(texture)));
         }
         Ok(())
     }
@@ -2519,4 +2582,17 @@ fn full_rect(w: u32, h: u32) -> vk::Rect2D {
             height: h,
         },
     }
+}
+
+/// The raw handle of `texture`'s image, which is how the draw ledger names what a draw sampled.
+fn raw(texture: &VkTexture) -> u64 {
+    vk::Handle::as_raw(texture.image())
+}
+
+/// A scissor rect as the ledger records it.
+fn rect_of(s: &vk::Rect2D) -> Rectangle<i32, Physical> {
+    Rectangle::new(
+        (s.offset.x, s.offset.y).into(),
+        (s.extent.width as i32, s.extent.height as i32).into(),
+    )
 }
