@@ -226,8 +226,10 @@ pub enum InputCmd {
     /// Move the pointer by a relative delta in logical pixels.
     PointerMotion {
         /// Horizontal delta.
+        #[arg(allow_negative_numbers = true)]
         dx: f64,
         /// Vertical delta.
+        #[arg(allow_negative_numbers = true)]
         dy: f64,
     },
     /// Click: press, then release a pointer button.
@@ -249,7 +251,33 @@ pub enum InputCmd {
     /// Scroll the vertical wheel by whole notches (positive scrolls down).
     Scroll {
         /// The number of notches.
+        #[arg(allow_negative_numbers = true)]
         notches: f64,
+    },
+    /// Scroll with touchpad fingers by a delta in logical pixels (positive dy scrolls down).
+    ///
+    /// Only non-zero axes are sent; end the scroll with scroll-stop, as the fingers lifting.
+    FingerScroll {
+        /// Horizontal delta.
+        #[arg(allow_negative_numbers = true)]
+        dx: f64,
+        /// Vertical delta.
+        #[arg(allow_negative_numbers = true)]
+        dy: f64,
+    },
+    /// Lift the fingers off a touchpad scroll (clients receive axis_stop).
+    ScrollStop,
+    /// Rest fingers on the touchpad: begin a hold gesture.
+    HoldBegin {
+        /// How many fingers are down.
+        #[arg(long, default_value_t = 2)]
+        fingers: u32,
+    },
+    /// End a hold gesture.
+    HoldEnd {
+        /// The hold was cancelled rather than ended by the fingers lifting.
+        #[arg(long)]
+        cancelled: bool,
     },
 }
 
@@ -288,6 +316,14 @@ impl InputCmd {
                 button: button.clone(),
             }],
             InputCmd::Scroll { notches } => vec![InjectedEvent::Scroll { notches: *notches }],
+            InputCmd::FingerScroll { dx, dy } => {
+                vec![InjectedEvent::FingerScroll { dx: *dx, dy: *dy }]
+            }
+            InputCmd::ScrollStop => vec![InjectedEvent::ScrollStop],
+            InputCmd::HoldBegin { fingers } => vec![InjectedEvent::HoldBegin { fingers: *fingers }],
+            InputCmd::HoldEnd { cancelled } => vec![InjectedEvent::HoldEnd {
+                cancelled: *cancelled,
+            }],
         }
     }
 }

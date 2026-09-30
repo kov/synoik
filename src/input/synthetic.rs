@@ -15,10 +15,11 @@
 
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
-    DeviceCapability, Event, GestureBeginEvent, GestureEndEvent, GestureSwipeBeginEvent,
-    GestureSwipeEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
-    KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
-    TouchDownEvent, TouchEvent, TouchSlot, TouchUpEvent, UnusedEvent,
+    DeviceCapability, Event, GestureBeginEvent, GestureEndEvent, GestureHoldBeginEvent,
+    GestureHoldEndEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
+    InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent,
+    PointerButtonEvent, PointerMotionEvent, TouchDownEvent, TouchEvent, TouchSlot, TouchUpEvent,
+    UnusedEvent,
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
@@ -91,8 +92,39 @@ pub fn inject(state: &mut State, event: &InjectedEvent) -> Result<(), String> {
             };
             state.process_input_event(event);
         }
+        InjectedEvent::FingerScroll { dx, dy } => send_finger_scroll(state, *dx, *dy),
+        InjectedEvent::ScrollStop => send_finger_scroll(state, 0., 0.),
+        InjectedEvent::HoldBegin { fingers } => {
+            let event = InputEvent::<SyntheticInputBackend>::GestureHoldBegin {
+                event: SyntheticGestureHoldBeginEvent {
+                    time: now(),
+                    fingers: *fingers,
+                },
+            };
+            state.process_input_event(event);
+        }
+        InjectedEvent::HoldEnd { cancelled } => {
+            let event = InputEvent::<SyntheticInputBackend>::GestureHoldEnd {
+                event: SyntheticGestureHoldEndEvent {
+                    time: now(),
+                    cancelled: *cancelled,
+                },
+            };
+            state.process_input_event(event);
+        }
     }
     Ok(())
+}
+
+fn send_finger_scroll(state: &mut State, dx: f64, dy: f64) {
+    let event = InputEvent::<SyntheticInputBackend>::PointerAxis {
+        event: SyntheticPointerAxisEvent {
+            time: now(),
+            v120: 0.,
+            finger: Some((dx, dy)),
+        },
+    };
+    state.process_input_event(event);
 }
 
 fn now() -> u64 {
@@ -358,6 +390,12 @@ pub struct SyntheticPointerAxisEvent {
     pub finger: Option<(f64, f64)>,
 }
 
+impl SyntheticPointerAxisEvent {
+    fn is_finger_stop(&self) -> bool {
+        self.finger == Some((0., 0.))
+    }
+}
+
 impl Event<SyntheticInputBackend> for SyntheticPointerAxisEvent {
     fn time(&self) -> u64 {
         self.time
@@ -369,11 +407,16 @@ impl Event<SyntheticInputBackend> for SyntheticPointerAxisEvent {
 }
 
 impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
+    /// Like libinput, a finger scroll carries only the axes it moved on, and the lift carries
+    /// a zero on both. A zero is what `wl_pointer.axis_stop` is made of, so reporting one for
+    /// the idle axis of every vertical scroll would stop a horizontal scroll that never began.
     fn amount(&self, axis: Axis) -> Option<f64> {
-        self.finger.map(|(dx, dy)| match axis {
+        let (dx, dy) = self.finger?;
+        let amount = match axis {
             Axis::Vertical => dy,
             Axis::Horizontal => dx,
-        })
+        };
+        (amount != 0. || self.is_finger_stop()).then_some(amount)
     }
 
     fn amount_v120(&self, axis: Axis) -> Option<f64> {
@@ -539,6 +582,54 @@ impl GestureEndEvent<SyntheticInputBackend> for SyntheticGestureSwipeEndEvent {
 
 impl GestureSwipeEndEvent<SyntheticInputBackend> for SyntheticGestureSwipeEndEvent {}
 
+/// Fingers coming to rest on the touchpad.
+pub struct SyntheticGestureHoldBeginEvent {
+    pub time: u64,
+    pub fingers: u32,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticGestureHoldBeginEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl GestureBeginEvent<SyntheticInputBackend> for SyntheticGestureHoldBeginEvent {
+    fn fingers(&self) -> u32 {
+        self.fingers
+    }
+}
+
+impl GestureHoldBeginEvent<SyntheticInputBackend> for SyntheticGestureHoldBeginEvent {}
+
+/// A hold ending: the fingers lifting, or libinput cancelling it when they start moving.
+pub struct SyntheticGestureHoldEndEvent {
+    pub time: u64,
+    pub cancelled: bool,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticGestureHoldEndEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl GestureEndEvent<SyntheticInputBackend> for SyntheticGestureHoldEndEvent {
+    fn cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
+impl GestureHoldEndEvent<SyntheticInputBackend> for SyntheticGestureHoldEndEvent {}
+
 impl InputBackend for SyntheticInputBackend {
     type Device = SyntheticInputDevice;
 
@@ -555,8 +646,8 @@ impl InputBackend for SyntheticInputBackend {
     type GesturePinchBeginEvent = UnusedEvent;
     type GesturePinchUpdateEvent = UnusedEvent;
     type GesturePinchEndEvent = UnusedEvent;
-    type GestureHoldBeginEvent = UnusedEvent;
-    type GestureHoldEndEvent = UnusedEvent;
+    type GestureHoldBeginEvent = SyntheticGestureHoldBeginEvent;
+    type GestureHoldEndEvent = SyntheticGestureHoldEndEvent;
 
     type TouchDownEvent = SyntheticTouchDownEvent;
     type TouchUpEvent = SyntheticTouchUpEvent;
@@ -659,6 +750,92 @@ mod tests {
             f.synoik().run_dialog.entry(),
             "Kitty!",
             "injected text must reach the dialog, including shifted characters"
+        );
+    }
+
+    /// Finger scrolls, the lift and the hold gesture reach the client under the pointer the way
+    /// a touchpad's do: a kinetic-scrolling client measures the flick from the finger-source
+    /// axis values, starts its glide at `axis_stop`, and stops it on `hold.begin`.
+    #[test]
+    fn finger_scroll_stop_and_hold_reach_the_client() {
+        use wayland_client::protocol::wl_pointer::{Axis as WlAxis, AxisSource as WlAxisSource};
+
+        use crate::synoik::CenterCoords;
+        use crate::tests::client::PointerEvent;
+
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        let id = f.add_client();
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.client(id).get_pointer();
+        f.roundtrip(id);
+        assert!(
+            f.synoik_state()
+                .move_cursor_to_focused_tile(CenterCoords::Both),
+            "precondition: the pointer is over the window"
+        );
+        f.double_roundtrip(id);
+        let _ = f.client(id).take_pointer_events();
+
+        inject(
+            f.synoik_state(),
+            &InjectedEvent::FingerScroll { dx: 0., dy: 30. },
+        )
+        .unwrap();
+        f.double_roundtrip(id);
+        assert_eq!(
+            f.client(id).take_pointer_events(),
+            vec![
+                PointerEvent::AxisSource(WlAxisSource::Finger),
+                PointerEvent::Axis {
+                    axis: WlAxis::VerticalScroll,
+                    value: 30.,
+                },
+            ],
+            "a vertical finger scroll carries the vertical axis only, in the Wayland sign — an \
+             idle axis reported as zero would stop a horizontal scroll that never began"
+        );
+
+        inject(f.synoik_state(), &InjectedEvent::ScrollStop).unwrap();
+        f.double_roundtrip(id);
+        let mut stop = f.client(id).take_pointer_events();
+        assert_eq!(
+            stop.first(),
+            Some(&PointerEvent::AxisSource(WlAxisSource::Finger))
+        );
+        stop.remove(0);
+        stop.sort_by_key(|e| format!("{e:?}"));
+        assert_eq!(
+            stop,
+            vec![
+                PointerEvent::AxisStop(WlAxis::HorizontalScroll),
+                PointerEvent::AxisStop(WlAxis::VerticalScroll),
+            ],
+            "the lift is `axis_stop` on both axes and nothing else"
+        );
+
+        inject(f.synoik_state(), &InjectedEvent::HoldBegin { fingers: 2 }).unwrap();
+        inject(
+            f.synoik_state(),
+            &InjectedEvent::HoldEnd { cancelled: true },
+        )
+        .unwrap();
+        f.double_roundtrip(id);
+        assert_eq!(
+            f.client(id).take_pointer_events(),
+            vec![
+                PointerEvent::HoldBegin { fingers: 2 },
+                PointerEvent::HoldEnd { cancelled: true },
+            ],
+            "the hold reaches the surface under the pointer with no grab active"
         );
     }
 

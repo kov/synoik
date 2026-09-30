@@ -204,6 +204,32 @@ pub enum InjectedEvent {
         /// The number of notches.
         notches: f64,
     },
+    /// A continuous touchpad (finger-source) scroll by a delta in logical pixels, with the
+    /// Wayland sign: positive `dy` scrolls down, like [`Self::Scroll`].
+    ///
+    /// Only the axes with a non-zero delta are sent, as libinput does; a zero delta on both is
+    /// [`Self::ScrollStop`].
+    FingerScroll {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// The fingers lifting off a touchpad scroll: the finger-source `(0, 0)` axis event libinput
+    /// sends, which clients receive as `wl_pointer.axis_stop` on both axes.
+    ScrollStop,
+    /// Fingers resting on the touchpad: a hold gesture begins
+    /// (`zwp_pointer_gesture_hold_v1.begin` on the surface under the pointer).
+    HoldBegin {
+        /// How many fingers are down.
+        fingers: u32,
+    },
+    /// The hold gesture ends (`zwp_pointer_gesture_hold_v1.end`).
+    HoldEnd {
+        /// Whether the hold was cancelled (e.g. it turned into a scroll or swipe) rather than
+        /// the fingers lifting.
+        cancelled: bool,
+    },
 }
 
 /// Reply from synoik to client.

@@ -30,6 +30,10 @@ use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_li
     self, ZwpLinuxBufferParamsV1,
 };
 use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use smithay::reexports::wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_hold_v1::{
+    self, ZwpPointerGestureHoldV1,
+};
+use smithay::reexports::wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1::ZwpPointerGesturesV1;
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
@@ -73,6 +77,7 @@ use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm;
@@ -138,6 +143,11 @@ pub struct State {
     pub keyboard: Option<WlKeyboard>,
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
     pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
+    pub pointer_gestures: Option<ZwpPointerGesturesV1>,
+    pub pointer: Option<WlPointer>,
+    pub hold_gesture: Option<ZwpPointerGestureHoldV1>,
+    /// Scroll and hold-gesture events received on [`Client::get_pointer`]'s objects, in order.
+    pub pointer_events: Vec<PointerEvent>,
     /// Every `wl_keyboard.modifiers` the client saw, as `mods_depressed`. A key the compositor
     /// swallows still has to leave the client's modifier state correct, and the key events alone
     /// cannot show that.
@@ -445,6 +455,10 @@ impl Client {
             screencopy: None,
             keyboard: None,
             key_events: Vec::new(),
+            pointer_gestures: None,
+            pointer: None,
+            hold_gesture: None,
+            pointer_events: Vec::new(),
             mods_events: Vec::new(),
             focus_events: Vec::new(),
             session_manager: None,
@@ -641,6 +655,27 @@ impl Client {
     pub fn get_keyboard(&mut self) {
         let seat = self.state.seat.clone().unwrap();
         self.state.keyboard = Some(seat.get_keyboard(&self.qh, ()));
+    }
+
+    /// Start receiving `wl_pointer` scroll events and `zwp_pointer_gesture_hold_v1` events;
+    /// they accumulate in [`take_pointer_events`].
+    ///
+    /// [`take_pointer_events`]: Self::take_pointer_events
+    pub fn get_pointer(&mut self) {
+        let seat = self.state.seat.clone().unwrap();
+        let pointer = seat.get_pointer(&self.qh, ());
+        let gestures = self
+            .state
+            .pointer_gestures
+            .clone()
+            .expect("compositor advertises zwp_pointer_gestures_v1");
+        self.state.hold_gesture = Some(gestures.get_hold_gesture(&pointer, &self.qh, ()));
+        self.state.pointer = Some(pointer);
+    }
+
+    /// Drain the pointer events received so far.
+    pub fn take_pointer_events(&mut self) -> Vec<PointerEvent> {
+        std::mem::take(&mut self.state.pointer_events)
     }
 
     /// Drain the `wl_keyboard.key` events received so far, as
@@ -1362,6 +1397,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwpTextInputManagerV3::interface().name {
                     let version = min(version, ZwpTextInputManagerV3::interface().version);
                     state.text_input_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpPointerGesturesV1::interface().name {
+                    let version = min(version, ZwpPointerGesturesV1::interface().version);
+                    state.pointer_gestures = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WlSeat::interface().name {
                     let version = min(version, WlSeat::interface().version);
                     state.seat = Some(registry.bind(name, version, qh, ()));
@@ -1814,6 +1852,78 @@ impl Dispatch<WlSeat, ()> for State {
             wl_seat::Event::Name { .. } => (),
             _ => unreachable!(),
         }
+    }
+}
+
+/// A `wl_pointer` scroll or hold-gesture event, as the client saw it. Motion, buttons and
+/// enter/leave are left out: no test needs them yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerEvent {
+    AxisSource(wl_pointer::AxisSource),
+    Axis { axis: wl_pointer::Axis, value: f64 },
+    AxisStop(wl_pointer::Axis),
+    HoldBegin { fingers: u32 },
+    HoldEnd { cancelled: bool },
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlPointer,
+        event: <WlPointer as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            wl_pointer::Event::AxisSource { axis_source } => {
+                PointerEvent::AxisSource(axis_source.into_result().unwrap())
+            }
+            wl_pointer::Event::Axis { axis, value, .. } => PointerEvent::Axis {
+                axis: axis.into_result().unwrap(),
+                value,
+            },
+            wl_pointer::Event::AxisStop { axis, .. } => {
+                PointerEvent::AxisStop(axis.into_result().unwrap())
+            }
+            _ => return,
+        };
+        state.pointer_events.push(event);
+    }
+}
+
+impl Dispatch<ZwpPointerGesturesV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpPointerGesturesV1,
+        _event: <ZwpPointerGesturesV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZwpPointerGestureHoldV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpPointerGestureHoldV1,
+        event: <ZwpPointerGestureHoldV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            zwp_pointer_gesture_hold_v1::Event::Begin { fingers, .. } => {
+                PointerEvent::HoldBegin { fingers }
+            }
+            zwp_pointer_gesture_hold_v1::Event::End { cancelled, .. } => PointerEvent::HoldEnd {
+                cancelled: cancelled != 0,
+            },
+            _ => unreachable!(),
+        };
+        state.pointer_events.push(event);
     }
 }
 

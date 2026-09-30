@@ -40,7 +40,7 @@ fn have_ffmpeg() -> bool {
     ok
 }
 
-mod client;
+pub(crate) mod client;
 pub(crate) mod fixture;
 mod server;
 
