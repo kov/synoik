@@ -34,18 +34,38 @@ smear fixes that; the blur has to span the inter-frame travel to read as motion,
 ## How it works
 
 `Monitor::workspace_switch_motion` reports the travel in logical pixels along the strip axis, and
-returns `None` — no blur — in three cases:
+returns `None` — no blur — when:
 
-- the switch came from a gesture (a swipe under the finger, or the fling it was released into):
-  the user is steering it, and it tracks the hand exactly;
-- a switch running *with* an overview zoom, where `workspace_render_idx` corrects one animation
+- a switch runs *with* an overview zoom, where `workspace_render_idx` corrects one animation
   against the other and this animation alone no longer describes what moves;
-- travel under `MOTION_BLUR_MIN_TRAVEL`, the last few frames of every switch.
+- it is a drag-and-drop edge scroll: the pointer parked on an edge, not a hand sweeping;
+- the travel is under `MOTION_BLUR_MIN_TRAVEL`, the last few frames of every switch.
 
 Travel is read off the animation curve across one fixed **exposure** either side of now
 (`MOTION_BLUR_EXPOSURE`, a shutter time — deliberately not the refresh interval, so a 144 Hz screen
 does not get a sharper picture of the same gesture), never differenced between frames: a dropped
 frame must not change how the next one is blurred.
+
+A swipe under the finger has no curve. The gesture records where the *strip* has been — after
+clamping and rubber-banding, so a finger pushing against the end of the row blurs nothing — and
+the travel is the strip's movement over the exposure just ended, interpolated from those samples.
+A reversal inside the exposure cancels against itself and a stall runs down to zero within one, so
+the smear follows the hand as it is now. That run-down happens with no input to repaint it, so a
+gesture that moved within the last exposure keeps asking for frames until the strip has been
+still for a whole one and the frame on screen is sharp.
+
+### Swipes blur only when fast
+
+A switch the user is steering — the swipe, or the fling it is released into — is smeared only past
+`SWIPE_MOTION_BLUR_THRESHOLD`, a fraction of one workspace per exposure. A slow swipe is the hand
+tracking content it wants to read; a fast one strobes exactly like a long keyboard switch. Above
+the threshold the radius ramps from nothing to the full travel at twice the threshold, so a swipe
+that speeds up eases into the smear rather than popping into it, and a fling fades back out as the
+spring slows. Keyboard switches have no threshold beyond the travel floor.
+
+The value is being chosen by feel on the live seat: `SYNOIK_SWIPE_BLUR_THRESHOLD` overrides it
+there (a test build never reads it). Once the value is settled it gets hard-coded and the variable
+goes away.
 
 The render side composites everything that slides into a per-output offscreen and smears it —
 `MotionBlurSlot::render`, `src/render_helpers/vulkan/motion_blur.rs`. The smear is
@@ -82,8 +102,8 @@ and after that instant. A one-sided trail would model a shutter that opened wher
 ## Cost
 
 On the desktop the strip is normally pushed straight through — `push_group_at_alpha` only routes
-through an offscreen at partial alpha — so during a non-gesture switch this adds one full-output
-composite plus the smear, for the fast part of ~290 ms. `OffscreenRenderElement` declares no opaque
+through an offscreen at partial alpha — so a blurred frame adds one full-output composite plus the
+smear: the fast part of ~290 ms for a keyboard switch, and only the fast stretches of a swipe. `OffscreenRenderElement` declares no opaque
 regions, so the backdrop below is filled for those frames too.
 
 ## Not done

@@ -37450,7 +37450,7 @@ fn the_battery_indicator_reads_every_power_state() {
     );
 }
 
-/// A keyboard workspace switch is smeared along its travel; a swipe never is.
+/// A keyboard workspace switch is smeared along its travel.
 ///
 /// **Deliberate divergence from gnome-shell**, approved 2026-09-17 — see
 /// `docs/fork/workspace-switch-motion-blur.md`. GNOME never has to smear anything, because a
@@ -37514,36 +37514,130 @@ fn a_keyboard_workspace_switch_is_smeared_by_how_fast_it_moves() {
          {far:.1}px of travel against {near:.1}px for one, and a spring's speed is proportional \
          to the distance left",
     );
+}
 
-    // A swipe is the user's own hand: the strip tracks it exactly, and so does the fling it is
-    // released into. Neither is something to blur.
-    let out = f.synoik().global_space.outputs().next().unwrap().clone();
-    let layout = &mut f.synoik_state().synoik.layout;
-    layout.workspace_switch_gesture_begin(&out, true);
-    layout.workspace_switch_gesture_update(400., Duration::from_millis(50), true);
-    assert_eq!(
+/// A swipe is smeared only while it moves fast enough to strobe.
+///
+/// Part of the same divergence (`docs/fork/workspace-switch-motion-blur.md`). A slow swipe is the
+/// hand tracking content it wants to read, so it stays sharp; a fast one jumps as far between
+/// frames as a long keyboard switch does, so it smears. The speed is the *strip's* over the
+/// exposure just ended, so a swipe that slows, stops or turns back loses its smear with it, and
+/// the fling it is released into fades out as the spring slows.
+#[test]
+fn a_swipe_is_smeared_only_while_it_moves_fast() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 4);
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(2)),
+        false,
+    );
+    f.settle();
+    f.freeze_clock();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    let motion = |f: &mut Fixture| {
         f.synoik()
             .layout
             .monitor_for_output(&output)
             .unwrap()
-            .workspace_switch_motion(),
-        None,
-        "a swipe under the finger must not be smeared",
+            .workspace_switch_motion()
+    };
+    let frames_wanted = |f: &mut Fixture| f.synoik().layout.are_animations_ongoing(Some(&output));
+    // One touchpad update of `dx` px after `ms` of clock, stamped on the same clock.
+    let step = |f: &mut Fixture, dx: f64, ms: u64| {
+        f.advance_clock(Duration::from_millis(ms));
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.layout.workspace_switch_gesture_update(dx, now, true);
+    };
+
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_begin(&output, true);
+
+    // 10 px of finger every 16 ms is a fortieth of a workspace a frame: well under the threshold.
+    for _ in 0..4 {
+        step(&mut f, 10., 16);
+    }
+    assert_eq!(motion(&mut f), None, "a slow swipe is not smeared");
+
+    // 100 px every 8 ms covers half a workspace an exposure — past twice the threshold, so the
+    // smear is the full travel.
+    step(&mut f, 100., 8);
+    step(&mut f, 100., 8);
+    let fast = motion(&mut f).expect("a fast swipe strobes, and is smeared");
+    assert!(
+        fast > 400.,
+        "the full travel of a fast swipe, got {fast:.1}px"
     );
 
-    let layout = &mut f.synoik_state().synoik.layout;
-    layout.workspace_switch_gesture_end(Some(true));
-    f.advance_clock(Duration::from_millis(16));
-    f.turn();
+    // The fingers stop. Nothing repaints on its own, so the compositor must keep drawing until
+    // the smear has run down — and it runs down within one exposure.
+    assert!(
+        frames_wanted(&mut f),
+        "a smeared swipe must keep frames coming after the fingers stop"
+    );
+    f.advance_clock(Duration::from_millis(17));
     assert_eq!(
-        f.synoik()
+        motion(&mut f),
+        None,
+        "a swipe held still is sharp within one exposure"
+    );
+    assert!(
+        !frames_wanted(&mut f),
+        "…and asks for no more frames once still"
+    );
+
+    // Out and straight back inside one exposure: the strip ends where it started, and the smear
+    // says so rather than adding up the two legs.
+    step(&mut f, 100., 8);
+    let out = motion(&mut f).expect("the outward leg alone is fast");
+    step(&mut f, -100., 8);
+    assert!(
+        motion(&mut f).is_none_or(|back| back < out),
+        "turning back cancels travel instead of doubling it"
+    );
+
+    // A fast release flings on under the spring, smeared while it is fast and sharp once it
+    // slows — well before it has settled. A fresh swipe, so the desktop's one-workspace bound
+    // does not rubber-band it.
+    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    f.advance_clock(Duration::from_millis(1000));
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_begin(&output, true);
+    for _ in 0..3 {
+        step(&mut f, 60., 8);
+    }
+    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    let mut smeared = false;
+    let mut sharp_while_moving = false;
+    for _ in 0..30 {
+        f.advance_clock(Duration::from_millis(16));
+        let moving = f
+            .synoik()
             .layout
             .monitor_for_output(&output)
             .unwrap()
-            .workspace_switch_motion(),
-        None,
-        "the fling a swipe is released into is the same motion continuing, and is not smeared \
-         either — it is an `Animation` like any other by then, so only the flag can tell",
+            .workspace_switch_in_progress();
+        match motion(&mut f) {
+            Some(_) => {
+                assert!(
+                    !sharp_while_moving,
+                    "once the fling is sharp it stays sharp"
+                );
+                smeared = true;
+            }
+            None if moving => sharp_while_moving = true,
+            None => break,
+        }
+    }
+    assert!(smeared, "a fast fling is smeared");
+    assert!(
+        sharp_while_moving,
+        "the fling goes sharp while it is still settling"
     );
 }
 

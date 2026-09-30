@@ -7,8 +7,10 @@
 // Modified for synoik in 2026.
 
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::iter::zip;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use smithay::backend::renderer::element::utils::{
@@ -110,6 +112,32 @@ const MOTION_BLUR_MIN_TRAVEL: f64 = 6.;
 /// `render_helpers::vulkan::motion_blur`, which is the radius the smear's pyramid is built deep
 /// enough for; asking past it would silently clamp to a shallower descent and a softer result.
 const MOTION_BLUR_MAX_TRAVEL_FACTOR: f64 = 1.5;
+
+/// Travel per exposure, as a fraction of one workspace, below which a switch the user is steering
+/// — a swipe, or the fling it was released into — is not blurred.
+///
+/// A slow, deliberate swipe is the hand tracking content it wants to read, and a smear would
+/// blur what it is looking for; a fast one strobes just like a long keyboard switch. Above the
+/// threshold the radius ramps from nothing up to the full travel at twice the threshold, so a
+/// swipe that speeds up eases into the smear instead of popping into it.
+const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.125;
+
+/// [`SWIPE_MOTION_BLUR_THRESHOLD`], overridable on a live seat through
+/// `SYNOIK_SWIPE_BLUR_THRESHOLD` while the value is being chosen by feel. A test build never
+/// reads the environment, so a suite started from inside a tuned session cannot see the knob.
+fn swipe_motion_blur_threshold() -> f64 {
+    static THRESHOLD: OnceLock<f64> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        if cfg!(test) {
+            return SWIPE_MOTION_BLUR_THRESHOLD;
+        }
+        std::env::var("SYNOIK_SWIPE_BLUR_THRESHOLD")
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .filter(|t| t.is_finite() && *t >= 0.)
+            .unwrap_or(SWIPE_MOTION_BLUR_THRESHOLD)
+    })
+}
 
 /// How long the row's scroll stays held after the pointer leaves its band — see
 /// [`StripFreeze`]. The same `WINDOW_REPOSITIONING_DELAY` the picker's close freeze runs on,
@@ -320,6 +348,10 @@ pub struct WorkspaceSwitchGesture {
     // When the last GNOME-mode DnD edge snap switched workspaces; the next
     // snap waits out [`WORKSPACE_DND_EDGE_SNAP_GRACE`] from here.
     dnd_snap_last_switch: Option<Duration>,
+    /// Where the strip has been over the last couple of exposures: `(unadjusted clock time,
+    /// current_idx)`, oldest first. What the motion blur reads a finger-driven switch's speed
+    /// off — the *strip's* travel, after clamping and rubber-banding, not the finger's.
+    motion: VecDeque<(Duration, f64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +691,47 @@ impl WorkspaceSwitch {
 }
 
 impl WorkspaceSwitchGesture {
+    /// Record where the strip is at `now`, dropping samples no exposure window can reach.
+    fn record_motion(&mut self, now: Duration) {
+        self.motion.push_back((now, self.current_idx));
+        let horizon = now.saturating_sub(MOTION_BLUR_EXPOSURE * 2);
+        // Keep one sample at or before the horizon, so a window starting there can interpolate.
+        while self.motion.len() > 2 && self.motion[1].0 <= horizon {
+            self.motion.pop_front();
+        }
+    }
+
+    /// Where the strip was at `at`, interpolated between recorded samples; before the first
+    /// sample it was where the swipe began, after the last it has not moved since.
+    fn idx_at(&self, at: Duration) -> f64 {
+        let Some(&(last_t, last_idx)) = self.motion.back() else {
+            return self.current_idx;
+        };
+        if at >= last_t {
+            return last_idx;
+        }
+        let mut later = (last_t, last_idx);
+        for &(t, idx) in self.motion.iter().rev().skip(1) {
+            if t <= at {
+                let span = (later.0 - t).as_secs_f64();
+                if span == 0. {
+                    return later.1;
+                }
+                let f = (at - t).as_secs_f64() / span;
+                return idx + (later.1 - idx) * f;
+            }
+            later = (t, idx);
+        }
+        later.1
+    }
+
+    /// How many workspaces the strip moved across the exposure ending at `now`. A reversal
+    /// inside the window cancels against itself and a stall runs down to zero within one
+    /// exposure, which is what makes the smear follow the hand rather than its history.
+    fn travel_idx(&self, now: Duration) -> f64 {
+        (self.idx_at(now) - self.idx_at(now.saturating_sub(MOTION_BLUR_EXPOSURE))).abs()
+    }
+
     fn min_max(&self, workspace_count: usize) -> (f64, f64) {
         if self.is_clamped {
             let min = self.center_idx.saturating_sub(1) as f64;
@@ -1893,6 +1966,16 @@ impl<W: LayoutElement> Monitor<W> {
             .is_some_and(|s| s.is_animation_ongoing())
         {
             causes |= AnimCauses::WORKSPACE_SWITCH;
+        }
+        // A swipe's frames come from the input driving it — until the fingers stop. The smear
+        // then runs down over one exposure with no event to repaint it, so keep frames coming
+        // until the strip has been still for a whole one and the last frame drawn is sharp.
+        if let Some(WorkspaceSwitch::Gesture(gesture)) = &self.workspace_switch {
+            if gesture.dnd_last_event_time.is_none()
+                && gesture.travel_idx(self.clock.now_unadjusted()) > 0.
+            {
+                causes |= AnimCauses::WORKSPACE_SWITCH;
+            }
         }
         if self.app_grid_expand.is_some() {
             causes |= AnimCauses::APP_GRID_EXPAND;
@@ -3875,17 +3958,12 @@ impl<W: LayoutElement> Monitor<W> {
     /// and blur the sweep instead of shortening it. See
     /// `docs/fork/workspace-switch-motion-blur.md`.
     ///
-    /// The travel is read off the animation curve around `now` rather than differenced between
-    /// frames, so it does not depend on when frames actually landed — a dropped frame must not
-    /// change how the next one is blurred.
+    /// The travel is never differenced between frames, so it does not depend on when frames
+    /// actually landed — a dropped frame must not change how the next one is blurred. An animation
+    /// is read off its curve around `now`; a swipe under the finger has no curve, and is read off
+    /// where the strip has been over the exposure just ended.
     pub fn workspace_switch_motion(&self) -> Option<f64> {
         let switch = self.workspace_switch.as_ref()?;
-
-        // A swipe under the finger tracks the hand exactly, and the fling it is released into is
-        // the same motion continuing; blurring either would smear something the user is steering.
-        if self.workspace_switch_from_gesture {
-            return None;
-        }
 
         // A switch that runs *with* an overview zoom has a rendered index corrected against the
         // zoom's own curve (see [`Self::workspace_render_idx`]), so this animation alone no longer
@@ -3896,17 +3974,38 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
-        let now = self.clock.now();
-        // The exposure is a wall-clock quantity, but the curve is sampled in *clock* time, which
-        // `org.synoik.animations speed` scales. At half speed one real frame advances the
-        // animation half as far, so without this the smear would claim twice the travel that
-        // actually lands on screen — and slow motion is exactly when someone is looking closely.
-        let half = MOTION_BLUR_EXPOSURE.mul_f64(self.clock.rate()) / 2;
-        let travel_idx = (switch.current_idx_at(now + half)
-            - switch.current_idx_at(now.saturating_sub(half)))
-        .abs();
+        let travel_idx = match switch {
+            WorkspaceSwitch::Animation(_) => {
+                let now = self.clock.now();
+                // The exposure is a wall-clock quantity, but the curve is sampled in *clock*
+                // time, which `org.synoik.animations speed` scales. At half speed one real frame
+                // advances the animation half as far, so without this the smear would claim twice
+                // the travel that actually lands on screen — and slow motion is exactly when
+                // someone is looking closely.
+                let half = MOTION_BLUR_EXPOSURE.mul_f64(self.clock.rate()) / 2;
+                (switch.current_idx_at(now + half)
+                    - switch.current_idx_at(now.saturating_sub(half)))
+                .abs()
+            }
+            // A drag-and-drop edge scroll is the pointer parked on an edge, not a hand sweeping.
+            WorkspaceSwitch::Gesture(gesture) if gesture.dnd_last_event_time.is_some() => {
+                return None;
+            }
+            // Under the finger: real time, so the animation speed does not apply.
+            WorkspaceSwitch::Gesture(gesture) => gesture.travel_idx(self.clock.now_unadjusted()),
+        };
         let extent = self.workspace_extent_with_gap(self.overview_zoom());
-        let travel = travel_idx * extent;
+        let mut travel = travel_idx * extent;
+
+        // A switch the user is steering — the swipe, or the fling it was released into — tracks
+        // their hand, and only smears once it moves fast enough to strobe; see
+        // [`SWIPE_MOTION_BLUR_THRESHOLD`].
+        if self.workspace_switch_from_gesture {
+            let threshold = swipe_motion_blur_threshold() * extent;
+            if threshold > 0. {
+                travel *= ((travel - threshold) / threshold).clamp(0., 1.);
+            }
+        }
 
         if travel < MOTION_BLUR_MIN_TRAVEL {
             return None;
@@ -4977,7 +5076,7 @@ impl<W: LayoutElement> Monitor<W> {
         let center_idx = self.active_workspace_idx;
         let current_idx = self.workspace_render_idx();
 
-        let gesture = WorkspaceSwitchGesture {
+        let mut gesture = WorkspaceSwitchGesture {
             center_idx,
             start_idx: current_idx,
             current_idx,
@@ -4988,7 +5087,9 @@ impl<W: LayoutElement> Monitor<W> {
             dnd_last_event_time: None,
             dnd_nonzero_start_time: None,
             dnd_snap_last_switch: None,
+            motion: VecDeque::new(),
         };
+        gesture.record_motion(self.clock.now_unadjusted());
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
         self.workspace_switch_from_gesture = true;
     }
@@ -5022,6 +5123,7 @@ impl<W: LayoutElement> Monitor<W> {
             dnd_last_event_time: Some(self.clock.now_unadjusted()),
             dnd_nonzero_start_time: None,
             dnd_snap_last_switch: None,
+            motion: VecDeque::new(),
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
         self.workspace_switch_from_gesture = true;
@@ -5077,12 +5179,12 @@ impl<W: LayoutElement> Monitor<W> {
         let new_idx = gesture.start_idx + pos;
         let new_idx = rubber_band.clamp(min, max, new_idx);
 
-        if gesture.current_idx == new_idx {
-            return Some(false);
-        }
-
+        let changed = gesture.current_idx != new_idx;
         gesture.current_idx = new_idx;
-        Some(true)
+        // Stationary updates are recorded too: they are what says the strip has been standing
+        // still, so a swipe that resumes after a pause measures its speed from the pause.
+        gesture.record_motion(self.clock.now_unadjusted());
+        Some(changed)
     }
 
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
