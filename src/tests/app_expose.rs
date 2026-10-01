@@ -8,7 +8,7 @@ use smithay::output::Output;
 use synoik_config::Action;
 
 use super::fixture::Fixture;
-use super::gnome::{map_window_for_app, switcher_apps, tap};
+use super::gnome::{map_window_for_app, switcher_apps, tap, touchpad_swipe};
 
 const ONE: &str = "org.example.One";
 const TWO: &str = "org.example.Two";
@@ -449,5 +449,115 @@ fn hovering_a_preview_shows_its_overlay() {
         overlays.iter().map(|(w, _, _)| w).collect::<Vec<_>>(),
         vec![&one[0]],
         "the hovered preview, and only it, shows its overlay"
+    );
+}
+
+/// Three fingers down from the desktop bring App Exposé up over the focused app; up again takes
+/// it down. (The fixture's swipes are post-natural-scrolling: positive is up.)
+#[test]
+fn swiping_down_brings_it_up_and_up_takes_it_down() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    // Off the hot corner, which would open the overview by itself.
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+
+    // Slowly, and far past its one leg.
+    touchpad_swipe(&mut f, 3, (0., -10.), 80, 50);
+    assert!(f.synoik().layout.is_app_expose_open());
+    assert!(!f.synoik().layout.is_overview_open());
+    assert!(same_set(shown(&mut f, &out), one.clone()));
+
+    touchpad_swipe(&mut f, 3, (0., 10.), 80, 50);
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "one swipe up from App Exposé reaches the desktop and no further"
+    );
+    assert_eq!(focused(&mut f), one[1], "the desktop as it was");
+}
+
+/// A swipe that turns back before half way leaves the desktop alone, by the overview's release
+/// rule.
+#[test]
+fn a_swipe_that_turns_back_leaves_the_desktop() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+
+    f.swipe_begin(3);
+    for _ in 0..10 {
+        f.advance_input_time(50);
+        f.swipe_update(0., -10.);
+    }
+    assert!(
+        f.synoik().layout.is_app_expose_open(),
+        "mid-swipe it is up, as far as input goes"
+    );
+    for _ in 0..8 {
+        f.advance_input_time(50);
+        f.swipe_update(0., 10.);
+    }
+    f.advance_input_time(1);
+    f.swipe_end(false);
+    f.settle_animations();
+    assert!(!f.synoik().layout.is_app_expose_open());
+}
+
+/// Down from the desktop with nothing focused has no app to show, and is swallowed: it does not
+/// open the overview either.
+#[test]
+fn swiping_down_over_nothing_focused_does_nothing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+
+    touchpad_swipe(&mut f, 3, (0., -10.), 80, 50);
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert!(!f.synoik().layout.is_overview_open());
+}
+
+/// Down from the overview is still the overview's: it closes it, and does not carry on into App
+/// Exposé.
+#[test]
+fn swiping_down_from_the_overview_only_closes_it() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+
+    touchpad_swipe(&mut f, 3, (0., 10.), 80, 50);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "precondition: up opens the overview"
+    );
+
+    touchpad_swipe(&mut f, 3, (0., -10.), 200, 50);
+    assert!(!f.synoik().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_app_expose_open());
+}
+
+/// A sideways swipe in App Exposé steps to the next app, one per swipe; the other way steps
+/// back.
+#[test]
+fn a_sideways_swipe_steps_to_the_next_app() {
+    let mut f = Fixture::new();
+    let (one, two) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+    open(&mut f);
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
+
+    // However far it goes, one swipe is one app.
+    touchpad_swipe(&mut f, 3, (10., 0.), 80, 50);
+    assert!(f.synoik().layout.is_app_expose_open());
+    assert_eq!(shown(&mut f, &out), vec![two.clone()]);
+
+    touchpad_swipe(&mut f, 3, (-10., 0.), 80, 50);
+    assert!(same_set(shown(&mut f, &out), one));
+    assert_eq!(
+        f.synoik().layout.active_workspace().unwrap().id(),
+        ws,
+        "and it is not a workspace switch"
     );
 }

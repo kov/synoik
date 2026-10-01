@@ -215,6 +215,8 @@ pub enum TouchpadSwipe {
     Workspace,
     /// Paging the app grid.
     AppGrid,
+    /// Bringing App Exposé up, or taking it down (`docs/fork/app-expose.md`).
+    AppExpose,
     /// Nothing runs its way; it is swallowed until the fingers lift.
     Ignored,
 }
@@ -10710,6 +10712,18 @@ impl State {
             delta_y = libinput_event.dy_unaccelerated();
         }
 
+        // The tracker flips the delta for natural scrolling (`swipeTracker.js:188-189`), so
+        // with it on the content follows the fingers: up opens the overview, left brings in
+        // the workspace on the right. Flipped before the pending travel accumulates, so the
+        // direction a swipe begins in is the one its fingers took.
+        let device = event.device();
+        if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
+            if device.config_scroll_natural_scroll_enabled() {
+                delta_x = -delta_x;
+                delta_y = -delta_y;
+            }
+        }
+
         let timestamp = Duration::from_micros(event.time());
 
         // When the update that chooses the axis follows the one before it (or the begin): see
@@ -10744,23 +10758,12 @@ impl State {
                      travel=({dx:.1}, {dy:.1}), this update ({delta_x:.1}, {delta_y:.1})",
                     timestamp.saturating_sub(began).as_secs_f64() * 1000.,
                 );
-                let swipe = self.touchpad_swipe_begin(dx.abs() > dy.abs());
+                let swipe = self.touchpad_swipe_begin(dx, dy);
                 self.synoik.touchpad_swipe = Some(swipe);
                 swipe
             }
             swipe => swipe,
         };
-
-        // The tracker flips the delta for natural scrolling (`swipeTracker.js:188-189`), so
-        // with it on the content follows the fingers: up opens the overview, left brings in
-        // the workspace on the right.
-        let device = event.device();
-        if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
-            if device.config_scroll_natural_scroll_enabled() {
-                delta_x = -delta_x;
-                delta_y = -delta_y;
-            }
-        }
 
         // DIVERGENCE: the tracker starts timing at the update before the one that chose the axis.
         // GNOME's starts at that update itself (`swipeTracker.js:157-186`), and a velocity needs
@@ -10784,6 +10787,17 @@ impl State {
     ) {
         match swipe {
             TouchpadSwipe::Pending { .. } | TouchpadSwipe::Ignored => (),
+            // Down, the opposite way to the overview, is towards App Exposé.
+            TouchpadSwipe::AppExpose => {
+                if self
+                    .synoik
+                    .layout
+                    .app_expose_gesture_update(-delta_y, timestamp)
+                    .unwrap_or(false)
+                {
+                    self.synoik.queue_redraw_all();
+                }
+            }
             TouchpadSwipe::Overview => {
                 if self
                     .synoik
@@ -10823,7 +10837,42 @@ impl State {
     /// is up (`appDisplay.js:603-614`) and switches workspaces otherwise
     /// (`workspaceAnimation.js:359-369` on the desktop, `workspacesView.js:839-848` in the
     /// overview).
-    fn touchpad_swipe_begin(&mut self, horizontal: bool) -> TouchpadSwipe {
+    ///
+    /// App Exposé takes the swipes the overview leaves free (`docs/fork/app-expose.md`): down
+    /// from the desktop brings it up, and while it is anywhere on screen a vertical swipe moves
+    /// it and a horizontal one steps to the next or previous app. `(dx, dy)` is the travel that
+    /// cleared the threshold, positive up and towards the next workspace.
+    fn touchpad_swipe_begin(&mut self, dx: f64, dy: f64) -> TouchpadSwipe {
+        let horizontal = dx.abs() > dy.abs();
+        let overview_up = self.synoik.layout.overview_progress_debug().is_some();
+        let app_expose_up = self
+            .synoik
+            .layout
+            .active_monitor_ref()
+            .is_some_and(|mon| mon.app_expose_progress().is_some());
+
+        if app_expose_up && horizontal {
+            // One app per swipe: the step is taken now, and the rest of the swipe goes nowhere.
+            self.cycle_app_expose(dx < 0.);
+            return TouchpadSwipe::Ignored;
+        }
+        if !horizontal && (app_expose_up || (dy < 0. && !overview_up)) {
+            // Down from the desktop over nothing focused is swallowed, with no affordance.
+            let windows = if app_expose_up || !self.synoik.layout.is_gnome_mode() {
+                Vec::new()
+            } else {
+                match self.synoik.app_expose_windows_for_focus() {
+                    Some(windows) => windows,
+                    None => return TouchpadSwipe::Ignored,
+                }
+            };
+            if !self.synoik.layout.app_expose_gesture_begin(windows) {
+                return TouchpadSwipe::Ignored;
+            }
+            self.synoik.queue_redraw_all();
+            return TouchpadSwipe::AppExpose;
+        }
+
         if !horizontal {
             self.synoik.layout.overview_gesture_begin();
             self.synoik.queue_redraw_all();
@@ -10894,6 +10943,12 @@ impl State {
             }
             TouchpadSwipe::Ignored => {
                 debug!(target: "synoik::swipe", "touchpad: ended on an axis nothing tracks");
+            }
+            TouchpadSwipe::AppExpose => {
+                let timestamp = Duration::from_micros(event.time());
+                if self.synoik.layout.app_expose_gesture_end(timestamp) {
+                    self.synoik.queue_redraw_all();
+                }
             }
             TouchpadSwipe::Overview => {
                 let timestamp = Duration::from_micros(event.time());

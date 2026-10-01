@@ -23688,7 +23688,13 @@ fn overview_app_grid_swipes_between_pages() {
 /// A three-finger swipe of `n` updates of `(dx, dy)`, `gap` ms apart, then the fingers lift
 /// and whatever it released settles. The synthetic touchpad has natural scrolling off, so
 /// `+dy` is the way to the app grid and `+dx` the way to the next workspace.
-fn touchpad_swipe(f: &mut Fixture, fingers: u32, (dx, dy): (f64, f64), n: usize, gap: u32) {
+pub(super) fn touchpad_swipe(
+    f: &mut Fixture,
+    fingers: u32,
+    (dx, dy): (f64, f64),
+    n: usize,
+    gap: u32,
+) {
     f.swipe_begin(fingers);
     for _ in 0..n {
         f.advance_input_time(gap);
