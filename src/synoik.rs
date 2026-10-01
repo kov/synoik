@@ -12471,7 +12471,8 @@ impl Synoik {
                         }
                     })
                     .collect();
-                self.thumbnail_chrome.retain_names(&names);
+                self.thumbnail_chrome
+                    .retain_names(mon.output_name(), &names);
                 // The workspace being renamed wears the entry instead of its label — the two
                 // occupy the same slot, and showing both would show the same name twice.
                 let entry = self.workspace_rename.as_ref().and_then(|rename| {
@@ -12485,6 +12486,7 @@ impl Synoik {
                 for element in self.thumbnail_chrome.render(
                     ctx.renderer,
                     &self.icon_cache,
+                    mon.output_name(),
                     fade_scale,
                     crate::ui::widget::style::accent_rgba(self.gnome_settings.accent_color),
                     crate::ui::thumbnail_chrome::StripChrome {

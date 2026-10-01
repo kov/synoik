@@ -82,13 +82,22 @@ pub struct ThumbnailClose {
     pub hovered: bool,
 }
 
-/// The strip chrome's GPU caches: one disc bake per (size, hover) key, and one pill bake per
+/// One output's strip-chrome bakes: one disc bake per (size, hover) key, and one pill bake per
 /// distinct label.
 #[derive(Default)]
-pub struct ThumbnailChrome {
+struct OutputStrip {
     disc: RefCell<BakeCache>,
     names: RefCell<std::collections::HashMap<String, BakeCache>>,
     entry: RefCell<BakeCache>,
+}
+
+/// The strip chrome's GPU caches, **one entry per output** by name. Workspaces are per-monitor, so
+/// each screen shows its own labels, and the label bakes are pruned against the names of whichever
+/// output is drawing: shared, two displays dropped each other's pills and re-baked them, with a new
+/// `Id`, every frame.
+#[derive(Default)]
+pub struct ThumbnailChrome {
+    outputs: RefCell<std::collections::HashMap<String, OutputStrip>>,
 }
 
 impl ThumbnailChrome {
@@ -96,12 +105,15 @@ impl ThumbnailChrome {
         Self::default()
     }
 
-    /// Drop the bakes for labels no thumbnail is showing any more, so a renamed or closed
-    /// workspace does not leave its pill in the cache for the session.
-    pub fn retain_names(&self, names: &[ThumbnailName]) {
-        self.names
-            .borrow_mut()
-            .retain(|key, _| names.iter().any(|n| n.name == *key));
+    /// Drop `output`'s bakes for labels none of its thumbnails is showing any more, so a renamed
+    /// or closed workspace does not leave its pill in the cache for the session.
+    pub fn retain_names(&self, output: &str, names: &[ThumbnailName]) {
+        if let Some(strip) = self.outputs.borrow().get(output) {
+            strip
+                .names
+                .borrow_mut()
+                .retain(|key, _| names.iter().any(|n| n.name == *key));
+        }
     }
 
     /// Render the close buttons and the name labels, topmost first (the caller pushes these
@@ -110,6 +122,7 @@ impl ThumbnailChrome {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        output: &str,
         scale: f64,
         accent: Rgba,
         chrome: StripChrome<'_>,
@@ -121,6 +134,8 @@ impl ThumbnailChrome {
             band,
         } = chrome;
         let mut elements: Vec<ThumbnailChromeRenderElement> = Vec::new();
+        let mut outputs = self.outputs.borrow_mut();
+        let strip = outputs.entry(output.to_owned()).or_default();
 
         // The name entry, where that workspace's label would be: what is being edited is where
         // the result will show.
@@ -136,7 +151,7 @@ impl ThumbnailChrome {
                 .done();
             let baked = widget::Entry::bake(
                 renderer,
-                &mut self.entry.borrow_mut(),
+                &mut strip.entry.borrow_mut(),
                 scale,
                 rect.size.w,
                 rect.size.h,
@@ -172,7 +187,7 @@ impl ThumbnailChrome {
                 continue;
             }
             let size = widget::Tooltip::size(&label.name);
-            let mut caches = self.names.borrow_mut();
+            let mut caches = strip.names.borrow_mut();
             let cache = caches.entry(label.name.clone()).or_default();
             let pill = widget::bake(
                 renderer,
@@ -234,7 +249,7 @@ impl ThumbnailChrome {
                 widget::IconButton::new(local, icon_px, CLOSE_BG).hovered(button.hovered);
             let disc = widget::bake(
                 renderer,
-                &mut self.disc.borrow_mut(),
+                &mut strip.disc.borrow_mut(),
                 scale,
                 local.size,
                 widget::Revision::new().of(button.hovered).px(size).done(),

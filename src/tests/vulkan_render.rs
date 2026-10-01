@@ -15177,6 +15177,13 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
         f.double_roundtrip(id);
         f.synoik_complete_animations();
         f.double_roundtrip(id);
+        // A named workspace on each screen, so the strip bakes a label pill for both: the strip
+        // chrome's label bakes are pruned against the names of whichever output is drawing.
+        f.synoik_state()
+            .do_action(Action::SetWorkspaceName("probe two".to_owned()), false);
+        f.synoik_state().do_action(Action::FocusMonitorLeft, false);
+        f.synoik_state()
+            .do_action(Action::SetWorkspaceName("probe one".to_owned()), false);
 
         f.synoik().layout.toggle_overview();
         f.synoik_complete_animations();
@@ -15191,7 +15198,13 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
         // one screen, every per-window cache on the other stays untouched.
         for output in &outputs {
             let ids = named_element_ids(&mut f, output);
-            for want in ["RoundedTexture", "PreviewChrome", "Dash", "Panel"] {
+            for want in [
+                "RoundedTexture",
+                "PreviewChrome",
+                "ThumbnailChrome",
+                "Dash",
+                "Panel",
+            ] {
                 assert!(
                     ids.iter().any(|id| id.starts_with(want)),
                     "no {want} element on {} — this guard is watching a scene without the \
