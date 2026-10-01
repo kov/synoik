@@ -4228,6 +4228,9 @@ impl<W: LayoutElement> Monitor<W> {
     /// app icon, which is *not* hover-gated and survives into the app-grid
     /// transition while its scale ramps out.
     pub fn preview_rects(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
+        if self.app_expose.is_some() {
+            return self.app_expose_preview_rects();
+        }
         let Some(progress) = self.expose_progress() else {
             return Vec::new();
         };
@@ -4266,6 +4269,19 @@ impl<W: LayoutElement> Monitor<W> {
         // live as the leg unwinds on the way out, which is the same comparison read backwards.
         if self.app_grid_leg() > 0. {
             return None;
+        }
+
+        // App Exposé's previews are activation hits, as the picker's are: a scaled window takes
+        // no real input.
+        if self.app_expose.is_some() {
+            return self.window_under_app_expose(pos_within_output).map(|win| {
+                (
+                    win,
+                    HitType::Activate {
+                        is_tab_indicator: false,
+                    },
+                )
+            });
         }
 
         let (ws, geo) = self.workspace_under(pos_within_output)?;
@@ -5112,7 +5128,12 @@ impl<W: LayoutElement> Monitor<W> {
         };
         let scale = self.scale.fractional_scale();
 
-        for entry in self.app_expose_layout() {
+        // The hovered preview draws above its neighbours, as in the picker (`render_expose`);
+        // first pushed is topmost.
+        let mut layout = self.app_expose_layout();
+        layout.sort_by(|a, b| b.hover.total_cmp(&a.hover));
+
+        for entry in layout {
             if entry.on_screen != on_screen {
                 continue;
             }

@@ -16,7 +16,7 @@ use smithay::utils::{Logical, Point, Rectangle};
 use super::expose::ExposeInput;
 use super::monitor::Monitor;
 use super::tile::Tile;
-use super::workspace::AppExposeTile;
+use super::workspace::{expose_tile_render, AppExposeTile};
 use super::{Layout, LayoutElement, OVERVIEW_GESTURE_MOVEMENT};
 use crate::animation::Animation;
 use crate::input::swipe_tracker::{self, SwipeTracker};
@@ -83,16 +83,22 @@ pub(super) struct AppExposeEntry<'a, W: LayoutElement> {
     /// Whether the window is on screen when App Exposé is down — on its display's active
     /// workspace. One that is not has nowhere to fly from, and fades in instead.
     pub on_screen: bool,
+    /// How far the picker overlay is up on it — the hover growth.
+    pub hover: f64,
 }
 
 impl<W: LayoutElement> AppExposeEntry<'_, W> {
-    /// Where the preview draws at `progress`, and at what scale — the picker's interpolation at
-    /// zoom 1.
+    /// Where the preview draws at `progress`, and at what scale — the picker's own geometry,
+    /// hover growth included, at zoom 1.
     pub fn placement(&self, progress: f64) -> (Point<f64, Logical>, f64) {
-        let target_scale = self.slot.size.w / self.rect.size.w;
-        let scale = self.from_scale + (target_scale - self.from_scale) * progress;
-        let pos = self.rect.loc + (self.slot.loc - self.rect.loc).upscale(progress);
-        (pos, scale)
+        expose_tile_render(
+            self.rect,
+            self.slot,
+            self.from_scale,
+            self.hover,
+            progress,
+            1.,
+        )
     }
 
     /// The rect the preview draws into at `progress`.
@@ -167,6 +173,7 @@ impl<W: LayoutElement> Monitor<W> {
             .into_iter()
             .zip(slots)
             .map(|((ws_idx, (tile, _, rect, from_scale)), slot)| {
+                let hover = self.workspaces[ws_idx].expose_hover_value(tile.window().id());
                 if ws_idx == active {
                     AppExposeEntry {
                         tile,
@@ -174,6 +181,7 @@ impl<W: LayoutElement> Monitor<W> {
                         slot,
                         from_scale,
                         on_screen: true,
+                        hover,
                     }
                 } else {
                     // Nowhere on screen to come from: start a little smaller than the slot,
@@ -193,19 +201,39 @@ impl<W: LayoutElement> Monitor<W> {
                         slot,
                         from_scale,
                         on_screen: false,
+                        hover,
                     }
                 }
             })
             .collect()
     }
 
-    /// The window whose preview is under `pos` (output coordinates), front to back.
+    /// The window whose slot is under `pos` (output coordinates) — the picker's hit test,
+    /// which is the slot and not the drawn rect, so what a click picks is what hover grows.
     pub(super) fn window_under_app_expose(&self, pos: Point<f64, Logical>) -> Option<&W> {
-        let progress = self.app_expose_progress()?;
+        self.app_expose_progress()?;
         self.app_expose_layout()
             .into_iter()
-            .find(|entry| entry.drawn_rect(progress).contains(pos))
+            .find(|entry| entry.slot.contains(pos))
             .map(|entry| entry.tile.window())
+    }
+
+    /// Every preview as drawn, with its overlay's alpha — what the preview chrome is built from,
+    /// as [`Monitor::preview_rects`] is for the picker.
+    pub(super) fn app_expose_preview_rects(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
+        let Some(progress) = self.app_expose_progress() else {
+            return Vec::new();
+        };
+        self.app_expose_layout()
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.tile.window().id().clone(),
+                    entry.drawn_rect(progress),
+                    entry.hover * progress,
+                )
+            })
+            .collect()
     }
 }
 
@@ -251,6 +279,11 @@ impl<W: LayoutElement> Layout<W> {
     pub fn close_app_expose(&mut self) -> bool {
         if !self.is_app_expose_open() {
             return false;
+        }
+
+        // Leaving drops the overlay at once, as the overview's exit does (`toggle_overview`).
+        for ws in self.workspaces_mut() {
+            ws.clear_expose_hover();
         }
 
         let from = self.app_expose_value();

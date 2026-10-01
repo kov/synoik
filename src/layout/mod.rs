@@ -7397,9 +7397,12 @@ impl<W: LayoutElement> Layout<W> {
     /// from the refresh and not only from motion.
     pub fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
         let overview_open = self.overview_open;
+        let app_expose_open = self.is_app_expose_open();
         let mut changed = false;
         for mon in self.monitors_mut() {
-            let enabled = overview_open && mon.overview_state_value() == Some(1.);
+            // App Exposé's overlay follows the same rule on its own one leg: only fully up.
+            let enabled = (overview_open && mon.overview_state_value() == Some(1.))
+                || (app_expose_open && mon.app_expose_progress() == Some(1.));
             for ws in &mut mon.workspaces {
                 changed |= if enabled {
                     ws.set_expose_hover(window)

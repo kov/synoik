@@ -1669,6 +1669,8 @@ pub enum KeyboardFocus {
     NetworkSecretDialog,
     Popover,
     Overview,
+    /// App Exposé (`docs/fork/app-expose.md`), which takes keys the way the overview does.
+    AppExpose,
     /// The Alt-Tab / Super-Tab switcher holds a modal grab while it is up.
     Switcher,
 }
@@ -1837,6 +1839,7 @@ impl KeyboardFocus {
             KeyboardFocus::NetworkSecretDialog => "NetworkSecretDialog",
             KeyboardFocus::Popover => "Popover",
             KeyboardFocus::Overview => "Overview",
+            KeyboardFocus::AppExpose => "AppExpose",
             KeyboardFocus::Switcher => "Switcher",
         };
         match self {
@@ -1867,6 +1870,7 @@ impl KeyboardFocus {
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
+            KeyboardFocus::AppExpose => None,
             KeyboardFocus::Switcher => None,
         }
     }
@@ -1884,6 +1888,7 @@ impl KeyboardFocus {
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
+            KeyboardFocus::AppExpose => None,
             KeyboardFocus::Switcher => None,
         }
     }
@@ -1894,6 +1899,10 @@ impl KeyboardFocus {
 
     pub fn is_overview(&self) -> bool {
         matches!(self, KeyboardFocus::Overview)
+    }
+
+    pub fn is_app_expose(&self) -> bool {
+        matches!(self, KeyboardFocus::AppExpose)
     }
 }
 
@@ -3667,6 +3676,9 @@ impl State {
 
                 if is_overview_open {
                     surface = Some(surface.unwrap_or(KeyboardFocus::Overview));
+                }
+                if self.synoik.layout.is_app_expose_open() {
+                    surface = Some(surface.unwrap_or(KeyboardFocus::AppExpose));
                 }
 
                 surface = surface.or_else(|| on_d_focus_on_layer(Layer::Bottom));
@@ -10936,6 +10948,7 @@ impl Synoik {
             KeyboardFocus::NetworkSecretDialog => true,
             KeyboardFocus::Popover => true,
             KeyboardFocus::Overview => true,
+            KeyboardFocus::AppExpose => true,
             KeyboardFocus::Switcher => true,
         };
 
@@ -12425,6 +12438,19 @@ impl Synoik {
             // then the blurred wallpaper fading in over everything else, which is all the other
             // windows' leaving amounts to.
             if let Some(progress) = mon.app_expose_progress().filter(|_| gnome_mode) {
+                // Topmost: each preview's chrome. App Exposé has no app icons — every window is
+                // the one app's — so `preview_icon_scale` keeps them at 0.
+                let overlays = self.preview_overlays_for(mon);
+                for element in self.preview_chrome.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    mon.output_name(),
+                    fade_scale,
+                    &overlays,
+                ) {
+                    push(element.into());
+                }
                 mon.render_app_expose(ctx.r(), true, &mut |elem| push(elem.into()));
                 let mut group = Vec::new();
                 mon.render_app_expose(ctx.r(), false, &mut |elem| group.push(elem.into()));
@@ -12609,30 +12635,7 @@ impl Synoik {
             // screen pixels — the workspace zoom is baked into the previews'
             // allocations there, not applied to them.
             {
-                // The icon is not hover-gated, so the source is every drawn
-                // preview; `preview_overlays` is the hover-gated subset, and a
-                // preview missing from it simply carries alpha 0.
-                let hovered: Vec<_> = mon.preview_overlays();
-                let icon_scale = mon.preview_icon_scale();
-                let overlays: Vec<_> = mon
-                    .preview_rects()
-                    .into_iter()
-                    .map(|(window, preview, _)| {
-                        let alpha = hovered
-                            .iter()
-                            .find(|(w, _, _)| *w == window)
-                            .map_or(0., |(_, _, hover)| *hover);
-                        let (icon, caption) = self.preview_app_chrome(&window);
-                        PreviewOverlay {
-                            preview,
-                            alpha: alpha as f32,
-                            hovered: self.preview_close_hovered.as_ref() == Some(&window),
-                            icon,
-                            caption,
-                            icon_scale,
-                        }
-                    })
-                    .collect();
+                let overlays = self.preview_overlays_for(mon);
                 for element in self.preview_chrome.render(
                     ctx.renderer,
                     &self.icon_cache,
@@ -15817,6 +15820,42 @@ impl Synoik {
     /// (see [`crate::ui::dock`]) while it is out. Every dash hit-test, hover and drop-target
     /// asks this rather than reaching for the overview layout, which is what lets the dock reuse
     /// the dash's interaction wholesale. `None` when the dash is not on screen at all.
+    /// Each drawn preview's chrome on `mon` — close button, caption and app icon — for the picker
+    /// and App Exposé alike.
+    fn preview_overlays_for(
+        &self,
+        mon: &crate::layout::monitor::Monitor<Mapped>,
+    ) -> Vec<PreviewOverlay> {
+        // The icon is not hover-gated, so the source is every drawn preview; `preview_overlays`
+        // is the hover-gated subset, and a preview missing from it simply carries alpha 0.
+        let hovered: Vec<_> = mon.preview_overlays();
+        let icon_scale = mon.preview_icon_scale();
+        mon.preview_rects()
+            .into_iter()
+            .map(|(window, preview, _)| {
+                let alpha = hovered
+                    .iter()
+                    .find(|(w, _, _)| *w == window)
+                    .map_or(0., |(_, _, hover)| *hover);
+                let (icon, caption) = self.preview_app_chrome(&window);
+                PreviewOverlay {
+                    preview,
+                    alpha: alpha as f32,
+                    hovered: self.preview_close_hovered.as_ref() == Some(&window),
+                    icon,
+                    caption,
+                    icon_scale,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether App Exposé is up and on screen to take the pointer: not behind the shield or the
+    /// screenshot UI, either of which may be raised over it.
+    pub fn app_expose_ui_visible(&self) -> bool {
+        self.layout.is_app_expose_open() && !self.is_locked() && !self.screenshot_ui.is_open()
+    }
+
     pub fn dash_area(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
         if self.overview_ui_visible() {
             return self

@@ -8,7 +8,7 @@ use smithay::output::Output;
 use synoik_config::Action;
 
 use super::fixture::Fixture;
-use super::gnome::{map_window_for_app, switcher_apps};
+use super::gnome::{map_window_for_app, switcher_apps, tap};
 
 const ONE: &str = "org.example.One";
 const TWO: &str = "org.example.Two";
@@ -289,4 +289,165 @@ fn there_is_no_dock() {
     f.synoik_state().do_action(Action::ToggleAppExpose, false);
     f.settle();
     assert_eq!(f.synoik().dash_area(&out), None);
+}
+
+const KEY_ESC: u32 = 1;
+const KEY_TAB: u32 = 15;
+const KEY_A: u32 = 30;
+const KEY_LEFTSHIFT: u32 = 42;
+
+fn open(f: &mut Fixture) {
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle();
+    assert!(f.synoik().layout.is_app_expose_open(), "precondition: up");
+    assert!(
+        f.synoik().keyboard_focus.is_app_expose(),
+        "it holds the keyboard focus, so no window and no search sees a key"
+    );
+}
+
+fn click_at(f: &mut Fixture, x: f64, y: f64) {
+    use smithay::backend::input::ButtonState;
+    super::gnome::pointer_motion_to(f, x, y);
+    f.pointer_button(super::gnome::BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(super::gnome::BTN_LEFT, ButtonState::Released);
+    f.settle();
+}
+
+/// Escape leaves, and the focus is where it was.
+#[test]
+fn escape_leaves() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    open(&mut f);
+
+    tap(&mut f, KEY_ESC);
+    f.settle();
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(focused(&mut f), one[1], "the desktop as it was");
+}
+
+/// Tab moves on to the next app, Shift+Tab back.
+#[test]
+fn tab_cycles_apps() {
+    let mut f = Fixture::new();
+    let (one, two) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    tap(&mut f, KEY_TAB);
+    f.settle();
+    assert_eq!(shown(&mut f, &out), vec![two]);
+
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTSHIFT);
+    f.settle();
+    assert!(same_set(shown(&mut f, &out), one));
+}
+
+/// There is no search to type into: a letter neither engages the overview's nor leaves.
+#[test]
+fn typing_does_not_search() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    open(&mut f);
+
+    tap(&mut f, KEY_A);
+    f.settle();
+    assert!(f.synoik().layout.is_app_expose_open());
+    assert!(!f.synoik().overview_search.is_active());
+}
+
+/// Clicking a preview goes to its window, its workspace first when it lives on another one.
+#[test]
+fn clicking_a_preview_goes_to_its_window() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    let c = one[2].clone();
+    let slot = f
+        .synoik()
+        .layout
+        .app_expose_slots(&out)
+        .into_iter()
+        .find(|(w, _)| *w == c)
+        .unwrap()
+        .1;
+    click_at(
+        &mut f,
+        slot.loc.x + slot.size.w / 2.,
+        slot.loc.y + slot.size.h / 2.,
+    );
+
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(focused(&mut f), c);
+    assert!(f
+        .synoik()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .holds_window(&c));
+}
+
+/// A click on no preview leaves, the desktop as it was.
+#[test]
+fn clicking_beside_the_previews_leaves() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    // The output's bottom-left corner, which no slot reaches.
+    let slots = f.synoik().layout.app_expose_slots(&out);
+    let (x, y) = (2., 1078.);
+    assert!(
+        slots
+            .iter()
+            .all(|(_, s)| !s.contains(smithay::utils::Point::from((x, y)))),
+        "precondition: no preview there"
+    );
+    click_at(&mut f, x, y);
+
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(focused(&mut f), one[1]);
+}
+
+/// The pointer on a preview raises its overlay — the close button and caption — once App
+/// Exposé is fully up, as the picker's does in the overview.
+#[test]
+fn hovering_a_preview_shows_its_overlay() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    let slot = f
+        .synoik()
+        .layout
+        .app_expose_slots(&out)
+        .into_iter()
+        .find(|(w, _)| *w == one[0])
+        .unwrap()
+        .1;
+    super::gnome::pointer_motion_to(
+        &mut f,
+        slot.loc.x + slot.size.w / 2.,
+        slot.loc.y + slot.size.h / 2.,
+    );
+    f.settle();
+
+    let overlays = f
+        .synoik()
+        .layout
+        .monitor_for_output(&out)
+        .unwrap()
+        .preview_overlays();
+    assert_eq!(
+        overlays.iter().map(|(w, _, _)| w).collect::<Vec<_>>(),
+        vec![&one[0]],
+        "the hovered preview, and only it, shows its overlay"
+    );
 }

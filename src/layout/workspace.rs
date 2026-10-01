@@ -420,7 +420,7 @@ fn hover_scale(size: Size<f64, Logical>, hover: f64) -> f64 {
 /// picker slot by `progress`, then grown about its center by the hover overlay.
 /// The single source of the picker's drawn geometry — rendering and the
 /// geometry accessors both go through it.
-fn expose_tile_render(
+pub(super) fn expose_tile_render(
     rect: Rectangle<f64, Logical>,
     slot: Rectangle<f64, Logical>,
     from_scale: f64,

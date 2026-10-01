@@ -178,8 +178,10 @@ pub fn volume_scroll_action(qs_open: bool, steps: f64) -> VolumeScroll {
 /// press-time target to compare the release against — this is that target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverviewHit {
-    /// The close button of a window preview in the picker.
+    /// The close button of a window preview in the picker, or in App Exposé.
     PreviewClose(smithay::desktop::Window),
+    /// A window's preview in App Exposé.
+    AppExposeWindow(smithay::desktop::Window),
     /// The dash (favorites bar).
     Dash(DashHit),
     /// The search entry / results card.
@@ -1638,6 +1640,20 @@ impl State {
                         this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
+                    // App Exposé takes its keys before anything else of the overview's could, and
+                    // swallows the rest: it holds the keyboard focus like the overview, and has no
+                    // search to type into. Presses only, as for the switcher above.
+                    if this.synoik.keyboard_focus.is_app_expose() && pressed {
+                        match raw {
+                            Some(Keysym::Escape) => this.toggle_app_expose(),
+                            Some(Keysym::Tab) => this.cycle_app_expose(mods.shift),
+                            Some(Keysym::ISO_Left_Tab) => this.cycle_app_expose(true),
+                            _ => {}
+                        }
+                        this.synoik.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
+
                     if this.synoik.keyboard_focus.is_overview() && pressed {
                         // Overview search: typing engages the search entry (GNOME's
                         // `_onStageKeyPress`/`_shouldTriggerSearch`, searchController.js:145-236).
@@ -5998,20 +6014,18 @@ impl State {
     /// `pos` is the global-space pointer location. Run on motion, and from the refresh for the
     /// state changes that move no pointer (see `Layout::set_expose_hover`).
     pub(crate) fn update_expose_hover(&mut self, pos: Point<f64, Logical>) {
-        let hovered = self
-            .synoik
-            .layout
-            .is_overview_open()
-            .then(|| {
-                let (output, p) = self.synoik.output_under(pos)?;
-                let output = output.clone();
-                match self.synoik.layout.window_under(&output, p) {
-                    Some((window, _)) => Some(LayoutElement::id(window).clone()),
-                    // `preview_overlays` already yields the layout id.
-                    None => self.preview_hover_under(&output, p),
-                }
-            })
-            .flatten();
+        let hovered = (self.synoik.layout.is_overview_open()
+            || self.synoik.layout.is_app_expose_open())
+        .then(|| {
+            let (output, p) = self.synoik.output_under(pos)?;
+            let output = output.clone();
+            match self.synoik.layout.window_under(&output, p) {
+                Some((window, _)) => Some(LayoutElement::id(window).clone()),
+                // `preview_overlays` already yields the layout id.
+                None => self.preview_hover_under(&output, p),
+            }
+        })
+        .flatten();
         if self.synoik.layout.set_expose_hover(hovered.as_ref()) {
             self.synoik.queue_redraw_all();
         }
@@ -8393,6 +8407,18 @@ impl State {
                 .map(OverviewHit::Dash);
         }
 
+        // App Exposé has no chrome of its own, only the previews and their close buttons.
+        if self.synoik.app_expose_ui_visible() {
+            if let Some(window) = self.preview_close_under(output, pos) {
+                return Some(OverviewHit::PreviewClose(window));
+            }
+            return self
+                .synoik
+                .layout
+                .window_under_app_expose(output, pos)
+                .map(|mapped| OverviewHit::AppExposeWindow(mapped.window.clone()));
+        }
+
         if !self.synoik.overview_ui_visible() {
             return None;
         }
@@ -8630,6 +8656,12 @@ impl State {
         }
 
         match hit {
+            // Picking a window in App Exposé goes to it, switching workspace if it must.
+            OverviewHit::AppExposeWindow(window) if primary => {
+                if self.synoik.layout.activate_app_expose_window(&window) {
+                    self.synoik.queue_redraw_all();
+                }
+            }
             // The close button asks the window to close, like GNOME's
             // `_deleteAll` (`windowPreview.js:218`), and leaves the overview open.
             OverviewHit::PreviewClose(window) if primary => {
@@ -9207,6 +9239,17 @@ impl State {
                     self.handle_bind(bind.clone());
                     return;
                 };
+            }
+
+            // A press anywhere in App Exposé that no preview took leaves it, the desktop as it
+            // was. After the panel, which stays clickable over it. Every button, and consumed:
+            // nothing beneath is on screen to receive it.
+            if self.synoik.app_expose_ui_visible() {
+                self.synoik.suppressed_buttons.insert(button_code);
+                if self.synoik.layout.close_app_expose() {
+                    self.synoik.queue_redraw_all();
+                }
+                return;
             }
 
             // We received an event for the regular pointer, so show it now.
