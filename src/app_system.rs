@@ -633,8 +633,8 @@ impl AppSystem {
         };
 
         self.lookup_startup_wmclass(app_id)
-            .filter(&allowed)
-            .or_else(|| self.lookup_desktop_wmclass(app_id).filter(&allowed))
+            .filter(allowed)
+            .or_else(|| self.lookup_desktop_wmclass(app_id).filter(allowed))
             .or_else(|| self.lookup(&format!("{}.desktop", sandbox_id?)))
     }
 
