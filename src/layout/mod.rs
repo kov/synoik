@@ -5247,6 +5247,9 @@ impl<W: LayoutElement> Layout<W> {
             velocity,
             true,
         );
+        gesture
+            .tracker
+            .log_release("overview", gesture.start, gesture.state, target);
 
         let from = gesture.value();
         let to = target.min(1.);

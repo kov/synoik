@@ -10784,7 +10784,16 @@ impl State {
         // A cancel releases the swipe just as the fingers lifting does: the touchpad gesture
         // emits the same `end` for both (`swipeTracker.js:190-197`).
         match swipe {
-            TouchpadSwipe::Pending { .. } | TouchpadSwipe::Ignored => (),
+            // The swipes that never reach a tracker, for the same log the released ones go to.
+            TouchpadSwipe::Pending { dx, dy } => {
+                debug!(
+                    target: "synoik::swipe",
+                    "touchpad: ended before choosing an axis, travel=({dx:.1}, {dy:.1})"
+                );
+            }
+            TouchpadSwipe::Ignored => {
+                debug!(target: "synoik::swipe", "touchpad: ended on an axis nothing tracks");
+            }
             TouchpadSwipe::Overview => {
                 let timestamp = Duration::from_micros(event.time());
                 if self.synoik.layout.overview_gesture_end(timestamp) {

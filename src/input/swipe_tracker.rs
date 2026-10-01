@@ -12,6 +12,10 @@ const DECELERATION_TOUCHPAD: f64 = 0.997;
 pub struct SwipeTracker {
     history: VecDeque<Event>,
     pos: f64,
+    /// Every event since the gesture began, untrimmed, and when it was released: what
+    /// [`Self::log_release`] reports.
+    samples: Vec<Event>,
+    released_at: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +30,8 @@ impl SwipeTracker {
         Self {
             history: VecDeque::new(),
             pos: 0.,
+            samples: Vec::new(),
+            released_at: None,
         }
     }
 
@@ -43,7 +49,9 @@ impl SwipeTracker {
             }
         }
 
-        self.history.push_back(Event { delta, timestamp });
+        let event = Event { delta, timestamp };
+        self.history.push_back(event);
+        self.samples.push(event);
         self.pos += delta;
 
         self.trim_history();
@@ -82,6 +90,40 @@ impl SwipeTracker {
     /// motion keeps the speed it was moving at — the lift itself adds no event that would dilute
     /// it.
     pub fn release(&mut self, timestamp: Duration) {
+        self.released_at = Some(timestamp);
+        self.trim_to(timestamp);
+    }
+
+    /// Logs what a release saw and what it decided, one line per swipe under the `synoik::swipe`
+    /// target: every sample since the swipe began (ms since the first, delta in the tracker's
+    /// units), the gap between the last one and the release, and the speed the decision read.
+    /// `start`, `progress` and `target` are in snap points.
+    pub fn log_release(&self, what: &str, start: f64, progress: f64, target: f64) {
+        let Some(first) = self.samples.first() else {
+            debug!(target: "synoik::swipe", "{what}: {start:.2} -> {progress:.2} -> {target}; no samples");
+            return;
+        };
+        let ms = |t: Duration| (t.as_secs_f64() - first.timestamp.as_secs_f64()) * 1000.;
+        let last = self.samples.last().map_or(first.timestamp, |e| e.timestamp);
+        let gap = self.released_at.map_or(0., |r| ms(r) - ms(last));
+        let samples = self
+            .samples
+            .iter()
+            .map(|e| format!("{:.0}:{:.1}", ms(e.timestamp), e.delta))
+            .collect::<Vec<_>>()
+            .join(" ");
+        debug!(
+            target: "synoik::swipe",
+            "{what}: {start:.2} -> {progress:.2} -> {target}; v={:.3} px/ms from {} in window; \
+             travel={:.1} in {:.0} ms; lift gap={gap:.0} ms; samples=[{samples}]",
+            self.velocity() / 1000.,
+            self.history.len(),
+            self.pos,
+            ms(last),
+        );
+    }
+
+    fn trim_to(&mut self, timestamp: Duration) {
         while let Some(first) = self.history.front() {
             if timestamp <= first.timestamp + HISTORY_LIMIT {
                 break;
@@ -99,7 +141,7 @@ impl SwipeTracker {
 
     fn trim_history(&mut self) {
         if let Some(&Event { timestamp, .. }) = self.history.back() {
-            self.release(timestamp);
+            self.trim_to(timestamp);
         }
     }
 }

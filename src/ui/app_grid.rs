@@ -1340,6 +1340,8 @@ impl AppGrid {
             initial - 1.
         }
         .clamp(0., last);
+        self.swipe
+            .log_release("app grid", self.gesture_from, pos, target);
         // Above the threshold GNOME projects `velocity * slope` and clamps it to the snap
         // points either side of where the gesture began (`_getEndProgress` +
         // `_getBounds`). The projection is in pixels while the progress it is added to is

@@ -5445,6 +5445,14 @@ impl<W: LayoutElement> Monitor<W> {
             px_per_ms,
             gesture.is_touchpad,
         );
+        let what = match (is_dnd, gesture.is_touchpad) {
+            (true, _) => "workspace dnd",
+            (false, true) => "workspace touchpad",
+            (false, false) => "workspace touch",
+        };
+        gesture
+            .tracker
+            .log_release(what, gesture.start_idx, progress, new_idx);
         let new_idx = new_idx as usize;
 
         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
