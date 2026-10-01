@@ -6704,6 +6704,7 @@ impl<W: LayoutElement> Layout<W> {
         // the overlay key behaves exactly as it did before the peek existed, which is what makes
         // "do I reach for it while fullscreen?" a question the seat can answer.
         let outranked = self.overview_open
+            || self.is_app_expose_open()
             || self
                 .active_monitor_ref()
                 .is_some_and(|mon| mon.render_above_top_layer());

@@ -71,7 +71,8 @@ impl State {
             }
             return;
         }
-        if self.synoik.is_locked() {
+        // GNOME windowing mode only, like the overview's picker it borrows from.
+        if self.synoik.is_locked() || !self.synoik.layout.is_gnome_mode() {
             return;
         }
         let Some(windows) = self.synoik.app_expose_windows_for_focus() else {

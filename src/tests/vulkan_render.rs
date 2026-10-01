@@ -15784,3 +15784,197 @@ fn the_frame_stamp_and_the_draw_ledger_toggle_at_runtime() {
     }
     assert_eq!(stamp(&mut f), None, "the stamp is off again");
 }
+
+/// App Exposé draws the window at its slot over the blurred wallpaper, and the window's live copy
+/// is gone from where it was — not left underneath for the backdrop to fade over
+/// (`docs/fork/app-expose.md`).
+#[test]
+fn vulkan_app_expose_draws_the_window_at_its_slot_and_hides_the_live_copy() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+
+    let is_green = |p: [u8; 4]| p[0] < 60 && p[1] > 200 && p[2] < 60;
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    // The only display's active workspace sits at the output's origin, so its coordinates are
+    // the output's.
+    let live = f
+        .synoik()
+        .layout
+        .expose_settled_rect(&win)
+        .expect("the window has a rect on screen");
+    let (lx, ly) = (live.loc.x as i32 + 4, live.loc.y as i32 + 4);
+
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    assert!(
+        is_green(px(&pixels, w, lx, ly)),
+        "precondition: the window is where the layout says"
+    );
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    assert!(f.synoik().layout.is_app_expose_open());
+    f.settle_animations();
+
+    let slots = f.synoik().layout.app_expose_slots(&output);
+    assert_eq!(slots.len(), 1, "the one window, laid out");
+    let slot = slots[0].1;
+    assert!(
+        !slot.contains(live.loc + smithay::utils::Point::from((4., 4.))),
+        "precondition: the slot does not cover where the window was"
+    );
+
+    let (pixels, ..) = render_output_vulkan(&mut f, &output);
+    let center = px(
+        &pixels,
+        w,
+        (slot.loc.x + slot.size.w / 2.) as i32,
+        (slot.loc.y + slot.size.h / 2.) as i32,
+    );
+    assert!(
+        is_green(center),
+        "the preview draws at its slot, got {center:?}"
+    );
+    let old = px(&pixels, w, lx, ly);
+    assert!(
+        !is_green(old),
+        "where the window was is backdrop now, got {old:?}"
+    );
+}
+
+/// Every other app's window is gone under App Exposé's backdrop — covered, not left showing
+/// through. Holds with no wallpaper to blur, as on this fixture: the solid backdrop stands in.
+#[test]
+fn vulkan_app_expose_covers_other_apps_windows() {
+    let Some((mut f, id, _)) = window_fixture_with_client(GREEN, true, None) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    super::gnome::switcher_apps(&mut f);
+
+    let is_green = |p: [u8; 4]| p[0] < 60 && p[1] > 200 && p[2] < 60;
+    let green = f.synoik().layout.focus().unwrap().window.clone();
+    let green_rect = f.synoik().layout.expose_settled_rect(&green).unwrap();
+
+    // Another app's window, focused; App Exposé shows it alone.
+    map_window_for_app(&mut f, id, "org.example.One");
+    f.synoik_complete_animations();
+    let one = f.synoik().layout.focus().unwrap().window.clone();
+    assert_ne!(one, green);
+    let one_rect = f.synoik().layout.expose_settled_rect(&one).unwrap();
+
+    // A point of the green window that the other one does not cover.
+    let probe = [(0.9, 0.9), (0.1, 0.9), (0.9, 0.1), (0.5, 0.5)]
+        .into_iter()
+        .map(|(fx, fy)| {
+            smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                green_rect.loc.x + green_rect.size.w * fx,
+                green_rect.loc.y + green_rect.size.h * fy,
+            ))
+        })
+        .find(|p| !one_rect.contains(*p))
+        .expect("the windows do not overlap entirely");
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    assert!(
+        is_green(px(&pixels, w, probe.x as i32, probe.y as i32)),
+        "precondition: the green window shows at the probe"
+    );
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle_animations();
+    let slots = f.synoik().layout.app_expose_slots(&output);
+    assert_eq!(slots.iter().map(|(w, _)| w).collect::<Vec<_>>(), vec![&one]);
+    assert!(
+        !slots[0].1.contains(probe),
+        "precondition: the slot is elsewhere"
+    );
+
+    let (pixels, ..) = render_output_vulkan(&mut f, &output);
+    let p = px(&pixels, w, probe.x as i32, probe.y as i32);
+    assert!(!is_green(p), "the other app's window is covered, got {p:?}");
+}
+
+/// A window from another workspace has nowhere on screen to fly from, so it fades in at its
+/// slot: part-way up, its slot shows it blended over the backdrop, by the measured ends.
+#[test]
+fn vulkan_app_expose_fades_in_a_window_from_another_workspace() {
+    let Some((mut f, id, surface)) = window_fixture_with_client(GREEN, true, None) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    super::gnome::switcher_apps(&mut f);
+
+    // The green window is One's, on the second workspace; another of One's is focused on the
+    // first.
+    let window = f.client(id).window(&surface);
+    window.set_app_id("org.example.One");
+    window.commit();
+    f.double_roundtrip(id);
+    let green = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    map_window_for_app(&mut f, id, "org.example.One");
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .holds_window(&green),
+        "precondition: the green window is on another workspace"
+    );
+
+    let sample = |f: &mut Fixture| {
+        let slot = f
+            .synoik()
+            .layout
+            .app_expose_slots(&output)
+            .into_iter()
+            .find(|(w, _)| *w == green)
+            .expect("the green window is in the grid")
+            .1;
+        let (pixels, w, _) = render_output_vulkan(f, &output);
+        px(
+            &pixels,
+            w,
+            (slot.loc.x + slot.size.w / 2.) as i32,
+            (slot.loc.y + slot.size.h / 2.) as i32,
+        )
+    };
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.synoik().advance_animations();
+    {
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
+    }
+    let progress = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .and_then(|mon| mon.app_expose_progress())
+        .unwrap();
+    assert!(
+        progress > 0.1 && progress < 0.9,
+        "the sample must be part-way, got {progress}"
+    );
+    let mid = sample(&mut f);
+
+    f.settle_animations();
+    let up = sample(&mut f);
+    assert!(
+        up[1] > 200 && up[0] < 60,
+        "fully up, the slot shows the window: {up:?}"
+    );
+
+    assert!(
+        mid[1] < up[1] - 20 && mid[1] > 20,
+        "part-way, the window is blended over what is beneath it: {mid:?} vs {up:?}"
+    );
+}

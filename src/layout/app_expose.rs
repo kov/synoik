@@ -80,6 +80,9 @@ pub(super) struct AppExposeEntry<'a, W: LayoutElement> {
     pub slot: Rectangle<f64, Logical>,
     /// Its scale at progress 0.
     pub from_scale: f64,
+    /// Whether the window is on screen when App Exposé is down — on its display's active
+    /// workspace. One that is not has nowhere to fly from, and fades in instead.
+    pub on_screen: bool,
 }
 
 impl<W: LayoutElement> AppExposeEntry<'_, W> {
@@ -110,6 +113,14 @@ impl<W: LayoutElement> Monitor<W> {
     /// How far App Exposé is up on this display, `None` when it is not there at all.
     pub fn app_expose_progress(&self) -> Option<f64> {
         self.app_expose.as_ref().map(|state| state.progress)
+    }
+
+    /// The windows the live desktop must not draw while App Exposé is anywhere on screen: they
+    /// are drawn at their slots instead, and would otherwise show twice on the way.
+    pub(super) fn app_expose_hidden(&self) -> &[W::Id] {
+        self.app_expose
+            .as_ref()
+            .map_or(&[], |state| &state.windows[..])
     }
 
     /// Decide this display's grid afresh at the next query.
@@ -162,6 +173,7 @@ impl<W: LayoutElement> Monitor<W> {
                         rect: Rectangle::new(rect.loc + active_loc, rect.size),
                         slot,
                         from_scale,
+                        on_screen: true,
                     }
                 } else {
                     // Nowhere on screen to come from: start a little smaller than the slot,
@@ -180,6 +192,7 @@ impl<W: LayoutElement> Monitor<W> {
                         rect: Rectangle::new(loc, natural),
                         slot,
                         from_scale,
+                        on_screen: false,
                     }
                 }
             })

@@ -255,3 +255,38 @@ fn activating_a_window_on_another_workspace_switches_to_it() {
     let ws = f.synoik().layout.active_workspace().unwrap();
     assert!(ws.holds_window(&c), "its workspace is the active one");
 }
+
+/// Locking puts App Exposé away: its input is the shell's, and a locked session has none.
+#[test]
+fn locking_puts_it_away() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle();
+    assert!(f.synoik().layout.is_app_expose_open());
+
+    f.synoik_state().on_screen_saver_msg(
+        crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(None),
+    );
+    f.settle();
+    assert!(!f.synoik().layout.is_app_expose_open());
+}
+
+/// The dash has neither of its homes in App Exposé: there is no dock to summon.
+#[test]
+fn there_is_no_dock() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+
+    f.synoik().dock.show(&out);
+    assert!(
+        f.synoik().dash_area(&out).is_some(),
+        "precondition: the dock is out"
+    );
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle();
+    assert_eq!(f.synoik().dash_area(&out), None);
+}

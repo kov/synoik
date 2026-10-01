@@ -1206,6 +1206,8 @@ pub struct Synoik {
     /// as a *group*: a per-element alpha would double-darken wherever previews
     /// overlap, which the group composite avoids.
     picker_offscreen: OffscreenBuffer,
+    /// App Exposé's previews from other workspaces, faded in as one group.
+    app_expose_offscreen: OffscreenBuffer,
     thumbnails_offscreen: OffscreenBuffer,
     /// Per-output state for the workspace switch's motion blur, keyed by output name.
     ///
@@ -2525,6 +2527,8 @@ impl State {
         // every later tap as a long hold — which is the overview becoming unreachable by tap.
         if self.synoik.is_locked() || self.synoik.screen_shield.is_active() {
             self.synoik.end_peek();
+            // Nor App Exposé: its input is the shell's, and a locked session has none.
+            self.synoik.layout.close_app_expose();
         }
 
         // A dismissal that waited for a grab, now that the grab is done. Level-triggered for the
@@ -8399,6 +8403,7 @@ impl Synoik {
             overview_search_expand: None,
             overview_search_expand_target: false,
             picker_offscreen: OffscreenBuffer::default(),
+            app_expose_offscreen: OffscreenBuffer::default(),
             motion_blur: RefCell::new(std::collections::HashMap::new()),
             thumbnails_offscreen: OffscreenBuffer::default(),
             icon_cache: IconCache::new("Adwaita"),
@@ -12072,12 +12077,14 @@ impl Synoik {
             let ws = self.workspace_state_for(output);
             let ws_position = self.workspace_position_for(output);
             // The bar background fades out as the overview opens (`#panel:overview`),
-            // so the overview backdrop runs unbroken behind it.
-            let overview_fade = self
-                .layout
-                .monitor_for_output(output)
-                .and_then(|mon| mon.expose_progress())
-                .unwrap_or(0.);
+            // so the overview backdrop runs unbroken behind it. App Exposé's backdrop is the
+            // same blur, so it fades the bar the same way.
+            let overview_fade = self.layout.monitor_for_output(output).map_or(0., |mon| {
+                f64::max(
+                    mon.expose_progress().unwrap_or(0.),
+                    mon.app_expose_progress().unwrap_or(0.),
+                )
+            });
             // The OSD raises itself above everything else on show
             // (`js/ui/osdWindow.js:98` lifts it to the top of `uiGroup`), so it is
             // pushed before the panel and its popovers — earlier push = higher z.
@@ -12413,6 +12420,53 @@ impl Synoik {
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
+
+            // App Exposé (`docs/fork/app-expose.md`) draws over the live desktop: the previews,
+            // then the blurred wallpaper fading in over everything else, which is all the other
+            // windows' leaving amounts to.
+            if let Some(progress) = mon.app_expose_progress().filter(|_| gnome_mode) {
+                mon.render_app_expose(ctx.r(), true, &mut |elem| push(elem.into()));
+                let mut group = Vec::new();
+                mon.render_app_expose(ctx.r(), false, &mut |elem| group.push(elem.into()));
+                Self::push_group_at_alpha(
+                    ctx.renderer,
+                    &self.app_expose_offscreen,
+                    fade_scale,
+                    progress as f32,
+                    group,
+                    push,
+                );
+
+                // Over the live desktop, so unlike the overview's this one must cover: with no
+                // blur to be had (no wallpaper, or the chain failed) the solid backdrop stands in.
+                let alpha = progress.clamp(0., 1.) as f32;
+                if alpha > 0. {
+                    let radius = OVERVIEW_BLUR_RADIUS * output_scale.x;
+                    let blurred = self.wallpaper.render_blurred(
+                        ctx.renderer,
+                        &output.name(),
+                        crate::wallpaper::BlurRequest {
+                            origin: Default::default(),
+                            view_size: output_size(output),
+                            scale: output_scale,
+                            radius,
+                            brightness: OVERVIEW_BLUR_BRIGHTNESS,
+                        },
+                    );
+                    match blurred {
+                        Some(elem) => push(elem.with_alpha(alpha).into()),
+                        None => push(
+                            SolidColorRenderElement::from_buffer(
+                                &state.backdrop_buffer,
+                                (0., 0.),
+                                alpha,
+                                Kind::Unspecified,
+                            )
+                            .into(),
+                        ),
+                    }
+                }
+            }
 
             // The small workspace row, above the picker. It cross-fades with the search
             // results alongside the picker, but — unlike the picker — it does **not** fade
@@ -15776,7 +15830,8 @@ impl Synoik {
         // than the dock directly, so the gate cannot come apart between what is drawn and what
         // is clickable. (No test: `LockState` carries a `SessionLocker` a fixture can't build,
         // so the guarantee is structural instead — one gate, both callers.)
-        if self.is_locked() || self.screenshot_ui.is_open() {
+        // App Exposé shows no dash in either of its homes (`docs/fork/app-expose.md`).
+        if self.is_locked() || self.screenshot_ui.is_open() || self.layout.is_app_expose_open() {
             return None;
         }
         self.dock.area(output)

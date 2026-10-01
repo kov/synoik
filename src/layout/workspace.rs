@@ -2721,10 +2721,12 @@ impl<W: LayoutElement> Workspace<W> {
             .render(ctx, scrolling_focus_ring, &mut |elem| push(elem.into()));
     }
 
+    /// The floating layer, minus `hidden` — windows drawn somewhere else this frame.
     pub fn render_floating(
         &self,
         ctx: RenderCtx,
         focus_ring: bool,
+        hidden: &[W::Id],
         push: &mut dyn FnMut(WorkspaceRenderElement),
     ) {
         if !self.is_floating_visible() {
@@ -2734,7 +2736,7 @@ impl<W: LayoutElement> Workspace<W> {
         let view_rect = Rectangle::from_size(self.view_size);
         let floating_focus_ring = focus_ring && self.floating_is_active();
         self.floating
-            .render(ctx, view_rect, floating_focus_ring, &mut |elem| {
+            .render(ctx, view_rect, floating_focus_ring, hidden, &mut |elem| {
                 push(elem.into())
             });
     }

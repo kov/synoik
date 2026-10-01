@@ -97,6 +97,12 @@ impl<T: Texture> Element for RoundedTextureRenderElement<T> {
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 impl RoundedTextureRenderElement<VkTexture> {
+    /// The same element drawn at `alpha`.
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.inner.set_alpha(alpha);
+        self
+    }
+
     pub fn new(
         inner: TextureRenderElement<VkTexture>,
         corner_radius: f64,

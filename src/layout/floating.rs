@@ -2134,6 +2134,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         mut ctx: RenderCtx,
         view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
+        hidden: &[W::Id],
         push: &mut dyn FnMut(FloatingSpaceRenderElement),
     ) {
         let scale = Scale::from(self.scale);
@@ -2179,7 +2180,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.render(ctx.r(), tile_pos, focus_ring, &mut |elem| push(elem.into()));
         };
 
-        for id in &raised {
+        for id in raised.iter().filter(|id| !hidden.contains(id)) {
             if let Some((tile, tile_pos)) = self
                 .tiles_with_render_positions()
                 .find(|(tile, _)| tile.window().id() == id)
@@ -2189,7 +2190,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         for (tile, tile_pos) in self.tiles_with_render_positions() {
-            if raised.iter().any(|id| id == tile.window().id()) {
+            if raised.iter().any(|id| id == tile.window().id())
+                || hidden.contains(tile.window().id())
+            {
                 continue;
             }
             draw(tile, tile_pos, &mut ctx);

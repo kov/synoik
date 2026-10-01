@@ -4415,7 +4415,10 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_above_top_layer(&self) -> bool {
         // Render above the top layer only if the view is stationary.
-        if self.workspace_switch.is_some() || self.overview_progress.is_some() {
+        if self.workspace_switch.is_some()
+            || self.overview_progress.is_some()
+            || self.app_expose.is_some()
+        {
             return false;
         }
 
@@ -5020,6 +5023,8 @@ impl<W: LayoutElement> Monitor<W> {
             )
         };
 
+        let hidden = self.app_expose_hidden();
+
         for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
             let ws_zoom = zoom * self.workspace_render_scale(idx);
             // Macro instead of closure because ws and insert hint have different elem types.
@@ -5081,14 +5086,58 @@ impl<W: LayoutElement> Monitor<W> {
             ws.render_minimizing(ctx.r(), push!());
             if ws.scrolling_renders_on_top() {
                 ws.render_scrolling(ctx.r(), focus_ring, push!());
-                ws.render_floating(ctx.r(), focus_ring, push!());
+                ws.render_floating(ctx.r(), focus_ring, hidden, push!());
             } else {
-                ws.render_floating(ctx.r(), focus_ring, push!());
+                ws.render_floating(ctx.r(), focus_ring, hidden, push!());
                 if !hint_above_all {
                     push_hint!();
                 }
                 ws.render_scrolling(ctx.r(), focus_ring, push!());
             }
+        }
+    }
+
+    /// App Exposé's previews (`docs/fork/app-expose.md`): the windows that were on screen when
+    /// `on_screen`, flying from where they were, or the ones from other workspaces, which the
+    /// caller fades in as one group — their slots never overlap, so a group alpha is each
+    /// preview's own.
+    pub fn render_app_expose(
+        &self,
+        mut ctx: RenderCtx,
+        on_screen: bool,
+        push: &mut dyn FnMut(MonitorRenderElement),
+    ) {
+        let Some(progress) = self.app_expose_progress() else {
+            return;
+        };
+        let scale = self.scale.fractional_scale();
+
+        for entry in self.app_expose_layout() {
+            if entry.on_screen != on_screen {
+                continue;
+            }
+            let (pos, tile_scale) = entry.placement(progress);
+            let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+            entry.tile.render(ctx.r(), pos, false, &mut |elem| {
+                let elem = WorkspaceRenderElement::from(RescaleRenderElement::from_element(
+                    elem,
+                    pos.to_physical_precise_round(scale),
+                    tile_scale,
+                ));
+                let Some(elem) = CropRenderElement::from_element(elem, scale, uncropped()) else {
+                    return;
+                };
+                let elem = RescaleRenderElement::from_element(
+                    MonitorInnerRenderElement::from(elem),
+                    Point::default(),
+                    1.,
+                );
+                push(RelocateRenderElement::from_element(
+                    elem,
+                    Point::default(),
+                    Relocate::Relative,
+                ));
+            });
         }
     }
 
