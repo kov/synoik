@@ -100,7 +100,7 @@ const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
 /// Tap a key: press and release.
-fn tap(f: &mut Fixture, key: u32) {
+pub(super) fn tap(f: &mut Fixture, key: u32) {
     f.key_press(key);
     f.key_release(key);
 }
@@ -27438,7 +27438,7 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
 }
 
 /// Two apps with a fake catalog, the shape most switcher tests want.
-fn switcher_apps(f: &mut Fixture) {
+pub(super) fn switcher_apps(f: &mut Fixture) {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
 
     f.synoik().app_system = AppSystem::with_parts(

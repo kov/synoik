@@ -1343,6 +1343,8 @@ pub enum Action {
     },
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
+    /// Toggle App Exposé: the focused app's windows from every workspace, one grid per display.
+    ToggleAppExpose {},
     /// Start or stop recording the focused screen to a WebM file.
     ToggleScreenRecord {},
     /// Open the Overview.

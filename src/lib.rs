@@ -9,6 +9,7 @@ extern crate tracing;
 
 pub mod a11y;
 pub mod animation;
+pub mod app_expose;
 pub mod app_system;
 pub mod audio;
 pub mod backend;

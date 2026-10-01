@@ -85,6 +85,7 @@ use crate::utils::{
 };
 use crate::window::ResolvedWindowRules;
 
+pub mod app_expose;
 pub mod closing_window;
 pub mod expose;
 pub mod floating;
@@ -482,6 +483,8 @@ pub struct Layout<W: LayoutElement> {
     /// The peek's slide, 1 fully out. Retired to `None` once it has finished going away, so a
     /// closed peek costs nothing to check.
     peek_progress: Option<Animation>,
+    /// App Exposé (`docs/fork/app-expose.md`), `None` once it has finished going away.
+    app_expose: Option<app_expose::AppExpose<W>>,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles/maximizes it (GNOME windowing mode only). Pushed in from the
     /// GSettings model.
@@ -1062,6 +1065,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             peek_open: false,
             peek_progress: None,
+            app_expose: None,
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
@@ -1095,6 +1099,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             peek_open: false,
             peek_progress: None,
+            app_expose: None,
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
@@ -3959,6 +3964,7 @@ impl<W: LayoutElement> Layout<W> {
         {
             self.peek_progress = None;
         }
+        self.advance_app_expose();
         let peek = self.peek_value();
 
         match &mut self.monitor_set {
@@ -4035,6 +4041,10 @@ impl<W: LayoutElement> Layout<W> {
             .is_some_and(|anim| !anim.is_done())
         {
             causes |= AnimCauses::WORKSPACE_PEEK;
+        }
+
+        if self.is_app_expose_animating() {
+            causes |= AnimCauses::APP_EXPOSE;
         }
 
         for mon in self.monitors() {
@@ -6758,6 +6768,10 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_overview(&mut self) {
+        // The overview and App Exposé are never up together; the overview wins.
+        if !self.overview_open {
+            self.close_app_expose();
+        }
         self.overview_open = !self.overview_open;
 
         if self.overview_open {

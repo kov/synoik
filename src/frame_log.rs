@@ -656,7 +656,7 @@ bitflags::bitflags! {
     /// switch composites *two* workspaces with a crop on the join axis, which is a
     /// different frame shape from any other layout animation.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-    pub struct AnimCauses: u32 {
+    pub struct AnimCauses: u64 {
         /// A workspace switch — a keyboard/programmatic animation, or a touchpad
         /// gesture being dragged. The gesture case is labelling only: a drag does not
         /// make the compositor queue frames (the input events do), so this bit can be
@@ -726,6 +726,8 @@ bitflags::bitflags! {
         const THUMB_SCROLL_FREEZE = 1 << 30;
         /// A drag lingering in one of the workspace row's gaps, counting down to the pill.
         const THUMB_PLACEHOLDER_LINGER = 1 << 31;
+        /// App Exposé opening, closing, or following a swipe (`docs/fork/app-expose.md`).
+        const APP_EXPOSE = 1 << 32;
     }
 }
 
@@ -786,6 +788,7 @@ impl AnimCauses {
                 AnimCauses::THUMB_PLACEHOLDER_LINGER,
                 "thumb-placeholder-linger",
             ),
+            (AnimCauses::APP_EXPOSE, "app-expose"),
         ];
         TABLE
             .iter()

@@ -45,6 +45,7 @@ pub(crate) mod fixture;
 mod server;
 
 mod animations;
+mod app_expose;
 mod background_effect;
 mod damage_instances;
 mod floating;

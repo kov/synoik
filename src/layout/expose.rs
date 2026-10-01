@@ -15,6 +15,9 @@
 //! This module is pure geometry: rects in, slot rects out (indexed like the
 //! input), so the corpus can pin the math directly.
 
+use std::cell::{Cell, RefCell};
+use std::iter;
+
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 /// `WINDOW_PREVIEW_MAXIMUM_SCALE` (js/ui/workspace.js).
@@ -434,6 +437,160 @@ pub(super) fn pack_grid(
     }
 
     slots
+}
+
+/// One input to the picker's layout: a window's stable sequence, and the rect it is laid
+/// out over.
+///
+/// The sequence rather than the id: identity is all the comparison needs, and an id here is
+/// a `smithay::desktop::Window` handle that the held layout would keep alive for as long as
+/// it holds it — which is until the next picker query on that workspace, i.e. the next
+/// overview visit. A window closing behind a shut overview must not wait on that.
+pub(super) type ExposeInput = (u64, Rectangle<f64, Logical>);
+
+/// The picker's standing layout decision, and the exact inputs it was reached from.
+///
+/// Held rather than re-derived because deciding is the half that *orders*: the row and
+/// column sorts in [`expose::compute_grid`] are stable with no tie-break, and centred
+/// placement makes exact ties ordinary, so re-running them over inputs that moved by a
+/// sub-pixel re-seats previews that had no business moving.
+#[derive(Debug)]
+struct RetainedExpose {
+    /// Every input the decision was reached from, in the order the grid's rows index —
+    /// stable creation order. Validity is bit-equality against this, recomputed per call.
+    ///
+    /// **Comparing the inputs rather than dirtying on the events that change them** is a
+    /// deliberate departure from what a dirty flag would do. Under-invalidation is this
+    /// design's one real hazard — a permanently wrong picker is worse than a transient
+    /// wobble — and the mutation surface cannot be closed by inspection:
+    /// `tiles_with_offsets_mut` (`floating.rs`) hands out `&mut Tile` past every named
+    /// mutator, and an interactive resize reaches a window's size through it. Comparison
+    /// makes a missed event unrepresentable: the worst it can do is recompute.
+    inputs: Vec<ExposeInput>,
+    /// The view the grid was decided for. Compared like the inputs, because the monitor is
+    /// frozen into the decision — `window_scale`'s enlargement of small windows is read
+    /// again at packing time from the height the grid was summed at, so a held grid packed
+    /// against a taller view would scale previews by a rule the view contradicts.
+    /// gnome-shell freezes the same thing, constructing its layout strategy around
+    /// `Main.layoutManager.monitors[this._monitorIndex]` on every decision
+    /// (`workspace.js:521-522`, read back in `_computeWindowScale` at `:173`).
+    ///
+    /// Both dimensions, not just the height the grid needs: a mode change from 1920x1080 to
+    /// 3440x1080 leaves the height bit-identical while the area doubles in width, and a row
+    /// count searched for half the width has no business surviving it.
+    ///
+    /// The **area** is deliberately absent. Packing the held decision into a changed area
+    /// rather than re-deciding is the entire point of holding one, and it is gnome-shell's:
+    /// `_layout` is guarded by `_needsLayout` while `_windowSlots` recomputes on
+    /// `containerAllocationChanged` (`workspace.js:668-681`), and a `workareas-changed`
+    /// calls `layout_changed()` without ever setting `_needsLayout` (`:594-597`).
+    view_size: Size<f64, Logical>,
+    grid: GridLayout,
+}
+
+/// Bit-equality of two layout inputs.
+///
+/// Bits, not `==`: `-0.` and `0.` compare equal but sort apart under `total_cmp`, which is
+/// what the grid orders with, so a value that flipped sign of zero really can re-seat a
+/// preview. `NaN` going the other way — never equal to itself — only costs a recompute.
+fn same_expose_input(a: &ExposeInput, b: &ExposeInput) -> bool {
+    let bits = |r: &Rectangle<f64, Logical>| {
+        [
+            r.loc.x.to_bits(),
+            r.loc.y.to_bits(),
+            r.size.w.to_bits(),
+            r.size.h.to_bits(),
+        ]
+    };
+    a.0 == b.0 && bits(&a.1) == bits(&b.1)
+}
+
+/// A picker layout decision held across queries — the grid, and the inputs it was decided over.
+///
+/// `RefCell` inside because a query is a read: the layout is a value the owner remembers, not a
+/// thing a caller has to ask it to update. Shared by the per-workspace picker and App Exposé's
+/// per-display grid (`docs/fork/app-expose.md`), which hold their decisions the same way.
+#[derive(Debug, Default)]
+pub(super) struct HeldLayout {
+    retained: RefCell<Option<RetainedExpose>>,
+    /// How many times a layout has been decided. The claim retention makes is about *when work
+    /// happens*, and this is the only way to observe it: a held layout and a freshly derived one
+    /// are otherwise indistinguishable by construction.
+    recomputes: Cell<u64>,
+}
+
+impl HeldLayout {
+    /// The slots for `inputs`, deciding the layout only if this is not the decision already
+    /// held.
+    ///
+    /// The decision is validated by comparing the inputs it was reached from, not by a flag
+    /// some mutator was supposed to set — see [`RetainedExpose::inputs`]. A hit re-packs the
+    /// held grid, which reads window *sizes* only and so cannot re-order anything; a miss
+    /// decides afresh and is indistinguishable from never having held one.
+    pub(super) fn slots(
+        &self,
+        inputs: Vec<ExposeInput>,
+        view_size: Size<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> Vec<Rectangle<f64, Logical>> {
+        // An empty workspace has no layout to decide, and the overview draws several of
+        // them: every workspace in the strip is rendered, and dynamic workspaces keep a
+        // trailing empty one. Deciding nothing must not read as a decision.
+        if inputs.is_empty() {
+            self.forget();
+            return Vec::new();
+        }
+
+        let mut retained = self.retained.borrow_mut();
+
+        let hit = retained.as_ref().is_some_and(|r| {
+            (r.view_size.w.to_bits(), r.view_size.h.to_bits())
+                == (view_size.w.to_bits(), view_size.h.to_bits())
+                && r.inputs.len() == inputs.len()
+                && iter::zip(&r.inputs, &inputs).all(|(a, b)| same_expose_input(a, b))
+        });
+
+        let rects: Vec<_> = inputs.iter().map(|(_, rect)| *rect).collect();
+        if hit {
+            // Packing reads window sizes only, so it cannot re-order anything: the same
+            // decision, re-fitted. A changed area therefore moves and re-scales the previews
+            // and never re-seats them, which is what makes a strut appearing mid-overview a
+            // shift rather than a shuffle.
+            let r = retained.as_mut().unwrap();
+            return pack_grid(&mut r.grid, area, &rects);
+        }
+
+        self.recomputes.set(self.recomputes.get() + 1);
+        let mut grid =
+            compute_grid(view_size.h, area, &rects).expect("a non-empty input always has a grid");
+        let slots = pack_grid(&mut grid, area, &rects);
+        *retained = Some(RetainedExpose {
+            inputs,
+            view_size,
+            grid,
+        });
+        slots
+    }
+
+    /// Drop the held decision, so the next query decides afresh.
+    pub(super) fn forget(&self) {
+        *self.retained.borrow_mut() = None;
+    }
+
+    /// How many inputs the standing decision was made over.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn decided_over(&self) -> usize {
+        self.retained
+            .borrow()
+            .as_ref()
+            .map_or(0, |r| r.inputs.len())
+    }
+
+    /// How many times a layout has been decided — see [`Self::recomputes`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn recompute_count(&self) -> u64 {
+        self.recomputes.get()
+    }
 }
 
 #[cfg(test)]

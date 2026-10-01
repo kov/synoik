@@ -220,7 +220,7 @@ pub struct Monitor<W: LayoutElement> {
     /// Latest known scale for this output.
     scale: smithay::output::Scale,
     /// Latest known size for this output.
-    view_size: Size<f64, Logical>,
+    pub(super) view_size: Size<f64, Logical>,
     /// Latest known working area for this output.
     ///
     /// Not rounded to physical pixels.
@@ -288,6 +288,10 @@ pub struct Monitor<W: LayoutElement> {
     /// there (`docs/fork/workspace-peek.md`). Pushed in from the parent layout, which owns the
     /// animation, exactly as [`Self::overview_progress`] is.
     peek_progress: f64,
+    /// App Exposé as the parent layout last told it — see [`super::app_expose`].
+    pub(super) app_expose: Option<super::app_expose::MonitorAppExpose<W>>,
+    /// This display's App Exposé grid decision, held across queries.
+    pub(super) app_expose_held: super::expose::HeldLayout,
     /// gnome-shell's `ControlsState` show-apps fraction (0 = window picker, 1 = app
     /// grid): eased when the show-apps state flips, shrinking the picker box and
     /// sliding the app grid up (`overviewControls.js` state adjustment). The target.
@@ -890,6 +894,8 @@ impl<W: LayoutElement> Monitor<W> {
             overview_open: false,
             overview_progress: None,
             peek_progress: 0.,
+            app_expose: None,
+            app_expose_held: super::expose::HeldLayout::default(),
             app_grid_shown: false,
             app_grid_expand: None,
             app_grid_gesture: None,

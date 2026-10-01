@@ -410,6 +410,9 @@ pub enum Action {
     /// favourite for another window rather than raising the one it has.
     OpenNewWindowApplication(u8),
     ToggleOverview,
+    /// App Exposé: the focused app's windows from every workspace, one grid per display
+    /// (`docs/fork/app-expose.md`). A divergence; GNOME has no such view.
+    ToggleAppExpose,
     /// GNOME's `toggle-application-view` (`<Super>a`): from the window picker it
     /// flips to the app grid and back, and from a closed overview it opens
     /// straight into the grid (`overviewControls.js:660-667`).
@@ -824,6 +827,7 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             synoik_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
             synoik_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
+            synoik_ipc::Action::ToggleAppExpose {} => Self::ToggleAppExpose,
             synoik_ipc::Action::ToggleScreenRecord {} => Self::ToggleScreenRecord,
             synoik_ipc::Action::OpenOverview {} => Self::OpenOverview,
             synoik_ipc::Action::CloseOverview {} => Self::CloseOverview,

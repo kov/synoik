@@ -6,7 +6,6 @@
 // distributed under the GNU General Public License version 3 or later.
 // Modified for synoik in 2026.
 
-use std::cell::{Cell, RefCell};
 use std::cmp::max;
 use std::iter;
 use std::rc::Rc;
@@ -27,6 +26,7 @@ use synoik_config::{
 };
 use synoik_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 
+use super::expose::ExposeInput;
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
 use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
@@ -173,15 +173,8 @@ pub struct Workspace<W: LayoutElement> {
     /// The picker's layout, held past a removal — see [`CloseFreeze`].
     expose_freeze: Option<CloseFreeze>,
 
-    /// The picker's held layout — see [`RetainedExpose`]. `RefCell` because
-    /// [`Workspace::expose_layout`] is a read: the layout is a value the workspace
-    /// remembers, not a thing a caller has to ask it to update.
-    expose_retained: RefCell<Option<RetainedExpose>>,
-
-    /// How many times the picker has decided a layout. The claim retention makes is about
-    /// *when work happens*, and this is the only way to observe it: a held layout and a
-    /// freshly derived one are otherwise indistinguishable by construction.
-    expose_recomputes: Cell<u64>,
+    /// The picker's held layout decision — see [`expose::HeldLayout`].
+    expose_held: expose::HeldLayout,
 
     /// Previews easing from the slots they held to the ones the picker now gives them —
     /// see [`Workspace::slide_expose_slots_from`].
@@ -315,71 +308,9 @@ type ExposeLayout<'a, W> = Vec<(
     f64,
 )>;
 
-/// One input to the picker's layout: a window's stable sequence, and the rect it is laid
-/// out over.
-///
-/// The sequence rather than the id: identity is all the comparison needs, and an id here is
-/// a `smithay::desktop::Window` handle that the held layout would keep alive for as long as
-/// it holds it — which is until the next picker query on that workspace, i.e. the next
-/// overview visit. A window closing behind a shut overview must not wait on that.
-type ExposeInput = (u64, Rectangle<f64, Logical>);
-
-/// The picker's standing layout decision, and the exact inputs it was reached from.
-///
-/// Held rather than re-derived because deciding is the half that *orders*: the row and
-/// column sorts in [`expose::compute_grid`] are stable with no tie-break, and centred
-/// placement makes exact ties ordinary, so re-running them over inputs that moved by a
-/// sub-pixel re-seats previews that had no business moving.
-#[derive(Debug)]
-struct RetainedExpose {
-    /// Every input the decision was reached from, in the order the grid's rows index —
-    /// stable creation order. Validity is bit-equality against this, recomputed per call.
-    ///
-    /// **Comparing the inputs rather than dirtying on the events that change them** is a
-    /// deliberate departure from what a dirty flag would do. Under-invalidation is this
-    /// design's one real hazard — a permanently wrong picker is worse than a transient
-    /// wobble — and the mutation surface cannot be closed by inspection:
-    /// `tiles_with_offsets_mut` (`floating.rs`) hands out `&mut Tile` past every named
-    /// mutator, and an interactive resize reaches a window's size through it. Comparison
-    /// makes a missed event unrepresentable: the worst it can do is recompute.
-    inputs: Vec<ExposeInput>,
-    /// The view the grid was decided for. Compared like the inputs, because the monitor is
-    /// frozen into the decision — `window_scale`'s enlargement of small windows is read
-    /// again at packing time from the height the grid was summed at, so a held grid packed
-    /// against a taller view would scale previews by a rule the view contradicts.
-    /// gnome-shell freezes the same thing, constructing its layout strategy around
-    /// `Main.layoutManager.monitors[this._monitorIndex]` on every decision
-    /// (`workspace.js:521-522`, read back in `_computeWindowScale` at `:173`).
-    ///
-    /// Both dimensions, not just the height the grid needs: a mode change from 1920x1080 to
-    /// 3440x1080 leaves the height bit-identical while the area doubles in width, and a row
-    /// count searched for half the width has no business surviving it.
-    ///
-    /// The **area** is deliberately absent. Packing the held decision into a changed area
-    /// rather than re-deciding is the entire point of holding one, and it is gnome-shell's:
-    /// `_layout` is guarded by `_needsLayout` while `_windowSlots` recomputes on
-    /// `containerAllocationChanged` (`workspace.js:668-681`), and a `workareas-changed`
-    /// calls `layout_changed()` without ever setting `_needsLayout` (`:594-597`).
-    view_size: Size<f64, Logical>,
-    grid: expose::GridLayout,
-}
-
-/// Bit-equality of two layout inputs.
-///
-/// Bits, not `==`: `-0.` and `0.` compare equal but sort apart under `total_cmp`, which is
-/// what the grid orders with, so a value that flipped sign of zero really can re-seat a
-/// preview. `NaN` going the other way — never equal to itself — only costs a recompute.
-fn same_expose_input(a: &ExposeInput, b: &ExposeInput) -> bool {
-    let bits = |r: &Rectangle<f64, Logical>| {
-        [
-            r.loc.x.to_bits(),
-            r.loc.y.to_bits(),
-            r.size.w.to_bits(),
-            r.size.h.to_bits(),
-        ]
-    };
-    a.0 == b.0 && bits(&a.1) == bits(&b.1)
-}
+/// One of an app's tiles found on a workspace for App Exposé — see
+/// [`Workspace::app_expose_tiles`].
+pub(super) type AppExposeTile<'a, W> = (&'a Tile<W>, ExposeInput, Rectangle<f64, Logical>, f64);
 
 /// Picker-overlay progress per window — see [`Workspace::expose_hover`].
 type ExposeHovers<W> = Vec<(<W as LayoutElement>::Id, Animation)>;
@@ -668,8 +599,7 @@ impl<W: LayoutElement> Workspace<W> {
             layout_config,
             expose_reserved: None,
             expose_freeze: None,
-            expose_retained: RefCell::new(None),
-            expose_recomputes: Cell::new(0),
+            expose_held: expose::HeldLayout::default(),
             expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
@@ -743,8 +673,7 @@ impl<W: LayoutElement> Workspace<W> {
             layout_config,
             expose_reserved: None,
             expose_freeze: None,
-            expose_retained: RefCell::new(None),
-            expose_recomputes: Cell::new(0),
+            expose_held: expose::HeldLayout::default(),
             expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
@@ -3058,56 +2987,29 @@ impl<W: LayoutElement> Workspace<W> {
             .collect()
     }
 
-    /// The picker's slots for `inputs`, deciding the layout only if this is not the
-    /// decision it is already holding.
-    ///
-    /// The decision is validated by comparing the inputs it was reached from, not by a flag
-    /// some mutator was supposed to set — see [`RetainedExpose::inputs`]. A hit re-packs the
-    /// held grid, which reads window *sizes* only and so cannot re-order anything; a miss
-    /// decides afresh and is indistinguishable from never having held one.
+    /// The tiles of `windows` that live here, for App Exposé's per-display grid
+    /// (`docs/fork/app-expose.md`): each with the input it is laid out over, the rect it draws
+    /// from, and its scale there — the picker's own three, see [`Self::expose_layout`].
+    pub(super) fn app_expose_tiles(&self, windows: &[W::Id]) -> Vec<AppExposeTile<'_, W>> {
+        self.tiles_with_render_positions()
+            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size()), 1.))
+            .chain(self.minimized_render_rects())
+            .filter(|(tile, _, _)| windows.contains(tile.window().id()))
+            .filter_map(|(tile, rect, from_scale)| {
+                let input = self.expose_input(tile.window().id())?;
+                Some((tile, input, rect, from_scale))
+            })
+            .collect()
+    }
+
+    /// The picker's slots for `inputs` — see [`expose::HeldLayout::slots`].
     fn retained_expose_slots(
         &self,
         inputs: Vec<ExposeInput>,
         view_size: Size<f64, Logical>,
         area: Rectangle<f64, Logical>,
     ) -> Vec<Rectangle<f64, Logical>> {
-        // An empty workspace has no layout to decide, and the overview draws several of
-        // them: every workspace in the strip is rendered, and dynamic workspaces keep a
-        // trailing empty one. Deciding nothing must not read as a decision.
-        if inputs.is_empty() {
-            *self.expose_retained.borrow_mut() = None;
-            return Vec::new();
-        }
-
-        let mut retained = self.expose_retained.borrow_mut();
-
-        let hit = retained.as_ref().is_some_and(|r| {
-            (r.view_size.w.to_bits(), r.view_size.h.to_bits())
-                == (view_size.w.to_bits(), view_size.h.to_bits())
-                && r.inputs.len() == inputs.len()
-                && iter::zip(&r.inputs, &inputs).all(|(a, b)| same_expose_input(a, b))
-        });
-
-        let rects: Vec<_> = inputs.iter().map(|(_, rect)| *rect).collect();
-        if hit {
-            // Packing reads window sizes only, so it cannot re-order anything: the same
-            // decision, re-fitted. A changed area therefore moves and re-scales the previews
-            // and never re-seats them, which is what makes a strut appearing mid-overview a
-            // shift rather than a shuffle.
-            let r = retained.as_mut().unwrap();
-            return expose::pack_grid(&mut r.grid, area, &rects);
-        }
-
-        self.expose_recomputes.set(self.expose_recomputes.get() + 1);
-        let mut grid = expose::compute_grid(view_size.h, area, &rects)
-            .expect("a non-empty workspace always has a grid");
-        let slots = expose::pack_grid(&mut grid, area, &rects);
-        *retained = Some(RetainedExpose {
-            inputs,
-            view_size,
-            grid,
-        });
-        slots
+        self.expose_held.slots(inputs, view_size, area)
     }
 
     /// How many windows the picker's standing decision was made over.
@@ -3117,17 +3019,14 @@ impl<W: LayoutElement> Workspace<W> {
     /// has no tile asking for it and so never reaches a caller.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn expose_decided_over(&self) -> usize {
-        self.expose_retained
-            .borrow()
-            .as_ref()
-            .map_or(0, |r| r.inputs.len())
+        self.expose_held.decided_over()
     }
 
     /// How many times this workspace has decided a picker layout — see
     /// [`Workspace::expose_recomputes`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn expose_recompute_count(&self) -> u64 {
-        self.expose_recomputes.get()
+        self.expose_held.recompute_count()
     }
 
     /// A preview's slot on the way to the one just computed for it, if it is mid-ease.
@@ -3241,7 +3140,7 @@ impl<W: LayoutElement> Workspace<W> {
     ///
     /// Note a padding constant here would have been a no-op: the cap already binds, so an
     /// inset has to exceed the slack under it (~26px at 1920×1080) before it moves anything.
-    fn expose_area(&self) -> Rectangle<f64, Logical> {
+    pub(super) fn expose_area(&self) -> Rectangle<f64, Logical> {
         let work = self.floating.working_area();
         let view = Rectangle::from_size(self.view_size);
 
@@ -3386,7 +3285,7 @@ impl<W: LayoutElement> Workspace<W> {
     /// `_updateWorkspacesViews` (`workspacesView.js:998`), which rebuilds every `Workspace`,
     /// and a fresh `WorkspaceLayout` starts with `_needsLayout` set (`workspace.js:430`).
     pub(super) fn forget_expose_layout(&mut self) {
-        *self.expose_retained.borrow_mut() = None;
+        self.expose_held.forget();
         // A freeze taken during a peek, or left over from an exit, has nothing to say about
         // the visit starting now — and holding a stale input list into it would keep the
         // decision below from ever being made over what is actually here.

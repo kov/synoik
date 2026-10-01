@@ -5833,6 +5833,7 @@ impl State {
                 self.synoik.layout.toggle_overview();
                 self.synoik.queue_redraw_all();
             }
+            Action::ToggleAppExpose => self.toggle_app_expose(),
             // The keyboard's route to the workspace menu. The menu hangs off a thumbnail, so the
             // strip has to be on screen: opening the overview is part of the action rather than a
             // precondition the user has to satisfy first.
