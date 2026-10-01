@@ -616,3 +616,37 @@ fn arrows_pick_a_preview_and_enter_goes_to_it() {
     assert!(!f.synoik().layout.is_app_expose_open());
     assert_eq!(focused(&mut f), picked);
 }
+
+/// `synoik msg input swipe-*` drives the same swipe a touchpad does, so a live session can be
+/// walked into App Exposé and back out without one.
+#[test]
+fn an_injected_swipe_brings_it_up_and_takes_it_down() {
+    use synoik_ipc::InjectedEvent;
+
+    use crate::input::synthetic::inject;
+
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    super::gnome::pointer_motion_to(&mut f, 960., 540.);
+
+    let swipe = |f: &mut Fixture, dy: f64| {
+        inject(f.synoik_state(), &InjectedEvent::SwipeBegin { fingers: 3 }).unwrap();
+        for _ in 0..20 {
+            inject(f.synoik_state(), &InjectedEvent::SwipeUpdate { dx: 0., dy }).unwrap();
+        }
+        inject(
+            f.synoik_state(),
+            &InjectedEvent::SwipeEnd { cancelled: false },
+        )
+        .unwrap();
+        f.settle_animations();
+    };
+
+    // Natural scrolling is off on the synthetic device, so negative is towards App Exposé.
+    swipe(&mut f, -20.);
+    assert!(f.synoik().layout.is_app_expose_open());
+
+    swipe(&mut f, 20.);
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert!(!f.synoik().layout.is_overview_open());
+}

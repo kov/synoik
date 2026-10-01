@@ -130,6 +130,34 @@ pub fn inject(state: &mut State, event: &InjectedEvent) -> Result<(), String> {
             };
             state.process_input_event(event);
         }
+        InjectedEvent::SwipeBegin { fingers } => {
+            let event = InputEvent::<SyntheticInputBackend>::GestureSwipeBegin {
+                event: SyntheticGestureSwipeBeginEvent {
+                    time: now(),
+                    fingers: *fingers,
+                },
+            };
+            state.process_input_event(event);
+        }
+        InjectedEvent::SwipeUpdate { dx, dy } => {
+            let event = InputEvent::<SyntheticInputBackend>::GestureSwipeUpdate {
+                event: SyntheticGestureSwipeUpdateEvent {
+                    time: now(),
+                    dx: *dx,
+                    dy: *dy,
+                },
+            };
+            state.process_input_event(event);
+        }
+        InjectedEvent::SwipeEnd { cancelled } => {
+            let event = InputEvent::<SyntheticInputBackend>::GestureSwipeEnd {
+                event: SyntheticGestureSwipeEndEvent {
+                    time: now(),
+                    cancelled: *cancelled,
+                },
+            };
+            state.process_input_event(event);
+        }
     }
     Ok(())
 }

@@ -291,6 +291,29 @@ pub enum InputCmd {
         #[arg(long)]
         cancelled: bool,
     },
+    /// Begin a touchpad swipe; three or more fingers are the shell's.
+    SwipeBegin {
+        /// How many fingers are down.
+        #[arg(long, default_value_t = 3)]
+        fingers: u32,
+    },
+    /// Move a touchpad swipe, in device units with natural scrolling off: positive dy is towards
+    /// the overview, negative towards App Exposé; positive dx towards the next workspace.
+    SwipeUpdate {
+        /// Horizontal delta.
+        #[arg(allow_negative_numbers = true)]
+        dx: f64,
+        /// Vertical delta.
+        #[arg(allow_negative_numbers = true)]
+        dy: f64,
+    },
+    /// End a touchpad swipe. Its speed is read from the timing of the updates, so pause before
+    /// this for a slow release.
+    SwipeEnd {
+        /// The swipe was cancelled rather than ended by the fingers lifting.
+        #[arg(long)]
+        cancelled: bool,
+    },
 }
 
 impl InputCmd {
@@ -335,6 +358,15 @@ impl InputCmd {
             InputCmd::ScrollStop => vec![InjectedEvent::ScrollStop],
             InputCmd::HoldBegin { fingers } => vec![InjectedEvent::HoldBegin { fingers: *fingers }],
             InputCmd::HoldEnd { cancelled } => vec![InjectedEvent::HoldEnd {
+                cancelled: *cancelled,
+            }],
+            InputCmd::SwipeBegin { fingers } => {
+                vec![InjectedEvent::SwipeBegin { fingers: *fingers }]
+            }
+            InputCmd::SwipeUpdate { dx, dy } => {
+                vec![InjectedEvent::SwipeUpdate { dx: *dx, dy: *dy }]
+            }
+            InputCmd::SwipeEnd { cancelled } => vec![InjectedEvent::SwipeEnd {
                 cancelled: *cancelled,
             }],
         }

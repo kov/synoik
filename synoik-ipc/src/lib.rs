@@ -239,6 +239,27 @@ pub enum InjectedEvent {
         /// the fingers lifting.
         cancelled: bool,
     },
+    /// Fingers start a touchpad swipe. Three or more are the shell's: the overview, App
+    /// Exposé and workspace switching; fewer go to the client under the pointer.
+    SwipeBegin {
+        /// How many fingers are down.
+        fingers: u32,
+    },
+    /// The swipe moves by a delta in touchpad units, as the device reports it with natural
+    /// scrolling **off**: positive `dy` is towards the overview, negative towards App Exposé;
+    /// positive `dx` towards the next workspace.
+    SwipeUpdate {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// The swipe ends, timed at the moment it arrives — so a pause before it reads as a slow
+    /// release, not a flick.
+    SwipeEnd {
+        /// Whether the swipe was cancelled rather than the fingers lifting.
+        cancelled: bool,
+    },
 }
 
 /// Reply from synoik to client.
