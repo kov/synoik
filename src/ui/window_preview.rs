@@ -155,17 +155,29 @@ pub struct PreviewOverlay {
     pub icon_scale: f64,
 }
 
-/// The picker chrome's GPU caches: two disc bakes (normal + hover) so a frame
+/// One output's picker-chrome bakes: two disc bakes (normal + hover) so a frame
 /// that draws one hovered and one fading-out button doesn't thrash a single
 /// cache, plus one caption bake per caption *string* — two previews of the same
 /// width but different titles would otherwise collide on
-/// [`BakeCache`]'s (scale, physical size) key. The close glyph and the app icons
-/// are not here: they come from the shared [`IconCache`] / [`AppIconCache`].
+/// [`BakeCache`]'s (scale, physical size) key.
 #[derive(Default)]
-pub struct PreviewChrome {
+struct OutputChrome {
     disc: RefCell<BakeCache>,
     disc_hover: RefCell<BakeCache>,
     captions: RefCell<HashMap<String, BakeCache>>,
+}
+
+/// The picker chrome's GPU caches. The close glyph and the app icons are not
+/// here: they come from the shared [`IconCache`] / [`AppIconCache`].
+#[derive(Default)]
+pub struct PreviewChrome {
+    /// **One entry per output**, by name: the captions are pruned against the overlays of
+    /// whichever output is drawing, so a shared map dropped every caption the other screen had
+    /// baked — a screen with no hovered preview cleared it outright — and the discs are keyed by
+    /// the drawing output's scale. Shared, a hovered preview's caption was re-baked, with a new
+    /// `Id`, every time the other display rendered.
+    outputs: RefCell<HashMap<String, OutputChrome>>,
+    /// Not per output: an icon already on the GPU is not uploaded again for another screen.
     icon_uploads: SharedAppIconUploads,
 }
 
@@ -181,24 +193,29 @@ impl PreviewChrome {
     }
 
     /// Render each preview's chrome, topmost first (the caller pushes these above
-    /// the previews): close button, caption pill, app icon.
+    /// the previews): close button, caption pill, app icon. `output` names the
+    /// screen being drawn, whose bakes these are.
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
         app_icons: &AppIconCache,
+        output: &str,
         scale: f64,
         overlays: &[PreviewOverlay],
     ) -> Vec<PreviewChromeRenderElement> {
         let mut elements: Vec<PreviewChromeRenderElement> = Vec::new();
+        let mut outputs = self.outputs.borrow_mut();
         if overlays.is_empty() {
-            self.captions.borrow_mut().clear();
+            outputs.remove(output);
             return elements;
         }
+        let chrome = outputs.entry(output.to_owned()).or_default();
 
         // Only the captions on screen keep a bake; a retitled window would
         // otherwise leak one cache entry per title it ever had.
-        self.captions
+        chrome
+            .captions
             .borrow_mut()
             .retain(|text, _| overlays.iter().any(|o| &o.caption == text));
 
@@ -219,9 +236,9 @@ impl PreviewChrome {
                 CLOSE_BG
             };
             let cache = if overlay.hovered {
-                &self.disc_hover
+                &chrome.disc_hover
             } else {
-                &self.disc
+                &chrome.disc
             };
 
             // The glyph goes on top of the disc, so it is pushed first.
@@ -303,7 +320,7 @@ impl PreviewChrome {
             }
 
             if overlay.alpha > 0. && !overlay.caption.is_empty() {
-                if let Some(element) = self.caption_element(renderer, scale, overlay) {
+                if let Some(element) = Self::caption_element(chrome, renderer, scale, overlay) {
                     elements.push(element.into());
                 }
             }
@@ -314,13 +331,13 @@ impl PreviewChrome {
 
     /// One caption pill, baked and placed. `None` when the bake failed.
     fn caption_element(
-        &self,
+        chrome: &OutputChrome,
         renderer: &mut VulkanRenderer,
         scale: f64,
         overlay: &PreviewOverlay,
     ) -> Option<TextureRenderElement<VkTexture>> {
         let size = widget::Tooltip::size(&overlay.caption);
-        let mut caches = self.captions.borrow_mut();
+        let mut caches = chrome.captions.borrow_mut();
         let cache = caches.entry(overlay.caption.clone()).or_default();
         let texture = widget::bake(
             renderer,

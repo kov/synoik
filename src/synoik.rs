@@ -12578,6 +12578,7 @@ impl Synoik {
                     ctx.renderer,
                     &self.icon_cache,
                     &self.app_icon_cache,
+                    mon.output_name(),
                     fade_scale,
                     &overlays,
                 ) {
