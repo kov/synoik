@@ -9218,6 +9218,71 @@ fn a_minimized_windows_preview_can_be_hovered() {
     );
 }
 
+/// Swiping out of the overview drops the hovered preview's overlay the moment the swipe begins.
+///
+/// gnome-shell enables a preview's overlay only while the picker state is exactly 1
+/// (`_syncOverlay`, `workspace.js:775-778`), hiding it without an ease (`hideOverlay(false)`)
+/// as soon as the state moves. The hover is otherwise only recomputed on pointer motion, which a
+/// swipe never produces, so the hovered preview flew home drawn above windows really above it,
+/// and snapped into its true place when the overview handed off to the normal render path.
+#[test]
+fn swiping_out_of_the_overview_drops_the_picker_overlay() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+
+    pointer_motion_to(&mut f, 960., 540.);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let slot = f.synoik().layout.expose_target_rect(&first).unwrap();
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.settle();
+
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let hovered = |f: &mut Fixture| {
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+        mon.preview_overlays()
+            .iter()
+            .any(|(w, _, hover)| w == &first && *hover > 0.)
+    };
+    assert!(hovered(&mut f), "the preview under the pointer is hovered");
+
+    // Past the tracker's 16 px pickup (`DRAG_THRESHOLD_DISTANCE`), but well short of home.
+    f.swipe_begin(3);
+    for _ in 0..3 {
+        f.advance_input_time(50);
+        f.swipe_update(0., -10.);
+    }
+    f.settle_animations();
+    let state = overview_state(&mut f);
+    assert!(state > 0.5 && state < 1., "mid-swipe: {state}");
+    assert!(
+        !hovered(&mut f),
+        "a swipe leaving the picker drops the overlay as it starts"
+    );
+
+    // Two thirds of the way home, slowly: the release eases the rest of the way shut, and the
+    // overlay must stay down for that ease too — sampled before it lands, where an armed
+    // overlay would still show.
+    for _ in 0..20 {
+        f.advance_input_time(50);
+        f.swipe_update(0., -10.);
+    }
+    f.advance_input_time(1);
+    f.swipe_end(false);
+    assert!(!f.synoik().layout.is_overview_open(), "the swipe closes it");
+    assert!(overview_state(&mut f) > 0., "still easing home");
+    assert!(
+        !hovered(&mut f),
+        "and the overlay stays down on the way out"
+    );
+}
+
 /// A settled preview fills its slot — including a minimized window's.
 ///
 /// The picker derives the tile's draw scale as `slot.w / rect.w` and then rescales the tile's

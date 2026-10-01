@@ -3303,11 +3303,18 @@ impl<W: LayoutElement> Workspace<W> {
         changed
     }
 
+    /// Drop the picker overlay outright, with no ease back down, leaving the slides alone —
+    /// `hideOverlay(false)` (`windowPreview.js:358`), for a state change that may yet come back
+    /// to the same picker.
+    pub(super) fn drop_expose_hover(&mut self) {
+        self.expose_hover.clear();
+    }
+
     /// Drop the picker overlay outright, with no ease back down — for leaving the
     /// overview, where an eased hover would keep [`Self::render_expose`] restacking
     /// the preview above its neighbours for the whole exit animation.
     pub(super) fn clear_expose_hover(&mut self) {
-        self.expose_hover.clear();
+        self.drop_expose_hover();
         // Leaving the picker: an eased slot would keep `render_expose` restacking (and
         // would be interpolating toward a layout nobody is looking at).
         self.expose_slides.clear();

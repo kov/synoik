@@ -5226,6 +5226,15 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open = true;
         if entering {
             self.forget_expose_layouts();
+        } else {
+            // The picker's overlay is enabled only while its state sits at exactly 1
+            // (`_syncOverlay`, `workspace.js:775-778`) and hides without an ease when it moves.
+            // A swipe moves no pointer, so nothing else would drop it: the hovered preview would
+            // ride the whole swipe raised above its neighbours. Only the hover goes — a swipe
+            // that is cancelled lands back in the same picker, its slides intact.
+            for ws in self.workspaces_mut() {
+                ws.drop_expose_hover();
+            }
         }
 
         let bounds = overview_gesture_bounds(start);
@@ -5298,7 +5307,9 @@ impl<W: LayoutElement> Layout<W> {
         if !self.overview_open {
             // See `Workspace::hold_expose_freeze_through_exit` — a swipe out is an exit like
             // any other, and a hold that ran out partway through it would shuffle the picker.
+            // And like any other exit it drops the picker overlay (see `toggle_overview`).
             for ws in self.workspaces_mut() {
+                ws.clear_expose_hover();
                 ws.hold_expose_freeze_through_exit();
             }
         }
@@ -7328,6 +7339,11 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
+    /// Whether a touchpad swipe is moving the overview right now.
+    fn is_overview_swiping(&self) -> bool {
+        matches!(self.overview_progress, Some(OverviewProgress::Gesture(_)))
+    }
+
     /// The workspace a drop at `pos` on `output` would land on, if it is an
     /// existing one: the workspace under the pointer in the picker, or the
     /// thumbnail under it in the strip (gnome-shell's `Workspace.acceptDrop` /
@@ -7400,6 +7416,9 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
+        // Nothing arms during a swipe: the state is off the picker's 1, where gnome-shell keeps
+        // the overlay disabled (`_syncOverlay`, `workspace.js:775-778`).
+        let window = window.filter(|_| !self.is_overview_swiping());
         let mut changed = false;
         for ws in self.workspaces_mut() {
             changed |= ws.set_expose_hover(window);
