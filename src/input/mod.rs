@@ -6171,7 +6171,7 @@ impl State {
                         .and_then(|hit| {
                             self.synoik
                                 .dash
-                                .filter_poke(hit, self.synoik.dock.is_poking())
+                                .filter_poke(hit, self.synoik.dock.is_poking_on(output))
                         }),
                     None,
                     None,
@@ -8416,7 +8416,7 @@ impl State {
         // so it produces the same hit and rides the same activation path. Nothing else of the
         // overview is up, so nothing else can be hit.
         if self.synoik.dock_owns_dash(output) {
-            let poking = self.synoik.dock.is_poking();
+            let poking = self.synoik.dock.is_poking_on(output);
             return self
                 .synoik
                 .dash_area(output)

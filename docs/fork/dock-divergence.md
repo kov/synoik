@@ -74,9 +74,13 @@ out on the first motion after the window left fullscreen.
 A window demanding attention slides the dock a fraction of the way out (`POKE_PROGRESS = 0.45`)
 and draws **only** the icons asking for it: no pill, no blur, no separator, no running dots, no
 show-apps button. The icons keep their normal dash x, so pushing the pointer into the bottom edge
-to answer the poke lands on the icon you are about to click. Suppressed while a fullscreen window
-is focused — poking into a fullscreen video is where "louder than GNOME" becomes "worse than
-GNOME".
+to answer the poke lands on the icon you are about to click.
+
+The poke is on **every display** at once — the user may be looking at any of them. It has its own
+slide, separate from the dock proper: pulling the dock out on one display leaves the others resting
+on the poke, and putting it away drops that display back onto it. A display showing a fullscreen
+window draws no poke (poking into a fullscreen video is where "louder than GNOME" becomes "worse
+than GNOME"); the others still do.
 
 This has no GNOME counterpart at all: `windowAttentionHandler.js` posts a notification and touches
 nothing in the dash.

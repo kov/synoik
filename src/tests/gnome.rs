@@ -34962,8 +34962,8 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
 
 /// App "a" (a dash favorite) maps a window on the second desktop while another window holds
 /// focus on the first — mapping where the user is not looking is what marks it urgent. Returns
-/// the session objects, which must outlive the window.
-fn map_an_urgent_window(f: &mut Fixture) -> impl Sized {
+/// the session objects, which must outlive the window, the client, and the focus holder's surface.
+fn map_an_urgent_window(f: &mut Fixture) -> (impl Sized, ClientId, WlSurface) {
     f.add_output(1, (1280, 720));
     // The catalog is keyed by desktop id; a toplevel `app_id` of "a" resolves through
     // `lookup_desktop_wmclass` to "a.desktop".
@@ -35020,7 +35020,93 @@ fn map_an_urgent_window(f: &mut Fixture) -> impl Sized {
             .any(|(_, mapped)| mapped.is_urgent()),
         "a window mapping on another desktop demands attention"
     );
-    (session, handle)
+    ((session, handle), id, holder_surface)
+}
+
+/// An app wanting attention pokes at the bottom of *every* display — the user may be looking at
+/// any of them — and pulling the dock out on one leaves the others poking.
+#[test]
+fn an_urgent_app_pokes_on_every_display() {
+    let mut f = Fixture::new();
+    let _session = map_an_urgent_window(&mut f);
+    f.add_output(2, (1920, 1080));
+    let first = f.synoik_output(1);
+    let second = f.synoik_output(2);
+
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_dock_urgency();
+    f.settle();
+    let poked = f
+        .synoik()
+        .dash_area(&first)
+        .expect("the first display pokes");
+    assert!(
+        f.synoik().dash_area(&second).is_some(),
+        "and so does the second"
+    );
+    assert!(f.synoik().dock.is_poking_on(&first));
+    assert!(f.synoik().dock.is_poking_on(&second));
+
+    f.synoik().dock.show(&second);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().dock.is_poking_on(&second),
+        "pulled out on the second display, it is the whole dash there"
+    );
+    assert_eq!(
+        f.synoik().dash_area(&first),
+        Some(poked),
+        "while the first display keeps its poke, unmoved"
+    );
+    assert!(f.synoik().dock.is_poking_on(&first));
+
+    f.synoik().dock.hide();
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dock.is_poking_on(&second),
+        "put away again, the second display falls back to the poke"
+    );
+}
+
+/// A fullscreen window keeps the poke off *its* display only: the other display has nothing in
+/// front of its bottom edge, so it still pokes.
+#[test]
+fn a_fullscreen_window_keeps_the_poke_off_its_own_display() {
+    let mut f = Fixture::new();
+    let (_session, id, holder) = map_an_urgent_window(&mut f);
+    f.add_output(2, (1920, 1080));
+    let first = f.synoik_output(1);
+    let second = f.synoik_output(2);
+
+    let holder_id = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik().layout.toggle_fullscreen(&holder_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&holder);
+    window.set_size(1280, 720);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_dock_urgency();
+    f.settle();
+    assert!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&first)
+            .is_some_and(|mon| mon.render_above_top_layer()),
+        "precondition: the first display shows a fullscreen window"
+    );
+    assert_eq!(
+        f.synoik().dash_area(&first),
+        None,
+        "no poke over the fullscreen window"
+    );
+    assert!(
+        f.synoik().dash_area(&second).is_some(),
+        "but the other display still pokes"
+    );
 }
 
 /// Clicking a poked icon ends the poke by sliding the *icon* back under the edge, its glow
@@ -35042,7 +35128,10 @@ fn clicking_a_poked_icon_retreats_it_without_the_dash() {
     f.synoik().sync_dash_favorites();
     f.synoik().sync_dock_urgency();
     f.settle();
-    assert!(f.synoik().dock.is_poking(), "the urgent app pokes");
+    assert!(
+        f.synoik().dock.is_poking_on(&output),
+        "the urgent app pokes"
+    );
     let poked = f
         .synoik()
         .dash_area(&output)
@@ -35068,10 +35157,10 @@ fn clicking_a_poked_icon_retreats_it_without_the_dash() {
         "the icon slides down: poked={poked:?} retreating={retreating:?}"
     );
     assert!(
-        f.synoik().dock.is_poking(),
+        f.synoik().dock.is_poking_on(&output),
         "the retreat draws the poke, not the whole dash"
     );
-    let fade = f.synoik().dock.poke_fade();
+    let fade = f.synoik().dock.poke_fade_on(&output);
     assert!(0. < fade && fade < 1., "the glow fades on the way: {fade}");
 
     f.settle();
@@ -35339,8 +35428,9 @@ fn an_app_you_are_looking_at_does_not_demand_attention() {
         !f.synoik().dash.items().iter().any(|item| item.urgent),
         "so the dash has nothing to poke"
     );
+    let output = f.synoik_output(1);
     assert!(
-        !f.synoik().dock.is_poking(),
+        f.synoik().dash_area(&output).is_none(),
         "and the dock must not poke at an app the user is already in"
     );
 }

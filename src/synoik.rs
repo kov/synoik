@@ -12192,7 +12192,9 @@ impl Synoik {
                     true,
                     self.appearance(),
                     self.gnome_settings.accent_color,
-                    self.dock.is_poking().then(|| self.dock.poke_fade()),
+                    self.dock
+                        .is_poking_on(output)
+                        .then(|| self.dock.poke_fade_on(output)),
                 ) {
                     push(element.into());
                 }
@@ -15881,29 +15883,25 @@ impl Synoik {
         if self.is_locked() || self.screenshot_ui.is_open() || self.layout.is_app_expose_open() {
             return None;
         }
+        // A poke stays off a display showing a fullscreen window: poking into a fullscreen video
+        // is the one place where "louder than GNOME" turns into "worse than GNOME". Per display,
+        // so the other displays still poke. (A dock pulled out over one is already refused by
+        // `push_dock`.)
+        if self.dock.is_poking_on(output)
+            && self
+                .layout
+                .monitor_for_output(output)
+                .is_some_and(|mon| mon.render_above_top_layer())
+        {
+            return None;
+        }
         self.dock.area(output)
     }
 
-    /// Point the dock at whichever output has an app demanding attention, so it can poke that
-    /// app's icon above the bottom edge.
-    ///
-    /// Suppressed while a fullscreen window is focused: poking into a fullscreen video is the one
-    /// place where "louder than GNOME" turns into "worse than GNOME". (A setting may follow.)
+    /// Poke the icons of apps demanding attention above the bottom edge of every display.
     pub fn sync_dock_urgency(&mut self) {
         let urgent = self.dash.items().iter().any(|item| item.urgent);
-
-        let fullscreen = self
-            .layout
-            .focus()
-            .is_some_and(|focus| focus.sizing_mode().is_fullscreen());
-
-        let output = self
-            .layout
-            .active_output()
-            .or_else(|| self.dock.output())
-            .cloned();
-        self.dock
-            .set_poking(output.as_ref(), urgent && !fullscreen && output.is_some());
+        self.dock.set_poking(urgent);
     }
 
     /// Whether the dock — not the overview — currently owns the dash on `output`.
