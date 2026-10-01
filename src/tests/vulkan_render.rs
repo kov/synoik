@@ -626,6 +626,82 @@ fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
     );
 }
 
+/// All Displays in cast mode records every display at once, each to its own file named by its
+/// connector, and stopping them posts one notification rather than one per display.
+#[test]
+fn vulkan_screenshot_ui_casting_every_display_records_each_to_its_own_file() {
+    if !super::have_ffmpeg() {
+        return;
+    }
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.add_output(2, (800, 600));
+    let output = f.synoik_output(1);
+    let second = f.synoik_output(2);
+
+    f.synoik_state().open_screenshot_ui(None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(
+        &mut f,
+        &output,
+        layout
+            .all_displays
+            .expect("two displays put the toggle on the panel"),
+    );
+
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(
+        &mut f,
+        &output,
+        crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1),
+    );
+
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.capture);
+    f.synoik_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+
+    let recorded: Vec<_> = f
+        .synoik()
+        .casting
+        .recordings
+        .iter()
+        .filter_map(|r| r.native_path())
+        .collect();
+    assert_eq!(recorded.len(), 2, "one recording per display: {recorded:?}");
+    for o in [&output, &second] {
+        let suffix = format!(" ({}).webm", o.name());
+        assert!(
+            recorded
+                .iter()
+                .any(|p| p.to_string_lossy().ends_with(&suffix)),
+            "a file named for {}: {recorded:?}",
+            o.name()
+        );
+    }
+
+    f.synoik_state().stop_screen_recordings();
+    assert!(f.synoik().casting.recordings.is_empty());
+    let notifications = f
+        .synoik()
+        .notifications
+        .sources
+        .iter()
+        .flat_map(|s| s.notifications.iter())
+        .filter(|n| n.title == "Screencast recorded")
+        .count();
+    assert_eq!(
+        notifications, 1,
+        "recordings stopped together are one piece of news"
+    );
+}
+
 /// The point of the whole divergence: the shot is of the screen as it is when the timer runs out,
 /// not the frozen one the picker was showing.
 #[test]

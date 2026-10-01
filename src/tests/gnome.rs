@@ -28852,6 +28852,163 @@ fn screen_mode_offers_the_display_under_the_pointer() {
     );
 }
 
+/// Two displays, sized apart, with the picker open from the first and its panel laid out.
+fn open_two_display_picker(f: &mut Fixture) -> (Output, Output) {
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (800, 600));
+    pointer_motion_to(f, 100., 100.);
+    open_picker_headless(f);
+    (f.synoik_output(1), f.synoik_output(2))
+}
+
+/// **Our divergence, All Displays.** The toggle takes every display at once, one capture each, in
+/// reading order; a press on one display narrows it back to that one.
+#[test]
+fn all_displays_takes_every_display_and_a_press_narrows_it() {
+    use smithay::utils::{Point, Size};
+
+    use crate::ui::screenshot_ui::{CaptureType, PointerUp};
+
+    let mut f = Fixture::new();
+    let (one, two) = open_two_display_picker(&mut f);
+
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    let toggle = layout
+        .all_displays
+        .expect("two displays put the toggle on the panel");
+    assert_eq!(click_picker_control(&mut f, toggle), PointerUp::Redraw);
+    assert!(f.synoik().screenshot_ui.captures_every_display());
+
+    let shots = f.synoik().screenshot_ui.capture_shots_from_neutral();
+    let taken: Vec<_> = shots
+        .iter()
+        .map(|(o, size, _)| (o.clone(), *size))
+        .collect();
+    assert_eq!(
+        taken,
+        vec![
+            (one.clone(), Size::from((1920, 1080))),
+            (two.clone(), Size::from((800, 600))),
+        ],
+        "one capture per display, each the whole of it"
+    );
+    assert_eq!(f.synoik().screenshot_ui.pending_targets().len(), 2);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_outputs(),
+        vec![one.clone(), two.clone()]
+    );
+
+    // `SelectArea` wants one rectangle: the box around both.
+    let rect = f.synoik().screenshot_ui.selection_rect_global().unwrap();
+    let two_geo = f.synoik().global_space.output_geometry(&two).unwrap();
+    assert_eq!(rect.loc, Point::from((0, 0)));
+    assert_eq!(
+        rect.size,
+        Size::from((
+            two_geo.loc.x + two_geo.size.w,
+            1080.max(two_geo.loc.y + two_geo.size.h)
+        ))
+    );
+
+    // A press on the second display picks it alone.
+    f.synoik_state().handle_screenshot_ui_pointer_down(
+        two.clone(),
+        Point::from((100, 100)),
+        None,
+        false,
+    );
+    f.synoik().screenshot_ui.pointer_up(None);
+    assert!(!f.synoik().screenshot_ui.captures_every_display());
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_outputs(),
+        vec![two.clone()]
+    );
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
+}
+
+/// From Selection (or Window), All Displays switches to Screen mode — the only one it means
+/// anything in. And it is remembered across opens, like show-pointer.
+#[test]
+fn all_displays_switches_to_screen_and_is_remembered() {
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    let (one, _two) = open_two_display_picker(&mut f);
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    click_picker_control(&mut f, layout.all_displays.unwrap());
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert!(f.synoik().screenshot_ui.captures_every_display());
+
+    f.synoik_state().cancel_screenshot();
+    open_picker_headless(&mut f);
+    assert!(
+        f.synoik().screenshot_ui.captures_every_display(),
+        "the choice survives a close, as GNOME's toggles do"
+    );
+
+    // Toggled again, it goes back to the one display that was picked.
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    click_picker_control(&mut f, layout.all_displays.unwrap());
+    assert!(!f.synoik().screenshot_ui.captures_every_display());
+    assert_eq!(f.synoik().screenshot_ui.capture_outputs(), vec![one]);
+}
+
+/// With one display there is no choice to offer: no toggle on the panel, and a remembered "every
+/// display" captures the one there is.
+#[test]
+fn one_display_has_no_all_displays_toggle() {
+    let mut f = Fixture::new();
+    let (one, _two) = open_two_display_picker(&mut f);
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    click_picker_control(&mut f, layout.all_displays.unwrap());
+    f.synoik_state().cancel_screenshot();
+
+    f.remove_output(2);
+    open_picker_headless(&mut f);
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    assert!(layout.all_displays.is_none());
+    assert!(!f.synoik().screenshot_ui.captures_every_display());
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_shots_from_neutral().len(),
+        1
+    );
+}
+
+/// Saving every display writes one file each, named apart by connector so two captures from the
+/// same second cannot overwrite each other.
+#[test]
+fn all_displays_saves_a_file_per_display() {
+    use crate::ui::screenshot_ui::ScreenshotUi;
+
+    let mut f = Fixture::new();
+    let (one, two) = open_two_display_picker(&mut f);
+    let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
+    click_picker_control(&mut f, layout.all_displays.unwrap());
+
+    let dir = std::env::temp_dir().join(format!("synoik-all-displays-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("shot.png");
+    if let ScreenshotUi::Open { path, .. } = &mut f.synoik().screenshot_ui {
+        *path = Some(base.to_string_lossy().into_owned());
+    }
+    f.synoik_state().confirm_screenshot(true);
+
+    let expected = [one, two].map(|o| crate::utils::with_label(&base, &o.name()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !expected.iter().all(|p| p.exists()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let found: Vec<_> = expected.iter().map(|p| p.exists()).collect();
+    let plain = base.exists();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(found, vec![true, true], "a file per display: {expected:?}");
+    assert!(!plain, "and no unlabelled file beside them");
+}
+
 /// The picker comes back the way you left it, for as long as the session lasts.
 ///
 /// gnome-shell's `ScreenshotUI` is a singleton built at startup that merely hides on close

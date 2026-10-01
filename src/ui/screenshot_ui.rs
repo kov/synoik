@@ -123,6 +123,8 @@ pub enum ScreenshotUi {
         last_selection: Option<(WeakOutput, Rectangle<i32, Physical>)>,
         /// Remembered across opens, like GNOME's toggle button. Not remembered across restarts.
         show_pointer: bool,
+        /// Remembered across opens, like `show_pointer`: see `Open::all_displays`.
+        all_displays: bool,
         /// Remembered across opens. Falls back to `Selection` at open time if `Window` is picked
         /// but there is nothing to pick, mirroring `screenshot.js:1663-1664`.
         capture_type: CaptureType,
@@ -145,6 +147,10 @@ pub enum ScreenshotUi {
         /// The display under the pointer while Screen mode offers it, for the selector's `:hover`
         /// shade. `None` when the pointer is on a panel, or on the display already picked.
         screen_hover: Option<Output>,
+        /// **Our divergence**: Screen mode takes every display at once, one file per display.
+        /// GNOME's selectors are single-choice. Only means anything with more than one display —
+        /// see [`ScreenshotUi::captures_every_display`], the one place that asks.
+        all_displays: bool,
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
@@ -549,6 +555,11 @@ struct PanelState {
     show_pointer: bool,
     delay: u8,
     mode: CaptureMode,
+    /// Whether there is more than one display, which is what puts the All Displays button on the
+    /// panel at all — with one, it would offer a choice that is not there.
+    multi_display: bool,
+    /// Whether the All Displays button reads as `:checked`.
+    all_displays: bool,
     hover: Option<Control>,
     /// The control currently held down, for the `:active` fills.
     active: Option<Control>,
@@ -748,6 +759,7 @@ impl ScreenshotUi {
             // GNOME's button is constructed unchecked (`screenshot.js:1417-1421`) and the cursor
             // actor starts hidden, so a first-ever picker shows no pointer.
             show_pointer: false,
+            all_displays: false,
             // Divergence: GNOME opens its first picker on Selection (`screenshot.js:1305-1312`
             // checks the area button). We open on Screen — the whole output is the common capture,
             // and a drag is one click away, while Selection makes every "just grab the screen"
@@ -780,6 +792,7 @@ impl ScreenshotUi {
         let Self::Closed {
             last_selection,
             show_pointer,
+            all_displays,
             capture_type: remembered_type,
             clock,
             config,
@@ -788,6 +801,7 @@ impl ScreenshotUi {
             return false;
         };
         let show_pointer = *show_pointer;
+        let all_displays = *all_displays;
         let remembered_type = *remembered_type;
         // Taken before the selection is consumed below, so what goes back is what was there.
         let quick = quick.then(|| Quick {
@@ -932,6 +946,7 @@ impl ScreenshotUi {
             area,
             screen_output,
             screen_hover: None,
+            all_displays,
             output_data,
             button: Button::Up,
             show_pointer,
@@ -960,6 +975,7 @@ impl ScreenshotUi {
         let Self::Open {
             area,
             show_pointer,
+            all_displays,
             capture_type,
             quick,
             clock,
@@ -988,6 +1004,7 @@ impl ScreenshotUi {
         *self = Self::Closed {
             last_selection,
             show_pointer: *show_pointer,
+            all_displays: *all_displays,
             capture_type,
             clock: clock.clone(),
             config: config.clone(),
@@ -1008,6 +1025,62 @@ impl ScreenshotUi {
             let next = DELAYS.iter().position(|d| d == delay).map_or(0, |i| i + 1);
             *delay = DELAYS[next % DELAYS.len()];
         }
+    }
+
+    /// Whether the picker has more than one display to offer.
+    pub fn is_multi_display(&self) -> bool {
+        matches!(self, Self::Open { output_data, .. } if output_data.len() > 1)
+    }
+
+    /// Whether the capture takes every display, one file each: Screen mode with All Displays on,
+    /// and more than one display to take. The one authority — the bake, the selectors, the capture
+    /// and the hover all ask this rather than the flag.
+    pub fn captures_every_display(&self) -> bool {
+        matches!(
+            self,
+            Self::Open {
+                capture_type: CaptureType::Screen,
+                all_displays: true,
+                ..
+            }
+        ) && self.is_multi_display()
+    }
+
+    /// The All Displays button. From another mode it switches to Screen with every display, since
+    /// that is the only mode it means anything in; in Screen mode it flips between every display
+    /// and the one that was picked.
+    pub fn toggle_all_displays(&mut self) {
+        let every = self.captures_every_display();
+        if self.capture_type() != CaptureType::Screen {
+            self.set_capture_type(CaptureType::Screen);
+        }
+        if let Self::Open {
+            all_displays,
+            screen_hover,
+            ..
+        } = self
+        {
+            *all_displays = !every;
+            *screen_hover = None;
+        }
+        self.update_buffers();
+    }
+
+    /// Every output the capture acts on, in reading order (top to bottom, then left to right) —
+    /// the order the files are written in, and the first is the one that goes to the clipboard.
+    pub fn capture_outputs(&self) -> Vec<Output> {
+        let Self::Open { output_data, .. } = self else {
+            return Vec::new();
+        };
+        if !self.captures_every_display() {
+            return self.capture_output().cloned().into_iter().collect();
+        }
+        let mut outputs: Vec<_> = output_data.keys().cloned().collect();
+        outputs.sort_by_key(|o| {
+            let loc = o.current_location();
+            (loc.y, loc.x)
+        });
+        outputs
     }
 
     /// How long the capture should wait before it fires, or `None` for right now.
@@ -1081,10 +1154,11 @@ impl ScreenshotUi {
         else {
             return;
         };
+        let multi_display = output_data.len() > 1;
         for data in output_data.values() {
             let mut cache = data.panel.borrow_mut();
             cache.scale = data.scale;
-            cache.layout = Some(PanelLayout::new(metrics));
+            cache.layout = Some(PanelLayout::new(metrics, multi_display));
         }
     }
 
@@ -1184,6 +1258,53 @@ impl ScreenshotUi {
             output.clone(),
             PendingTarget::Area(rect_from_corner_points(a, b)),
         ))
+    }
+
+    /// What a delayed capture should shoot, per output — one entry, or one per display when the
+    /// capture takes every display.
+    pub fn pending_targets(&self) -> Vec<(Output, PendingTarget)> {
+        if !self.captures_every_display() {
+            return self.pending_target().into_iter().collect();
+        }
+        let Self::Open { output_data, .. } = self else {
+            return Vec::new();
+        };
+        self.capture_outputs()
+            .into_iter()
+            .filter_map(|o| {
+                let size = output_data.get(&o)?.size;
+                Some((o, PendingTarget::Area(Rectangle::from_size(size))))
+            })
+            .collect()
+    }
+
+    /// Every capture the picker would save, as `(output, size, RGBA pixels)` — one, or one per
+    /// display when the capture takes every display. See [`Self::capture_from_neutral`].
+    pub fn capture_shots_from_neutral(&self) -> Vec<(Output, Size<i32, Physical>, Vec<u8>)> {
+        let Self::Open {
+            output_data,
+            show_pointer,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        if !self.captures_every_display() {
+            let output = self.capture_output().cloned();
+            return output
+                .zip(self.capture_from_neutral())
+                .map(|(o, (size, pixels))| (o, size, pixels))
+                .into_iter()
+                .collect();
+        }
+        self.capture_outputs()
+            .into_iter()
+            .filter_map(|o| {
+                let data = output_data.get(&o)?;
+                let rect = Rectangle::from_size(data.size);
+                Some((o, rect.size, data.crop_neutral(rect, *show_pointer)?))
+            })
+            .collect()
     }
 
     /// The output the capture acts on: the selection's in Selection mode, the picked display in
@@ -1585,6 +1706,7 @@ impl ScreenshotUi {
         // monitors: a press lands on whichever output it happens on, so dimming all but one would
         // point at a choice the user has not made yet.
         let crosshair_only = self.crosshair_only();
+        let every_display = self.captures_every_display();
 
         let Self::Open {
             area,
@@ -1622,7 +1744,8 @@ impl ScreenshotUi {
                 for buffer in buffers.iter_mut() {
                     buffer.resize((0., 0.));
                 }
-            } else if (capture_type == CaptureType::Screen && output == screen_output)
+            } else if (capture_type == CaptureType::Screen
+                && (every_display || output == screen_output))
                 || (capture_type != CaptureType::Screen && output == area_output)
             {
                 // An output that shrank can leave the *area* out of bounds; reset it to the default
@@ -1799,6 +1922,8 @@ impl ScreenshotUi {
             show_pointer: *show_pointer,
             delay: *delay,
             mode: *mode,
+            multi_display: self.is_multi_display(),
+            all_displays: self.captures_every_display(),
             hover,
             // `:active` only while the pointer is still on the control the press armed — a press
             // dragged off a button must let go of it, as it does anywhere else.
@@ -1924,26 +2049,9 @@ impl ScreenshotUi {
         }
 
         let data = &output_data[self.capture_output()?];
-        let OutputScreenshot {
-            screen,
-            pointer: screenshot_pointer,
-            ..
-        } = &data.screenshot[0];
-
         let (a, b) = capture_corners(*capture_type, (area.1, area.2), data.size);
         let rect = rect_from_corner_points(a, b);
-
-        // The pointer neutral carries its top-left in logical output coordinates; map it back to
-        // the physical space the frozen screen (and the selection rect) live in.
-        let pointer = show_pointer
-            .then(|| screenshot_pointer.as_ref())
-            .flatten()
-            .map(|(ptr, loc)| {
-                let scale = Scale::from(data.scale);
-                (ptr, loc.to_physical_precise_round(scale))
-            });
-
-        Some((rect.size, crop_screenshot_neutral(screen, rect, pointer)))
+        Some((rect.size, data.crop_neutral(rect, *show_pointer)?))
     }
 
     /// The selected window's frozen content, with the pointer composited on top if it was over
@@ -2045,6 +2153,18 @@ impl ScreenshotUi {
         else {
             return None;
         };
+
+        // Every display: the box around them all, the one rectangle a `SelectArea` caller can take.
+        if self.captures_every_display() {
+            return self
+                .capture_outputs()
+                .iter()
+                .map(|o| {
+                    Rectangle::new(o.current_location().to_f64(), crate::utils::output_size(o))
+                        .to_i32_round()
+                })
+                .reduce(|a, b| a.merge(b));
+        }
 
         // Window mode has no rectangle; like the other callers, it answers with the area.
         let output = match capture_type {
@@ -2239,6 +2359,7 @@ impl ScreenshotUi {
     fn update_hover(&mut self, under: Option<(Output, Point<i32, Physical>)>) -> bool {
         let window_enabled = self.window_enabled();
         let crosshair_only = self.crosshair_only();
+        let every_display = self.captures_every_display();
         let Self::Open {
             area,
             screen_output,
@@ -2306,11 +2427,14 @@ impl ScreenshotUi {
             .flatten()
             .zip(under_output.clone())
             .map(|(id, output)| (output, id));
-        // A display lights up as something to pick only off its panel, and only if it is not the
-        // one already picked — the checked selector has no hover style of its own.
+        // A display lights up as something to pick only off its panel, and only if it is not
+        // already picked — a checked selector has no hover style of its own, and with every
+        // display taken, none is unpicked.
         let new_screen = under_output
             .clone()
-            .filter(|o| *capture_type == CaptureType::Screen && o != screen_output)
+            .filter(|o| {
+                *capture_type == CaptureType::Screen && !every_display && o != screen_output
+            })
             .filter(|_| !data.is_some_and(|data| data.over_chrome(point)));
         let new_hover_output = new.and(under_output);
 
@@ -2373,11 +2497,13 @@ impl ScreenshotUi {
         move_existing: bool,
     ) -> Option<PointerDown> {
         let crosshair_only = self.crosshair_only();
+        let every_display = self.captures_every_display();
 
         let Self::Open {
             area,
             screen_output,
             screen_hover,
+            all_displays,
             output_data,
             capture_type,
             selected_window,
@@ -2464,7 +2590,7 @@ impl ScreenshotUi {
         // In Screen mode every display is a selector button, and a press on one picks it
         // (`screenSelector`'s `notify::checked`, `js/ui/screenshot.js:1600-1615`). Picked on the
         // press, like the window selector above: there is nothing to drag, and the selection is
-        // single-valued.
+        // single-valued. With every display taken, a press on one narrows the capture to it.
         if *capture_type == CaptureType::Screen {
             *button = Button::Down {
                 touch_slot: slot,
@@ -2472,11 +2598,12 @@ impl ScreenshotUi {
                 last_pos: (output.clone(), point),
                 grab: Grab::New,
             };
-            if *screen_output == output {
+            if *screen_output == output && !every_display {
                 return None;
             }
             *screen_output = output;
             *screen_hover = None;
+            *all_displays = false;
             self.update_buffers();
             return Some(PointerDown::Redraw);
         }
@@ -2693,6 +2820,10 @@ impl ScreenshotUi {
                 self.cycle_delay();
                 PointerUp::Redraw
             }
+            Control::AllDisplays => {
+                self.toggle_all_displays();
+                PointerUp::Redraw
+            }
             Control::ShotCast(i) => {
                 self.set_mode(CaptureMode::from_index(i));
                 PointerUp::Redraw
@@ -2768,6 +2899,27 @@ impl OutputScreenshot {
 }
 
 impl OutputData {
+    /// `rect` of the frozen screen, with the pointer composited if asked for.
+    fn crop_neutral(&self, rect: Rectangle<i32, Physical>, show_pointer: bool) -> Option<Vec<u8>> {
+        let OutputScreenshot {
+            screen,
+            pointer: screenshot_pointer,
+            ..
+        } = &self.screenshot[0];
+
+        // The pointer neutral carries its top-left in logical output coordinates; map it back to
+        // the physical space the frozen screen (and the selection rect) live in.
+        let pointer = show_pointer
+            .then_some(screenshot_pointer.as_ref())
+            .flatten()
+            .map(|(ptr, loc)| {
+                let scale = Scale::from(self.scale);
+                (ptr, loc.to_physical_precise_round(scale))
+            });
+
+        Some(crop_screenshot_neutral(screen, rect, pointer))
+    }
+
     /// Build the panel (and its shadow and close button) into `VkTexture`s if missing or stale —
     /// a [`PanelState`], scale or renderer-context change. Failures leave the texture `None`, so
     /// the panel just doesn't draw.
@@ -2963,6 +3115,7 @@ impl OutputData {
             Control::Capture => layout.capture,
             Control::ShowPointer => layout.show_pointer,
             Control::Delay => layout.delay,
+            Control::AllDisplays => layout.all_displays?,
             Control::Close => unreachable!("handled above"),
         };
         Some(Rectangle::new(panel.loc + local.loc, local.size))
@@ -3212,6 +3365,16 @@ impl OutputData {
             );
         }
 
+        if let Some(rect) = layout.all_displays {
+            icon(
+                "video-joined-displays-symbolic",
+                widget::IconButton::ICON_PX,
+                style::OSD_FG,
+                origin,
+                centre(rect),
+            );
+        }
+
         if let Some(panel) = self.panel_rect_logical() {
             let close = close_rect(panel);
             icon(
@@ -3447,6 +3610,9 @@ pub enum Control {
     /// **Our divergence**: arm the capture to fire after a delay. See
     /// `docs/fork/screenshot-ui-port.md`.
     Delay,
+    /// **Our divergence**: Screen mode takes every display, one file each. Only on the panel with
+    /// more than one display.
+    AllDisplays,
     Close,
 }
 
@@ -3467,6 +3633,7 @@ impl Control {
             Control::Capture => "Capture",
             Control::ShowPointer => "Show Pointer",
             Control::Delay => "Delay",
+            Control::AllDisplays => "All Displays",
             // GNOME's close button carries no tooltip.
             Control::Close => return None,
         })
@@ -3490,6 +3657,10 @@ pub struct PanelLayout {
     /// Our delay button, left of the show-pointer toggle. Both are persistent capture *options*,
     /// which is why they share the end of the bottom row rather than joining the type row.
     pub delay: Rectangle<f64, Logical>,
+    /// Our All Displays toggle, left of the delay; `None` with a single display. It is a *what*
+    /// rather than a *how*, but the type row is homogeneous icon-over-caption buttons each naming
+    /// a capture type, and this is a modifier of one of them — so it joins the round toggles.
+    pub all_displays: Option<Rectangle<f64, Logical>>,
 }
 
 impl PanelLayout {
@@ -3516,7 +3687,7 @@ impl PanelLayout {
     /// capture button and the show-pointer button all occupy the same band, aligned start, centre
     /// and end. Laying them out in sequence instead would push the capture button off-centre,
     /// which is the mistake this arithmetic exists to prevent.
-    pub fn new(metrics: CaptionMetrics) -> Self {
+    pub fn new(metrics: CaptionMetrics, multi_display: bool) -> Self {
         let CaptionMetrics { label_w, label_h } = metrics;
         let type_sizes = label_w.map(|w| widget::IconLabelButton::size(w, label_h));
 
@@ -3533,13 +3704,13 @@ impl PanelLayout {
             .max(show_pointer_d);
 
         // The bottom row must fit its three children side by side even though they are stacked in
-        // a bin — otherwise the pill and the toggle would overlap the capture button on a narrow
-        // panel.
-        let bottom_min_w = shot_cast_size.w
-            + Self::CAPTURE_DIAMETER
-            + show_pointer_d * 2.
-            + Self::TYPE_SPACING
-            + Self::ROW_SPACING * 2.;
+        // a bin — otherwise the pill and the toggles would overlap the capture button on a narrow
+        // panel. The capture button is *centred*, so each half of the row has to hold the wider
+        // of the two ends beside half the button.
+        let round_toggles = if multi_display { 3. } else { 2. };
+        let toggles_w = show_pointer_d * round_toggles + Self::TYPE_SPACING * (round_toggles - 1.);
+        let bottom_min_w =
+            (shot_cast_size.w.max(toggles_w) + Self::ROW_SPACING) * 2. + Self::CAPTURE_DIAMETER;
         let content_w = type_row_w.max(bottom_min_w);
 
         let size = Size::from((
@@ -3580,6 +3751,13 @@ impl PanelLayout {
             show_pointer_d,
             show_pointer.loc.x - Self::TYPE_SPACING - show_pointer_d,
         );
+        let all_displays = multi_display.then(|| {
+            centred(
+                show_pointer_d,
+                show_pointer_d,
+                delay.loc.x - Self::TYPE_SPACING - show_pointer_d,
+            )
+        });
 
         Self {
             size,
@@ -3588,6 +3766,7 @@ impl PanelLayout {
             capture,
             show_pointer,
             delay,
+            all_displays,
         }
     }
 
@@ -3613,6 +3792,9 @@ impl PanelLayout {
         }
         if in_circle(self.delay) {
             return Some(Control::Delay);
+        }
+        if self.all_displays.is_some_and(in_circle) {
+            return Some(Control::AllDisplays);
         }
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
             if self.type_buttons[i].contains(p) {
@@ -3920,7 +4102,7 @@ fn generate_panel(
         })
         .transpose()?;
 
-    let layout = PanelLayout::new(metrics);
+    let layout = PanelLayout::new(metrics, state.multi_display);
     let size = widget::physical_size(scale, layout.size);
 
     let texture = widget::bake_uncached_sized(renderer, size, |frame| {
@@ -3995,6 +4177,24 @@ fn generate_panel(
         )?;
         if let Some(label) = &delay_label {
             p.text(label, centre(layout.delay), Align::CENTER, style::OSD_FG)?;
+        }
+
+        // All Displays shares the cascade too: on, it reads as `:checked`.
+        if let Some(rect) = layout.all_displays {
+            let control = Control::AllDisplays;
+            let bg = if state.active == Some(control) {
+                style::OSD_FLAT_ACTIVE
+            } else if state.all_displays {
+                style::OSD_FLAT_CHECKED
+            } else if state.hover == Some(control) {
+                style::OSD_FLAT_HOVER
+            } else {
+                style::OSD_BG
+            };
+            p.icon_button(
+                &widget::IconButton::new(rect, widget::IconButton::ICON_PX, bg),
+                accent,
+            )?;
         }
 
         // The capture button: a real 4px ring, a transparent gap, then the inner circle.
@@ -4266,7 +4466,7 @@ mod tests {
     const LABEL_H: f64 = CaptionMetrics::TEST.label_h;
 
     fn layout() -> PanelLayout {
-        PanelLayout::new(CaptionMetrics::TEST)
+        PanelLayout::new(CaptionMetrics::TEST, false)
     }
 
     // GNOME's bottom row is a BinLayout (`screenshot.js:1350`), so the capture button is centred on
@@ -4449,6 +4649,29 @@ mod tests {
 
     // The delay button is ours, and it shares the bottom row's right end with show-pointer: both
     // are persistent capture *options*, as against the type row's "what to capture".
+    /// With more than one display, All Displays joins the round toggles left of the delay — and it
+    /// is the only thing that changes: the controls GNOME has stay where they were.
+    #[test]
+    fn all_displays_sits_beside_the_delay_only_with_several_displays() {
+        assert!(PanelLayout::new(CaptionMetrics::TEST, false)
+            .all_displays
+            .is_none());
+
+        let layout = PanelLayout::new(CaptionMetrics::TEST, true);
+        let rect = layout
+            .all_displays
+            .expect("several displays get the toggle");
+        assert!(rect.loc.x + rect.size.w <= layout.delay.loc.x);
+        assert_eq!(mid_y(rect), mid_y(layout.delay), "on the same band");
+        assert_eq!(layout.control_at(centre(rect)), Some(Control::AllDisplays));
+        assert!(
+            rect.loc.x >= layout.shot_cast.loc.x + layout.shot_cast.size.w
+                && rect.loc.x + rect.size.w <= layout.capture.loc.x
+                || rect.loc.x >= layout.capture.loc.x + layout.capture.size.w,
+            "clear of the pill and the capture button"
+        );
+    }
+
     #[test]
     fn the_delay_button_sits_beside_show_pointer_and_takes_clicks() {
         let l = layout();

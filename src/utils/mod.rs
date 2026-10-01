@@ -284,6 +284,18 @@ pub fn expand_home(path: &Path) -> anyhow::Result<Option<PathBuf>> {
     }
 }
 
+/// `path` with ` (label)` before its extension — how captures taken together, one per display,
+/// are told apart: `Screenshot from … (DP-1).png`.
+pub fn with_label(path: &Path, label: &str) -> PathBuf {
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(" ({label})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
+}
+
 pub fn make_screenshot_path(config: &Config) -> anyhow::Result<Option<PathBuf>> {
     let Some(path) = &config.screenshot_path.0 else {
         return Ok(None);
@@ -793,6 +805,18 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    #[test]
+    fn a_label_goes_before_the_extension() {
+        assert_eq!(
+            with_label(Path::new("/a/Screenshot from 2026.png"), "DP-1"),
+            PathBuf::from("/a/Screenshot from 2026 (DP-1).png")
+        );
+        assert_eq!(
+            with_label(Path::new("shot"), "HDMI-A-1"),
+            PathBuf::from("shot (HDMI-A-1)")
+        );
+    }
 
     /// A crop takes the requested rectangle, not the top-left corner of it.
     ///

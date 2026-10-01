@@ -66,6 +66,17 @@ pub struct ScreenRecording {
     pub kind: RecordingKind,
 }
 
+impl ScreenRecording {
+    /// The file a native recording is writing to. Test-only.
+    #[cfg(test)]
+    pub fn native_path(&self) -> Option<std::path::PathBuf> {
+        match &self.kind {
+            RecordingKind::Native(n) => Some(n.path.clone()),
+            RecordingKind::External => None,
+        }
+    }
+}
+
 /// How a recording is driven and stopped.
 pub enum RecordingKind {
     /// A screencast started with the `is-recording` property (gnome-shell's recorder path).

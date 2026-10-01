@@ -38,10 +38,11 @@ constraint GNOME flips as the selection moves (`_closeButtonXAlignConstraint`,
 ## What we have today
 
 `src/ui/screenshot_ui.rs`. Area selection on a single output, drag/move/resize by pointer and by
-keyboard, the shade, the selection chrome and its four corner handles, the window selector, and
-GNOME's control panel: the three type buttons, the shot/cast pill, the capture button, the
-show-pointer and delay toggles, the close button and tooltips, all hover/checked/active-styled and
-hit-tested off one shared `PanelLayout`. The keyboard reaches all of it: `s`/`c`/`w` pick the
+keyboard, the shade, the selection chrome and its four corner handles, the window selector, the
+screen selectors, and GNOME's control panel: the three type buttons, the shot/cast pill, the
+capture button, the show-pointer, delay and (with several displays) All Displays toggles, the
+close button and tooltips, all hover/checked/active-styled and hit-tested off one shared
+`PanelLayout`. The keyboard reaches all of it: `s`/`c`/`w` pick the
 capture type, `v` flips shot/cast, `p` toggles the pointer, `Space` saves and `Ctrl+C` copies.
 
 Two things the panel's shape now fixes in place, worth knowing before touching it:
@@ -182,6 +183,31 @@ hover, the cursor, the selectors), and `State::handle_screenshot_ui_motion` deri
 global position so no call site can hand it only one. A panel is not a selector — its capture
 button acts on the picked display, wherever the panel is. Pinned by
 `every_displays_panel_takes_the_pointer` and `screen_mode_offers_the_display_under_the_pointer`.
+
+## Approved divergence: All Displays
+
+GNOME's selectors are single-choice. Ours adds a round **All Displays** toggle to the bottom row,
+left of the delay, present only with more than one display (a choice that is not there is not
+offered — the same reason GNOME hides the cast button without a recorder). It is a *what*, not a
+*how*, but the type row is homogeneous icon-over-caption buttons each naming a capture type, and
+this modifies one of them, so it joins the round toggles. From Selection or Window it switches to
+Screen; in Screen it flips between every display and the one picked; a press on a display narrows
+back to it. Remembered across opens, like show-pointer. `captures_every_display` is the one
+authority the bake, the selectors, the capture and the hover ask.
+
+**One file per display, never stitched** (kov's call, 2026-10-01): displays can differ in scale and
+refresh, and a stitched image or video pays for the gaps between them. Each file carries its
+connector — `Screenshot from … (DP-1).png`, `Screencast From … (DP-1).webm` — since the templates
+are second-granular and would otherwise overwrite one another. What the user hears about is still
+**one** capture: `save_screenshots` puts the first file (reading order, top to bottom then left to
+right) on the clipboard, in the notification and in an `InteractiveScreenshot` reply, and stopping
+recordings started together posts one notification. A `SelectArea` caller gets the box around every
+display. A delayed capture arms against every display at once, and losing any of them cancels it.
+
+Pinned by `all_displays_takes_every_display_and_a_press_narrows_it`,
+`all_displays_switches_to_screen_and_is_remembered`, `one_display_has_no_all_displays_toggle`,
+`all_displays_saves_a_file_per_display` and
+`vulkan_screenshot_ui_casting_every_display_records_each_to_its_own_file`.
 
 ## Approved divergence: a fresh picker opens on Screen
 

@@ -33,7 +33,24 @@ use anyhow::Context as _;
 /// `base` overrides where a relative template lands (see [`resolve_file_template`]); production
 /// passes `None`.
 pub fn default_recording_path(base: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
-    resolve_file_template("Screencasts/Screencast From %d %t", "webm", base)
+    default_recording_path_labelled(base, None)
+}
+
+/// [`default_recording_path`], with ` (label)` after the time — how recordings started together,
+/// one per display, are told apart.
+pub fn default_recording_path_labelled(
+    base: Option<&std::path::Path>,
+    label: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let template = match label {
+        // A `%` in a connector name would read as an escape.
+        Some(label) => format!(
+            "Screencasts/Screencast From %d %t ({})",
+            label.replace('%', "%%")
+        ),
+        None => String::from("Screencasts/Screencast From %d %t"),
+    };
+    resolve_file_template(&template, "webm", base)
 }
 
 /// Resolve a `org.gnome.Shell.Screencast` file template into an absolute path, matching

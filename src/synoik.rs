@@ -1305,7 +1305,9 @@ pub struct Synoik {
 /// Deliberately *not* a field of `ScreenshotUi::Open`: arming closes the picker, so this outlives
 /// it. The output is held weakly so an unplug during the countdown cancels rather than resurrects.
 pub struct PendingCapture {
-    output: WeakOutput,
+    /// Every output the capture takes — one, or each display with All Displays on. Losing *any*
+    /// of them cancels the whole capture: a set with a hole in it is not what was armed.
+    outputs: Vec<WeakOutput>,
     action: PendingAction,
     /// Monotonic; the countdown reads it, and it — not the tick count — decides when to fire.
     fires_at: Duration,
@@ -1317,7 +1319,8 @@ pub struct PendingCapture {
 /// as firmly as it stops a photograph being taken.
 enum PendingAction {
     Shot {
-        target: PendingTarget,
+        /// One per entry of `PendingCapture::outputs`, in the same order.
+        targets: Vec<PendingTarget>,
         show_pointer: bool,
         write_to_disk: bool,
         path: Option<String>,
@@ -1326,7 +1329,7 @@ enum PendingAction {
         reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     },
     Cast {
-        /// Global-logical, or `None` for the whole output.
+        /// Global-logical, or `None` for the whole output. Always `None` with several outputs.
         crop: Option<Rectangle<i32, Logical>>,
         draw_cursor: bool,
     },
@@ -4719,11 +4722,17 @@ impl State {
     /// context the capture will need — the output, the target, the reply channel, the path — is
     /// lifted out here: none of it survives `close_screenshot_ui`.
     fn arm_delayed_shot(&mut self, delay: Duration, write_to_disk: bool, path: Option<String>) {
-        let Some((output, target)) = self.synoik.screenshot_ui.pending_target() else {
+        let (outputs, targets): (Vec<_>, Vec<_>) = self
+            .synoik
+            .screenshot_ui
+            .pending_targets()
+            .into_iter()
+            .unzip();
+        if outputs.is_empty() {
             warn!("nothing to capture; not arming the delay");
             self.cancel_screenshot();
             return;
-        };
+        }
         let show_pointer = self.synoik.screenshot_ui.show_pointer();
 
         // Taken *before* the close, which answers whatever is still pending with `None`. An armed
@@ -4732,9 +4741,9 @@ impl State {
 
         self.arm_delayed_capture(
             delay,
-            output,
+            outputs,
             PendingAction::Shot {
-                target,
+                targets,
                 show_pointer,
                 write_to_disk,
                 path,
@@ -4743,8 +4752,13 @@ impl State {
         );
     }
 
-    /// Arm `action` to fire on `output` after `delay`, and dismiss the picker.
-    fn arm_delayed_capture(&mut self, delay: Duration, output: Output, action: PendingAction) {
+    /// Arm `action` to fire on `outputs` after `delay`, and dismiss the picker.
+    fn arm_delayed_capture(
+        &mut self,
+        delay: Duration,
+        outputs: Vec<Output>,
+        action: PendingAction,
+    ) {
         self.synoik.close_screenshot_ui();
         self.synoik
             .cursor_manager
@@ -4764,7 +4778,7 @@ impl State {
             });
 
         self.synoik.pending_capture = Some(PendingCapture {
-            output: output.downgrade(),
+            outputs: outputs.iter().map(Output::downgrade).collect(),
             action,
             fires_at,
             token,
@@ -4785,11 +4799,14 @@ impl State {
             .then(|| self.synoik.screenshot_ui.selection_rect_global())
             .flatten();
         let draw_cursor = self.synoik.screenshot_ui.show_pointer();
-        let output = self.synoik.screenshot_ui.capture_output().cloned();
+        // One recording per display when the capture takes every display, each its own file.
+        let outputs = self.synoik.screenshot_ui.capture_outputs();
 
-        if let (Some(delay), Some(output)) = (self.synoik.screenshot_ui.delay(), output.clone()) {
-            self.arm_delayed_capture(delay, output, PendingAction::Cast { crop, draw_cursor });
-            return;
+        if let Some(delay) = self.synoik.screenshot_ui.delay() {
+            if !outputs.is_empty() {
+                self.arm_delayed_capture(delay, outputs, PendingAction::Cast { crop, draw_cursor });
+                return;
+            }
         }
 
         self.synoik.close_screenshot_ui();
@@ -4798,55 +4815,67 @@ impl State {
             .set_cursor_image(CursorImageStatus::default_named());
         self.synoik.queue_redraw_all();
 
-        self.start_picker_recording(output, crop, draw_cursor);
+        self.start_picker_recording(outputs, crop, draw_cursor);
     }
 
-    /// The recorder call both the immediate and the delayed path end at.
+    /// The recorder call both the immediate and the delayed path end at: one recording per output,
+    /// each to its own file, named apart by connector when there are several.
     fn start_picker_recording(
         &mut self,
-        output: Option<Output>,
+        outputs: Vec<Output>,
         crop: Option<Rectangle<i32, Logical>>,
         draw_cursor: bool,
     ) {
-        let Some(output) = output else {
+        if outputs.is_empty() {
             warn!("no output to record");
             return;
-        };
+        }
+        let labelled = outputs.len() > 1;
 
-        // GNOME's own template and folder (`js/ui/screenshot.js:2056-2065`), which is what
-        // `default_recording_path` already encodes — so the picker's recordings land beside the
-        // keybind's rather than in a second place.
-        let base = self.synoik.recordings_base.clone();
-        let path = match crate::recording::default_recording_path(base.as_deref()) {
-            Ok(path) => path,
-            Err(err) => {
-                warn!("could not resolve the recording path: {err:?}");
+        for output in outputs {
+            // GNOME's own template and folder (`js/ui/screenshot.js:2056-2065`), which is what
+            // `default_recording_path` already encodes — so the picker's recordings land beside the
+            // keybind's rather than in a second place.
+            let base = self.synoik.recordings_base.clone();
+            let label = labelled.then(|| output.name());
+            let path = match crate::recording::default_recording_path_labelled(
+                base.as_deref(),
+                label.as_deref(),
+            ) {
+                Ok(path) => path,
+                Err(err) => {
+                    warn!("could not resolve the recording path: {err:?}");
+                    return;
+                }
+            };
+
+            // 30fps is what `org.gnome.Shell.Screencast` defaults to when a caller omits
+            // `framerate`.
+            if let Err(err) =
+                self.synoik
+                    .start_native_recording(&output, path, 30, draw_cursor, crop)
+            {
+                warn!("could not start the recorder: {err:?}");
                 return;
             }
-        };
 
-        // 30fps is what `org.gnome.Shell.Screencast` defaults to when a caller omits `framerate`.
-        if let Err(err) = self
-            .synoik
-            .start_native_recording(&output, path, 30, draw_cursor, crop)
-        {
-            warn!("could not start the recorder: {err:?}");
-            return;
-        }
-
-        // Mark what is being recorded, for as long as it is (`_startScreencast`,
-        // `js/ui/screenshot.js:2022-2032`). No crop means the whole output, which GNOME marks with
-        // the monitor's own rect — the shades then have nothing to cover.
-        let scale = output.current_scale().fractional_scale();
-        let rect = match crop {
-            Some(crop) => {
-                let local = Rectangle::new(crop.loc - output.current_location(), crop.size);
-                local.to_f64().to_physical_precise_round(scale)
+            // Mark what is being recorded, for as long as it is (`_startScreencast`,
+            // `js/ui/screenshot.js:2022-2032`). No crop means the whole output, which GNOME marks
+            // with the monitor's own rect — the shades then have nothing to cover. Several outputs
+            // are always whole, so the one indicator has nothing to show for any of them.
+            if !labelled {
+                let scale = output.current_scale().fractional_scale();
+                let rect = match crop {
+                    Some(crop) => {
+                        let local = Rectangle::new(crop.loc - output.current_location(), crop.size);
+                        local.to_f64().to_physical_precise_round(scale)
+                    }
+                    None => Rectangle::from_size(crate::utils::output_size(&output))
+                        .to_physical_precise_round(scale),
+                };
+                self.synoik.cast_area_indicator.set(output, rect);
             }
-            None => Rectangle::from_size(crate::utils::output_size(&output))
-                .to_physical_precise_round(scale),
-        };
-        self.synoik.cast_area_indicator.set(output, rect);
+        }
 
         self.synoik.queue_redraw_all();
     }
@@ -4868,9 +4897,9 @@ impl State {
             return None;
         }
 
-        // The output is held weakly, so unplugging it mid-countdown lands here.
-        if pending.output.upgrade().is_none() {
-            debug!("the delayed capture's output is gone; dropping it");
+        // The outputs are held weakly, so unplugging one mid-countdown lands here.
+        if pending.outputs.iter().any(|o| o.upgrade().is_none()) {
+            debug!("an output of the delayed capture is gone; dropping it");
             self.cancel_pending_capture();
             return None;
         }
@@ -4891,8 +4920,14 @@ impl State {
         };
         // The timer that got us here ends by returning `None`; cancelling it as well would be
         // harmless but pointless, so the token is deliberately left alone.
-        let PendingCapture { output, action, .. } = pending;
-        let Some(output) = output.upgrade() else {
+        let PendingCapture {
+            outputs, action, ..
+        } = pending;
+        let Some(outputs) = outputs
+            .iter()
+            .map(WeakOutput::upgrade)
+            .collect::<Option<Vec<_>>>()
+        else {
             action.dismiss();
             return;
         };
@@ -4903,10 +4938,10 @@ impl State {
 
         match action {
             PendingAction::Cast { crop, draw_cursor } => {
-                self.start_picker_recording(Some(output), crop, draw_cursor)
+                self.start_picker_recording(outputs, crop, draw_cursor)
             }
             PendingAction::Shot {
-                target,
+                targets,
                 show_pointer,
                 write_to_disk,
                 path,
@@ -4916,36 +4951,63 @@ impl State {
                 // The spare is for the paths that never get that far — the channel is used once, so
                 // whichever sends first is the answer.
                 let spare = reply.clone();
-                let res = self.backend.with_vulkan_renderer(|renderer| match target {
-                    PendingTarget::Window(id) => {
-                        let found = self
-                            .synoik
-                            .layout
-                            .windows()
-                            .find(|(_, m)| m.id().get() == id);
-                        let Some((_, mapped)) = found else {
-                            return Err(anyhow::anyhow!("the window is gone"));
-                        };
-                        self.synoik.screenshot_window(
+                let res = self
+                    .backend
+                    .with_vulkan_renderer(|renderer| match &targets[..] {
+                        // Every display: render each, then save them as one screenshot.
+                        [_, _, ..] => {
+                            let mut shots = Vec::with_capacity(targets.len());
+                            for (output, target) in
+                                std::iter::zip(&outputs, targets.iter().copied())
+                            {
+                                let PendingTarget::Area(rect) = target else {
+                                    return Err(anyhow::anyhow!("only areas are taken together"));
+                                };
+                                let (size, pixels) = self.synoik.render_area(
+                                    renderer,
+                                    output,
+                                    rect,
+                                    show_pointer,
+                                )?;
+                                shots.push((output.clone(), size, pixels));
+                            }
+                            self.synoik.save_screenshots(
+                                labelled_shots(shots),
+                                write_to_disk,
+                                path,
+                                reply,
+                            )
+                        }
+                        [] => Err(anyhow::anyhow!("nothing to capture")),
+                        [PendingTarget::Window(id)] => {
+                            let found = self
+                                .synoik
+                                .layout
+                                .windows()
+                                .find(|(_, m)| m.id().get() == *id);
+                            let Some((_, mapped)) = found else {
+                                return Err(anyhow::anyhow!("the window is gone"));
+                            };
+                            self.synoik.screenshot_window(
+                                renderer,
+                                &outputs[0],
+                                mapped,
+                                write_to_disk,
+                                show_pointer,
+                                path,
+                                reply,
+                            )
+                        }
+                        [PendingTarget::Area(rect)] => self.synoik.screenshot_area(
                             renderer,
-                            &output,
-                            mapped,
+                            &outputs[0],
+                            *rect,
                             write_to_disk,
                             show_pointer,
                             path,
                             reply,
-                        )
-                    }
-                    PendingTarget::Area(rect) => self.synoik.screenshot_area(
-                        renderer,
-                        &output,
-                        rect,
-                        write_to_disk,
-                        show_pointer,
-                        path,
-                        reply,
-                    ),
-                });
+                        ),
+                    });
 
                 let failed = match res {
                     Some(Ok(())) => None,
@@ -5006,17 +5068,17 @@ impl State {
             // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
             // render or readback. The neutral is captured when the UI opens, so a missing one means
             // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
-            match self.synoik.screenshot_ui.capture_from_neutral() {
-                Some((size, pixels)) => {
-                    let reply = self.synoik.interactive_screenshot_reply.take();
-                    if let Err(err) =
-                        self.synoik
-                            .save_screenshot(size, pixels, write_to_disk, path, reply)
-                    {
-                        warn!("error saving screenshot: {err:?}");
-                    }
+            let shots = labelled_shots(self.synoik.screenshot_ui.capture_shots_from_neutral());
+            if shots.is_empty() {
+                warn!("no frozen-screen capture to save the screenshot from");
+            } else {
+                let reply = self.synoik.interactive_screenshot_reply.take();
+                if let Err(err) = self
+                    .synoik
+                    .save_screenshots(shots, write_to_disk, path, reply)
+                {
+                    warn!("error saving screenshot: {err:?}");
                 }
-                None => warn!("no frozen-screen capture to save the screenshot from"),
             }
         }
 
@@ -5033,8 +5095,11 @@ impl State {
     /// does not fire for a `org.gnome.Shell.Screencast.StopScreencast` caller: in GNOME the shell
     /// UI is what notifies (`_showNotification`, `js/ui/screenshot.js:2109-2144`) and the recorder
     /// service does not, so a client driving the recorder gets to do its own reporting.
+    ///
+    /// One notification however many files: recordings started together (one per display) end
+    /// together, land in one folder, and a banner each would be the same news told N times.
     pub fn stop_screen_recordings(&mut self) {
-        for path in self.synoik.stop_screen_recordings() {
+        if let Some(path) = self.synoik.stop_screen_recordings().into_iter().next() {
             self.show_screencast_notification(path);
         }
     }
@@ -14111,6 +14176,20 @@ impl Synoik {
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Synoik::screenshot_area");
 
+        let (size, pixels) = self.render_area(renderer, output, rect, include_pointer)?;
+        self.save_screenshot(size, pixels, write_to_disk, path, reply)
+            .context("error saving screenshot")
+    }
+
+    /// Render an output-local **physical** rect of the live screen to RGBA pixels, for
+    /// [`Self::screenshot_area`] and for captures that save several areas together.
+    pub fn render_area(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        rect: Rectangle<i32, Physical>,
+        include_pointer: bool,
+    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
         self.update_render_elements(Some(output));
 
         let size = output.current_mode().unwrap().size;
@@ -14142,8 +14221,7 @@ impl Synoik {
         let pixels =
             crate::ui::screenshot_ui::crop_rgba(Size::from((size.w, size.h)), &pixels, rect);
 
-        self.save_screenshot(rect.size, pixels, write_to_disk, path, reply)
-            .context("error saving screenshot")
+        Ok((rect.size, pixels))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14306,6 +14384,28 @@ impl Synoik {
         path_arg: Option<String>,
         interactive_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     ) -> anyhow::Result<()> {
+        self.save_screenshots(
+            vec![(None, size, pixels)],
+            write_to_disk,
+            path_arg,
+            interactive_reply,
+        )
+    }
+
+    /// Save several captures taken together — one per display when the picker takes every display
+    /// — as one screenshot: a file each, named apart by `label` (the connector) so captures from
+    /// the same second do not overwrite one another, but **one** clipboard entry, notification and
+    /// D-Bus answer, all the first capture's. The clipboard holds one image, and a notification per
+    /// display would be the same news told N times.
+    pub fn save_screenshots(
+        &self,
+        shots: Vec<LabelledShot>,
+        write_to_disk: bool,
+        path_arg: Option<String>,
+        interactive_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!shots.is_empty(), "nothing to save");
+
         let path = write_to_disk
             .then(|| {
                 // When given an explicit path, don't try to strftime it or create parents.
@@ -14320,6 +14420,16 @@ impl Synoik {
                 })
             })
             .flatten();
+        let shots: Vec<_> = shots
+            .into_iter()
+            .map(|(label, size, pixels)| {
+                let path = path.as_ref().map(|(path, create_parent)| match &label {
+                    Some(label) => (crate::utils::with_label(path, label), *create_parent),
+                    None => (path.clone(), *create_parent),
+                });
+                (path, size, pixels)
+            })
+            .collect();
 
         // Prepare to set the encoded image as our clipboard selection. This must be done from the
         // main thread.
@@ -14341,10 +14451,11 @@ impl Synoik {
         // encoding thread, which is holding the raw pixels anyway: making the main loop re-read and
         // re-decode the PNG it just wrote would be a full-screen image decode on the frame path.
         let (event_tx, event_rx) =
-            calloop::channel::sync_channel::<(Option<String>, Option<Arc<PixelIcon>>)>(1);
+            calloop::channel::sync_channel::<(Vec<Option<String>>, Option<Arc<PixelIcon>>)>(1);
         self.event_loop
             .insert_source(event_rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg((path, thumbnail)) => {
+                calloop::channel::Event::Msg((paths, thumbnail)) => {
+                    let path = paths.first().cloned().flatten();
                     if let Some(tx) = interactive_reply.take() {
                         let _ = tx.send_blocking(path.as_deref().map(|p| format!("file://{p}")));
                     }
@@ -14358,67 +14469,81 @@ impl Synoik {
                         path.as_deref().map(PathBuf::from),
                         thumbnail,
                     );
-                    state.ipc_screenshot_taken(path);
+                    for path in paths {
+                        state.ipc_screenshot_taken(path);
+                    }
                 }
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
 
-        // Encode and save the image in a thread as it's slow.
+        // Encode and save the images in a thread as it's slow.
         thread::spawn(move || {
-            let mut buf = vec![];
+            let mut paths = Vec::with_capacity(shots.len());
+            let mut thumbnail = None;
 
-            let w = std::io::Cursor::new(&mut buf);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
+            for (i, (path, size, pixels)) in shots.into_iter().enumerate() {
+                let mut buf = vec![];
 
-            let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
-            let _ = tx.send(buf.clone());
+                let w = std::io::Cursor::new(&mut buf);
+                if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
+                    warn!("error encoding screenshot image: {err:?}");
+                    paths.push(None);
+                    continue;
+                }
 
-            // The notification's image. `pixels` is the capture in RGBA already, so this is a
-            // downscale and nothing else — no second decode of the PNG above.
-            let thumbnail = Some(bounded_pixels(PixelIcon {
-                width: size.w.max(0) as u32,
-                height: size.h.max(0) as u32,
-                rgba: pixels,
-            }));
+                let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+                if i == 0 {
+                    let _ = tx.send(buf.clone());
 
-            let mut image_path = None;
+                    // The notification's image. `pixels` is the capture in RGBA already, so this
+                    // is a downscale and nothing else — no second decode of the PNG above.
+                    thumbnail = Some(bounded_pixels(PixelIcon {
+                        width: size.w.max(0) as u32,
+                        height: size.h.max(0) as u32,
+                        rgba: pixels,
+                    }));
+                }
 
-            if let Some((path, create_parent)) = path {
-                debug!("saving screenshot to {path:?}");
+                let mut image_path = None;
 
-                if create_parent {
-                    if let Some(parent) = path.parent() {
-                        // Relative paths with one component, i.e. "test.png", have Some("") parent.
-                        if !parent.as_os_str().is_empty() {
-                            if let Err(err) = std::fs::create_dir_all(parent) {
-                                if err.kind() != std::io::ErrorKind::AlreadyExists {
-                                    warn!("error creating screenshot directory: {err:?}");
+                if let Some((path, create_parent)) = path {
+                    debug!("saving screenshot to {path:?}");
+
+                    if create_parent {
+                        if let Some(parent) = path.parent() {
+                            // Relative paths with one component, i.e. "test.png", have Some("")
+                            // parent.
+                            if !parent.as_os_str().is_empty() {
+                                if let Err(err) = std::fs::create_dir_all(parent) {
+                                    if err.kind() != std::io::ErrorKind::AlreadyExists {
+                                        warn!("error creating screenshot directory: {err:?}");
+                                    }
                                 }
                             }
                         }
                     }
+
+                    match std::fs::write(&path, buf) {
+                        Ok(()) => image_path = Some(path),
+                        Err(err) => {
+                            warn!("error saving screenshot image: {err:?}");
+                        }
+                    }
+                } else {
+                    debug!("not saving screenshot to disk");
                 }
 
-                match std::fs::write(&path, buf) {
-                    Ok(()) => image_path = Some(path),
-                    Err(err) => {
-                        warn!("error saving screenshot image: {err:?}");
-                    }
-                }
-            } else {
-                debug!("not saving screenshot to disk");
+                paths.push(
+                    image_path
+                        .as_ref()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_owned()),
+                );
             }
 
             // Send screenshot completion event.
-            let path_string = image_path
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_owned());
-            let _ = event_tx.send((path_string, thumbnail));
+            let _ = event_tx.send((paths, thumbnail));
         });
 
         Ok(())
@@ -17326,6 +17451,21 @@ fn log_session_record(session_id: &str, name: &str, record: &ToplevelRecord) {
         record.workspace_name,
         record.state
     );
+}
+
+/// One capture for [`Synoik::save_screenshots`]: a file-name label (or none), its size, and its
+/// RGBA pixels.
+pub type LabelledShot = (Option<String>, Size<i32, Physical>, Vec<u8>);
+
+/// Captures taken together, labelled for [`Synoik::save_screenshots`]: by connector when there are
+/// several, so their files land side by side instead of on top of one another; unlabelled when
+/// there is one, so a single capture keeps the plain name.
+fn labelled_shots(shots: Vec<(Output, Size<i32, Physical>, Vec<u8>)>) -> Vec<LabelledShot> {
+    let labelled = shots.len() > 1;
+    shots
+        .into_iter()
+        .map(|(output, size, pixels)| (labelled.then(|| output.name()), size, pixels))
+        .collect()
 }
 
 #[cfg(test)]
