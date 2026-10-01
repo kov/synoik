@@ -1308,10 +1308,17 @@ impl AppGrid {
         true
     }
 
-    /// Release a swipe (`_swipeEnd`, `appDisplay.js:726-735`): project where it would
-    /// coast to, snap that to a page, and ease there — then the page bookkeeping catches
-    /// up, which is `goToPage(endProgress, false)`. Returns whether anything changed.
-    pub fn gesture_end(&mut self, area: Rectangle<f64, Logical>) -> bool {
+    /// Release a swipe at `timestamp` (`_swipeEnd`, `appDisplay.js:726-735`): project
+    /// where it would coast to, snap that to a page, and ease there — then the page
+    /// bookkeeping catches up, which is `goToPage(endProgress, false)`. Returns whether
+    /// anything changed.
+    pub fn gesture_end(&mut self, area: Rectangle<f64, Logical>, timestamp: Duration) -> bool {
+        self.swipe.release(timestamp);
+        self.settle(area)
+    }
+
+    /// Ease a live swipe onto a page from the speed the tracker holds.
+    fn settle(&mut self, area: Rectangle<f64, Logical>) -> bool {
         let Some(pos) = self.gesture else {
             return false;
         };
@@ -1363,7 +1370,7 @@ impl AppGrid {
             return false;
         }
         self.swipe = crate::input::swipe_tracker::SwipeTracker::new();
-        self.gesture_end(area)
+        self.settle(area)
     }
 
     /// Ease the view to `to` (in pages) over `ms`, from wherever it is now — an

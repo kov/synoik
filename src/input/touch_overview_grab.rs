@@ -108,7 +108,7 @@ impl TouchOverviewGrab {
                 layout.view_offset_gesture_end(Some(false));
             }
             GestureState::WorkspaceSwitch => {
-                layout.workspace_switch_gesture_end(Some(false));
+                layout.workspace_switch_gesture_end(Some(false), None);
             }
             GestureState::InteractiveMove => {
                 layout.interactive_move_end(self.window.as_ref().unwrap());

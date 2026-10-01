@@ -33,7 +33,7 @@ use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Optio
 use crate::animation::{Animation, Clock};
 use crate::frame_log::AnimCauses;
 use crate::gnome::EdgeTileTarget;
-use crate::input::swipe_tracker::SwipeTracker;
+use crate::input::swipe_tracker::{self, SwipeTracker};
 use crate::output_identity::OutputIdentity;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -5379,7 +5379,14 @@ impl<W: LayoutElement> Monitor<W> {
         true
     }
 
-    pub fn workspace_switch_gesture_end(&mut self, is_touchpad: Option<bool>) -> bool {
+    /// Release a workspace swipe at `timestamp` — the input event's time when there is one, or
+    /// now. A flick moves at least one workspace however short it was (`_endGesture`,
+    /// `swipeTracker.js:633-657`).
+    pub fn workspace_switch_gesture_end(
+        &mut self,
+        is_touchpad: Option<bool>,
+        timestamp: Option<Duration>,
+    ) -> bool {
         let Some(WorkspaceSwitch::Gesture(gesture)) = &self.workspace_switch else {
             return false;
         };
@@ -5401,31 +5408,44 @@ impl<W: LayoutElement> Monitor<W> {
             return false;
         };
 
-        // Take into account any idle time between the last event and now.
-        let now = self.clock.now_unadjusted();
-        gesture.tracker.push(0., now);
+        gesture
+            .tracker
+            .release(timestamp.unwrap_or_else(|| self.clock.now_unadjusted()));
 
         let mut rubber_band = WORKSPACE_GESTURE_RUBBER_BAND;
         rubber_band.limit /= zoom;
 
+        // A DnD edge scroll is paced by the pointer's dwell, not flung: it settles where it is.
+        let is_dnd = gesture.dnd_last_event_time.is_some();
+        // `velocity()` is per second; the reference judges pixels per millisecond.
+        let px_per_ms = if is_dnd {
+            0.
+        } else {
+            gesture.tracker.velocity() / 1000.
+        };
         // Read before the rubber band damps it: a flick is a flick wherever it lands.
         let flick_threshold = if gesture.is_touchpad {
-            super::VELOCITY_THRESHOLD_TOUCHPAD
+            swipe_tracker::VELOCITY_THRESHOLD_TOUCHPAD
         } else {
-            super::VELOCITY_THRESHOLD_TOUCH
+            swipe_tracker::VELOCITY_THRESHOLD_TOUCH
         };
-        let flung = gesture.dnd_last_event_time.is_none()
-            && gesture.tracker.velocity().abs() >= flick_threshold * 1000.;
+        let flung = px_per_ms.abs() >= flick_threshold;
 
         let mut velocity = gesture.tracker.velocity() / total_height;
         let current_pos = gesture.tracker.pos() / total_height;
-        let pos = gesture.tracker.projected_end_pos() / total_height;
 
         let (min, max) = gesture.min_max(self.workspaces.len());
-        let new_idx = gesture.start_idx + pos;
-
-        let new_idx = new_idx.clamp(min, max);
-        let new_idx = new_idx.round() as usize;
+        // The reference's progress is clamped to the bounds as it goes; ours rubber-bands past
+        // them, which is only the visual.
+        let progress = (gesture.start_idx + current_pos).clamp(min, max);
+        let new_idx = swipe_tracker::end_progress(
+            gesture.start_idx,
+            progress,
+            (min, max),
+            px_per_ms,
+            gesture.is_touchpad,
+        );
+        let new_idx = new_idx as usize;
 
         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
 
@@ -5475,7 +5495,7 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         };
 
-        self.workspace_switch_gesture_end(None);
+        self.workspace_switch_gesture_end(None, None);
     }
 
     pub fn scale(&self) -> smithay::output::Scale {

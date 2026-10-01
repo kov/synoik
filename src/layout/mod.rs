@@ -66,7 +66,7 @@ use self::workspace::Workspace;
 use crate::animation::{Animation, Clock};
 use crate::frame_log::AnimCauses;
 use crate::gnome::{EdgeTileTarget, TileSide};
-use crate::input::swipe_tracker::SwipeTracker;
+use crate::input::swipe_tracker::{self, SwipeTracker};
 use crate::layout::scrolling::ScrollDirection;
 use crate::output_identity::OutputIdentity;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
@@ -807,47 +807,6 @@ fn overview_gesture_bounds(start: f64) -> (f64, f64) {
         (start.floor(), start.ceil())
     };
     ((prev - 1.).max(0.), (next + 1.).min(2.))
-}
-
-/// The release speed, in pixels per millisecond, past which gnome-shell treats a swipe as a flick
-/// that carries on to the next snap point rather than settling on the nearest one
-/// (`swipeTracker.js:22-23`, read by `_getEndProgress`).
-pub(super) const VELOCITY_THRESHOLD_TOUCH: f64 = 0.3;
-pub(super) const VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
-
-/// Where a released swipe settles — gnome-shell's `_getEndProgress` and
-/// `_findPointForProjection` (`swipeTracker.js:536-631`) over the snap points 0, 1, 2.
-/// `velocity` is in touchpad pixels per millisecond, the unit the reference compares
-/// against its threshold *and* projects with before normalizing.
-fn overview_gesture_target(start: f64, state: f64, bounds: (f64, f64), velocity: f64) -> f64 {
-    const DECELERATION_TOUCHPAD: f64 = 0.997;
-    const VELOCITY_CURVE_THRESHOLD: f64 = 2.;
-    const DECELERATION_PARABOLA_MULTIPLIER: f64 = 0.35;
-
-    if velocity.abs() < VELOCITY_THRESHOLD_TOUCHPAD {
-        return state.round();
-    }
-
-    let slope = DECELERATION_TOUCHPAD / (1. - DECELERATION_TOUCHPAD) / 1000.;
-    let pos = if velocity.abs() > VELOCITY_CURVE_THRESHOLD {
-        let c = slope / 2. / DECELERATION_PARABOLA_MULTIPLIER;
-        let x = velocity.abs() - VELOCITY_CURVE_THRESHOLD + c;
-        slope * VELOCITY_CURVE_THRESHOLD + DECELERATION_PARABOLA_MULTIPLIER * x * x
-            - DECELERATION_PARABOLA_MULTIPLIER * c * c
-    } else {
-        velocity.abs() * slope
-    };
-    let pos = (pos * velocity.signum() + state).clamp(bounds.0, bounds.1);
-
-    let initial = start.round();
-    let (prev, next) = (pos.floor(), pos.ceil());
-    if velocity > 0. && prev == initial {
-        next
-    } else if velocity < 0. && next == initial {
-        prev
-    } else {
-        pos.round()
-    }
 }
 
 /// A window's persistable layout state, from [`Layout::session_snapshot`].
@@ -5086,7 +5045,7 @@ impl<W: LayoutElement> Layout<W> {
         for monitor in monitors {
             // Cancel the gesture on other outputs.
             if &monitor.output != output {
-                monitor.workspace_switch_gesture_end(None);
+                monitor.workspace_switch_gesture_end(None, None);
                 continue;
             }
 
@@ -5120,14 +5079,19 @@ impl<W: LayoutElement> Layout<W> {
         None
     }
 
-    pub fn workspace_switch_gesture_end(&mut self, is_touchpad: Option<bool>) -> Option<Output> {
+    /// Release the workspace swipe at `timestamp` (the input event's time; `None` is now).
+    pub fn workspace_switch_gesture_end(
+        &mut self,
+        is_touchpad: Option<bool>,
+        timestamp: Option<Duration>,
+    ) -> Option<Output> {
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
             MonitorSet::NoOutputs { .. } => return None,
         };
 
         for monitor in monitors {
-            if monitor.workspace_switch_gesture_end(is_touchpad) {
+            if monitor.workspace_switch_gesture_end(is_touchpad, timestamp) {
                 return Some(monitor.output.clone());
             }
         }
@@ -5272,13 +5236,17 @@ impl<W: LayoutElement> Layout<W> {
             return false;
         };
 
-        // Take into account any idle time between the last event and the release.
-        gesture.tracker.push(0., timestamp);
+        gesture.tracker.release(timestamp);
 
         // `velocity()` is per second; the reference judges pixels per millisecond.
         let velocity = gesture.tracker.velocity() / 1000.;
-        let target =
-            overview_gesture_target(gesture.start, gesture.state, gesture.bounds, velocity);
+        let target = swipe_tracker::end_progress(
+            gesture.start,
+            gesture.state,
+            gesture.bounds,
+            velocity,
+            true,
+        );
 
         let from = gesture.value();
         let to = target.min(1.);

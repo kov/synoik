@@ -1102,7 +1102,7 @@ right: after the first visit a page switch re-bakes nothing.
 * **P2 — the swipe.** *(landed.)* The reserved continuous-scroll branch drives `page_pos` 1:1 at 400 px
   per page, and the release projects to a snap point and eases there. Reuses the existing
   `ScrollSwipeGesture` (begin/update/end from axis events) and `SwipeTracker`
-  (velocity + `projected_end_pos`), the same pair the overview's own scroll swipe uses.
+  (its release velocity), the same pair the overview's own scroll swipe uses.
   A **pointer drag** on the grid background pans it too: the tracker's `Clutter.PanGesture`
   takes `min_n_points: 1` and `allowDrag` defaults to true (`swipeTracker.js:367-404`), so
   a plain click-drag is a swipe — the only route to one on a machine with no touchpad.

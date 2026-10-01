@@ -136,7 +136,7 @@ impl SpatialMovementGrab {
         let res = match self.gesture {
             GestureState::Recognizing => None,
             GestureState::ViewOffset => layout.view_offset_gesture_end(Some(false)),
-            GestureState::WorkspaceSwitch => layout.workspace_switch_gesture_end(Some(false)),
+            GestureState::WorkspaceSwitch => layout.workspace_switch_gesture_end(Some(false), None),
         };
 
         if let Some(output) = res {

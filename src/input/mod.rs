@@ -8830,7 +8830,8 @@ impl State {
                             .controls_layout_for_output(&pan.output)
                             .map(|c| c.app_display);
                         if let Some(area) = area {
-                            self.synoik.app_grid.gesture_end(area);
+                            let now = self.synoik.clock.now_unadjusted();
+                            self.synoik.app_grid.gesture_end(area, now);
                         }
                     }
                     self.synoik.queue_redraw_all();
@@ -9638,7 +9639,7 @@ impl State {
                             let action = self.synoik.app_grid_scroll_swipe.update(dx, dy);
                             let mut redraw = false;
                             if action.end() {
-                                redraw |= self.synoik.app_grid.gesture_end(area);
+                                redraw |= self.synoik.app_grid.gesture_end(area, timestamp);
                             } else {
                                 if action.begin() {
                                     self.synoik
@@ -10022,7 +10023,7 @@ impl State {
                         redraw |= self
                             .synoik
                             .layout
-                            .workspace_switch_gesture_end(Some(true))
+                            .workspace_switch_gesture_end(Some(true), Some(timestamp))
                             .is_some();
                     } else {
                         redraw |= self
@@ -10088,7 +10089,7 @@ impl State {
                         redraw |= self
                             .synoik
                             .layout
-                            .workspace_switch_gesture_end(Some(true))
+                            .workspace_switch_gesture_end(Some(true), Some(timestamp))
                             .is_some();
                     } else {
                         redraw |= self
@@ -10791,13 +10792,19 @@ impl State {
                 }
             }
             TouchpadSwipe::Workspace => {
-                if let Some(output) = self.synoik.layout.workspace_switch_gesture_end(Some(true)) {
+                let timestamp = Some(Duration::from_micros(event.time()));
+                if let Some(output) = self
+                    .synoik
+                    .layout
+                    .workspace_switch_gesture_end(Some(true), timestamp)
+                {
                     self.synoik.queue_redraw(&output);
                 }
             }
             TouchpadSwipe::AppGrid => {
                 if let Some(area) = self.app_grid_swipe_area() {
-                    if self.synoik.app_grid.gesture_end(area) {
+                    let timestamp = Duration::from_micros(event.time());
+                    if self.synoik.app_grid.gesture_end(area, timestamp) {
                         self.synoik.queue_redraw_all();
                     }
                 }

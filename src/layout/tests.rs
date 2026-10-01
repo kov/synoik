@@ -1571,7 +1571,7 @@ impl Op {
                 layout.workspace_switch_gesture_update(delta, timestamp, is_touchpad);
             }
             Op::WorkspaceSwitchGestureEnd { is_touchpad } => {
-                layout.workspace_switch_gesture_end(is_touchpad);
+                layout.workspace_switch_gesture_end(is_touchpad, None);
             }
             Op::OverviewGestureBegin => {
                 layout.overview_gesture_begin();

@@ -23907,6 +23907,86 @@ fn touchpad_swipe_sideways_switches_workspaces() {
     assert!(f.synoik().layout.is_overview_open());
 }
 
+/// A short flick, then a beat before the fingers lift: `delta` every 10 ms, six times, then
+/// `lift_after` ms of stillness and the release. The first update only arms the 16 px
+/// orientation threshold, so the tracker sees five updates — `4 * delta` px over 40 ms past its
+/// first event.
+fn touchpad_flick(f: &mut Fixture, (dx, dy): (f64, f64), lift_after: u32) {
+    f.swipe_begin(3);
+    for _ in 0..6 {
+        f.advance_input_time(10);
+        f.swipe_update(dx, dy);
+    }
+    f.advance_input_time(lift_after);
+    f.swipe_end(false);
+    f.settle_animations();
+}
+
+/// The release speed is the motion inside the last 150 ms, and the lift adds nothing to it:
+/// `_endTouchpadGesture` only trims the history to the release time before it reads the velocity
+/// (`swipeTracker.js:49-82,668-679`). So a short flick whose fingers take a beat to come off still
+/// carries a whole state, and only a pause longer than the history window turns it into a plain
+/// drag that settles on the nearest one.
+#[test]
+fn a_short_flick_is_not_diluted_by_the_lift() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    pointer_motion_to(&mut f, 960., 540.);
+
+    // 1 px/ms over 50 px, a sixth of a state; lifted 80 ms after the last motion. Timing the
+    // lift as a motionless event would read 50 px over 120 ms, under the 0.6 px/ms threshold.
+    touchpad_flick(&mut f, (0., 10.), 80);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "a flick opens the overview however late the fingers lift"
+    );
+    assert_eq!(overview_state(&mut f), 1.);
+
+    touchpad_flick(&mut f, (0., -10.), 80);
+    assert!(!f.synoik().layout.is_overview_open(), "…and closes it");
+
+    // Held for longer than the history window: nothing moved within it, so it is no flick.
+    touchpad_flick(&mut f, (0., 10.), 200);
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a flick held still past the history window settles where it is"
+    );
+}
+
+/// A flick moves to the next workspace however little it travelled — the same
+/// `_getEndProgress` as every other swipe (`swipeTracker.js:601-631`): past the release threshold
+/// the projection carries on at least one snap point from where the swipe began.
+#[test]
+fn a_short_flick_switches_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 3);
+    pointer_motion_to(&mut f, 960., 540.);
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(1)),
+        false,
+    );
+    f.settle();
+
+    // 50 px is an eighth of the 400 px to a workspace, at 1 px/ms.
+    touchpad_flick(&mut f, (10., 0.), 80);
+    f.settle();
+    assert_eq!(active_idx(&mut f), 1, "a short flick switches");
+
+    touchpad_flick(&mut f, (-10., 0.), 80);
+    f.settle();
+    assert_eq!(active_idx(&mut f), 0, "…both ways");
+
+    touchpad_flick(&mut f, (10., 0.), 200);
+    f.settle();
+    assert_eq!(
+        active_idx(&mut f),
+        0,
+        "a flick held still past the history window snaps back"
+    );
+}
+
 /// With the app grid up, a horizontal three-finger swipe pages the grid instead: `AppDisplay`
 /// runs its own horizontal `SwipeTracker` (`appDisplay.js:603-614`) at 400 px a page.
 #[test]
@@ -37905,7 +37985,9 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
         }
         frames
     };
-    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_end(Some(true), None);
     f.advance_clock(Duration::from_millis(1000));
     f.synoik()
         .layout
@@ -37913,7 +37995,9 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
     for _ in 0..3 {
         step(&mut f, 60., 8);
     }
-    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_end(Some(true), None);
     let frames = fling(&mut f);
     assert!(
         frames
@@ -37941,7 +38025,9 @@ fn a_swipe_is_smeared_only_while_it_moves_fast() {
     for _ in 0..64 {
         step(&mut f, 5., 16);
     }
-    f.synoik().layout.workspace_switch_gesture_end(Some(true));
+    f.synoik()
+        .layout
+        .workspace_switch_gesture_end(Some(true), None);
     let frames = fling(&mut f);
     assert!(
         frames.iter().any(|&(moved, _)| moved > 0.01),
@@ -39660,7 +39746,7 @@ fn a_sticky_window_follows_a_swipe_to_the_next_workspace() {
     let layout = &mut f.synoik_state().synoik.layout;
     layout.workspace_switch_gesture_begin(&out, true);
     layout.workspace_switch_gesture_update(400., Duration::from_millis(50), true);
-    layout.workspace_switch_gesture_end(Some(true));
+    layout.workspace_switch_gesture_end(Some(true), None);
     f.synoik_complete_animations();
     f.settle();
 
