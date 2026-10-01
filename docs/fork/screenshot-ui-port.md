@@ -141,6 +141,14 @@ capture acts on is `capture_corners(type, area, output_size)`: the area in Selec
 output in Screen mode. Window mode has no rectangle at all — it crops the selected window's own
 frozen buffer — so the two callers that would care settle Window before asking.
 
+*Which display* is derived the same way, by `capture_output`: the area's in Selection mode, the
+picked window's in Window mode, and `Open::screen_output` in Screen mode — GNOME's checked
+`_screenSelectors` entry (`js/ui/screenshot.js:1585-1618`). Every display is a selector: a press
+on one picks it, the picked one gets the 2px white border *inside* its edge (the selection's border
+sits outside its rectangle, which for a whole display is off the screen), the others keep the 50%
+shade, and the one under the pointer lightens to 30% (`_screenshot.scss:187-195`). The
+`MoveWindowToMonitor*` keys move the picked display along with the area.
+
 This is GNOME's split: `_areaSelector` keeps its own geometry while Screen mode draws
 `_screenSelectors`, a different widget (`js/ui/screenshot.js:1780-1800`). Four consequences worth
 keeping in mind when touching this:
@@ -154,8 +162,26 @@ keeping in mind when touching this:
 - `move_to_output` carries the area across proportionally in every mode, so it arrives in the new
   output's coordinate space. Pinned by `moving_output_in_screen_mode_carries_the_area`, which uses
   differently-sized outputs on purpose — on equal ones, carrying and not carrying agree.
+- Picking a display never touches the area, and the area never picks a display: they are two
+  fields. Pinned by `screen_mode_captures_the_display_it_was_picked_on`.
 - `Closed::last_selection` is the area, so what a close remembers is what was dragged regardless of
   what the picker was capturing at the time.
+
+## Divergence: Screen mode opens on the pointer's display
+
+GNOME checks the **primary** monitor's selector when it builds them (`js/ui/screenshot.js:1617-1618`)
+and keeps whichever is checked from then on. Ours re-derives it at every open from the display the
+picker was opened from — the one the pointer is on — the same "the pointer decides" rule workspace
+actions follow (`docs/fork/multi-display.md`). Opening the picker on a second display and
+capturing the first is exactly the bug a primary default produced.
+
+**Every display's panel is live.** We draw the panel on every output (GNOME keeps one, on the
+primary), so each one takes hover, clicks and tooltips: motion reaches the picker in two spaces at
+once, the selection output's (a drag clamps there) and the output the pointer is actually on (the
+hover, the cursor, the selectors), and `State::handle_screenshot_ui_motion` derives both from the
+global position so no call site can hand it only one. A panel is not a selector — its capture
+button acts on the picked display, wherever the panel is. Pinned by
+`every_displays_panel_takes_the_pointer` and `screen_mode_offers_the_display_under_the_pointer`.
 
 ## Approved divergence: a fresh picker opens on Screen
 
@@ -343,9 +369,7 @@ who wins.
   out of a screenshot taken while a recording runs.
 
 **Left, and agreed as a later pass:** arrow-key navigation of the window selector
-(`navigate_focus`, `:2236-2262`), `_screenSelectors` — Screen mode picking *which* monitor on a
-multi-monitor setup, which is also the last thing keeping the panel on one output — and the
-click-without-drag constant above.
+(`navigate_focus`, `:2236-2262`) and the click-without-drag constant above.
 
 ## Toolkit first
 

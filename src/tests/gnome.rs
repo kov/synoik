@@ -28280,7 +28280,7 @@ fn click_picker_control(
             + panel.loc;
 
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
-    ui.pointer_motion(point, None);
+    ui.pointer_motion_here(point);
     assert!(ui.pointer_down(output, point, None, false).is_some());
     ui.pointer_up(None)
         .expect("the release must land on a control")
@@ -28417,6 +28417,14 @@ fn open_picker_headless_in_selection(f: &mut Fixture) {
         .set_capture_type(CaptureType::Selection);
 }
 
+/// The global logical position of an output-local **physical** point — what the picker's motion
+/// funnel takes, as every input path has it.
+fn global_of(output: &Output, p: Point<i32, Physical>) -> Point<f64, smithay::utils::Logical> {
+    p.to_f64()
+        .to_logical(output.current_scale().fractional_scale())
+        + output.current_location().to_f64()
+}
+
 /// Drive a press/drag/release on the area selector, in output-local physical coords.
 fn drag_selection(f: &mut Fixture, from: (i32, i32), to: (i32, i32)) {
     use smithay::utils::{Physical, Point};
@@ -28424,10 +28432,10 @@ fn drag_selection(f: &mut Fixture, from: (i32, i32), to: (i32, i32)) {
     let output = f.synoik_output(1);
     let from = Point::<i32, Physical>::from(from);
     f.synoik_state()
-        .handle_screenshot_ui_pointer_down(output, from, None, false);
+        .handle_screenshot_ui_pointer_down(output.clone(), from, None, false);
     // From wherever the press left the pointer — a resize warps it onto the side it grabbed.
     f.synoik_state()
-        .handle_screenshot_ui_motion(Point::from(to), None);
+        .handle_screenshot_ui_motion(global_of(&output, Point::from(to)), None);
     f.synoik_state().synoik.screenshot_ui.pointer_up(None);
 }
 
@@ -28487,7 +28495,7 @@ fn a_handle_dragged_past_the_far_side_flips() {
     let output = f.synoik_output(1);
     // The pointer arrives on the handle before it presses, as a real one does.
     f.synoik_state()
-        .handle_screenshot_ui_motion(Point::from((400, 400)), None);
+        .handle_screenshot_ui_motion(global_of(&output, Point::from((400, 400))), None);
     assert_eq!(
         f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::NwResize,
@@ -28495,7 +28503,7 @@ fn a_handle_dragged_past_the_far_side_flips() {
     );
     // Grab it...
     f.synoik_state().handle_screenshot_ui_pointer_down(
-        output,
+        output.clone(),
         Point::from((400, 400)),
         None,
         false,
@@ -28508,7 +28516,7 @@ fn a_handle_dragged_past_the_far_side_flips() {
 
     // ...and drag it beyond the bottom-right one.
     f.synoik_state()
-        .handle_screenshot_ui_motion(Point::from((800, 800)), None);
+        .handle_screenshot_ui_motion(global_of(&output, Point::from((800, 800))), None);
     assert_eq!(
         f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::SeResize,
@@ -28698,6 +28706,152 @@ fn moving_output_in_screen_mode_carries_the_area() {
     );
 }
 
+/// Screen mode captures the display it was **picked** on — at open, the one the pointer is on;
+/// after that, whichever display was clicked (GNOME's `_screenSelectors`). Using the picker on a
+/// second display must never capture the first.
+///
+/// Sized 1920x1080 + 800x600 so a capture of the wrong display cannot pass by having the right
+/// size.
+#[test]
+fn screen_mode_captures_the_display_it_was_picked_on() {
+    use smithay::utils::{Point, Size};
+
+    use crate::ui::screenshot_ui::{CaptureType, PendingTarget};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (800, 600));
+    let one = f.synoik_output(1);
+    let two = f.synoik_output(2);
+    let two_loc = f.synoik().global_space.output_geometry(&two).unwrap().loc;
+
+    pointer_motion_to(
+        &mut f,
+        f64::from(two_loc.x) + 100.,
+        f64::from(two_loc.y) + 100.,
+    );
+    open_picker_headless(&mut f);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_output(),
+        Some(&two),
+        "opened from the second display, Screen mode offers that one"
+    );
+    let (size, _) = f.synoik().screenshot_ui.capture_from_neutral().unwrap();
+    assert_eq!(size, Size::from((800, 600)));
+
+    // A press on the first display, clear of its panel, picks it.
+    f.synoik_state().handle_screenshot_ui_pointer_down(
+        one.clone(),
+        Point::from((100, 100)),
+        None,
+        false,
+    );
+    f.synoik().screenshot_ui.pointer_up(None);
+    assert_eq!(f.synoik().screenshot_ui.capture_output(), Some(&one));
+    let (size, _) = f.synoik().screenshot_ui.capture_from_neutral().unwrap();
+    assert_eq!(size, Size::from((1920, 1080)), "and the capture is of it");
+    let (output, target) = f.synoik().screenshot_ui.pending_target().unwrap();
+    assert_eq!(output, one, "a delayed capture is armed against it too");
+    assert_eq!(
+        target,
+        PendingTarget::Area(smithay::utils::Rectangle::from_size(Size::from((
+            1920, 1080
+        ))))
+    );
+
+    // Picking a display is not dragging a rectangle: Selection mode still has the one it had.
+    assert_eq!(f.synoik().screenshot_ui.selection_output(), Some(&two));
+}
+
+/// Every display's panel is live: the pointer lights up the control it is over on whichever
+/// display that is, and a click there acts on the display Screen mode has picked — not on the
+/// display whose panel was clicked, and not on the first one.
+#[test]
+fn every_displays_panel_takes_the_pointer() {
+    use smithay::utils::{Logical, Point};
+
+    use crate::ui::screenshot_ui::{Control, PointerUp};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (800, 600));
+    let one = f.synoik_output(1);
+    let two = f.synoik_output(2);
+    pointer_motion_to(&mut f, 100., 100.);
+    open_picker_headless(&mut f);
+    assert_eq!(f.synoik().screenshot_ui.capture_output(), Some(&one));
+
+    let panel = f.synoik().screenshot_ui.panel_rect(&two).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&two).unwrap();
+    let scale = two.current_scale().fractional_scale();
+    let capture = Point::<f64, Logical>::from((
+        layout.capture.loc.x + layout.capture.size.w / 2.,
+        layout.capture.loc.y + layout.capture.size.h / 2.,
+    ))
+    .to_physical(scale)
+    .to_i32_round::<i32>()
+        + panel.loc;
+
+    f.synoik_state()
+        .handle_screenshot_ui_motion(global_of(&two, capture), None);
+    assert_eq!(
+        f.synoik().screenshot_ui.hovered_control(),
+        Some((&two, Control::Capture)),
+        "the second display's capture button lights up under the pointer"
+    );
+
+    f.synoik_state()
+        .handle_screenshot_ui_pointer_down(two.clone(), capture, None, false);
+    assert_eq!(
+        f.synoik().screenshot_ui.pointer_up(None),
+        Some(PointerUp::Capture)
+    );
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_output(),
+        Some(&one),
+        "a panel is not a selector: clicking its button captures the display that was picked"
+    );
+}
+
+/// In Screen mode a display the pointer is over, and that is not already picked, lightens as an
+/// offer to pick it (`.screenshot-ui-screen-selector:hover`). The panel sits above the selector,
+/// so it takes that hover away.
+#[test]
+fn screen_mode_offers_the_display_under_the_pointer() {
+    use smithay::utils::{Logical, Point};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (800, 600));
+    let two = f.synoik_output(2);
+    let two_loc = f.synoik().global_space.output_geometry(&two).unwrap().loc;
+    pointer_motion_to(&mut f, 100., 100.);
+    open_picker_headless(&mut f);
+
+    f.synoik_state()
+        .handle_screenshot_ui_motion(Point::<f64, Logical>::from((500., 300.)), None);
+    assert_eq!(
+        f.synoik().screenshot_ui.screen_hover(),
+        None,
+        "the picked display is not offered again"
+    );
+
+    let on_two =
+        Point::<f64, Logical>::from((f64::from(two_loc.x) + 100., f64::from(two_loc.y) + 100.));
+    f.synoik_state().handle_screenshot_ui_motion(on_two, None);
+    assert_eq!(f.synoik().screenshot_ui.screen_hover(), Some(&two));
+
+    let panel = f.synoik().screenshot_ui.panel_rect(&two).unwrap();
+    let on_panel = global_of(&two, panel.loc + Point::from((4, 4)));
+    f.synoik_state().handle_screenshot_ui_motion(on_panel, None);
+    assert_eq!(
+        f.synoik().screenshot_ui.screen_hover(),
+        None,
+        "the panel is in front of the selector"
+    );
+}
+
 /// The picker comes back the way you left it, for as long as the session lasts.
 ///
 /// gnome-shell's `ScreenshotUI` is a singleton built at startup that merely hides on close
@@ -28839,7 +28993,9 @@ fn the_crosshair_is_only_over_the_selectable_area() {
             + panel.loc
     };
     let move_to = |f: &mut Fixture, p: Point<i32, Physical>| {
-        f.synoik_state().handle_screenshot_ui_motion(p, None);
+        let output = f.synoik_output(1);
+        f.synoik_state()
+            .handle_screenshot_ui_motion(global_of(&output, p), None);
         f.synoik().screenshot_ui.cursor_icon()
     };
 
@@ -29136,9 +29292,9 @@ fn the_crosshair_captures_on_release_and_cancels_on_a_bare_click() {
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
     let from = Point::<i32, smithay::utils::Physical>::from((200, 200));
     let to = Point::<i32, smithay::utils::Physical>::from((600, 500));
-    ui.pointer_motion(from, None);
+    ui.pointer_motion_here(from);
     assert!(ui.pointer_down(output.clone(), from, None, false).is_some());
-    ui.pointer_motion(to, None);
+    ui.pointer_motion_here(to);
     assert_eq!(
         ui.pointer_up(None),
         Some(PointerUp::Capture),
@@ -29149,7 +29305,7 @@ fn the_crosshair_captures_on_release_and_cancels_on_a_bare_click() {
     // Press and release on one spot, having dragged nothing.
     open_quick_picker_headless(&mut f);
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
-    ui.pointer_motion(from, None);
+    ui.pointer_motion_here(from);
     assert!(ui.pointer_down(output, from, None, false).is_some());
     assert_eq!(
         ui.pointer_up(None),
@@ -29226,7 +29382,7 @@ fn space_in_the_crosshair_arms_the_focused_window() {
         + Point::from((slot.size.w / 2., slot.size.h / 2.)))
     .to_physical_precise_round(scale);
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
-    ui.pointer_motion(at, None);
+    ui.pointer_motion_here(at);
     assert!(
         ui.pointer_down(output, at, None, false).is_some(),
         "a press on the thumbnail picks that window"

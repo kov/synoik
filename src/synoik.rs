@@ -4785,7 +4785,7 @@ impl State {
             .then(|| self.synoik.screenshot_ui.selection_rect_global())
             .flatten();
         let draw_cursor = self.synoik.screenshot_ui.show_pointer();
-        let output = self.synoik.screenshot_ui.selection_output().cloned();
+        let output = self.synoik.screenshot_ui.capture_output().cloned();
 
         if let (Some(delay), Some(output)) = (self.synoik.screenshot_ui.delay(), output.clone()) {
             self.arm_delayed_capture(delay, output, PendingAction::Cast { crop, draw_cursor });
@@ -5137,12 +5137,33 @@ impl State {
     /// reason the release does: the cursor is a consequence of the hit test, and a hit test whose
     /// consequence is applied at three of four call sites is a bug waiting for the fourth.
     /// Returns whether anything changed, so callers keep their own redraw scope.
+    ///
+    /// Takes the **global** position and derives both spaces the picker needs from it — the
+    /// selection output's (a drag clamps there) and the output the pointer is actually on (the
+    /// hover, the cursor and the screen selectors) — so no call site can hand it only one.
     pub fn handle_screenshot_ui_motion(
         &mut self,
-        point: Point<i32, Physical>,
+        pos: Point<f64, Logical>,
         slot: Option<smithay::backend::input::TouchSlot>,
     ) -> bool {
-        let changed = self.synoik.screenshot_ui.pointer_motion(point, slot);
+        let Some(output) = self.synoik.screenshot_ui.selection_output().cloned() else {
+            return false;
+        };
+        let local = |synoik: &Synoik, output: &Output| {
+            let geom = synoik.global_space.output_geometry(output)?;
+            Some(
+                (pos - geom.loc.to_f64())
+                    .to_physical(output.current_scale().fractional_scale())
+                    .to_i32_round::<i32>(),
+            )
+        };
+        let Some(point) = local(&self.synoik, &output) else {
+            return false;
+        };
+        let under = self.synoik.output_under(pos).map(|(o, _)| o.clone());
+        let under = under.and_then(|o| local(&self.synoik, &o).map(|p| (o, p)));
+
+        let changed = self.synoik.screenshot_ui.pointer_motion(point, under, slot);
         self.sync_screenshot_ui_cursor();
         changed
     }

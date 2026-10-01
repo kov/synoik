@@ -5253,7 +5253,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorLeft => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_left_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5269,7 +5269,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorRight => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_right_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5285,7 +5285,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorDown => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_down_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5301,7 +5301,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorUp => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_up_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5317,7 +5317,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorPrevious => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_previous_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5333,7 +5333,7 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorNext => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_next_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5402,7 +5402,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorLeft => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_left_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5418,7 +5418,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorRight => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_right_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5434,7 +5434,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorDown => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_down_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5450,7 +5450,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorUp => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_up_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5466,7 +5466,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorPrevious => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_previous_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -5482,7 +5482,7 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorNext => {
-                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                if let Some(current_output) = self.synoik.screenshot_ui.keyboard_output() {
                     if let Some(target_output) = self.synoik.output_next_of(current_output) {
                         self.move_cursor_to_output(&target_output);
                         self.synoik.screenshot_ui.move_to_output(target_output);
@@ -6512,15 +6512,8 @@ impl State {
         }
         self.synoik.dock_pointer_motion(new_pos);
 
-        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
-            let geom = self.synoik.global_space.output_geometry(output).unwrap();
-            let point = (new_pos - geom.loc.to_f64())
-                .to_physical(output.current_scale().fractional_scale())
-                .to_i32_round::<i32>();
-
-            if self.handle_screenshot_ui_motion(point, None) {
-                self.synoik.queue_redraw_all();
-            }
+        if self.handle_screenshot_ui_motion(new_pos, None) {
+            self.synoik.queue_redraw_all();
         }
 
         // Hovering an item moves the switcher's selection -- but only once the pointer is live
@@ -6706,15 +6699,8 @@ impl State {
         }
         self.synoik.dock_pointer_motion(pos);
 
-        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
-            let geom = self.synoik.global_space.output_geometry(output).unwrap();
-            let point = (pos - geom.loc.to_f64())
-                .to_physical(output.current_scale().fractional_scale())
-                .to_i32_round::<i32>();
-
-            if self.handle_screenshot_ui_motion(point, None) {
-                self.synoik.queue_redraw_all();
-            }
+        if self.handle_screenshot_ui_motion(pos, None) {
+            self.synoik.queue_redraw_all();
         }
 
         if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
@@ -10341,15 +10327,8 @@ impl State {
             return;
         };
 
-        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
-            let geom = self.synoik.global_space.output_geometry(output).unwrap();
-            let point = (pos - geom.loc.to_f64())
-                .to_physical(output.current_scale().fractional_scale())
-                .to_i32_round::<i32>();
-
-            if self.handle_screenshot_ui_motion(point, None) {
-                self.synoik.queue_redraw_all();
-            }
+        if self.handle_screenshot_ui_motion(pos, None) {
+            self.synoik.queue_redraw_all();
         }
 
         if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
@@ -11282,15 +11261,8 @@ impl State {
         };
         let slot = evt.slot();
 
-        if let Some(output) = self.synoik.screenshot_ui.selection_output().cloned() {
-            let geom = self.synoik.global_space.output_geometry(&output).unwrap();
-            let point = (pos - geom.loc.to_f64())
-                .to_physical(output.current_scale().fractional_scale())
-                .to_i32_round::<i32>();
-
-            if self.handle_screenshot_ui_motion(point, Some(slot)) {
-                self.synoik.queue_redraw(&output);
-            }
+        if self.handle_screenshot_ui_motion(pos, Some(slot)) {
+            self.synoik.queue_redraw_all();
         }
 
         let under = self.synoik.contents_under(pos);

@@ -510,7 +510,7 @@ fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>
             + panel.loc;
 
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
-    ui.pointer_motion(point, None);
+    ui.pointer_motion_here(point);
     assert!(ui
         .pointer_down(output.clone(), point, None, false)
         .is_some());
@@ -787,7 +787,7 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
 
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
     let click = |ui: &mut crate::ui::screenshot_ui::ScreenshotUi, point| {
-        ui.pointer_motion(point, None);
+        ui.pointer_motion_here(point);
         assert!(ui
             .pointer_down(output.clone(), point, None, false)
             .is_some());
@@ -14482,7 +14482,7 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
 
     {
         let ui = &mut f.synoik_state().synoik.screenshot_ui;
-        ui.pointer_motion(point, None);
+        ui.pointer_motion_here(point);
         ui.pointer_down(output.clone(), point, None, false);
         assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
         assert_eq!(
@@ -14570,7 +14570,7 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     f.synoik_state()
         .synoik
         .screenshot_ui
-        .pointer_motion(point, None);
+        .pointer_motion_here(point);
     f.settle_animations();
     assert_eq!(
         f.synoik().screenshot_ui.tooltip_text(),
@@ -14626,7 +14626,7 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     f.synoik_state()
         .synoik
         .screenshot_ui
-        .pointer_motion(at(layout.type_buttons[1]), None);
+        .pointer_motion_here(at(layout.type_buttons[1]));
     assert_eq!(
         f.synoik().screenshot_ui.tooltip_text(),
         None,
@@ -14650,7 +14650,7 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     f.synoik_state()
         .synoik
         .screenshot_ui
-        .pointer_motion(at(layout.capture), None);
+        .pointer_motion_here(at(layout.capture));
     assert_eq!(
         f.synoik().screenshot_ui.tooltip_text(),
         None,
@@ -14664,7 +14664,7 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     f.synoik_state()
         .synoik
         .screenshot_ui
-        .pointer_motion(Point::from((5, 5)), None);
+        .pointer_motion_here(Point::from((5, 5)));
     assert_eq!(f.synoik().screenshot_ui.tooltip_text(), None);
 
     // An insensitive control offers no tooltip either: this fixture has a window, so unmap it and
@@ -14674,7 +14674,7 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     f.synoik_state()
         .synoik
         .screenshot_ui
-        .pointer_motion(window_button, None);
+        .pointer_motion_here(window_button);
     f.settle_animations();
     assert_eq!(
         f.synoik().screenshot_ui.tooltip_text(),
