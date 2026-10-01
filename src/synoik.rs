@@ -1130,6 +1130,9 @@ pub struct Synoik {
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
     pub preview_close_hovered: Option<Window>,
+    /// The App Exposé preview the arrow keys have picked. It shows as hovered until the pointer
+    /// moves, which takes the overlay back.
+    pub app_expose_key_selection: Option<Window>,
     /// GPU caches for the strip's per-thumbnail close button.
     pub thumbnail_chrome: ThumbnailChrome,
     /// The strip thumbnail the pointer is on: an empty workspace shows its close button
@@ -8389,6 +8392,7 @@ impl Synoik {
             workspace_rename: None,
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
+            app_expose_key_selection: None,
             thumbnail_chrome: ThumbnailChrome::new(),
             thumbnail_hovered: None,
             thumbnail_close_hovered: None,

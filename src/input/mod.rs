@@ -1650,6 +1650,13 @@ impl State {
                             Some(Keysym::Escape) => this.toggle_app_expose(),
                             Some(Keysym::Tab) => this.cycle_app_expose(mods.shift),
                             Some(Keysym::ISO_Left_Tab) => this.cycle_app_expose(true),
+                            Some(Keysym::Left) => this.move_app_expose_selection(FocusDir::Left),
+                            Some(Keysym::Right) => this.move_app_expose_selection(FocusDir::Right),
+                            Some(Keysym::Up) => this.move_app_expose_selection(FocusDir::Up),
+                            Some(Keysym::Down) => this.move_app_expose_selection(FocusDir::Down),
+                            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
+                                this.activate_app_expose_selection()
+                            }
                             _ => {}
                         }
                         this.synoik.suppressed_keys.insert(key_code);
@@ -6016,18 +6023,25 @@ impl State {
     /// `pos` is the global-space pointer location. Run on motion, and from the refresh for the
     /// state changes that move no pointer (see `Layout::set_expose_hover`).
     pub(crate) fn update_expose_hover(&mut self, pos: Point<f64, Logical>) {
-        let hovered = (self.synoik.layout.is_overview_open()
-            || self.synoik.layout.is_app_expose_open())
-        .then(|| {
-            let (output, p) = self.synoik.output_under(pos)?;
-            let output = output.clone();
-            match self.synoik.layout.window_under(&output, p) {
-                Some((window, _)) => Some(LayoutElement::id(window).clone()),
-                // `preview_overlays` already yields the layout id.
-                None => self.preview_hover_under(&output, p),
-            }
-        })
-        .flatten();
+        // The arrow keys' pick in App Exposé, until the pointer moves.
+        let key_selection = self
+            .synoik
+            .app_expose_key_selection
+            .clone()
+            .filter(|_| self.synoik.layout.is_app_expose_open());
+        let hovered = key_selection.or_else(|| {
+            (self.synoik.layout.is_overview_open() || self.synoik.layout.is_app_expose_open())
+                .then(|| {
+                    let (output, p) = self.synoik.output_under(pos)?;
+                    let output = output.clone();
+                    match self.synoik.layout.window_under(&output, p) {
+                        Some((window, _)) => Some(LayoutElement::id(window).clone()),
+                        // `preview_overlays` already yields the layout id.
+                        None => self.preview_hover_under(&output, p),
+                    }
+                })
+                .flatten()
+        });
         if self.synoik.layout.set_expose_hover(hovered.as_ref()) {
             self.synoik.queue_redraw_all();
         }
@@ -6192,6 +6206,8 @@ impl State {
             }
         }
 
+        // The pointer moving takes the overlay back from the arrow keys.
+        self.synoik.app_expose_key_selection = None;
         self.update_expose_hover(pos);
 
         // A removal holds the picker's layout still until the pointer stops working in it

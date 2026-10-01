@@ -561,3 +561,58 @@ fn a_sideways_swipe_steps_to_the_next_app() {
         "and it is not a workspace switch"
     );
 }
+
+const KEY_ENTER: u32 = 28;
+const KEY_UP: u32 = 103;
+const KEY_LEFT: u32 = 105;
+const KEY_RIGHT: u32 = 106;
+const KEY_DOWN: u32 = 108;
+
+/// The arrow keys pick a preview — the focused window's first, then its neighbours — showing it
+/// as hovered, and Enter goes to it.
+#[test]
+fn arrows_pick_a_preview_and_enter_goes_to_it() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    let overlaid = |f: &mut Fixture| -> Vec<Window> {
+        f.synoik()
+            .layout
+            .monitor_for_output(&out)
+            .unwrap()
+            .preview_overlays()
+            .into_iter()
+            .map(|(w, _, _)| w)
+            .collect()
+    };
+
+    tap(&mut f, KEY_RIGHT);
+    f.settle();
+    assert_eq!(
+        f.synoik().app_expose_key_selection,
+        Some(one[1].clone()),
+        "the first press picks the focused window"
+    );
+    assert_eq!(overlaid(&mut f), vec![one[1].clone()], "shown as hovered");
+
+    // Three previews in a grid: some arrow reaches another one.
+    let picked = [KEY_RIGHT, KEY_LEFT, KEY_DOWN, KEY_UP]
+        .into_iter()
+        .find_map(|key| {
+            tap(&mut f, key);
+            f.settle();
+            f.synoik()
+                .app_expose_key_selection
+                .clone()
+                .filter(|sel| *sel != one[1])
+        })
+        .expect("an arrow moves the pick");
+    assert_eq!(overlaid(&mut f), vec![picked.clone()]);
+
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(focused(&mut f), picked);
+}
