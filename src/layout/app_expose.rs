@@ -36,6 +36,10 @@ pub(super) struct AppExpose<W: LayoutElement> {
     /// overview's flag is.
     open: bool,
     progress: AppExposeProgress,
+    /// The window that had the focus when it came up. Focus moving off it to a window it does
+    /// not show — the switcher, an activation — puts it away (see
+    /// [`Layout::close_app_expose_if_focus_left`]).
+    focus: Option<W::Id>,
 }
 
 #[derive(Debug)]
@@ -67,6 +71,8 @@ impl AppExposeProgress {
 pub(super) struct MonitorAppExpose<W: LayoutElement> {
     windows: Vec<W::Id>,
     progress: f64,
+    /// Whether it is up for input, as opposed to on its way out.
+    open: bool,
 }
 
 /// One preview in a display's App Exposé grid.
@@ -109,11 +115,18 @@ impl<W: LayoutElement> AppExposeEntry<'_, W> {
 }
 
 impl<W: LayoutElement> Monitor<W> {
-    pub(super) fn set_app_expose(&mut self, state: Option<(&[W::Id], f64)>) {
-        self.app_expose = state.map(|(windows, progress)| MonitorAppExpose {
+    pub(super) fn set_app_expose(&mut self, state: Option<(&[W::Id], f64, bool)>) {
+        self.app_expose = state.map(|(windows, progress, open)| MonitorAppExpose {
             windows: windows.to_vec(),
             progress,
+            open,
         });
+    }
+
+    /// Whether App Exposé is up for input here. On its way out its previews are scenery: they
+    /// take no hits and grow no overlay, and the windows beneath take the pointer back.
+    pub(super) fn app_expose_takes_input(&self) -> bool {
+        self.app_expose.as_ref().is_some_and(|state| state.open)
     }
 
     /// How far App Exposé is up on this display, `None` when it is not there at all.
@@ -265,14 +278,35 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let from = self.app_expose_value();
+        let focus = self.focus().map(|win| win.id().clone());
         self.app_expose = Some(AppExpose {
             windows,
             open: true,
             progress: AppExposeProgress::Animation(self.app_expose_animation(from, 1., 0.)),
+            focus,
         });
         self.forget_app_expose_layouts();
         self.set_monitors_app_expose();
         true
+    }
+
+    /// Put App Exposé away if the focus has moved to a window it does not show — the switcher
+    /// committing, an activation, another app's window mapping with focus. That window would
+    /// otherwise sit focused and invisible under the backdrop, with App Exposé taking its keys.
+    ///
+    /// A change of focus, not a level test: cycling to another app leaves the focus on the first
+    /// app's window, which the grid then does not show, and must not close anything.
+    pub fn close_app_expose_if_focus_left(&mut self) -> bool {
+        let Some(state) = self.app_expose.as_ref().filter(|state| state.open) else {
+            return false;
+        };
+        let Some(now) = self.focus().map(|win| win.id()) else {
+            return false;
+        };
+        if state.focus.as_ref() == Some(now) || state.windows.contains(now) {
+            return false;
+        }
+        self.close_app_expose()
     }
 
     /// Put App Exposé away, leaving the desktop as it was.
@@ -356,10 +390,12 @@ impl<W: LayoutElement> Layout<W> {
                 if windows.is_empty() {
                     return false;
                 }
+                let focus = self.focus().map(|win| win.id().clone());
                 self.app_expose = Some(AppExpose {
                     windows,
                     open: true,
                     progress: gesture,
+                    focus,
                 });
                 self.forget_app_expose_layouts();
             }
@@ -476,9 +512,9 @@ impl<W: LayoutElement> Layout<W> {
         let state = self
             .app_expose
             .as_ref()
-            .map(|state| (state.windows.clone(), state.progress.value()));
+            .map(|state| (state.windows.clone(), state.progress.value(), state.open));
         for mon in self.monitors_mut() {
-            mon.set_app_expose(state.as_ref().map(|(w, p)| (&w[..], *p)));
+            mon.set_app_expose(state.as_ref().map(|(w, p, o)| (&w[..], *p, *o)));
         }
     }
 

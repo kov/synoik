@@ -9262,7 +9262,9 @@ impl State {
             // A press anywhere in App Exposé that no preview took leaves it, the desktop as it
             // was. After the panel, which stays clickable over it. Every button, and consumed:
             // nothing beneath is on screen to receive it.
-            if self.synoik.app_expose_ui_visible() {
+            // A layer-shell surface drawn above it (a Top or Overlay banner, a launcher) has the
+            // pointer, and keeps its clicks.
+            if self.synoik.app_expose_ui_visible() && self.synoik.pointer_contents.layer.is_none() {
                 self.synoik.suppressed_buttons.insert(button_code);
                 if self.synoik.layout.close_app_expose() {
                     self.synoik.queue_redraw_all();
@@ -10867,7 +10869,8 @@ impl State {
             .active_monitor_ref()
             .is_some_and(|mon| mon.app_expose_progress().is_some());
 
-        if app_expose_up && horizontal {
+        // Only while it is up for input: on its way out a sideways swipe is a workspace flick.
+        if horizontal && self.synoik.layout.is_app_expose_open() {
             // One app per swipe: the step is taken now, and the rest of the swipe goes nowhere.
             self.cycle_app_expose(dx < 0.);
             return TouchpadSwipe::Ignored;
@@ -11156,7 +11159,22 @@ impl State {
                 self.finish_switcher(outcome);
             }
         } else if !handle.is_grabbed() {
-            if self.synoik.layout.is_overview_open()
+            // App Exposé takes a touch the way it takes a click: a preview goes to its window,
+            // anywhere else leaves. Previews are activation hits, so nothing reaches a client.
+            if self.synoik.app_expose_ui_visible()
+                && under.layer.is_none()
+                && under.output.is_some()
+            {
+                match &under.window {
+                    Some((window, _)) => {
+                        self.synoik.layout.activate_app_expose_window(window);
+                    }
+                    None => {
+                        self.synoik.layout.close_app_expose();
+                    }
+                }
+                self.synoik.queue_redraw_all();
+            } else if self.synoik.layout.is_overview_open()
                 && !mod_down
                 && under.layer.is_none()
                 && under.output.is_some()

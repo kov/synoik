@@ -2542,6 +2542,10 @@ impl State {
             // Nor App Exposé: its input is the shell's, and a locked session has none.
             self.synoik.layout.close_app_expose();
         }
+        // Focus leaving for another app's window takes App Exposé down with it.
+        if self.synoik.layout.close_app_expose_if_focus_left() {
+            self.synoik.queue_redraw_all();
+        }
 
         // A dismissal that waited for a grab, now that the grab is done. Level-triggered for the
         // same reason as the dock's holds: no path that ends a drag has to remember.

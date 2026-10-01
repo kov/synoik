@@ -4229,6 +4229,10 @@ impl<W: LayoutElement> Monitor<W> {
     /// transition while its scale ramps out.
     pub fn preview_rects(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
         if self.app_expose.is_some() {
+            // On its way out it shows no overlay, as the picker shows none off state 1.
+            if !self.app_expose_takes_input() {
+                return Vec::new();
+            }
             return self.app_expose_preview_rects();
         }
         let Some(progress) = self.expose_progress() else {
@@ -4273,7 +4277,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // App Exposé's previews are activation hits, as the picker's are: a scaled window takes
         // no real input.
-        if self.app_expose.is_some() {
+        if self.app_expose_takes_input() {
             return self.window_under_app_expose(pos_within_output).map(|win| {
                 (
                     win,

@@ -650,3 +650,70 @@ fn an_injected_swipe_brings_it_up_and_takes_it_down() {
     assert!(!f.synoik().layout.is_app_expose_open());
     assert!(!f.synoik().layout.is_overview_open());
 }
+
+/// The focus leaving for another app's window — the switcher committing, an activation — puts
+/// App Exposé away, rather than leaving that window focused and invisible under the backdrop.
+#[test]
+fn focus_moving_to_another_app_puts_it_away() {
+    let mut f = Fixture::new();
+    let (_, two) = one_display_two_workspaces(&mut f);
+    open(&mut f);
+
+    f.synoik().layout.activate_window(&two);
+    f.settle();
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(focused(&mut f), two);
+}
+
+/// Cycling to another app leaves the focus on the first app's window, which the grid no longer
+/// shows — and that is not the focus leaving.
+#[test]
+fn cycling_does_not_count_as_the_focus_leaving() {
+    let mut f = Fixture::new();
+    let _ = one_display_two_workspaces(&mut f);
+    open(&mut f);
+
+    f.synoik_state().cycle_app_expose(false);
+    f.settle();
+    assert!(f.synoik().layout.is_app_expose_open());
+}
+
+/// A touch goes to the preview it lands on, and a touch on no preview leaves.
+#[test]
+fn touch_picks_a_preview_or_leaves() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let out = output(&mut f, "headless-1");
+    // The seat gains its touch capability from a touch device appearing, which the fixture has
+    // none of; without it a touch is dropped before anything sees it.
+    f.synoik().seat.add_touch();
+
+    open(&mut f);
+    f.touch_down(2., 1078.);
+    f.touch_up();
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_app_expose_open(),
+        "a touch beside the previews leaves"
+    );
+    assert_eq!(focused(&mut f), one[1]);
+
+    open(&mut f);
+    let slot = f
+        .synoik()
+        .layout
+        .app_expose_slots(&out)
+        .into_iter()
+        .find(|(w, _)| *w == one[2])
+        .unwrap()
+        .1;
+    f.touch_down(slot.loc.x + slot.size.w / 2., slot.loc.y + slot.size.h / 2.);
+    f.touch_up();
+    f.settle();
+    assert!(!f.synoik().layout.is_app_expose_open());
+    assert_eq!(
+        focused(&mut f),
+        one[2],
+        "a touch on a preview goes to its window"
+    );
+}
