@@ -779,6 +779,76 @@ fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
     );
 }
 
+/// A delayed capture of every display renders each one live when the timer runs out and saves
+/// them together — a file per display, named by connector, each the size of its display.
+#[test]
+fn vulkan_screenshot_ui_a_delayed_capture_of_every_display_writes_each() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.add_output(2, (800, 600));
+    let output = f.synoik_output(1);
+    let second = f.synoik_output(2);
+
+    let path = std::env::temp_dir().join(format!(
+        "synoik-delayed-every-display-{}.png",
+        std::process::id()
+    ));
+    let expected = [&output, &second].map(|o| crate::utils::with_label(&path, &o.name()));
+    for p in &expected {
+        std::fs::remove_file(p).ok();
+    }
+    f.synoik_state()
+        .open_screenshot_ui(Some(path.to_string_lossy().into_owned()));
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.all_displays.unwrap());
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.capture);
+    f.synoik_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+    assert!(f.synoik().pending_capture.is_some());
+
+    let mut clock = f.synoik().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + Duration::from_secs(4));
+    assert!(f.synoik_state().tick_pending_capture().is_none());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let sizes = loop {
+        let decoded: Option<Vec<_>> = expected
+            .iter()
+            .map(|p| {
+                let img = image::ImageReader::open(p).ok()?.decode().ok()?;
+                Some((img.width(), img.height()))
+            })
+            .collect();
+        if let Some(sizes) = decoded {
+            break sizes;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delayed capture never wrote both of {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for p in &expected {
+        std::fs::remove_file(p).ok();
+    }
+    assert_eq!(
+        sizes,
+        vec![(u32::from(OUT_W), u32::from(OUT_H)), (800, 600)],
+        "each display, whole"
+    );
+    assert!(!path.exists(), "and no unlabelled file beside them");
+}
+
 /// The fail-closed rule the countdown exists under: it may never appear in anything captured.
 #[test]
 fn vulkan_screenshot_ui_countdown_cannot_reach_a_capture() {

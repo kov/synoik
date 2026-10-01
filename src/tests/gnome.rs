@@ -28933,7 +28933,7 @@ fn all_displays_switches_to_screen_and_is_remembered() {
     use crate::ui::screenshot_ui::CaptureType;
 
     let mut f = Fixture::new();
-    let (one, _two) = open_two_display_picker(&mut f);
+    let (one, two) = open_two_display_picker(&mut f);
     f.synoik()
         .screenshot_ui
         .set_capture_type(CaptureType::Selection);
@@ -28954,7 +28954,17 @@ fn all_displays_switches_to_screen_and_is_remembered() {
     let layout = f.synoik().screenshot_ui.panel_layout(&one).unwrap();
     click_picker_control(&mut f, layout.all_displays.unwrap());
     assert!(!f.synoik().screenshot_ui.captures_every_display());
-    assert_eq!(f.synoik().screenshot_ui.capture_outputs(), vec![one]);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_outputs(),
+        vec![one.clone()]
+    );
+
+    // The monitor-move keys pick a display the way a press does, so they narrow it too.
+    click_picker_control(&mut f, layout.all_displays.unwrap());
+    assert!(f.synoik().screenshot_ui.captures_every_display());
+    f.synoik().screenshot_ui.move_to_output(two.clone());
+    assert!(!f.synoik().screenshot_ui.captures_every_display());
+    assert_eq!(f.synoik().screenshot_ui.capture_outputs(), vec![two]);
 }
 
 /// With one display there is no choice to offer: no toggle on the panel, and a remembered "every

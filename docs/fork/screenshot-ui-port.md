@@ -191,8 +191,8 @@ left of the delay, present only with more than one display (a choice that is not
 offered — the same reason GNOME hides the cast button without a recorder). It is a *what*, not a
 *how*, but the type row is homogeneous icon-over-caption buttons each naming a capture type, and
 this modifies one of them, so it joins the round toggles. From Selection or Window it switches to
-Screen; in Screen it flips between every display and the one picked; a press on a display narrows
-back to it. Remembered across opens, like show-pointer. `captures_every_display` is the one
+Screen; in Screen it flips between every display and the one picked; a press on a display, or a
+monitor-move key, narrows back to one. Remembered across opens, like show-pointer. `captures_every_display` is the one
 authority the bake, the selectors, the capture and the hover ask.
 
 **One file per display, never stitched** (kov's call, 2026-10-01): displays can differ in scale and

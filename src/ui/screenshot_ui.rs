@@ -1511,6 +1511,7 @@ impl ScreenshotUi {
         let Self::Open {
             area,
             screen_output,
+            all_displays,
             output_data,
             ..
         } = self
@@ -1523,9 +1524,10 @@ impl ScreenshotUi {
         };
 
         // Screen mode's display goes too: these are the keyboard's way of picking one, as a click
-        // on a selector is the pointer's.
-        let screen_changed = *screen_output != new_output;
+        // on a selector is the pointer's — so, like the click, they narrow All Displays to it.
+        let screen_changed = *screen_output != new_output || *all_displays;
         *screen_output = new_output.clone();
+        *all_displays = false;
 
         let (current_output, current_a, current_b) = area;
 
@@ -1726,11 +1728,13 @@ impl ScreenshotUi {
         for (output, data) in output_data {
             // `.screenshot-ui-screen-selector` (`_screenshot.scss:187-195`): 50% black, 30% under
             // the pointer. The selection area's shade is the same 50% (`:121-124`).
-            let shade = if screen_hover.as_ref() == Some(output) {
-                SCREEN_SELECTOR_HOVER
-            } else {
-                SHADE
-            };
+            // Only Screen mode has selectors; a hover left over from it must not outlive it.
+            let shade =
+                if capture_type == CaptureType::Screen && screen_hover.as_ref() == Some(output) {
+                    SCREEN_SELECTOR_HOVER
+                } else {
+                    SHADE
+                };
             for buffer in &mut data.buffers[4..] {
                 buffer.set_color(shade);
             }
