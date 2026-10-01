@@ -340,6 +340,148 @@ fn vulkan_composites_a_mapped_window() {
     );
 }
 
+/// `org.gnome.Shell.Screenshot.Screenshot` returns one file for the whole screen, so with two
+/// displays it is one image of both, each where it sits in the global space and the gap beside the
+/// shorter one left transparent. `ScreenshotArea` crops that same image, so an area straddling the
+/// seam takes from both.
+#[test]
+fn vulkan_the_whole_screen_shot_stitches_every_display() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.add_output(2, (800, 600));
+    let second = f.synoik_output(2);
+    let geo = f.synoik().global_space.output_geometry(&second).unwrap();
+    assert_eq!(
+        (geo.loc.x, geo.loc.y),
+        (i32::from(OUT_W), 0),
+        "precondition: the second display sits right of the first"
+    );
+
+    let state = f.synoik_state();
+    let (whole, seam) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let whole = state.synoik.render_stitched(vk, false, None).unwrap();
+            let seam = Rectangle::new(
+                Point::from((i32::from(OUT_W) - 100, 10)),
+                Size::from((200, 100)),
+            );
+            let seam = state.synoik.render_stitched(vk, false, Some(seam)).unwrap();
+            (whole, seam)
+        })
+        .expect("a Vulkan renderer");
+
+    let (size, pixels) = whole;
+    let (w, h) = (i32::from(OUT_W) + 800, i32::from(OUT_H));
+    assert_eq!((size.w, size.h), (w, h), "one image spanning both displays");
+    let alpha = |x: i32, y: i32| px(&pixels, w, x, y)[3];
+    assert_eq!(alpha(10, 10), 255, "the first display is in it");
+    assert_eq!(
+        alpha(i32::from(OUT_W) + 10, 10),
+        255,
+        "and so is the second"
+    );
+    assert_eq!(
+        alpha(i32::from(OUT_W) + 10, 650),
+        0,
+        "below the shorter display there is nothing"
+    );
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    assert!(
+        (0..w * h).any(|i| is_green(px(&pixels, w, i % w, i / w))),
+        "with the first display's window composited"
+    );
+
+    let (seam_size, _) = seam;
+    assert_eq!(
+        (seam_size.w, seam_size.h),
+        (200, 100),
+        "an area across the seam"
+    );
+}
+
+/// Print (`screenshot-screen`) takes every display, a file each.
+#[test]
+fn vulkan_screenshot_screen_writes_a_file_per_display() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.add_output(2, (800, 600));
+    let first = f.synoik_output(1);
+    let second = f.synoik_output(2);
+
+    let path = std::env::temp_dir().join(format!(
+        "synoik-screenshot-screens-{}.png",
+        std::process::id()
+    ));
+    let expected = [&first, &second].map(|o| crate::utils::with_label(&path, &o.name()));
+    for p in &expected {
+        std::fs::remove_file(p).ok();
+    }
+    f.synoik_state().do_action(
+        Action::ScreenshotScreen(true, false, Some(path.to_string_lossy().into_owned())),
+        false,
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let sizes = loop {
+        let decoded: Option<Vec<_>> = expected
+            .iter()
+            .map(|p| {
+                let img = image::ImageReader::open(p).ok()?.decode().ok()?;
+                Some((img.width(), img.height()))
+            })
+            .collect();
+        if let Some(sizes) = decoded {
+            break sizes;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "screenshot-screen never wrote both of {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for p in &expected {
+        std::fs::remove_file(p).ok();
+    }
+    assert_eq!(
+        sizes,
+        vec![(u32::from(OUT_W), u32::from(OUT_H)), (800, 600)]
+    );
+}
+
+/// The record keybind records every display, a file each.
+#[test]
+fn vulkan_the_record_keybind_records_every_display() {
+    if !super::have_ffmpeg() {
+        return;
+    }
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    f.add_output(2, (800, 600));
+
+    f.synoik_state()
+        .do_action(Action::ToggleScreenRecord, false);
+    let recorded: Vec<_> = f
+        .synoik()
+        .casting
+        .recordings
+        .iter()
+        .filter_map(|r| r.native_path())
+        .collect();
+    assert_eq!(recorded.len(), 2, "one recording per display: {recorded:?}");
+
+    f.synoik_state()
+        .do_action(Action::ToggleScreenRecord, false);
+    assert!(
+        f.synoik().casting.recordings.is_empty(),
+        "and the same key stops them all"
+    );
+}
+
 #[test]
 fn vulkan_composites_the_run_dialog() {
     let Some(mut f) = green_window_fixture() else {

@@ -3823,20 +3823,11 @@ impl State {
             .any(|r| matches!(r.kind, RecordingKind::Native(_)));
         if recording {
             self.stop_screen_recordings();
-        } else if let Some(output) = self.synoik.layout.active_output().cloned() {
-            let base = self.synoik.recordings_base.clone();
-            match crate::recording::default_recording_path(base.as_deref()) {
-                Ok(path) => {
-                    // The keybind/pill records the whole active output at 30fps, cursor drawn.
-                    if let Err(err) = self
-                        .synoik
-                        .start_native_recording(&output, path, 30, true, None)
-                    {
-                        warn!("could not start screen recording: {err:?}");
-                    }
-                }
-                Err(err) => warn!("could not choose a recording path: {err:?}"),
-            }
+        } else {
+            // The keybind/pill records every display whole at 30fps, cursor drawn — a file each,
+            // the way the picker's All Displays does.
+            let outputs = self.synoik.outputs_in_reading_order();
+            self.start_picker_recording(outputs, None, true);
         }
         self.synoik.queue_redraw_all();
     }
@@ -4087,17 +4078,16 @@ impl State {
                 self.synoik.do_screen_transition(neutrals, delay_ms);
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
-                let active = self.synoik.layout.active_output().cloned();
-                if let Some(active) = active {
-                    let res = self.backend.with_vulkan_renderer(|renderer| {
-                        self.synoik
-                            .screenshot(renderer, &active, write_to_disk, show_pointer, path)
-                    });
-                    match res {
-                        Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
-                        None => warn!("renderer unavailable for screenshot"),
-                        Some(Ok(())) => {}
-                    }
+                // Every display, a file each — not just the focused one, which on a multi-display
+                // setup is a coin toss as to which screen the user meant.
+                let res = self.backend.with_vulkan_renderer(|renderer| {
+                    self.synoik
+                        .screenshot_screens(renderer, write_to_disk, show_pointer, path)
+                });
+                match res {
+                    Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                    None => warn!("renderer unavailable for screenshot"),
+                    Some(Ok(())) => {}
                 }
             }
             Action::ConfirmScreenshot { write_to_disk } => {

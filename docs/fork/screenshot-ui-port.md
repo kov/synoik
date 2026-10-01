@@ -209,6 +209,21 @@ Pinned by `all_displays_takes_every_display_and_a_press_narrows_it`,
 `all_displays_saves_a_file_per_display` and
 `vulkan_screenshot_ui_casting_every_display_records_each_to_its_own_file`.
 
+## Outside the picker: every display
+
+The same choice holds where there is no picker to ask. `screenshot-screen` (GNOME's `screenshot`
+key) and the record keybind take **every display, a file each**, named like the picker's — not the
+focused one, which on several displays is a guess at which screen was meant.
+
+`org.gnome.Shell.Screenshot.Screenshot` is the exception, because its contract is one file name:
+it **stitches**, as mutter's stage screenshot does. `Synoik::render_stitched` lays every display out
+where it sits in the global space, at the largest display scale (a lower-scale display is upscaled
+nearest-neighbour into its place), with the gaps of a non-rectangular arrangement transparent.
+`ScreenshotArea` crops that same image, so an area straddling two displays takes from both. Pinned
+by `vulkan_the_whole_screen_shot_stitches_every_display`,
+`vulkan_screenshot_screen_writes_a_file_per_display` and
+`vulkan_the_record_keybind_records_every_display`.
+
 ## Approved divergence: a fresh picker opens on Screen
 
 GNOME checks the area button as it builds the type row (`js/ui/screenshot.js:1305-1312`), so a

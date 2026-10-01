@@ -371,6 +371,46 @@ pub fn crop_rgba8(
     Ok((area.size, out))
 }
 
+/// Copy a tightly-packed RGBA8 image into `dest` of another, nearest-neighbour scaled to fill it
+/// and clipped to the destination buffer.
+pub fn blit_rgba8_scaled(
+    (dst, dst_size): (&mut [u8], Size<i32, Physical>),
+    (src, src_size): (&[u8], Size<i32, Physical>),
+    dest: Rectangle<i32, Physical>,
+) {
+    if src_size.w <= 0 || src_size.h <= 0 || dest.size.w <= 0 || dest.size.h <= 0 {
+        return;
+    }
+    let Some(clipped) = dest.intersection(Rectangle::from_size(dst_size)) else {
+        return;
+    };
+    let same_size = dest.size == src_size;
+    for y in clipped.loc.y..clipped.loc.y + clipped.size.h {
+        let sy = if same_size {
+            y - dest.loc.y
+        } else {
+            ((i64::from(y - dest.loc.y) * i64::from(src_size.h)) / i64::from(dest.size.h)) as i32
+        };
+        let dst_row = (y * dst_size.w) as usize * 4;
+        let src_row = (sy * src_size.w) as usize * 4;
+        if same_size {
+            let x0 = clipped.loc.x - dest.loc.x;
+            let len = clipped.size.w as usize * 4;
+            let d = dst_row + clipped.loc.x as usize * 4;
+            let s = src_row + x0 as usize * 4;
+            dst[d..d + len].copy_from_slice(&src[s..s + len]);
+            continue;
+        }
+        for x in clipped.loc.x..clipped.loc.x + clipped.size.w {
+            let sx = ((i64::from(x - dest.loc.x) * i64::from(src_size.w)) / i64::from(dest.size.w))
+                as usize;
+            let d = dst_row + x as usize * 4;
+            let s = src_row + sx * 4;
+            dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+}
+
 pub fn output_matches_name(output: &Output, target: &str) -> bool {
     let name = output.user_data().get::<OutputName>().unwrap();
     name.matches(target)
@@ -805,6 +845,29 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    #[test]
+    fn a_blit_places_and_scales_an_image() {
+        // A 2x1 red|green source into a 4x2 canvas at (0,0), doubled.
+        let src = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut dst = vec![0u8; 6 * 2 * 4];
+        blit_rgba8_scaled(
+            (&mut dst, Size::from((6, 2))),
+            (&src, Size::from((2, 1))),
+            Rectangle::new(Point::from((1, 0)), Size::from((4, 2))),
+        );
+        let px = |x: usize, y: usize| &dst[(y * 6 + x) * 4..(y * 6 + x) * 4 + 4];
+        assert_eq!(
+            px(0, 0),
+            [0, 0, 0, 0],
+            "outside the destination stays empty"
+        );
+        assert_eq!(px(1, 0), [255, 0, 0, 255]);
+        assert_eq!(px(2, 1), [255, 0, 0, 255]);
+        assert_eq!(px(3, 0), [0, 255, 0, 255]);
+        assert_eq!(px(4, 1), [0, 255, 0, 255]);
+        assert_eq!(px(5, 1), [0, 0, 0, 0]);
+    }
 
     #[test]
     fn a_label_goes_before_the_extension() {

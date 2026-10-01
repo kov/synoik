@@ -4820,7 +4820,7 @@ impl State {
 
     /// The recorder call both the immediate and the delayed path end at: one recording per output,
     /// each to its own file, named apart by connector when there are several.
-    fn start_picker_recording(
+    pub(crate) fn start_picker_recording(
         &mut self,
         outputs: Vec<Output>,
         crop: Option<Rectangle<i32, Logical>>,
@@ -14574,57 +14574,7 @@ impl Synoik {
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Synoik::screenshot_to_path");
 
-        self.update_render_elements(None);
-
-        let outputs: Vec<_> = self.global_space.outputs().cloned().collect();
-
-        // FIXME: support multiple outputs, needs fixing multi-scale handling and cropping.
-        anyhow::ensure!(outputs.len() == 1);
-
-        let output = outputs.into_iter().next().unwrap();
-        let geom = self.global_space.output_geometry(&output).unwrap();
-
-        let output_scale = output.current_scale().integer_scale();
-        // The crop, in the same output-local physical pixels the readback is in.
-        let crop = area
-            .map(|area| {
-                let local = Rectangle::new(area.loc - geom.loc, area.size);
-                let local = local.to_physical(output_scale);
-                anyhow::ensure!(
-                    local.size.w > 0 && local.size.h > 0,
-                    "empty screenshot area"
-                );
-                Ok(local)
-            })
-            .transpose()?;
-        let geom = geom.to_physical(output_scale);
-
-        let size = geom.size;
-        let transform = output.current_transform();
-        let size = transform.transform_size(size);
-
-        let ctx = RenderCtx {
-            renderer,
-            target: RenderTarget::ScreenCapture,
-            appearance: Some(self.appearance()),
-        };
-        let elements = self.render_to_vec(ctx, &output, include_pointer);
-        let elements = elements.iter().rev();
-        let pixels = render_to_vec(
-            renderer,
-            size,
-            Scale::from(f64::from(output_scale)),
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            elements,
-        )?;
-
-        // Crop before encoding: the readback is one full output, and the requested area is a
-        // sub-rectangle of it clamped to what actually exists.
-        let (size, pixels) = match crop {
-            Some(crop) => crop_rgba8(size, &pixels, crop)?,
-            None => (size, pixels),
-        };
+        let (size, pixels) = self.render_stitched(renderer, include_pointer, area)?;
 
         let path = path
             .or_else(|| make_screenshot_path(&self.config.borrow()).ok().flatten())
@@ -14636,6 +14586,97 @@ impl Synoik {
         write_png_in_thread(size, pixels, path, on_done);
 
         Ok(())
+    }
+
+    /// The whole desktop as one image — every display rendered and laid out where it sits in the
+    /// global space — optionally cropped to `area` (global logical).
+    ///
+    /// This is what mutter's stage screenshot is, and what `org.gnome.Shell.Screenshot` promises:
+    /// one file for the whole screen. The image is at the **largest** display scale, so the
+    /// sharpest display keeps every pixel and a lower-scale one is upscaled into its place
+    /// (nearest-neighbour). The gaps between displays of a non-rectangular arrangement are
+    /// transparent.
+    pub fn render_stitched(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        include_pointer: bool,
+        area: Option<Rectangle<i32, Logical>>,
+    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+        let outputs: Vec<_> = self
+            .global_space
+            .outputs()
+            .filter_map(|o| Some((o.clone(), self.global_space.output_geometry(o)?)))
+            .collect();
+        let bounds = outputs
+            .iter()
+            .map(|(_, geo)| *geo)
+            .reduce(|a, b| a.merge(b))
+            .context("no display to capture")?;
+        let scale = outputs
+            .iter()
+            .map(|(o, _)| o.current_scale().fractional_scale())
+            .fold(1., f64::max);
+
+        let to_canvas = |r: Rectangle<i32, Logical>| -> Rectangle<i32, Physical> {
+            Rectangle::new(r.loc - bounds.loc, r.size)
+                .to_f64()
+                .to_physical(scale)
+                .to_i32_round()
+        };
+        let canvas_size = to_canvas(bounds).size;
+        let mut canvas = vec![0u8; canvas_size.w as usize * canvas_size.h as usize * 4];
+
+        for (output, geo) in outputs {
+            // Only the displays the area touches need rendering at all.
+            if area.is_some_and(|area| !area.overlaps(geo)) {
+                continue;
+            }
+            let full = Rectangle::from_size(crate::utils::output_size(&output))
+                .to_physical_precise_round(output.current_scale().fractional_scale());
+            let (size, pixels) = self.render_area(renderer, &output, full, include_pointer)?;
+            crate::utils::blit_rgba8_scaled(
+                (&mut canvas, canvas_size),
+                (&pixels, size),
+                to_canvas(geo),
+            );
+        }
+
+        match area {
+            Some(area) => crop_rgba8(canvas_size, &canvas, to_canvas(area)),
+            None => Ok((canvas_size, canvas)),
+        }
+    }
+
+    /// Every display, in reading order — top to bottom, then left to right.
+    pub fn outputs_in_reading_order(&self) -> Vec<Output> {
+        let mut outputs: Vec<_> = self.global_space.outputs().cloned().collect();
+        outputs.sort_by_key(|o| {
+            let loc = o.current_location();
+            (loc.y, loc.x)
+        });
+        outputs
+    }
+
+    /// Screenshot every display, a file each, saved together as one screenshot (see
+    /// [`Self::save_screenshots`]). With one display this is the plain whole-screen shot.
+    pub fn screenshot_screens(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        write_to_disk: bool,
+        include_pointer: bool,
+        path: Option<String>,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("Synoik::screenshot_screens");
+
+        let mut shots = Vec::new();
+        for output in self.outputs_in_reading_order() {
+            let full = Rectangle::from_size(crate::utils::output_size(&output))
+                .to_physical_precise_round(output.current_scale().fractional_scale());
+            let (size, pixels) = self.render_area(renderer, &output, full, include_pointer)?;
+            shots.push((output, size, pixels));
+        }
+        self.save_screenshots(labelled_shots(shots), write_to_disk, path, None)
+            .context("error saving screenshot")
     }
 
     /// Close the picker, answering any pending `SelectArea` caller.

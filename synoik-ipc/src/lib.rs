@@ -553,7 +553,7 @@ pub enum Action {
     /// [`Self::Screenshot`], nothing about the session is remembered: it forces the Selection
     /// capture type and hands back whatever the picker had before it.
     ScreenshotQuick {},
-    /// Screenshot the focused screen.
+    /// Screenshot every screen, one file each.
     ScreenshotScreen {
         /// Write the screenshot to disk in addition to putting it in your clipboard.
         ///
