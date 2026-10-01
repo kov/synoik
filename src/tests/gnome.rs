@@ -23987,6 +23987,50 @@ fn a_short_flick_switches_workspaces() {
     );
 }
 
+/// A flick whose whole travel lands in the update that chooses its axis — the usual short flick
+/// on a touchpad reporting at ~60 Hz — is timed from the update before it, here the begin
+/// (a DIVERGENCE: GNOME's tracker starts at the deciding update and reads one event as standing
+/// still). The same travel spread over a long wait is still a slow drag.
+#[test]
+fn a_flick_of_one_update_is_timed_from_the_begin() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 3);
+    pointer_motion_to(&mut f, 960., 540.);
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(1)),
+        false,
+    );
+    f.settle();
+
+    let one_update = |f: &mut Fixture, (dx, dy): (f64, f64), after_begin: u32| {
+        f.swipe_begin(3);
+        f.advance_input_time(after_begin);
+        f.swipe_update(dx, dy);
+        f.advance_input_time(33);
+        f.swipe_end(false);
+        f.settle_animations();
+        f.settle();
+    };
+
+    // 20 px in the 17 ms since the begin is 1.2 px/ms.
+    one_update(&mut f, (20., 0.), 17);
+    assert_eq!(active_idx(&mut f), 1, "a one-update flick switches");
+
+    one_update(&mut f, (0., 20.), 17);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "…and opens the overview"
+    );
+    one_update(&mut f, (0., -20.), 17);
+    assert!(!f.synoik().layout.is_overview_open(), "…and closes it");
+
+    // 20 px over 100 ms is 0.2 px/ms, a third of the flick speed.
+    one_update(&mut f, (-20., 0.), 100);
+    assert_eq!(active_idx(&mut f), 1, "the same travel, slowly, snaps back");
+}
+
 /// With the app grid up, a horizontal three-finger swipe pages the grid instead: `AppDisplay`
 /// runs its own horizontal `SwipeTracker` (`appDisplay.js:603-614`) at 400 px a page.
 #[test]

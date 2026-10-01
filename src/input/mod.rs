@@ -197,8 +197,16 @@ pub enum OverviewHit {
 /// A touchpad swipe of three or more fingers, which the shell keeps for itself.
 #[derive(Debug, Clone, Copy)]
 pub enum TouchpadSwipe {
-    /// Still under the threshold that decides its orientation; the travel so far.
-    Pending { dx: f64, dy: f64 },
+    /// Still under the threshold that decides its orientation; the travel so far, when the
+    /// swipe began, how many updates it has had and when the last of them came (the begin until
+    /// the first).
+    Pending {
+        dx: f64,
+        dy: f64,
+        began: Duration,
+        updates: u32,
+        last: Duration,
+    },
     /// Swiping along the overview's state axis.
     Overview,
     /// Switching workspaces.
@@ -10597,7 +10605,13 @@ impl State {
         // `swipeTracker.js:35,127`) — four are no different from three — except on the lock
         // screen, where neither of its swipe trackers' action modes is live.
         if event.fingers() >= 3 && !self.synoik.is_locked() {
-            self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending { dx: 0., dy: 0. });
+            self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending {
+                dx: 0.,
+                dy: 0.,
+                began: Duration::from_micros(event.time()),
+                updates: 0,
+                last: Duration::from_micros(event.time()),
+            });
             return;
         }
 
@@ -10654,15 +10668,38 @@ impl State {
 
         let timestamp = Duration::from_micros(event.time());
 
+        // When the update that chooses the axis follows the one before it (or the begin): see
+        // below.
+        let mut anchor = None;
         let swipe = match swipe {
-            TouchpadSwipe::Pending { dx, dy } => {
+            TouchpadSwipe::Pending {
+                dx,
+                dy,
+                began,
+                updates,
+                last,
+            } => {
                 let (dx, dy) = (dx + delta_x, dy + delta_y);
+                let updates = updates + 1;
                 // `DRAG_THRESHOLD_DISTANCE` (`swipeTracker.js:28,157-176`): the travel
                 // that decides which way the swipe goes. The motion up to it moves nothing.
                 if dx * dx + dy * dy < 16. * 16. {
-                    self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending { dx, dy });
+                    self.synoik.touchpad_swipe = Some(TouchpadSwipe::Pending {
+                        dx,
+                        dy,
+                        began,
+                        updates,
+                        last: timestamp,
+                    });
                     return;
                 }
+                anchor = Some(last);
+                debug!(
+                    target: "synoik::swipe",
+                    "touchpad: chose an axis on update {updates}, {:.0} ms after the begin, \
+                     travel=({dx:.1}, {dy:.1}), this update ({delta_x:.1}, {delta_y:.1})",
+                    timestamp.saturating_sub(began).as_secs_f64() * 1000.,
+                );
                 let swipe = self.touchpad_swipe_begin(dx.abs() > dy.abs());
                 self.synoik.touchpad_swipe = Some(swipe);
                 swipe
@@ -10681,6 +10718,26 @@ impl State {
             }
         }
 
+        // DIVERGENCE: the tracker starts timing at the update before the one that chose the axis.
+        // GNOME's starts at that update itself (`swipeTracker.js:157-186`), and a velocity needs
+        // two events, so a short flick whose whole travel lands in the deciding update reads as
+        // standing still. On a touchpad reporting at ~60 Hz that is most short flicks: 15-25 px
+        // in one update, then the lift. A motionless event at the previous update's time gives
+        // that travel the interval it was covered in, without moving anything.
+        if let Some(at) = anchor {
+            self.touchpad_swipe_update_tracker(swipe, 0., 0., at);
+        }
+        self.touchpad_swipe_update_tracker(swipe, delta_x, delta_y, timestamp);
+    }
+
+    /// Feed one update of a three-finger swipe to the tracker it chose.
+    fn touchpad_swipe_update_tracker(
+        &mut self,
+        swipe: TouchpadSwipe,
+        delta_x: f64,
+        delta_y: f64,
+        timestamp: Duration,
+    ) {
         match swipe {
             TouchpadSwipe::Pending { .. } | TouchpadSwipe::Ignored => (),
             TouchpadSwipe::Overview => {
@@ -10785,7 +10842,7 @@ impl State {
         // emits the same `end` for both (`swipeTracker.js:190-197`).
         match swipe {
             // The swipes that never reach a tracker, for the same log the released ones go to.
-            TouchpadSwipe::Pending { dx, dy } => {
+            TouchpadSwipe::Pending { dx, dy, .. } => {
                 debug!(
                     target: "synoik::swipe",
                     "touchpad: ended before choosing an axis, travel=({dx:.1}, {dy:.1})"
