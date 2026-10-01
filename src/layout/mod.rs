@@ -5226,15 +5226,6 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open = true;
         if entering {
             self.forget_expose_layouts();
-        } else {
-            // The picker's overlay is enabled only while its state sits at exactly 1
-            // (`_syncOverlay`, `workspace.js:775-778`) and hides without an ease when it moves.
-            // A swipe moves no pointer, so nothing else would drop it: the hovered preview would
-            // ride the whole swipe raised above its neighbours. Only the hover goes — a swipe
-            // that is cancelled lands back in the same picker, its slides intact.
-            for ws in self.workspaces_mut() {
-                ws.drop_expose_hover();
-            }
         }
 
         let bounds = overview_gesture_bounds(start);
@@ -7339,11 +7330,6 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
-    /// Whether a touchpad swipe is moving the overview right now.
-    fn is_overview_swiping(&self) -> bool {
-        matches!(self.overview_progress, Some(OverviewProgress::Gesture(_)))
-    }
-
     /// The workspace a drop at `pos` on `output` would land on, if it is an
     /// existing one: the workspace under the pointer in the picker, or the
     /// thumbnail under it in the strip (gnome-shell's `Workspace.acceptDrop` /
@@ -7415,13 +7401,26 @@ impl<W: LayoutElement> Layout<W> {
         changed
     }
 
+    /// Point the picker overlay at `window` (or at nothing) on every monitor whose overview sits
+    /// exactly in the window picker, and drop it outright everywhere else.
+    ///
+    /// gnome-shell enables a preview's overlay only at state 1 (`_syncOverlay`,
+    /// `workspace.js:775-778`): an opening, a closing, a swipe or the app grid all hide it with no
+    /// ease (`hideOverlay(false)`), and arriving back at 1 shows it for whatever preview has the
+    /// pointer. Nothing about a state change moves the pointer, which is why this is also fed
+    /// from the refresh and not only from motion.
     pub fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
-        // Nothing arms during a swipe: the state is off the picker's 1, where gnome-shell keeps
-        // the overlay disabled (`_syncOverlay`, `workspace.js:775-778`).
-        let window = window.filter(|_| !self.is_overview_swiping());
+        let overview_open = self.overview_open;
         let mut changed = false;
-        for ws in self.workspaces_mut() {
-            changed |= ws.set_expose_hover(window);
+        for mon in self.monitors_mut() {
+            let enabled = overview_open && mon.overview_state_value() == Some(1.);
+            for ws in &mut mon.workspaces {
+                changed |= if enabled {
+                    ws.set_expose_hover(window)
+                } else {
+                    ws.drop_expose_hover()
+                };
+            }
         }
         changed
     }

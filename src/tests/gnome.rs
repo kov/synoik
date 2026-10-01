@@ -9228,37 +9228,18 @@ fn a_minimized_windows_preview_can_be_hovered() {
 #[test]
 fn swiping_out_of_the_overview_drops_the_picker_overlay() {
     let mut f = Fixture::new();
-    f.add_output(1, (1920, 1080));
-    let id = f.add_client();
-    let _first = map_window_sized(&mut f, id, (800, 600), None);
-    let first = f.synoik().layout.focus().unwrap().window.clone();
-    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let (_, hovered) = hover_a_preview(&mut f);
 
-    pointer_motion_to(&mut f, 960., 540.);
-    tap(&mut f, KEY_LEFTMETA);
-    f.settle();
-
-    let slot = f.synoik().layout.expose_target_rect(&first).unwrap();
-    let center = slot.loc + slot.size.downscale(2.).to_point();
-    pointer_motion_to(&mut f, center.x, center.y);
-    f.settle();
-
-    let output = f.synoik().global_space.outputs().next().unwrap().clone();
-    let hovered = |f: &mut Fixture| {
-        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
-        mon.preview_overlays()
-            .iter()
-            .any(|(w, _, hover)| w == &first && *hover > 0.)
-    };
-    assert!(hovered(&mut f), "the preview under the pointer is hovered");
-
-    // Past the tracker's 16 px pickup (`DRAG_THRESHOLD_DISTANCE`), but well short of home.
+    // Past the tracker's 16 px pickup (`DRAG_THRESHOLD_DISTANCE`), but well short of home. The
+    // clock is pinned so the release's ease can be sampled before it lands; the turn is the
+    // refresh the live loop runs after every input event.
+    f.freeze_clock();
     f.swipe_begin(3);
     for _ in 0..3 {
         f.advance_input_time(50);
         f.swipe_update(0., -10.);
     }
-    f.settle_animations();
+    f.turn();
     let state = overview_state(&mut f);
     assert!(state > 0.5 && state < 1., "mid-swipe: {state}");
     assert!(
@@ -9275,11 +9256,119 @@ fn swiping_out_of_the_overview_drops_the_picker_overlay() {
     }
     f.advance_input_time(1);
     f.swipe_end(false);
+    f.turn();
     assert!(!f.synoik().layout.is_overview_open(), "the swipe closes it");
     assert!(overview_state(&mut f) > 0., "still easing home");
     assert!(
         !hovered(&mut f),
         "and the overlay stays down on the way out"
+    );
+}
+
+/// Two overlapping windows in the open overview, the pointer resting on the first one's preview —
+/// which is that window, and a closure telling whether its overlay is showing.
+fn hover_a_preview(f: &mut Fixture) -> (smithay::desktop::Window, impl Fn(&mut Fixture) -> bool) {
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _first = map_window_sized(f, id, (800, 600), None);
+    let first = f.synoik().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(f, id, (800, 600), None);
+
+    pointer_motion_to(f, 960., 540.);
+    tap(f, KEY_LEFTMETA);
+    f.settle();
+
+    let slot = f.synoik().layout.expose_target_rect(&first).unwrap();
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(f, center.x, center.y);
+    f.settle();
+
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let win = first.clone();
+    let hovered = move |f: &mut Fixture| {
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
+        mon.preview_overlays()
+            .iter()
+            .any(|(w, _, hover)| w == &win && *hover > 0.)
+    };
+    assert!(hovered(f), "the preview under the pointer is hovered");
+    (first, hovered)
+}
+
+/// A swipe that turns back into the picker shows the overlay again for the preview the pointer
+/// never left.
+///
+/// Back at state 1 gnome-shell re-enables the overlay and shows it for a preview that `has-pointer`
+/// (`overlayEnabled`, `windowPreview.js:493-504`). A swipe moves no pointer, so a hover fed only
+/// from motion stayed down until the user nudged the mouse.
+#[test]
+fn a_cancelled_swipe_out_restores_the_picker_overlay() {
+    let mut f = Fixture::new();
+    let (_, hovered) = hover_a_preview(&mut f);
+
+    // A tenth of the way home, slowly: the release eases back to the picker. The turn is the
+    // refresh the live loop runs after every input event.
+    f.swipe_begin(3);
+    for _ in 0..3 {
+        f.advance_input_time(50);
+        f.swipe_update(0., -10.);
+    }
+    f.turn();
+    assert!(!hovered(&mut f), "the overlay drops while the swipe is out");
+
+    f.advance_input_time(1);
+    f.swipe_end(false);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the swipe turned back"
+    );
+    assert_eq!(overview_state(&mut f), 1.);
+    assert!(
+        hovered(&mut f),
+        "back in the picker, the preview under the still pointer shows its overlay again"
+    );
+}
+
+/// The overlay waits for the overview to finish opening, then shows for the preview under a pointer
+/// that never moved.
+///
+/// `_syncOverlay` (`workspace.js:775-778`) enables it only at state 1, so a pointer crossing a
+/// preview mid-open grows nothing; arriving at 1 shows it for whatever has the pointer.
+#[test]
+fn the_picker_overlay_waits_for_the_overview_to_open() {
+    let mut f = Fixture::new();
+    let (first, hovered) = hover_a_preview(&mut f);
+    let slot = f.synoik().layout.expose_target_rect(&first).unwrap();
+
+    // Out and back in, the pointer parked on the preview's slot all along.
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(!f.synoik().layout.is_overview_open());
+
+    f.freeze_clock();
+    tap(&mut f, KEY_LEFTMETA);
+    f.advance_clock(Duration::from_millis(100));
+    f.turn();
+    let state = overview_state(&mut f);
+    assert!(state > 0. && state < 1., "mid-open: {state}");
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    // Long enough for an armed overlay to have faded in visibly, short of the open's end.
+    f.advance_clock(Duration::from_millis(50));
+    f.turn();
+    let state = overview_state(&mut f);
+    assert!(state > 0. && state < 1., "still mid-open: {state}");
+    assert!(
+        !hovered(&mut f),
+        "nothing arms before the overview has opened"
+    );
+
+    f.settle();
+    assert_eq!(overview_state(&mut f), 1.);
+    assert!(
+        hovered(&mut f),
+        "once open, the preview under the still pointer shows its overlay"
     );
 }
 

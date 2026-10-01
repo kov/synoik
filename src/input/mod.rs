@@ -5980,6 +5980,34 @@ impl State {
         }
     }
 
+    /// Hovering a window preview in the overview's picker grows it and raises it above its
+    /// neighbours (`showOverlay`, `windowPreview.js:310-352`). The hit is the picker slot the
+    /// click would activate, so what grows is always what a click would pick — falling back to
+    /// the preview whose overlay the pointer is on, which is what keeps the close button from
+    /// fading out from under a pointer that has left the slot to reach its overhanging half.
+    ///
+    /// `pos` is the global-space pointer location. Run on motion, and from the refresh for the
+    /// state changes that move no pointer (see `Layout::set_expose_hover`).
+    pub(crate) fn update_expose_hover(&mut self, pos: Point<f64, Logical>) {
+        let hovered = self
+            .synoik
+            .layout
+            .is_overview_open()
+            .then(|| {
+                let (output, p) = self.synoik.output_under(pos)?;
+                let output = output.clone();
+                match self.synoik.layout.window_under(&output, p) {
+                    Some((window, _)) => Some(LayoutElement::id(window).clone()),
+                    // `preview_overlays` already yields the layout id.
+                    None => self.preview_hover_under(&output, p),
+                }
+            })
+            .flatten();
+        if self.synoik.layout.set_expose_hover(hovered.as_ref()) {
+            self.synoik.queue_redraw_all();
+        }
+    }
+
     /// Light up the panel button under the pointer (gnome-shell `panel_button:hover`).
     /// `pos` is the global-space pointer location. Off any button — or outside GNOME
     /// mode — clears the hover. Redraws only when the hovered button actually changed.
@@ -6139,29 +6167,7 @@ impl State {
             }
         }
 
-        // Hovering a window preview in the overview's picker grows it and raises it
-        // above its neighbours (`showOverlay`, `windowPreview.js:310-352`). The
-        // hit is the picker slot the click would activate, so what grows is always
-        // what a click would pick — falling back to the preview whose overlay the
-        // pointer is on, which is what keeps the close button from fading out from
-        // under a pointer that has left the slot to reach its overhanging half.
-        let hovered = self
-            .synoik
-            .layout
-            .is_overview_open()
-            .then(|| {
-                let (output, p) = self.synoik.output_under(pos)?;
-                let output = output.clone();
-                match self.synoik.layout.window_under(&output, p) {
-                    Some((window, _)) => Some(LayoutElement::id(window).clone()),
-                    // `preview_overlays` already yields the layout id.
-                    None => self.preview_hover_under(&output, p),
-                }
-            })
-            .flatten();
-        if self.synoik.layout.set_expose_hover(hovered.as_ref()) {
-            self.synoik.queue_redraw_all();
-        }
+        self.update_expose_hover(pos);
 
         // A removal holds the picker's layout still until the pointer stops working in it
         // (`Workspace::expose_pointer_moved`). Fed from motion rather than polled, so it has

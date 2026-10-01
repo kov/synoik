@@ -2576,6 +2576,9 @@ impl State {
         self.synoik.global_space.refresh();
         self.synoik.refresh_idle_inhibit();
         self.refresh_pointer_contents();
+        // An overview state change arms or drops the picker overlay under a still pointer.
+        let pointer = self.synoik.seat.get_pointer().unwrap().current_location();
+        self.update_expose_hover(pointer);
         foreign_toplevel::refresh(self);
         ext_workspace::refresh(self);
 
