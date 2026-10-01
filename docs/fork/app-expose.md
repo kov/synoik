@@ -32,16 +32,18 @@ this doc covers only what is new.
   as it was.
 - **Click a window** to activate it. If it lives on another workspace, that workspace becomes its
   display's active one first, and the leave animation lands the window where it now is.
-- **`ToggleAppExpose`** is an action (config, IPC, and a GNOME-style keybinding slot) so the mode
-  is reachable without a touchpad, and so the corpus and a live session can drive it.
+- **`ToggleAppExpose`** is an action (config and IPC) so the mode is reachable without a
+  touchpad, and so the corpus and a live session can drive it. It has no default key.
 
 ## Cycling apps
 
 Tab / Shift+Tab, and a **horizontal** three-finger swipe, move to the next / previous running app
-in the switcher's order (most recently used first), re-laying every display out for the new app.
-A swipe is one step per lift, decided by its direction once it crosses the same 16 px threshold
-that tells vertical from horizontal. Arrow keys move a selection between the previews by geometry,
-Enter activates it.
+in the switcher's order (most recently used first), re-laying every display out for the new app
+at once, with no transition between the two grids. A swipe is one step per lift, taken as soon as
+it crosses the same 16 px threshold that tells vertical from horizontal.
+
+The arrow keys pick a preview by geometry — the first press the focused window's — and Enter goes
+to it. The pick shows as the hover overlay until the pointer moves, which takes the overlay back.
 
 ## Model
 
@@ -92,12 +94,13 @@ Back to front:
 1. The **live desktop**, as normally drawn — minus the app's windows on the active workspace,
    which are drawn by step 3 instead.
 2. The **blurred wallpaper**, pushed at App Exposé's progress over the live desktop. That fade *is*
-   the other windows leaving; they need no animation of their own.
+   the other windows leaving; they need no animation of their own. Unlike the overview's backdrop
+   this one must cover, so with no blur to be had the solid backdrop stands in.
 3. The app's **windows at their slots**, with their preview chrome:
    - on the active workspace they interpolate from their live rect to the slot, with the picker's
      own placement function at zoom 1;
    - on any other workspace they have no on-screen origin, so they scale up into the slot while
-     fading in.
+     fading in — composited as one group, since their slots never overlap.
 4. The **panel**, unchanged apart from the overview's background fade.
 
 The overview's chrome block, the thumbnail strip, and the picker's per-workspace wallpaper and
@@ -108,21 +111,20 @@ rendering, so nothing invisible can take a click — the dash's lesson under the
 
 - A keyboard focus of its own (`KeyboardFocus::AppExpose`), so the overview's type-to-search
   path never sees a key.
-- A display-level hit test over the new layout, front to back, hovered preview first.
+- Hover, the overlay, the close button and the hit tests are the picker's own: App Exposé's
+  previews feed `Monitor::preview_rects` and `Monitor::window_under`, and the overlay is enabled
+  only once it is fully up, as the picker's is only at state 1.
 - Click on a preview activates it (switching workspace if needed); click on its close button
-  closes the window; click elsewhere leaves.
+  closes the window; click anywhere else leaves. The panel stays clickable over it.
 
 ## Testing
 
-Corpus, in its own `src/tests/app_expose.rs` next to `gnome.rs`, driven the same way: the action
-opens and closes it; the grid holds exactly the focused app's windows on that
-display's workspaces, minimized included; displays are independent; a display without the app is
-empty; activating a window on another workspace switches to it; Escape and swipe-up leave; locked
-or unfocused is a no-op; a key never starts a search; Tab cycles apps. The swipe-down-from-desktop
-no-op that `touchpad_swipe_walks_the_overview_states` pins changes meaning here.
+Corpus, in `src/tests/app_expose.rs`, driven like `gnome.rs`: which windows the grid holds
+(every workspace, minimized included, per display), the no-ops (nothing focused, over the
+overview), locking, the dock, every key, clicks, hover, and the swipes — down, up, turned back,
+over nothing focused, out of the overview, sideways. Render tests in `vulkan_render.rs`: a
+preview lands at its slot with its live copy gone, another app's window is covered, and a window
+from another workspace is blended part-way up.
 
-Render tests: no chrome is drawn; the backdrop is the blurred wallpaper; a preview lands at its
-slot.
-
-Live: `synoik msg input` gains a swipe (begin / update / end), alongside the finger-scroll and hold
-injection, so the gesture itself is drivable on a running session.
+Live: `synoik msg input swipe-begin` / `swipe-update DX DY` / `swipe-end` drive the gesture on a
+running session (synthetic swipes have natural scrolling off: negative `dy` is towards App Exposé).
