@@ -15214,6 +15214,17 @@ fn nothing_churns_its_element_id_across_two_outputs_over_a_wallpaper() {
             }
         }
 
+        // And a hovered preview: its caption and close button are the preview chrome that is
+        // baked per hover, and the pointer, warped onto a window by the focus change, rests on
+        // one. Without it the caption bakes are never exercised.
+        assert!(
+            f.synoik()
+                .layout
+                .monitors()
+                .any(|mon| !mon.preview_overlays().is_empty()),
+            "no hovered preview on either output — the caption bakes go unwatched",
+        );
+
         assert_quiet_across_outputs(&mut f, &format!("overview, {pairing:?} outputs"));
     }
 }
