@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::panic::Location;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -960,8 +960,13 @@ pub struct Synoik {
     pub key_repeat_timer: Option<TimerToken>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
-    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
-    pub is_fdo_idle_inhibited: Arc<AtomicBool>,
+    /// Surfaces with live `zwp_idle_inhibitor_v1`s, counted: a client may create several on one
+    /// surface, and destroying one of them must not release the others.
+    pub idle_inhibiting_surfaces: HashMap<WlSurface, usize>,
+    /// The visible ones among them, each holding an inhibit on the session bus.
+    pub idle_inhibit_forwarder: crate::dbus::idle_inhibit::IdleInhibitForwarder,
+    /// gnome-session's `InhibitedActions` has the idle bit: someone, anywhere, inhibits idle.
+    pub is_session_idle_inhibited: bool,
     pub keyboard_shortcuts_inhibiting_surfaces: HashMap<WlSurface, KeyboardShortcutsInhibitor>,
 
     /// Most recent XKB settings from org.freedesktop.locale1.
@@ -6940,6 +6945,17 @@ impl State {
     }
 
     /// gnome-session's presence changed (`_onStatusChanged`, `screenShield.js:242-272`).
+    pub fn on_session_inhibit_msg(
+        &mut self,
+        msg: crate::dbus::idle_inhibit::SessionInhibitToSynoik,
+    ) {
+        use crate::dbus::idle_inhibit::SessionInhibitToSynoik;
+
+        let SessionInhibitToSynoik::IdleInhibited(inhibited) = msg;
+        self.synoik.is_session_idle_inhibited = inhibited;
+        self.synoik.refresh_idle_inhibit();
+    }
+
     pub fn on_presence_msg(&mut self, msg: crate::dbus::gnome_session_presence::PresenceToSynoik) {
         use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToSynoik};
 
@@ -8412,8 +8428,9 @@ impl Synoik {
             seat,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
-            idle_inhibiting_surfaces: HashSet::new(),
-            is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
+            idle_inhibiting_surfaces: HashMap::new(),
+            idle_inhibit_forwarder: Default::default(),
+            is_session_idle_inhibited: false,
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
             cursor_manager,
@@ -11052,14 +11069,25 @@ impl Synoik {
     pub fn refresh_idle_inhibit(&mut self) {
         let _span = tracy_client::span!("Synoik::refresh_idle_inhibit");
 
-        self.idle_inhibiting_surfaces.retain(|s| s.is_alive());
+        self.idle_inhibiting_surfaces.retain(|s, _| s.is_alive());
 
-        let is_inhibited = self.is_fdo_idle_inhibited.load(Ordering::SeqCst)
-            || self.idle_inhibiting_surfaces.iter().any(|surface| {
+        // Mutter inhibits while the surface is not effectively obscured; being presented on some
+        // output is our reading of that, and drops on a hidden workspace or under the shield.
+        let visible: Vec<&WlSurface> = self
+            .idle_inhibiting_surfaces
+            .keys()
+            .filter(|surface| {
                 with_states(surface, |states| {
                     surface_primary_scanout_output(surface, states).is_some()
                 })
-            });
+            })
+            .collect();
+        self.idle_inhibit_forwarder.sync(visible.iter().copied());
+
+        // ext-idle-notify: our own inhibitors answer immediately and without a session bus;
+        // gnome-session's verdict adds every other source (D-Bus inhibitors included).
+        let is_inhibited =
+            self.idle_inhibit_forwarder.is_any_held() || self.is_session_idle_inhibited;
         self.idle_notifier_state.set_is_inhibited(is_inhibited);
     }
 

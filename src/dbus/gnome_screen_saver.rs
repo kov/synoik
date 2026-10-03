@@ -5,12 +5,11 @@
 //! `org.gnome.ScreenSaver` — the interface a GNOME session locks the screen through
 //! (`js/ui/shellDBus.js:517-566`, `data/dbus-interfaces/org.gnome.ScreenSaver.xml`).
 //!
-//! Not to be confused with [`super::freedesktop_screensaver`], which is a *different* name and a
-//! different job: `org.freedesktop.ScreenSaver` is `Inhibit`/`UnInhibit`, what a video player
-//! calls to stop the screen blanking. Nothing in it can lock. Serving only that one — which is
-//! where this fork stood until now — leaves `Lock` unowned, so gsd-power's idle lock, its
-//! lock-on-suspend, and `loginctl lock-session` all land on a name nobody answers and the session
-//! silently never locks.
+//! Not to be confused with `org.freedesktop.ScreenSaver`, which is a *different* name and a
+//! different job: `Inhibit`/`UnInhibit`, what a video player calls to stop the screen blanking.
+//! gsd-screensaver-proxy owns that one, and nothing in it can lock; without this interface `Lock`
+//! is unowned, so gsd-power's idle lock, its lock-on-suspend, and `loginctl lock-session` all land
+//! on a name nobody answers and the session silently never locks.
 //!
 //! # Two names, on purpose
 //!

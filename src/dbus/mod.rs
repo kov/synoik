@@ -20,7 +20,6 @@ pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
 pub mod freedesktop_notifications;
-pub mod freedesktop_screensaver;
 pub mod gdm;
 pub mod gnome_screen_saver;
 pub mod gnome_session;
@@ -32,6 +31,7 @@ pub mod gnome_shell_screenshot;
 pub mod gnome_software;
 pub mod gtk_notifications;
 pub mod ibus;
+pub mod idle_inhibit;
 pub mod mpris;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
@@ -55,7 +55,6 @@ use mutter_screen_cast::ScreenCast;
 
 use self::freedesktop_a11y::KeyboardMonitor;
 use self::freedesktop_notifications::Notifications;
-use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_screen_saver::GnomeScreenSaver;
 use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
@@ -75,11 +74,10 @@ trait Start: Interface {
 pub struct DBusServers {
     pub conn_service_channel: Option<Connection>,
     pub conn_display_config: Option<Connection>,
-    pub conn_screen_saver: Option<Connection>,
     /// The system-bus connection behind the unlock dialog's verifier.
     pub conn_gdm: Option<Connection>,
     /// org.gnome.ScreenSaver + org.gnome.Shell.ScreenShield — the *locking* screensaver
-    /// interface, as opposed to `conn_screen_saver`'s inhibit-only one.
+    /// interface, as opposed to `org.freedesktop.ScreenSaver`'s inhibit-only one.
     pub conn_screen_shield: Option<Connection>,
     pub conn_screen_shot: Option<Connection>,
     pub conn_introspect: Option<Connection>,
@@ -95,6 +93,8 @@ pub struct DBusServers {
     pub conn_login1: Option<Connection>,
     /// gnome-session's presence, the shield's idle source.
     pub conn_presence: Option<Connection>,
+    /// The sender of our forwarded idle inhibits; see `idle_inhibit`.
+    pub conn_idle_inhibit: Option<Connection>,
     pub conn_accounts: Option<Connection>,
     pub conn_fprintd: Option<Connection>,
     pub conn_smartcard: Option<Connection>,
@@ -164,11 +164,8 @@ impl DBusServers {
                 .unwrap();
             dbus.conn_display_config = try_start(display_config);
 
-            let screen_saver = ScreenSaver::new(synoik.is_fdo_idle_inhibited.clone());
-            dbus.conn_screen_saver = try_start(screen_saver);
-
             // The lock half. A separate name and a separate object from the inhibit-only
-            // `org.freedesktop.ScreenSaver` above; see `dbus::gnome_screen_saver`.
+            // `org.freedesktop.ScreenSaver`; see `dbus::gnome_screen_saver`.
             let (to_niri, from_screen_saver) = calloop::channel::channel();
             let (to_screen_saver, from_niri) = async_channel::unbounded();
             synoik
@@ -468,6 +465,29 @@ impl DBusServers {
         match gnome_session_presence::start(to_niri) {
             Ok(conn) => dbus.conn_presence = Some(conn),
             Err(err) => warn!("error starting gnome-session presence watcher: {err:?}"),
+        }
+
+        // Reading `InhibitedActions` is ungated, like presence. *Taking* inhibits is gated like
+        // the services: a stray `synoik --headless` on the user's bus must not keep their
+        // session awake.
+        let forward_inhibits =
+            is_session_instance || config.debug.dbus_interfaces_in_non_session_instances;
+        let (to_niri, from_session_inhibit) = calloop::channel::channel();
+        synoik
+            .event_loop
+            .insert_source(from_session_inhibit, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_session_inhibit_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match idle_inhibit::start(to_niri) {
+            Ok(conn) => {
+                if forward_inhibits {
+                    synoik.idle_inhibit_forwarder.connect(conn.inner().clone());
+                }
+                dbus.conn_idle_inhibit = Some(conn);
+            }
+            Err(err) => warn!("error starting idle inhibit forwarding: {err:?}"),
         }
 
         let (to_niri, from_accounts) = calloop::channel::channel();

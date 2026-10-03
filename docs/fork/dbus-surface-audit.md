@@ -32,8 +32,9 @@ Full parity: `org.gnome.ScreenSaver`, `Shell.Screenshot`, `Shell.Introspect`, `S
 `Mutter.ScreenCast`(+`.Stream`), `Mutter.IdleMonitor`, `SessionManager.EndSessionDialog`,
 `freedesktop.Notifications`, `gtk.Notifications`, `freedesktop.a11y.KeyboardMonitor`.
 
-`org.freedesktop.ScreenSaver` (the inhibit half) and `org.kde.StatusNotifierWatcher` have no GNOME
-reference XML; both are ours to define.
+`org.kde.StatusNotifierWatcher` has no GNOME reference XML; it is ours to define.
+`org.freedesktop.ScreenSaver` (the inhibit half) is deliberately not ours: gsd-screensaver-proxy
+owns it, as under gnome-shell, and we are its client (`src/dbus/idle_inhibit.rs`).
 
 ## 2. Names we do not serve
 

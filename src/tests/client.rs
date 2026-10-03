@@ -22,6 +22,8 @@ use smithay::reexports::wayland_protocols::ext::background_effect::v1::client::e
     self, Capability, ExtBackgroundEffectManagerV1,
 };
 use smithay::reexports::wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+use smithay::reexports::wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1;
+use smithay::reexports::wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
     self, ZwpKeyboardShortcutsInhibitorV1,
@@ -121,6 +123,7 @@ pub struct State {
     pub background_effect_capabilities: Option<Capability>,
     pub seat: Option<WlSeat>,
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    pub idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     /// The in-flight wlr-screencopy capture, if any. One at a time is enough for tests.
     pub screencopy: Option<ScreencopyCapture>,
@@ -451,6 +454,7 @@ impl Client {
             background_effect_capabilities: None,
             seat: None,
             shortcuts_inhibit_manager: None,
+            idle_inhibit_manager: None,
             screencopy_manager: None,
             screencopy: None,
             keyboard: None,
@@ -571,6 +575,16 @@ impl Client {
 
     pub fn inhibit_shortcuts(&mut self, surface: &WlSurface) {
         self.state.inhibit_shortcuts(surface);
+    }
+
+    /// Create a `zwp_idle_inhibitor_v1` on `surface`; destroy the returned proxy to release it.
+    pub fn inhibit_idle(&mut self, surface: &WlSurface) -> ZwpIdleInhibitorV1 {
+        let manager = self
+            .state
+            .idle_inhibit_manager
+            .clone()
+            .expect("compositor advertises zwp_idle_inhibit_manager_v1");
+        manager.create_inhibitor(surface, &self.state.qh, ())
     }
 
     /// Begin a wlr-screencopy capture of `output`. The compositor answers with `buffer` +
@@ -1409,6 +1423,9 @@ impl Dispatch<WlRegistry, ()> for State {
                         ZwpKeyboardShortcutsInhibitManagerV1::interface().version,
                     );
                     state.shortcuts_inhibit_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpIdleInhibitManagerV1::interface().name {
+                    let version = min(version, ZwpIdleInhibitManagerV1::interface().version);
+                    state.idle_inhibit_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == ZwlrScreencopyManagerV1::interface().name {
                     let version = min(version, ZwlrScreencopyManagerV1::interface().version);
                     state.screencopy_manager = Some(registry.bind(name, version, qh, ()));
@@ -2105,6 +2122,32 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for State {
         _state: &mut Self,
         _proxy: &ZwpKeyboardShortcutsInhibitManagerV1,
         _event: <ZwpKeyboardShortcutsInhibitManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZwpIdleInhibitManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpIdleInhibitManagerV1,
+        _event: <ZwpIdleInhibitManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZwpIdleInhibitorV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpIdleInhibitorV1,
+        _event: <ZwpIdleInhibitorV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

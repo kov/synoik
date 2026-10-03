@@ -3106,6 +3106,197 @@ fn shortcuts_inhibit_disables_overlay_key() {
     );
 }
 
+/// Whether the compositor holds a forwarded idle inhibit once frames have caught up with `want`.
+///
+/// Visibility is read off what was last presented, so the answer can lag a change by a frame or
+/// two; this steps frames until it lands or a half second of clock has gone by.
+fn idle_inhibit_reaches(f: &mut Fixture, want: bool) -> bool {
+    f.advance_until(Duration::from_millis(500), |state| {
+        state.synoik.idle_inhibit_forwarder.is_any_held() == want
+    })
+}
+
+/// A fixture that presents frames, or `None` (the test skips) without a Vulkan device: "visible"
+/// is "presented on an output", and only a renderer presents anything.
+fn idle_inhibit_fixture(test: &str) -> Option<Fixture> {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!("skipping {test}: no Vulkan ({e})");
+        return None;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    Some(f)
+}
+
+/// A `zwp_idle_inhibitor_v1` on a visible surface becomes a session idle inhibit, held for as
+/// long as the inhibitor lives (mutter `meta-wayland-idle-inhibit.c:130-197`), and drives
+/// ext-idle-notify along with it.
+#[test]
+fn a_visible_idle_inhibitor_holds_a_session_inhibit() {
+    let Some(mut f) = idle_inhibit_fixture("a_visible_idle_inhibitor_holds_a_session_inhibit")
+    else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    f.settle();
+    assert!(
+        !f.synoik().idle_inhibit_forwarder.is_any_held(),
+        "nothing inhibits before the client asks"
+    );
+
+    let inhibitor = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(
+        idle_inhibit_reaches(&mut f, true),
+        "a visible window's inhibitor must be forwarded"
+    );
+
+    inhibitor.destroy();
+    f.roundtrip(id);
+    assert!(
+        idle_inhibit_reaches(&mut f, false),
+        "destroying the inhibitor must release it"
+    );
+}
+
+/// Mutter drops the inhibit while the surface is not shown: a window on a workspace the user
+/// switched away from keeps nobody's screen awake, and switching back takes it again.
+#[test]
+fn an_idle_inhibitor_on_a_hidden_workspace_is_released() {
+    let Some(mut f) = idle_inhibit_fixture("an_idle_inhibitor_on_a_hidden_workspace_is_released")
+    else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let _inhibitor = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, true));
+
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    assert!(
+        idle_inhibit_reaches(&mut f, false),
+        "a window on a workspace that is not shown must not inhibit idle"
+    );
+
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+    assert!(
+        idle_inhibit_reaches(&mut f, true),
+        "coming back to the workspace must inhibit again"
+    );
+}
+
+/// A minimized window is not shown, so its inhibitor is not either.
+#[test]
+fn an_idle_inhibitor_on_a_minimized_window_is_released() {
+    let Some(mut f) = idle_inhibit_fixture("an_idle_inhibitor_on_a_minimized_window_is_released")
+    else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let _inhibitor = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, true));
+
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state().minimize_window(&window);
+    f.settle();
+    assert!(
+        idle_inhibit_reaches(&mut f, false),
+        "a minimized window must not inhibit idle"
+    );
+}
+
+/// Under the lock shield no window is shown (gnome-shell hides the window group), so a video left
+/// playing behind a locked screen must not keep the display from blanking.
+#[test]
+fn an_idle_inhibitor_behind_the_lock_shield_is_released() {
+    let Some(mut f) = idle_inhibit_fixture("an_idle_inhibitor_behind_the_lock_shield_is_released")
+    else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let _inhibitor = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, true));
+
+    f.synoik_state().on_screen_saver_msg(
+        crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(None),
+    );
+    f.settle();
+    assert!(
+        idle_inhibit_reaches(&mut f, false),
+        "a window hidden by the lock shield must not inhibit idle"
+    );
+}
+
+/// Inhibitors are per object, not per surface: with two on one surface, destroying one leaves
+/// the surface inhibiting.
+#[test]
+fn two_idle_inhibitors_on_one_surface_release_independently() {
+    let Some(mut f) =
+        idle_inhibit_fixture("two_idle_inhibitors_on_one_surface_release_independently")
+    else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let first = f.client(id).inhibit_idle(&surface);
+    let second = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, true));
+
+    first.destroy();
+    f.roundtrip(id);
+    // Not `idle_inhibit_reaches(true)`, which would pass on the spot: give a wrong release the
+    // frames it needs to show.
+    idle_inhibit_reaches(&mut f, false);
+    assert!(
+        f.synoik().idle_inhibit_forwarder.is_any_held(),
+        "the surface still has a live inhibitor"
+    );
+
+    second.destroy();
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, false));
+}
+
+/// A surface destroyed with its inhibitor still alive (a client tearing down carelessly, or
+/// dying) must not leave the inhibit held.
+#[test]
+fn an_idle_inhibitor_dies_with_its_surface() {
+    let Some(mut f) = idle_inhibit_fixture("an_idle_inhibitor_dies_with_its_surface") else {
+        return;
+    };
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let _inhibitor = f.client(id).inhibit_idle(&surface);
+    f.roundtrip(id);
+    assert!(idle_inhibit_reaches(&mut f, true));
+
+    let w = f.client(id).window(&surface);
+    w.xdg_toplevel.destroy();
+    w.xdg_surface.destroy();
+    w.surface.destroy();
+    f.double_roundtrip(id);
+    f.settle();
+    assert!(
+        idle_inhibit_reaches(&mut f, false),
+        "a dead surface's inhibitor must be released"
+    );
+}
+
 /// The GNOME `close` keybinding (`org.gnome.desktop.wm.keybindings`, default
 /// `<Alt>F4`) asks the focused window to close, through the same xdg-toplevel
 /// close event any close request uses.

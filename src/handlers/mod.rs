@@ -9,6 +9,7 @@ mod compositor;
 mod layer_shell;
 mod xdg_shell;
 
+use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
@@ -598,11 +599,20 @@ delegate_idle_notify!(State);
 
 impl IdleInhibitHandler for State {
     fn inhibit(&mut self, surface: WlSurface) {
-        self.synoik.idle_inhibiting_surfaces.insert(surface);
+        *self
+            .synoik
+            .idle_inhibiting_surfaces
+            .entry(surface)
+            .or_default() += 1;
     }
 
     fn uninhibit(&mut self, surface: WlSurface) {
-        self.synoik.idle_inhibiting_surfaces.remove(&surface);
+        if let Entry::Occupied(mut count) = self.synoik.idle_inhibiting_surfaces.entry(surface) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
     }
 }
 delegate_idle_inhibit!(State);
