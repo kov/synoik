@@ -16184,6 +16184,82 @@ fn vulkan_app_expose_covers_other_apps_windows() {
     assert!(!is_green(p), "the other app's window is covered, got {p:?}");
 }
 
+/// Another app's window between two of the app's keeps its place as App Exposé goes away: near
+/// the end of the exit it shows where it does on the desktop, over the lower preview and under
+/// the upper one, instead of under both until the desktop takes over.
+///
+/// Nested squares, centred: the app's 400 and 200 pixel windows around another's 300. In the
+/// desktop's stack the other app's shows as a ring between them.
+#[test]
+fn vulkan_app_expose_keeps_another_apps_window_in_the_stack() {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    f.synoik().hotkey_overlay.hide();
+    super::gnome::switcher_apps(&mut f);
+    let id = f.add_client();
+    let map = |f: &mut Fixture, app: &str, color: [u32; 4], size: u16| {
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.set_app_id(app);
+        window.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(color[0], color[1], color[2], color[3]);
+        window.set_size(size, size);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.synoik_complete_animations();
+        f.double_roundtrip(id);
+    };
+    const BLUE: [u32; 4] = [0, 0, u32::MAX, u32::MAX];
+    map(&mut f, "org.example.One", RED, 400);
+    map(&mut f, "org.example.Two", BLUE, 300);
+    map(&mut f, "org.example.One", GREEN, 200);
+    let output = f.synoik_output(1);
+
+    let ring = 300 * 300 - 200 * 200;
+    let blue = |f: &mut Fixture| {
+        let (pixels, w, h) = render_output_vulkan(f, &output);
+        count_px(&pixels, w, h, |p| p[2] > 180 && p[0] < 60 && p[1] < 60)
+    };
+    assert_eq!(
+        blue(&mut f),
+        ring,
+        "precondition: the ring shows on the desktop"
+    );
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle_animations();
+    f.freeze_clock();
+    f.synoik_state().toggle_app_expose();
+    let progress = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .and_then(|mon| mon.app_expose_progress())
+    };
+    while progress(&mut f).is_some_and(|p| p > 0.05) {
+        f.advance_clock(Duration::from_millis(8));
+    }
+    let p = progress(&mut f).expect("precondition: still on its way out");
+
+    let shown = blue(&mut f);
+    // Bounded both ways: above every preview it would show its whole square, the inner one too.
+    assert!(
+        shown > ring * 9 / 10 && shown < ring * 11 / 10,
+        "at progress {p} the ring shows nearly whole, got {shown} of {ring} pixels"
+    );
+}
+
 /// A window from another workspace has nowhere on screen to fly from, so it fades in at its
 /// slot: part-way up, its slot shows it blended over the backdrop, by the measured ends.
 #[test]

@@ -298,6 +298,52 @@ fn the_activated_window_draws_on_top_on_the_way_back() {
     );
 }
 
+/// Another app's window keeps its place in the stack while App Exposé comes and goes: one
+/// between two of the app's windows stays between their previews, rather than going under both
+/// until the desktop takes over on the last frame.
+#[test]
+fn another_apps_window_keeps_its_place_among_the_previews() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, ONE);
+    let a1 = focused(&mut f);
+    map_window_for_app(&mut f, client, TWO);
+    let b = focused(&mut f);
+    map_window_for_app(&mut f, client, ONE);
+    let a2 = focused(&mut f);
+    let out = output(&mut f, "headless-1");
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.turn();
+    let expected = [a2.clone(), b.clone(), a1.clone()];
+    assert_eq!(
+        f.synoik().layout.app_expose_draw_order(&out),
+        expected,
+        "on the way up"
+    );
+
+    f.settle();
+    f.synoik_state().toggle_app_expose();
+    f.turn();
+    assert!(
+        f.synoik()
+            .layout
+            .monitors()
+            .next()
+            .unwrap()
+            .app_expose_progress()
+            .is_some(),
+        "precondition: still on its way out"
+    );
+    assert_eq!(
+        f.synoik().layout.app_expose_draw_order(&out),
+        expected,
+        "on the way out"
+    );
+}
+
 /// Locking puts App Exposé away: its input is the shell's, and a locked session has none.
 #[test]
 fn locking_puts_it_away() {

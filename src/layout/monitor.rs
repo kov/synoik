@@ -19,12 +19,13 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use synoik_config::{CornerRadius, LayoutPart, WindowingMode};
 
+use super::app_expose::AppExposeItem;
 use super::focus_ring::FocusRing;
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
 use super::shadow::Shadow;
 use super::thumbnails::{self, Strip};
-use super::tile::Tile;
+use super::tile::{Tile, TileRenderElement};
 use super::workspace::{
     active_workspace_shadow_config, compute_working_area, Workspace, WorkspaceAddWindowTarget,
     WorkspaceId, WorkspaceRenderElement,
@@ -35,6 +36,7 @@ use crate::frame_log::AnimCauses;
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::{self, SwipeTracker};
 use crate::output_identity::OutputIdentity;
+use crate::render_helpers::offscreen::OffscreenBuffer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -292,6 +294,9 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) app_expose: Option<super::app_expose::MonitorAppExpose<W>>,
     /// This display's App Exposé grid decision, held across queries.
     pub(super) app_expose_held: super::expose::HeldLayout,
+    /// The offscreens the other apps' windows fade through while App Exposé comes and goes, one
+    /// per window, kept across the animation's frames and dropped with App Exposé.
+    pub(super) app_expose_fades: super::app_expose::AppExposeFades<W>,
     /// gnome-shell's `ControlsState` show-apps fraction (0 = window picker, 1 = app
     /// grid): eased when the show-apps state flips, shrinking the picker box and
     /// sliding the app grid up (`overviewControls.js` state adjustment). The target.
@@ -896,6 +901,7 @@ impl<W: LayoutElement> Monitor<W> {
             peek_progress: 0.,
             app_expose: None,
             app_expose_held: super::expose::HeldLayout::default(),
+            app_expose_fades: Default::default(),
             app_grid_shown: false,
             app_grid_expand: None,
             app_grid_gesture: None,
@@ -5044,8 +5050,18 @@ impl<W: LayoutElement> Monitor<W> {
         };
 
         let hidden = self.app_expose_hidden();
+        // On the active workspace App Exposé draws every window itself, its own app's as
+        // previews and the rest fading, so the two interleave in the stack.
+        let active_hidden = self
+            .app_expose
+            .as_ref()
+            .map(|_| self.workspaces[self.active_workspace_idx].tile_ids());
 
         for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
+            let hidden = match &active_hidden {
+                Some(ids) if idx == self.active_workspace_idx => &ids[..],
+                _ => hidden,
+            };
             let ws_zoom = zoom * self.workspace_render_scale(idx);
             // Macro instead of closure because ws and insert hint have different elem types.
             macro_rules! push_cropped_to {
@@ -5133,32 +5149,78 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
 
         // First pushed is topmost.
-        for entry in self.app_expose_draw_order() {
-            if entry.on_screen != on_screen {
-                continue;
+        for item in self.app_expose_draw_order() {
+            match item {
+                AppExposeItem::Preview(entry) => {
+                    if entry.on_screen != on_screen {
+                        continue;
+                    }
+                    let (pos, tile_scale) = entry.placement(progress);
+                    let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+                    entry.tile.render(ctx.r(), pos, false, &mut |elem| {
+                        push_app_expose_tile_elem(elem, pos, tile_scale, scale, push)
+                    });
+                }
+                AppExposeItem::Fading { tile, pos, .. } => {
+                    if on_screen {
+                        self.render_app_expose_fading(ctx.r(), tile, pos, 1. - progress, push);
+                    }
+                }
             }
-            let (pos, tile_scale) = entry.placement(progress);
-            let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-            entry.tile.render(ctx.r(), pos, false, &mut |elem| {
-                let elem = WorkspaceRenderElement::from(RescaleRenderElement::from_element(
-                    elem,
-                    pos.to_physical_precise_round(scale),
-                    tile_scale,
-                ));
-                let Some(elem) = CropRenderElement::from_element(elem, scale, uncropped()) else {
-                    return;
-                };
-                let elem = RescaleRenderElement::from_element(
-                    MonitorInnerRenderElement::from(elem),
-                    Point::default(),
-                    1.,
-                );
-                push(RelocateRenderElement::from_element(
-                    elem,
-                    Point::default(),
-                    Relocate::Relative,
-                ));
+        }
+    }
+
+    /// Another app's window, in its place at `alpha` — leaving as App Exposé comes up, through an
+    /// offscreen so the window fades as one picture rather than its shadow showing through it.
+    fn render_app_expose_fading(
+        &self,
+        mut ctx: RenderCtx,
+        tile: &Tile<W>,
+        pos: Point<f64, Logical>,
+        alpha: f64,
+        push: &mut dyn FnMut(MonitorRenderElement),
+    ) {
+        let scale = self.scale.fractional_scale();
+        if alpha <= 0.001 {
+            return;
+        }
+        if alpha >= 0.999 {
+            tile.render(ctx.r(), pos, false, &mut |elem| {
+                push_app_expose_tile_elem(elem, pos, 1., scale, push)
             });
+            return;
+        }
+
+        let mut elements = Vec::new();
+        tile.render(ctx.r(), Point::default(), false, &mut |elem| {
+            elements.push(elem)
+        });
+        let mut fades = self.app_expose_fades.borrow_mut();
+        let id = tile.window().id();
+        let idx = match fades.iter().position(|(fade_id, _)| fade_id == id) {
+            Some(idx) => idx,
+            None => {
+                fades.push((id.clone(), OffscreenBuffer::default()));
+                fades.len() - 1
+            }
+        };
+        match fades[idx]
+            .1
+            .render(ctx.renderer, Scale::from(scale), &elements)
+        {
+            Ok((elem, _sync, _data)) => {
+                let offset = elem.offset();
+                let elem = elem.with_alpha(alpha as f32).with_offset(pos + offset);
+                push_app_expose_tile_elem(elem.into(), pos, 1., scale, push);
+            }
+            // Shown whole rather than not at all: a window popping out at the end of the fade
+            // beats one missing for the length of it.
+            Err(err) => {
+                warn!("error rendering a window fading for App Exposé: {err:?}");
+                for elem in elements {
+                    push_app_expose_tile_elem(elem, pos, 1., scale, push);
+                }
+            }
         }
     }
 
@@ -5926,6 +5988,35 @@ fn thumbnail_hairline_config() -> synoik_config::FocusRing {
 /// (`overview_grid_transition_moves_the_row_monotonically` in the conformance
 /// corpus); here we pin the endpoints themselves, as plain algebra, so a
 /// regression in either row is attributable without an animation in the picture.
+/// One of a tile's elements as App Exposé draws it: at `pos`, scaled by `tile_scale` about it,
+/// uncropped.
+fn push_app_expose_tile_elem(
+    elem: TileRenderElement,
+    pos: Point<f64, Logical>,
+    tile_scale: f64,
+    scale: f64,
+    push: &mut dyn FnMut(MonitorRenderElement),
+) {
+    let elem = WorkspaceRenderElement::from(RescaleRenderElement::from_element(
+        elem,
+        pos.to_physical_precise_round(scale),
+        tile_scale,
+    ));
+    let Some(elem) = CropRenderElement::from_element(elem, scale, uncropped()) else {
+        return;
+    };
+    let elem = RescaleRenderElement::from_element(
+        MonitorInnerRenderElement::from(elem),
+        Point::default(),
+        1.,
+    );
+    push(RelocateRenderElement::from_element(
+        elem,
+        Point::default(),
+        Relocate::Relative,
+    ));
+}
+
 #[cfg(test)]
 mod row_tests {
     use super::fit_single_row;

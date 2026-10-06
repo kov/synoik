@@ -91,16 +91,22 @@ workspace on a display shares its view size, so the workspace-local rects are al
 
 Back to front:
 
-1. The **live desktop**, as normally drawn — minus the app's windows on the active workspace,
-   which are drawn by step 3 instead.
-2. The **blurred wallpaper**, pushed at App Exposé's progress over the live desktop. That fade *is*
-   the other windows leaving; they need no animation of their own. Unlike the overview's backdrop
-   this one must cover, so with no blur to be had the solid backdrop stands in.
-3. The app's **windows at their slots**, with their preview chrome:
-   - on the active workspace they interpolate from their live rect to the slot, with the picker's
-     own placement function at zoom 1;
-   - on any other workspace they have no on-screen origin, so they scale up into the slot while
-     fading in — composited as one group, since their slots never overlap.
+1. The **live desktop**, as normally drawn — minus every window on the active workspace, which
+   step 3 draws instead.
+2. The **blurred wallpaper**, pushed at App Exposé's progress. Unlike the overview's backdrop this
+   one must cover, so with no blur to be had the solid backdrop stands in.
+3. The active workspace's windows **in their stack order**, so a window of another app between
+   two of the app's stays between their previews the whole way rather than popping into place
+   when the desktop takes over:
+   - the app's windows interpolate from their live rect to their slot, with the picker's own
+     placement function at zoom 1, and draw with their preview chrome; the hovered one draws
+     on top;
+   - every other window stays in its place and fades out at `1 − progress`, each through an
+     offscreen of its own so it fades as one picture — one per window, only while the
+     animation runs (none at either end). The fade over the backdrop *is* those windows leaving.
+
+   The app's windows on any other workspace have no on-screen origin, so they scale up into the
+   slot while fading in — composited as one group, since their slots never overlap.
 4. The **panel**, unchanged apart from the overview's background fade.
 
 The overview's chrome block, the thumbnail strip, and the picker's per-workspace wallpaper and

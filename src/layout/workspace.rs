@@ -309,8 +309,14 @@ type ExposeLayout<'a, W> = Vec<(
 )>;
 
 /// One of an app's tiles found on a workspace for App Exposé — see
-/// [`Workspace::app_expose_tiles`].
-pub(super) type AppExposeTile<'a, W> = (&'a Tile<W>, ExposeInput, Rectangle<f64, Logical>, f64);
+/// [`Workspace::app_expose_tiles`]. The first field is its place in the workspace's stack.
+pub(super) type AppExposeTile<'a, W> = (
+    usize,
+    &'a Tile<W>,
+    ExposeInput,
+    Rectangle<f64, Logical>,
+    f64,
+);
 
 /// Picker-overlay progress per window — see [`Workspace::expose_hover`].
 type ExposeHovers<W> = Vec<(<W as LayoutElement>::Id, Animation)>;
@@ -2990,17 +2996,39 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     /// The tiles of `windows` that live here, for App Exposé's per-display grid
-    /// (`docs/fork/app-expose.md`): each with the input it is laid out over, the rect it draws
-    /// from, and its scale there — the picker's own three, see [`Self::expose_layout`].
+    /// (`docs/fork/app-expose.md`): each with its place in the stack, the input it is laid out
+    /// over, the rect it draws from, and its scale there — the picker's own three, see
+    /// [`Self::expose_layout`].
     pub(super) fn app_expose_tiles(&self, windows: &[W::Id]) -> Vec<AppExposeTile<'_, W>> {
         self.tiles_with_render_positions()
             .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size()), 1.))
             .chain(self.minimized_render_rects())
-            .filter(|(tile, _, _)| windows.contains(tile.window().id()))
-            .filter_map(|(tile, rect, from_scale)| {
+            .enumerate()
+            .filter(|(_, (tile, _, _))| windows.contains(tile.window().id()))
+            .filter_map(|(stack, (tile, rect, from_scale))| {
                 let input = self.expose_input(tile.window().id())?;
-                Some((tile, input, rect, from_scale))
+                Some((stack, tile, input, rect, from_scale))
             })
+            .collect()
+    }
+
+    /// The on-screen tiles App Exposé does *not* show, with their places in the stack — counted
+    /// as [`Self::app_expose_tiles`] counts them, so the two interleave — and their positions.
+    pub(super) fn app_expose_others(
+        &self,
+        windows: &[W::Id],
+    ) -> Vec<(usize, &Tile<W>, Point<f64, Logical>)> {
+        self.tiles_with_render_positions()
+            .enumerate()
+            .filter(|(_, (tile, _, visible))| *visible && !windows.contains(tile.window().id()))
+            .map(|(stack, (tile, pos, _))| (stack, tile, pos))
+            .collect()
+    }
+
+    /// Every tile's id — what the live desktop leaves to App Exposé on its active workspace.
+    pub(super) fn tile_ids(&self) -> Vec<W::Id> {
+        self.tiles()
+            .map(|tile| tile.window().id().clone())
             .collect()
     }
 

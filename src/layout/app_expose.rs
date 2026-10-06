@@ -9,6 +9,7 @@
 //!
 //! `Layout` knows nothing about apps: the windows are decided by the caller and handed in.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use smithay::utils::{Logical, Point, Rectangle};
@@ -20,6 +21,7 @@ use super::workspace::{expose_tile_render, AppExposeTile};
 use super::{Layout, LayoutElement, OVERVIEW_GESTURE_MOVEMENT};
 use crate::animation::Animation;
 use crate::input::swipe_tracker::{self, SwipeTracker};
+use crate::render_helpers::offscreen::OffscreenBuffer;
 
 /// How large a window from another workspace starts, relative to its slot. It has no on-screen
 /// origin to fly from, so it grows into the slot from here while it fades in.
@@ -96,6 +98,41 @@ pub(super) struct AppExposeEntry<'a, W: LayoutElement> {
     stack: usize,
 }
 
+/// One window as App Exposé draws it on its display.
+#[derive(Debug)]
+pub(super) enum AppExposeItem<'a, W: LayoutElement> {
+    /// One of the app's, in the grid.
+    Preview(AppExposeEntry<'a, W>),
+    /// Another app's window on the active workspace, fading in its place as App Exposé comes up.
+    /// Drawn here rather than by the live desktop so that it keeps its place in the stack among
+    /// the previews: under the backdrop, every preview would cover it until the very last frame.
+    Fading {
+        tile: &'a Tile<W>,
+        /// Where it sits, in output coordinates.
+        pos: Point<f64, Logical>,
+        stack: usize,
+    },
+}
+
+impl<W: LayoutElement> AppExposeItem<'_, W> {
+    fn sort_key(&self) -> (f64, bool, usize) {
+        match self {
+            AppExposeItem::Preview(entry) => (entry.hover, !entry.on_screen, entry.stack),
+            AppExposeItem::Fading { stack, .. } => (0., false, *stack),
+        }
+    }
+
+    fn tile(&self) -> &Tile<W> {
+        match self {
+            AppExposeItem::Preview(entry) => entry.tile,
+            AppExposeItem::Fading { tile, .. } => tile,
+        }
+    }
+}
+
+/// See [`Monitor::app_expose_fades`].
+pub(super) type AppExposeFades<W> = RefCell<Vec<(<W as LayoutElement>::Id, OffscreenBuffer)>>;
+
 impl<W: LayoutElement> AppExposeEntry<'_, W> {
     /// Where the preview draws at `progress`, and at what scale — the picker's own geometry,
     /// hover growth included, at zoom 1.
@@ -119,6 +156,9 @@ impl<W: LayoutElement> AppExposeEntry<'_, W> {
 
 impl<W: LayoutElement> Monitor<W> {
     pub(super) fn set_app_expose(&mut self, state: Option<(&[W::Id], f64, bool)>) {
+        if state.is_none() {
+            self.app_expose_fades.borrow_mut().clear();
+        }
         self.app_expose = state.map(|(windows, progress, open)| MonitorAppExpose {
             windows: windows.to_vec(),
             progress,
@@ -167,24 +207,23 @@ impl<W: LayoutElement> Monitor<W> {
             .nth(active)
             .map_or_else(Point::default, |geo| geo.loc);
 
-        let mut found: Vec<(usize, usize, AppExposeTile<'_, W>)> = self
+        let mut found: Vec<(usize, AppExposeTile<'_, W>)> = self
             .workspaces
             .iter()
             .enumerate()
             .flat_map(|(ws_idx, ws)| {
                 ws.app_expose_tiles(&state.windows)
                     .into_iter()
-                    .enumerate()
-                    .map(move |(stack, found)| (ws_idx, stack, found))
+                    .map(move |found| (ws_idx, found))
             })
             .collect();
         // Stable creation order, for the reason the picker uses it — see
         // `Workspace::expose_live_inputs`.
-        found.sort_by_key(|(_, _, (_, (seq, _), _, _))| *seq);
+        found.sort_by_key(|(_, (_, _, (seq, _), _, _))| *seq);
 
         let inputs: Vec<ExposeInput> = found
             .iter()
-            .map(|(_, _, (_, input, _, _))| *input)
+            .map(|(_, (_, _, input, _, _))| *input)
             .collect();
         let area = self.workspaces[active].expose_area();
         let slots = self.app_expose_held.slots(inputs, self.view_size, area);
@@ -192,7 +231,7 @@ impl<W: LayoutElement> Monitor<W> {
         found
             .into_iter()
             .zip(slots)
-            .map(|((ws_idx, stack, (tile, _, rect, from_scale)), slot)| {
+            .map(|((ws_idx, (stack, tile, _, rect, from_scale)), slot)| {
                 let hover = self.workspaces[ws_idx].expose_hover_value(tile.window().id());
                 if ws_idx == active {
                     AppExposeEntry {
@@ -230,13 +269,42 @@ impl<W: LayoutElement> Monitor<W> {
             .collect()
     }
 
-    /// The grid in draw order, first topmost: the hovered preview above its neighbours, as in the
-    /// picker (`render_expose`), and otherwise each workspace's own stack. Previews of different
-    /// workspaces never meet — those of other workspaces draw as a group of their own.
-    pub(super) fn app_expose_draw_order(&self) -> Vec<AppExposeEntry<'_, W>> {
-        let mut layout = self.app_expose_layout();
-        layout.sort_by(|a, b| b.hover.total_cmp(&a.hover).then(a.stack.cmp(&b.stack)));
-        layout
+    /// What App Exposé draws, first topmost: the hovered preview above its neighbours, as in the
+    /// picker (`render_expose`), and otherwise each workspace's own stack, the active one's other
+    /// windows fading in their places among the previews. Previews of different workspaces never
+    /// meet — those of other workspaces draw as a group of their own.
+    pub(super) fn app_expose_draw_order(&self) -> Vec<AppExposeItem<'_, W>> {
+        let Some(state) = &self.app_expose else {
+            return Vec::new();
+        };
+        let active_loc = self
+            .workspaces_render_geo()
+            .nth(self.active_workspace_idx)
+            .map_or_else(Point::default, |geo| geo.loc);
+        let others = self.workspaces[self.active_workspace_idx]
+            .app_expose_others(&state.windows)
+            .into_iter()
+            .map(|(stack, tile, pos)| AppExposeItem::Fading {
+                tile,
+                pos: pos + active_loc,
+                stack,
+            });
+
+        let mut items: Vec<_> = self
+            .app_expose_layout()
+            .into_iter()
+            .map(AppExposeItem::Preview)
+            .chain(others)
+            .collect();
+        items.sort_by(|a, b| {
+            let (a_hover, a_off, a_stack) = a.sort_key();
+            let (b_hover, b_off, b_stack) = b.sort_key();
+            b_hover
+                .total_cmp(&a_hover)
+                .then(a_off.cmp(&b_off))
+                .then(a_stack.cmp(&b_stack))
+        });
+        items
     }
 
     /// The window whose slot is under `pos` (output coordinates) — the picker's hit test,
@@ -552,14 +620,15 @@ impl<W: LayoutElement> Layout<W> {
             .unwrap_or_default()
     }
 
-    /// The windows of `output`'s App Exposé in the order their previews draw, topmost first.
+    /// The windows App Exposé draws on `output`, topmost first: its previews and the windows
+    /// fading among them.
     pub fn app_expose_draw_order(&self, output: &smithay::output::Output) -> Vec<W::Id> {
         self.monitors()
             .find(|mon| mon.output() == output)
             .map(|mon| {
                 mon.app_expose_draw_order()
-                    .into_iter()
-                    .map(|entry| entry.tile.window().id().clone())
+                    .iter()
+                    .map(|item| item.tile().window().id().clone())
                     .collect()
             })
             .unwrap_or_default()
