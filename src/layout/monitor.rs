@@ -5132,12 +5132,8 @@ impl<W: LayoutElement> Monitor<W> {
         };
         let scale = self.scale.fractional_scale();
 
-        // The hovered preview draws above its neighbours, as in the picker (`render_expose`);
-        // first pushed is topmost.
-        let mut layout = self.app_expose_layout();
-        layout.sort_by(|a, b| b.hover.total_cmp(&a.hover));
-
-        for entry in layout {
+        // First pushed is topmost.
+        for entry in self.app_expose_draw_order() {
             if entry.on_screen != on_screen {
                 continue;
             }

@@ -256,6 +256,48 @@ fn activating_a_window_on_another_workspace_switches_to_it() {
     assert!(ws.holds_window(&c), "its workspace is the active one");
 }
 
+/// The previews draw in their windows' stack, so the window activated from App Exposé is raised
+/// for the whole way back — not left under its neighbours until the desktop takes over.
+#[test]
+fn the_activated_window_draws_on_top_on_the_way_back() {
+    let mut f = Fixture::new();
+    let (one, _) = one_display_two_workspaces(&mut f);
+    let (a, b) = (one[0].clone(), one[1].clone());
+    let out = output(&mut f, "headless-1");
+    // The older window on top, so the one activated below is the later-created: creation order
+    // alone cannot pass this.
+    f.synoik().layout.activate_window(&a);
+    f.settle();
+
+    f.synoik_state().do_action(Action::ToggleAppExpose, false);
+    f.settle();
+    // Only the order within a workspace means anything: the others' previews are a group apart.
+    let order = |f: &mut Fixture| -> Vec<Window> {
+        let mut order = f.synoik().layout.app_expose_draw_order(&out);
+        order.retain(|w| *w == a || *w == b);
+        order
+    };
+    assert_eq!(order(&mut f), [a.clone(), b.clone()], "the stack as it was");
+
+    assert!(f.synoik().layout.activate_app_expose_window(&b));
+    f.turn();
+    assert!(
+        f.synoik()
+            .layout
+            .monitors()
+            .next()
+            .unwrap()
+            .app_expose_progress()
+            .is_some(),
+        "precondition: still on its way out"
+    );
+    assert_eq!(
+        order(&mut f),
+        [b.clone(), a.clone()],
+        "the activated window is on top from the start"
+    );
+}
+
 /// Locking puts App Exposé away: its input is the shell's, and a locked session has none.
 #[test]
 fn locking_puts_it_away() {

@@ -91,6 +91,9 @@ pub(super) struct AppExposeEntry<'a, W: LayoutElement> {
     pub on_screen: bool,
     /// How far the picker overlay is up on it — the hover growth.
     pub hover: f64,
+    /// Its place in its workspace's stack, front-to-back — what the previews draw in, so a
+    /// window raised on activation is on top for the whole way back.
+    stack: usize,
 }
 
 impl<W: LayoutElement> AppExposeEntry<'_, W> {
@@ -164,28 +167,32 @@ impl<W: LayoutElement> Monitor<W> {
             .nth(active)
             .map_or_else(Point::default, |geo| geo.loc);
 
-        let mut found: Vec<(usize, AppExposeTile<'_, W>)> = self
+        let mut found: Vec<(usize, usize, AppExposeTile<'_, W>)> = self
             .workspaces
             .iter()
             .enumerate()
             .flat_map(|(ws_idx, ws)| {
                 ws.app_expose_tiles(&state.windows)
                     .into_iter()
-                    .map(move |found| (ws_idx, found))
+                    .enumerate()
+                    .map(move |(stack, found)| (ws_idx, stack, found))
             })
             .collect();
         // Stable creation order, for the reason the picker uses it — see
         // `Workspace::expose_live_inputs`.
-        found.sort_by_key(|(_, (_, (seq, _), _, _))| *seq);
+        found.sort_by_key(|(_, _, (_, (seq, _), _, _))| *seq);
 
-        let inputs: Vec<ExposeInput> = found.iter().map(|(_, (_, input, _, _))| *input).collect();
+        let inputs: Vec<ExposeInput> = found
+            .iter()
+            .map(|(_, _, (_, input, _, _))| *input)
+            .collect();
         let area = self.workspaces[active].expose_area();
         let slots = self.app_expose_held.slots(inputs, self.view_size, area);
 
         found
             .into_iter()
             .zip(slots)
-            .map(|((ws_idx, (tile, _, rect, from_scale)), slot)| {
+            .map(|((ws_idx, stack, (tile, _, rect, from_scale)), slot)| {
                 let hover = self.workspaces[ws_idx].expose_hover_value(tile.window().id());
                 if ws_idx == active {
                     AppExposeEntry {
@@ -195,6 +202,7 @@ impl<W: LayoutElement> Monitor<W> {
                         from_scale,
                         on_screen: true,
                         hover,
+                        stack,
                     }
                 } else {
                     // Nowhere on screen to come from: start a little smaller than the slot,
@@ -215,10 +223,20 @@ impl<W: LayoutElement> Monitor<W> {
                         from_scale,
                         on_screen: false,
                         hover,
+                        stack,
                     }
                 }
             })
             .collect()
+    }
+
+    /// The grid in draw order, first topmost: the hovered preview above its neighbours, as in the
+    /// picker (`render_expose`), and otherwise each workspace's own stack. Previews of different
+    /// workspaces never meet — those of other workspaces draw as a group of their own.
+    pub(super) fn app_expose_draw_order(&self) -> Vec<AppExposeEntry<'_, W>> {
+        let mut layout = self.app_expose_layout();
+        layout.sort_by(|a, b| b.hover.total_cmp(&a.hover).then(a.stack.cmp(&b.stack)));
+        layout
     }
 
     /// The window whose slot is under `pos` (output coordinates) — the picker's hit test,
@@ -529,6 +547,19 @@ impl<W: LayoutElement> Layout<W> {
                 mon.app_expose_layout()
                     .into_iter()
                     .map(|entry| (entry.tile.window().id().clone(), entry.slot))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The windows of `output`'s App Exposé in the order their previews draw, topmost first.
+    pub fn app_expose_draw_order(&self, output: &smithay::output::Output) -> Vec<W::Id> {
+        self.monitors()
+            .find(|mon| mon.output() == output)
+            .map(|mon| {
+                mon.app_expose_draw_order()
+                    .into_iter()
+                    .map(|entry| entry.tile.window().id().clone())
                     .collect()
             })
             .unwrap_or_default()
