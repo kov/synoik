@@ -8629,6 +8629,95 @@ fn super_right_drag_does_not_resize() {
     );
 }
 
+/// A window resize holds mutter's input-only stage grab (`meta-window-drag.c:2037`), which eats
+/// the touchpad swipe the shell's trackers would read off the stage (`swipeTracker.js:115`). So
+/// the three-finger click-and-drag that is Super+MMB on a clickfinger touchpad resizes, and
+/// neither opens the overview nor switches workspaces; once the grab ends, the swipe is the
+/// shell's again.
+#[test]
+fn a_super_resize_swallows_the_three_finger_swipe() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    pointer_motion_to(&mut f, x + 700., y + 550.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    touchpad_swipe(&mut f, 3, (0., 10.), 40, 50);
+    touchpad_swipe(&mut f, 3, (10., 0.), 40, 50);
+    f.pointer_motion(100., 100.);
+    f.double_roundtrip(id);
+
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "the resize grab eats the vertical swipe"
+    );
+    assert_eq!(
+        active_idx(&mut f),
+        0,
+        "the resize grab eats the sideways swipe"
+    );
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 900 × 700"),
+        "the drag still resizes, got: {configures}"
+    );
+
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+
+    touchpad_swipe(&mut f, 3, (0., 10.), 40, 50);
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "with the grab gone the swipe is the shell's again"
+    );
+}
+
+/// `resize-with-right-button` swaps mutter's resize and menu buttons
+/// (`meta_prefs_get_mouse_button_resize`/`_menu`): Mod+RMB resizes from the pressed corner and
+/// Mod+MMB pops the window menu.
+#[test]
+fn resize_with_right_button_swaps_the_resize_and_menu_buttons() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().gnome_settings.resize_with_right_button = true;
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    pointer_motion_to(&mut f, x + 700., y + 550.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_motion(100., 100.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 900 × 700"),
+        "Mod+RMB resizes from the bottom-right third, got: {configures}"
+    );
+    assert!(
+        f.synoik().panel_popover.window_menu().is_none(),
+        "Mod+RMB is no longer the window menu"
+    );
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    // Back over the window, which the client has not yet redrawn at its new size.
+    f.pointer_motion(-100., -100.);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    assert!(
+        f.synoik().panel_popover.window_menu().is_some(),
+        "Mod+MMB is the window menu"
+    );
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// The window menu is gnome-shell's `WindowMenu` (`js/ui/windowMenu.js`): the rows a window
 /// actually has a model for, in GNOME's order, anchored where the click was.
 ///

@@ -97,6 +97,10 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.wm.preferences focus-new-windows`: whether new
     /// windows may take focus on map.
     pub focus_new_windows: FocusNewWindows,
+    /// `org.gnome.desktop.wm.preferences resize-with-right-button`: Mod+RMB
+    /// resizes and Mod+MMB opens the window menu, instead of the other way
+    /// round (`meta_prefs_get_mouse_button_resize`, `prefs.c`).
+    pub resize_with_right_button: bool,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles (sides) or maximizes (top) it.
     pub edge_tiling: bool,
@@ -430,6 +434,7 @@ impl Default for GnomeSettings {
             disable_command_line: false,
             shield: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
+            resize_with_right_button: false,
             edge_tiling: true,
             center_new_windows: true,
             auto_maximize: true,
@@ -909,6 +914,9 @@ impl GnomeSettings {
                 "strict" => self.focus_new_windows = FocusNewWindows::Strict,
                 other => warn!("ignoring unrecognized focus-new-windows {other:?}"),
             }
+        }
+        if settings_has_key(wm, "resize-with-right-button") {
+            self.resize_with_right_button = wm.boolean("resize-with-right-button");
         }
     }
 

@@ -9253,6 +9253,12 @@ impl State {
             self.synoik.tablet_cursor_location = None;
 
             let is_overview_open = self.synoik.layout.is_overview_open();
+            let (resize_button, menu_button) =
+                if self.synoik.gnome_settings.resize_with_right_button {
+                    (MouseButton::Right, MouseButton::Middle)
+                } else {
+                    (MouseButton::Middle, MouseButton::Right)
+                };
 
             // A right press on a thumbnail is that workspace's context menu, the same place a
             // right press on a titlebar is the window's. Before the overview pan grab below,
@@ -9307,14 +9313,14 @@ impl State {
                 return;
             }
 
-            // Super+MMB — the resize chord — stands the peek down and then does its work, the
+            // The Super+resize-button chord stands the peek down and then does its work, the
             // same rule the keyboard chords follow (`docs/fork/workspace-peek.md`). Taken here
             // rather than at the resize itself so it holds whether or not a window is under the
             // pointer: the chord was pressed either way. Super+LMB is deliberately not in here —
             // carrying a window up to the strip is the peek's headline gesture, and dismissing on
             // its press would take the target away. A press *on* the strip never reaches this
             // far: it was handled above.
-            if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
+            if button == Some(resize_button) && !pointer.is_grabbed() && mod_down {
                 self.synoik.end_peek();
             }
 
@@ -9363,11 +9369,11 @@ impl State {
                     }
                 }
                 // Mutter's passive button grabs are Mod+LMB to move, Mod+MMB to resize and
-                // Mod+RMB for the window menu (`window.c:7743-7844`,
-                // `meta_prefs_get_mouse_button_resize` defaults to button 2). The menu is
-                // anchored where the pointer is, which is what mutter passes as the event
-                // coordinates.
-                else if button == Some(MouseButton::Right) && !pointer.is_grabbed() && mod_down {
+                // Mod+RMB for the window menu, the last two swapped by
+                // `resize-with-right-button` (`window.c:7743-7844`,
+                // `meta_prefs_get_mouse_button_resize`/`_menu`). The menu is anchored where
+                // the pointer is, which is what mutter passes as the event coordinates.
+                else if button == Some(menu_button) && !pointer.is_grabbed() && mod_down {
                     let location = pointer.current_location();
                     let anchor = self
                         .synoik
@@ -9381,7 +9387,7 @@ impl State {
                     }
                 }
                 // Check if we need to start an interactive resize.
-                else if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
+                else if button == Some(resize_button) && !pointer.is_grabbed() && mod_down {
                     let location = pointer.current_location();
                     let (output, pos_within_output) = self.synoik.output_under(location).unwrap();
                     let edges = self
@@ -10830,6 +10836,14 @@ impl State {
     /// it and a horizontal one steps to the next or previous app. `(dx, dy)` is the travel that
     /// cleared the threshold, positive up and towards the next workspace.
     fn touchpad_swipe_begin(&mut self, dx: f64, dy: f64) -> TouchpadSwipe {
+        // A window move or resize holds an input-only stage grab that eats every event, the
+        // touchpad swipe included (`meta-window-drag.c:2037`), so the shell's trackers on the
+        // stage (`swipeTracker.js:115`) never see the fingers dragging it. The overview's
+        // window drag is a `dnd.js` drag with no stage grab, so its swipes stay live.
+        if self.window_drag_grab_is_active() {
+            return TouchpadSwipe::Ignored;
+        }
+
         let horizontal = dx.abs() > dy.abs();
         let overview_up = self.synoik.layout.overview_progress_debug().is_some();
         let app_expose_up = self
@@ -10889,6 +10903,17 @@ impl State {
             .layout
             .workspace_switch_gesture_begin(&output, true);
         TouchpadSwipe::Workspace
+    }
+
+    /// Whether the pointer is grabbed by one of mutter's window drags: a resize, or a move
+    /// that is not the overview's picker drag.
+    fn window_drag_grab_is_active(&self) -> bool {
+        let overview_open = self.synoik.layout.is_overview_open();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
+        pointer.with_grab(|_, grab| {
+            let grab = grab.as_any();
+            grab.is::<ResizeGrab>() || (grab.is::<MoveGrab>() && !overview_open)
+        }) == Some(true)
     }
 
     fn app_grid_swipe_area(&self) -> Option<Rectangle<f64, Logical>> {
