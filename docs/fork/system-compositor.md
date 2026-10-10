@@ -1,7 +1,7 @@
 # The system compositor
 
-> Status: **design, agreed 2026-08-15.** Nothing implemented. One blocking unknown (§9 S1)
-> is scheduled as a spike for the same day.
+> Status: **design, agreed 2026-08-15.** Nothing implemented. The blocking unknown (§9 S1) is
+> resolved: the outer sits outside logind.
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -55,7 +55,7 @@ Keeping it thin is not an aesthetic preference — it is what makes restart fast
 | libinput config | none (chord matcher only) | **owns** |
 | Greeter | **hosts** (as a client) | — |
 | Session windows, shell UI | none | **owns** |
-| logind session | see §9 S1 — unresolved | **is one** |
+| logind session | **none** — root, outside logind (§9 S1) | **is one** |
 | Audio / USB / webcam ACLs | none | **owns** (follows logind `Active`) |
 | Xwayland | none | **owns** |
 | Steady-state scanout | passes through (unredirected) | **renders directly to scanout** |
@@ -259,18 +259,28 @@ gfx stack, since fixed; it is not a live constraint and should not be raised as 
 
 ## 9. Open questions
 
-**S1 — blocking, spike scheduled 2026-08-15. logind on a VT-less seat.**
-`uaccess` ACLs (audio, webcam, USB) follow logind's `Active`, which has historically been
-VT-driven. The knot:
+**S1 — resolved: the outer runs outside logind's session model.**
+Measured 2026-10-10 on stock Fedora 44 (systemd 259.5) on a VT-less seat (`seat1`: GPU and sound
+attached, `CanTTY=no`). The seat has no VTs, so this is the same logind switching path a
+`CONFIG_VT=n` seat0 takes:
 
-- If the outer runs as a permanently-`Active` greeter-class session so it can `TakeDevice` the DRM
-  node, then user sessions are **never** `Active` and never get their device ACLs.
-- If the outer instead sits outside logind's session model and takes DRM/evdev privileged, then
-  `Active` is free to track user sessions — but `ActivateSession` has to work on a VT-less seat.
+- `ActivateSession` switches between user sessions; `ActiveSession` tracks it, and the GPU and
+  sound `uaccess` ACLs move to the active user every time. A newly created session goes `Active`
+  on its own.
+- A root process holding the card open **outside any session** does not interfere: switching and
+  ACLs behave exactly as above. This is the outer's position.
+- A greeter-class session that is `Active` strips every user's ACLs and grants none — the feared
+  failure. So the outer must **not** be a permanently-`Active` logind session.
+- Sessions that `TakeControl`/`TakeDevice` get `PauseDevice` for card and evdev on switch-away and
+  `ResumeDevice` on switch-back. The pause type is always **`force`**: logind revokes and moves
+  on, it never waits for `PauseDeviceComplete`. Irrelevant to the inner, which takes no device
+  from logind (DRM is the outer's; evdev comes from the outer, which revokes it itself, §2.2).
 
-**Test it, do not reason about it.** On a `CONFIG_VT=n` (or VT-less seat0) systemd: can logind
-activate and deactivate sessions, and do uaccess ACLs follow? If no, this needs a systemd patch or
-an out-of-logind device-ACL path — better known now than at month three. Half a day.
+Consequences: the outer opens DRM and evdev as root, and drives `ActivateSession` on login1 to
+match whichever session it fronts, so the fronted session's ACLs follow. No systemd patch and no
+out-of-logind ACL path. Untested: ACLs on a real keyboard/mouse node (the VM had none
+seat-attachable), and GDM — it spawned a greeter on the new seat unprompted, so it must not run on
+the outer's seat.
 
 **S2 — Greeter as a client: confirm.** Assumed throughout: the greeter is a separate application,
 a client of the outer, doing PAM and then asking the outer to spawn the session. Not yet decided
