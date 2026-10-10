@@ -1,7 +1,7 @@
 # The system compositor
 
 > Status: **design, agreed 2026-08-15.** Nothing implemented. The blocking unknown (§9 S1) is
-> resolved: the outer sits outside logind.
+> resolved: the outer is an unprivileged system user outside logind.
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -47,21 +47,28 @@ is fronted (greeter, transitions, system heralds).
 Keeping it thin is not an aesthetic preference — it is what makes restart fast and reconnect
 (§7) cheap.
 
-**Privilege lives in a separate helper.** The outer runs as an unprivileged system user (as GDM
-does). A small root helper stays resident beside it, and the outer asks it over varlink (with fd
-passing) for each privileged act: opening DRM and evdev nodes, `EVIOCREVOKE`,
-`DRM_IOCTL_SET/DROP_MASTER`, and `ActivateSession` on login1. This is logind's own `TakeDevice`
-shape: master and revocation are properties of the open file description, so the helper acts on
-**its** dup and the outer's copy follows, and the outer modesets and flips without privilege, as
-synoik does under logind today. Because the helper keeps its DRM dup open, master survives an outer
-crash: the restarted outer is handed the same fd, and there is never a masterless moment for the
-active user (who holds a `uaccess` ACL on the card) to claim master in.
+**No privileged process.** The outer runs as an unprivileged system user (as GDM does) in the
+`video` and `input` groups, outside logind's session model (§9 S1). It needs root for nothing:
+
+- **DRM master** — the first opener of a card with no master becomes master; no capability check.
+  The outer opens it before any session exists and never drops it. A later opener, including the
+  active user (who holds a `uaccess` ACL on the card), can open it but cannot take master.
+- **Crash gap** — master dies with the last reference to the open file, and a masterless card can
+  be claimed by anyone with access. So the outer stores its DRM fd in systemd's fd store
+  (`FileDescriptorStoreMax=`, `FDSTORE=1`); systemd's reference keeps the file and its master alive
+  across a crash, and the restarted outer gets it back. The inherited fd cannot `SET/DROP_MASTER`
+  unprivileged (the kernel checks the opener's pid), which costs nothing: the outer never drops it.
+- **Session switch** — a polkit rule grants the outer's user `org.freedesktop.login1.chvt`, the
+  action logind checks for `ActivateSession`.
+- **Its own input** — the `input` group, for the chord matcher (§2.1).
+
+The inner's devices come from logind (§2), so there is no device-brokering helper either.
 
 | | Outer (system compositor) | Inner (session compositor) |
 |---|---|---|
-| DRM master, CRTC, planes | **owns** (fd from the helper) | never touches |
+| DRM master, CRTC, planes | **owns** (opens it itself, §1) | never touches |
 | Modeset | executes | **decides** (§4) |
-| Input devices | holds; the helper opens and revokes | **consumes real evdev fds** |
+| Input devices | own opens, for the chord matcher | **takes real evdev fds from logind** |
 | libinput config | none (chord matcher only) | **owns** |
 | Greeter | **hosts** (as a client) | — |
 | Session windows, shell UI | none | **owns** |
@@ -82,9 +89,10 @@ while it is itself fronted.
 inner would end up reimplementing device configuration, and GNOME's model puts per-device config
 (accel profile, tap-to-click, tablet mapping) in the *session*.
 
-**Each evdev node is opened twice** (by the helper, §1). The outer keeps one and passes the other
-to the inner over `SCM_RIGHTS`. Two independent `open()`s — not `dup()` — so each has its own event queue and
-neither steals from the other. Both see every event.
+**Each evdev node is opened twice, independently.** The outer opens its own (`input` group, §1);
+the inner takes its own from logind (`TakeDevice`), exactly as synoik's tty backend does today.
+Two independent `open()`s — not `dup()` — so each has its own event queue and neither steals from
+the other. Both see every event.
 
 The inner runs real libinput on real fds. The outer's steady-state input handling is a chord
 matcher and nothing else.
@@ -101,17 +109,15 @@ hardware-path chord that works against a hung session.
 
 If user A's inner compositor holds live evdev fds while user B is fronted, **A keylogs B.**
 
-`EVIOCREVOKE` is per-open-file-description. So: the helper keeps a dup of every evdev fd it
-hands out; on defocus the outer asks it to `EVIOCREVOKE` that dup and the inner's copy goes dead
-too.
-This is the same mechanism logind uses on session switch.
-
-Enforced by the outer, never by inner good behaviour — the boundary being crossed is a user
-boundary, and that is the one place cooperation is not a sufficient argument.
+logind enforces it: when the outer fronts B it calls `ActivateSession(B)`, and logind
+`EVIOCREVOKE`s every device A took (`PauseDevice` type `force`, no ack awaited — measured, §9 S1).
+Enforced by logind, never by inner good behaviour — the boundary being crossed is a user boundary,
+and that is the one place cooperation is not a sufficient argument. The corollary is that the
+outer must never front a session without activating it.
 
 ### 2.3 Smaller obligations
 
-- **Hotplug.** The outer watches udev and pushes new device fds to the fronted inner.
+- **Hotplug.** The inner watches udev and takes new devices from logind, as today.
 - **Modifier state.** Handover needs an explicit modifier reset, or a session that was holding
   Ctrl when it lost focus leaves it stuck.
 
@@ -188,7 +194,8 @@ default, which is the common case.
 1. **Snapshot A.** Capture A's final frame into an outer-owned texture. Animate *that*, not A.
    Three wins: no A frames arriving mid-animation at the wrong size; no dependency on A being
    responsive (**a hung session still animates out**); A can be suspended for the whole
-   transition. Revoke A's input fds here (§2.2).
+   transition. **`ActivateSession(B)` here** (§2.2): logind revokes A's input and resumes B's in
+   one step, so no keystroke typed during the animation reaches A.
 2. **Animate out** — outer composites, current mode still set.
 3. *(mode-change only)* **Converge to black.**
 4. *(mode-change only)* **Modeset**, atomic mode+fb per §4.3. Panel may blank; invisible.
@@ -198,7 +205,7 @@ default, which is the common case.
 6. **Wait for B's first correctly-sized commit.** Gate the in-animation on that frame, **never on
    a timer.** Starting on a timer and hoping is how a wrong-sized frame lands at the most visible
    moment in the entire design.
-7. **Animate in.** Pass B's input fds.
+7. **Animate in.**
 8. **Drop to unredirected.** Composited → direct scanout is a plane reconfiguration, not a
    modeset; cheap, given step 5.
 
@@ -270,28 +277,30 @@ gfx stack, since fixed; it is not a live constraint and should not be raised as 
 
 ## 9. Open questions
 
-**S1 — resolved: the outer runs outside logind's session model.**
-Measured 2026-10-10 on stock Fedora 44 (systemd 259.5) on a VT-less seat (`seat1`: GPU and sound
-attached, `CanTTY=no`). The seat has no VTs, so this is the same logind switching path a
-`CONFIG_VT=n` seat0 takes:
+**S1 — resolved: the outer runs outside logind, unprivileged.**
+Measured 2026-10-10 on stock Fedora 44 (systemd 259.5, kernel 6.19) on a VT-less seat (`seat1`:
+GPU and sound attached, `CanTTY=no`) — the same logind switching path a `CONFIG_VT=n` seat0 takes:
 
 - `ActivateSession` switches between user sessions; `ActiveSession` tracks it, and the GPU and
   sound `uaccess` ACLs move to the active user every time. A newly created session goes `Active`
   on its own.
-- A root process holding the card open **outside any session** does not interfere: switching and
-  ACLs behave exactly as above. This is the outer's position.
-- A greeter-class session that is `Active` strips every user's ACLs and grants none — the feared
-  failure. So the outer must **not** be a permanently-`Active` logind session.
-- Sessions that `TakeControl`/`TakeDevice` get `PauseDevice` for card and evdev on switch-away and
-  `ResumeDevice` on switch-back. The pause type is always **`force`**: logind revokes and moves
-  on, it never waits for `PauseDeviceComplete`. Irrelevant to the inner, which takes no device
-  from logind (DRM is the outer's; evdev comes from the outer, which revokes it itself, §2.2).
+- A process holding the card **outside any session** does not interfere with switching or ACLs.
+- A greeter-class session that is `Active` strips every user's ACLs and grants none, and logind
+  force-revokes a session's devices whenever it is not `Active`. So the outer can be neither a
+  permanently-`Active` session nor a logind device client.
+- Sessions that `TakeDevice` get `PauseDevice` (type always **`force`**) for card and evdev on
+  switch-away and `ResumeDevice` on switch-back; logind never waits for `PauseDeviceComplete`.
+- An unprivileged `video`-group system user opening an unmastered card gets master and modesets.
+  With master held, the active user's open gets no master and `drmSetMaster` fails `EACCES`.
+- SIGKILL of the master holder frees master for the active user to claim; with the fd in systemd's
+  fd store it does not, and the restarted holder gets the fd back still master.
+- Without a polkit rule the system user's `ActivateSession` is denied; logind checks
+  `org.freedesktop.login1.chvt`, and allowing it is sufficient.
 
-Consequences: the outer's root helper (§1) opens DRM and evdev and drives `ActivateSession` on
-login1 to match whichever session the outer fronts, so the fronted session's ACLs follow. No systemd patch and no
-out-of-logind ACL path. Untested: ACLs on a real keyboard/mouse node (the VM had none
-seat-attachable), and GDM — it spawned a greeter on the new seat unprompted, so it must not run on
-the outer's seat.
+Bring-up notes: GDM spawns a greeter on any new graphical seat, so it must not run on the outer's
+seat. With no display manager running, `loginctl attach` writes the udev rule but the seat does not
+appear until `udevadm trigger` re-adds the devices. Untested: ACLs on a real keyboard/mouse node
+(the VM had none seat-attachable).
 
 **S2 — Greeter as a client: confirm.** Assumed throughout: the greeter is a separate application,
 a client of the outer, doing PAM and then asking the outer to spawn the session. Not yet decided
