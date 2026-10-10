@@ -297,6 +297,9 @@ GPU and sound attached, `CanTTY=no`) — the same logind switching path a `CONFI
 - Without a polkit rule the system user's `ActivateSession` is denied; logind checks
   `org.freedesktop.login1.chvt`, and allowing it is sufficient.
 
+Fallback if VT-less operation causes trouble: keep a VT and run the outer and every session it
+nests on that **single VT**, so the VT never switches and session switching stays the outer's.
+
 Bring-up notes: GDM spawns a greeter on any new graphical seat, so it must not run on the outer's
 seat. With no display manager running, `loginctl attach` writes the udev rule but the seat does not
 appear until `udevadm trigger` re-adds the devices. Untested: ACLs on a real keyboard/mouse node
