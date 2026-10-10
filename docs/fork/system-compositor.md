@@ -47,15 +47,25 @@ is fronted (greeter, transitions, system heralds).
 Keeping it thin is not an aesthetic preference — it is what makes restart fast and reconnect
 (§7) cheap.
 
+**Privilege lives in a separate helper.** The outer runs as an unprivileged system user (as GDM
+does). A small root helper stays resident beside it, and the outer asks it over varlink (with fd
+passing) for each privileged act: opening DRM and evdev nodes, `EVIOCREVOKE`,
+`DRM_IOCTL_SET/DROP_MASTER`, and `ActivateSession` on login1. This is logind's own `TakeDevice`
+shape: master and revocation are properties of the open file description, so the helper acts on
+**its** dup and the outer's copy follows, and the outer modesets and flips without privilege, as
+synoik does under logind today. Because the helper keeps its DRM dup open, master survives an outer
+crash: the restarted outer is handed the same fd, and there is never a masterless moment for the
+active user (who holds a `uaccess` ACL on the card) to claim master in.
+
 | | Outer (system compositor) | Inner (session compositor) |
 |---|---|---|
-| DRM master, CRTC, planes | **owns** | never touches |
+| DRM master, CRTC, planes | **owns** (fd from the helper) | never touches |
 | Modeset | executes | **decides** (§4) |
-| Input devices | opens, holds, revokes | **consumes real evdev fds** |
+| Input devices | holds; the helper opens and revokes | **consumes real evdev fds** |
 | libinput config | none (chord matcher only) | **owns** |
 | Greeter | **hosts** (as a client) | — |
 | Session windows, shell UI | none | **owns** |
-| logind session | **none** — root, outside logind (§9 S1) | **is one** |
+| logind session | **none** — system user, outside logind (§9 S1) | **is one** |
 | Audio / USB / webcam ACLs | none | **owns** (follows logind `Active`) |
 | Xwayland | none | **owns** |
 | Steady-state scanout | passes through (unredirected) | **renders directly to scanout** |
@@ -72,8 +82,8 @@ while it is itself fronted.
 inner would end up reimplementing device configuration, and GNOME's model puts per-device config
 (accel profile, tap-to-click, tablet mapping) in the *session*.
 
-**The outer opens each evdev node twice.** It keeps one open and passes the other to the inner
-over `SCM_RIGHTS`. Two independent `open()`s — not `dup()` — so each has its own event queue and
+**Each evdev node is opened twice** (by the helper, §1). The outer keeps one and passes the other
+to the inner over `SCM_RIGHTS`. Two independent `open()`s — not `dup()` — so each has its own event queue and
 neither steals from the other. Both see every event.
 
 The inner runs real libinput on real fds. The outer's steady-state input handling is a chord
@@ -91,8 +101,9 @@ hardware-path chord that works against a hung session.
 
 If user A's inner compositor holds live evdev fds while user B is fronted, **A keylogs B.**
 
-`EVIOCREVOKE` is per-open-file-description. So: before sending an fd, the outer `dup()`s it and
-keeps the dup; on defocus it calls `EVIOCREVOKE` on its dup and the inner's copy goes dead too.
+`EVIOCREVOKE` is per-open-file-description. So: the helper keeps a dup of every evdev fd it
+hands out; on defocus the outer asks it to `EVIOCREVOKE` that dup and the inner's copy goes dead
+too.
 This is the same mechanism logind uses on session switch.
 
 Enforced by the outer, never by inner good behaviour — the boundary being crossed is a user
@@ -276,8 +287,8 @@ attached, `CanTTY=no`). The seat has no VTs, so this is the same logind switchin
   on, it never waits for `PauseDeviceComplete`. Irrelevant to the inner, which takes no device
   from logind (DRM is the outer's; evdev comes from the outer, which revokes it itself, §2.2).
 
-Consequences: the outer opens DRM and evdev as root, and drives `ActivateSession` on login1 to
-match whichever session it fronts, so the fronted session's ACLs follow. No systemd patch and no
+Consequences: the outer's root helper (§1) opens DRM and evdev and drives `ActivateSession` on
+login1 to match whichever session the outer fronts, so the fronted session's ACLs follow. No systemd patch and no
 out-of-logind ACL path. Untested: ACLs on a real keyboard/mouse node (the VM had none
 seat-attachable), and GDM — it spawned a greeter on the new seat unprompted, so it must not run on
 the outer's seat.
