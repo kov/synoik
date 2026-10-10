@@ -294,6 +294,11 @@ GPU and sound attached, `CanTTY=no`) — the same logind switching path a `CONFI
   With master held, the active user's open gets no master and `drmSetMaster` fails `EACCES`.
 - SIGKILL of the master holder frees master for the active user to claim; with the fd in systemd's
   fd store it does not, and the restarted holder gets the fd back still master.
+- Real keyboard and pointer (virtio-input, kov typing live): only the active session's
+  `TakeDevice` fds deliver events. On switch-away logind revokes them (`read()` → `ENODEV`) and
+  `ResumeDevice` hands the incoming session fresh fds. A `video`+`input` system user reading the
+  same nodes by plain `open()` saw every event throughout. Input nodes carry **no** `uaccess` ACL:
+  evdev gating is `TakeDevice` + revoke alone, so the inner must take input through logind.
 - Without a polkit rule the system user's `ActivateSession` is denied; logind checks
   `org.freedesktop.login1.chvt`, and allowing it is sufficient.
 
@@ -302,8 +307,7 @@ nests on that **single VT**, so the VT never switches and session switching stay
 
 Bring-up notes: GDM spawns a greeter on any new graphical seat, so it must not run on the outer's
 seat. With no display manager running, `loginctl attach` writes the udev rule but the seat does not
-appear until `udevadm trigger` re-adds the devices. Untested: ACLs on a real keyboard/mouse node
-(the VM had none seat-attachable).
+appear until `udevadm trigger` re-adds the devices.
 
 **S2 — Greeter as a client: confirm.** Assumed throughout: the greeter is a separate application,
 a client of the outer, doing PAM and then asking the outer to spawn the session. Not yet decided
