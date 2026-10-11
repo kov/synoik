@@ -41975,3 +41975,108 @@ fn the_greeter_logs_a_picked_user_in() {
         "a verified conversation is not cancelled"
     );
 }
+
+/// The end-session confirmation sits above the shield (`modalDialogGroup` over
+/// `screenShieldGroup`, `layout.js:267-294`), so it takes its keys there: Escape cancels a
+/// power-off asked for from the greeter, rather than going back to the grid while the countdown
+/// runs on.
+#[test]
+fn the_greeters_power_off_can_be_cancelled() {
+    use crate::end_session::SessionRequest;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    f.synoik_state()
+        .request_session_action(SessionRequest::PowerOff);
+    // Keys reach the dialog once it has faded in (`is_interactive`).
+    f.settle_animations();
+    assert!(f.synoik().end_session.is_open());
+    tap(&mut f, KEY_ESC);
+    assert!(!f.synoik().end_session.is_open());
+}
+
+/// ...and the same over a locked screen, by pointer: gnome-session's `Open` after a Restart from
+/// the lock screen's menu raises a dialog whose Cancel must be clickable through the shield.
+#[test]
+fn an_end_session_dialog_over_the_lock_screen_takes_clicks() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik_state().synoik.lock_screen.settle();
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 2,
+            seconds: 60,
+        });
+    f.settle_animations();
+    assert!(f.synoik().end_session.is_open());
+    let cancel = f
+        .synoik()
+        .end_session_dialog
+        .cancel_button_rect(smithay::utils::Size::from((1920., 1080.)));
+    pointer_motion_to(
+        &mut f,
+        cancel.loc.x + cancel.size.w / 2.,
+        cancel.loc.y + cancel.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(!f.synoik().end_session.is_open());
+    assert!(
+        f.synoik().screen_shield.is_active(),
+        "the click stayed in the dialog"
+    );
+}
+
+/// A channel lost while the greeter shows its list asks for nobody; the next pick asks, once, for
+/// the user picked — not for whoever was picked before.
+#[test]
+fn a_lost_channel_on_the_greeters_list_asks_for_nobody() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = |name: &str| LoginUser {
+        name: name.to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user("amy"), user("bob")]));
+    let begun = |f: &mut Fixture| -> Vec<String> {
+        f.gdm_requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                VerifierRequest::Begin { username, .. } => Some(username),
+                _ => None,
+            })
+            .collect()
+    };
+
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(begun(&mut f), ["amy"]);
+    tap(&mut f, KEY_ESC);
+    f.synoik_state().on_verifier_event(VerifierEvent::Lost);
+    f.advance_clock(std::time::Duration::from_secs(60));
+    f.turn();
+    assert!(begun(&mut f).is_empty());
+
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(begun(&mut f), ["bob"]);
+}

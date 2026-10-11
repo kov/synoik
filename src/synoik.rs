@@ -6335,6 +6335,8 @@ impl State {
                 real_name: user.real_name,
             });
         self.synoik.warm_avatar();
+        // A fresh conversation for this pick, whatever an earlier one left awaiting.
+        self.synoik.screen_shield.drop_authenticator();
         let effects = self.synoik.screen_shield.retry_authenticator();
         self.apply_shield_effects(effects);
         let now = self.synoik.shield_now();
@@ -6796,6 +6798,12 @@ impl State {
                 }
                 let effects = self.synoik.screen_shield.authenticator_ready(*epoch, false);
                 self.apply_shield_effects(effects);
+            }
+            // On the greeter's list nobody is being asked for, so there is nothing to recover.
+            VerifierEvent::Lost
+                if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid =>
+            {
+                self.synoik.screen_shield.drop_authenticator();
             }
             VerifierEvent::Lost => {
                 let effects = self.synoik.screen_shield.authenticator_lost();

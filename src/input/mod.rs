@@ -1113,10 +1113,20 @@ impl State {
                         return FilterResult::Forward;
                     }
 
+                    // The end-session confirmation is above the shield (`modalDialogGroup` over
+                    // `screenShieldGroup`, `layout.js:267-294`), and it counts down: it must take
+                    // its keys here, or nothing could cancel it.
+                    if this.synoik.end_session_dialog.is_open() {
+                        match this.synoik.end_session_dialog.handle_key(raw, pressed) {
+                            DialogOutcome::Handled => this.synoik.queue_redraw_all(),
+                            DialogOutcome::Confirm => this.confirm_end_session(),
+                            DialogOutcome::Cancel => this.synoik.cancel_end_session(),
+                            DialogOutcome::ToggleUpdates => this.synoik.toggle_install_updates(),
+                        }
                     // A menu of the panel over the shield takes the keys the entry would — and
                     // only those: nothing that reaches the desktop's popover branch below (its
                     // binds, the overlay key) may run behind a lock.
-                    if pressed && this.synoik.panel_popover.grabs_input() {
+                    } else if pressed && this.synoik.panel_popover.grabs_input() {
                         this.synoik.panel_popover.handle_key(raw, mods, pressed);
                         if key_repeats {
                             this.arm_key_repeat(key_code, RepeatKey::Popover { raw, mods: *mods });
@@ -8921,6 +8931,27 @@ impl State {
             if button_state == ButtonState::Pressed {
                 let pos = self.synoik.seat.get_pointer().unwrap().current_location();
                 let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
+                // The end-session confirmation is above the shield, and modal.
+                if self.synoik.end_session_dialog.is_open() {
+                    if button == Some(MouseButton::Left) {
+                        if let Some((output, local)) = &under {
+                            match self
+                                .synoik
+                                .end_session_dialog
+                                .pointer_click(output_size(output), *local)
+                            {
+                                DialogOutcome::Handled => {}
+                                DialogOutcome::Confirm => self.confirm_end_session(),
+                                DialogOutcome::Cancel => self.synoik.cancel_end_session(),
+                                DialogOutcome::ToggleUpdates => {
+                                    self.synoik.toggle_install_updates()
+                                }
+                            }
+                        }
+                    }
+                    self.synoik.queue_redraw_all();
+                    return;
+                }
                 // The panel over the shield (`unlock-dialog`, `gdm`) and its menus come first.
                 if self.synoik.panel_popover.grabs_input() {
                     self.popover_click(under, button_code);

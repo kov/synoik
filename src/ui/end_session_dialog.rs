@@ -447,6 +447,14 @@ impl EndSessionDialog {
         )
     }
 
+    /// The Cancel button, output-local, where a click on it lands.
+    pub fn cancel_button_rect(&self, output_size: Size<f64, Logical>) -> Rectangle<f64, Logical> {
+        let has_checkbox = self.has_checkbox();
+        let mut rect = Self::button_rect(Button::Cancel, has_checkbox, self.presentation());
+        rect.loc += Self::origin(output_size, has_checkbox);
+        rect
+    }
+
     fn focus_at(&self, output_size: Size<f64, Logical>, pos: Point<f64, Logical>) -> Option<Focus> {
         let has_checkbox = self.has_checkbox();
         let local = pos - Self::origin(output_size, has_checkbox);
