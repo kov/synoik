@@ -94,7 +94,12 @@ const VERIFIER_IFACE: &str = "org.gnome.DisplayManager.UserVerifier";
 trait DisplayManager {
     /// Returns a peer-to-peer D-Bus **address**, not an object path.
     fn open_reauthentication_channel(&self, username: &str) -> zbus::Result<String>;
+    /// The login channel: the same kind of address, serving `Greeter` beside `UserVerifier`.
+    fn open_session(&self) -> zbus::Result<String>;
 }
+
+/// `org.gnome.DisplayManager.Greeter`, on a login channel at [`SESSION_PATH`].
+const GREETER_IFACE: &str = "org.gnome.DisplayManager.Greeter";
 
 /// Which lock a request or event belongs to.
 ///
@@ -114,6 +119,10 @@ pub enum VerifierRequest {
         epoch: Epoch,
         /// What the fprintd probe found. `None` starts one service, not two.
         reader: crate::dbus::fprintd::ReaderType,
+        /// From the greeter: log `username` in. A reauthentication channel is still tried first,
+        /// for a user who already has a session (`util.js:508-540`); without one it is a login
+        /// channel, whose verified session is started (`loginDialog.js` `_onSessionOpened`).
+        login: bool,
     },
     /// Answer the outstanding query. **Carries a password** — see the `Debug` impl below.
     Answer(String),
@@ -133,11 +142,13 @@ impl std::fmt::Debug for VerifierRequest {
                 username,
                 epoch,
                 reader,
+                login,
             } => f
                 .debug_struct("Begin")
                 .field("username", username)
                 .field("epoch", epoch)
                 .field("reader", reader)
+                .field("login", login)
                 .finish(),
             Self::Answer(answer) => write!(f, "Answer(<redacted, {} chars>)", answer.len()),
             Self::StartFingerprint => write!(f, "StartFingerprint"),
@@ -249,6 +260,7 @@ async fn run(
                 username,
                 epoch,
                 reader,
+                login,
             } => {
                 // Close the previous channel *before* opening another: gdm keeps a PAM worker per
                 // channel, and an orphan would go on emitting into the compositor — including a
@@ -256,7 +268,7 @@ async fn run(
                 if let Some(old) = session.take() {
                     old.close().await;
                 }
-                match Session::open(&system, &username, reader, to_niri.clone()).await {
+                match Session::open(&system, &username, reader, login, to_niri.clone()).await {
                     Ok(new) => {
                         session = Some(new);
                         let _ = to_niri.send(VerifierEvent::Ready(epoch));
@@ -354,6 +366,7 @@ impl Session {
         system: &zbus::Connection,
         username: &str,
         reader: crate::dbus::fprintd::ReaderType,
+        login: bool,
         to_niri: calloop::channel::Sender<VerifierEvent>,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
@@ -361,10 +374,17 @@ impl Session {
         let manager = DisplayManagerProxy::new(system)
             .await
             .context("connecting to gdm on the system bus")?;
-        let address = manager
-            .open_reauthentication_channel(username)
-            .await
-            .context("OpenReauthenticationChannel")?;
+        let reauth = manager.open_reauthentication_channel(username).await;
+        let address = match reauth {
+            Ok(address) => address,
+            // No session to reauthenticate into: log in instead (`util.js:508-540`, which falls
+            // back to `get_user_verifier` the same way).
+            Err(err) if login => {
+                debug!("gdm: no session to reauthenticate {username} into ({err}); logging in");
+                manager.open_session().await.context("OpenSession")?
+            }
+            Err(err) => return Err(err).context("OpenReauthenticationChannel"),
+        };
 
         // `.p2p()`: gdm's channel is not a message bus. Building it as one would hang waiting for a
         // `Hello` reply that never comes.
@@ -501,6 +521,29 @@ async fn pump_signals(
 
     while let Some(Ok(msg)) = stream.next().await {
         let header = msg.header();
+        // A login channel's verified session is open: start it (`_onSessionOpened` →
+        // `_startSession` → `StartSessionWhenReady`, `loginDialog.js`). The verifier's own
+        // `VerificationComplete` has already told the compositor.
+        if header.message_type() == zbus::message::Type::Signal
+            && header.interface().map(|i| i.as_str()) == Some(GREETER_IFACE)
+            && header.member().map(|m| m.as_str()) == Some("SessionOpened")
+        {
+            if let Ok((service, _id)) = msg.body().deserialize::<(String, String)>() {
+                let started = conn
+                    .call_method(
+                        None::<&str>,
+                        SESSION_PATH,
+                        Some(GREETER_IFACE),
+                        "StartSessionWhenReady",
+                        &(service.as_str(), true),
+                    )
+                    .await;
+                if let Err(err) = started {
+                    warn!("gdm: could not start the session: {err:?}");
+                }
+            }
+            continue;
+        }
         if header.message_type() != zbus::message::Type::Signal
             || header.interface().map(|i| i.as_str()) != Some(VERIFIER_IFACE)
             || header.path().map(|p| p.as_str()) != Some(SESSION_PATH)

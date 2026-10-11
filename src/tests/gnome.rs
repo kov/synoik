@@ -41892,3 +41892,86 @@ fn the_greeter_grid_picks_a_user() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(f.synoik().login_page, LoginPage::Prompt { user: None });
 }
+
+/// Picking a user on the greeter asks gdm for a login conversation for them; Escape cancels it and
+/// goes back to the list; a verified one goes back to the list without cancelling, because the
+/// daemon is starting that session.
+#[test]
+fn the_greeter_logs_a_picked_user_in() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = |name: &str| LoginUser {
+        name: name.to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user("amy"), user("bob")]));
+    let begun = |f: &mut Fixture| -> Vec<(String, u64)> {
+        f.gdm_requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                VerifierRequest::Begin {
+                    username,
+                    epoch,
+                    login: true,
+                    ..
+                } => Some((username, epoch)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Pick bob, then think better of it.
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_ENTER);
+    let asked = begun(&mut f);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, "bob");
+    assert_eq!(f.synoik().unlock_dialog.user().name, "bob");
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Cancel)));
+
+    // Pick amy, answer, and get in.
+    tap(&mut f, KEY_LEFT);
+    tap(&mut f, KEY_ENTER);
+    let asked = begun(&mut f);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, "amy");
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::Ready(asked[0].1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Answer(a) if a == "a")));
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f.synoik().screen_shield.is_active(), "the greeter stays");
+    assert!(
+        !f.gdm_requests()
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::Cancel)),
+        "a verified conversation is not cancelled"
+    );
+}

@@ -6209,6 +6209,10 @@ impl State {
             self.on_login_grid_key(raw, mods);
             return;
         }
+        if self.synoik.greeter && raw == Some(Keysym::Escape) {
+            self.greeter_back_to_grid(true);
+            return;
+        }
         let now = self.synoik.shield_now();
 
         if self.synoik.screen_shield.is_dismissible() {
@@ -6310,11 +6314,48 @@ impl State {
     fn on_login_grid_action(&mut self, action: crate::ui::login_grid::GridAction) {
         use crate::ui::login_grid::GridAction;
 
-        let user = match action {
-            GridAction::Pick(i) => self.synoik.login_users.get(i).map(|u| u.name.clone()),
+        let picked = match action {
+            GridAction::Pick(i) => self.synoik.login_users.get(i).cloned(),
             GridAction::EnterName => None,
         };
-        self.synoik.login_page = LoginPage::Prompt { user };
+        self.synoik.login_page = LoginPage::Prompt {
+            user: picked.as_ref().map(|u| u.name.clone()),
+        };
+        self.synoik.queue_redraw_all();
+        let Some(user) = picked else {
+            return;
+        };
+
+        // Ask for this user's credentials: the shield's own path to a conversation, so a channel
+        // that dies is retried like the lock screen's (`ScreenShield::retry_authenticator`).
+        self.synoik
+            .unlock_dialog
+            .set_user(crate::unlock_dialog::UserInfo {
+                name: user.name,
+                real_name: user.real_name,
+            });
+        self.synoik.warm_avatar();
+        let effects = self.synoik.screen_shield.retry_authenticator();
+        self.apply_shield_effects(effects);
+        let now = self.synoik.shield_now();
+        let mut effects = self.synoik.unlock_dialog.show_prompt(now);
+        effects.start_fingerprint = true;
+        self.apply_unlock_effects(effects);
+    }
+
+    /// Back from the credentials page to the user list (`LoginDialog` `_onReset` /
+    /// `cancel`). `cancel` ends the conversation; after a verified one there is nothing to end, and
+    /// ending it would close the session the daemon is starting.
+    fn greeter_back_to_grid(&mut self, cancel: bool) {
+        if cancel {
+            if let Some(tx) = self.synoik.gdm_requests.as_ref() {
+                let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
+            }
+        }
+        self.synoik.screen_shield.drop_authenticator();
+        let effects = self.synoik.unlock_dialog.show_clock();
+        self.apply_unlock_effects(effects);
+        self.synoik.login_page = LoginPage::Grid;
         self.synoik.queue_redraw_all();
     }
 
@@ -6523,7 +6564,11 @@ impl State {
             self.synoik.queue_redraw_all();
         }
 
-        if effects.unlock {
+        if effects.unlock && self.synoik.greeter {
+            // Verified: the daemon is starting the session, or fronting the one it unlocked. The
+            // greeter's shield stays, and its next visitor starts from the list.
+            self.greeter_back_to_grid(false);
+        } else if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
             let effects = self.synoik.screen_shield.deactivate();
@@ -6906,6 +6951,7 @@ impl State {
                         username,
                         epoch,
                         reader: self.synoik.fingerprint_reader,
+                        login: self.synoik.greeter,
                     })
                     .is_ok();
             }
@@ -6991,6 +7037,10 @@ impl State {
 
         if let Some(delay) = effects.retry_authenticator_after {
             self.synoik.timer_after(delay, |state| {
+                // The greeter's user went back to the list meanwhile: nobody to ask for.
+                if state.synoik.greeter && state.synoik.login_page == LoginPage::Grid {
+                    return None;
+                }
                 let effects = state.synoik.screen_shield.retry_authenticator();
                 state.apply_shield_effects(effects);
                 None
@@ -12222,8 +12272,9 @@ impl Synoik {
                 }
             }
 
-            // The greeter's page is the login dialog, drawn by its own block above.
-            if prompt_t.is_visible() && !self.greeter {
+            // The greeter's credentials page is the unlock prompt, for the user it picked.
+            let prompt_page = !self.greeter || matches!(self.login_page, LoginPage::Prompt { .. });
+            if prompt_t.is_visible() && prompt_page {
                 let d = &self.unlock_dialog;
                 let (caret, selection) = match d.entry_mask() {
                     Some(mask) => d.entry().masked_positions(mask, d.is_entry_live()),
@@ -16755,7 +16806,8 @@ impl Synoik {
         // runtime (`set_settings` on every settings change), and reading the other would make the
         // button ignore a lockdown that took effect after startup.
         let settings = self.screen_shield.settings();
-        self.can_switch_user
+        !self.greeter
+            && self.can_switch_user
             && self.multiple_users
             && settings.user_switch_enabled
             && !settings.disable_user_switching
@@ -16776,9 +16828,17 @@ impl Synoik {
 
     /// The account picture as an image source, if AccountsService gave us one that is on disk.
     pub fn avatar_source(&self) -> Option<crate::image_source::ImageSource> {
-        self.user_account
-            .icon_file
-            .as_ref()
+        // The greeter asks for whoever was picked from the list.
+        let icon = if self.greeter {
+            let name = &self.unlock_dialog.user().name;
+            self.login_users
+                .iter()
+                .find(|u| &u.name == name)
+                .and_then(|u| u.icon_file.as_ref())
+        } else {
+            self.user_account.icon_file.as_ref()
+        };
+        icon.as_ref()
             .map(|icon| crate::image_source::ImageSource::File(icon.path.clone()))
     }
 

@@ -369,6 +369,15 @@ impl ScreenShield {
         }
     }
 
+    /// Forget a conversation that is no longer wanted — the greeter's user went back to the list.
+    /// A late answer for it is then ignored, and the next [`retry_authenticator`] asks afresh.
+    ///
+    /// [`retry_authenticator`]: Self::retry_authenticator
+    pub fn drop_authenticator(&mut self) {
+        self.awaiting_authenticator = None;
+        self.recover_attempts = 0;
+    }
+
     /// `_onStatusChanged` with `PresenceStatus.IDLE` (`:242-272`) — gnome-session says the seat
     /// has gone idle.
     ///
