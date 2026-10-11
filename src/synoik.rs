@@ -236,6 +236,14 @@ const DEVICE_MEMORY_CENSUS_TARGET: &str = "devmem";
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
+/// `$system_base_color` (`_colors.scss:20`, `_palette.scss`), behind the login screen.
+const GREETER_BG: [f32; 4] = [
+    0x22 as f32 / 255.,
+    0x22 as f32 / 255.,
+    0x26 as f32 / 255.,
+    1.,
+];
+
 /// The screen shield's wash over the wallpaper: black at `1 - BLUR_BRIGHTNESS`, which multiplies
 /// what shows through by GNOME's `BLUR_BRIGHTNESS` (`js/ui/unlockDialog.js:34`). Premultiplied,
 /// like every other [`SolidColorBuffer`] color here.
@@ -1499,6 +1507,8 @@ pub struct OutputState {
     /// wash is translucent black over the desktop, which is the one way the shield could fail
     /// open.
     pub shield_backstop_buffer: SolidColorBuffer,
+    /// The greeter's backdrop, [`GREETER_BG`].
+    pub greeter_bg_buffer: SolidColorBuffer,
     pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     ///
@@ -6385,6 +6395,13 @@ impl State {
         if !self.synoik.screen_shield.is_active() {
             return;
         }
+        // The greeter has only the login dialog: no clock page to go back to.
+        if self.synoik.greeter {
+            self.synoik
+                .lock_screen
+                .set_page(true, self.synoik.shield_now());
+            return;
+        }
         let prompt = self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
             && !self.synoik.screen_shield.is_dismissible();
         self.synoik
@@ -6751,6 +6768,20 @@ impl State {
 
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
     /// bus reads, the signals it emits, logind's locked hint, and the clipboard wipe.
+    /// `screenShield.showDialog()` at startup in `gdm` mode (`main.js:327-330`): the shield goes
+    /// down at once, on the login dialog rather than the clock.
+    pub fn show_greeter_dialog(&mut self) {
+        let now = self.synoik.shield_now();
+        self.synoik
+            .screen_shield
+            .show_dialog(crate::utils::get_monotonic_time());
+        self.synoik.lock_screen.set_shown(true, now);
+        self.synoik.lock_screen.set_page(true, now);
+        self.synoik.lock_screen.settle();
+        self.synoik.sync_session_mode();
+        self.synoik.queue_redraw_all();
+    }
+
     pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
         // The curtain follows `active`, not `locked`: a shield down without a lock is still a
         // shield, and it is what a `lock-enabled = false` screensaver is.
@@ -9196,6 +9227,7 @@ impl Synoik {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             shield_dim_buffer: SolidColorBuffer::new(size, SHIELD_DIM_COLOR),
             shield_backstop_buffer: SolidColorBuffer::new(size, [0., 0., 0., 1.]),
+            greeter_bg_buffer: SolidColorBuffer::new(size, GREETER_BG),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
             debug_damage_age: 1,
@@ -9362,6 +9394,7 @@ impl Synoik {
             state.lock_color_buffer.resize(output_size);
             state.shield_dim_buffer.resize(output_size);
             state.shield_backstop_buffer.resize(output_size);
+            state.greeter_bg_buffer.resize(output_size);
             if let Some(lock_surface) = &state.lock_surface {
                 configure_lock_surface(lock_surface, output);
             }
@@ -12080,7 +12113,8 @@ impl Synoik {
             prompt_t.translation_y += slide;
             clock_t.translation_y += slide;
 
-            if prompt_t.is_visible() {
+            // The greeter's page is the login dialog, drawn by its own block below.
+            if prompt_t.is_visible() && !self.greeter {
                 let d = &self.unlock_dialog;
                 let (caret, selection) = match d.entry_mask() {
                     Some(mask) => d.entry().masked_positions(mask, d.is_entry_live()),
@@ -12164,6 +12198,20 @@ impl Synoik {
             // `BLUR_RADIUS` is in stage pixels, which for us is output physical pixels — hence the
             // scale, and hence `render_blurred` doing its own conversion into the wallpaper
             // texture's resolution.
+            // The login screen sits on `#lockDialogGroup`'s flat `$_gdm_bg`, which is
+            // `$system_base_color` (`_login-lock.scss:1,233-235`); the wallpaper is the user's.
+            if self.greeter {
+                push(
+                    SolidColorRenderElement::from_buffer(
+                        &state.greeter_bg_buffer,
+                        (0., slide),
+                        1.,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                );
+                return;
+            }
             let radius = crate::ui::lock_screen::BLUR_RADIUS * output_scale.x;
             // GNOME's `BLUR_BRIGHTNESS` is a ceiling here, not a constant: a near-white wallpaper
             // leaves 72pt white text below WCAG AA at *any* radius, so the picture gets measured

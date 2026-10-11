@@ -261,7 +261,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
     state.synoik.greeter = cli.greeter;
-    state.synoik.sync_session_mode();
+    if cli.greeter {
+        state.show_greeter_dialog();
+    }
 
     if cli.headless {
         // A renderer lets clients actually draw (and screencasting work), but

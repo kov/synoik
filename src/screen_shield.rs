@@ -160,6 +160,8 @@ pub struct ScreenShield {
     epoch: u64,
     /// Failed attempts to replace the channel a locked shield lost; 0 when it has one.
     recover_attempts: u32,
+    /// The greeter's shield ([`show_dialog`](Self::show_dialog)), which never goes away.
+    greeter: bool,
 }
 
 impl ScreenShield {
@@ -228,6 +230,17 @@ impl ScreenShield {
         now.saturating_sub(started).as_secs() as u32
     }
 
+    /// `showDialog` (`:321-327`) — the greeter's shield, put down at startup with the login dialog
+    /// on it (`main.js:327-330`). Locked from the start, with no conversation to wait for: the
+    /// login dialog opens its own once a user is picked. No `ActiveChanged` or `locked-changed`,
+    /// as in GNOME, which sets the fields without the signals.
+    pub fn show_dialog(&mut self, now: Duration) {
+        self.greeter = true;
+        self.active = true;
+        self.locked = true;
+        self.activation_time = Some(now);
+    }
+
     /// `activate` (`:586-616`) — put the shield down *without* requiring authentication.
     ///
     /// This is the screensaver half: `SetActive(true)`, and the idle fade. It never sets `locked`;
@@ -244,6 +257,11 @@ impl ScreenShield {
     /// Clears `locked` too: GNOME only reaches here once the dialog has authenticated (or was
     /// never needed), so the caller owes that check, not this.
     pub fn deactivate(&mut self) -> ShieldEffects {
+        // The greeter's shield stays: GNOME only clears `isActive` there, for gnome-session's idle
+        // counter (`:530-541`), and the greeter session has no gnome-session.
+        if self.greeter {
+            return ShieldEffects::default();
+        }
         self.activation_time = None;
         self.awaiting_authenticator = None;
         self.recover_attempts = 0;
@@ -274,6 +292,10 @@ impl ScreenShield {
     ) -> Result<ShieldEffects, LockRefused> {
         if self.settings.disable_lock_screen {
             return Err(LockRefused::LockedDown);
+        }
+        // Already locked, by the login dialog.
+        if self.greeter {
+            return Ok(ShieldEffects::default());
         }
 
         let mut effects = self.activate(now);

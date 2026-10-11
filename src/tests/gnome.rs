@@ -41730,7 +41730,7 @@ fn the_greeter_is_gdm_mode() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.synoik().greeter = true;
-    f.synoik().sync_session_mode();
+    f.synoik_state().show_greeter_dialog();
 
     assert_eq!(f.synoik().session_mode().name, "gdm");
     assert!(f.synoik().screen_is_covered());
@@ -41762,7 +41762,7 @@ fn the_greeters_power_off_confirms_like_gnome_session() {
     f.add_output(1, (1920, 1080));
     f.freeze_clock();
     f.synoik().greeter = true;
-    f.synoik().sync_session_mode();
+    f.synoik_state().show_greeter_dialog();
 
     f.synoik_state()
         .request_session_action(SessionRequest::Suspend);
@@ -41825,4 +41825,29 @@ fn the_lock_screen_panel_ignores_a_fullscreen_window() {
         .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
     assert!(f.synoik().panel_takes_input_on(&output));
     assert!(f.synoik().panel_visible_on(&output));
+}
+
+/// The greeter is the screen shield shown at startup (`main.js:327-330` → `showDialog`): down at
+/// once, locked, on the login page, and nothing raises it — not input, not a deactivate.
+#[test]
+fn the_greeter_is_a_shield_that_stays_down() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+
+    let now = f.synoik().shield_now();
+    assert!(f.synoik().screen_shield.is_locked());
+    assert!(f.synoik().lock_screen.is_covering(now));
+    assert_eq!(f.synoik().lock_screen.page_progress(now), 1.);
+    assert!(f.gdm_requests().is_empty(), "no user to ask for yet");
+
+    tap(&mut f, KEY_A);
+    let effects = f.synoik().screen_shield.deactivate();
+    f.synoik_state().apply_shield_effects(effects);
+    f.turn();
+    let now = f.synoik().shield_now();
+    assert!(f.synoik().screen_shield.is_active());
+    assert!(f.synoik().lock_screen.is_covering(now));
 }
