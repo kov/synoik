@@ -6,11 +6,8 @@
 > autologin; the system-only clock and quick settings GDM's greeter shows.
 
 References: gnome-shell **50.3** for everything the greeter does and everything it calls
-(`js/gdm/*.js`, `js/ui/sessionMode.js`) — that is the client being ported, so it fixes the wire.
-The daemon internals (worker per service, the PAM sequence) are cited from the gdm checkout at
-`~/Projects/gdm`, which is **43.0**; the two already differ on the wire (`SessionOpened` carries a
-session id in 50.3's `loginDialog.js:1292`, not in 43's `daemon/gdm-session.xml:130-132`), so the
-wire contract is pinned to a gdm 50 checkout before the daemon is built (§8 G1).
+(`js/gdm/*.js`, `js/ui/sessionMode.js`) — that is the client being ported, so it fixes the wire —
+and gdm **51.0** (`~/Projects/gdm`) for the daemon side.
 
 ---
 
@@ -41,9 +38,19 @@ Three kinds of process, and only the first two are privileged:
 
 The root code is its own crate (`synoik-login`) and binary — never the compositor binary, which
 stays unprivileged (system-compositor §1) and never links PAM. This is GDM's split
-(`daemon/main.c:340-342` root daemon; `gdm-session-worker` per conversation,
-`daemon/gdm-session.c:2193-2240`), without GDM's display management: the outer owns the display,
+(`daemon/main.c:253-257` root daemon; `gdm-session-worker` per conversation,
+`daemon/gdm-session.c:2367-2416`), without GDM's display management: the outer owns the display,
 logind owns the seat, and the daemon only authenticates and starts sessions.
+
+The greeter runs as one fixed system user. GDM 51 allocates dynamic greeter users per seat
+(`gdm-greeter`, `gdm-greeter-2`, … from systemd's greeter UID range, served over userdb,
+`daemon/gdm-dynamic-user-store.c:266-285`); that buys multi-seat, which we do not do
+(system-compositor S5).
+
+PAM is bound by a thin FFI layer of our own over `security/pam_appl.h` — the worker uses about a
+dozen calls, the conversation callback's memory must be ours to zeroize, and the handle's
+lifetime across the session fork must be explicit; the published crates are either an alpha
+`-sys` or safe wrappers that hide exactly those.
 
 ---
 
@@ -62,9 +69,12 @@ client path, and stock installs that keep real GDM need no second one.
   speaks): `UserVerifier` (`BeginVerificationForUser`, `AnswerQuery`, `Cancel`, and the signals
   `InfoQuery`, `SecretInfoQuery`, `Info`, `Problem`, `ConversationStarted/Stopped`,
   `ServiceUnavailable`, `VerificationFailed/Complete`, `Reset`), and on login channels `Greeter`
-  (`SelectUser`, `StartSessionWhenReady`, signals `SessionOpened`, `Reauthenticated`).
+  (`SelectUser`, `StartSessionWhenReady`, `StopConflictingSession`, signals
+  `SessionOpened(service, session_id)`, `Reauthenticated`) — `daemon/gdm-session.xml:40-163`,
+  `daemon/gdm-manager.xml:3-16`.
 - **Refused with a named error:** `SelectSession`, `BeginAutoLogin`, `GetTimedLoginDetails`, the
-  `ChoiceList` extension (smartcard-only).
+  `ChoiceList` and `CustomJSON` extensions (smartcard and switchable auth; gnome-shell 50.3 uses
+  neither for password or fingerprint, `js/gdm/util.js:27-29`).
 - **Service names on the wire are GDM's** — the client must keep sending `gdm-password` to real
   GDM. The daemon maps `gdm-password` → PAM service `synoik-password`, `gdm-fingerprint` →
   `synoik-fingerprint`; any other name is `ServiceUnavailable`.
@@ -74,8 +84,8 @@ Owning GDM's bus name means GDM and synoik-login are alternatives, as display ma
 
 ### 2.2 Who may open what
 
-Every channel is checked twice, at open and at connect, like GDM (`daemon/gdm-manager.c:461-583`,
-`daemon/gdm-session.c:1890-1915`): the caller's uid and pid from the bus (open) and `SO_PEERCRED`
+Every channel is checked twice, at open and at connect, like GDM (`daemon/gdm-manager.c:471-593`,
+`daemon/gdm-session.c:2056-2083`): the caller's uid and pid from the bus (open) and `SO_PEERCRED`
 (connect), then the same logind claim the outer checks for `Hello` (system-compositor §10: the
 session's `UID` is the peer's, `SEAT=seat0`, and the peer's scope is that session's).
 
@@ -84,7 +94,7 @@ session's `UID` is the peer's, `SEAT=seat0`, and the peer's scope is that sessio
   session (its lock screen), and only while U has a session on seat0.
 - **A channel's conversations die with its connection.** A greeter that crashes or reconnects
   starts from nothing; no PAM conversation outlives the client that drives it. (GDM sets no
-  timeout at all, `gdm-session.c:1172`.)
+  timeout at all, `gdm-session.c:1284`.)
 
 ### 2.3 Conversations: one worker per PAM service
 
@@ -92,53 +102,73 @@ Each `BeginVerificationForUser(service, user)` forks a worker that runs one PAM 
 worker per service, not threads: `pam_fprintd` blocks inside the conversation, PAM modules keep
 process state, and the losing conversation must be killable — SIGTERM, then the worker's own
 cleanup runs `pam_close_session` (if it got that far), `pam_setcred(PAM_DELETE_CRED)`, `pam_end`
-(`daemon/gdm-session-worker.c:1079-1092`).
+(`daemon/gdm-session-worker.c:1174-1198`).
 
-The worker's sequence (`gdm-session-worker.c:1178-1645`, `2186-2416`):
+The worker's sequence (`gdm-session-worker.c:1225-1808`, `2271-2397`):
 
-1. `pam_start(service, user)`; `PAM_TTY` is unset (no VT on the outer's seat).
+1. A service with no file in the PAM search path is `ServiceUnavailable` before `pam_start`
+   (`:1244-1259`). `pam_start(service, user)`; `PAM_TTY` is set only where seat0 has VTs
+   (`:1354-1361`).
 2. `pam_authenticate`. `PAM_USER_UNKNOWN` is reported as `PAM_AUTH_ERR`, so an unknown user and a
-   wrong password look the same (`:1273-1301`); `PAM_AUTHINFO_UNAVAIL`/`PAM_MAXTRIES` become
-   `ServiceUnavailable` (the client already turns that into "Fingerprint reader unavailable").
+   wrong password look the same; `PAM_AUTHINFO_UNAVAIL`, `PAM_MODULE_UNKNOWN` and `PAM_MAXTRIES`
+   reach the client as `ServiceUnavailable` (`:1392-1440`, `gdm-session.c:215-230`) — which the
+   client already turns into "Fingerprint reader unavailable".
 3. `pam_acct_mgmt`; on `PAM_NEW_AUTHTOK_REQD`, `pam_chauthtok(PAM_CHANGE_EXPIRED_AUTHTOK)` over the
-   same conversation (`:1337-1352`).
-4. `pam_setcred(PAM_ESTABLISH_CRED)`.
-5. Then `VerificationComplete(service)`, and the worker waits: it opens nothing until the greeter
-   names it the winner (§2.4).
+   same conversation (`:1470-1485`).
+4. `setgid`/`initgroups` (uid stays 0), then `pam_setcred(PAM_ESTABLISH_CRED)` (`:1571-1610`,
+   `1700-1808`).
+5. `VerificationComplete(service)`.
 
 A prompt travels as GDM's does: the PAM conversation callback blocks; the daemon parks it and
-emits `SecretInfoQuery`/`InfoQuery`; `AnswerQuery` completes it (`gdm-session.c:715-737`).
+emits `SecretInfoQuery`/`InfoQuery`; `AnswerQuery` completes it (`gdm-session.c:754-784`).
 Secrets are zeroized wherever they rest — the worker, the daemon's parked answer (GDM wipes only
-the worker side, `gdm-session.c:724-729`) — and never cross the system bus.
+the worker side, `gdm-session-worker.c:900-906`; `answer_pending_query`, `gdm-session.c:769-775`,
+does not) — and never cross the system bus.
 
-### 2.4 The winner opens the session
+### 2.4 The first to verify opens the session
 
-GDM opens a session in **every** conversation that reaches credentials and only later kills the
-losers (`gdm-session.c:324-327`, `2805-2857`). We open only the winner's:
+GDM opens a session in **every** login conversation that reaches credentials and kills the losers
+only when the greeter starts one (`gdm-session.c:338-340`, `2969-3021`); in practice the first to
+open is the one `SessionOpened` names. We make that the rule and open only it:
 
-1. A login conversation completes → `SessionOpened(service, id)` once the winner is chosen. The
-   greeter calls `StartSessionWhenReady(service, true)`; every other worker is SIGTERMed.
+1. The first login conversation to reach `VerificationComplete` wins; every other worker is
+   SIGTERMed at once.
 2. The winner puts **everything pam_systemd reads** into the PAM environment *before*
    `pam_open_session`: `XDG_SEAT=seat0`, `XDG_SESSION_TYPE=wayland`, `XDG_SESSION_CLASS=user`,
    `XDG_SESSION_DESKTOP=synoik`. (GDM pushes the desktop name only after open,
-   `gdm-session.c:2693-2750`, so logind never sees it — a GDM quirk we do not copy.)
-3. `pam_open_session`; `XDG_SESSION_ID` comes back in the PAM environment.
-4. Fork: `setsid`, `initgroups`/`setgid`/`setuid`, `chdir(HOME)`, stdout/stderr to the journal,
-   exec `synoik-session` with `pam_getenvlist` plus `SYNOIK_SYSTEM_SOCKET`
-   (`gdm-session-worker.c:2015-2140`).
+   `gdm-session.c:2873-2915` called at `:3105`, so logind never sees it — a GDM quirk we do not
+   copy.)
+3. `pam_open_session`; `XDG_SESSION_ID` comes back in the PAM environment, and the daemon emits
+   `SessionOpened(service, id)`. The id must be real: gnome-shell looks it up in logind to find
+   a conflicting session of the same user (`loginDialog.js:1267-1304`) and offers
+   `StopConflictingSession`, which terminates the user's other graphical sessions
+   (`gdm-session.c:1802-1822`).
+4. On `StartSessionWhenReady(service, true)`, fork: `setsid`, `setuid`, `chdir(HOME)`,
+   `environment.d`, stdout/stderr to the journal, `pam_end(PAM_DATA_SILENT)` in the child, exec
+   `synoik-session` with `pam_getenvlist` plus `SYNOIK_SYSTEM_SOCKET`
+   (`gdm-session-worker.c:2083-2236`).
 5. The worker stays the session's parent; when it exits, `pam_close_session`,
-   `pam_setcred(DELETE)`, `pam_end` (`:1752-1775`).
+   `pam_setcred(DELETE)`, `pam_end`, `killpg(SIGHUP)` (`:1862-1880`).
+
+GDM 51 also puts `XDG_SESSION_EXTRA_DEVICE_ACCESS=render:accel` in every session's PAM
+environment (`gdm-session-worker.c:1338`); what logind grants for it is checked at bring-up
+before we copy it (§8 G1).
 
 logind makes a new seat0 session `Active` on its own (system-compositor §9 S1), so the outer
 fronts it with no call from anyone.
 
 ### 2.5 Reauthentication
 
-One mechanism for both callers: a reauthentication channel runs fresh workers for U (GDM's
-transient-session path, `gdm-manager.c:1043-1121`) with `PAM_REINITIALIZE_CRED` and
-`acct_mgmt`/`setcred` failures ignored (`gdm-session-worker.c:1356-1358`, `2950-2952`). On
-`VerificationComplete` the daemon calls logind `UnlockSession` and `ActivateSession` on U's
-session, then emits `Reauthenticated`.
+One mechanism for both callers: a reauthentication channel runs fresh workers for U with
+`PAM_REINITIALIZE_CRED` and `acct_mgmt`/`setcred` failures ignored
+(`gdm-session-worker.c:1487-1492`, `1776-1783`, `2911-2915`). On `VerificationComplete` the daemon
+calls logind `UnlockSession` and `ActivateSession` on U's session, then emits `Reauthenticated`
+(`gdm-manager.c:947-970`).
+
+GDM runs this inside the worker of U's own session, and uses fresh workers (its temporary channel,
+`gdm-manager.c:979-1055`) only for a frozen session or one it did not start
+(`gdm-manager.c:1133-1143`). We always use fresh workers: one path, and the session's worker
+stays a plain parent that never talks PAM again after the session starts.
 
 - **Lock screen:** what `src/dbus/gdm.rs` does today, unchanged.
 - **Greeter, U already logged in:** gnome-shell tries the reauthentication channel first and falls
@@ -150,7 +180,7 @@ session, then emits `Reauthenticated`.
 At boot the daemon opens the greeter's own session: PAM service `synoik-greeter`, user
 `synoik-greeter`, `XDG_SESSION_CLASS=greeter`, `XDG_SEAT=seat0`, running
 `synoik --greeter` with `SYNOIK_SYSTEM_SOCKET` (GDM's `gdm-launch-environment`,
-`daemon/gdm-launch-environment.c:330-350`). That session lives for the machine's lifetime and is
+`daemon/gdm-launch-environment.c:495-510`, `568-629`). That session lives for the machine's lifetime and is
 restarted if it dies. After a login it stays, in the background, ready: logout and "switch user"
 activate it (§5), so there is never a greeter to spawn on the interactive path.
 
@@ -175,13 +205,21 @@ Shipped as `synoik-*`, modelled on GDM's Fedora and Arch stacks (`data/pam-redha
   `pam_systemd`; no password.
 - **`synoik-autologin`:** `pam_permit` auth, the normal account and session stacks.
 
+Each distro substack is wrapped as GDM 51 wraps its own — `include <substack>` then `pam_deny`
+(`data/pam-redhat/gdm-service-auth-substack.pam.in`, `data/meson.build:103-120`) — so an empty or
+missing distro file denies instead of authenticating anyone. Where the distro stacks carry
+`pam_oo7` beside `pam_gnome_keyring`, ours do too.
+
 Rate limiting is `pam_faillock` in the stack; the greeter's `allowed-failures` (§4.3) only decides
 when the prompt resets.
 
-**Accepted limitation:** a fingerprint login leaves the login keyring locked — there is no password
-to unlock it with. GDM papers over this with `pam_gdm`, which hands `pam_gnome_keyring` the disk
-encryption passphrase from the kernel keyring (`pam_gdm/pam_gdm.c:48-80`); whether we ship an
-equivalent is §8 G3.
+**The keyring after a fingerprint login.** There is no password to unlock it with, so
+`synoik-fingerprint` does what GDM's does: a module ahead of `pam_gnome_keyring` hands it the disk
+encryption passphrase from the kernel keyring's `cryptsetup` key as `PAM_AUTHTOK`, zeroized after
+(`pam_gdm/pam_gdm.c:48-99`), and is skipped (`[success=ok default=1]`) when there is none. Ours is
+`pam_synoik`, since `pam_gdm` ships with the gdm package. Planned beyond GDM: the user's password
+sealed in the TPM at password login and unsealed for this, so the keyring opens without disk
+encryption too.
 
 ---
 
@@ -311,14 +349,11 @@ user → user switches, where it exists to take the previous user's screen away.
 
 ## 8. Open questions
 
-**G1 — gdm 50 reference.** Add a gdm 50.x checkout under `~/Projects` and pin §2.1 to it before
-the daemon's D-Bus surface is written; 43 is fine for the worker and the PAM sequence.
+**G1 — `XDG_SESSION_EXTRA_DEVICE_ACCESS`.** GDM 51 asks logind for `render:accel` on every
+session; read what logind does with it before copying it.
 
-**G2 — PAM bindings.** Which Rust PAM crate, or a thin `pam-sys` layer of our own; decided when
-the worker is written, against the then-current crates.
-
-**G3 — Keyring after a fingerprint login.** Ship a `pam_gdm` equivalent (disk passphrase as the
-authtok), or accept a locked keyring until first password use.
+**G2 — The TPM-sealed password** (§3): how it is sealed (systemd-creds, or a policy of our own),
+when it is re-sealed after a password change, and what binds it to the user.
 
 **S4 (system-compositor) stays open:** the lock screen remains in the inner; this design does not
 need it moved.
