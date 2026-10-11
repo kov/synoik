@@ -160,11 +160,11 @@ Two hazards it closes, both pinned by tests in `screen_shield.rs`:
 - **The epoch.** Opening a channel can outlive the lock that asked for it (lock, dismiss, re-lock).
   An old *failure* answering a new lock leaves the screen covered but unlocked; an old *success*
   locks with no conversation behind it. Each lock asks under its own epoch and ignores the others.
-- **A lost channel.** If gdm goes away mid-conversation the lock is a trap — `answer_query` no-ops
-  on a dead conversation *after* replying successfully, so the user sees no error and makes no
-  progress. `authenticator_lost` drops the lock back to a screensaver. This is a divergence: GNOME
-  leaves the dialog stuck. It is not a weakening, since killing gdm needs root and root can already
-  read the session.
+- **A lost channel.** If the display manager goes away mid-conversation, the conversation is dead —
+  `answer_query` no-ops on it *after* replying successfully, so the user would see no error and
+  make no progress. `authenticator_lost` keeps the lock and asks for a new channel, backing off
+  (1 s doubling to 30 s) while none can be had: a crash below the lock screen must never leave the
+  session open. This is a divergence: GNOME leaves the dialog stuck on the dead channel.
 
 **First seat test: open a second VT before typing a wrong password.**
 

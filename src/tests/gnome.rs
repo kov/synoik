@@ -18466,36 +18466,61 @@ fn logind_lock_and_unlock_drive_the_shield() {
     );
 }
 
-/// If the unlock channel dies, the lock drops to a dismissible screensaver rather than trapping
-/// the session.
+/// If the unlock channel dies, the lock stays and the shield asks for a new channel until one
+/// opens.
 ///
-/// A locked shield whose verifier is gone can never be answered: gdm's `answer_query` no-ops on a
-/// dead conversation *after* replying successfully, so the user gets no error and no progress.
-/// Dropping the lock is a deliberate divergence — GNOME leaves the dialog stuck — and it is not a
-/// weakening, since anyone who can kill gdm as root can already read the session.
+/// A locked shield whose verifier is gone cannot be answered: the display manager's
+/// `answer_query` no-ops on a dead conversation *after* replying successfully. Dropping the lock
+/// would leave the session open to whoever walks up because something below the lock screen
+/// failed; keeping it and recovering the channel is the divergence — GNOME leaves the dialog stuck
+/// on the dead one.
 #[test]
-fn losing_the_unlock_channel_does_not_trap_the_session() {
-    use crate::dbus::gdm::VerifierEvent;
+fn losing_the_unlock_channel_keeps_the_lock_and_recovers_it() {
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
     use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+
+    let begins = |f: &mut Fixture| -> Vec<u64> {
+        f.gdm_requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                VerifierRequest::Begin { epoch, .. } => Some(epoch),
+                _ => None,
+            })
+            .collect()
+    };
 
     f.synoik_state()
         .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    assert_eq!(begins(&mut f), [1]);
     f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
     assert!(f.synoik().screen_shield.is_locked());
 
     f.synoik_state().on_verifier_event(VerifierEvent::Lost);
-    assert!(!f.synoik().screen_shield.is_locked(), "the lock is dropped");
-    assert!(
-        f.synoik().screen_shield.is_active(),
-        "the screen stays covered"
-    );
+    assert!(f.synoik().screen_shield.is_locked(), "the lock stays");
+    assert_eq!(begins(&mut f), [2], "and asks for a new channel");
 
-    // ...and it can now be dismissed, which is the whole point.
+    // Nothing gets past it meanwhile.
     tap(&mut f, KEY_A);
-    assert!(!f.synoik().screen_shield.is_active());
+    assert!(f.synoik().screen_shield.is_active());
+    assert!(f.synoik().screen_shield.is_locked());
+
+    // The display manager is still down: the shield waits and asks again.
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::Unavailable(2, "down".to_owned()));
+    assert!(f.synoik().screen_shield.is_locked());
+    assert!(begins(&mut f).is_empty(), "not at once");
+    f.advance_clock(Duration::from_secs(2));
+    f.turn();
+    assert_eq!(begins(&mut f), [3]);
+
+    // Back: still locked, with a conversation to answer.
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(3));
+    assert!(f.synoik().screen_shield.is_locked());
+    assert!(!f.synoik().screen_shield.is_dismissible());
 }
 
 /// A dash click does three different things depending on the app's state, and only one of them

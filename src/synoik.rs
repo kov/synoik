@@ -6307,8 +6307,8 @@ impl State {
     /// this session: it stays running in the background and the user can VT-switch straight back to
     /// it. The trade is a conversation that outlives the page flip, which is what Escape already
     /// does and for the same stated reason ([`crate::unlock_dialog::UnlockDialog::show_clock`]) —
-    /// against a lock screen nobody can get past. Cancelling becomes safe once there is a re-Begin;
-    /// see `authenticator_lost`, which is the same fail-open instinct from the other direction.
+    /// against a lock screen nobody can get past. Cancelling becomes safe once a locked shield can
+    /// re-Begin on demand; `authenticator_lost` re-Begins only for a channel that died.
     pub fn switch_user(&mut self) {
         let now = self.synoik.shield_now();
         let effects = self.synoik.unlock_dialog.cancel();
@@ -6648,7 +6648,11 @@ impl State {
                 self.apply_shield_effects(effects);
             }
             VerifierEvent::Unavailable(epoch, reason) => {
-                warn!("the screen will not lock: {reason}");
+                if self.synoik.screen_shield.is_locked() {
+                    warn!("no unlock channel yet; the screen stays locked: {reason}");
+                } else {
+                    warn!("the screen will not lock: {reason}");
+                }
                 let effects = self.synoik.screen_shield.authenticator_ready(*epoch, false);
                 self.apply_shield_effects(effects);
             }
@@ -6859,6 +6863,14 @@ impl State {
             self.arm_lock_timer(delay);
         }
 
+        if let Some(delay) = effects.retry_authenticator_after {
+            self.synoik.timer_after(delay, |state| {
+                let effects = state.synoik.screen_shield.retry_authenticator();
+                state.apply_shield_effects(effects);
+                None
+            });
+        }
+
         // The shield's own paths move the page too (`cancel_dialog`, and the `show_clock` a
         // cancelled conversation forces), so the crossfade clock is synced from here as well.
         self.sync_lock_page_and_caps();
@@ -6889,9 +6901,14 @@ impl State {
     fn arm_authenticator_watchdog(&mut self, epoch: u64) {
         self.synoik
             .timer_after(Self::AUTHENTICATOR_TIMEOUT, move |state| {
+                let locked = state.synoik.screen_shield.is_locked();
                 let effects = state.synoik.screen_shield.authenticator_ready(epoch, false);
                 if effects != crate::screen_shield::ShieldEffects::default() {
-                    warn!("gdm never answered; the shield stays a screensaver");
+                    if locked {
+                        warn!("gdm never answered; the shield stays locked and will ask again");
+                    } else {
+                        warn!("gdm never answered; the shield stays a screensaver");
+                    }
                 }
                 state.apply_shield_effects(effects);
                 None

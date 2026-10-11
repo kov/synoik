@@ -53,6 +53,9 @@ pub struct ShieldEffects {
     /// Tear any conversation down: the shield was raised, so gdm's PAM worker and its channel must
     /// not outlive it.
     pub cancel_authenticator: bool,
+    /// Call [`ScreenShield::retry_authenticator`] after this long: a locked shield lost its
+    /// channel and could not get a new one yet.
+    pub retry_authenticator_after: Option<Duration>,
     /// Arm a one-shot timer that calls [`ScreenShield::lock`] after this long
     /// (`_onStatusChanged`, `:257-271`). Replaces any timer already pending.
     pub arm_lock_timer: Option<Duration>,
@@ -127,6 +130,11 @@ impl Default for ShieldSettings {
     }
 }
 
+/// The first wait before asking again for a channel a locked shield lost; it doubles per attempt.
+const RECOVER_FIRST: Duration = Duration::from_secs(1);
+/// ...up to this.
+const RECOVER_MAX: Duration = Duration::from_secs(30);
+
 /// Why a [`ScreenShield::lock`] did not lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockRefused {
@@ -150,6 +158,8 @@ pub struct ScreenShield {
     awaiting_authenticator: Option<u64>,
     /// Monotonically increasing; one per lock that asks for a verifier.
     epoch: u64,
+    /// Failed attempts to replace the channel a locked shield lost; 0 when it has one.
+    recover_attempts: u32,
 }
 
 impl ScreenShield {
@@ -236,6 +246,7 @@ impl ScreenShield {
     pub fn deactivate(&mut self) -> ShieldEffects {
         self.activation_time = None;
         self.awaiting_authenticator = None;
+        self.recover_attempts = 0;
         let mut effects = self.set_active(false);
         effects.wake_up_screen = true;
         effects.cancel_authenticator = true;
@@ -282,7 +293,8 @@ impl ScreenShield {
     /// has begun, `false` if it could not be had.
     ///
     /// This is the only path into `locked`. On `false` the shield stays merely active, so the
-    /// screen is still covered and any input raises it.
+    /// screen is still covered and any input raises it — unless it is already locked and only
+    /// replacing a channel it lost, in which case it stays locked and tries again later.
     pub fn authenticator_ready(&mut self, epoch: u64, ready: bool) -> ShieldEffects {
         // Ignore an answer for a lock that no longer applies: a different epoch, or a shield that
         // has since been raised. Either way, locking now would be a lock nobody asked for.
@@ -291,24 +303,48 @@ impl ScreenShield {
         }
         self.awaiting_authenticator = None;
         if !ready {
-            return ShieldEffects::default();
+            if !self.locked {
+                return ShieldEffects::default();
+            }
+            let delay = RECOVER_FIRST
+                .saturating_mul(1 << self.recover_attempts.min(16))
+                .min(RECOVER_MAX);
+            self.recover_attempts += 1;
+            return ShieldEffects {
+                retry_authenticator_after: Some(delay),
+                ..Default::default()
+            };
         }
+        self.recover_attempts = 0;
         self.set_locked(true)
     }
 
-    /// The channel behind a locked shield died (gdm went away). There is nothing left to
-    /// authenticate against, so the lock is a trap — drop back to a plain screensaver, which the
-    /// user can at least dismiss.
+    /// The channel behind a locked shield died (the display manager went away). The lock stays —
+    /// a session left open because something below it failed is the worse failure — and the shield
+    /// asks for a new channel, retrying until one opens (`authenticator_ready`).
     ///
-    /// A divergence: GNOME leaves the dialog stuck. Ours is the safer failure, and it is not a
-    /// weakening — anyone who can kill gdm as root can already read the session.
+    /// GNOME leaves the dialog stuck on a dead channel; this keeps the lock and recovers it.
     pub fn authenticator_lost(&mut self) -> ShieldEffects {
         self.awaiting_authenticator = None;
-        if !self.locked {
+        if !self.locked || !self.active {
             return ShieldEffects::default();
         }
-        warn!("the unlock channel died; dropping the lock to a screensaver so it is not a trap");
-        self.set_locked(false)
+        warn!("the unlock channel died; keeping the lock and asking for a new channel");
+        self.retry_authenticator()
+    }
+
+    /// Ask again for a channel to the lock a shield lost its channel to. Nothing if the shield was
+    /// raised or unlocked meanwhile, or a request is already out.
+    pub fn retry_authenticator(&mut self) -> ShieldEffects {
+        if !self.locked || !self.active || self.awaiting_authenticator.is_some() {
+            return ShieldEffects::default();
+        }
+        self.epoch += 1;
+        self.awaiting_authenticator = Some(self.epoch);
+        ShieldEffects {
+            request_authenticator: Some(self.epoch),
+            ..Default::default()
+        }
     }
 
     /// `_onStatusChanged` with `PresenceStatus.IDLE` (`:242-272`) — gnome-session says the seat
@@ -671,9 +707,10 @@ mod tests {
         assert!(shield.is_locked());
     }
 
-    /// If the unlock channel dies, the lock drops to a screensaver rather than becoming a trap.
+    /// If the unlock channel dies, the lock stays and the shield asks for a new channel, backing
+    /// off while none can be had, until one opens.
     #[test]
-    fn losing_the_channel_drops_the_lock_rather_than_trapping_the_session() {
+    fn losing_the_channel_keeps_the_lock_and_recovers_it() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
         let epoch = shield
             .lock(T0, false)
@@ -683,13 +720,43 @@ mod tests {
         shield.authenticator_ready(epoch, true);
         assert!(shield.is_locked());
 
-        let effects = shield.authenticator_lost();
-        assert_eq!(effects.locked_changed, Some(false));
-        assert!(
-            !shield.is_locked(),
-            "nothing can unlock it, so it must not lock"
-        );
-        assert!(shield.is_active(), "but the screen stays covered");
+        let lost = shield.authenticator_lost();
+        assert_eq!(lost.locked_changed, None, "the lock stays");
+        assert!(shield.is_locked() && !shield.is_dismissible());
+        let again = lost.request_authenticator.expect("asks for a new channel");
+        assert!(again > epoch);
+
+        // The display manager is still down: wait, longer each time, and ask again.
+        let refused = shield.authenticator_ready(again, false);
+        assert!(shield.is_locked(), "a refusal does not unlock");
+        assert_eq!(refused.retry_authenticator_after, Some(RECOVER_FIRST));
+        let retry = shield.retry_authenticator().request_authenticator.unwrap();
+        let refused = shield.authenticator_ready(retry, false);
+        assert_eq!(refused.retry_authenticator_after, Some(RECOVER_FIRST * 2));
+
+        // Back: locked, with a live conversation, and nothing announced — it never unlocked.
+        let retry = shield.retry_authenticator().request_authenticator.unwrap();
+        let back = shield.authenticator_ready(retry, true);
+        assert!(shield.is_locked());
+        assert_eq!(back.locked_changed, None);
+        assert_eq!(back.retry_authenticator_after, None);
+    }
+
+    /// A retry that comes due after the shield was raised asks for nothing.
+    #[test]
+    fn a_retry_after_the_shield_rose_does_nothing() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .unwrap()
+            .request_authenticator
+            .unwrap();
+        shield.authenticator_ready(epoch, true);
+        let again = shield.authenticator_lost().request_authenticator.unwrap();
+        shield.authenticator_ready(again, false);
+        shield.deactivate();
+
+        assert_eq!(shield.retry_authenticator(), ShieldEffects::default());
     }
 
     /// A verifier that arrives after the shield was raised must not lock the running session.
@@ -783,7 +850,7 @@ mod tests {
     /// GNOME's only guard here is the fade already running (`:248-251`); the arming condition is
     /// `lockEnabled && !isLocked` and says nothing about whether the shield is down (`:258`). An
     /// `active`-based guard looks like the obvious idempotence fix and is a security hole: raise a
-    /// screensaver by hand (or lose a lock to `authenticator_lost`), walk away, and with
+    /// screensaver by hand, walk away, and with
     /// `lock-enabled = true` the screen stays covered and unlocked forever.
     #[test]
     fn an_already_covered_screensaver_still_locks_on_idle() {
