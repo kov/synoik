@@ -81,6 +81,15 @@ Steady state is **unredirected**: the fronted session's buffer goes straight to 
 one flip, no outer compositing, no added latency. The outer only composites during transitions and
 while it is itself fronted.
 
+**The steady-state path works on our stack** (measured 2026-10-11, enhanced F44 on Limina, venus):
+a buffer allocated and cleared by one process with `Texture::allocate_scanout` and passed as a
+dmabuf over `SCM_RIGHTS` is PRIME-imported, `AddFB2`'d and flipped by a second process holding
+master — every re-clear reaches glass, at 60 Hz, and the buffer keeps scanning out after its
+producer exits. Two consequences for the protocol: virtio-gpu lacks `DRM_CAP_ADDFB2_MODIFIERS`, so `AddFB2`
+must go without `DRM_MODE_FB_MODIFIERS` (`PrimeFramebufferExporter` already checks); and nothing
+orders the producer's writes against the flip, so the buffer handoff carries an explicit fence.
+Probe: `synoik-vk/examples/xproc_scanout_send.rs` + `spikes/xproc_scanout_recv.c`.
+
 ---
 
 ## 2. Input
