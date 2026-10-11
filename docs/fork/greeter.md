@@ -413,5 +413,8 @@ the daemon; a wrong password shows "Sorry, password authentication didn't work. 
 and the client re-begins; the right one unlocks. Through a GDBus client on the channel:
 `gdm-fingerprint` with the guest's stack (no reader) gives `ServiceUnavailable('')`,
 `VerificationFailed`, `ConversationStopped` — the sequence the lock screen turns into "Fingerprint
-reader unavailable" — and `gdm-smartcard` the same, with no worker. Not yet exercised: a real
-fingerprint scan (the harness runs without its reader).
+reader unavailable" — and `gdm-smartcard` the same, with no worker. With Limina's Touch ID reader
+(`authselect enable-feature with-fingerprint`, a print enrolled with `fprintd-enroll`), the lock
+screen runs `gdm-fingerprint` beside `gdm-password` and a touch unlocks the session; a reader
+another client holds (Settings' fingerprint dialog keeps its claim while open), or a scan that
+times out (pam_fprintd's 30 s), reports unavailable and leaves the password working.
