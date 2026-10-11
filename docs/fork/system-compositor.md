@@ -2,8 +2,8 @@
 
 > Status: **design agreed 2026-08-15; partly built** — sessions nested and scanned out
 > unredirected, the screen following logind's active session with a crossfade, surviving a crash
-> of either side (§10). The greeter and outer-initiated switching are not built. The outer is an
-> unprivileged system user outside logind (§9 S1).
+> of either side, and switchable by the outer's own chord where there are no VTs (§10). The
+> greeter is not built. The outer is an unprivileged system user outside logind (§9 S1).
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -399,6 +399,12 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   first `Presented` (§5 step 8). The target is the incoming session's held frame, else its next
   present, gated on its render fence polled readable (§5 step 6). A fronted frame that replaces
   the plate fades in the same way. Without a usable GPU a switch is a cut.
+- **Chord** (`system_compositor::chord`): on a seat without VTs the outer reads every evdev node
+  itself (the `input` group, nothing grabbed) for Ctrl+Alt+F<n>, which activates the n-th seat0
+  session in login order through logind's `ActivateSession` — off the event loop, allowed by
+  `resources/synoik-system.rules` (`chvt` only). With VTs the session compositor already turns
+  that chord into a VT switch, so the outer leaves it alone; `SYNOIK_SYSTEM_CHORDS=1`/`0`
+  overrides the detection.
 - **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
   backend takes it; renders like headless into three scanout slots, only while logind has it
   active; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
@@ -415,9 +421,11 @@ screen (the stored fd is still master, the session reattaches within the 0.5 s r
 a session leaves its last frame up until its next. Ctrl+Alt+F2/F1 switches crossfade: fitting
 each captured frame as `A + a·(B − A)` gives `a` on the ease-out curve (0.13 at 10 ms, 0.83 at
 110 ms, 1.0 by 211 ms) with a mean residual under 0.3/255, then the session's own buffers take
-over with no visible step; reversing at `a` = 0.46 continues from 0.46.
+over with no visible step; reversing at `a` = 0.46 continues from 0.46. With the fronted session
+SIGSTOPped, the outer's chord (forced on) fronted the other session 40 ms after the keypress;
+without the polkit rule logind refuses it (`InteractiveAuthorizationRequired`).
 
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
-more than one output; the mode-change path of §4.2/§4.3; the outer starting a switch itself
-(`ActivateSession`, the chord matcher); the greeter.
+more than one output; the mode-change path of §4.2/§4.3; the inner asking the outer for a switch
+over IPC (§2.1's normal path); the greeter.

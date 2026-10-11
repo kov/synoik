@@ -1,0 +1,10 @@
+// Install as /etc/polkit-1/rules.d/50-synoik-system.rules.
+//
+// The system compositor runs outside any logind session, so polkit would refuse it the session
+// switch it starts on Ctrl+Alt+F<n> (docs/fork/system-compositor.md §1). `chvt` is the action
+// logind checks for ActivateSession, and it is the only one granted.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.login1.chvt" && subject.user == "synoik-system") {
+        return polkit.Result.YES;
+    }
+});

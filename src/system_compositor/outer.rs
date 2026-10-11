@@ -43,6 +43,7 @@ use smithay::reexports::drm::control::{connector, crtc, framebuffer, Device as _
 use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
 
+use super::chord;
 use super::compose::{Compositor, Picture};
 use super::protocol::{self, ModeInfo, OutputInfo, Received, ToInner, ToOuter};
 use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
@@ -100,6 +101,12 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
         )
         .map_err(|err| anyhow::anyhow!("inserting the seat watch: {err}"))?;
     outer.refresh_front();
+
+    if chord::wanted() {
+        if let Err(err) = chord::watch(&handle, Outer::on_chord) {
+            warn!("no switch chord: {err:#}");
+        }
+    }
 
     notify(&[sd_notify::NotifyState::Ready]);
     event_loop.run(None, &mut outer, |_| ())?;
@@ -599,6 +606,21 @@ impl Outer {
                 end: End::Plate,
             });
         }
+    }
+
+    /// Ctrl+Alt+F<n>: front the n-th session on seat0, in login order, by asking logind to
+    /// activate it (§2.2) — the screen then follows the active session as for any switch.
+    fn on_chord(&mut self, n: u32) {
+        let sessions = seat_sessions("seat0");
+        let Some(id) = sessions.get(n as usize - 1) else {
+            debug!("Ctrl+Alt+F{n}: seat0 has {} sessions", sessions.len());
+            return;
+        };
+        if self.front.as_ref() == Some(id) {
+            return;
+        }
+        info!("Ctrl+Alt+F{n}: activating session {id}");
+        activate_session(id.clone());
     }
 
     /// The attached session logind has fronted, if any.
@@ -1490,4 +1512,59 @@ fn watch_seats() -> anyhow::Result<OwnedFd> {
 fn drain_inotify(fd: BorrowedFd<'_>) {
     let mut buf = [0u8; 4096];
     while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+/// The sessions on `seat` that can be fronted, oldest login first.
+fn seat_sessions(seat: &str) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir("/run/systemd/sessions") else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<(u64, String)> = dir
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let id = entry.file_name().into_string().ok()?;
+            if id.contains('.') {
+                // `<id>.ref` and the like: not session state.
+                return None;
+            }
+            let state = std::fs::read_to_string(entry.path()).ok()?;
+            let field = |key: &str| {
+                state
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            };
+            let fronts = field("SEAT") == Some(seat)
+                && matches!(field("CLASS"), Some("user" | "greeter"))
+                && matches!(field("STATE"), Some("online" | "active"));
+            let since = field("REALTIME")?.parse().ok()?;
+            fronts.then_some((since, id))
+        })
+        .collect();
+    sessions.sort();
+    sessions.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Ask logind to make session `id` the active one on its seat. Off the event loop: the call goes
+/// through polkit (`org.freedesktop.login1.chvt`, §1), and the outer must keep flipping while it
+/// is answered.
+fn activate_session(id: String) {
+    let spawned = std::thread::Builder::new()
+        .name("activate-session".into())
+        .spawn(move || {
+            let result = zbus::blocking::Connection::system().and_then(|bus| {
+                bus.call_method(
+                    Some("org.freedesktop.login1"),
+                    "/org/freedesktop/login1",
+                    Some("org.freedesktop.login1.Manager"),
+                    "ActivateSession",
+                    &(id.as_str(),),
+                )
+            });
+            if let Err(err) = result {
+                warn!("activating session {id}: {err}");
+            }
+        });
+    if let Err(err) = spawned {
+        warn!("spawning the session activation: {err}");
+    }
 }
