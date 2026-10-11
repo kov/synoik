@@ -444,6 +444,8 @@ pub struct Synoik {
 
     /// Whether synoik was run with `--session`
     pub is_session_instance: bool,
+    /// The login screen's user list (greeter only), from AccountsService.
+    pub login_users: Vec<crate::dbus::accounts_service::LoginUser>,
     /// `synoik --greeter`: the login screen's session, in gnome-shell's `gdm` mode
     /// (`docs/fork/greeter.md` §4).
     pub greeter: bool,
@@ -6760,6 +6762,13 @@ impl State {
                 }
                 self.synoik.can_switch_user = can;
             }
+            AccountsToSynoik::Users(users) => {
+                if self.synoik.login_users == users {
+                    return;
+                }
+                self.synoik.login_users = users;
+                self.synoik.queue_redraw_all();
+            }
         }
         if self.synoik.screen_shield.is_active() {
             self.synoik.queue_redraw_all();
@@ -8350,6 +8359,7 @@ impl Synoik {
             display_handle,
             is_session_instance,
             greeter: false,
+            login_users: Vec::new(),
             start_time: Instant::now(),
             is_at_startup: true,
             clock: animation_clock.clone(),

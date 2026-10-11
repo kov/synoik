@@ -498,7 +498,13 @@ impl DBusServers {
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
-        match accounts_service::start(synoik.unlock_dialog.user().name.clone(), to_niri) {
+        // The greeter's own account is nobody's to show; what it wants is everyone else.
+        let started = if synoik.greeter {
+            accounts_service::start_user_list(to_niri)
+        } else {
+            accounts_service::start(synoik.unlock_dialog.user().name.clone(), to_niri)
+        };
+        match started {
             Ok(conn) => dbus.conn_accounts = Some(conn),
             Err(err) => warn!("error starting AccountsService watcher: {err:?}"),
         }

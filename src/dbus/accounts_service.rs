@@ -130,6 +130,217 @@ pub enum AccountsToSynoik {
     /// It rides this channel rather than logind's because it is one of the same button's four
     /// gates and is resolved once at startup, not watched: a session does not change seats.
     CanSwitch(bool),
+    /// The greeter's user list, in display order, on first read and on every change.
+    Users(Vec<LoginUser>),
+}
+
+/// One entry of the login screen's user list (`UserList.addUser`, `loginDialog.js:262-288`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginUser {
+    /// `UserName`.
+    pub name: String,
+    /// `RealName`; empty when unset.
+    pub real_name: String,
+    pub icon_file: Option<AccountIcon>,
+    pub uid: u32,
+    /// `is_logged_in()`: the user has a session on our seat (`:logged-in`,
+    /// `loginDialog.js:104-109`).
+    pub logged_in: bool,
+    /// `LoginFrequency`, the first key of libaccountsservice's ordering (`act_user_collate`).
+    pub login_frequency: u64,
+}
+
+impl LoginUser {
+    /// The name the list shows: the real name, or the login name without one.
+    pub fn display_name(&self) -> &str {
+        if self.real_name.is_empty() {
+            &self.name
+        } else {
+            &self.real_name
+        }
+    }
+}
+
+/// The list the login screen shows, from every account AccountsService reported: no system
+/// accounts, no locked ones, none without a name (`UserList.addUser`, `loginDialog.js:262-276`).
+/// Ordered as libaccountsservice collates them — most frequent logins first, then by name.
+pub fn login_list(mut users: Vec<(LoginUser, bool, bool)>) -> Vec<LoginUser> {
+    users.retain(|(user, system, locked)| !system && !locked && !user.name.is_empty());
+    let mut users: Vec<LoginUser> = users.into_iter().map(|(user, _, _)| user).collect();
+    users.sort_by(|a, b| {
+        b.login_frequency.cmp(&a.login_frequency).then_with(|| {
+            a.display_name()
+                .to_lowercase()
+                .cmp(&b.display_name().to_lowercase())
+        })
+    });
+    users
+}
+
+/// Read one account for the list: the entry, and whether it is a system account and locked.
+async fn read_login_user(user: &zbus::Proxy<'_>, seated: &[u32]) -> (LoginUser, bool, bool) {
+    let uid = user.get_property::<u64>("Uid").await.unwrap_or(u64::MAX) as u32;
+    let login_user = LoginUser {
+        name: user
+            .get_property::<String>("UserName")
+            .await
+            .unwrap_or_default(),
+        real_name: user
+            .get_property::<String>("RealName")
+            .await
+            .unwrap_or_default(),
+        icon_file: user
+            .get_property::<String>("IconFile")
+            .await
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .and_then(AccountIcon::read),
+        uid,
+        logged_in: seated.contains(&uid),
+        login_frequency: user
+            .get_property::<u64>("LoginFrequency")
+            .await
+            .unwrap_or_default(),
+    };
+    // Unknown reads as the excluding answer: a list that briefly misses someone is better than
+    // one that offers a system account.
+    let system = user
+        .get_property::<bool>("SystemAccount")
+        .await
+        .unwrap_or(true);
+    let locked = user.get_property::<bool>("Locked").await.unwrap_or(true);
+    (login_user, system, locked)
+}
+
+/// The uids with a `user`-class session on seat0 that is not closing — libaccountsservice's
+/// `is_logged_in`, which counts the sessions on our seat.
+async fn seated_uids(conn: &zbus::Connection) -> Vec<u32> {
+    let Ok(reply) = conn
+        .call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "ListSessions",
+            &(),
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(sessions) =
+        reply
+            .body()
+            .deserialize::<Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)>>()
+    else {
+        return Vec::new();
+    };
+    let mut uids = Vec::new();
+    for (_, uid, _, seat, path) in sessions {
+        if seat != "seat0" {
+            continue;
+        }
+        let Ok(session) = zbus::Proxy::new(
+            conn,
+            "org.freedesktop.login1",
+            path,
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        else {
+            continue;
+        };
+        let class = session.get_property::<String>("Class").await;
+        let state = session.get_property::<String>("State").await;
+        if class.as_deref() == Ok("user") && state.as_deref() != Ok("closing") {
+            uids.push(uid);
+        }
+    }
+    uids
+}
+
+async fn read_login_list(conn: &zbus::Connection) -> Vec<LoginUser> {
+    let Ok(accounts) = zbus::Proxy::new(conn, ACCOUNTS_NAME, ACCOUNTS_PATH, ACCOUNTS_IFACE).await
+    else {
+        return Vec::new();
+    };
+    let paths = accounts
+        .call_method("ListCachedUsers", &())
+        .await
+        .ok()
+        .and_then(|reply| {
+            reply
+                .body()
+                .deserialize::<Vec<zbus::zvariant::OwnedObjectPath>>()
+                .ok()
+        })
+        .unwrap_or_default();
+    let seated = seated_uids(conn).await;
+    let mut users = Vec::new();
+    for path in paths {
+        if let Ok(user) = zbus::Proxy::new(conn, ACCOUNTS_NAME, path, USER_IFACE).await {
+            users.push(read_login_user(&user, &seated).await);
+        }
+    }
+    login_list(users)
+}
+
+/// The greeter's watcher: the login screen's user list, re-read whenever an account is added,
+/// deleted or changed (`loginDialog.js:1523-1545` — `Locked` flipping arrives as `Changed`) or a
+/// session starts or ends on the machine (the `:logged-in` mark).
+pub fn start_user_list(
+    to_niri: calloop::channel::Sender<AccountsToSynoik>,
+) -> anyhow::Result<zbus::blocking::Connection> {
+    let conn = zbus::blocking::Connection::system()?;
+
+    let async_conn = conn.inner().clone();
+    let future = async move {
+        use futures_util::stream::{self, StreamExt as _};
+
+        // Any `Changed` from any user object, and the manager's own signals: one match rule each,
+        // subscribed before the first read so nothing lands in between unseen.
+        let rule = |iface: &'static str, member: &'static str| {
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .interface(iface)
+                .and_then(|b| b.member(member))
+                .map(|b| b.build())
+        };
+        let mut streams = Vec::new();
+        for (iface, member) in [
+            (ACCOUNTS_IFACE, "UserAdded"),
+            (ACCOUNTS_IFACE, "UserDeleted"),
+            (USER_IFACE, "Changed"),
+            ("org.freedesktop.login1.Manager", "SessionNew"),
+            ("org.freedesktop.login1.Manager", "SessionRemoved"),
+        ] {
+            let Ok(rule) = rule(iface, member) else {
+                continue;
+            };
+            match zbus::MessageStream::for_match_rule(rule, &async_conn, None).await {
+                Ok(stream) => streams.push(stream.map(|_| ()).boxed()),
+                Err(err) => warn!("error subscribing to {iface}.{member}: {err:?}"),
+            }
+        }
+        let mut events = stream::select_all(streams);
+
+        loop {
+            let users = read_login_list(&async_conn).await;
+            if to_niri.send(AccountsToSynoik::Users(users)).is_err() {
+                break;
+            }
+            if events.next().await.is_none() {
+                break;
+            }
+        }
+    };
+
+    conn.inner()
+        .executor()
+        .spawn(future, "watch the login user list")
+        .detach();
+
+    Ok(conn)
 }
 
 /// Read the properties we care about off an already-resolved user proxy.
@@ -366,5 +577,32 @@ mod tests {
         assert!(!UserAccount::default().password_mode.is_none());
         assert_eq!(UserAccount::default().icon_file, None);
         assert_eq!(UserAccount::default().real_name, "");
+    }
+
+    fn user(name: &str, real: &str, freq: u64) -> LoginUser {
+        LoginUser {
+            name: name.to_owned(),
+            real_name: real.to_owned(),
+            icon_file: None,
+            uid: 1000,
+            logged_in: false,
+            login_frequency: freq,
+        }
+    }
+
+    /// `UserList.addUser` skips system, locked and nameless accounts (`loginDialog.js:262-276`);
+    /// the rest come most-frequent first, then by the shown name.
+    #[test]
+    fn the_login_list_is_filtered_and_collated() {
+        let list = login_list(vec![
+            (user("zed", "", 0), false, false),
+            (user("amy", "Amy Pond", 0), false, false),
+            (user("gdm", "", 9), true, false),
+            (user("old", "Old Account", 9), false, true),
+            (user("", "Nameless", 9), false, false),
+            (user("bob", "Bob", 5), false, false),
+        ]);
+        let names: Vec<_> = list.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(names, ["bob", "amy", "zed"]);
     }
 }
