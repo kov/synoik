@@ -79,11 +79,13 @@ the session alive and active and the outer master, `KDSETMODE KD_TEXT` on its VT
 framebuffer on the plane; with fbcon unbound the same ioctl left the plane alone. The `KD_TEXT`
 comes from logind, and the fbdev restore runs inside that very ioctl. logind issues it when the
 session's *controller* lets go — measured: a controller exiting put its VT to text while the
-session lived on, and the session's end later issued nothing. So with fbcon bound, any inner that
-crashes or restarts shows the console, logout or not.
+session lived on, and the session's end later issued nothing. The kernel only touches the screen
+for the foreground VT, so it is the fronted inner crashing, restarting or calling
+`ReleaseControl` that shows the console, logout or not. logind has no setting for this: in
+systemd 259 `session_prepare_vt`/`session_restore_vt` are unconditional for any session with a VT.
 Sessions cannot avoid owning a VT either: on a seat with VTs logind refuses a session with none
-(`CreateSession` → `InvalidParameter: VTNr`, measured on seat0). So the machine runs without fbcon
-on that card (`CONFIG_VT=n`, or the `vtconsole` unbound at boot); see §9 S6.
+(`CreateSession` → `InvalidParameter: VTNr`, measured on seat0). So there is no fbcon on that card,
+by one of the setups §9 S6 settles.
 
 | | Outer (system compositor) | Inner (session compositor) |
 |---|---|---|
@@ -354,12 +356,19 @@ screen in the inner, and moving it means the outer grows real UI — against §1
 
 **S5 — Multi-seat.** Not considered anywhere above.
 
-**S6 — Who unbinds fbcon.** The outer cannot share its card with a bound fbcon, and sessions on a
-seat with VTs must own one (§1). `CONFIG_VT=n` settles both: the seat has no VTs, so sessions are
-VT-less as on the S1 seat, and there is no fbcon. On a stock kernel sessions keep their VTs and
-fbcon is unbound at boot — a root write to `/sys/class/vtconsole/*/bind` or a kernel command line,
-configuration rather than a resident privileged process, but still root. Undecided which the
-shipped setup uses.
+**S6 — resolved: no fbcon on the outer's card, two supported setups.**
+
+- **Stock kernel, VTs present** — sessions keep their VTs; the install puts
+  `drm_kms_helper.fbdev_emulation=0` on the kernel command line, so no DRM device gets an fbdev
+  and fbcon never binds (measured: no `/dev/fb*`, only the dummy console, VT sessions unaffected,
+  a fronted inner killed or put to `KD_TEXT` leaves the plane on its framebuffer).
+  `drm_client_lib.active=` (empty) is equivalent; a one-shot root unbind of `/sys/class/vtconsole`
+  at boot is the fallback where the command line cannot be touched. The cost is shared by all
+  three: no kernel text console on the display — boot messages and an emergency shell go
+  unseen there.
+- **Enhanced-tier Limina guests** — `CONFIG_VT=n`: no VTs, so sessions are VT-less as on the S1
+  seat and there is no fbcon. If VT-less operation turns up too many problems, these guests fall
+  back to the stock setup above.
 
 ---
 
@@ -381,8 +390,7 @@ of §4/§5 yet.
   tty does off vblank. On losing the outer it keeps running, retries, re-registers its buffers
   and redraws in full.
 
-Measured 2026-10-11 on enhanced F44 under Limina (venus), session autologged on tty1, fbcon
-unbound: injected input reaches the session through logind and the frames flip contiguously
+Measured 2026-10-11 on enhanced F44 under Limina (venus), session autologged on tty1, no fbcon: injected input reaches the session through logind and the frames flip contiguously
 through the session's own buffers; SIGKILL of the outer is invisible on screen (the session's
 frame stays up, the outer restarts with the stored fd still master, the session reattaches within
 the 0.5 s retry); SIGKILL of the session leaves its last frame up until the next session's first.
