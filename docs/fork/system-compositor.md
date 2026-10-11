@@ -368,8 +368,9 @@ screen in the inner, and moving it means the outer grows real UI — against §1
   three: no kernel text console on the display — boot messages and an emergency shell go
   unseen there.
 - **Enhanced-tier Limina guests** — `CONFIG_VT=n`: no VTs, so sessions are VT-less as on the S1
-  seat and there is no fbcon. If VT-less operation turns up too many problems, these guests fall
-  back to the stock setup above.
+  seat and there is no fbcon (measured, §10: seat0 reports `CanTTY=no`, logind takes VT-less
+  sessions there, and the outer's chord is the switch). If VT-less operation turns up too many
+  problems, these guests fall back to the stock setup above.
 
 ---
 
@@ -424,6 +425,15 @@ each captured frame as `A + a·(B − A)` gives `a` on the ease-out curve (0.13 
 over with no visible step; reversing at `a` = 0.46 continues from 0.46. With the fronted session
 SIGSTOPped, the outer's chord (forced on) fronted the other session 40 ms after the keypress;
 without the polkit rule logind refuses it (`InteractiveAuthorizationRequired`).
+
+Measured 2026-10-11 on the same guest booted with a `CONFIG_VT=n` kernel: no `tty0`, no
+`/dev/fb*`, seat0 `CanTTY=no`. Two sessions opened through PAM (`login`) with `XDG_SEAT=seat0` and
+no TTY — a system unit standing in for the greeter — are both seat0 user sessions, the later one
+`Active`. The outer turned the chord on by itself (6 evdev nodes) and it is the only switch path:
+Ctrl+Alt+F1 fronted session 1 31 ms after the keypress. Super reached only the fronted session,
+and switching away and back found its overview intact. The crossfade fits as on the VT guest
+(`a` = 0.20 at 15 ms, 0.51 at 50 ms, 0.80 at 100 ms, 1.0 by 223 ms; residual under 0.25/255), the
+session's own buffer following. Neither inner logged a warning, though each also sees the chord.
 
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
