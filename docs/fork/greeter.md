@@ -1,7 +1,8 @@
 # The greeter and the login daemon
 
-> Status: **designed; the daemon's first two steps built** (§9) — the greeter session,
-> autologin, and the lock screen's password and fingerprint reauthentication. Our own replacement for GDM on the system compositor's seat: a
+> Status: **§7 steps 1-3 built** (§9) — the greeter session, autologin, the lock screen's
+> password and fingerprint reauthentication, and the greeter's grid and login; step 3's name
+> entry and `org.gnome.login-screen` keys are left. Our own replacement for GDM on the system compositor's seat: a
 > small root login daemon that runs PAM, and a greeter that is synoik in a greeter session mode,
 > nested in the outer like any session (`system-compositor.md`). Password and fingerprint;
 > autologin; the system-only clock and quick settings GDM's greeter shows.
@@ -229,19 +230,23 @@ too — to be designed on its own.
 
 ## 4. The greeter
 
-`synoik --greeter`: the same compositor, nested (`backend::nested`), in a **greeter session
-mode** — a single model carrying gnome-shell's `restrictive` + `gdm` flags
-(`js/ui/sessionMode.js:22-65`): `is_greeter`, `allow_settings = false`,
-`has_windows = has_overview = has_workspaces = false`, `show_calendar_events = false`, dark colour
-scheme, components `networkAgent` (always asking, `components/networkAgent.js:679`) and
-`polkitAgent`. Today's lock gating is two ad-hoc booleans (`Synoik::is_locked`,
-`screen_is_covered`); the mode replaces them as the place a surface asks what it may show.
+`synoik --greeter`: the same compositor, nested (`backend::nested`), in gnome-shell's `gdm`
+**session mode** (`src/session_mode.rs`, `js/ui/sessionMode.js:22-102`): `user`, `unlock-dialog`
+while a user's shield is up, `gdm` for the greeter, each defaulting to `restrictive`. The greeter
+is the **screen shield shown at startup** (`main.js:327-330` → `screenShield.showDialog`, the
+`LoginDialog` in the unlock dialog's place): down and locked from the first frame, never raised
+(`deactivate` only clears GNOME's `isActive`, `screenShield.js:530-541`), so every gate the lock
+screen already has covers the greeter too. Still to come from the mode: components
+`networkAgent` (always asking, `components/networkAgent.js:679`) and `polkitAgent`.
 
 ### 4.1 Panel: clock and system-only quick settings
 
-`login-screen` panel style — transparent, sliding in from the top at startup
-(`js/ui/layout.js:797-809`). Left empty; centre the date menu; right keyboard layout and quick
-settings (`sessionMode.js:59-63`).
+`login-screen` panel style — transparent (`_panel.scss:100-130`), drawn over the shield; the
+lock screen gets the same in `unlock-dialog`'s shape (a11y, keyboard, quick settings, no clock,
+`sessionMode.js:65-77`). Left empty; the date menu at the right end of the right box, where ours
+always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
+(`sessionMode.js:59-63`). Not built: the slide in from the top at startup
+(`js/ui/layout.js:797-809`).
 
 - **Clock:** the date menu with a plain month calendar — no events, no world clocks or weather, no
   message list (`js/ui/dateMenu.js:999-1015`).
@@ -254,24 +259,36 @@ settings (`sessionMode.js:59-63`).
   (`status/thunderbolt.js:280`), every "Settings" menu entry (`popupMenu.js:689-691`, `723`).
   The battery pill shows but does not open settings (`status/system.js:66-68`).
 - **Power menu:** Suspend, Restart, Power Off — all hidden by `disable-restart-buttons`
-  (`systemActions.js:375-418`). gnome-shell routes them through gnome-session, which the greeter
-  does not run; we call logind directly (`Suspend`, `Reboot`, `PowerOff`), allowed for the active
-  greeter session by logind's default polkit policy.
+  (`systemActions.js:375-418`, not read yet). gnome-shell routes them through gnome-session,
+  which the greeter does not run: Restart and Power Off raise the end-session confirmation
+  themselves, with gnome-session's 60 s countdown (`gsm-shell.c:40`), and the confirmation calls
+  logind (`Reboot`, `PowerOff`); Suspend calls logind at once.
+- **Behind the menus:** while the mode is locked or the greeter, no menu action may start an app,
+  a command or the screenshot UI — the one Settings hand-off GNOME leaves there (a network's
+  802.1x form, `network.js:943-952`) goes nowhere.
+- **Lock screen divergence:** its quick settings hide Screenshot too, where GNOME keeps it
+  (`system.js:117` hides it only on the greeter): our screenshot UI cannot draw over the shield.
 - **Accessibility:** not in the panel in this mode; it is the dialog's bottom-right button
   (§4.2).
 
 ### 4.2 The login dialog
 
-- **Background:** flat dark, no wallpaper (`layout.js:552`; `SystemBackground` `#282828`,
-  `background.js:109`).
-- **Users:** a grid of avatar tiles — the design-dreams layout, not GDM's list
-  (`dreams-assessment.md` §9). The users are AccountsService's, skipping system accounts, locked
-  accounts and users with no name, live on `UserAdded`/`UserDeleted`/`Changed`
-  (`js/gdm/loginDialog.js:262-275`, `1530-1545`); a user with a running session is marked
-  (`:110-115`). An empty list, or `disable-user-list`, goes straight to the username prompt
+- **Background:** `#lockDialogGroup`'s flat `$_gdm_bg`, i.e. `$system_base_color` #222226
+  (`_login-lock.scss:1,233-235`); no wallpaper.
+- **Users** (`src/ui/login_grid.rs`): a grid of avatar tiles after the GNOME design team's
+  user-selection-grid mockup, not GDM's list — 200 px tiles 48 px apart, four to a row, rows and
+  block centred, at most twelve; each tile tinted from its picture (the picture's mean, part
+  neutral, darkened for the white name). The users are AccountsService's
+  (`accounts_service::start_user_list`), skipping system accounts, locked accounts and users with
+  no name (`js/gdm/loginDialog.js:262-276`), most frequent logins first then by name
+  (`act_user_collate`), re-read on `UserAdded`/`UserDeleted`, any user's `Changed`, and logind's
+  `SessionNew`/`SessionRemoved`. A user with a session on seat0 gets the accent ring
+  (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. Not built: an
+  empty list, more than twelve, or `disable-user-list` going straight to the username prompt
   (`:914-944`).
-- **Not listed?** under the grid: asks "Username", then begins verification for what was typed
-  (`:1141-1165`).
+- **Not listed?** the mockup's "Enter User Name ›" pill at the bottom-right: asks "Username",
+  then begins verification for what was typed (`:1141-1165`). The pill is built; the page it opens
+  is not.
 - **Banner** (`banner-message-enable`, `-source`, `-text`, `-path`) top-centre, moving into the
   free space above the prompt (`:946-1010`, `807-867`); **logo** (`logo`) bottom-centre
   (`:1018-1039`); **accessibility** button bottom-right, a two-column menu of the ten
@@ -285,12 +302,15 @@ message queue with read-time floors, the wiggle, `submit`/`cancel` — and `src/
 reader's text into the hint. The greeter reuses both; what it adds is what differs between
 gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 
-- the user is chosen (or typed), not fixed;
-- a **Cancel** button (back to the grid), hidden while asking for a username with the list
-  disabled;
+- the user is chosen (or typed), not fixed — picking sets the prompt's user and avatar and asks
+  through the shield's authenticator path, so a channel that dies is retried as on the lock screen;
+- **Escape** goes back to the grid, cancelling the conversation; a verified one goes back without
+  cancelling, since the daemon is starting that session. Not built: a **Cancel** button, hidden
+  while asking for a username with the list disabled;
 - after `allowed-failures` (default 3, `js/gdm/util.js:165-167`) failed attempts the prompt resets
   to the grid instead of retrying forever as the lock screen does (`:839-842`);
-- the channel is the login one (`OpenSession`), falling back from reauthentication (§2.5).
+- the channel is the login one (`OpenSession`), falling back from reauthentication (§2.5), and
+  the client answers `SessionOpened` with `StartSessionWhenReady`.
 
 Honoured `org.gnome.login-screen` keys: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
@@ -441,3 +461,14 @@ Measured 2026-10-11 through a GDBus client run inside the greeter's session: a w
 and after `StartSessionWhenReady` session 20 runs `synoik --session` and is seat0's active session;
 terminating it fronts the greeter. A reauthentication channel for `u2` (no session) is
 `AccessDenied`; for `claude` it verifies and activates session 2.
+
+§7 step 3, the greeter: session modes, the panel over the shield, the greeter as a shield shown at
+startup, the user list and grid, and login from it (§4).
+
+Measured 2026-10-11 on the same guest, by injected keys: the greeter shows Claude (accent ring,
+session 2) and u2; picking u2 asks for u2's password (`OpenReauthenticationChannel` is
+`AccessDenied`, the client falls back to `OpenSession`) and the right one starts session 10, which
+seat0 fronts. Back on the greeter u2 has the ring; picking Claude reauthenticates and fronts
+session 2. Left in step 3: the name entry, `org.gnome.login-screen` (`disable-user-list`,
+`allowed-failures`, `logo`, banner, `disable-restart-buttons`, the authentication toggles), the
+a11y button, and the greeter's network and polkit agents.
