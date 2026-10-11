@@ -76,8 +76,11 @@ The inner's devices come from logind (§2), so there is no device-brokering help
 makes the kernel force-restore fbdev over whoever holds master — `drm_fb_helper_set_par`'s
 deliberate ABI exception for X servers that switch to text before dropping master. Measured: with
 the session alive and active and the outer master, `KDSETMODE KD_TEXT` on its VT put fbcon's
-framebuffer on the plane; with fbcon unbound the same ioctl left the plane alone. logind restores
-a session's VT to text when the session ends, so with fbcon bound every logout shows the console.
+framebuffer on the plane; with fbcon unbound the same ioctl left the plane alone. The `KD_TEXT`
+comes from logind, and the fbdev restore runs inside that very ioctl. logind issues it when the
+session's *controller* lets go — measured: a controller exiting put its VT to text while the
+session lived on, and the session's end later issued nothing. So with fbcon bound, any inner that
+crashes or restarts shows the console, logout or not.
 Sessions cannot avoid owning a VT either: on a seat with VTs logind refuses a session with none
 (`CreateSession` → `InvalidParameter: VTNr`, measured on seat0). So the machine runs without fbcon
 on that card (`CONFIG_VT=n`, or the `vtconsole` unbound at boot); see §9 S6.
