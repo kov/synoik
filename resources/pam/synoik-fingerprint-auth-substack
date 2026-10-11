@@ -1,0 +1,8 @@
+#%PAM-1.0
+# The distro's fingerprint-auth, wrapped so that an empty or missing one denies instead of letting
+# anyone in (docs/fork/greeter.md §3; GDM 51's gdm-service-auth-substack.pam.in).
+auth     include   fingerprint-auth
+auth     required  pam_deny.so
+
+password include   fingerprint-auth
+password required  pam_deny.so

@@ -6,17 +6,15 @@
 //! and brings the greeter forward when seat0 has nothing active (`docs/fork/greeter.md` §2.6, §5).
 
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
 use crate::config::Config;
-use crate::worker::{Request, STATUS_FD};
+use crate::ipc::Frame;
+use crate::worker::{spawn_worker, Request};
 
 const GREETER_USER: &str = "synoik-greeter";
 /// Autologin runs once per boot: after that user logs out, the greeter is what comes up.
@@ -45,6 +43,15 @@ struct Daemon {
 pub fn run() -> anyhow::Result<()> {
     let config = Config::load();
     let signals = block_signals()?;
+    // GDM's name, for the lock screen's reauthentication (§2.1). Without it sessions still open,
+    // but nothing can unlock one.
+    let _bus = match crate::bus::serve() {
+        Ok(bus) => Some(bus),
+        Err(err) => {
+            eprintln!("synoik-login: not serving org.gnome.DisplayManager: {err:#}");
+            None
+        }
+    };
     let seats = watch_seats()?;
     let mut daemon = Daemon {
         workers: HashMap::new(),
@@ -155,25 +162,10 @@ impl Daemon {
 
     fn spawn(&mut self, kind: Kind, request: Request) -> anyhow::Result<libc::pid_t> {
         let (read, write) = pipe()?;
-        let write_fd = write.as_raw_fd();
-        let mut command = Command::new(std::env::current_exe().context("finding our binary")?);
-        command.args(request.to_args()).stdin(Stdio::null());
-        // SAFETY: only async-signal-safe calls. The child keeps the write end on STATUS_FD, and
-        // gets back the signals this process takes through its signalfd: an exec keeps the mask.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(write_fd, STATUS_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let mut none = std::mem::zeroed();
-                libc::sigemptyset(&mut none);
-                libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
-                Ok(())
-            });
-        }
-        let child = command.spawn().context("spawning a worker")?;
+        let args = request.to_args();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let pid = spawn_worker(&args, write.as_raw_fd())?;
         drop(write);
-        let pid = child.id() as libc::pid_t;
         eprintln!(
             "synoik-login: worker {pid}: {} for {}",
             request.service, request.user
@@ -218,12 +210,10 @@ impl Daemon {
         let Some(fd) = worker.status.take() else {
             return;
         };
-        // The worker writes one line and closes; read to its end.
-        let mut text = String::new();
-        let _ = std::fs::File::from(fd).read_to_string(&mut text);
-        if let Some(id) = text.trim().strip_prefix("opened ") {
+        // The worker reports once and closes.
+        if let Ok(Some(Frame::Opened(id))) = Frame::read_from(&mut std::fs::File::from(fd)) {
             eprintln!("synoik-login: worker {pid} opened session {id}");
-            worker.session = Some(id.to_owned());
+            worker.session = Some(id);
         }
     }
 

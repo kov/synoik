@@ -9,17 +9,41 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::Write as _;
 use std::os::fd::FromRawFd as _;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{bail, Context as _};
 
 use crate::config;
+use crate::ipc::Frame;
 use crate::pam::{Pam, PAM_DELETE_CRED, PAM_ESTABLISH_CRED};
 
-/// Where the worker reports to the daemon; the daemon puts a pipe there.
+/// Where a worker talks to the daemon: a pipe (session workers) or a socket (verification).
 pub const STATUS_FD: i32 = 3;
+
+/// Start `synoik-login ARGS...` as root, with `fd` as its [`STATUS_FD`]. Returns its pid; the
+/// daemon's SIGCHLD handler reaps it.
+pub fn spawn_worker(args: &[&str], fd: libc::c_int) -> anyhow::Result<libc::pid_t> {
+    let mut command = Command::new(std::env::current_exe().context("finding our binary")?);
+    command.args(args).stdin(Stdio::null());
+    // SAFETY: only async-signal-safe calls. The child keeps `fd` on STATUS_FD, and gets back the
+    // signals the daemon takes through its signalfd: an exec keeps the mask.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(fd, STATUS_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut none = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    let child = command.spawn().context("spawning a worker")?;
+    Ok(child.id() as libc::pid_t)
+}
 
 const PATH: &str = "/usr/local/bin:/usr/bin";
 
@@ -143,7 +167,7 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
     );
     // SAFETY: the daemon put the write end of a pipe on this fd; nothing else owns it.
     let mut status = unsafe { File::from_raw_fd(STATUS_FD) };
-    let _ = writeln!(status, "opened {id}");
+    let _ = Frame::Opened(id.clone()).write_to(&mut status);
     drop(status);
 
     let env = session_environment(&pam, &account)?;

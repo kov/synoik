@@ -1,7 +1,7 @@
 # The greeter and the login daemon
 
-> Status: **designed; the daemon's first step built** (§9) — the greeter session and autologin,
-> no authentication yet. Our own replacement for GDM on the system compositor's seat: a
+> Status: **designed; the daemon's first two steps built** (§9) — the greeter session,
+> autologin, and the lock screen's password and fingerprint reauthentication. Our own replacement for GDM on the system compositor's seat: a
 > small root login daemon that runs PAM, and a greeter that is synoik in a greeter session mode,
 > nested in the outer like any session (`system-compositor.md`). Password and fingerprint;
 > autologin; the system-only clock and quick settings GDM's greeter shows.
@@ -92,7 +92,10 @@ session's `UID` is the peer's, `SEAT=seat0`, and the peer's scope is that sessio
 
 - **Login channel:** only the current greeter session's process.
 - **Reauthentication channel for user U:** the greeter (U picked from its list) or U's own running
-  session (its lock screen), and only while U has a session on seat0.
+  session (its lock screen), and only while U has a session on seat0. The caller's session is the
+  one its process is in, else U's display session as logind names it (`User.Display`): a
+  compositor run as a user service lives in the user's manager, outside any session. GDM falls
+  back the same way (`common/gdm-common.c:812-866`).
 - **A channel's conversations die with its connection.** A greeter that crashes or reconnects
   starts from nothing; no PAM conversation outlives the client that drives it. (GDM sets no
   timeout at all, `gdm-session.c:1284`.)
@@ -387,3 +390,28 @@ back to session 2 at once. Logging out (`loginctl terminate-session 2`) closes i
 its worker, and logind leaves seat0 with **no** active session — the greeter is in front 15 ms
 later because the daemon activates it. Left: the greeter's user manager may not start IBus
 (`xdm_t` denied `start`).
+
+§7 step 2: reauthentication, for the lock screen.
+
+- **Bus** (`bus.rs`): owns `org.gnome.DisplayManager` (policy `resources/synoik-login.dbus.conf`)
+  and serves `Manager.OpenReauthenticationChannel` with the §2.2 checks; `RegisterSession` and
+  `RegisterDisplay` are accepted and ignored.
+- **Channel** (`channel.rs`): an abstract socket with a random name — no file to label, nothing
+  reachable but by the address — for the one uid that asked; `UserVerifier` on it, one
+  `synoik-login verify` worker per service, GDM 51's signals in GDM 51's order. On
+  `VerificationComplete` the daemon unlocks the session through logind. The client hanging up ends
+  every conversation.
+- **Worker** (`verify.rs`, `ipc.rs`): the PAM conversation relayed over a socket pair as framed
+  messages; answers are wiped where they rest, and cut at `PAM_MAX_RESP_SIZE`. Refusals carry
+  GDM's wording.
+- **Stacks:** `synoik-password` and `synoik-fingerprint` after GDM 51's Fedora ones, each distro
+  substack wrapped with `pam_deny`. `pam_synoik` (§3) waits for the greeter: a lock screen's
+  keyring is already open.
+
+Measured 2026-10-11 on the same guest: the lock screen (`src/dbus/gdm.rs`, unchanged) locks against
+the daemon; a wrong password shows "Sorry, password authentication didn't work. Please try again."
+and the client re-begins; the right one unlocks. Through a GDBus client on the channel:
+`gdm-fingerprint` with the guest's stack (no reader) gives `ServiceUnavailable('')`,
+`VerificationFailed`, `ConversationStopped` — the sequence the lock screen turns into "Fingerprint
+reader unavailable" — and `gdm-smartcard` the same, with no worker. Not yet exercised: a real
+fingerprint scan (the harness runs without its reader).
