@@ -25,6 +25,10 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Run as the login greeter, in the greeter session `synoik-login` opens
+    /// (`docs/fork/greeter.md`). Implies `--session`.
+    #[arg(long, conflicts_with = "session")]
+    pub greeter: bool,
     /// Run with a headless backend: no display or input devices, virtual
     /// outputs only (see `--output`).
     ///

@@ -1,0 +1,26 @@
+[Unit]
+Description=synoik login daemon
+Documentation=https://github.com/kov/synoik/blob/main/docs/fork/greeter.md
+# The greeter and every session nest in the system compositor.
+Wants=synoik-system.service
+After=synoik-system.service systemd-user-sessions.service systemd-logind.service
+# One display manager.
+Conflicts=gdm.service
+# Seat0 sessions without a VT: a seat with VTs needs each session on one, which the worker does
+# not do yet (docs/fork/greeter.md §7).
+ConditionPathExists=!/sys/class/tty/tty0
+
+[Service]
+ExecStart=synoik-login
+Environment=SYNOIK_SYSTEM_SOCKET=/run/synoik-system/outer.sock
+# Holds the once-per-boot autologin marker, so it must outlive a restart.
+RuntimeDirectory=synoik-login
+RuntimeDirectoryPreserve=yes
+# Sessions leave this cgroup for their own scopes when they open; on stop the daemon ends the
+# greeter itself and leaves users' sessions running.
+KillMode=process
+Restart=always
+RestartSec=1s
+
+[Install]
+Alias=display-manager.service

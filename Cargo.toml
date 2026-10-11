@@ -2,6 +2,7 @@
 members = [
     "synoik-config",
     "synoik-ipc",
+    "synoik-login",
     "synoik-vk",
 ]
 

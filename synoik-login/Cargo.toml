@@ -1,0 +1,14 @@
+[package]
+name = "synoik-login"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+description = "The synoik login daemon: runs PAM and opens the greeter's and users' sessions."
+
+[dependencies]
+anyhow.workspace = true
+libc = "0.2.185"
+zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "async-io"] }

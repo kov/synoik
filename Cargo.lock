@@ -3737,6 +3737,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synoik-login"
+version = "26.4.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "zbus",
+]
+
+[[package]]
 name = "synoik-vk"
 version = "0.0.0"
 dependencies = [

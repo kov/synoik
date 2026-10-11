@@ -1,0 +1,4 @@
+# Install as /usr/lib/tmpfiles.d/synoik-login.conf.
+#
+# The greeter's home: its dconf, caches and state.
+d /var/lib/synoik-greeter 0700 synoik-greeter synoik-greeter -

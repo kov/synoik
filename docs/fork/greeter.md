@@ -1,6 +1,7 @@
 # The greeter and the login daemon
 
-> Status: **designed, not built.** Our own replacement for GDM on the system compositor's seat: a
+> Status: **designed; the daemon's first step built** (§9) — the greeter session and autologin,
+> no authentication yet. Our own replacement for GDM on the system compositor's seat: a
 > small root login daemon that runs PAM, and a greeter that is synoik in a greeter session mode,
 > nested in the outer like any session (`system-compositor.md`). Password and fingerprint;
 > autologin; the system-only clock and quick settings GDM's greeter shows.
@@ -217,9 +218,9 @@ when the prompt resets.
 `synoik-fingerprint` does what GDM's does: a module ahead of `pam_gnome_keyring` hands it the disk
 encryption passphrase from the kernel keyring's `cryptsetup` key as `PAM_AUTHTOK`, zeroized after
 (`pam_gdm/pam_gdm.c:48-99`), and is skipped (`[success=ok default=1]`) when there is none. Ours is
-`pam_synoik`, since `pam_gdm` ships with the gdm package. Planned beyond GDM: the user's password
-sealed in the TPM at password login and unsealed for this, so the keyring opens without disk
-encryption too.
+`pam_synoik`, since `pam_gdm` ships with the gdm package. Not in this version: the user's
+password sealed in the TPM and unsealed for this, so the keyring opens without disk encryption
+too — to be designed on its own.
 
 ---
 
@@ -352,9 +353,6 @@ user → user switches, where it exists to take the previous user's screen away.
 **G1 — `XDG_SESSION_EXTRA_DEVICE_ACCESS`.** GDM 51 asks logind for `render:accel` on every
 session; read what logind does with it before copying it.
 
-**G2 — The TPM-sealed password** (§3): how it is sealed (systemd-creds, or a policy of our own),
-when it is re-sealed after a password change, and what binds it to the user.
-
 **S4 (system-compositor) stays open:** the lock screen remains in the inner; this design does not
 need it moved.
 
@@ -362,5 +360,30 @@ need it moved.
 
 ## 9. What is built
 
-Nothing yet. The harness's sessions come from `synoik-session@` units opening PAM `login` sessions
-on seat0 (system-compositor §10), which §7 step 1 replaces.
+§7 step 1: `synoik-login` (crate `synoik-login`, `resources/synoik-login.service`,
+`resources/pam/`, the greeter user's `sysusers`/`tmpfiles`) opens the greeter's session and the
+autologin session, and nothing else — no channels, no D-Bus name, no prompts.
+
+- **Daemon** (`daemon.rs`): at start, the greeter's session (`synoik-greeter`, `CLASS=greeter`,
+  running `synoik --greeter`, which is `--session` until §4 exists), then autologin once per boot
+  (`/etc/synoik/login.conf`, a marker in `/run/synoik-login`). It restarts a greeter that dies
+  and, since a new session takes the seat, gives the seat back to whatever was active before it
+  reopened one. It follows seat0 through logind's `PropertiesChanged` and activates the greeter
+  when seat0 has no active session. Stopping it ends the greeter and leaves users' sessions.
+- **Worker** (`worker.rs`, `pam.rs`): §2.3-§2.4 without a client — the conversation refuses any
+  prompt. Reports the logind session id on a pipe; forwards SIGTERM/SIGHUP to the session and
+  kills it 5 s after a SIGTERM it ignored.
+- **SELinux** (Fedora, enforcing): the daemon must run in GDM's domain, or `pam_selinux`'s switch to
+  the user's context is denied — `synoik-login` is labelled `xdm_exec_t`. The greeter then runs
+  in `xdm_t`, so what it writes needs GDM's types: the outer's `/run/synoik-system` is
+  `xdm_var_run_t`, the greeter's home `xdm_var_lib_t`. `xdm_t` may read `/run/systemd/seats`
+  but not watch it, hence the D-Bus subscription. These are `semanage fcontext` rules today; a
+  package carries them.
+
+Measured 2026-10-11 on the enhanced F44 guest under Limina with the `CONFIG_VT=n` kernel: boot opens
+the greeter (`c1`) then `claude`'s session (`2`, active), both attached to the outer;
+Ctrl+Alt+F1/F2 switch between them. Restarting the daemon replaces the greeter and gives the seat
+back to session 2 at once. Logging out (`loginctl terminate-session 2`) closes its PAM session in
+its worker, and logind leaves seat0 with **no** active session — the greeter is in front 15 ms
+later because the daemon activates it. Left: the greeter's user manager may not start IBus
+(`xdm_t` denied `start`).

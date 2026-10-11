@@ -115,7 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // The greeter is a session of its own (its user's manager and bus); what it shows differently
+    // is greeter.md §4, not yet built.
+    cli.session |= cli.greeter;
 
     if cli.session {
         // If we're starting as a session, assume that the intention is to start on a TTY unless
