@@ -74,10 +74,13 @@ The inner's devices come from logind (§2), so there is no device-brokering help
 
 **No fbdev console may be bound to the outer's card.** A VT returning to text mode (`KD_TEXT`)
 makes the kernel force-restore fbdev over whoever holds master — `drm_fb_helper_set_par`'s
-deliberate ABI exception for X servers that switch to text before dropping master. Measured: a
-session on tty1 ending put fbcon's framebuffer on the plane while the outer was master. With VTs,
-any logind session on a VT does this at logout, so the machine runs without fbcon on that card
-(`CONFIG_VT=n`, or the `vtconsole` unbound at boot); see §9 S6.
+deliberate ABI exception for X servers that switch to text before dropping master. Measured: with
+the session alive and active and the outer master, `KDSETMODE KD_TEXT` on its VT put fbcon's
+framebuffer on the plane; with fbcon unbound the same ioctl left the plane alone. logind restores
+a session's VT to text when the session ends, so with fbcon bound every logout shows the console.
+Sessions cannot avoid owning a VT either: on a seat with VTs logind refuses a session with none
+(`CreateSession` → `InvalidParameter: VTNr`, measured on seat0). So the machine runs without fbcon
+on that card (`CONFIG_VT=n`, or the `vtconsole` unbound at boot); see §9 S6.
 
 | | Outer (system compositor) | Inner (session compositor) |
 |---|---|---|
@@ -348,10 +351,12 @@ screen in the inner, and moving it means the outer grows real UI — against §1
 
 **S5 — Multi-seat.** Not considered anywhere above.
 
-**S6 — Who unbinds fbcon.** The outer cannot share its card with a bound fbcon (§1). `CONFIG_VT=n`
-settles it in the kernel; on a stock kernel it is a root write to `/sys/class/vtconsole/*/bind` at
-boot (or a kernel command line), which is configuration rather than a resident privileged process,
-but still root. Undecided which the shipped setup uses.
+**S6 — Who unbinds fbcon.** The outer cannot share its card with a bound fbcon, and sessions on a
+seat with VTs must own one (§1). `CONFIG_VT=n` settles both: the seat has no VTs, so sessions are
+VT-less as on the S1 seat, and there is no fbcon. On a stock kernel sessions keep their VTs and
+fbcon is unbound at boot — a root write to `/sys/class/vtconsole/*/bind` or a kernel command line,
+configuration rather than a resident privileged process, but still root. Undecided which the
+shipped setup uses.
 
 ---
 
