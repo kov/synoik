@@ -7,7 +7,8 @@
 //!
 //! Deliberately not a `Synoik`. In steady state it composites nothing — it flips the fronted
 //! session's own buffers — so it is a small event loop over the DRM device and one socket, and
-//! that thinness is what keeps restart and reattach cheap (§1, §7).
+//! that thinness is what keeps restart and reattach cheap (§1, §7). It draws only to animate a
+//! session switch (§5, `compose`).
 //!
 //! What this cut does: master and modeset of the first connected display at its preferred mode,
 //! a plate until a session is fronted, then the fronted session unredirected, with its render
@@ -32,6 +33,7 @@ use smithay::backend::drm::{
     NodeType, PlaneConfig, PlaneState,
 };
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
 };
@@ -41,12 +43,27 @@ use smithay::reexports::drm::control::{connector, crtc, framebuffer, Device as _
 use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
 
+use super::compose::{Compositor, Picture};
 use super::protocol::{self, ModeInfo, OutputInfo, Received, ToInner, ToOuter};
 use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
 use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
+use crate::render_helpers::vulkan::VkTexture;
+use crate::utils::get_monotonic_time;
 
 /// The name the DRM fd is stored under in systemd's fd store.
 const FDSTORE_NAME: &str = "drm";
+
+/// GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a session's
+/// own background sits on.
+const PLATE: [u8; 3] = [0x24, 0x24, 0x24];
+
+/// How long a switch crossfades (§5 steps 2 and 7, which with no modeset are one fade).
+const FADE: Duration = Duration::from_millis(250);
+
+/// How long the outgoing session's picture may stay up waiting for the incoming one's first
+/// frame. Past it the switch fades to the incoming session's last frame, or the plate: the
+/// previous user's screen is not left in front of whoever is at the seat now.
+const TARGET_WAIT: Duration = Duration::from_millis(300);
 
 /// Run the system compositor until it is told to stop.
 pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
@@ -250,7 +267,20 @@ enum Shown {
         /// Held so the framebuffer outlives a `RemoveBuffer` while KMS still scans it out:
         /// `RMFB` on the framebuffer a CRTC is showing turns the CRTC off.
         _fb: Rc<PrimeFramebuffer>,
+        /// Its contents, for the snapshot a switch takes of it.
+        dmabuf: Dmabuf,
         generation: u64,
+        /// Whether its flip answers a `Present`. A frame shown again (`last_presented`) was
+        /// answered already, and a second `Presented` would be taken for whatever the session
+        /// has in flight now.
+        answer: bool,
+    },
+    /// A frame the outer drew itself, in its own scanout slot: the switch's `from` and `to`
+    /// pictures blended at `alpha`.
+    Composite {
+        slot: usize,
+        _fb: Rc<PrimeFramebuffer>,
+        alpha: f32,
     },
 }
 
@@ -261,7 +291,50 @@ enum Next {
         generation: u64,
         buffer: u32,
         fence: Option<Rc<OwnedFd>>,
+        answer: bool,
     },
+    Composite {
+        slot: usize,
+        fb: Rc<PrimeFramebuffer>,
+        fence: Option<Rc<OwnedFd>>,
+        alpha: f32,
+    },
+}
+
+/// A session switch being animated (§5): `from` crossfading to `to`, which is unknown until the
+/// incoming session's frame is ready.
+struct Transition {
+    from: Picture,
+    to: Option<Target>,
+    /// Waiting for this session frame's render fence before it can become `to`.
+    pending: Option<(u64, u32, Option<Rc<OwnedFd>>)>,
+    pending_watch: Option<RegistrationToken>,
+    /// When the fade began, on the monotonic clock.
+    start: Duration,
+    /// Armed while there is neither `to` nor `pending` (`TARGET_WAIT`).
+    wait: Option<RegistrationToken>,
+}
+
+struct Target {
+    picture: Picture,
+    /// What goes on screen, unredirected, when the fade completes.
+    end: End,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum End {
+    Plate,
+    Session {
+        generation: u64,
+        buffer: u32,
+        answer: bool,
+    },
+}
+
+/// A buffer a session registered.
+struct SessionBuffer {
+    fb: Rc<PrimeFramebuffer>,
+    dmabuf: Dmabuf,
 }
 
 /// The display this cut drives: one connector, one CRTC.
@@ -287,7 +360,7 @@ struct Session {
     pid: i32,
     /// The logind session it proved to be, once `Hello` is accepted.
     logind_id: Option<String>,
-    buffers: HashMap<u32, Rc<PrimeFramebuffer>>,
+    buffers: HashMap<u32, SessionBuffer>,
     /// The newest frame it presented while in the background, left unanswered: the inner keeps
     /// that slot reserved for as long as the present is outstanding, so it can be flipped the
     /// moment the session is fronted without the inner rendering into it underneath the scanout.
@@ -314,6 +387,14 @@ struct Outer {
     in_flight: Option<Shown>,
     /// What to show once the flip in flight lands; latest wins.
     queued: Option<Next>,
+    /// The outer's own drawing, for switch transitions. `None` without a usable GPU, and then a
+    /// switch is a cut.
+    compositor: Option<Compositor>,
+    transition: Option<Transition>,
+    /// A switch waiting for the flip in flight to land before it snapshots the screen.
+    switch_pending: bool,
+    /// What the last finished transition faded to, standing in for its frame on screen.
+    last_to: Option<Picture>,
 }
 
 impl Outer {
@@ -339,6 +420,11 @@ impl Outer {
             .map_err(|err| anyhow::anyhow!("inserting the DRM notifier: {err}"))?;
 
         let display = open_display(&drm_fd, &mut drm)?;
+        let compositor = render_node.and_then(|node| {
+            Compositor::new(node, display.mode.size())
+                .map_err(|err| warn!("no transitions, session switches will cut: {err:#}"))
+                .ok()
+        });
         let outer = Self {
             handle,
             drm_fd,
@@ -351,6 +437,10 @@ impl Outer {
             on_screen: Shown::Plate,
             in_flight: None,
             queued: None,
+            compositor,
+            transition: None,
+            switch_pending: false,
+            last_to: None,
         };
         // A restarted outer leaves the screen alone: it still shows the session's last frame
         // (`close_inherited_framebuffers`), and the session's next present replaces it. Lighting
@@ -496,6 +586,19 @@ impl Outer {
         if matches!(self.queued, Some(Next::Session { generation: g, .. }) if g == generation) {
             self.queued = None;
         }
+        // A switch waiting on this session's frame would wait forever.
+        let pending = self.transition.as_mut().and_then(|t| {
+            t.pending
+                .take_if(|(g, _, _)| *g == generation)
+                .and(t.pending_watch.take())
+        });
+        if let Some(token) = pending {
+            self.handle.remove(token);
+            self.set_target(Target {
+                picture: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
+                end: End::Plate,
+            });
+        }
     }
 
     /// The attached session logind has fronted, if any.
@@ -519,8 +622,19 @@ impl Outer {
         info!("seat0 fronts session {front:?} (was {:?})", self.front);
         self.front = front;
 
-        // Never leave the previous session's frame up for whoever is at the seat now: show the
-        // new session's newest frame, or the plate until it draws one. Only frames the inner
+        if self.compositor.is_some() {
+            if self.in_flight.is_some() {
+                // The snapshot must be of what is on screen, and that changes when this flip
+                // lands; start from there.
+                self.switch_pending = true;
+            } else {
+                self.begin_switch();
+            }
+            return;
+        }
+
+        // A cut. Never leave the previous session's frame up for whoever is at the seat now: show
+        // the new session's newest frame, or the plate until it draws one. Only frames the inner
         // cannot be drawing into qualify (`held`, `last_presented`); a frame it was told was
         // discarded is a free slot to it, and scanning that out would race its next render.
         let next = match self.fronted().and_then(|g| self.sessions.get_mut(&g)) {
@@ -529,39 +643,398 @@ impl Outer {
                     generation: session.generation,
                     buffer,
                     fence,
+                    answer: true,
                 },
                 (None, Some(buffer)) => Next::Session {
                     generation: session.generation,
                     buffer,
                     fence: None,
+                    answer: false,
                 },
                 (None, None) => Next::Plate,
             },
             None => Next::Plate,
         };
-        match &next {
-            Next::Plate => debug!("switch-in shows the plate"),
-            Next::Session { buffer, fence, .. } => {
-                debug!(
-                    "switch-in shows buffer {buffer} (fenced: {})",
-                    fence.is_some()
-                );
+        self.show(next);
+    }
+
+    /// Start animating to the newly fronted session (§5).
+    ///
+    /// Step 1 is the snapshot: the outgoing picture is copied out of the session's buffer, so the
+    /// fade does not depend on that session drawing, answering or even living. logind already
+    /// moved input when it changed the active session, so nothing typed during the fade reaches
+    /// the outgoing session.
+    fn begin_switch(&mut self) {
+        let from = self.snapshot_screen();
+        self.cancel_transition();
+        // A frame of the outgoing session waiting to flip is that session's newest; it waits for
+        // the switch back instead, still reserved.
+        if let Some(next) = self.queued.take() {
+            match next {
+                Next::Session {
+                    generation,
+                    buffer,
+                    fence,
+                    answer: true,
+                } => self.hold(generation, buffer, fence),
+                Next::Session { answer: false, .. } => (),
+                Next::Plate | Next::Composite { .. } => (),
             }
         }
-        self.show(next);
+        self.transition = Some(Transition {
+            from,
+            to: None,
+            pending: None,
+            pending_watch: None,
+            start: get_monotonic_time(),
+            wait: None,
+        });
+
+        let held = self
+            .fronted()
+            .and_then(|g| Some((g, self.sessions.get_mut(&g)?.held.take()?)));
+        match held {
+            // Its newest frame is already here: the session drew it, then was switched away
+            // before it could be shown, and it draws nothing more until that frame is answered.
+            Some((generation, (buffer, fence))) => self.target_frame(generation, buffer, fence),
+            None => self.arm_target_wait(),
+        }
+    }
+
+    /// The picture on screen now, as something a fade can start from.
+    fn snapshot_screen(&mut self) -> Picture {
+        let plate = Picture::Color(PLATE.map(|c| f32::from(c) / 255.));
+        let compositor = self.compositor.as_mut().expect("only with a compositor");
+        let captured = match &self.on_screen {
+            Shown::Plate => return plate,
+            Shown::Session { dmabuf, .. } => compositor.snapshot(dmabuf),
+            // Mid-fade: the blend on screen, redrawn, so the next fade starts where this one
+            // stands instead of jumping to either end.
+            Shown::Composite { alpha, .. } => match &self.transition {
+                Some(Transition {
+                    from, to: Some(to), ..
+                }) => compositor.capture(from, &to.picture, *alpha),
+                Some(Transition { from, .. }) => return from.clone(),
+                None => return self.last_to.clone().unwrap_or(plate),
+            },
+        };
+        match captured {
+            Ok(texture) => Picture::Texture(texture),
+            Err(err) => {
+                warn!("snapshotting the screen: {err:#}");
+                plate
+            }
+        }
+    }
+
+    /// Drop the transition, returning a session frame it was holding to that session's `held`.
+    fn cancel_transition(&mut self) {
+        let Some(transition) = self.transition.take() else {
+            return;
+        };
+        if let Some(token) = transition.wait {
+            self.handle.remove(token);
+        }
+        if let Some(token) = transition.pending_watch {
+            self.handle.remove(token);
+        }
+        if let Some((generation, buffer, fence)) = transition.pending {
+            self.hold(generation, buffer, fence);
+        }
+        if let Some(Target {
+            end:
+                End::Session {
+                    generation,
+                    buffer,
+                    answer: true,
+                },
+            ..
+        }) = transition.to
+        {
+            // Unanswered still; the session is waiting on it.
+            self.hold(generation, buffer, None);
+        }
+    }
+
+    /// Keep `buffer` as `generation`'s newest unanswered frame, giving back the one it replaces.
+    fn hold(&mut self, generation: u64, buffer: u32, fence: Option<Rc<OwnedFd>>) {
+        let Some(session) = self.sessions.get_mut(&generation) else {
+            return;
+        };
+        if let Some((stale, _)) = session.held.replace((buffer, fence)) {
+            if stale != buffer {
+                self.discard(generation, stale);
+            }
+        }
+    }
+
+    fn arm_target_wait(&mut self) {
+        // Not the compositor clock of `Synoik::timer_after`: the outer holds no `Synoik`.
+        #[allow(clippy::disallowed_methods)]
+        let timer = Timer::from_duration(TARGET_WAIT);
+        let token = self
+            .handle
+            .insert_source(timer, |_, _, outer: &mut Outer| {
+                outer.on_target_wait();
+                TimeoutAction::Drop
+            })
+            .expect("inserting a timer");
+        if let Some(transition) = &mut self.transition {
+            transition.wait = Some(token);
+        }
+    }
+
+    /// The incoming session has not drawn in time: fade to its last frame, or the plate.
+    fn on_target_wait(&mut self) {
+        let Some(transition) = &mut self.transition else {
+            return;
+        };
+        transition.wait = None;
+        if transition.to.is_some() || transition.pending.is_some() {
+            return;
+        }
+        let last = self
+            .fronted()
+            .and_then(|g| Some((g, self.sessions.get(&g)?.last_presented?)));
+        debug!("switch target late; fading to {last:?}");
+        let target = last
+            .and_then(|(generation, buffer)| {
+                let texture = self.import_frame(generation, buffer)?;
+                Some(Target {
+                    picture: Picture::Texture(texture),
+                    end: End::Session {
+                        generation,
+                        buffer,
+                        answer: false,
+                    },
+                })
+            })
+            .unwrap_or(Target {
+                picture: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
+                end: End::Plate,
+            });
+        self.set_target(target);
+    }
+
+    /// A frame of the incoming session becomes the target once its render is complete. Its
+    /// present stays unanswered until it is flipped as it is at the end (§3.1: a target is not
+    /// told it is on screen before it is).
+    fn target_frame(&mut self, generation: u64, buffer: u32, fence: Option<Rc<OwnedFd>>) {
+        let signalled = fence.as_ref().is_none_or(|fd| fence_signalled(fd.as_fd()));
+        let Some(transition) = &mut self.transition else {
+            return;
+        };
+        if let Some(token) = transition.wait.take() {
+            self.handle.remove(token);
+        }
+        if signalled {
+            self.target_ready(generation, buffer);
+            return;
+        }
+        let fd = fence.clone().expect("unsignalled means fenced");
+        let token = self
+            .handle
+            .insert_source(
+                Generic::new(FdRef(fd), Interest::READ, Mode::OneShot),
+                move |_, _, outer: &mut Outer| {
+                    if let Some(transition) = &mut outer.transition {
+                        if matches!(transition.pending, Some((g, b, _)) if g == generation && b == buffer)
+                        {
+                            transition.pending = None;
+                            transition.pending_watch = None;
+                            outer.target_ready(generation, buffer);
+                        }
+                    }
+                    Ok(PostAction::Remove)
+                },
+            )
+            .expect("inserting a fence watch");
+        let transition = self.transition.as_mut().expect("checked above");
+        transition.pending = Some((generation, buffer, fence));
+        transition.pending_watch = Some(token);
+    }
+
+    fn target_ready(&mut self, generation: u64, buffer: u32) {
+        match self.import_frame(generation, buffer) {
+            Some(texture) => self.set_target(Target {
+                picture: Picture::Texture(texture),
+                end: End::Session {
+                    generation,
+                    buffer,
+                    answer: true,
+                },
+            }),
+            None => {
+                // Unusable as a picture; show it without the fade rather than not at all.
+                self.cancel_transition();
+                self.show(Next::Session {
+                    generation,
+                    buffer,
+                    fence: None,
+                    answer: true,
+                });
+            }
+        }
+    }
+
+    fn import_frame(&mut self, generation: u64, buffer: u32) -> Option<VkTexture> {
+        let dmabuf = &self.sessions.get(&generation)?.buffers.get(&buffer)?.dmabuf;
+        let compositor = self.compositor.as_mut()?;
+        compositor
+            .import(dmabuf)
+            .map_err(|err| warn!("{err:#}"))
+            .ok()
+    }
+
+    fn set_target(&mut self, target: Target) {
+        let Some(transition) = &mut self.transition else {
+            return;
+        };
+        transition.to = Some(target);
+        transition.start = get_monotonic_time();
+        if self.in_flight.is_none() {
+            self.advance();
+        }
+    }
+
+    fn progress(&self, start: Duration) -> f32 {
+        let elapsed = get_monotonic_time().saturating_sub(start);
+        (elapsed.as_secs_f32() / FADE.as_secs_f32()).clamp(0., 1.)
+    }
+
+    /// Draw and flip the next frame of the fade, or finish it. Runs once per flip completion, so
+    /// the fade is paced by the display.
+    fn advance(&mut self) {
+        let Some(transition) = &self.transition else {
+            return;
+        };
+        let Some(to) = &transition.to else {
+            return;
+        };
+        let t = self.progress(transition.start);
+        if t >= 1. {
+            self.finish_transition();
+            return;
+        }
+        // Ease out: most of the change early, settling into the incoming picture.
+        let alpha = 1. - (1. - t).powi(3);
+        let busy = match &self.on_screen {
+            Shown::Composite { slot, .. } => Some(*slot),
+            _ => None,
+        };
+        let compositor = self
+            .compositor
+            .as_mut()
+            .expect("transitions need a compositor");
+        match compositor.compose(&self.drm_fd, busy, &transition.from, &to.picture, alpha) {
+            Ok((slot, fb, fence)) => self.flip(Next::Composite {
+                slot,
+                fb,
+                fence: fence.map(Rc::new),
+                alpha,
+            }),
+            Err(err) => {
+                warn!("drawing a transition frame: {err:#}");
+                self.finish_transition();
+            }
+        }
+    }
+
+    /// Step 8: the fade is over, so put the incoming session's frame on screen as it is.
+    fn finish_transition(&mut self) {
+        let Some(transition) = self.transition.take() else {
+            return;
+        };
+        if let Some(token) = transition.wait {
+            self.handle.remove(token);
+        }
+        let Some(to) = transition.to else {
+            return;
+        };
+        self.last_to = Some(to.picture);
+        let end = match to.end {
+            End::Session {
+                generation,
+                buffer,
+                answer,
+            } if self
+                .sessions
+                .get(&generation)
+                .is_some_and(|s| s.buffers.contains_key(&buffer)) =>
+            {
+                Next::Session {
+                    generation,
+                    buffer,
+                    fence: None,
+                    answer,
+                }
+            }
+            _ => Next::Plate,
+        };
+        let ended_on_plate = matches!(end, Next::Plate);
+        self.show(end);
+
+        // The incoming session drew while the fade was running on a stand-in.
+        let held = self
+            .fronted()
+            .and_then(|g| Some((g, self.sessions.get_mut(&g)?.held.take()?)));
+        if let Some((generation, (buffer, fence))) = held {
+            self.fronted_frame(generation, buffer, fence, ended_on_plate);
+        }
+    }
+
+    /// A frame of the fronted session, outside a switch. It replaces the plate with a fade, and
+    /// anything else as it is.
+    fn fronted_frame(
+        &mut self,
+        generation: u64,
+        buffer: u32,
+        fence: Option<Rc<OwnedFd>>,
+        over_plate: bool,
+    ) {
+        if over_plate && self.compositor.is_some() {
+            self.transition = Some(Transition {
+                from: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
+                to: None,
+                pending: None,
+                pending_watch: None,
+                start: get_monotonic_time(),
+                wait: None,
+            });
+            self.target_frame(generation, buffer, fence);
+        } else {
+            self.show(Next::Session {
+                generation,
+                buffer,
+                fence,
+                answer: true,
+            });
+        }
     }
 
     /// Show `next` now, or once the flip in flight lands.
     fn show(&mut self, next: Next) {
         if self.in_flight.is_some() {
             if let Some(Next::Session {
-                generation, buffer, ..
+                generation,
+                buffer,
+                answer: true,
+                ..
             }) = self.queued.replace(next)
             {
                 self.discard(generation, buffer);
             }
         } else {
             self.flip(next);
+        }
+    }
+
+    /// Whether the plate is what the screen shows, or is about to.
+    fn plate_showing(&self) -> bool {
+        match (&self.in_flight, &self.queued) {
+            (_, Some(next)) => matches!(next, Next::Plate),
+            (Some(shown), None) => matches!(shown, Shown::Plate),
+            (None, None) => matches!(self.on_screen, Shown::Plate),
         }
     }
 
@@ -631,7 +1104,13 @@ impl Outer {
                 let fb = framebuffer_from_dmabuf(&self.drm_fd, &dmabuf, true)
                     .map_err(|err| anyhow::anyhow!("importing buffer {id}: {err}"))?;
                 debug!("session buffer {id}: {width}x{height} {code:?} {modifier:#x}");
-                session.buffers.insert(id, Rc::new(fb));
+                session.buffers.insert(
+                    id,
+                    SessionBuffer {
+                        fb: Rc::new(fb),
+                        dmabuf,
+                    },
+                );
             }
             ToOuter::RemoveBuffer { id } => {
                 session.buffers.remove(&id);
@@ -654,16 +1133,21 @@ impl Outer {
                     bail!("present of unknown buffer {buffer}");
                 }
                 let fence = fenced.then(|| Rc::new(fds.remove(0)));
-                if fronted {
-                    self.show(Next::Session {
-                        generation,
-                        buffer,
-                        fence,
-                    });
-                } else if let Some((stale, _)) = session.held.replace((buffer, fence)) {
-                    // A background session does not reach the screen. Its newest frame is held
-                    // unanswered for the switch back; the one it supersedes is given back.
-                    self.discard(generation, stale);
+                let awaiting = self
+                    .transition
+                    .as_ref()
+                    .map(|t| t.to.is_none() && t.pending.is_none());
+                match (fronted, awaiting) {
+                    // The frame the switch to this session was waiting for (§5 step 6).
+                    (true, Some(true)) => self.target_frame(generation, buffer, fence),
+                    (true, None) => {
+                        let over_plate = self.plate_showing();
+                        self.fronted_frame(generation, buffer, fence, over_plate);
+                    }
+                    // A background session does not reach the screen, nor does a fronted one
+                    // while the switch to it runs on another frame. Its newest frame is held
+                    // unanswered; the one it supersedes is given back.
+                    _ => self.hold(generation, buffer, fence),
                 }
             }
         }
@@ -680,22 +1164,41 @@ impl Outer {
                 generation,
                 buffer,
                 fence,
+                answer,
             } => {
-                let Some(fb) = self
+                let Some(SessionBuffer { fb, dmabuf }) = self
                     .sessions
                     .get(&generation)
                     .and_then(|s| s.buffers.get(&buffer))
-                    .cloned()
                 else {
                     return;
                 };
-                let handle = *(*fb).as_ref();
+                let handle = *(**fb).as_ref();
                 let shown = Shown::Session {
                     buffer,
-                    _fb: fb,
+                    _fb: fb.clone(),
+                    dmabuf: dmabuf.clone(),
                     generation,
+                    answer,
                 };
                 (handle, shown, fence)
+            }
+            Next::Composite {
+                slot,
+                fb,
+                fence,
+                alpha,
+            } => {
+                let handle = *(*fb).as_ref();
+                (
+                    handle,
+                    Shown::Composite {
+                        slot,
+                        _fb: fb,
+                        alpha,
+                    },
+                    fence,
+                )
             }
         };
         let plane = PlaneState {
@@ -715,11 +1218,17 @@ impl Outer {
             Ok(()) => self.in_flight = Some(shown),
             Err(err) => {
                 warn!("flip refused: {err}");
-                if let Shown::Session {
-                    generation, buffer, ..
-                } = shown
-                {
-                    self.discard(generation, buffer);
+                match shown {
+                    Shown::Session {
+                        generation,
+                        buffer,
+                        answer: true,
+                        ..
+                    } => self.discard(generation, buffer),
+                    Shown::Session { answer: false, .. } => (),
+                    // No flip completion will come to draw the next frame: end the fade now.
+                    Shown::Composite { .. } => self.finish_transition(),
+                    Shown::Plate => (),
                 }
             }
         }
@@ -745,7 +1254,10 @@ impl Outer {
         };
 
         if let Shown::Session {
-            buffer, generation, ..
+            buffer,
+            generation,
+            answer: true,
+            ..
         } = &shown
         {
             if let Some(session) = self.sessions.get_mut(generation) {
@@ -773,10 +1285,26 @@ impl Outer {
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
         self.on_screen = shown;
 
-        if let Some(next) = self.queued.take() {
+        if self.switch_pending {
+            // Now that the screen has settled, take the switch from what it shows.
+            self.switch_pending = false;
+            self.begin_switch();
+        } else if let Some(next) = self.queued.take() {
             self.flip(next);
+        } else if self.transition.is_some() {
+            self.advance();
         }
     }
+}
+
+/// Whether a sync_file has signalled: it polls readable once it has.
+fn fence_signalled(fd: BorrowedFd<'_>) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
 /// An `Rc<OwnedFd>` the event loop can poll while the session keeps its own reference for sends.
@@ -826,10 +1354,10 @@ fn open_display(drm_fd: &DrmDeviceFd, drm: &mut DrmDevice) -> anyhow::Result<Dis
         let mut map = drm_fd
             .map_dumb_buffer(&mut plate_buffer)
             .context("mapping the plate")?;
-        // GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a
-        // session's own background sits on. Opaque and flat: this is a herald surface, not chrome.
+        // Opaque and flat: this is a herald surface, not chrome.
+        let [r, g, b] = PLATE;
         for px in map.as_mut().as_chunks_mut::<4>().0 {
-            px.copy_from_slice(&[0x24, 0x24, 0x24, 0xff]);
+            px.copy_from_slice(&[b, g, r, 0xff]);
         }
     }
     let plate = drm_fd

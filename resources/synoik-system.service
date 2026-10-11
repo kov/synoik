@@ -19,6 +19,9 @@ User=synoik-system
 SupplementaryGroups=video input
 RuntimeDirectory=synoik-system
 RuntimeDirectoryPreserve=restart
+# Mesa's shader cache, for the transitions the outer draws (§5); the user has no home.
+CacheDirectory=synoik-system
+Environment=XDG_CACHE_HOME=%C/synoik-system
 # Master lives on the open file, not the process. systemd holding a reference to it keeps the card
 # mastered across a crash, so nobody else can claim it in the gap and the restarted outer is
 # master again without asking (§1, §7).

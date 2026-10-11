@@ -629,16 +629,18 @@ impl Nested {
         let Some(out) = self.outputs.get_mut(name) else {
             return;
         };
-        let Some((index, mut feedback, target)) = out.in_flight.take() else {
-            warn!("Presented for {name} with nothing in flight");
+        // Only the frame in flight can be answered. Taking another buffer's `Presented` for it
+        // would mark the wrong slot on screen and free the one that is.
+        let Some(index) = out
+            .in_flight
+            .as_ref()
+            .map(|(index, _, _)| *index)
+            .filter(|&index| out.slots[index].id == buffer)
+        else {
+            warn!("Presented buffer {buffer} on {name}, which is not in flight");
             return;
         };
-        if out.slots[index].id != buffer {
-            warn!(
-                "Presented buffer {buffer} on {name}, but {} was in flight",
-                out.slots[index].id
-            );
-        }
+        let (_, mut feedback, target) = out.in_flight.take().expect("checked above");
         out.on_screen = Some(index);
         let output = out.output.clone();
 
@@ -707,14 +709,21 @@ impl Nested {
         let Some(out) = self.outputs.get_mut(name) else {
             return;
         };
-        if let Some((index, _, _)) = out.in_flight.take() {
-            if out.slots[index].id != buffer {
-                warn!("Discarded buffer {buffer} on {name}, but another was in flight");
-            }
-            // Its contents never reached the screen, so the damage history it was drawn against
-            // is not one anything will be compared with.
-            out.slots[index].drawn = 0;
-        }
+        // Only the frame in flight can be discarded; with nothing in flight the redraw machinery
+        // is in some other state, which forcing it idle would corrupt.
+        let Some(index) = out
+            .in_flight
+            .as_ref()
+            .map(|(index, _, _)| *index)
+            .filter(|&index| out.slots[index].id == buffer)
+        else {
+            warn!("Discarded buffer {buffer} on {name}, which is not in flight");
+            return;
+        };
+        out.in_flight = None;
+        // Its contents never reached the screen, so the damage history it was drawn against is
+        // not one anything will be compared with.
+        out.slots[index].drawn = 0;
         let output = out.output.clone();
         if let Some(state) = synoik.output_state.get_mut(&output) {
             state.redraw_state = RedrawState::Idle;

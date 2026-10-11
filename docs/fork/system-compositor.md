@@ -1,9 +1,9 @@
 # The system compositor
 
 > Status: **design agreed 2026-08-15; partly built** — sessions nested and scanned out
-> unredirected, the screen following logind's active session, surviving a crash of either side
-> (§10). Transitions and the greeter are not built. The outer is an unprivileged system user
-> outside logind (§9 S1).
+> unredirected, the screen following logind's active session with a crossfade, surviving a crash
+> of either side (§10). The greeter and outer-initiated switching are not built. The outer is an
+> unprivileged system user outside logind (§9 S1).
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -375,36 +375,49 @@ screen in the inner, and moving it means the outer grows real UI — against §1
 
 ## 10. What is built
 
-Sessions nested and unredirected, switched by logind — the steady state of §1, the fronting rule
-of §2.2 and the reliability of §7; none of §4/§5's transitions yet.
+Sessions nested and unredirected, switched by logind with a crossfade — the steady state of §1,
+the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the reliability of §7.
 
 - **Wire** (`system_compositor::protocol`): one JSON message per `SOCK_SEQPACKET` packet, fds as
   `SCM_RIGHTS` on the same packet, version refused on mismatch. `Hello`/`Welcome` (render node,
   connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
-  (kernel flip time and sequence, untouched, §3.1) or `Discarded`.
+  (kernel flip time and sequence, untouched, §3.1) or `Discarded`. Each `Present` is answered
+  exactly once, and only by its own buffer id: a frame shown again is not re-answered.
 - **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): opens or recovers the
   card, modesets the first connected display at its preferred mode, and flips the buffers of the
   session logind has made active on seat0, following `ACTIVE=` in `/run/systemd/seats/seat0` by
   inotify (`sd_login_monitor`'s mechanism). Any number of sessions attach; each names its logind
   session in `Hello`, accepted only if that session is on seat0, owned by the peer's uid, and —
-  when the peer runs in a session scope — that scope's. A background session's presents are
-  discarded at once and kept as its latest frame. On a switch the outer shows the new session's
-  latest frame, or the plate until it draws one — never the previous session's frame. A departing
-  fronted session's last frame stays up until replaced.
+  when the peer runs in a session scope — that scope's. A background session's newest present is
+  held unanswered (so its slot stays reserved) and the one it supersedes discarded. The screen
+  never shows a buffer the inner may be drawing into: only a held frame, or the last one answered
+  `Presented`.
+- **Switch** (`system_compositor::compose`, the outer's own Vulkan device on the render node): on
+  a change of active session the outer snapshots what is on screen into its own texture (§5 step
+  1; mid-fade, the blend on screen) and crossfades to the incoming session's frame, 250 ms
+  ease-out, into two outer-owned scanout buffers, then flips that frame itself — the session's
+  first `Presented` (§5 step 8). The target is the incoming session's held frame, else its next
+  present, gated on its render fence polled readable (§5 step 6). A fronted frame that replaces
+  the plate fades in the same way. Without a usable GPU a switch is a cut.
 - **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
   backend takes it; renders like headless into three scanout slots, only while logind has it
   active; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
   retries, re-registers its buffers and redraws in full.
 
-Measured 2026-10-11 on enhanced F44 under Limina (venus), session autologged on tty1, no fbcon: injected input reaches the session through logind and the frames flip contiguously
-through the session's own buffers; SIGKILL of the outer is invisible on screen (the session's
-frame stays up, the outer restarts with the stored fd still master, the session reattaches within
-the 0.5 s retry); SIGKILL of the session leaves its last frame up until the next session's first.
-With two sessions (tty1, tty2), an injected Ctrl+Alt+F2 in one switched logind and the outer
-followed: the other session's frames on screen, its overview answering Super, and the first
-session's desktop back untouched by those keys after Ctrl+Alt+F1. Switching to a session that has
-never drawn shows the plate for one frame (~50 ms) — what §5 step 6 removes.
+Divergence from §5 step 6: the in-animation is gated on the incoming frame, but the outgoing
+picture is not held indefinitely for it. After 300 ms without one the switch fades to the incoming
+session's last answered frame, or the plate — logind has already moved input, and the previous
+user's screen must not stay in front of whoever is at the seat now.
+
+Measured 2026-10-11 on enhanced F44 under Limina (venus), sessions autologged on tty1 and tty2,
+no fbcon: injected input reaches the fronted session only; SIGKILL of the outer is invisible on
+screen (the stored fd is still master, the session reattaches within the 0.5 s retry); SIGKILL of
+a session leaves its last frame up until its next. Ctrl+Alt+F2/F1 switches crossfade: fitting
+each captured frame as `A + a·(B − A)` gives `a` on the ease-out curve (0.13 at 10 ms, 0.83 at
+110 ms, 1.0 by 211 ms) with a mean residual under 0.3/255, then the session's own buffers take
+over with no visible step; reversing at `a` = 0.46 continues from 0.46.
 
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
-more than one output; transitions, the greeter, the chord matcher.
+more than one output; the mode-change path of §4.2/§4.3; the outer starting a switch itself
+(`ActivateSession`, the chord matcher); the greeter.

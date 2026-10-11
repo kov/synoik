@@ -5,5 +5,6 @@
 //! The system compositor and the wire it shares with nested sessions
 //! (`docs/fork/system-compositor.md`). The session side is `backend::nested`.
 
+mod compose;
 pub mod outer;
 pub mod protocol;
