@@ -2001,6 +2001,13 @@ impl State {
                     .context("error initializing the TTY backend")?;
                 Backend::Tty(tty)
             }
+            BackendMode::Nested => {
+                let socket = std::env::var_os(crate::system_compositor::protocol::SOCKET_ENV)
+                    .context("the nested backend needs SYNOIK_SYSTEM_SOCKET")?;
+                let nested = crate::backend::Nested::new(event_loop.clone(), socket.into())
+                    .context("error nesting in the system compositor")?;
+                Backend::Nested(nested)
+            }
         };
 
         let mut synoik = Synoik::new(

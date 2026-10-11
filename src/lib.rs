@@ -58,6 +58,7 @@ pub mod screencasting;
 pub mod session_state;
 pub mod status_notifier;
 pub mod synoik;
+pub mod system_compositor;
 pub mod system_status;
 pub mod ui;
 pub mod unlock_dialog;

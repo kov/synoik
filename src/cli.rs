@@ -117,6 +117,20 @@ pub enum Sub {
         #[arg(short, long)]
         json: bool,
     },
+    /// Run as the system compositor: hold the display for the machine and scan the session
+    /// compositors out (`docs/fork/system-compositor.md`).
+    ///
+    /// Runs as an unprivileged system user in the `video` and `input` groups, from a unit that
+    /// gives it an fd store; see `resources/synoik-system.service`. A session compositor started
+    /// with `SYNOIK_SYSTEM_SOCKET` pointing at `--socket` nests inside it.
+    SystemCompositor {
+        /// The DRM card to drive. Ignored when systemd hands back a stored one.
+        #[arg(long, value_name = "PATH")]
+        card: Option<std::path::PathBuf>,
+        /// Where sessions connect.
+        #[arg(long, value_name = "PATH", default_value = crate::system_compositor::protocol::DEFAULT_SOCKET)]
+        socket: std::path::PathBuf,
+    },
     /// Cause a panic to check if the backtraces are good.
     Panic,
     /// Generate shell completions.

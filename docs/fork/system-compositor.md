@@ -1,7 +1,8 @@
 # The system compositor
 
-> Status: **design, agreed 2026-08-15.** Nothing implemented. The blocking unknown (§9 S1) is
-> resolved: the outer is an unprivileged system user outside logind.
+> Status: **design agreed 2026-08-15; first milestone built** — one session nested and scanned out
+> unredirected, surviving a crash of either side (§10). Greeter, switching and transitions are not
+> built. The outer is an unprivileged system user outside logind (§9 S1).
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -27,7 +28,7 @@ versioned in lockstep. It can be told it is nested and adjust. That means:
   Wayland protocol we have to generalise and then live with;
 - capabilities can be **handed over wholesale** rather than proxied — see §2, where the inner
   gets real evdev fds rather than forwarded events;
-- the inner gets a third backend alongside `winit` and `tty`: **`nested-privileged`**.
+- the inner gets a third backend alongside `tty` and `headless`: **`nested`** (`backend::nested`).
 
 ChromeOS is the existence proof that the shape works (single compositor, no VTs, `frecon` in the
 boot-splash/recovery-console role). Mir is the proof that it only works cooperatively.
@@ -58,11 +59,25 @@ Keeping it thin is not an aesthetic preference — it is what makes restart fast
   (`FileDescriptorStoreMax=`, `FDSTORE=1`); systemd's reference keeps the file and its master alive
   across a crash, and the restarted outer gets it back. The inherited fd cannot `SET/DROP_MASTER`
   unprivileged (the kernel checks the opener's pid), which costs nothing: the outer never drops it.
+  The store must outlive a crash *loop* too: a unit that hits its start limit fails, and a failed
+  unit's store is flushed — master lost — so the unit sets `StartLimitIntervalSec=0` and
+  `FileDescriptorStorePreserve=yes`. Releasing master is then a deliberate
+  `systemctl clean --what=fdstore`.
+- **Framebuffer handover** — framebuffers belong to the open file, so the restarted outer inherits
+  its predecessor's, including the session frame on screen. It `CLOSEFB`s them (Linux 6.8): the
+  handle goes, the scanout stays until the next flip. `RMFB` would turn the plane off.
 - **Session switch** — a polkit rule grants the outer's user `org.freedesktop.login1.chvt`, the
   action logind checks for `ActivateSession`.
 - **Its own input** — the `input` group, for the chord matcher (§2.1).
 
 The inner's devices come from logind (§2), so there is no device-brokering helper either.
+
+**No fbdev console may be bound to the outer's card.** A VT returning to text mode (`KD_TEXT`)
+makes the kernel force-restore fbdev over whoever holds master — `drm_fb_helper_set_par`'s
+deliberate ABI exception for X servers that switch to text before dropping master. Measured: a
+session on tty1 ending put fbcon's framebuffer on the plane while the outer was master. With VTs,
+any logind session on a VT does this at logout, so the machine runs without fbcon on that card
+(`CONFIG_VT=n`, or the `vtconsole` unbound at boot); see §9 S6.
 
 | | Outer (system compositor) | Inner (session compositor) |
 |---|---|---|
@@ -81,14 +96,13 @@ Steady state is **unredirected**: the fronted session's buffer goes straight to 
 one flip, no outer compositing, no added latency. The outer only composites during transitions and
 while it is itself fronted.
 
-**The steady-state path works on our stack** (measured 2026-10-11, enhanced F44 on Limina, venus):
-a buffer allocated and cleared by one process with `Texture::allocate_scanout` and passed as a
-dmabuf over `SCM_RIGHTS` is PRIME-imported, `AddFB2`'d and flipped by a second process holding
-master — every re-clear reaches glass, at 60 Hz, and the buffer keeps scanning out after its
-producer exits. Two consequences for the protocol: virtio-gpu lacks `DRM_CAP_ADDFB2_MODIFIERS`, so `AddFB2`
-must go without `DRM_MODE_FB_MODIFIERS` (`PrimeFramebufferExporter` already checks); and nothing
-orders the producer's writes against the flip, so the buffer handoff carries an explicit fence.
-Probe: `synoik-vk/examples/xproc_scanout_send.rs` + `spikes/xproc_scanout_recv.c`.
+The inner allocates its scanout buffers on its own Vulkan device and registers each with the outer
+once, as a dmabuf; a frame is then a buffer id plus the render's `sync_file`, which the outer hands
+to the atomic commit as `IN_FENCE_FD` — the kernel orders the flip after the render, and neither
+side blocks on it. virtio-gpu lacks `DRM_CAP_ADDFB2_MODIFIERS`, so those buffers are LINEAR and
+`AddFB2` names no modifier (`framebuffer_from_dmabuf`). A buffer on screen outlives the process
+that rendered it. Probe for the bare path: `synoik-vk/examples/xproc_scanout_send.rs` +
+`spikes/xproc_scanout_recv.c`.
 
 ---
 
@@ -333,3 +347,38 @@ inside the session, which is GDM's structural problem today). But we already imp
 screen in the inner, and moving it means the outer grows real UI — against §1.
 
 **S5 — Multi-seat.** Not considered anywhere above.
+
+**S6 — Who unbinds fbcon.** The outer cannot share its card with a bound fbcon (§1). `CONFIG_VT=n`
+settles it in the kernel; on a stock kernel it is a root write to `/sys/class/vtconsole/*/bind` at
+boot (or a kernel command line), which is configuration rather than a resident privileged process,
+but still root. Undecided which the shipped setup uses.
+
+---
+
+## 10. What is built
+
+One session, nested and unredirected — the steady state of §1 and the reliability of §7, nothing
+of §4/§5 yet.
+
+- **Wire** (`system_compositor::protocol`): one JSON message per `SOCK_SEQPACKET` packet, fds as
+  `SCM_RIGHTS` on the same packet, version refused on mismatch. `Hello`/`Welcome` (render node,
+  connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
+  (kernel flip time and sequence, untouched, §3.1) or `Discarded`.
+- **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): opens or recovers the
+  card, modesets the first connected display at its preferred mode, shows a plate until a session
+  attaches, flips one session's buffers. A connection is accepted only from the uid of seat0's
+  active session (logind's own state). A departing session's last frame stays up until replaced.
+- **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
+  backend takes it; renders like headless into three scanout slots; paces off `Presented` as the
+  tty does off vblank. On losing the outer it keeps running, retries, re-registers its buffers
+  and redraws in full.
+
+Measured 2026-10-11 on enhanced F44 under Limina (venus), session autologged on tty1, fbcon
+unbound: injected input reaches the session through logind and the frames flip contiguously
+through the session's own buffers; SIGKILL of the outer is invisible on screen (the session's
+frame stays up, the outer restarts with the stored fd still master, the session reattaches within
+the 0.5 s retry); SIGKILL of the session leaves its last frame up until the next session's first.
+
+Not built: cursor and client planes through the outer (the inner composites everything, cursor
+included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
+more than one output; switching, transitions, the greeter, the chord matcher.

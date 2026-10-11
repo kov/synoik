@@ -519,7 +519,7 @@ fn device_names_modifiers(drm: &DrmDeviceFd) -> bool {
 ///
 /// `use_opaque` substitutes the alpha-less twin of the fourcc (`Argb8888` → `Xrgb8888`), which is
 /// what tells KMS it may ignore the alpha channel on the primary plane.
-fn framebuffer_from_dmabuf(
+pub(crate) fn framebuffer_from_dmabuf(
     drm: &DrmDeviceFd,
     dmabuf: &Dmabuf,
     use_opaque: bool,

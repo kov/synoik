@@ -3112,7 +3112,7 @@ fn get_drm_property(
         .find_map(|(handle, value)| (handle == prop).then_some(value))
 }
 
-fn refresh_interval(mode: DrmMode) -> Duration {
+pub(crate) fn refresh_interval(mode: DrmMode) -> Duration {
     let clock = mode.clock() as u64;
     let htotal = mode.hsync().2 as u64;
     let vtotal = mode.vsync().2 as u64;
@@ -4045,10 +4045,11 @@ fn pick_mode(
     mode.map(|m| (*m, fallback))
 }
 
-fn get_edid_info(
+/// The raw EDID bytes of `connector`, as the kernel exposes them.
+pub(crate) fn edid_blob(
     device: &DrmDevice,
     connector: connector::Handle,
-) -> anyhow::Result<libdisplay_info::info::Info> {
+) -> anyhow::Result<Vec<u8>> {
     let (_, info, value) =
         find_drm_property(device, connector, "EDID").context("no EDID property")?;
     let blob = info
@@ -4056,10 +4057,9 @@ fn get_edid_info(
         .convert_value(value)
         .as_blob()
         .context("EDID was not blob type")?;
-    let data = device
+    device
         .get_property_blob(blob)
-        .context("error getting EDID blob value")?;
-    libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
+        .context("error getting EDID blob value")
 }
 
 impl<'a> ConnectorProperties<'a> {
@@ -4257,7 +4257,7 @@ pub fn set_gamma_for_crtc(
     Ok(())
 }
 
-fn format_connector_name(connector: &connector::Info) -> String {
+pub(crate) fn format_connector_name(connector: &connector::Info) -> String {
     format!(
         "{}-{}",
         connector.interface().as_str(),
@@ -4270,9 +4270,21 @@ fn make_output_name(
     connector: connector::Handle,
     connector_name: String,
 ) -> OutputName {
-    let info = get_edid_info(device, connector)
-        .map_err(|err| warn!("error getting EDID info for {connector_name}: {err:?}"))
+    let edid = edid_blob(device, connector)
+        .map_err(|err| warn!("error getting EDID for {connector_name}: {err:?}"))
         .ok();
+    output_name_from_edid(connector_name, edid.as_deref())
+}
+
+/// Name a display from its connector and EDID, mutter's way. Shared with the nested backend, which
+/// gets the EDID over the wire from the system compositor and has to name the display exactly as
+/// this backend would, or `monitors.xml` reads it as a different monitor.
+pub(crate) fn output_name_from_edid(connector_name: String, edid: Option<&[u8]>) -> OutputName {
+    let info = edid.and_then(|data| {
+        libdisplay_info::info::Info::parse_edid(data)
+            .map_err(|err| warn!("error parsing the EDID of {connector_name}: {err:?}"))
+            .ok()
+    });
     let spec = info.as_ref().and_then(monitor_spec_from_edid);
     OutputName {
         connector: connector_name,

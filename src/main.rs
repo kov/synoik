@@ -164,6 +164,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_msg(msg, json)?;
                 return Ok(());
             }
+            Sub::SystemCompositor { card, socket } => {
+                synoik::system_compositor::outer::run(card, socket)?;
+                return Ok(());
+            }
             Sub::Panic => cause_panic(),
             Sub::Completions { shell } => {
                 match shell {
@@ -235,6 +239,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mode = if cli.headless {
         BackendMode::Headless
+    } else if env::var_os(synoik::system_compositor::protocol::SOCKET_ENV).is_some() {
+        BackendMode::Nested
     } else {
         BackendMode::Auto
     };

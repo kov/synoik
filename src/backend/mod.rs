@@ -25,10 +25,15 @@ pub use tty::Tty;
 pub mod headless;
 pub use headless::Headless;
 
+pub mod nested;
+pub use nested::Nested;
+
 #[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Tty(Tty),
     Headless(Headless),
+    /// A session nested in the system compositor (`docs/fork/system-compositor.md`).
+    Nested(Nested),
 }
 
 /// Which backend to start the compositor with.
@@ -42,6 +47,8 @@ pub enum BackendMode {
     /// Headless for the in-process test fixture: additionally skips external
     /// integrations (GSettings/dconf) to keep tests hermetic.
     HeadlessTest,
+    /// Nested in the system compositor, whose socket `SYNOIK_SYSTEM_SOCKET` names.
+    Nested,
 }
 
 #[derive(PartialEq, Eq)]
@@ -77,6 +84,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.init(synoik),
             Backend::Headless(headless) => headless.init(synoik),
+            Backend::Nested(nested) => nested.init(synoik),
         }
     }
 
@@ -84,6 +92,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.seat_name(),
             Backend::Headless(headless) => headless.seat_name(),
+            Backend::Nested(nested) => nested.seat_name(),
         }
     }
 
@@ -99,6 +108,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.with_vulkan_renderer(f),
             Backend::Headless(headless) => headless.with_vulkan_renderer(f),
+            Backend::Nested(nested) => nested.with_vulkan_renderer(f),
         }
     }
 
@@ -113,12 +123,15 @@ impl Backend {
             Backend::Headless(headless) => {
                 headless.render(synoik, output, target_presentation_time)
             }
+            Backend::Nested(nested) => nested.render(synoik, output, target_presentation_time),
         }
     }
 
     pub fn mod_key(&self, config: &Config) -> ModKey {
         match self {
-            Backend::Tty(_) | Backend::Headless(_) => config.input.mod_key.unwrap_or(ModKey::Super),
+            Backend::Tty(_) | Backend::Headless(_) | Backend::Nested(_) => {
+                config.input.mod_key.unwrap_or(ModKey::Super)
+            }
         }
     }
 
@@ -126,20 +139,21 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.change_vt(vt),
             Backend::Headless(headless) => headless.change_vt(vt),
+            Backend::Nested(nested) => nested.change_vt(vt),
         }
     }
 
     pub fn suspend(&mut self) {
         match self {
             Backend::Tty(tty) => tty.suspend(),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
     pub fn toggle_debug_tint(&mut self) {
         match self {
             Backend::Tty(tty) => tty.toggle_debug_tint(),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
@@ -147,6 +161,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.import_dmabuf(dmabuf),
             Backend::Headless(headless) => headless.import_dmabuf(dmabuf),
+            Backend::Nested(nested) => nested.import_dmabuf(dmabuf),
         }
     }
 
@@ -154,6 +169,7 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.ipc_outputs(),
             Backend::Headless(headless) => headless.ipc_outputs(),
+            Backend::Nested(nested) => nested.ipc_outputs(),
         }
     }
 
@@ -167,13 +183,14 @@ impl Backend {
             // Opened lazily off the render node, so a headless run can drive the whole screencast
             // path without a seat.
             Backend::Headless(headless) => headless.gbm_device(),
+            Backend::Nested(nested) => nested.gbm_device(),
         }
     }
 
     pub fn set_monitors_active(&mut self, active: bool) {
         match self {
             Backend::Tty(tty) => tty.set_monitors_active(active),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
@@ -185,21 +202,21 @@ impl Backend {
     ) {
         match self {
             Backend::Tty(tty) => tty.set_output_on_demand_vrr(synoik, output, enable_vrr),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
     pub fn update_ignored_nodes_config(&mut self, synoik: &mut Synoik) {
         match self {
             Backend::Tty(tty) => tty.update_ignored_nodes_config(synoik),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
     pub fn on_output_config_changed(&mut self, synoik: &mut Synoik) {
         match self {
             Backend::Tty(tty) => tty.on_output_config_changed(synoik),
-            Backend::Headless(_) => (),
+            Backend::Headless(_) | Backend::Nested(_) => (),
         }
     }
 
@@ -216,6 +233,14 @@ impl Backend {
             v
         } else {
             panic!("backend is not Tty");
+        }
+    }
+
+    pub fn nested(&mut self) -> &mut Nested {
+        if let Self::Nested(v) = self {
+            v
+        } else {
+            panic!("backend is not Nested")
         }
     }
 
