@@ -218,7 +218,11 @@ impl PageTransform {
     }
 
     /// Where a point of the page lands, scaled about `centre` and then translated.
-    fn place(&self, p: Point<f64, Logical>, centre: Point<f64, Logical>) -> Point<f64, Logical> {
+    pub(crate) fn place(
+        &self,
+        p: Point<f64, Logical>,
+        centre: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
         Point::from((
             centre.x + (p.x - centre.x) * self.scale,
             centre.y + (p.y - centre.y) * self.scale + self.translation_y,
@@ -233,7 +237,7 @@ impl PageTransform {
     /// cache for a bucketed *size* instead, which bounded the number of keys but made the first
     /// run of the crossfade miss a cold key per bucket — and a cold key draws nothing, so the
     /// avatar blinked its way in. Bucketing turned one cold miss into twelve.
-    fn buffer_scale(&self, scale: f64) -> f64 {
+    pub(crate) fn buffer_scale(&self, scale: f64) -> f64 {
         scale / self.scale
     }
 }

@@ -16388,3 +16388,89 @@ fn vulkan_app_expose_fades_in_a_window_from_another_workspace() {
         "part-way, the window is blended over what is beneath it: {mid:?} vs {up:?}"
     );
 }
+
+/// The greeter's user grid on its flat `$system_base_color` (`_login-lock.scss:1,233-235`): three
+/// users make three tiles in a centred row, each drawn over the backdrop with its name, and the
+/// rest of the screen is the backdrop and nothing else of the desktop.
+#[test]
+fn vulkan_draws_the_greeter_user_grid() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    let output = f.synoik_output(1);
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = |name: &str| LoginUser {
+        name: name.to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    // A picture for bob, generated: CI has no account pictures to borrow.
+    let picture = std::env::temp_dir().join(format!("greeter-avatar-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([220, 30, 30, 255]))
+        .save(&picture)
+        .expect("write the avatar");
+    let bob = LoginUser {
+        icon_file: crate::dbus::accounts_service::AccountIcon::read(picture.clone()),
+        ..user("bob")
+    };
+    assert!(bob.icon_file.is_some());
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user("amy"), bob, user("cat")]));
+    f.synoik_complete_animations();
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let monitor = Rectangle::from_size(Size::from((f64::from(w), f64::from(h))));
+    let tiles = crate::ui::login_grid::tile_rects(monitor, 3);
+    assert_eq!(tiles.len(), 3);
+
+    let backdrop: [u8; 3] = [0x22, 0x22, 0x26];
+    let is_backdrop = |p: [u8; 4]| {
+        (0..3).all(|c| (i32::from(p[c]) - i32::from(backdrop[c])).abs() <= 2) && p[3] == 255
+    };
+    // Between the panel and the tiles: the backdrop, flat.
+    assert!(is_backdrop(px(&pixels, w, w / 2, h / 6)));
+    for (i, t) in tiles.iter().enumerate() {
+        // A tile corner inset is the neutral tint, not the backdrop.
+        let corner = px(&pixels, w, t.loc.x as i32 + 20, t.loc.y as i32 + 20);
+        assert!(!is_backdrop(corner), "tile {i} is not drawn: {corner:?}");
+        // The name band holds white text.
+        let white = (t.loc.y as i32 + 150..t.loc.y as i32 + 172)
+            .flat_map(|y| (t.loc.x as i32..(t.loc.x + t.size.w) as i32).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = px(&pixels, w, x, y);
+                p[0] > 200 && p[1] > 200 && p[2] > 200
+            })
+            .count();
+        assert!(white > 0, "tile {i} has no name");
+    }
+
+    // Bob's picture is in his circle, and his tile is tinted from it.
+    let t = tiles[1];
+    let avatar = px(
+        &pixels,
+        w,
+        (t.loc.x + t.size.w / 2.) as i32,
+        t.loc.y as i32 + 80,
+    );
+    assert!(avatar[0] > 180 && avatar[1] < 80, "no picture: {avatar:?}");
+    let corner = px(&pixels, w, t.loc.x as i32 + 20, t.loc.y as i32 + 20);
+    assert!(
+        corner[0] > corner[1] + 40,
+        "the tile is not tinted red: {corner:?}"
+    );
+    let _ = std::fs::remove_file(&picture);
+}

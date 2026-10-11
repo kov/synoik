@@ -41851,3 +41851,44 @@ fn the_greeter_is_a_shield_that_stays_down() {
     assert!(f.synoik().screen_shield.is_active());
     assert!(f.synoik().lock_screen.is_covering(now));
 }
+
+/// The greeter's grid takes the keyboard: the first tile has the focus, the arrows move it, Enter
+/// picks that user; a click on the pill asks for a name instead.
+#[test]
+fn the_greeter_grid_picks_a_user() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = |name: &str| LoginUser {
+        name: name.to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user("amy"), user("bob")]));
+
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Prompt {
+            user: Some("bob".to_owned())
+        }
+    );
+
+    f.synoik_state().show_greeter_dialog();
+    let monitor = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((1920., 1080.)));
+    let pill = crate::ui::login_grid::enter_name_rect(monitor);
+    pointer_motion_to(&mut f, pill.loc.x + 5., pill.loc.y + 5.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().login_page, LoginPage::Prompt { user: None });
+}

@@ -236,6 +236,15 @@ const DEVICE_MEMORY_CENSUS_TARGET: &str = "devmem";
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
+/// Which page of the login screen is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginPage {
+    /// The user grid ([`crate::ui::login_grid`]).
+    Grid,
+    /// Asking for credentials: for a picked user, or for a name first (`None`).
+    Prompt { user: Option<String> },
+}
+
 /// `$system_base_color` (`_colors.scss:20`, `_palette.scss`), behind the login screen.
 const GREETER_BG: [f32; 4] = [
     0x22 as f32 / 255.,
@@ -446,6 +455,9 @@ pub struct Synoik {
     pub is_session_instance: bool,
     /// The login screen's user list (greeter only), from AccountsService.
     pub login_users: Vec<crate::dbus::accounts_service::LoginUser>,
+    /// The login screen's user grid and which page it is on.
+    pub login_grid: crate::ui::login_grid::LoginGrid,
+    pub login_page: LoginPage,
     /// `synoik --greeter`: the login screen's session, in gnome-shell's `gdm` mode
     /// (`docs/fork/greeter.md` §4).
     pub greeter: bool,
@@ -6193,6 +6205,10 @@ impl State {
         if !self.synoik.screen_shield.is_active() {
             return;
         }
+        if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid {
+            self.on_login_grid_key(raw, mods);
+            return;
+        }
         let now = self.synoik.shield_now();
 
         if self.synoik.screen_shield.is_dismissible() {
@@ -6259,10 +6275,65 @@ impl State {
         self.apply_unlock_effects(effects);
     }
 
+    /// A key on the greeter's user grid.
+    fn on_login_grid_key(
+        &mut self,
+        raw: Option<smithay::input::keyboard::Keysym>,
+        mods: crate::ui::text_edit::EditMods,
+    ) {
+        use smithay::input::keyboard::Keysym;
+
+        use crate::ui::login_grid::GridKey;
+
+        let key = match raw {
+            Some(Keysym::Left | Keysym::KP_Left) => GridKey::Left,
+            Some(Keysym::Right | Keysym::KP_Right) => GridKey::Right,
+            Some(Keysym::Up | Keysym::KP_Up) => GridKey::Up,
+            Some(Keysym::Down | Keysym::KP_Down) => GridKey::Down,
+            Some(Keysym::Tab) if mods.shift => GridKey::Prev,
+            Some(Keysym::ISO_Left_Tab) => GridKey::Prev,
+            Some(Keysym::Tab) => GridKey::Next,
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => GridKey::Activate,
+            _ => return,
+        };
+        let count = self.synoik.login_users.len();
+        let (action, moved) = self.synoik.login_grid.key(key, count);
+        if moved {
+            self.synoik.queue_redraw_all();
+        }
+        if let Some(action) = action {
+            self.on_login_grid_action(action);
+        }
+    }
+
+    /// The grid picked a user, or asked for a name.
+    fn on_login_grid_action(&mut self, action: crate::ui::login_grid::GridAction) {
+        use crate::ui::login_grid::GridAction;
+
+        let user = match action {
+            GridAction::Pick(i) => self.synoik.login_users.get(i).map(|u| u.name.clone()),
+            GridAction::EnterName => None,
+        };
+        self.synoik.login_page = LoginPage::Prompt { user };
+        self.synoik.queue_redraw_all();
+    }
+
     /// A click while the shield is down: raise it, raise the prompt page
     /// (`unlockDialog.js:571-573`'s click gesture), or hit something on the prompt.
     pub fn on_shield_click(&mut self, pos: Point<f64, Logical>) {
         if !self.synoik.screen_shield.is_active() {
+            return;
+        }
+        if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid {
+            let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
+            if let Some((output, local)) = under {
+                let monitor = Rectangle::from_size(output_size(&output));
+                let count = self.synoik.login_users.len();
+                if let Some(action) = self.synoik.login_grid.click(monitor, count, local) {
+                    self.on_login_grid_action(action);
+                }
+                self.synoik.queue_redraw_all();
+            }
             return;
         }
         let now = self.synoik.shield_now();
@@ -6766,7 +6837,14 @@ impl State {
                 if self.synoik.login_users == users {
                     return;
                 }
+                let first = self.synoik.login_users.is_empty();
                 self.synoik.login_users = users;
+                let count = self.synoik.login_users.len();
+                if first {
+                    self.synoik.login_grid.reset(count);
+                } else {
+                    self.synoik.login_grid.clamp(count);
+                }
                 self.synoik.queue_redraw_all();
             }
         }
@@ -6781,6 +6859,8 @@ impl State {
     /// down at once, on the login dialog rather than the clock.
     pub fn show_greeter_dialog(&mut self) {
         let now = self.synoik.shield_now();
+        self.synoik.login_page = LoginPage::Grid;
+        self.synoik.login_grid.reset(self.synoik.login_users.len());
         self.synoik
             .screen_shield
             .show_dialog(crate::utils::get_monotonic_time());
@@ -8360,6 +8440,8 @@ impl Synoik {
             is_session_instance,
             greeter: false,
             login_users: Vec::new(),
+            login_grid: crate::ui::login_grid::LoginGrid::new(),
+            login_page: LoginPage::Grid,
             start_time: Instant::now(),
             is_at_startup: true,
             clock: animation_clock.clone(),
@@ -12123,7 +12205,24 @@ impl Synoik {
             prompt_t.translation_y += slide;
             clock_t.translation_y += slide;
 
-            // The greeter's page is the login dialog, drawn by its own block below.
+            if self.greeter && self.login_page == LoginPage::Grid && prompt_t.is_visible() {
+                for elem in self.login_grid.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.image_cache,
+                    page_ctx,
+                    &self.login_users,
+                    self.gnome_settings.accent_color,
+                    prompt_t,
+                ) {
+                    match elem {
+                        crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                        crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                    }
+                }
+            }
+
+            // The greeter's page is the login dialog, drawn by its own block above.
             if prompt_t.is_visible() && !self.greeter {
                 let d = &self.unlock_dialog;
                 let (caret, selection) = match d.entry_mask() {

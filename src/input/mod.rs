@@ -6167,6 +6167,16 @@ impl State {
             if self.synoik.panel.set_hovered_role(role) {
                 self.synoik.queue_redraw_all();
             }
+            if self.synoik.greeter && self.synoik.login_page == crate::synoik::LoginPage::Grid {
+                let count = self.synoik.login_users.len();
+                let tile = self.synoik.output_under(pos).and_then(|(output, p)| {
+                    let monitor = Rectangle::from_size(output_size(output));
+                    crate::ui::login_grid::hit(monitor, count, p)
+                });
+                if self.synoik.login_grid.set_hovered(tile) {
+                    self.synoik.queue_redraw_all();
+                }
+            }
             let now = crate::utils::get_monotonic_time();
             let on_button = self.synoik.switch_user_reactive(now)
                 && self
