@@ -3,7 +3,7 @@
 > Status: **design agreed 2026-08-15; partly built** — sessions nested and scanned out
 > unredirected, the screen following logind's active session with a crossfade, surviving a crash
 > of either side, and switchable by the outer's own chord where there are no VTs (§10). The
-> greeter is not built. The outer is an unprivileged system user outside logind (§9 S1).
+> greeter is designed (`greeter.md`), not built. The outer is an unprivileged system user outside logind (§9 S1).
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -341,11 +341,10 @@ Bring-up notes: GDM spawns a greeter on any new graphical seat, so it must not r
 seat. With no display manager running, `loginctl attach` writes the udev rule but the seat does not
 appear until `udevadm trigger` re-adds the devices.
 
-**S2 — Greeter as a client: confirm.** Assumed throughout: the greeter is a separate application,
-a client of the outer, doing PAM and then asking the outer to spawn the session. Not yet decided
-against the alternative (greeter mode *inside* the outer, as gnome-shell does with GDM). Note
-`dreams-assessment.md` §9 already commits to building the greeter with the design-dreams grid
-layout rather than porting GDM's.
+**S2 — resolved: the greeter is a nested session, and PAM is a root daemon's.** The greeter is
+`synoik --greeter` in a `CLASS=greeter` logind session, attached to the outer like any session; a
+small root login daemon (`synoik-login`, speaking GDM's D-Bus subset) runs PAM and opens user
+sessions. The outer stays unprivileged and never sees a secret. Design: `greeter.md`.
 
 **S3 — Suspend/resume and lid across the boundary.** Who owns the inhibitor, and does the shield
 still ride the flip (cf. the "a suspend waits for a PRESENTED shield" finding) when the presenting
@@ -438,4 +437,5 @@ session's own buffer following. Neither inner logged a warning, though each also
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
 more than one output; the mode-change path of §4.2/§4.3; the inner asking the outer for a switch
-over IPC (§2.1's normal path); the greeter.
+over IPC (§2.1's normal path); the greeter (`greeter.md`), including its rule that a greeter-class
+outgoing picture is held until the incoming session's first frame (`greeter.md` §4.4).
