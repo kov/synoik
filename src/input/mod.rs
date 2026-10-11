@@ -1082,7 +1082,7 @@ impl State {
                 // behind it may see a key. This lives *inside* the keyboard filter rather than
                 // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
                 // never register and the unlock entry could not type a capital letter.
-                if this.synoik.shield_is_up() && !this.synoik.panel_popover.grabs_input() {
+                if this.synoik.shield_is_up() {
                     // ...with the same exceptions the `ext-session-lock` path already makes.
                     // **Ctrl+Alt+F<n> above all**: a VT switch is the escape hatch from a lock
                     // screen that has gone wrong, and swallowing it means a compositor bug becomes
@@ -1113,7 +1113,16 @@ impl State {
                         return FilterResult::Forward;
                     }
 
-                    if pressed {
+                    // A menu of the panel over the shield takes the keys the entry would — and
+                    // only those: nothing that reaches the desktop's popover branch below (its
+                    // binds, the overlay key) may run behind a lock.
+                    if pressed && this.synoik.panel_popover.grabs_input() {
+                        this.synoik.panel_popover.handle_key(raw, mods, pressed);
+                        if key_repeats {
+                            this.arm_key_repeat(key_code, RepeatKey::Popover { raw, mods: *mods });
+                        }
+                        this.synoik.queue_redraw_all();
+                    } else if pressed {
                         let text = modified
                             .key_char()
                             .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);

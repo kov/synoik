@@ -9488,6 +9488,10 @@ impl Synoik {
     /// fullscreen window. See [`Monitor::panel_hidden_fraction`] for the shape and the GNOME
     /// divergence (GNOME toggles `panelBox.visible` outright, `js/ui/layout.js:983`).
     pub fn panel_hidden_fraction(&self, output: &Output) -> f64 {
+        // The panel over the shield tracks no window: the curtain hides the fullscreen one.
+        if self.screen_is_covered() {
+            return 0.;
+        }
         self.layout
             .monitor_for_output(output)
             .map_or(0., |mon| mon.panel_hidden_fraction())

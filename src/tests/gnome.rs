@@ -41777,3 +41777,52 @@ fn the_greeters_power_off_confirms_like_gnome_session() {
     );
     assert_eq!(f.synoik().end_session.seconds_left(now), Some(60));
 }
+
+/// A menu open over the lock screen takes keys, and nothing past it does: the overlay key does not
+/// reach the overview behind the shield.
+#[test]
+fn a_menu_over_the_shield_keeps_keys_from_the_desktop() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik_state().synoik.lock_screen.settle();
+
+    let x = qs_center_x(&mut f, 1920.);
+    click_panel_at(&mut f, x);
+    assert!(f.synoik().panel_popover.is_open());
+
+    tap(&mut f, KEY_LEFTMETA);
+    assert!(!f.synoik().layout.is_overview_open());
+    assert!(f.synoik().screen_shield.is_active());
+}
+
+/// The lock screen's panel stays down over a fullscreen window: the curtain hides the window, and
+/// GNOME's `unlock-dialog` panel does not track it.
+#[test]
+fn the_lock_screen_panel_ignores_a_fullscreen_window() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.settle();
+    let output = f.synoik_output(1);
+    assert!(!f.synoik().panel_takes_input_on(&output));
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    assert!(f.synoik().panel_takes_input_on(&output));
+    assert!(f.synoik().panel_visible_on(&output));
+}
