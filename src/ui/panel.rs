@@ -839,6 +839,8 @@ pub struct Panel {
     /// the right-anchored dateMenu box, so showing it slides the clock (and everything
     /// left of it) over — see [`MESSAGES_INDICATOR_EXTENT`].
     messages_indicator: bool,
+    /// The session mode's say on which roles exist and how the bar looks.
+    mode: &'static crate::session_mode::SessionMode,
     /// The accessibility state driving the `a11y` right-box indicator's presence
     /// (`ATIndicator._syncMenuVisibility`, `js/ui/status/accessibility.js:90-97`).
     a11y: A11ySettings,
@@ -903,7 +905,23 @@ impl Panel {
             fills,
             cache: RefCell::new(HashMap::new()),
             backdrop: FramebufferEffect::new(),
+            mode: &crate::session_mode::USER,
         }
+    }
+
+    /// Show what `mode` shows (`Panel._updatePanel`, `js/ui/panel.js:740-760`). Returns whether
+    /// it changed, so the caller can queue a redraw.
+    pub fn set_mode(&mut self, mode: &'static crate::session_mode::SessionMode) -> bool {
+        if *self.mode == *mode {
+            return false;
+        }
+        self.mode = mode;
+        self.clear_caches();
+        true
+    }
+
+    fn shows(&self, role: &str) -> bool {
+        self.mode.shows_panel_role(role)
     }
 
     /// Drop every output's cached chrome. See [`Self::cache`].
@@ -1210,10 +1228,12 @@ impl Panel {
         ws: WorkspaceState,
     ) -> Option<Rectangle<f64, Logical>> {
         match role {
-            ROLE_ACTIVITIES => Some(self.activities_rect(ws)),
+            ROLE_ACTIVITIES => self
+                .shows(ROLE_ACTIVITIES)
+                .then(|| self.activities_rect(ws)),
             // The dateMenu's right-box slot spans the messages dot too, but only the
             // `.clock` wears the pill (`js/ui/dateMenu.js:880-886`).
-            ROLE_DATE_MENU => Some(self.date_menu_rect(output_width)),
+            ROLE_DATE_MENU => self.date_menu_rect(output_width),
             // quickSettings (always present) and keyboard (present with >1 layout) both
             // live in the right box, so their geometry comes from the same folder.
             _ => self.right_box_rect(role, output_width),
@@ -1277,9 +1297,9 @@ impl Panel {
     /// same fold that places quickSettings places the clock. This is the whole button:
     /// what it draws, what wears the pill, and what a click hits, dot or no dot.
     /// `output_width` is the output's logical width.
-    pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+    /// `None` in a mode without a date menu (the lock screen's panel, `sessionMode.js:65-77`).
+    pub fn date_menu_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
         self.right_box_rect(ROLE_DATE_MENU, output_width)
-            .expect("the dateMenu is always present in the right box")
     }
 
     /// The messages-indicator dot's rect (logical), or `None` when hidden: the 16px icon
@@ -1294,7 +1314,7 @@ impl Panel {
         if !self.messages_indicator {
             return None;
         }
-        let clock = self.date_menu_rect(output_width);
+        let clock = self.date_menu_rect(output_width)?;
         let right = clock.loc.x + clock.size.w;
         Some(Rectangle::new(
             Point::from((
@@ -1423,7 +1443,10 @@ impl Panel {
     /// stepping the focus past an icon must never activate it. They belong here once an
     /// indicator's menu can be opened without going through its click.
     pub fn menu_roles(&self, output_width: f64) -> Vec<(&'static str, Rectangle<f64, Logical>)> {
-        let mut out = vec![(ROLE_DATE_MENU, self.date_menu_rect(output_width))];
+        let mut out = Vec::new();
+        if let Some(rect) = self.date_menu_rect(output_width) {
+            out.push((ROLE_DATE_MENU, rect));
+        }
         if let Some(rect) = self.a11y_rect(output_width) {
             out.push((ROLE_A11Y, rect));
         }
@@ -1455,6 +1478,9 @@ impl Panel {
     /// (quickSettings is always present, the others come and go). The single source of
     /// truth for right-box presence, folded by [`Self::right_box_rect`] into placement.
     fn right_box_role_width(&self, role: &str) -> f64 {
+        if !self.shows(role) {
+            return 0.;
+        }
         match role {
             ROLE_QUICK_SETTINGS => {
                 qs_indicator_width(self.toggles, &self.system_status, self.audio, self.mic)
@@ -1519,11 +1545,14 @@ impl Panel {
     /// (deferred) extension host. `output_width` is the output's logical width, used
     /// to place the right-anchored box (the status indicators and, past them, the clock).
     pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
-        let mut items = vec![PanelItem {
-            role: ROLE_ACTIVITIES,
-            r#box: PanelBox::Left,
-            rect: self.activities_rect(ws),
-        }];
+        let mut items = Vec::new();
+        if self.shows(ROLE_ACTIVITIES) {
+            items.push(PanelItem {
+                role: ROLE_ACTIVITIES,
+                r#box: PanelBox::Left,
+                rect: self.activities_rect(ws),
+            });
+        }
         // The right box, in `sessionMode.js:99` order plus our trailing dateMenu — each
         // role present only when it has a rect (screenRecording comes and goes with the
         // recording, like GNOME hiding the actor). A role's rect is its whole slot, so
@@ -1572,7 +1601,7 @@ impl Panel {
         output_width: f64,
         ws: WorkspaceState,
     ) -> Option<&'static str> {
-        if self.activities_rect(ws).contains(pos) {
+        if self.shows(ROLE_ACTIVITIES) && self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
         } else {
             // Every role's slot is its clickable extent, the dateMenu's included: its
@@ -1748,22 +1777,26 @@ impl Panel {
         // The recording label is why all three moved rather than just the clock: it is an `M:SS`
         // elapsed timer, so an active recording re-baked the full bar *every second*. Splitting
         // the clock alone would have left the same bug with a rarer trigger.
-        let labels = [(
-            LabelSlot::Clock,
-            self.clock_text.as_str(),
-            self.date_menu_rect(width).loc.x + clock_h_padding(),
-        )]
-        .into_iter()
-        .chain(
-            recording_label
-                .as_ref()
-                .map(|(s, x)| (LabelSlot::Recording, s.as_str(), *x)),
-        )
-        .chain(
-            keyboard_label
-                .as_ref()
-                .map(|(s, x)| (LabelSlot::Keyboard, s.as_str(), *x)),
-        );
+        let labels = self
+            .date_menu_rect(width)
+            .map(|clock| {
+                (
+                    LabelSlot::Clock,
+                    self.clock_text.as_str(),
+                    clock.loc.x + clock_h_padding(),
+                )
+            })
+            .into_iter()
+            .chain(
+                recording_label
+                    .as_ref()
+                    .map(|(s, x)| (LabelSlot::Recording, s.as_str(), *x)),
+            )
+            .chain(
+                keyboard_label
+                    .as_ref()
+                    .map(|(s, x)| (LabelSlot::Keyboard, s.as_str(), *x)),
+            );
         for (slot, text, x) in labels {
             match label_element(renderer, cache, scale, scale_key, slot, text, x) {
                 Ok(element) => elements.push(element),
@@ -1777,7 +1810,11 @@ impl Panel {
         // The workspace dots, over the pills and the background but under nothing they
         // overlap (the clock and labels in the chrome sit elsewhere in the bar). One
         // element each, drawn straight into the frame — see [`workspace_dots`].
-        let dots = workspace_dots(ws.count, position);
+        let dots = if self.shows(ROLE_ACTIVITIES) {
+            workspace_dots(ws.count, position)
+        } else {
+            Vec::new()
+        };
         cache.dots.resize_with(dots.len(), RoundedSolidBuffer::new);
         for (buffer, (rect, radius, color)) in cache.dots.iter_mut().zip(&dots) {
             buffer.update(rect.size, *radius, *color);
@@ -1805,7 +1842,13 @@ impl Panel {
         // The bar background wash, under everything pushed above (this list is front-to-back).
         // Its alpha is the only thing the overview animates, which is exactly why it is not baked
         // into the chrome.
-        let bg = bar_bg(overview_fade);
+        // `.unlock-screen` / `.login-screen`: no background at all, and so nothing to blur.
+        let transparent = self.mode.panel_style == crate::session_mode::PanelStyle::Transparent;
+        let bg = if transparent {
+            [0.; 4]
+        } else {
+            bar_bg(overview_fade)
+        };
         cache
             .bg
             .update(Size::from((width, panel_height())), Color32F::from(bg));
@@ -1827,6 +1870,9 @@ impl Panel {
         // a neutral pass has the property that blurring a flat colour returns that same colour —
         // which is what keeps a wallpaper-less session (and the render corpus) showing the panel
         // over exactly the fill that is behind it.
+        if transparent {
+            return elements;
+        }
         let geometry = Rectangle::new(Point::from((0., 0.)), Size::from((width, panel_height())));
         elements.push(PanelElement::Backdrop(self.backdrop.render(
             None,
@@ -3050,7 +3096,7 @@ mod tests {
         // Hidden by default: no dot rect, and the button owns the output's right corner.
         assert!(!panel.messages_indicator_visible());
         assert!(panel.messages_indicator_rect(ow).is_none());
-        let clock = panel.date_menu_rect(ow);
+        let clock = panel.date_menu_rect(ow).unwrap();
         let qs = panel.quick_settings_rect(ow);
         assert_eq!(
             clock.loc.x + clock.size.w,
@@ -3065,7 +3111,7 @@ mod tests {
 
         // Nothing moved — not the button, not the cluster left of it.
         assert_eq!(
-            panel.date_menu_rect(ow),
+            panel.date_menu_rect(ow).unwrap(),
             clock,
             "the clock button must not move"
         );

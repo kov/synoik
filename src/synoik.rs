@@ -436,6 +436,9 @@ pub struct Synoik {
 
     /// Whether synoik was run with `--session`
     pub is_session_instance: bool,
+    /// `synoik --greeter`: the login screen's session, in gnome-shell's `gdm` mode
+    /// (`docs/fork/greeter.md` §4).
+    pub greeter: bool,
 
     /// Name of the Wayland socket.
     ///
@@ -2793,7 +2796,9 @@ impl State {
     /// open and never on close (`js/ui/messageList.js:1193-1199`).
     pub fn toggle_date_menu(&mut self, output: Output) {
         let output_w = output_size(&output).w;
-        let anchor = self.synoik.panel.date_menu_rect(output_w);
+        let Some(anchor) = self.synoik.panel.date_menu_rect(output_w) else {
+            return;
+        };
         let cal = self.synoik.gnome_settings.calendar;
         let accent = self.synoik.gnome_settings.accent_color;
         let now = self.synoik.clock.now_unadjusted();
@@ -2864,6 +2869,7 @@ impl State {
             source_list,
             brightness,
             accent,
+            self.synoik.session_mode(),
         );
         self.synoik.queue_redraw_all();
     }
@@ -6883,6 +6889,7 @@ impl State {
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
+        self.synoik.sync_session_mode();
         self.synoik.sync_sleep_inhibitor();
     }
 
@@ -8278,6 +8285,7 @@ impl Synoik {
             socket_name,
             display_handle,
             is_session_instance,
+            greeter: false,
             start_time: Instant::now(),
             is_at_startup: true,
             clock: animation_clock.clone(),
@@ -9957,7 +9965,27 @@ impl Synoik {
     /// false`) reads as unlocked while still covering everything. Anything that must not draw over
     /// a covered screen wants this one.
     pub fn screen_is_covered(&self) -> bool {
-        self.screen_shield.is_active() || self.is_locked()
+        self.greeter || self.screen_shield.is_active() || self.is_locked()
+    }
+
+    /// Whether the shield's chrome owns the screen and its input: the lock screen while it is
+    /// down, and the greeter always.
+    pub fn shield_is_up(&self) -> bool {
+        self.greeter || self.screen_shield.is_active()
+    }
+
+    /// The session mode in force (`Main.sessionMode`): what the shell may show right now.
+    pub fn session_mode(&self) -> &'static crate::session_mode::SessionMode {
+        crate::session_mode::current(self.greeter, self.screen_is_covered())
+    }
+
+    /// Bring what follows the session mode up to date with it — today the panel's roles and look.
+    pub fn sync_session_mode(&mut self) {
+        if self.panel.set_mode(self.session_mode()) {
+            // A menu opened in the old mode offers what that mode allowed.
+            self.panel_popover.close_immediately();
+            self.queue_redraw_all();
+        }
     }
 
     /// Whether the polkit dialog is on screen. Always false without `dbus`, where there is no
@@ -11745,6 +11773,59 @@ impl Synoik {
         self.render_inner(ctx, output, include_pointer, push);
     }
 
+    /// The top panel and its open popover, as the frame draws them: over the desktop in a user
+    /// session, over the shield on the lock screen and the greeter (`sessionMode.js:50-77`).
+    fn push_panel(
+        &self,
+        ctx: &mut RenderCtx,
+        output: &Output,
+        ws: crate::ui::panel::WorkspaceState,
+        ws_position: f64,
+        overview_fade: f64,
+        push: &mut dyn FnMut(OutputRenderElements),
+    ) {
+        let panel_hidden = self.panel_hidden_fraction(output);
+        if panel_hidden < 1. {
+            // One rounding, in physical pixels: rounding the logical offset and then
+            // converting would land the bar and its contents on different subpixels.
+            let scale = output.current_scale().fractional_scale();
+            let panel_slide: Point<i32, Physical> =
+                Point::from((0., -(panel_hidden * crate::ui::panel::panel_height())))
+                    .to_physical_precise_round(scale);
+            for element in self.panel.render(
+                ctx.renderer,
+                output,
+                ws,
+                ws_position,
+                overview_fade,
+                crate::render_helpers::icon::DrawCaches {
+                    icons: &self.icon_cache,
+                    images: &self.image_cache,
+                },
+            ) {
+                push(
+                    RelocateRenderElement::from_element(element, panel_slide, Relocate::Relative)
+                        .into(),
+                );
+            }
+            // A panel popover (dateMenu calendar, quick settings, …) sits above the
+            // bar; the quick-settings menu composites several elements (chrome + icons).
+            // It rides the same slide so a menu caught by a switch travels with its button.
+            for element in self.panel_popover.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.app_icon_cache,
+                &self.image_cache,
+                output,
+            ) {
+                push(
+                    RelocateRenderElement::from_element(element, panel_slide, Relocate::Relative)
+                        .into(),
+                );
+            }
+        }
+    }
+
     fn render_inner(
         &self,
         mut ctx: RenderCtx,
@@ -11917,9 +11998,20 @@ impl Synoik {
         // stronger claim on the screen and there is no sense in drawing both — but above
         // everything else, because the whole point is that the desktop is not visible.
         let now = self.shield_now();
+        let mut panel_drawn = false;
         // Not `is_active`: the curtain outlives the shield by the length of its slide away, and
         // gating the draw on the model would turn unlocking into a hard cut.
         if self.lock_screen.is_covering(now) {
+            // The lock screen keeps a panel of its own over the shield (`unlock-dialog`,
+            // `sessionMode.js:65-77`), on top of the curtain as it slides in. The mode pops the
+            // moment the shield goes (`screenShield.js:525-526`), so a curtain sliding away has the
+            // user's panel back, drawn where it always is.
+            if self.screen_is_covered() {
+                let ws = self.workspace_state_for(output);
+                let ws_position = self.workspace_position_for(output);
+                self.push_panel(&mut ctx, output, ws, ws_position, 0., push);
+                panel_drawn = true;
+            }
             let size = output_size(output);
             // `WallClock` is wall time, not the monotonic clock the fade runs on.
             let epoch = std::time::SystemTime::now()
@@ -12253,53 +12345,8 @@ impl Synoik {
             // Slid up off the top edge over a fullscreen window, and with it its popovers — see
             // `panel_hidden_fraction`. The OSD above is deliberately outside this: it is not
             // `trackFullscreen` chrome and shows over fullscreen windows in GNOME too.
-            let panel_hidden = self.panel_hidden_fraction(output);
-            if panel_hidden < 1. {
-                // One rounding, in physical pixels: rounding the logical offset and then
-                // converting would land the bar and its contents on different subpixels.
-                let scale = output.current_scale().fractional_scale();
-                let panel_slide: Point<i32, Physical> =
-                    Point::from((0., -(panel_hidden * crate::ui::panel::panel_height())))
-                        .to_physical_precise_round(scale);
-                for element in self.panel.render(
-                    ctx.renderer,
-                    output,
-                    ws,
-                    ws_position,
-                    overview_fade,
-                    crate::render_helpers::icon::DrawCaches {
-                        icons: &self.icon_cache,
-                        images: &self.image_cache,
-                    },
-                ) {
-                    push(
-                        RelocateRenderElement::from_element(
-                            element,
-                            panel_slide,
-                            Relocate::Relative,
-                        )
-                        .into(),
-                    );
-                }
-                // A panel popover (dateMenu calendar, quick settings, …) sits above the
-                // bar; the quick-settings menu composites several elements (chrome + icons).
-                // It rides the same slide so a menu caught by a switch travels with its button.
-                for element in self.panel_popover.render(
-                    ctx.renderer,
-                    &self.icon_cache,
-                    &self.app_icon_cache,
-                    &self.image_cache,
-                    output,
-                ) {
-                    push(
-                        RelocateRenderElement::from_element(
-                            element,
-                            panel_slide,
-                            Relocate::Relative,
-                        )
-                        .into(),
-                    );
-                }
+            if !panel_drawn {
+                self.push_panel(&mut ctx, output, ws, ws_position, overview_fade, push);
             }
             // The notification banner slides out from under the bar (pushed after
             // the panel = below it in z, like gnome-shell's tray behind the panel).

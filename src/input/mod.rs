@@ -1082,7 +1082,7 @@ impl State {
                 // behind it may see a key. This lives *inside* the keyboard filter rather than
                 // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
                 // never register and the unlock entry could not type a capital letter.
-                if this.synoik.screen_shield.is_active() {
+                if this.synoik.shield_is_up() && !this.synoik.panel_popover.grabs_input() {
                     // ...with the same exceptions the `ext-session-lock` path already makes.
                     // **Ctrl+Alt+F<n> above all**: a VT switch is the escape hatch from a lock
                     // screen that has gone wrong, and swallowing it means a compositor bug becomes
@@ -1995,7 +1995,7 @@ impl State {
         // The caps-lock warning, for the same reason and read the same way: at the *press* of
         // Caps Lock the event's mask still describes the lock state the key is about to change, so
         // trusting it means the warning never goes away again. Sampled live after `input()`.
-        if self.synoik.screen_shield.is_active() && self.sync_caps_warning() {
+        if self.synoik.shield_is_up() && self.sync_caps_warning() {
             self.synoik.queue_redraw_all();
         }
 
@@ -2251,7 +2251,7 @@ impl State {
     fn shell_entry_takes_keys(&self, entry: crate::input_method::ShellEntry) -> bool {
         use crate::input_method::ShellEntry;
         match entry {
-            ShellEntry::Shield => self.synoik.screen_shield.is_active(),
+            ShellEntry::Shield => self.synoik.shield_is_up(),
             ShellEntry::Polkit => self.synoik.polkit_is_open(),
             ShellEntry::NetworkSecret => self.synoik.network_secret_is_open(),
             ShellEntry::RunDialog => self.synoik.run_dialog.is_open(),
@@ -2461,6 +2461,23 @@ impl State {
                 .panel
                 .set_quick_toggles(state.synoik.gnome_settings.quick_toggles);
         };
+
+        // Behind the menus' own restrictions, the one that matters: nothing reached from a menu
+        // over the lock screen or the greeter starts an app, a command or the screenshot UI.
+        // Settings' 802.1x hand-off is the one row GNOME leaves there (`network.js:943-952`); it
+        // goes nowhere useful on the greeter, and behind the shield it would open a window.
+        let mode = self.synoik.session_mode();
+        if (mode.is_locked || mode.is_greeter)
+            && matches!(
+                action,
+                PopoverAction::LaunchSettingsPanel { .. }
+                    | PopoverAction::ActivateApp(_)
+                    | PopoverAction::Spawn(_)
+                    | PopoverAction::Screenshot
+            )
+        {
+            return;
+        }
 
         match action {
             PopoverAction::Consumed => {}
@@ -6037,6 +6054,85 @@ impl State {
         }
     }
 
+    /// A press while a panel popover grabs the pointer: a click inside routes to it (a
+    /// quick-settings tile or button returns an action to apply), anywhere else dismisses it.
+    fn popover_click(&mut self, under: Option<(Output, Point<f64, Logical>)>, button_code: u32) {
+        self.synoik.suppressed_buttons.insert(button_code);
+        match under {
+            Some((output, pos)) => {
+                if let Some(action) = self.synoik.panel_popover.pointer_click(&output, pos) {
+                    self.apply_popover_action(action);
+                }
+            }
+            None => self.synoik.panel_popover.close(),
+        }
+        // A click may have paged the calendar month (nav arrows) —
+        // reload the events for the now-shown grid, like GNOME's
+        // per-rebuild `requestRange` (`js/ui/calendar.js:748`).
+        self.synoik.sync_calendar_range();
+        self.synoik.refresh_popover_calendar_events();
+        self.synoik.refresh_popover_world_clocks();
+        self.synoik.queue_redraw_all();
+    }
+
+    /// A left press on a panel button: the workspace indicator toggles the overview (the mouse
+    /// counterpart of the Super-tap); the clock, quick settings, keyboard and a11y open their
+    /// menus. Returns whether the press was the panel's.
+    fn panel_button_click(
+        &mut self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+        button_code: u32,
+    ) -> bool {
+        let output = output.clone();
+        let ws = self.synoik.workspace_state_for(&output);
+        let output_w = output_size(&output).w;
+        match self.synoik.panel.hit_test(pos, output_w, ws) {
+            Some(crate::ui::panel::ROLE_ACTIVITIES) => {
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.do_action(Action::ToggleOverview, false);
+                true
+            }
+            Some(role @ crate::ui::panel::ROLE_DATE_MENU)
+            | Some(role @ crate::ui::panel::ROLE_QUICK_SETTINGS) => {
+                // Anchored by the role's own rect inside `open_panel_menu`; these
+                // two ignore the anchor passed here.
+                self.open_panel_menu(&output, role, Rectangle::default());
+                self.synoik.suppressed_buttons.insert(button_code);
+                true
+            }
+            Some(crate::ui::panel::ROLE_SCREEN_RECORDING) => {
+                // Recognize on press (GNOME's `ScreenRecordingIndicator`):
+                // clicking the indicator stops the recording(s).
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.stop_screen_recordings();
+                self.synoik.queue_redraw_all();
+                true
+            }
+            Some(role @ crate::ui::panel::ROLE_KEYBOARD) => {
+                // Open the input-source (keyboard-layout) menu, anchored on the
+                // indicator (gnome-shell's `InputSourceIndicator` popup).
+                if let Some(anchor) = self.synoik.panel.keyboard_rect(output_w) {
+                    self.open_panel_menu(&output, role, anchor);
+                }
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.synoik.queue_redraw_all();
+                true
+            }
+            Some(role @ crate::ui::panel::ROLE_A11Y) => {
+                // Open the accessibility menu, anchored on the indicator
+                // (gnome-shell's `ATIndicator`).
+                if let Some(anchor) = self.synoik.panel.a11y_rect(output_w) {
+                    self.open_panel_menu(&output, role, anchor);
+                }
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.synoik.queue_redraw_all();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Light up the panel button under the pointer (gnome-shell `panel_button:hover`).
     /// `pos` is the global-space pointer location. Off any button — or outside GNOME
     /// mode — clears the hover. Redraws only when the hovered button actually changed.
@@ -6054,7 +6150,14 @@ impl State {
         // The shield is over everything, so while it is down the only thing that tracks `:hover` is
         // its own chrome. Falling through to the panel and overview below would light up buttons
         // nobody can see, and redraw for each one.
-        if self.synoik.screen_shield.is_active() {
+        if self.synoik.shield_is_up() {
+            let role = self.synoik.output_under(pos).and_then(|(output, p)| {
+                let ws = self.synoik.workspace_state_for(output);
+                self.synoik.panel.hit_test(p, output_size(output).w, ws)
+            });
+            if self.synoik.panel.set_hovered_role(role) {
+                self.synoik.queue_redraw_all();
+            }
             let now = crate::utils::get_monotonic_time();
             let on_button = self.synoik.switch_user_reactive(now)
                 && self
@@ -8795,9 +8898,22 @@ impl State {
         // A click while the shield is down raises it. Both edges are swallowed, not just the
         // press: leaking the release alone would give whatever is underneath a button-up it never
         // saw pressed.
-        if self.synoik.screen_shield.is_active() {
+        if self.synoik.shield_is_up() {
             if button_state == ButtonState::Pressed {
                 let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+                let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
+                // The panel over the shield (`unlock-dialog`, `gdm`) and its menus come first.
+                if self.synoik.panel_popover.grabs_input() {
+                    self.popover_click(under, button_code);
+                    return;
+                }
+                if button == Some(MouseButton::Left) {
+                    if let Some((output, p)) = under {
+                        if self.panel_button_click(&output, p, button_code) {
+                            return;
+                        }
+                    }
+                }
                 self.on_shield_click(pos);
             }
             return;
@@ -8996,24 +9112,7 @@ impl State {
                 // click inside routes to it (a quick-settings tile/button returns an action we
                 // apply), anywhere else dismisses it. Either way the click is consumed.
                 if self.synoik.panel_popover.grabs_input() {
-                    self.synoik.suppressed_buttons.insert(button_code);
-                    match under {
-                        Some((output, pos)) => {
-                            if let Some(action) =
-                                self.synoik.panel_popover.pointer_click(&output, pos)
-                            {
-                                self.apply_popover_action(action);
-                            }
-                        }
-                        None => self.synoik.panel_popover.close(),
-                    }
-                    // A click may have paged the calendar month (nav arrows) —
-                    // reload the events for the now-shown grid, like GNOME's
-                    // per-rebuild `requestRange` (`js/ui/calendar.js:748`).
-                    self.synoik.sync_calendar_range();
-                    self.synoik.refresh_popover_calendar_events();
-                    self.synoik.refresh_popover_world_clocks();
-                    self.synoik.queue_redraw_all();
+                    self.popover_click(under, button_code);
                     return;
                 }
 
@@ -9137,51 +9236,8 @@ impl State {
                 // (the mouse counterpart of the Super-tap); the clock opens the calendar popover.
                 if button == Some(MouseButton::Left) && panel_takes_input {
                     if let Some((output, pos)) = under {
-                        let ws = self.synoik.workspace_state_for(&output);
-                        let output_w = output_size(&output).w;
-                        match self.synoik.panel.hit_test(pos, output_w, ws) {
-                            Some(crate::ui::panel::ROLE_ACTIVITIES) => {
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                self.do_action(Action::ToggleOverview, false);
-                                return;
-                            }
-                            Some(role @ crate::ui::panel::ROLE_DATE_MENU)
-                            | Some(role @ crate::ui::panel::ROLE_QUICK_SETTINGS) => {
-                                // Anchored by the role's own rect inside `open_panel_menu`; these
-                                // two ignore the anchor passed here.
-                                self.open_panel_menu(&output, role, Rectangle::default());
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                return;
-                            }
-                            Some(crate::ui::panel::ROLE_SCREEN_RECORDING) => {
-                                // Recognize on press (GNOME's `ScreenRecordingIndicator`):
-                                // clicking the indicator stops the recording(s).
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                self.stop_screen_recordings();
-                                self.synoik.queue_redraw_all();
-                                return;
-                            }
-                            Some(role @ crate::ui::panel::ROLE_KEYBOARD) => {
-                                // Open the input-source (keyboard-layout) menu, anchored on the
-                                // indicator (gnome-shell's `InputSourceIndicator` popup).
-                                if let Some(anchor) = self.synoik.panel.keyboard_rect(output_w) {
-                                    self.open_panel_menu(&output, role, anchor);
-                                }
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                self.synoik.queue_redraw_all();
-                                return;
-                            }
-                            Some(role @ crate::ui::panel::ROLE_A11Y) => {
-                                // Open the accessibility menu, anchored on the indicator
-                                // (gnome-shell's `ATIndicator`).
-                                if let Some(anchor) = self.synoik.panel.a11y_rect(output_w) {
-                                    self.open_panel_menu(&output, role, anchor);
-                                }
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                self.synoik.queue_redraw_all();
-                                return;
-                            }
-                            _ => {}
+                        if self.panel_button_click(&output, pos, button_code) {
+                            return;
                         }
                     }
                 }

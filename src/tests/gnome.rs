@@ -11492,7 +11492,7 @@ pub(super) fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
 /// on the label's width and on whether the messages dot is showing, so a literal
 /// screen-centre would just click the wallpaper.
 fn clock_center_x(f: &mut Fixture, output_w: f64) -> f64 {
-    let rect = f.synoik().panel.date_menu_rect(output_w);
+    let rect = f.synoik().panel.date_menu_rect(output_w).unwrap();
     rect.loc.x + rect.size.w / 2.
 }
 
@@ -13921,7 +13921,7 @@ fn panel_clock_label_sits_24px_inside_its_button() {
     );
     panel.update_clock_at(0);
 
-    let rect = panel.date_menu_rect(2560.);
+    let rect = panel.date_menu_rect(2560.).unwrap();
     let text_w = synoik_vk::text::measure_line_width_weighted(
         panel.clock_text(),
         crate::ui::pt_to_px(11.) as f32,
@@ -14092,7 +14092,7 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     f.add_output(1, (1920, 1080));
     f.synoik().update_render_elements(None);
 
-    let clock = f.synoik().panel.date_menu_rect(1920.);
+    let clock = f.synoik().panel.date_menu_rect(1920.).unwrap();
     let qs = f.synoik().panel.quick_settings_rect(1920.);
     assert_eq!(
         clock.loc.x + clock.size.w,
@@ -41668,4 +41668,86 @@ fn a_popup_flips_when_that_fits_and_otherwise_slides() {
         crate::handlers::place_popup(menu(600, ConstraintAdjustment::empty()), work_area),
         Rectangle::new((320, 640).into(), (200, 300).into())
     );
+}
+
+fn click_panel_at(f: &mut Fixture, x: f64) {
+    pointer_motion_to(f, x, 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.turn();
+}
+
+/// The lock screen keeps a panel over the shield, in `unlock-dialog`'s shape
+/// (`sessionMode.js:65-77`): no Activities, no clock (the shield shows its own), quick settings
+/// still there and still opening. Unlocking brings the user's panel back.
+#[test]
+fn the_lock_screen_panel_is_the_unlock_dialog_modes() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::ui::panel::{ROLE_ACTIVITIES, ROLE_DATE_MENU, ROLE_QUICK_SETTINGS};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    let roles = |f: &mut Fixture| -> Vec<&'static str> {
+        let output = f.synoik_output(1);
+        let ws = f.synoik().workspace_state_for(&output);
+        f.synoik()
+            .panel
+            .items(1920., ws)
+            .into_iter()
+            .map(|i| i.role)
+            .collect()
+    };
+    assert!(roles(&mut f).contains(&ROLE_ACTIVITIES));
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert_eq!(f.synoik().session_mode().name, "unlock-dialog");
+    let locked = roles(&mut f);
+    assert!(!locked.contains(&ROLE_ACTIVITIES));
+    assert!(!locked.contains(&ROLE_DATE_MENU));
+    assert!(locked.contains(&ROLE_QUICK_SETTINGS));
+
+    let x = qs_center_x(&mut f, 1920.);
+    click_panel_at(&mut f, x);
+    assert_eq!(
+        f.synoik().panel_popover.open_role(),
+        Some(ROLE_QUICK_SETTINGS),
+        "quick settings open over the shield"
+    );
+    assert!(f.synoik().screen_shield.is_locked(), "and the lock holds");
+}
+
+/// The greeter is `gdm` mode (`sessionMode.js:50-63`): the screen counts as covered, the panel
+/// carries the clock and quick settings but no Activities, and a click on the clock opens the
+/// date menu rather than reaching anything below.
+#[test]
+fn the_greeter_is_gdm_mode() {
+    use crate::ui::panel::{ROLE_ACTIVITIES, ROLE_DATE_MENU, ROLE_QUICK_SETTINGS};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().greeter = true;
+    f.synoik().sync_session_mode();
+
+    assert_eq!(f.synoik().session_mode().name, "gdm");
+    assert!(f.synoik().screen_is_covered());
+    let output = f.synoik_output(1);
+    let ws = f.synoik().workspace_state_for(&output);
+    let roles: Vec<_> = f
+        .synoik()
+        .panel
+        .items(1920., ws)
+        .into_iter()
+        .map(|i| i.role)
+        .collect();
+    assert!(!roles.contains(&ROLE_ACTIVITIES));
+    assert!(roles.contains(&ROLE_DATE_MENU));
+    assert!(roles.contains(&ROLE_QUICK_SETTINGS));
+
+    let x = clock_center_x(&mut f, 1920.);
+    click_panel_at(&mut f, x);
+    assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_DATE_MENU));
 }

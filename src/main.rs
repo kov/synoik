@@ -116,8 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut cli = Cli::parse();
-    // The greeter is a session of its own (its user's manager and bus); what it shows differently
-    // is greeter.md §4, not yet built.
+    // The greeter is a session of its own (its user's manager and bus), in gnome-shell's `gdm`
+    // session mode (greeter.md §4).
     cli.session |= cli.greeter;
 
     if cli.session {
@@ -260,6 +260,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.session,
     )
     .unwrap();
+    state.synoik.greeter = cli.greeter;
+    state.synoik.sync_session_mode();
 
     if cli.headless {
         // A renderer lets clients actually draw (and screencasting work), but

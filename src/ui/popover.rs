@@ -1102,6 +1102,7 @@ impl PanelPopover {
         source_list: crate::audio::SourceList,
         brightness: crate::brightness::BrightnessView,
         accent: [u8; 3],
+        mode: &'static crate::session_mode::SessionMode,
     ) {
         if self.is_showing::<QuickSettingsTag>() {
             self.close();
@@ -1129,6 +1130,7 @@ impl PanelPopover {
             accent,
         );
         qs.set_network_state(net);
+        qs.set_session_mode(mode);
         self.content = Some(PopoverContent::QuickSettings(Box::new(qs)));
         self.anim = Some(self.make_anim(0., 1.));
     }

@@ -3333,7 +3333,11 @@ fn vulkan_renders_the_calendar_popover() {
 
     // Open the calendar popover under the clock.
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -3399,7 +3403,11 @@ fn vulkan_renders_the_message_list_card() {
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         let card = crate::ui::notification_card::CardContent {
@@ -3509,7 +3517,11 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -3625,7 +3637,11 @@ fn vulkan_renders_the_expanded_card_body() {
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         let card = crate::ui::notification_card::CardContent {
@@ -3768,7 +3784,11 @@ fn vulkan_renders_a_grouped_stack_and_header() {
         time_text: "Just now".to_owned(),
     };
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -3925,7 +3945,11 @@ fn vulkan_renders_the_scrolled_message_list() {
     let mut groups = vec![group(1, vec![card(1), card(2), card(3)])];
     groups.extend((4..=13).map(|id| group(id, vec![card(id)])));
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -4059,6 +4083,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             source_list,
             crate::brightness::BrightnessView::default(),
             accent,
+            &crate::session_mode::USER,
         );
     }
     assert!(f.synoik().panel_popover.is_open());
@@ -11094,12 +11119,17 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
         source_list,
         brightness,
         accent,
+        &crate::session_mode::USER,
     );
 }
 
 /// Open the calendar popover on `output`, exactly as the clock does.
 fn open_calendar(f: &mut Fixture, output: &Output) {
-    let anchor = f.synoik().panel.date_menu_rect(output_size(output).w);
+    let anchor = f
+        .synoik()
+        .panel
+        .date_menu_rect(output_size(output).w)
+        .unwrap();
     let cal = f.synoik().gnome_settings.calendar;
     let accent = f.synoik().gnome_settings.accent_color;
     f.synoik().panel_popover.toggle_calendar(
@@ -13016,7 +13046,11 @@ fn vulkan_renders_the_media_card() {
             }),
         });
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -13154,7 +13188,11 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
             }),
         });
     {
-        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let anchor = f
+            .synoik()
+            .panel
+            .date_menu_rect(output_size(&output).w)
+            .unwrap();
         let cal = f.synoik().gnome_settings.calendar;
         let accent = f.synoik().gnome_settings.accent_color;
         f.synoik().panel_popover.toggle_calendar(
@@ -13984,9 +14022,9 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
         .count();
     assert_eq!(transparent, 0, "the shield left transparent pixels");
 
-    // The clock: bright, near-white pixels in the middle band, and none in the top eighth (which
-    // is background only). Both halves matter — the first says the text drew, the second says it
-    // is the text and not a washed-out frame.
+    // The clock: bright, near-white pixels in the middle band, and none between the panel and the
+    // top eighth (which is background only). Both halves matter — the first says the text drew,
+    // the second says it is the text and not a washed-out frame.
     let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
     let bright_in = |y0: i32, y1: i32| {
         (y0..y1)
@@ -13995,8 +14033,16 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
             .count()
     };
     let middle = bright_in(h * 3 / 8, h * 5 / 8);
-    let top = bright_in(0, h / 8);
+    let panel_px = (crate::ui::panel::panel_height() * output.current_scale().fractional_scale())
+        .ceil() as i32;
+    let top = bright_in(panel_px, h / 8);
     assert!(middle > 0, "the lock screen clock did not draw");
+    // `unlock-dialog` keeps a panel over the shield (`sessionMode.js:65-77`): its quick-settings
+    // icons are white on the curtain.
+    assert!(
+        bright_in(0, panel_px) > 0,
+        "the lock screen's panel did not draw over the shield"
+    );
     assert!(
         top == 0,
         "{top} bright px in the top eighth — the curtain is not just its clock"

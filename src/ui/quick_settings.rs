@@ -47,6 +47,7 @@ use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::session_mode::{SessionMode, USER};
 use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, BluetoothRfkill, BluetoothStatus, BtAdapterState,
     PowerProfileStatus,
@@ -1058,7 +1059,26 @@ impl DetailOwner {
     /// rows. MUST match `rows()`'s length + separators (a debug_assert checks it at the draw/hit
     /// sites). `device_count` is ignored by the fixed owners; it's the sink count for Output, the
     /// source count for Input, and the profile count for PowerProfile.
-    fn row_shape(self, device_count: usize) -> Vec<RowSpec> {
+    fn row_shape(self, device_count: usize, mode: &SessionMode) -> Vec<RowSpec> {
+        let mut shape = self.full_row_shape(device_count);
+        if !self.trailing_row_allowed(mode) {
+            shape.pop();
+        }
+        shape
+    }
+
+    /// Whether the card keeps its last row in `mode`: the power menu's is Log Out, hidden on the
+    /// lock screen and the greeter (`systemActions.js:440-452`); every other card but brightness
+    /// ends in a Settings entry point, hidden without `allowSettings` (`popupMenu.js:719-724`).
+    fn trailing_row_allowed(self, mode: &SessionMode) -> bool {
+        match self {
+            DetailOwner::Power => !(mode.is_locked || mode.is_greeter),
+            DetailOwner::Brightness => true,
+            _ => mode.allow_settings,
+        }
+    }
+
+    fn full_row_shape(self, device_count: usize) -> Vec<RowSpec> {
         match self {
             // N rows — or ONE placeholder when there is nothing to list — then the settings row
             // past a separator. Same shape for all three network cards.
@@ -1122,8 +1142,8 @@ impl DetailOwner {
     }
 
     /// The card's logical height: top pad + header + gap + rows + separators + bottom pad.
-    fn detail_height(self, device_count: usize) -> f64 {
-        let shape = self.row_shape(device_count);
+    fn detail_height(self, device_count: usize, mode: &SessionMode) -> f64 {
+        let shape = self.row_shape(device_count, mode);
         let rows = shape.len() as f64;
         let seps = shape.iter().filter(|s| s.separator_before).count() as f64;
         let row_h: f64 = shape.iter().map(|s| s.kind.height()).sum();
@@ -1196,6 +1216,8 @@ fn power_profile_index(net: NetTiles, show_bluetooth: bool) -> usize {
 /// the renderer draws.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
+    /// The session mode, which drops a card's trailing Settings / Log Out row.
+    mode: &'static SessionMode,
     sliders: Sliders,
     expanded: Option<DetailOwner>,
     /// Number of output sinks, input sources, and known power profiles — the state a detail card's
@@ -1271,7 +1293,7 @@ impl Layout {
     /// the container height gnome-shell eases (`QuickSettingsMenu.open`, `quickSettings.js:459`).
     fn detail_block(self) -> Option<(f64, f64)> {
         let owner = self.expanded?;
-        let full = DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner));
+        let full = DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner), self.mode);
         Some((owner.anchor_row_bottom(self), full * self.block_scale))
     }
 
@@ -1677,6 +1699,10 @@ impl SysButton {
 /// The quick-settings menu. Holds its own copy of the toggle states so a click
 /// updates the tile immediately (the write-back round-trips through gsettings).
 pub struct QuickSettings {
+    /// What the session mode lets the menu offer (`js/ui/status/system.js`,
+    /// `js/misc/systemActions.js`): the lock screen and the greeter lose Settings, Lock and Log
+    /// Out.
+    mode: &'static SessionMode,
     toggles: QuickToggles,
     /// The full NetworkManager model behind the Wired / Wi-Fi / VPN tiles and their cards.
     net: crate::network_model::NetworkState,
@@ -1973,6 +1999,7 @@ impl QuickSettings {
         accent: [u8; 3],
     ) -> Self {
         Self {
+            mode: &USER,
             toggles,
             net: crate::network_model::NetworkState::default(),
             airplane,
@@ -2010,6 +2037,36 @@ impl QuickSettings {
         self.battery.is_some()
     }
 
+    pub fn set_session_mode(&mut self, mode: &'static SessionMode) {
+        self.mode = mode;
+    }
+
+    /// The pill opens power settings, so it is only a control where Settings is allowed
+    /// (`PowerToggle._sessionUpdated`, `system.js:65-68`).
+    fn pill_is_reactive(&self) -> bool {
+        self.has_pill() && self.mode.allow_settings
+    }
+
+    /// The system-row buttons the mode shows, each with its rect.
+    ///
+    /// - Screenshot: gnome-shell hides it only on the greeter (`system.js:117`). **Divergence:** we
+    ///   hide it on the lock screen too, because our screenshot UI cannot draw over the shield.
+    /// - Settings: `allowSettings` (`system.js:161-164`).
+    /// - Lock: not when already locked, nor on the greeter (`systemActions.js:352-356`).
+    /// - Power: whenever its menu has a row (`system.js:239-241`).
+    pub(crate) fn sys_buttons(&self) -> Vec<(SysButton, Rectangle<f64, Logical>)> {
+        let restricted = self.mode.is_locked || self.mode.is_greeter;
+        let visible: Vec<SysButton> = SYS_BUTTONS
+            .into_iter()
+            .filter(|b| match b {
+                SysButton::Screenshot | SysButton::Lock => !restricted,
+                SysButton::Settings => self.mode.allow_settings,
+                SysButton::Power => !self.detail_rows(DetailOwner::Power).is_empty(),
+            })
+            .collect();
+        sys_layout(&visible, self.has_pill())
+    }
+
     /// Which slider rows are present: the output slider whenever a sink is bound; the mic slider
     /// only while recording with a bound source (gnome-shell's `_shouldBeVisible`,
     /// `volume.js:429`).
@@ -2038,8 +2095,17 @@ impl QuickSettings {
         self.bt_predicted.unwrap_or(self.bluetooth.state)
     }
 
-    /// The open detail view's rows for `owner`, with every live source threaded in.
+    /// The open detail view's rows for `owner`, with every live source threaded in, less the
+    /// trailing row the session mode forbids ([`DetailOwner::trailing_row_allowed`]).
     fn detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
+        let mut rows = self.unfiltered_detail_rows(owner);
+        if !owner.trailing_row_allowed(self.mode) {
+            rows.pop();
+        }
+        rows
+    }
+
+    fn unfiltered_detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
         owner.rows(
             &self.net,
             AudioDetail {
@@ -2061,6 +2127,7 @@ impl QuickSettings {
     /// the active drag + tile count), the single source of truth every geometry function shares.
     fn layout(&self) -> Layout {
         Layout {
+            mode: self.mode,
             sliders: self.sliders(),
             // The card still on screen wins while it collapses, so the gap it leaves keeps its
             // geometry until the animation has shut it.
@@ -2104,7 +2171,7 @@ impl QuickSettings {
         let layout = self.layout();
         self.expand
             .advance(self.expanded, clock, params, dim_params, |owner| {
-                DETAIL_MARGIN + owner.detail_height(layout.owner_device_count(owner))
+                DETAIL_MARGIN + owner.detail_height(layout.owner_device_count(owner), layout.mode)
             })
     }
 
@@ -2378,11 +2445,11 @@ impl QuickSettings {
     /// bake, which is drawn as if nothing were expanded.
     fn stops_with(&self, layout: Layout) -> Vec<(QsStop, Rectangle<f64, Logical>)> {
         let mut out = Vec::new();
-        if let Some(pill) = pill_rect(self.has_pill()) {
+        if let Some(pill) = pill_rect(self.pill_is_reactive()) {
             out.push((QsStop::Pill, pill));
         }
-        for button in SYS_BUTTONS {
-            out.push((QsStop::Sys(button), sys_rect(button, self.has_pill())));
+        for (button, rect) in self.sys_buttons() {
+            out.push((QsStop::Sys(button), rect));
         }
         for (i, &item) in self.grid().iter().enumerate() {
             out.push((QsStop::Tile(item), tile_body_rect(i, item, layout)));
@@ -2597,11 +2664,11 @@ impl QuickSettings {
                 return Some(QsStop::Tile(item));
             }
         }
-        if pill_rect(self.has_pill()).is_some_and(|r| r.contains(pos)) {
+        if pill_rect(self.pill_is_reactive()).is_some_and(|r| r.contains(pos)) {
             return Some(QsStop::Pill);
         }
-        for button in SYS_BUTTONS {
-            if sys_rect(button, self.has_pill()).contains(pos) {
+        for (button, rect) in self.sys_buttons() {
+            if rect.contains(pos) {
                 return Some(QsStop::Sys(button));
             }
         }
@@ -2891,11 +2958,11 @@ impl QuickSettings {
                 return Some(QsHover::Tile(i));
             }
         }
-        if pill_rect(self.has_pill()).is_some_and(|p| p.contains(pos)) {
+        if pill_rect(self.pill_is_reactive()).is_some_and(|p| p.contains(pos)) {
             return Some(QsHover::Pill);
         }
-        for button in SYS_BUTTONS {
-            if sys_rect(button, self.has_pill()).contains(pos) {
+        for (button, rect) in self.sys_buttons() {
+            if rect.contains(pos) {
                 return Some(QsHover::Sys(button));
             }
         }
@@ -3255,8 +3322,7 @@ impl QuickSettings {
         }
 
         // System-row icons.
-        for button in SYS_BUTTONS {
-            let rect = sys_rect(button, self.has_pill());
+        for (button, rect) in self.sys_buttons() {
             let center =
                 Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
             if let Some(el) = widget::icon_element(
@@ -3518,7 +3584,7 @@ impl QuickSettings {
             // (count + separator positions) so the geometry can't drift from what's drawn.
             debug_assert_eq!(
                 rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
-                owner.row_shape(self.layout().owner_device_count(owner)),
+                owner.row_shape(self.layout().owner_device_count(owner), self.mode),
                 "rows() must match row_shape() for correct card sizing"
             );
             let row_runs = rows
@@ -3611,7 +3677,7 @@ impl QuickSettings {
 
             // The group-separator rules (`.popup-separator-menu-item`): one 1px rule per row
             // that opens a new group (the shutdown menu's machine-power vs session split).
-            let sep_shape = owner.row_shape(layout.owner_device_count(owner));
+            let sep_shape = owner.row_shape(layout.owner_device_count(owner), layout.mode);
             for (k, row_run) in row_runs.iter().enumerate() {
                 // Card-local, like `card`: the row rects come out in menu coordinates.
                 let Some(mut rrect) = detail_row_rect(k, layout) else {
@@ -3897,8 +3963,7 @@ impl QuickSettings {
             // $forced_circular_radius`). SYS_HIT (40px) is the 16px icon plus the button's
             // 12px padding on each side — i.e. the button diameter. The icons composite on
             // top afterwards, like the battery pill above.
-            for button in SYS_BUTTONS {
-                let hit = sys_rect(button, self.has_pill());
+            for (button, hit) in self.sys_buttons() {
                 let disc = Rectangle::new(
                     Point::from((hit.loc.x, hit.loc.y + (hit.size.h - SYS_HIT) / 2.)),
                     Size::from((SYS_HIT, SYS_HIT)),
@@ -4200,7 +4265,7 @@ fn tile_body_rect(i: usize, tile: GridTile, layout: Layout) -> Rectangle<f64, Lo
 fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let (insert_y, block_h) = layout.detail_block()?;
-    let card_h = owner.detail_height(layout.owner_device_count(owner));
+    let card_h = owner.detail_height(layout.owner_device_count(owner), layout.mode);
     // The card's *bottom* rides the bottom of the gap, so it slides down out of the owner's row as
     // the gap opens rather than being revealed in place: at `block_scale == 1` this is the settled
     // `insert_y + DETAIL_MARGIN`, and below that the card sits higher, with everything above
@@ -4238,7 +4303,7 @@ fn detail_clip(layout: Layout) -> Option<Rectangle<f64, Logical>> {
 fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let card = detail_rect(layout)?;
-    let shape = owner.row_shape(layout.owner_device_count(owner));
+    let shape = owner.row_shape(layout.owner_device_count(owner), layout.mode);
     if k >= shape.len() {
         return None;
     }
@@ -4269,34 +4334,46 @@ fn pill_rect(has_pill: bool) -> Option<Rectangle<f64, Logical>> {
     has_pill.then(|| Rectangle::new(Point::from((PAD, PAD)), Size::from((PILL_W, SYS_H))))
 }
 
-/// The hit rectangle of a system button, menu-local. The row is at the top,
-/// mirroring gnome-shell's `SystemItem`: with a battery, the pill leads at the
-/// left and screenshot/settings/lock/power cluster at the right; without one,
-/// screenshot/settings sit on the left and lock/power on the right.
+#[cfg(test)]
+/// The hit rectangle of a system button with every button shown, menu-local. See
+/// [`sys_layout`].
 pub(crate) fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
+    sys_layout(&SYS_BUTTONS, has_pill)
+        .into_iter()
+        .find(|(b, _)| *b == button)
+        .map(|(_, rect)| rect)
+        .expect("every button is in the full layout")
+}
+
+/// The system row's `visible` buttons with their hit rectangles, menu-local — gnome-shell's
+/// `SystemItem` box (`system.js:263-300`): pill, spacer, screenshot, settings, spacer, lock, power,
+/// one spacer shown at a time. With a battery the pill leads at the left and the buttons pack at
+/// the right; without one, screenshot/settings pack from the left and lock/power from the right.
+fn sys_layout(visible: &[SysButton], has_pill: bool) -> Vec<(SysButton, Rectangle<f64, Logical>)> {
     // Outermost disc edges align with the tile-grid columns (both inset by PAD).
     let left = PAD + SYS_HIT / 2.;
     let right = menu_w() - PAD - SYS_HIT / 2.;
-    let center_x = if has_pill {
-        // All four buttons right-aligned (the pill takes the left).
-        match button {
-            SysButton::Power => right,
-            SysButton::Lock => right - SYS_ADVANCE,
-            SysButton::Settings => right - 2. * SYS_ADVANCE,
-            SysButton::Screenshot => right - 3. * SYS_ADVANCE,
+    let leading = |b: &&SysButton| matches!(b, SysButton::Screenshot | SysButton::Settings);
+    let mut centers: Vec<(SysButton, f64)> = Vec::new();
+    if has_pill {
+        for (i, &b) in visible.iter().rev().enumerate() {
+            centers.push((b, right - i as f64 * SYS_ADVANCE));
         }
     } else {
-        match button {
-            SysButton::Screenshot => left,
-            SysButton::Settings => left + SYS_ADVANCE,
-            SysButton::Lock => right - SYS_ADVANCE,
-            SysButton::Power => right,
+        for (i, &b) in visible.iter().filter(leading).enumerate() {
+            centers.push((b, left + i as f64 * SYS_ADVANCE));
         }
-    };
-    Rectangle::new(
-        Point::from((center_x - SYS_HIT / 2., PAD)),
-        Size::from((SYS_HIT, SYS_H)),
-    )
+        for (i, &b) in visible.iter().rev().filter(|b| !leading(b)).enumerate() {
+            centers.push((b, right - i as f64 * SYS_ADVANCE));
+        }
+    }
+    centers
+        .into_iter()
+        .map(|(b, center_x)| {
+            let loc = Point::from((center_x - SYS_HIT / 2., PAD));
+            (b, Rectangle::new(loc, Size::from((SYS_HIT, SYS_H))))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4379,6 +4456,7 @@ run it with --features reference-env, as the fedora CI job does"
     /// slider, no devices).
     fn lay(has_slider: bool) -> Layout {
         Layout {
+            mode: &USER,
             sliders: Sliders {
                 output: has_slider,
                 mic: false,
@@ -5227,11 +5305,11 @@ run it with --features reference-env, as the fedora CI job does"
         // The live rows must match the pure shape the card was sized from.
         assert_eq!(
             rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
-            DetailOwner::Brightness.row_shape(2),
+            DetailOwner::Brightness.row_shape(2, &USER),
         );
         // No separators anywhere -- unlike every other card, which ends in one.
         assert!(DetailOwner::Brightness
-            .row_shape(2)
+            .row_shape(2, &USER)
             .iter()
             .all(|s| !s.separator_before));
 
@@ -5908,7 +5986,9 @@ run it with --features reference-env, as the fedora CI job does"
         let shapes_match = |qs: &QuickSettings, owner: DetailOwner| {
             let layout = qs.layout();
             let rows = qs.detail_rows(owner).len();
-            let shape = owner.row_shape(layout.owner_device_count(owner)).len();
+            let shape = owner
+                .row_shape(layout.owner_device_count(owner), layout.mode)
+                .len();
             assert_eq!(rows, shape, "{owner:?}: {rows} rows vs a shape of {shape}");
         };
 
@@ -5984,6 +6064,7 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn detail_view_grows_menu_and_shifts_lower_rows_only() {
         let collapsed = Layout {
+            mode: &USER,
             sliders: Sliders {
                 output: false,
                 mic: false,
@@ -6008,6 +6089,7 @@ run it with --features reference-env, as the fedora CI job does"
             block_scale: 1.,
         };
         let expanded = Layout {
+            mode: &USER,
             sliders: Sliders {
                 output: false,
                 mic: false,
@@ -6036,7 +6118,7 @@ run it with --features reference-env, as the fedora CI job does"
             "the menu must grow taller"
         );
 
-        let block = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3);
+        let block = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3, &USER);
         // Row 0 (Network + its neighbor) does not move.
         for i in 0..COLS {
             assert_eq!(
@@ -6119,6 +6201,7 @@ run it with --features reference-env, as the fedora CI job does"
         for owner in [DetailOwner::Wifi, DetailOwner::Power] {
             for has_slider in [false, true] {
                 let l = Layout {
+                    mode: &USER,
                     sliders: Sliders {
                         output: has_slider,
                         mic: false,
@@ -6257,7 +6340,7 @@ run it with --features reference-env, as the fedora CI job does"
             "the card is drawn the whole way out"
         );
         let (insert_y, block, card) = edges(&qs);
-        let settled_h = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3);
+        let settled_h = DETAIL_MARGIN + DetailOwner::Wifi.detail_height(3, &USER);
         assert!(
             block < settled_h,
             "the menu is still shorter than its settled height, {block} vs {settled_h}"
@@ -6360,7 +6443,7 @@ run it with --features reference-env, as the fedora CI job does"
             center(tile_arrow_rect(wifi_index(qs.layout()), GridTile::Wifi, qs.layout()).unwrap())
         };
         let block_of = |owner: DetailOwner, qs: &QuickSettings| {
-            DETAIL_MARGIN + owner.detail_height(qs.layout().owner_device_count(owner))
+            DETAIL_MARGIN + owner.detail_height(qs.layout().owner_device_count(owner), qs.mode)
         };
 
         // Open Network and let both phases land.
@@ -6532,6 +6615,7 @@ run it with --features reference-env, as the fedora CI job does"
     #[test]
     fn power_detail_shifts_slider_and_grid_but_not_the_system_row() {
         let collapsed = Layout {
+            mode: &USER,
             sliders: Sliders {
                 output: true,
                 mic: false,
@@ -6556,6 +6640,7 @@ run it with --features reference-env, as the fedora CI job does"
             block_scale: 1.,
         };
         let expanded = Layout {
+            mode: &USER,
             sliders: Sliders {
                 output: true,
                 mic: false,
@@ -6579,7 +6664,7 @@ run it with --features reference-env, as the fedora CI job does"
             grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
-        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
+        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0, &USER);
         assert_eq!(
             sys_rect(SysButton::Power, false).loc.y,
             PAD,
@@ -6709,7 +6794,9 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(item(&rows[3]).label, "Sound Settings");
         // Row geometry agrees with the shape.
         assert_eq!(
-            DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
+            DetailOwner::Output
+                .row_shape(q.sink_list.sinks.len(), &USER)
+                .len(),
             rows.len()
         );
 
@@ -6737,7 +6824,9 @@ run it with --features reference-env, as the fedora CI job does"
             "capped sinks + settings row"
         );
         assert_eq!(
-            DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
+            DetailOwner::Output
+                .row_shape(q.sink_list.sinks.len(), &USER)
+                .len(),
             rows.len()
         );
     }
@@ -7353,5 +7442,60 @@ run it with --features reference-env, as the fedora CI job does"
             card.loc.y,
             tile.loc.y + TILE_H
         );
+    }
+
+    /// The lock screen's and the greeter's menus (`system.js`, `systemActions.js`): no Settings,
+    /// Lock or Log Out, no Settings rows, an inert battery pill; Power keeps Suspend / Restart /
+    /// Power Off. The buttons that remain pack where GNOME's box puts them.
+    #[test]
+    fn restricted_modes_drop_settings_lock_and_log_out() {
+        for mode in [
+            &crate::session_mode::UNLOCK_DIALOG,
+            &crate::session_mode::GDM,
+        ] {
+            let mut q = qs(None);
+            q.battery = Some(battery(50.));
+            q.set_session_mode(mode);
+            let buttons: Vec<_> = q.sys_buttons().into_iter().map(|(b, _)| b).collect();
+            assert_eq!(buttons, [SysButton::Power], "{}", mode.name);
+            assert_eq!(
+                q.sys_buttons()[0].1,
+                sys_rect(SysButton::Power, true),
+                "power keeps the right end"
+            );
+            assert!(!q.stops().iter().any(|(s, _)| *s == QsStop::Pill));
+
+            let power: Vec<_> = q
+                .detail_rows(DetailOwner::Power)
+                .iter()
+                .filter_map(|r| match r {
+                    DetailRow::Item(row) => Some(row.action.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                power,
+                [
+                    PopoverAction::SessionRequest(SessionRequest::Suspend),
+                    PopoverAction::SessionRequest(SessionRequest::Reboot),
+                    PopoverAction::SessionRequest(SessionRequest::PowerOff),
+                ]
+            );
+            assert_eq!(
+                q.detail_rows(DetailOwner::Wifi).len(),
+                DetailOwner::Wifi
+                    .row_shape(q.layout().owner_device_count(DetailOwner::Wifi), mode)
+                    .len()
+            );
+            // The trailing "All Networks" entry point is gone.
+            assert!(!q.detail_rows(DetailOwner::Wifi).iter().any(|r| matches!(
+                r,
+                DetailRow::Item(ItemRow {
+                    separator_before: true,
+                    action: PopoverAction::LaunchSettingsPanel { .. },
+                    ..
+                })
+            )));
+        }
     }
 }
