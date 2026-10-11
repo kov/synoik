@@ -288,9 +288,13 @@ struct Session {
     /// The logind session it proved to be, once `Hello` is accepted.
     logind_id: Option<String>,
     buffers: HashMap<u32, Rc<PrimeFramebuffer>>,
-    /// Its newest frame and the fence that completes it — what goes on screen the moment it is
-    /// fronted again, without waiting for it to draw.
-    latest: Option<(u32, Option<Rc<OwnedFd>>)>,
+    /// The newest frame it presented while in the background, left unanswered: the inner keeps
+    /// that slot reserved for as long as the present is outstanding, so it can be flipped the
+    /// moment the session is fronted without the inner rendering into it underneath the scanout.
+    held: Option<(u32, Option<Rc<OwnedFd>>)>,
+    /// The last frame reported `Presented` to it. The inner never draws into the slot it was last
+    /// told is on screen, so this too is safe to show again on a switch back.
+    last_presented: Option<u32>,
 }
 
 struct Outer {
@@ -438,7 +442,8 @@ impl Outer {
                 pid: cred.pid,
                 logind_id: None,
                 buffers: HashMap::new(),
-                latest: None,
+                held: None,
+                last_presented: None,
             },
         );
     }
@@ -515,19 +520,34 @@ impl Outer {
         self.front = front;
 
         // Never leave the previous session's frame up for whoever is at the seat now: show the
-        // new session's newest frame, or the plate until it draws one.
-        let next = match self.fronted().and_then(|g| self.sessions.get(&g)) {
-            Some(Session {
-                generation,
-                latest: Some((buffer, fence)),
-                ..
-            }) => Next::Session {
-                generation: *generation,
-                buffer: *buffer,
-                fence: fence.clone(),
+        // new session's newest frame, or the plate until it draws one. Only frames the inner
+        // cannot be drawing into qualify (`held`, `last_presented`); a frame it was told was
+        // discarded is a free slot to it, and scanning that out would race its next render.
+        let next = match self.fronted().and_then(|g| self.sessions.get_mut(&g)) {
+            Some(session) => match (session.held.take(), session.last_presented) {
+                (Some((buffer, fence)), _) => Next::Session {
+                    generation: session.generation,
+                    buffer,
+                    fence,
+                },
+                (None, Some(buffer)) => Next::Session {
+                    generation: session.generation,
+                    buffer,
+                    fence: None,
+                },
+                (None, None) => Next::Plate,
             },
-            _ => Next::Plate,
+            None => Next::Plate,
         };
+        match &next {
+            Next::Plate => debug!("switch-in shows the plate"),
+            Next::Session { buffer, fence, .. } => {
+                debug!(
+                    "switch-in shows buffer {buffer} (fenced: {})",
+                    fence.is_some()
+                );
+            }
+        }
         self.show(next);
     }
 
@@ -551,6 +571,7 @@ impl Outer {
         msg: ToOuter,
         mut fds: Vec<OwnedFd>,
     ) -> anyhow::Result<()> {
+        let fronted = self.fronted() == Some(generation);
         let session = self
             .sessions
             .get_mut(&generation)
@@ -614,8 +635,11 @@ impl Outer {
             }
             ToOuter::RemoveBuffer { id } => {
                 session.buffers.remove(&id);
-                if matches!(session.latest, Some((b, _)) if b == id) {
-                    session.latest = None;
+                if matches!(session.held, Some((b, _)) if b == id) {
+                    session.held = None;
+                }
+                if session.last_presented == Some(id) {
+                    session.last_presented = None;
                 }
             }
             ToOuter::Present {
@@ -630,17 +654,16 @@ impl Outer {
                     bail!("present of unknown buffer {buffer}");
                 }
                 let fence = fenced.then(|| Rc::new(fds.remove(0)));
-                session.latest = Some((buffer, fence.clone()));
-                if self.fronted() == Some(generation) {
+                if fronted {
                     self.show(Next::Session {
                         generation,
                         buffer,
                         fence,
                     });
-                } else {
-                    // A background session does not reach the screen. It hears so at once, so it
-                    // is not left waiting for a flip, and it keeps the frame as its latest.
-                    self.discard(generation, buffer);
+                } else if let Some((stale, _)) = session.held.replace((buffer, fence)) {
+                    // A background session does not reach the screen. Its newest frame is held
+                    // unanswered for the switch back; the one it supersedes is given back.
+                    self.discard(generation, stale);
                 }
             }
         }
@@ -704,6 +727,7 @@ impl Outer {
 
     fn discard(&self, generation: u64, buffer: u32) {
         if let Some(session) = self.sessions.get(&generation) {
+            debug!("discarding buffer {buffer} of {:?}", session.logind_id);
             let msg = ToInner::Discarded {
                 output: self.display.connector_name.clone(),
                 buffer,
@@ -724,7 +748,8 @@ impl Outer {
             buffer, generation, ..
         } = &shown
         {
-            if let Some(session) = self.sessions.get(generation) {
+            if let Some(session) = self.sessions.get_mut(generation) {
+                session.last_presented = Some(*buffer);
                 let (sequence, time_ns) = match meta {
                     Some(DrmEventMetadata {
                         sequence,

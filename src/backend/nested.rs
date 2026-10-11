@@ -700,8 +700,9 @@ impl Nested {
         }
     }
 
-    /// The outer will not show the frame in flight — the flip was refused, or this session is not
-    /// the one logind fronts. Its slot is free again, and an active session owes a fresh frame.
+    /// The outer will not show the frame in flight — the flip was refused, or a newer frame
+    /// superseded it while this session was in the background. Its slot is free again, and an
+    /// active session owes a fresh frame.
     fn on_discarded(&mut self, synoik: &mut Synoik, name: &str, buffer: u32) {
         let Some(out) = self.outputs.get_mut(name) else {
             return;
