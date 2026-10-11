@@ -15227,6 +15227,12 @@ impl Synoik {
         let locked =
             matches!(self.lock_state, LockState::Locked(_)) || self.screen_shield.is_locked();
 
+        // The greeter's shield is locked without `_setLocked` (`showDialog`,
+        // `screenShield.js:321-327`), and logind has no lock screen for a greeter session to hint
+        // about ("Session does not support lock screen").
+        if self.greeter {
+            return;
+        }
         if self.locked_hint.is_some_and(|h| h == locked) {
             return;
         }
