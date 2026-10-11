@@ -6,8 +6,10 @@
 //! and brings the greeter forward when seat0 has nothing active (`docs/fork/greeter.md` §2.6, §5).
 
 use std::collections::HashMap;
+use std::io::{BufRead as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -40,6 +42,23 @@ struct Daemon {
     workers: HashMap<libc::pid_t, Worker>,
 }
 
+/// The greeter's logind session, once open: the only caller allowed a login channel (§2.2).
+static GREETER_SESSION: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn greeter_session() -> Option<String> {
+    GREETER_SESSION.lock().unwrap().clone()
+}
+
+/// Where a channel hands over a session it started, so the main loop tracks it as it does the
+/// ones it opened itself: logout from it must bring the greeter forward.
+static ADOPT: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+pub fn adopt(pid: libc::pid_t, session: &str) {
+    if let Some(pipe) = ADOPT.get() {
+        let _ = writeln!(pipe.lock().unwrap(), "{pid} {session}");
+    }
+}
+
 pub fn run() -> anyhow::Result<()> {
     let config = Config::load();
     let signals = block_signals()?;
@@ -53,6 +72,9 @@ pub fn run() -> anyhow::Result<()> {
         }
     };
     let seats = watch_seats()?;
+    let (adopted, adopt_write) = pipe()?;
+    let _ = ADOPT.set(Mutex::new(std::fs::File::from(adopt_write)));
+    let mut adopted = std::io::BufReader::new(std::fs::File::from(adopted));
     let mut daemon = Daemon {
         workers: HashMap::new(),
     };
@@ -87,6 +109,11 @@ pub fn run() -> anyhow::Result<()> {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: adopted.get_ref().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let reporting: Vec<libc::pid_t> = daemon
             .workers
@@ -111,9 +138,15 @@ pub fn run() -> anyhow::Result<()> {
             return Err(err).context("poll");
         }
 
-        for (pid, fd) in reporting.iter().zip(&fds[2..]) {
+        for (pid, fd) in reporting.iter().zip(&fds[3..]) {
             if fd.revents != 0 {
                 daemon.read_status(*pid);
+            }
+        }
+        if fds[2].revents != 0 {
+            let mut line = String::new();
+            if adopted.read_line(&mut line).is_ok() {
+                daemon.adopt(&line);
             }
         }
         if fds[1].revents != 0 {
@@ -213,8 +246,31 @@ impl Daemon {
         // The worker reports once and closes.
         if let Ok(Some(Frame::Opened(id))) = Frame::read_from(&mut std::fs::File::from(fd)) {
             eprintln!("synoik-login: worker {pid} opened session {id}");
+            if worker.kind == Kind::Greeter {
+                *GREETER_SESSION.lock().unwrap() = Some(id.clone());
+            }
             worker.session = Some(id);
         }
+    }
+
+    /// A session the greeter logged into: `"<worker pid> <session id>"`.
+    fn adopt(&mut self, line: &str) {
+        let Some((pid, session)) = line.trim().split_once(' ') else {
+            return;
+        };
+        let Ok(pid) = pid.parse() else {
+            return;
+        };
+        eprintln!("synoik-login: worker {pid} parents session {session}");
+        self.workers.insert(
+            pid,
+            Worker {
+                kind: Kind::User,
+                status: None,
+                session: Some(session.to_owned()),
+                started: Instant::now(),
+            },
+        );
     }
 
     fn reap(&mut self) -> anyhow::Result<()> {
@@ -233,6 +289,7 @@ impl Daemon {
                 worker.kind, worker.session
             );
             if worker.kind == Kind::Greeter {
+                *GREETER_SESSION.lock().unwrap() = None;
                 if worker.started.elapsed() < RESPAWN_PAUSE {
                     std::thread::sleep(RESPAWN_PAUSE);
                 }

@@ -82,7 +82,7 @@ impl Request {
     }
 }
 
-struct Account {
+pub struct Account {
     name: CString,
     uid: libc::uid_t,
     gid: libc::gid_t,
@@ -90,7 +90,7 @@ struct Account {
     shell: String,
 }
 
-fn account(user: &str) -> anyhow::Result<Account> {
+pub fn account(user: &str) -> anyhow::Result<Account> {
     let name = CString::new(user)?;
     // SAFETY: getpwnam's result is copied out before any other passwd call.
     let pw = unsafe { libc::getpwnam(name.as_ptr()) };
@@ -139,25 +139,11 @@ extern "C" fn kill_session(_: libc::c_int) {
 pub fn run(request: &Request) -> anyhow::Result<i32> {
     let account = account(&request.user)?;
     let mut pam = Pam::start(&request.service, &request.user)?;
-
-    // Everything pam_systemd reads goes in before the session opens (greeter.md §2.4).
-    pam.putenv("XDG_SEAT", "seat0")?;
-    pam.putenv("XDG_SESSION_TYPE", "wayland")?;
-    pam.putenv("XDG_SESSION_CLASS", &request.class)?;
-    pam.putenv("XDG_SESSION_DESKTOP", "synoik")?;
+    put_session_env(&mut pam, &request.class)?;
 
     pam.authenticate()?;
     pam.acct_mgmt()?;
-
-    // SAFETY: plain syscalls; the uid stays 0 until the child drops it.
-    unsafe {
-        if libc::setgid(account.gid) != 0
-            || libc::initgroups(account.name.as_ptr(), account.gid) != 0
-        {
-            bail!("setting groups: {}", std::io::Error::last_os_error());
-        }
-    }
-    pam.setcred(PAM_ESTABLISH_CRED)?;
+    establish_credentials(&mut pam, &account)?;
     pam.open_session()?;
 
     let id = pam.getenv("XDG_SESSION_ID").unwrap_or_default();
@@ -170,9 +156,41 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
     let _ = Frame::Opened(id.clone()).write_to(&mut status);
     drop(status);
 
-    let env = session_environment(&pam, &account)?;
-    let argv: Vec<CString> = request
-        .program
+    parent_session(pam, &account, &request.program, &id)
+}
+
+/// Everything pam_systemd reads, put in before the session opens (greeter.md §2.4).
+pub fn put_session_env(pam: &mut Pam, class: &str) -> anyhow::Result<()> {
+    pam.putenv("XDG_SEAT", "seat0")?;
+    pam.putenv("XDG_SESSION_TYPE", "wayland")?;
+    pam.putenv("XDG_SESSION_CLASS", class)?;
+    pam.putenv("XDG_SESSION_DESKTOP", "synoik")
+}
+
+/// The account's groups, then `pam_setcred(PAM_ESTABLISH_CRED)`; the uid stays 0 until the
+/// session's child drops it (`gdm-session-worker.c:1571-1610`, `1700-1808`).
+pub fn establish_credentials(pam: &mut Pam, account: &Account) -> anyhow::Result<()> {
+    // SAFETY: plain syscalls.
+    unsafe {
+        if libc::setgid(account.gid) != 0
+            || libc::initgroups(account.name.as_ptr(), account.gid) != 0
+        {
+            bail!("setting groups: {}", std::io::Error::last_os_error());
+        }
+    }
+    pam.setcred(PAM_ESTABLISH_CRED)
+}
+
+/// Start `program` in the open session `id` and stay its parent until it ends; then close the
+/// session. Returns the program's exit status.
+pub fn parent_session(
+    mut pam: Pam,
+    account: &Account,
+    program: &[String],
+    id: &str,
+) -> anyhow::Result<i32> {
+    let env = session_environment(&pam, account)?;
+    let argv: Vec<CString> = program
         .iter()
         .map(|a| CString::new(a.as_str()))
         .collect::<Result<_, _>>()?;
@@ -208,7 +226,10 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
             break;
         }
     }
-    eprintln!("synoik-login: session {id} for {} ended", request.user);
+    eprintln!(
+        "synoik-login: session {id} for {} ended",
+        account.name.to_string_lossy()
+    );
 
     if let Err(err) = pam.close_session() {
         eprintln!("synoik-login: {err:#}");

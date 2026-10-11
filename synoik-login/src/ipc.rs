@@ -29,6 +29,10 @@ pub enum Frame {
     Opened(String),
     // Daemon → worker.
     Answer(Secret),
+    /// This login conversation won: open its session.
+    Open,
+    /// The greeter is ready: start the session's program.
+    Start,
 }
 
 /// Bytes that are wiped before their memory is freed.
@@ -81,6 +85,8 @@ impl Frame {
             Frame::Unavailable(_) => 7,
             Frame::Opened(_) => 8,
             Frame::Answer(_) => 9,
+            Frame::Open => 10,
+            Frame::Start => 11,
         }
     }
 
@@ -93,7 +99,7 @@ impl Frame {
             | Frame::Failed(s)
             | Frame::Unavailable(s)
             | Frame::Opened(s) => s.as_bytes(),
-            Frame::Complete => &[],
+            Frame::Complete | Frame::Open | Frame::Start => &[],
             Frame::Answer(secret) => secret.as_bytes(),
         }
     }
@@ -140,6 +146,8 @@ impl Frame {
             7 => Frame::Unavailable(text(payload)?),
             8 => Frame::Opened(text(payload)?),
             9 => Frame::Answer(Secret::new(payload)),
+            10 => Frame::Open,
+            11 => Frame::Start,
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -162,6 +170,8 @@ mod tests {
             Frame::Complete,
             Frame::Answer(Secret::new(b"hunter2".to_vec())),
             Frame::Opened("c1".into()),
+            Frame::Open,
+            Frame::Start,
         ];
         let mut wire = Vec::new();
         for frame in &frames {

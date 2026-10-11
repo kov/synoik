@@ -418,3 +418,26 @@ reader unavailable" — and `gdm-smartcard` the same, with no worker. With Limin
 screen runs `gdm-fingerprint` beside `gdm-password` and a touch unlocks the session; a reader
 another client holds (Settings' fingerprint dialog keeps its claim while open), or a scan that
 times out (pam_fprintd's 30 s), reports unavailable and leaves the password working.
+
+§7 step 3, the daemon's half: the login channel.
+
+- **`OpenSession`** (`bus.rs`) is granted only to a process in the greeter's own session (the
+  daemon learns its id when it opens it). From the greeter, `OpenReauthenticationChannel(U)`
+  targets U's seat0 session and is `AccessDenied` when U has none; a verified reauthentication
+  unlocks and activates that session.
+- **Login channel** (`channel.rs`): `UserVerifier` plus `Greeter` at the same path. Each
+  `BeginVerificationForUser` runs `synoik-login login SERVICE USER -- synoik-session`
+  (`verify.rs`): authentication, account checks enforced, credentials established, then it waits.
+  The first to verify wins (`Open`): it opens the session and reports its id, emitted as
+  `SessionOpened`; `StartSessionWhenReady` (`Start`) has it start `synoik-session` and parent it,
+  and hands it to the daemon's main loop, so the channel closing does not end it and logout brings
+  the greeter forward. Losers past verification are ended by closing their socket, so they drop
+  their credentials; ones still inside PAM are killed. `StopConflictingSession` terminates the
+  user's other graphical sessions; `SelectSession`, `BeginAutoLogin`, `GetTimedLoginDetails` and
+  `BeginVerification` without a user are refused.
+
+Measured 2026-10-11 through a GDBus client run inside the greeter's session: a wrong password for
+`u2` gives GDM's refusal; the right one gives `VerificationComplete`, `SessionOpened('…', '20')`,
+and after `StartSessionWhenReady` session 20 runs `synoik --session` and is seat0's active session;
+terminating it fronts the greeter. A reauthentication channel for `u2` (no session) is
+`AccessDenied`; for `claude` it verifies and activates session 2.

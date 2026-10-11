@@ -2,8 +2,9 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! A verification channel: a private peer-to-peer D-Bus socket serving GDM's `UserVerifier` to one
-//! client, with one worker per PAM conversation (`docs/fork/greeter.md` §2.1-§2.3, §2.5).
+//! A channel: a private peer-to-peer D-Bus socket serving GDM's `UserVerifier` to one client, with
+//! one worker per PAM conversation (`docs/fork/greeter.md` §2.1-§2.5). A login channel (the
+//! greeter's) serves GDM's `Greeter` beside it.
 //!
 //! The signals and their order are GDM 51's, because the clients are written against it
 //! (`src/dbus/gdm.rs`): a question or message as the worker relays it; on success
@@ -21,22 +22,31 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _};
 use zbus::fdo;
+use zbus::zvariant::OwnedObjectPath;
 
 use crate::ipc::{Frame, Secret};
 use crate::worker::spawn_worker;
 
 const SESSION_PATH: &str = "/org/gnome/DisplayManager/Session";
 const VERIFIER_IFACE: &str = "org.gnome.DisplayManager.UserVerifier";
+const GREETER_IFACE: &str = "org.gnome.DisplayManager.Greeter";
 /// How long the client has to connect to the address it was handed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a login starts in its new session.
+const SESSION_PROGRAM: &str = "synoik-session";
 
-/// Who a channel verifies, and for whom.
+/// What a channel is for.
+pub enum Kind {
+    /// Verify `user` again and unlock and front their running `session` (§2.5).
+    Reauth { user: String, session: String },
+    /// The greeter's login channel: verify whoever it names and open a new session (§2.4).
+    Login,
+}
+
 pub struct Target {
-    pub user: String,
+    pub kind: Kind,
     /// The only uid that may connect: the caller that asked for the channel.
     pub client_uid: u32,
-    /// The logind session to unlock once the user is verified.
-    pub session: String,
 }
 
 /// The PAM service behind a service name on the wire. The wire keeps GDM's names, so the client
@@ -74,12 +84,18 @@ fn serve(listener: UnixListener, target: Target) -> anyhow::Result<()> {
         );
     }
 
+    let login = matches!(target.kind, Kind::Login);
     let shared = Arc::new(Shared {
+        user: Mutex::new(match &target.kind {
+            Kind::Reauth { user, .. } => Some(user.clone()),
+            Kind::Login => None,
+        }),
         target,
         conversations: Mutex::new(HashMap::new()),
+        winner: Mutex::new(None),
         connection: OnceLock::new(),
     });
-    let connection = zbus::blocking::connection::Builder::unix_stream(stream)
+    let mut builder = zbus::blocking::connection::Builder::unix_stream(stream)
         .server(zbus::Guid::generate())?
         .p2p()
         .serve_at(
@@ -87,13 +103,21 @@ fn serve(listener: UnixListener, target: Target) -> anyhow::Result<()> {
             Verifier {
                 shared: shared.clone(),
             },
-        )?
-        .build()
-        .context("serving the channel")?;
+        )?;
+    if login {
+        builder = builder.serve_at(
+            SESSION_PATH,
+            Greeter {
+                shared: shared.clone(),
+            },
+        )?;
+    }
+    let connection = builder.build().context("serving the channel")?;
     let _ = shared.connection.set(connection.clone());
-    eprintln!("synoik-login: channel for {} connected", shared.target.user);
+    eprintln!("synoik-login: {} connected", shared.name());
 
-    // Until the client goes away: then every conversation it was driving goes with it.
+    // Until the client goes away: then every conversation it was driving goes with it. A session
+    // already started is no longer one of them.
     for message in zbus::blocking::MessageIterator::from(&connection) {
         if message.is_err() {
             break;
@@ -105,25 +129,44 @@ fn serve(listener: UnixListener, target: Target) -> anyhow::Result<()> {
 
 struct Shared {
     target: Target,
-    /// Running conversations by wire service name, each its worker's pid.
+    /// Who the conversations verify: fixed for reauthentication, named per conversation by the
+    /// greeter on a login channel.
+    user: Mutex<Option<String>>,
+    /// Running conversations by wire service name.
     conversations: Mutex<HashMap<String, Conversation>>,
+    /// A login channel's winning conversation: the first to verify (§2.4), and the session it
+    /// opened once it has.
+    winner: Mutex<Option<Winner>>,
     connection: OnceLock<zbus::blocking::Connection>,
 }
 
 struct Conversation {
     pid: libc::pid_t,
     to_worker: UnixStream,
+    /// Past `VerificationComplete`: the worker waits on the daemon, not inside PAM.
+    verified: bool,
+}
+
+struct Winner {
+    service: String,
+    session: Option<String>,
 }
 
 impl Shared {
-    fn emit<B>(&self, member: &str, body: &B)
+    fn name(&self) -> String {
+        match &self.target.kind {
+            Kind::Reauth { user, .. } => format!("channel for {user}"),
+            Kind::Login => "login channel".to_owned(),
+        }
+    }
+
+    fn emit_on<B>(&self, iface: &str, member: &str, body: &B)
     where
         B: serde::Serialize + zbus::zvariant::DynamicType,
     {
         let connection = self.connection.wait();
-        eprintln!("synoik-login: channel for {}: {member}", self.target.user);
-        let result =
-            connection.emit_signal(None::<&str>, SESSION_PATH, VERIFIER_IFACE, member, body);
+        eprintln!("synoik-login: {}: {member}", self.name());
+        let result = connection.emit_signal(None::<&str>, SESSION_PATH, iface, member, body);
         match result {
             // The client hung up first — it cancels, then closes. Nothing is listening for this.
             Err(zbus::Error::InputOutput(err)) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
@@ -132,17 +175,22 @@ impl Shared {
         }
     }
 
+    fn emit<B>(&self, member: &str, body: &B)
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        self.emit_on(VERIFIER_IFACE, member, body);
+    }
+
     fn stop(&self, service: &str) {
         if let Some(conversation) = self.conversations.lock().unwrap().get(service) {
-            // SAFETY: signalling our own worker.
-            unsafe { libc::kill(conversation.pid, libc::SIGTERM) };
+            end(conversation);
         }
     }
 
     fn stop_all(&self) {
         for conversation in self.conversations.lock().unwrap().values() {
-            // SAFETY: signalling our own worker.
-            unsafe { libc::kill(conversation.pid, libc::SIGTERM) };
+            end(conversation);
         }
     }
 
@@ -159,27 +207,38 @@ impl Shared {
                 Frame::SecretInfoQuery(text) => self.emit("SecretInfoQuery", &(&service, text)),
                 Frame::Info(text) => self.emit("Info", &(&service, text)),
                 Frame::Problem(text) => self.emit("Problem", &(&service, text)),
-                Frame::Complete => {
-                    self.emit("VerificationComplete", &(&service,));
-                    if let Err(err) = unlock_session(&self.target.session) {
-                        eprintln!(
-                            "synoik-login: unlocking session {}: {err:#}",
-                            self.target.session
-                        );
+                Frame::Complete => self.verified(&service),
+                Frame::Opened(id) => {
+                    if let Some(winner) = self.winner.lock().unwrap().as_mut() {
+                        winner.session = Some(id.clone());
                     }
+                    self.emit_on(GREETER_IFACE, "SessionOpened", &(&service, id));
                 }
                 Frame::Failed(text) => {
+                    self.lose(&service);
                     self.emit("Problem", &(&service, text));
                     self.emit("VerificationFailed", &(&service,));
                     self.stop(&service);
                 }
                 Frame::Unavailable(text) => {
+                    self.lose(&service);
                     self.emit("ServiceUnavailable", &(&service, text));
                     self.emit("VerificationFailed", &(&service,));
                     self.stop(&service);
                 }
-                Frame::Opened(_) | Frame::Answer(_) => (),
+                Frame::Answer(_) | Frame::Open | Frame::Start => (),
             }
+        }
+        // A started session's worker shut its end and went on to parent the session; the daemon
+        // has it now.
+        let ours = self
+            .conversations
+            .lock()
+            .unwrap()
+            .get(&service)
+            .is_some_and(|c| c.pid == pid);
+        if !ours {
+            return;
         }
         // Drain whatever the worker still had to say; it is ending.
         let _ = from_worker.read_to_end(&mut Vec::new());
@@ -191,7 +250,72 @@ impl Shared {
                 conversations.remove(&service);
             }
         }
+        self.lose(&service);
         self.emit("ConversationStopped", &(&service,));
+    }
+
+    fn verified(&self, service: &str) {
+        if let Some(conversation) = self.conversations.lock().unwrap().get_mut(service) {
+            conversation.verified = true;
+        }
+        match &self.target.kind {
+            Kind::Reauth { session, .. } => {
+                self.emit("VerificationComplete", &(service,));
+                // Unlocked and fronted: the lock screen's own session, or — from the greeter —
+                // the session the user already has (`gdm-manager.c:947-970`).
+                for method in ["UnlockSession", "ActivateSession"] {
+                    if let Err(err) = logind_session_call(method, session) {
+                        eprintln!("synoik-login: {method} {session}: {err:#}");
+                    }
+                }
+            }
+            Kind::Login => {
+                // The first to verify wins and is the only one that opens a session (§2.4).
+                {
+                    let mut winner = self.winner.lock().unwrap();
+                    if winner.is_some() {
+                        drop(winner);
+                        self.stop(service);
+                        return;
+                    }
+                    *winner = Some(Winner {
+                        service: service.to_owned(),
+                        session: None,
+                    });
+                }
+                let conversations = self.conversations.lock().unwrap();
+                for (other, conversation) in conversations.iter() {
+                    if other != service {
+                        end(conversation);
+                    }
+                }
+                if let Some(conversation) = conversations.get(service) {
+                    let _ = Frame::Open.write_to(&mut &conversation.to_worker);
+                }
+                drop(conversations);
+                self.emit("VerificationComplete", &(service,));
+            }
+        }
+    }
+
+    /// `service` is out: if it had won, the login is open to the next one to verify.
+    fn lose(&self, service: &str) {
+        let mut winner = self.winner.lock().unwrap();
+        if winner.as_ref().is_some_and(|w| w.service == service) {
+            *winner = None;
+        }
+    }
+}
+
+/// End a conversation. One still inside PAM is killed — `pam_fprintd` blocks there with no
+/// question outstanding; one past verification is waiting on us, so closing its socket lets it
+/// drop its credentials and end its transaction (§2.3).
+fn end(conversation: &Conversation) {
+    if conversation.verified {
+        let _ = conversation.to_worker.shutdown(std::net::Shutdown::Both);
+    } else {
+        // SAFETY: signalling our own worker.
+        unsafe { libc::kill(conversation.pid, libc::SIGTERM) };
     }
 }
 
@@ -202,10 +326,7 @@ struct Verifier {
 impl Verifier {
     fn begin(&self, service: String) -> fdo::Result<()> {
         let shared = &self.shared;
-        eprintln!(
-            "synoik-login: channel for {}: begin {service}",
-            shared.target.user
-        );
+        eprintln!("synoik-login: {}: begin {service}", shared.name());
         if shared.conversations.lock().unwrap().contains_key(&service) {
             return Err(fdo::Error::Failed(format!("{service} is already running")));
         }
@@ -219,20 +340,29 @@ impl Verifier {
             });
             return Ok(());
         };
+        let Some(user) = shared.user.lock().unwrap().clone() else {
+            return Err(fdo::Error::Failed("no user to verify".into()));
+        };
 
         let (ours, theirs) = UnixStream::pair().map_err(|e| fdo::Error::IOError(e.to_string()))?;
-        let args = ["verify", pam, &shared.target.user];
+        let args: Vec<&str> = match shared.target.kind {
+            Kind::Reauth { .. } => vec!["verify", pam, &user],
+            Kind::Login => vec!["login", pam, &user, "--", SESSION_PROGRAM],
+        };
         let pid = spawn_worker(&args, theirs.as_raw_fd())
             .map_err(|e| fdo::Error::Failed(format!("{e:#}")))?;
         drop(theirs);
         let to_worker = ours
             .try_clone()
             .map_err(|e| fdo::Error::IOError(e.to_string()))?;
-        shared
-            .conversations
-            .lock()
-            .unwrap()
-            .insert(service.clone(), Conversation { pid, to_worker });
+        shared.conversations.lock().unwrap().insert(
+            service.clone(),
+            Conversation {
+                pid,
+                to_worker,
+                verified: false,
+            },
+        );
         let shared = shared.clone();
         std::thread::spawn(move || shared.pump(service, pid, ours));
         Ok(())
@@ -245,7 +375,14 @@ impl Verifier {
     /// not offer; accepting the call keeps libgdm-shaped clients happy.
     fn enable_extensions(&self, _extensions: Vec<String>) {}
 
+    /// Verification without a user is PAM asking for the name; the greeter always names one
+    /// (§4.2), so a login channel refuses it.
     fn begin_verification(&self, service_name: String) -> fdo::Result<()> {
+        if matches!(self.shared.target.kind, Kind::Login) {
+            return Err(fdo::Error::NotSupported(
+                "name the user: BeginVerificationForUser".into(),
+            ));
+        }
         self.begin(service_name)
     }
 
@@ -254,18 +391,34 @@ impl Verifier {
         service_name: String,
         username: String,
     ) -> fdo::Result<()> {
-        if username != self.shared.target.user {
-            return Err(fdo::Error::AccessDenied(
-                "this channel verifies another user".into(),
-            ));
+        {
+            let mut user = self.shared.user.lock().unwrap();
+            match &self.shared.target.kind {
+                Kind::Reauth { .. } => {
+                    if user.as_deref() != Some(username.as_str()) {
+                        return Err(fdo::Error::AccessDenied(
+                            "this channel verifies another user".into(),
+                        ));
+                    }
+                }
+                Kind::Login => {
+                    let busy = !self.shared.conversations.lock().unwrap().is_empty();
+                    if busy && user.as_deref() != Some(username.as_str()) {
+                        return Err(fdo::Error::Failed(
+                            "already verifying another user; cancel first".into(),
+                        ));
+                    }
+                    *user = Some(username);
+                }
+            }
         }
         self.begin(service_name)
     }
 
     fn answer_query(&self, service_name: String, answer: String) -> fdo::Result<()> {
         eprintln!(
-            "synoik-login: channel for {}: AnswerQuery {service_name}",
-            self.shared.target.user
+            "synoik-login: {}: AnswerQuery {service_name}",
+            self.shared.name()
         );
         let answer = Secret::new(answer.into_bytes());
         let conversations = self.shared.conversations.lock().unwrap();
@@ -278,12 +431,129 @@ impl Verifier {
     }
 
     fn cancel(&self) {
-        eprintln!(
-            "synoik-login: channel for {}: Cancel",
-            self.shared.target.user
-        );
+        eprintln!("synoik-login: {}: Cancel", self.shared.name());
         self.shared.stop_all();
     }
+}
+
+struct Greeter {
+    shared: Arc<Shared>,
+}
+
+#[zbus::interface(name = "org.gnome.DisplayManager.Greeter")]
+impl Greeter {
+    /// There is one session type (greeter.md §0).
+    fn select_session(&self, _session: String) -> fdo::Result<()> {
+        Err(fdo::Error::NotSupported("there is one session".into()))
+    }
+
+    /// The user is the one each conversation names; nothing to remember here.
+    fn select_user(&self, _username: String) {}
+
+    /// Autologin is the daemon's own, once per boot (§2.6), never the greeter's to ask for.
+    fn begin_auto_login(&self, _username: String) -> fdo::Result<()> {
+        Err(fdo::Error::NotSupported(
+            "autologin is not the greeter's".into(),
+        ))
+    }
+
+    fn get_timed_login_details(&self) -> fdo::Result<(bool, String, i32)> {
+        Err(fdo::Error::NotSupported("there is no timed login".into()))
+    }
+
+    /// Start the session the winning conversation opened. From here it is the daemon's: the
+    /// greeter closing this channel must not end it.
+    fn start_session_when_ready(
+        &self,
+        service_name: String,
+        should_start_session: bool,
+    ) -> fdo::Result<()> {
+        let session = {
+            let winner = self.shared.winner.lock().unwrap();
+            match winner.as_ref() {
+                Some(w) if w.service == service_name => w.session.clone(),
+                _ => {
+                    return Err(fdo::Error::Failed(format!(
+                        "{service_name} has no session to start"
+                    )))
+                }
+            }
+        };
+        let Some(session) = session else {
+            return Err(fdo::Error::Failed("the session is not open yet".into()));
+        };
+        if !should_start_session {
+            self.shared.stop(&service_name);
+            return Ok(());
+        }
+        let conversation = self
+            .shared
+            .conversations
+            .lock()
+            .unwrap()
+            .remove(&service_name)
+            .ok_or_else(|| fdo::Error::Failed(format!("{service_name} is gone")))?;
+        Frame::Start
+            .write_to(&mut &conversation.to_worker)
+            .map_err(|e| fdo::Error::IOError(e.to_string()))?;
+        eprintln!(
+            "synoik-login: starting session {session} (worker {})",
+            conversation.pid
+        );
+        crate::daemon::adopt(conversation.pid, &session);
+        Ok(())
+    }
+
+    /// End the user's other graphical sessions — the ones gnome-shell found from
+    /// `SessionOpened`'s id and asked to stop (`gdm-session.c:1802-1822`).
+    fn stop_conflicting_session(&self) -> fdo::Result<()> {
+        let (Some(user), Some(session)) = (
+            self.shared.user.lock().unwrap().clone(),
+            self.shared
+                .winner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|w| w.session.clone()),
+        ) else {
+            return Err(fdo::Error::Failed("no session has opened".into()));
+        };
+        stop_conflicting(&user, &session).map_err(|e| fdo::Error::Failed(format!("{e:#}")))
+    }
+}
+
+fn stop_conflicting(user: &str, keep: &str) -> anyhow::Result<()> {
+    let connection = zbus::blocking::Connection::system()?;
+    let reply = connection.call_method(
+        Some("org.freedesktop.login1"),
+        "/org/freedesktop/login1",
+        Some("org.freedesktop.login1.Manager"),
+        "ListSessions",
+        &(),
+    )?;
+    let sessions: Vec<(String, u32, String, String, OwnedObjectPath)> =
+        reply.body().deserialize()?;
+    for (id, _, name, _, path) in sessions {
+        if name != user || id == keep {
+            continue;
+        }
+        let proxy = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            path,
+            "org.freedesktop.login1.Session",
+        )?;
+        let kind: String = proxy.get_property("Type")?;
+        let state: String = proxy.get_property("State")?;
+        if !matches!(kind.as_str(), "wayland" | "x11")
+            || !matches!(state.as_str(), "active" | "online")
+        {
+            continue;
+        }
+        eprintln!("synoik-login: ending {user}'s conflicting session {id}");
+        logind_session_call("TerminateSession", &id)?;
+    }
+    Ok(())
 }
 
 fn accept_one(listener: &UnixListener) -> anyhow::Result<UnixStream> {
@@ -330,13 +600,13 @@ fn random_hex(bytes: usize) -> anyhow::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn unlock_session(id: &str) -> anyhow::Result<()> {
+fn logind_session_call(method: &str, id: &str) -> anyhow::Result<()> {
     let connection = zbus::blocking::Connection::system()?;
     connection.call_method(
         Some("org.freedesktop.login1"),
         "/org/freedesktop/login1",
         Some("org.freedesktop.login1.Manager"),
-        "UnlockSession",
+        method,
         &(id,),
     )?;
     Ok(())

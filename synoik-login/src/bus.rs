@@ -10,7 +10,7 @@ use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::channel::{self, Target};
+use crate::channel::{self, Kind, Target};
 
 const NAME: &str = "org.gnome.DisplayManager";
 const PATH: &str = "/org/gnome/DisplayManager/Manager";
@@ -27,42 +27,69 @@ struct Manager;
 
 #[zbus::interface(name = "org.gnome.DisplayManager.Manager")]
 impl Manager {
-    /// A channel that verifies `username` for the caller's own session — the lock screen's
-    /// (§2.2). The caller must be that user, in a session of theirs on seat0.
+    /// The greeter's login channel (§2.2): only the greeter session's own process may have one.
+    async fn open_session(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<String> {
+        let (uid, pid) = caller(&header, connection).await?;
+        let session = logind(connection, "GetSessionByPID", &(pid,))
+            .await
+            .map_err(|err| fdo::Error::AccessDenied(format!("no session for the caller: {err}")))?;
+        let session = self::session(connection, session).await?;
+        if crate::daemon::greeter_session().as_deref() != Some(session.id.as_str())
+            || session.uid != uid
+        {
+            return Err(fdo::Error::AccessDenied(
+                "a login channel is for the greeter".into(),
+            ));
+        }
+        channel::open(Target {
+            kind: Kind::Login,
+            client_uid: uid,
+        })
+        .map_err(|err| fdo::Error::Failed(format!("{err:#}")))
+    }
+
+    /// A channel that verifies `username` again (§2.2, §2.5): for the caller's own session — the
+    /// lock screen's — or, from the greeter, for the seat0 session `username` already has. With
+    /// no such session the answer is `AccessDenied`, which is what sends the greeter to a login
+    /// channel instead (`js/gdm/util.js:508-529`).
     async fn open_reauthentication_channel(
         &self,
         username: String,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> fdo::Result<String> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| fdo::Error::AccessDenied("no sender".into()))?
-            .to_owned();
-        let credentials = fdo::DBusProxy::new(connection)
-            .await?
-            .get_connection_credentials(BusName::Unique(sender))
-            .await?;
-        let (Some(uid), Some(pid)) = (credentials.unix_user_id(), credentials.process_id()) else {
-            return Err(fdo::Error::AccessDenied("no credentials".into()));
-        };
-
-        let session = caller_session(connection, pid, uid)
+        let (uid, pid) = caller(&header, connection).await?;
+        let caller = caller_session(connection, pid, uid)
             .await
             .map_err(|err| fdo::Error::AccessDenied(format!("no session for the caller: {err}")))?;
-        if session.name != username || session.uid != uid || session.seat != "seat0" {
-            return Err(fdo::Error::AccessDenied(
-                "a reauthentication channel is for the caller's own session on seat0".into(),
-            ));
-        }
 
-        let address = channel::open(Target {
-            user: username,
+        let session = if crate::daemon::greeter_session().as_deref() == Some(caller.id.as_str())
+            && caller.uid == uid
+        {
+            seat0_session_of(connection, &username)
+                .await
+                .map_err(|err| fdo::Error::AccessDenied(format!("{username}: {err}")))?
+        } else {
+            if caller.name != username || caller.uid != uid || caller.seat != "seat0" {
+                return Err(fdo::Error::AccessDenied(
+                    "a reauthentication channel is for the caller's own session on seat0".into(),
+                ));
+            }
+            caller.id
+        };
+
+        channel::open(Target {
+            kind: Kind::Reauth {
+                user: username,
+                session,
+            },
             client_uid: uid,
-            session: session.id,
         })
-        .map_err(|err| fdo::Error::Failed(format!("{err:#}")))?;
-        Ok(address)
+        .map_err(|err| fdo::Error::Failed(format!("{err:#}")))
     }
 
     /// The session tells the display manager it is up; nothing here depends on it.
@@ -74,6 +101,55 @@ impl Manager {
     fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_owned()
     }
+}
+
+/// The calling process's uid and pid, from the bus.
+async fn caller(header: &Header<'_>, connection: &zbus::Connection) -> fdo::Result<(u32, u32)> {
+    let sender = header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied("no sender".into()))?
+        .to_owned();
+    let credentials = fdo::DBusProxy::new(connection)
+        .await?
+        .get_connection_credentials(BusName::Unique(sender))
+        .await?;
+    match (credentials.unix_user_id(), credentials.process_id()) {
+        (Some(uid), Some(pid)) => Ok((uid, pid)),
+        _ => Err(fdo::Error::AccessDenied("no credentials".into())),
+    }
+}
+
+/// `username`'s graphical session on seat0, if it has one.
+async fn seat0_session_of(connection: &zbus::Connection, username: &str) -> zbus::Result<String> {
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "ListSessions",
+            &(),
+        )
+        .await?;
+    let sessions: Vec<(String, u32, String, String, OwnedObjectPath)> =
+        reply.body().deserialize()?;
+    for (id, _, name, seat, path) in sessions {
+        if name != username || seat != "seat0" {
+            continue;
+        }
+        let proxy = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.login1",
+            path,
+            "org.freedesktop.login1.Session",
+        )
+        .await?;
+        let class: String = proxy.get_property("Class").await?;
+        let state: String = proxy.get_property("State").await?;
+        if class == "user" && state != "closing" {
+            return Ok(id);
+        }
+    }
+    Err(zbus::Error::Failure("has no session on seat0".into()))
 }
 
 struct Session {

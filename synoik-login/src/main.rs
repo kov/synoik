@@ -21,9 +21,14 @@ fn main() {
             worker::Request::parse(rest).and_then(|request| worker::run(&request))
         }
         Some((mode, [service, user])) if mode == "verify" => verify::run(service, user),
+        Some((mode, [service, user, sep, program @ ..]))
+            if mode == "login" && sep == "--" && !program.is_empty() =>
+        {
+            verify::run_login(service, user, program)
+        }
         None => daemon::run().map(|()| 0),
         Some(_) => Err(anyhow::anyhow!(
-            "usage: synoik-login [session ... | verify SERVICE USER]"
+            "usage: synoik-login [session ... | verify SERVICE USER | login SERVICE USER -- PROGRAM...]"
         )),
     };
     match result {
