@@ -373,6 +373,31 @@ pub fn start(
 /// Blocking, unlike [`set_brightness`]: this is called only when the shield's state or its settings
 /// change (a handful of times in a session), never per frame or per input event, and the fd must be
 /// in hand before we can claim to be inhibiting.
+/// Ask logind to `Suspend`, `Reboot` or `PowerOff` the machine, the way gnome-session would for a
+/// session that has one. The greeter has none, so its power menu comes straight here. Interactive,
+/// so polkit may ask through the greeter's agent. Spawned: logind holds the call until it acts.
+pub fn power_action(conn: &zbus::blocking::Connection, method: &'static str) {
+    let async_conn = conn.inner().clone();
+    let future = async move {
+        let result = async_conn
+            .call_method(
+                Some("org.freedesktop.login1"),
+                MANAGER_PATH,
+                Some(MANAGER_IFACE),
+                method,
+                &(true,),
+            )
+            .await;
+        if let Err(err) = result {
+            warn!("error calling login1 {method}: {err:?}");
+        }
+    };
+    conn.inner()
+        .executor()
+        .spawn(future, "login1 power action")
+        .detach();
+}
+
 pub fn take_sleep_inhibitor(conn: &zbus::blocking::Connection) -> Option<zbus::zvariant::OwnedFd> {
     let reply = conn
         .call_method(

@@ -2602,7 +2602,7 @@ impl State {
                 if request == crate::end_session::SessionRequest::Logout {
                     self.synoik.layout.close_overview();
                 }
-                self.synoik.request_session_action(request);
+                self.request_session_action(request);
             }
             PopoverAction::SetVolume(volume) => {
                 if let Some(audio) = self.synoik.audio_backend.as_ref() {
@@ -3915,15 +3915,15 @@ impl State {
             Action::PowerOnMonitors => {
                 self.synoik.activate_monitors(&mut self.backend);
             }
-            Action::Logout => self
-                .synoik
-                .request_session_action(crate::end_session::SessionRequest::Logout),
-            Action::PowerOff => self
-                .synoik
-                .request_session_action(crate::end_session::SessionRequest::PowerOff),
-            Action::Reboot => self
-                .synoik
-                .request_session_action(crate::end_session::SessionRequest::Reboot),
+            Action::Logout => {
+                self.request_session_action(crate::end_session::SessionRequest::Logout)
+            }
+            Action::PowerOff => {
+                self.request_session_action(crate::end_session::SessionRequest::PowerOff)
+            }
+            Action::Reboot => {
+                self.request_session_action(crate::end_session::SessionRequest::Reboot)
+            }
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.synoik.queue_redraw_all();

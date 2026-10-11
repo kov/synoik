@@ -7851,29 +7851,9 @@ impl State {
         use crate::dbus::gnome_session::EndSessionDialogToSynoik;
         use crate::end_session::EndSessionType;
 
-        let now = self.synoik.clock.now_unadjusted();
         match msg {
             EndSessionDialogToSynoik::Open { kind, seconds } => {
-                let kind = EndSessionType::from_u32(kind);
-                self.synoik.end_session.open(kind, seconds, now);
-                // Before gnome-software answers the presentation is just the wire type; a restart
-                // with an already-scheduled update is promoted when the reply lands.
-                let presentation = self
-                    .synoik
-                    .end_session
-                    .presentation()
-                    .expect("a dialog was just opened");
-                self.synoik.end_session_dialog.show(presentation);
-                self.synoik.end_session_dialog.set_content(
-                    presentation,
-                    self.synoik.end_session.seconds_left(now),
-                    self.synoik.update_checkbox(),
-                );
-                // Ask gnome-software what is pending. Asynchronous: the dialog is already up, and
-                // the checkbox appears if and when the answer says there is something to install.
-                self.synoik.query_offline_updates();
-                self.synoik.reschedule_end_session_timer();
-                self.synoik.queue_redraw_all();
+                self.open_end_session_dialog(EndSessionType::from_u32(kind), seconds);
             }
             EndSessionDialogToSynoik::Close => {
                 if self.synoik.end_session.close() {
@@ -7882,6 +7862,59 @@ impl State {
                     self.synoik.queue_redraw_all();
                 }
             }
+        }
+    }
+
+    /// Raise the logout/shutdown/restart confirmation, counting down `seconds`.
+    pub fn open_end_session_dialog(
+        &mut self,
+        kind: crate::end_session::EndSessionType,
+        seconds: u64,
+    ) {
+        let now = self.synoik.clock.now_unadjusted();
+        self.synoik.end_session.open(kind, seconds, now);
+        // Before gnome-software answers the presentation is just the wire type; a restart
+        // with an already-scheduled update is promoted when the reply lands.
+        let presentation = self
+            .synoik
+            .end_session
+            .presentation()
+            .expect("a dialog was just opened");
+        self.synoik.end_session_dialog.show(presentation);
+        self.synoik.end_session_dialog.set_content(
+            presentation,
+            self.synoik.end_session.seconds_left(now),
+            self.synoik.update_checkbox(),
+        );
+        // Ask gnome-software what is pending. Asynchronous: the dialog is already up, and
+        // the checkbox appears if and when the answer says there is something to install.
+        self.synoik.query_offline_updates();
+        self.synoik.reschedule_end_session_timer();
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Start a logout, power-off, reboot or suspend. A user's session asks gnome-session, which
+    /// comes back with `EndSessionDialog.Open`. The greeter has no gnome-session: it raises the
+    /// same dialog itself, with gnome-session's countdown, and the confirmation goes to logind
+    /// (`Synoik::emit_confirmation`); Suspend goes straight there.
+    pub fn request_session_action(&mut self, request: crate::end_session::SessionRequest) {
+        use crate::end_session::{EndSessionType, SessionRequest};
+        /// gnome-session's `AUTOMATIC_ACTION_TIMEOUT` (`gsm-shell.c:40`), seconds.
+        const AUTOMATIC_ACTION_TIMEOUT: u64 = 60;
+
+        if !self.synoik.greeter {
+            self.synoik.request_session_action(request);
+            return;
+        }
+        match request {
+            SessionRequest::Suspend => self.synoik.login1_power_action("Suspend"),
+            SessionRequest::PowerOff => {
+                self.open_end_session_dialog(EndSessionType::Shutdown, AUTOMATIC_ACTION_TIMEOUT)
+            }
+            SessionRequest::Reboot => {
+                self.open_end_session_dialog(EndSessionType::Restart, AUTOMATIC_ACTION_TIMEOUT)
+            }
+            SessionRequest::Logout => warn!("the greeter has no session to log out of"),
         }
     }
 
@@ -17130,7 +17163,16 @@ impl Synoik {
     /// before emitting, for the same reason — a `shutdown` that gnome-software accepted must
     /// become a reboot on the wire, and one it refused must not.
     pub(crate) fn emit_confirmation(&self, confirmation: crate::end_session::Confirmation) {
-        use crate::end_session::UpdateDecision;
+        use crate::end_session::{EndSessionType, UpdateDecision};
+
+        if self.greeter {
+            match confirmation.kind {
+                EndSessionType::Shutdown => self.login1_power_action("PowerOff"),
+                EndSessionType::Restart => self.login1_power_action("Reboot"),
+                EndSessionType::Logout => {}
+            }
+            return;
+        }
 
         let accepted = match (confirmation.updates, self.gnome_software_conn()) {
             (UpdateDecision::Install(action), Some(conn)) => {
@@ -17262,6 +17304,14 @@ impl Synoik {
 
     /// Ask gnome-session to start a logout/power-off/restart (the `Logout`/`PowerOff`/`Reboot`
     /// actions). gnome-session then calls `EndSessionDialog.Open` back on us.
+    /// `Suspend`, `Reboot` or `PowerOff` through logind — the greeter's power menu.
+    pub fn login1_power_action(&self, method: &'static str) {
+        match self.dbus.as_ref().and_then(|d| d.conn_login1.as_ref()) {
+            Some(conn) => crate::dbus::freedesktop_login1::power_action(conn, method),
+            None => warn!("cannot {method}: no logind connection"),
+        }
+    }
+
     pub fn request_session_action(&self, request: crate::end_session::SessionRequest) {
         let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_end_session.clone()) else {
             warn!("cannot request {request:?}: no session bus connection");

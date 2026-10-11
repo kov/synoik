@@ -41751,3 +41751,29 @@ fn the_greeter_is_gdm_mode() {
     click_panel_at(&mut f, x);
     assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_DATE_MENU));
 }
+
+/// The greeter has no gnome-session to ask, so its Power Off raises the confirmation itself, with
+/// gnome-session's 60 s countdown (`gsm-shell.c:40`); Suspend asks nothing.
+#[test]
+fn the_greeters_power_off_confirms_like_gnome_session() {
+    use crate::end_session::{EndSessionType, SessionRequest};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik().sync_session_mode();
+
+    f.synoik_state()
+        .request_session_action(SessionRequest::Suspend);
+    assert!(!f.synoik().end_session.is_open());
+
+    f.synoik_state()
+        .request_session_action(SessionRequest::PowerOff);
+    let now = f.synoik().clock.now_unadjusted();
+    assert_eq!(
+        f.synoik().end_session.kind(),
+        Some(EndSessionType::Shutdown)
+    );
+    assert_eq!(f.synoik().end_session.seconds_left(now), Some(60));
+}
