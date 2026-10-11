@@ -15,7 +15,9 @@ use smithay::desktop::{
 use smithay::input::pointer::Focus;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::ConstraintAdjustment;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+    self, ConstraintAdjustment,
+};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::{self};
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration;
 use smithay::reexports::wayland_server::protocol::wl_output;
@@ -1549,7 +1551,7 @@ impl State {
         let mut target = self.synoik.layout.popup_target_rect(window);
         target.loc -= get_popup_toplevel_coords(popup).to_f64();
 
-        self.position_popup_within_rect(popup, target, true);
+        self.position_popup_within_rect(popup, target);
     }
 
     pub fn unconstrain_layer_shell_popup(
@@ -1584,25 +1586,14 @@ impl State {
         target.loc -= get_popup_toplevel_coords(popup);
 
         // Don't add padding to layer-shell popups. It's not really needed, and it's unexpected.
-        self.position_popup_within_rect(popup, target.to_f64(), false);
+        self.position_popup_within_rect(popup, target.to_f64());
     }
 
-    fn position_popup_within_rect(
-        &self,
-        popup: &PopupKind,
-        target: Rectangle<f64, Logical>,
-        padding: bool,
-    ) {
+    fn position_popup_within_rect(&self, popup: &PopupKind, target: Rectangle<f64, Logical>) {
         match popup {
             PopupKind::Xdg(popup) => {
                 popup.with_pending_state(|state| {
-                    state.geometry = if padding {
-                        unconstrain_with_padding(state.positioner, target)
-                    } else {
-                        state
-                            .positioner
-                            .get_unconstrained_geometry(target.to_i32_round())
-                    };
+                    state.geometry = place_popup(state.positioner, target.to_i32_round());
                 });
             }
             PopupKind::InputMethod(popup) => {
@@ -1694,45 +1685,151 @@ impl State {
     }
 }
 
-fn unconstrain_with_padding(
+/// Where a popup goes inside `target`, both relative to the parent's window geometry —
+/// mutter's `constrain_custom_rule` (`src/core/constraints.c:928-1246`).
+///
+/// It follows the protocol's order (flip, then slide, then resize) with mutter's one deviation:
+/// a flip is kept not only when it fits but whenever it leaves more of the popup inside the target
+/// than not flipping does. The protocol, and smithay's `get_unconstrained_geometry`, revert any
+/// flip that does not fit outright.
+pub fn place_popup(
     positioner: PositionerState,
-    target: Rectangle<f64, Logical>,
+    target: Rectangle<i32, Logical>,
 ) -> Rectangle<i32, Logical> {
-    // Try unconstraining with a small padding first which looks nicer, then if it doesn't fit try
-    // unconstraining without padding.
-    const PADDING: f64 = 8.;
-
-    let mut padded = target;
-    if PADDING * 2. < padded.size.w {
-        padded.loc.x += PADDING;
-        padded.size.w -= PADDING * 2.;
-    }
-    if PADDING * 2. < padded.size.h {
-        padded.loc.y += PADDING;
-        padded.size.h -= PADDING * 2.;
-    }
-
-    // No padding, so just unconstrain with the original target.
-    if padded == target {
-        return positioner.get_unconstrained_geometry(target.to_i32_round());
-    }
-
-    // Do not try to resize to fit the padded target rectangle.
-    let mut no_resize = positioner;
-    no_resize
-        .constraint_adjustment
-        .remove(ConstraintAdjustment::ResizeX);
-    no_resize
-        .constraint_adjustment
-        .remove(ConstraintAdjustment::ResizeY);
-
-    let geo = no_resize.get_unconstrained_geometry(padded.to_i32_round());
-    if padded.contains_rect(geo.to_f64()) {
+    let adjustment = positioner.constraint_adjustment;
+    let mut geo = positioner.get_geometry();
+    let mut inside = intersect(geo, target);
+    if is_placement_satisfied(geo, inside, adjustment) {
         return geo;
     }
 
-    // Could not unconstrain into the padded target, so resort to the regular one.
-    positioner.get_unconstrained_geometry(target.to_i32_round())
+    let mut rule = positioner;
+    if geo.size.w != inside.size.w && adjustment.contains(ConstraintAdjustment::FlipX) {
+        let mut flipped = rule;
+        flipped.anchor_edges = flip_anchor_x(flipped.anchor_edges);
+        flipped.gravity = flip_gravity_x(flipped.gravity);
+        let flipped_geo = flipped.get_geometry();
+        let flipped_inside = intersect(flipped_geo, target);
+        if flipped_inside.size.w == flipped_geo.size.w || flipped_inside.size.w > inside.size.w {
+            (rule, geo, inside) = (flipped, flipped_geo, flipped_inside);
+        }
+    }
+    if geo.size.h != inside.size.h && adjustment.contains(ConstraintAdjustment::FlipY) {
+        let mut flipped = rule;
+        flipped.anchor_edges = flip_anchor_y(flipped.anchor_edges);
+        flipped.gravity = flip_gravity_y(flipped.gravity);
+        let flipped_geo = flipped.get_geometry();
+        let flipped_inside = intersect(flipped_geo, target);
+        if flipped_inside.size.h == flipped_geo.size.h || flipped_inside.size.h > inside.size.h {
+            (geo, inside) = (flipped_geo, flipped_inside);
+        }
+    }
+    if is_placement_satisfied(geo, inside, adjustment) {
+        return geo;
+    }
+
+    let target_right = target.loc.x + target.size.w;
+    let target_bottom = target.loc.y + target.size.h;
+    if adjustment.contains(ConstraintAdjustment::SlideX) {
+        if geo.loc.x + geo.size.w > target_right {
+            geo.loc.x = target.loc.x.max(target_right - geo.size.w);
+        } else if geo.loc.x < target.loc.x {
+            geo.loc.x = target.loc.x;
+        }
+    }
+    if adjustment.contains(ConstraintAdjustment::SlideY) {
+        if geo.loc.y + geo.size.h > target_bottom {
+            geo.loc.y = target.loc.y.max(target_bottom - geo.size.h);
+        } else if geo.loc.y < target.loc.y {
+            geo.loc.y = target.loc.y;
+        }
+    }
+    let inside = intersect(geo, target);
+    if is_placement_satisfied(geo, inside, adjustment) {
+        return geo;
+    }
+
+    if adjustment.contains(ConstraintAdjustment::ResizeX) {
+        geo.loc.x = inside.loc.x;
+        geo.size.w = inside.size.w;
+    }
+    if adjustment.contains(ConstraintAdjustment::ResizeY) {
+        geo.loc.y = inside.loc.y;
+        geo.size.h = inside.size.h;
+    }
+    geo
+}
+
+/// `mtk_rectangle_intersect`: an empty intersection is a zero-sized rectangle, not "none".
+fn intersect(a: Rectangle<i32, Logical>, b: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    a.intersection(b).unwrap_or_default()
+}
+
+/// `is_custom_rule_satisfied` (`constraints.c:866-886`): an axis is satisfied when it is wholly
+/// inside, or when the client allowed no adjustment on it at all.
+fn is_placement_satisfied(
+    geo: Rectangle<i32, Logical>,
+    inside: Rectangle<i32, Logical>,
+    adjustment: ConstraintAdjustment,
+) -> bool {
+    let x_actions =
+        ConstraintAdjustment::SlideX | ConstraintAdjustment::ResizeX | ConstraintAdjustment::FlipX;
+    let y_actions =
+        ConstraintAdjustment::SlideY | ConstraintAdjustment::ResizeY | ConstraintAdjustment::FlipY;
+    !((adjustment.intersects(x_actions) && geo.size.w != inside.size.w)
+        || (adjustment.intersects(y_actions) && geo.size.h != inside.size.h))
+}
+
+fn flip_anchor_x(anchor: xdg_positioner::Anchor) -> xdg_positioner::Anchor {
+    use xdg_positioner::Anchor::*;
+    match anchor {
+        Left => Right,
+        Right => Left,
+        TopLeft => TopRight,
+        TopRight => TopLeft,
+        BottomLeft => BottomRight,
+        BottomRight => BottomLeft,
+        other => other,
+    }
+}
+
+fn flip_anchor_y(anchor: xdg_positioner::Anchor) -> xdg_positioner::Anchor {
+    use xdg_positioner::Anchor::*;
+    match anchor {
+        Top => Bottom,
+        Bottom => Top,
+        TopLeft => BottomLeft,
+        BottomLeft => TopLeft,
+        TopRight => BottomRight,
+        BottomRight => TopRight,
+        other => other,
+    }
+}
+
+fn flip_gravity_x(gravity: xdg_positioner::Gravity) -> xdg_positioner::Gravity {
+    use xdg_positioner::Gravity::*;
+    match gravity {
+        Left => Right,
+        Right => Left,
+        TopLeft => TopRight,
+        TopRight => TopLeft,
+        BottomLeft => BottomRight,
+        BottomRight => BottomLeft,
+        other => other,
+    }
+}
+
+fn flip_gravity_y(gravity: xdg_positioner::Gravity) -> xdg_positioner::Gravity {
+    use xdg_positioner::Gravity::*;
+    match gravity {
+        Top => Bottom,
+        Bottom => Top,
+        TopLeft => BottomLeft,
+        BottomLeft => TopLeft,
+        TopRight => BottomRight,
+        BottomRight => TopRight,
+        other => other,
+    }
 }
 
 pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId {

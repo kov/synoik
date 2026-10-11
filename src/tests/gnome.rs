@@ -41585,3 +41585,87 @@ fn a_workspace_switch_arrives_instead_of_snapping_into_place() {
         &steps[steps.len().saturating_sub(10)..]
     );
 }
+
+/// A popup that fits neither below nor above its anchor flips to whichever side holds more of it,
+/// then shrinks — mutter's `constrain_custom_rule` (`src/core/constraints.c:928-1246`).
+///
+/// The geometry is GNOME Settings' finger menu on a 1280x800 screen: 424 px tall, anchored under a
+/// button with 343 px below and 391 px above. The protocol's own order reverts a flip that does not
+/// fit outright and shrinks the popup below the button, to 343; mutter keeps the flip, since more
+/// of the popup lands inside, and shrinks it to 391.
+#[test]
+fn a_popup_flips_to_the_roomier_side_when_neither_fits() {
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+    use smithay::utils::Rectangle;
+    use smithay::wayland::shell::xdg::PositionerState;
+
+    let positioner = PositionerState {
+        rect_size: (189, 424).into(),
+        anchor_rect: Rectangle::new((622, 391).into(), (34, 34).into()),
+        anchor_edges: Anchor::Bottom,
+        gravity: Gravity::Bottom,
+        constraint_adjustment: ConstraintAdjustment::SlideX
+            | ConstraintAdjustment::FlipY
+            | ConstraintAdjustment::ResizeX
+            | ConstraintAdjustment::ResizeY,
+        ..Default::default()
+    };
+    let work_area = Rectangle::from_size((1280, 768).into());
+
+    assert_eq!(
+        crate::handlers::place_popup(positioner, work_area),
+        Rectangle::new((545, 0).into(), (189, 391).into()),
+        "above the button, shrunk to the 391 px there"
+    );
+}
+
+/// A popup that fits only on the flipped side flips and keeps its size; one that fits where the
+/// client put it is left alone; and a slide happens only after a flip could not help.
+#[test]
+fn a_popup_flips_when_that_fits_and_otherwise_slides() {
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+    use smithay::utils::Rectangle;
+    use smithay::wayland::shell::xdg::PositionerState;
+
+    let work_area = Rectangle::from_size((1000, 800).into());
+    let menu = |anchor_y: i32, adjustment: ConstraintAdjustment| PositionerState {
+        rect_size: (200, 300).into(),
+        anchor_rect: Rectangle::new((400, anchor_y).into(), (40, 40).into()),
+        anchor_edges: Anchor::Bottom,
+        gravity: Gravity::Bottom,
+        constraint_adjustment: adjustment,
+        ..Default::default()
+    };
+    let all = ConstraintAdjustment::all();
+
+    // Fits below: unchanged.
+    assert_eq!(
+        crate::handlers::place_popup(menu(100, all), work_area),
+        Rectangle::new((320, 140).into(), (200, 300).into())
+    );
+    // No room below, room above: flipped, full size.
+    assert_eq!(
+        crate::handlers::place_popup(menu(600, all), work_area),
+        Rectangle::new((320, 300).into(), (200, 300).into())
+    );
+    // No flip allowed: slid up until it fits.
+    assert_eq!(
+        crate::handlers::place_popup(
+            menu(
+                600,
+                ConstraintAdjustment::SlideY | ConstraintAdjustment::ResizeY
+            ),
+            work_area
+        ),
+        Rectangle::new((320, 500).into(), (200, 300).into())
+    );
+    // No adjustment at all: left hanging off the edge, as asked.
+    assert_eq!(
+        crate::handlers::place_popup(menu(600, ConstraintAdjustment::empty()), work_area),
+        Rectangle::new((320, 640).into(), (200, 300).into())
+    );
+}

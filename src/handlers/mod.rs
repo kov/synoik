@@ -79,6 +79,7 @@ use smithay::{
     delegate_single_pixel_buffer, delegate_tablet_manager, delegate_text_input_manager,
     delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation,
 };
+pub use xdg_shell::place_popup;
 
 use crate::clipboard::SelectionData;
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
