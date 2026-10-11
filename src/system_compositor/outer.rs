@@ -10,10 +10,12 @@
 //! that thinness is what keeps restart and reattach cheap (§1, §7).
 //!
 //! What this cut does: master and modeset of the first connected display at its preferred mode,
-//! a plate until a session attaches, then one nested session unredirected, with the session's
-//! render fence handed to the commit as `IN_FENCE_FD` and the kernel's flip timestamps passed
-//! back. The DRM fd lives in systemd's fd store, so a restarted outer is still master and the
-//! session's last frame stays on screen across the gap (§1, §7).
+//! a plate until a session is fronted, then the fronted session unredirected, with its render
+//! fence handed to the commit as `IN_FENCE_FD` and the kernel's flip timestamps passed back. Any
+//! number of sessions may be attached; the one on screen is always the one logind made active on
+//! seat0 (§2.2), and nothing a background session presents reaches the screen. The DRM fd lives
+//! in systemd's fd store, so a restarted outer is still master and the session's last frame stays
+//! on screen across the gap (§1, §7).
 
 use std::collections::HashMap;
 use std::io;
@@ -68,6 +70,19 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
         )
         .map_err(|err| anyhow::anyhow!("inserting the listener: {err}"))?;
     info!("system compositor listening on {}", socket.display());
+
+    let seat_watch = watch_seats()?;
+    handle
+        .insert_source(
+            Generic::new(seat_watch, Interest::READ, Mode::Level),
+            |_, watch, outer: &mut Outer| {
+                drain_inotify(watch.as_fd());
+                outer.refresh_front();
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("inserting the seat watch: {err}"))?;
+    outer.refresh_front();
 
     notify(&[sd_notify::NotifyState::Ready]);
     event_loop.run(None, &mut outer, |_| ())?;
@@ -239,6 +254,16 @@ enum Shown {
     },
 }
 
+/// What to flip once the flip in flight completes.
+enum Next {
+    Plate,
+    Session {
+        generation: u64,
+        buffer: u32,
+        fence: Option<Rc<OwnedFd>>,
+    },
+}
+
 /// The display this cut drives: one connector, one CRTC.
 struct Display {
     connector_name: String,
@@ -251,15 +276,21 @@ struct Display {
     plate: framebuffer::Handle,
 }
 
-/// The attached session.
+/// An attached session.
 struct Session {
     fd: Rc<OwnedFd>,
     token: RegistrationToken,
-    /// Bumped per connection, so a flip that completes after a session left is not reported to
-    /// the next one.
+    /// Per connection, so a flip that completes after a session left is not reported to the next
+    /// one.
     generation: u64,
-    welcomed: bool,
+    uid: u32,
+    pid: i32,
+    /// The logind session it proved to be, once `Hello` is accepted.
+    logind_id: Option<String>,
     buffers: HashMap<u32, Rc<PrimeFramebuffer>>,
+    /// Its newest frame and the fence that completes it — what goes on screen the moment it is
+    /// fronted again, without waiting for it to draw.
+    latest: Option<(u32, Option<Rc<OwnedFd>>)>,
 }
 
 struct Outer {
@@ -268,15 +299,17 @@ struct Outer {
     _drm: DrmDevice,
     display: Display,
     render_node: Option<(u64, u64)>,
-    session: Option<Session>,
+    sessions: HashMap<u64, Session>,
     next_generation: u64,
+    /// seat0's active logind session, as logind last wrote it.
+    front: Option<String>,
     /// The last frame whose flip completed.
     on_screen: Shown,
     /// The flip in flight, if any. One at a time: the kernel refuses a second flip on a CRTC with
     /// one pending.
     in_flight: Option<Shown>,
-    /// A present that arrived while a flip was in flight; latest wins.
-    queued: Option<(u32, Option<OwnedFd>)>,
+    /// What to show once the flip in flight lands; latest wins.
+    queued: Option<Next>,
 }
 
 impl Outer {
@@ -308,8 +341,9 @@ impl Outer {
             _drm: drm,
             display,
             render_node,
-            session: None,
+            sessions: HashMap::new(),
             next_generation: 1,
+            front: None,
             on_screen: Shown::Plate,
             in_flight: None,
             queued: None,
@@ -379,50 +413,39 @@ impl Outer {
                 return;
             }
         };
-        if let Err(reason) = peer_may_attach(cred.uid) {
-            warn!(
-                "refusing a session from pid {} uid {}: {reason}",
-                cred.pid, cred.uid
-            );
-            return;
-        }
-        if self.session.is_some() {
-            // One session in this cut. Switching is the next milestone, and it replaces this with
-            // fronting the session logind made active (§2.2), never "last one to connect wins".
-            warn!(
-                "refusing a second session (pid {} uid {}): one is attached",
-                cred.pid, cred.uid
-            );
-            return;
-        }
-        info!("session connected: pid {} uid {}", cred.pid, cred.uid);
+        debug!("connection from pid {} uid {}", cred.pid, cred.uid);
 
         let fd = Rc::new(fd);
         let generation = self.next_generation;
         self.next_generation += 1;
-        let source_fd = fd.clone();
         let token = self
             .handle
             .insert_source(
-                Generic::new(FdRef(source_fd), Interest::READ, Mode::Level),
+                Generic::new(FdRef(fd.clone()), Interest::READ, Mode::Level),
                 move |_, _, outer: &mut Outer| {
                     outer.on_session_readable(generation);
                     Ok(PostAction::Continue)
                 },
             )
             .expect("inserting a session source");
-        self.session = Some(Session {
-            fd,
-            token,
+        self.sessions.insert(
             generation,
-            welcomed: false,
-            buffers: HashMap::new(),
-        });
+            Session {
+                fd,
+                token,
+                generation,
+                uid: cred.uid,
+                pid: cred.pid,
+                logind_id: None,
+                buffers: HashMap::new(),
+                latest: None,
+            },
+        );
     }
 
     fn on_session_readable(&mut self, generation: u64) {
         loop {
-            let Some(session) = self.session.as_ref().filter(|s| s.generation == generation) else {
+            let Some(session) = self.sessions.get(&generation) else {
                 return;
             };
             let fd = session.fd.clone();
@@ -430,49 +453,109 @@ impl Outer {
                 Ok(Received::Message(msg, fds)) => {
                     if fds.len() != msg.fd_count() {
                         warn!(
-                            "dropping the session: {msg:?} came with {} fds, expected {}",
+                            "dropping a session: {msg:?} came with {} fds, expected {}",
                             fds.len(),
                             msg.fd_count()
                         );
-                        self.drop_session();
+                        self.drop_session(generation);
                         return;
                     }
-                    if let Err(err) = self.handle_message(msg, fds) {
-                        warn!("dropping the session: {err:#}");
-                        self.drop_session();
+                    if let Err(err) = self.handle_message(generation, msg, fds) {
+                        warn!("dropping a session: {err:#}");
+                        self.drop_session(generation);
                         return;
                     }
                 }
                 Ok(Received::WouldBlock) => return,
                 Ok(Received::Closed) => {
-                    info!("session disconnected");
-                    self.drop_session();
+                    info!("session {:?} disconnected", session.logind_id);
+                    self.drop_session(generation);
                     return;
                 }
                 Err(err) => {
-                    warn!("dropping the session: {err}");
-                    self.drop_session();
+                    warn!("dropping a session: {err}");
+                    self.drop_session(generation);
                     return;
                 }
             }
         }
     }
 
-    /// Forget the session. Whatever it last showed stays on screen — its framebuffer is held by
-    /// `on_screen` — until something replaces it, so a session that crashes or restarts leaves its
-    /// last frame up rather than a flash of plate (§7 is the same rule seen from the other end).
-    fn drop_session(&mut self) {
-        if let Some(session) = self.session.take() {
+    /// Forget a session. If it is on screen its frame stays up — the framebuffer is held by
+    /// `on_screen` — until something replaces it, so a fronted session that crashes or restarts
+    /// leaves its last frame rather than a flash of plate (§7 seen from the other end).
+    fn drop_session(&mut self, generation: u64) {
+        if let Some(session) = self.sessions.remove(&generation) {
             self.handle.remove(session.token);
         }
-        if let Some((buffer, _)) = self.queued.take() {
-            debug!("dropping queued buffer {buffer} of a departed session");
+        if matches!(self.queued, Some(Next::Session { generation: g, .. }) if g == generation) {
+            self.queued = None;
         }
     }
 
-    fn handle_message(&mut self, msg: ToOuter, mut fds: Vec<OwnedFd>) -> anyhow::Result<()> {
-        let session = self.session.as_mut().expect("only called with a session");
-        if !session.welcomed && !matches!(msg, ToOuter::Hello { .. }) {
+    /// The attached session logind has fronted, if any.
+    fn fronted(&self) -> Option<u64> {
+        let front = self.front.as_deref()?;
+        self.sessions
+            .values()
+            .find(|s| s.logind_id.as_deref() == Some(front))
+            .map(|s| s.generation)
+    }
+
+    /// Re-read seat0's active session and, if it changed, put the new one on screen.
+    ///
+    /// The screen follows logind and nothing else (§2.2): logind is what moved input to that
+    /// session, so the session on screen and the session typed into can never disagree.
+    fn refresh_front(&mut self) {
+        let front = read_seat_active("seat0");
+        if front == self.front {
+            return;
+        }
+        info!("seat0 fronts session {front:?} (was {:?})", self.front);
+        self.front = front;
+
+        // Never leave the previous session's frame up for whoever is at the seat now: show the
+        // new session's newest frame, or the plate until it draws one.
+        let next = match self.fronted().and_then(|g| self.sessions.get(&g)) {
+            Some(Session {
+                generation,
+                latest: Some((buffer, fence)),
+                ..
+            }) => Next::Session {
+                generation: *generation,
+                buffer: *buffer,
+                fence: fence.clone(),
+            },
+            _ => Next::Plate,
+        };
+        self.show(next);
+    }
+
+    /// Show `next` now, or once the flip in flight lands.
+    fn show(&mut self, next: Next) {
+        if self.in_flight.is_some() {
+            if let Some(Next::Session {
+                generation, buffer, ..
+            }) = self.queued.replace(next)
+            {
+                self.discard(generation, buffer);
+            }
+        } else {
+            self.flip(next);
+        }
+    }
+
+    fn handle_message(
+        &mut self,
+        generation: u64,
+        msg: ToOuter,
+        mut fds: Vec<OwnedFd>,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .get_mut(&generation)
+            .expect("only called for an attached session");
+        if session.logind_id.is_none() && !matches!(msg, ToOuter::Hello { .. }) {
             bail!("expected Hello first, got {msg:?}");
         }
 
@@ -481,7 +564,7 @@ impl Outer {
                 version,
                 session: id,
             } => {
-                if session.welcomed {
+                if session.logind_id.is_some() {
                     bail!("a second Hello");
                 }
                 if version != protocol::VERSION {
@@ -490,8 +573,14 @@ impl Outer {
                         protocol::VERSION
                     );
                 }
-                info!("session hello: logind session {id:?}");
-                session.welcomed = true;
+                let id = id.context("Hello names no logind session")?;
+                verify_session_claim(&id, session.uid, session.pid)
+                    .with_context(|| format!("pid {} claiming session {id}", session.pid))?;
+                info!(
+                    "session {id} attached (pid {} uid {})",
+                    session.pid, session.uid
+                );
+                session.logind_id = Some(id);
                 let welcome = ToInner::Welcome {
                     version: protocol::VERSION,
                     render_node: self.render_node,
@@ -525,6 +614,9 @@ impl Outer {
             }
             ToOuter::RemoveBuffer { id } => {
                 session.buffers.remove(&id);
+                if matches!(session.latest, Some((b, _)) if b == id) {
+                    session.latest = None;
+                }
             }
             ToOuter::Present {
                 output,
@@ -537,30 +629,52 @@ impl Outer {
                 if !session.buffers.contains_key(&buffer) {
                     bail!("present of unknown buffer {buffer}");
                 }
-                let fence = fenced.then(|| fds.remove(0));
-                if self.in_flight.is_some() {
-                    if let Some((stale, _)) = self.queued.replace((buffer, fence)) {
-                        self.discard(stale);
-                    }
+                let fence = fenced.then(|| Rc::new(fds.remove(0)));
+                session.latest = Some((buffer, fence.clone()));
+                if self.fronted() == Some(generation) {
+                    self.show(Next::Session {
+                        generation,
+                        buffer,
+                        fence,
+                    });
                 } else {
-                    self.flip(buffer, fence);
+                    // A background session does not reach the screen. It hears so at once, so it
+                    // is not left waiting for a flip, and it keeps the frame as its latest.
+                    self.discard(generation, buffer);
                 }
             }
         }
         Ok(())
     }
 
-    /// Flip `buffer` onto the screen, gated on `fence` in the kernel (`IN_FENCE_FD`), so the
-    /// session's render is never shown half-done and the outer never blocks on it.
-    fn flip(&mut self, buffer: u32, fence: Option<OwnedFd>) {
-        let Some(session) = &self.session else {
-            return;
-        };
-        let Some(fb) = session.buffers.get(&buffer).cloned() else {
-            return;
-        };
-        let generation = session.generation;
+    /// Put `next` on the screen. A session frame is gated on its fence in the kernel
+    /// (`IN_FENCE_FD`), so it is never shown half-rendered and the outer never blocks on it.
+    fn flip(&mut self, next: Next) {
         let size = self.mode_size();
+        let (fb_handle, shown, fence) = match next {
+            Next::Plate => (self.display.plate, Shown::Plate, None),
+            Next::Session {
+                generation,
+                buffer,
+                fence,
+            } => {
+                let Some(fb) = self
+                    .sessions
+                    .get(&generation)
+                    .and_then(|s| s.buffers.get(&buffer))
+                    .cloned()
+                else {
+                    return;
+                };
+                let handle = *(*fb).as_ref();
+                let shown = Shown::Session {
+                    buffer,
+                    _fb: fb,
+                    generation,
+                };
+                (handle, shown, fence)
+            }
+        };
         let plane = PlaneState {
             handle: self.display.surface.plane(),
             config: Some(PlaneConfig {
@@ -569,34 +683,33 @@ impl Outer {
                 transform: Transform::Normal,
                 alpha: 1.0,
                 damage_clips: None,
-                fb: *(*fb).as_ref(),
+                fb: fb_handle,
                 fence: fence.as_ref().map(|fd| fd.as_fd()),
                 hotspot: None,
             }),
         };
         match self.display.surface.page_flip([plane], true) {
-            Ok(()) => {
-                self.in_flight = Some(Shown::Session {
-                    buffer,
-                    _fb: fb,
-                    generation,
-                });
-            }
+            Ok(()) => self.in_flight = Some(shown),
             Err(err) => {
-                warn!("flip of buffer {buffer} refused: {err}");
-                self.discard(buffer);
+                warn!("flip refused: {err}");
+                if let Shown::Session {
+                    generation, buffer, ..
+                } = shown
+                {
+                    self.discard(generation, buffer);
+                }
             }
         }
     }
 
-    fn discard(&self, buffer: u32) {
-        if let Some(session) = &self.session {
+    fn discard(&self, generation: u64, buffer: u32) {
+        if let Some(session) = self.sessions.get(&generation) {
             let msg = ToInner::Discarded {
                 output: self.display.connector_name.clone(),
                 buffer,
             };
             if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
-                warn!("telling the session buffer {buffer} was discarded: {err}");
+                warn!("telling a session buffer {buffer} was discarded: {err}");
             }
         }
     }
@@ -611,11 +724,7 @@ impl Outer {
             buffer, generation, ..
         } = &shown
         {
-            if let Some(session) = self
-                .session
-                .as_ref()
-                .filter(|s| s.generation == *generation)
-            {
+            if let Some(session) = self.sessions.get(generation) {
                 let (sequence, time_ns) = match meta {
                     Some(DrmEventMetadata {
                         sequence,
@@ -632,15 +741,15 @@ impl Outer {
                     refresh_ns: self.display.refresh.as_nanos() as u64,
                 };
                 if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
-                    warn!("reporting a flip to the session: {err}");
+                    warn!("reporting a flip to a session: {err}");
                 }
             }
         }
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
         self.on_screen = shown;
 
-        if let Some((buffer, fence)) = self.queued.take() {
-            self.flip(buffer, fence);
+        if let Some(next) = self.queued.take() {
+            self.flip(next);
         }
     }
 }
@@ -756,24 +865,76 @@ fn peer_cred(fd: BorrowedFd<'_>) -> io::Result<PeerCred> {
     })
 }
 
-/// Whether a process running as `uid` may attach as the fronted session.
+/// Check that a peer is entitled to the logind session it names.
 ///
-/// The rule is logind's, not ours: the session that may be on screen is the one logind made
-/// active on the seat, which is also the one whose input it routes (§2.2). Read from logind's seat
-/// state file, the same source `sd_seat_get_active` reads.
-fn peer_may_attach(uid: u32) -> Result<(), String> {
-    let state = std::fs::read_to_string("/run/systemd/seats/seat0")
-        .map_err(|err| format!("reading seat0's state: {err}"))?;
-    let active_uid = state
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIVE_UID="))
-        .ok_or("seat0 has no active session")?;
-    if active_uid.trim() == uid.to_string() {
-        Ok(())
-    } else {
-        Err(format!(
-            "seat0's active session belongs to uid {}",
-            active_uid.trim()
-        ))
+/// A claim is accepted when the session exists on seat0, belongs to the peer's uid, and — when
+/// the peer runs inside a session scope at all — is that scope's session. That last case is the
+/// common one (a session compositor started from the session's login process); one started as a
+/// user service runs outside any scope, and then owning the session is what entitles it, which
+/// is also all logind itself asks before handing that uid the session's devices.
+fn verify_session_claim(id: &str, uid: u32, pid: i32) -> anyhow::Result<()> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!("not a session id: {id:?}");
     }
+    let state = std::fs::read_to_string(format!("/run/systemd/sessions/{id}"))
+        .with_context(|| format!("no logind session {id}"))?;
+    let field = |key: &str| {
+        state
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    if field("UID").as_deref() != Some(uid.to_string().as_str()) {
+        bail!("session {id} does not belong to uid {uid}");
+    }
+    if field("SEAT").as_deref() != Some("seat0") {
+        bail!("session {id} is not on seat0");
+    }
+    if let Some(scope) = session_of_pid(pid) {
+        if scope != id {
+            bail!("the peer runs in session {scope}");
+        }
+    }
+    Ok(())
+}
+
+/// The logind session whose scope `pid` runs in, read the way `sd_pid_get_session` does.
+fn session_of_pid(pid: i32) -> Option<String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    cgroup
+        .split('/')
+        .find_map(|part| part.strip_prefix("session-")?.strip_suffix(".scope"))
+        .map(|id| id.trim().to_owned())
+}
+
+/// The active session of `seat`, from logind's own state file — what `sd_seat_get_active` reads.
+fn read_seat_active(seat: &str) -> Option<String> {
+    let state = std::fs::read_to_string(format!("/run/systemd/seats/{seat}")).ok()?;
+    state
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIVE="))
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+}
+
+/// An inotify watch on logind's seat state, the mechanism `sd_login_monitor` uses: logind
+/// rewrites `/run/systemd/seats/<seat>` by rename on every change of the active session.
+fn watch_seats() -> anyhow::Result<OwnedFd> {
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error()).context("inotify_init1");
+    }
+    // SAFETY: just created.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let path = c"/run/systemd/seats";
+    let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_CREATE | libc::IN_DELETE;
+    if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } < 0 {
+        return Err(io::Error::last_os_error()).context("watching /run/systemd/seats");
+    }
+    Ok(fd)
+}
+
+fn drain_inotify(fd: BorrowedFd<'_>) {
+    let mut buf = [0u8; 4096];
+    while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }

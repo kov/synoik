@@ -700,8 +700,8 @@ impl Nested {
         }
     }
 
-    /// The outer will never show the frame in flight. Its slot is free again and the screen still
-    /// shows the previous one, so this output owes a fresh frame.
+    /// The outer will not show the frame in flight — the flip was refused, or this session is not
+    /// the one logind fronts. Its slot is free again, and an active session owes a fresh frame.
     fn on_discarded(&mut self, synoik: &mut Synoik, name: &str, buffer: u32) {
         let Some(out) = self.outputs.get_mut(name) else {
             return;
@@ -718,7 +718,11 @@ impl Nested {
         if let Some(state) = synoik.output_state.get_mut(&output) {
             state.redraw_state = RedrawState::Idle;
         }
-        synoik.queue_redraw(&output);
+        // A session in the background is discarded because it is not on screen; redrawing would
+        // only be discarded again. Activation redraws everything (`on_session_event`).
+        if self.session.is_active() {
+            synoik.queue_redraw(&output);
+        }
     }
 
     pub(super) fn on_estimated_vblank_timer(&self, synoik: &mut Synoik, output: Output) {

@@ -1,8 +1,9 @@
 # The system compositor
 
-> Status: **design agreed 2026-08-15; first milestone built** — one session nested and scanned out
-> unredirected, surviving a crash of either side (§10). Greeter, switching and transitions are not
-> built. The outer is an unprivileged system user outside logind (§9 S1).
+> Status: **design agreed 2026-08-15; partly built** — sessions nested and scanned out
+> unredirected, the screen following logind's active session, surviving a crash of either side
+> (§10). Transitions and the greeter are not built. The outer is an unprivileged system user
+> outside logind (§9 S1).
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -374,27 +375,36 @@ screen in the inner, and moving it means the outer grows real UI — against §1
 
 ## 10. What is built
 
-One session, nested and unredirected — the steady state of §1 and the reliability of §7, nothing
-of §4/§5 yet.
+Sessions nested and unredirected, switched by logind — the steady state of §1, the fronting rule
+of §2.2 and the reliability of §7; none of §4/§5's transitions yet.
 
 - **Wire** (`system_compositor::protocol`): one JSON message per `SOCK_SEQPACKET` packet, fds as
   `SCM_RIGHTS` on the same packet, version refused on mismatch. `Hello`/`Welcome` (render node,
   connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
   (kernel flip time and sequence, untouched, §3.1) or `Discarded`.
 - **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): opens or recovers the
-  card, modesets the first connected display at its preferred mode, shows a plate until a session
-  attaches, flips one session's buffers. A connection is accepted only from the uid of seat0's
-  active session (logind's own state). A departing session's last frame stays up until replaced.
+  card, modesets the first connected display at its preferred mode, and flips the buffers of the
+  session logind has made active on seat0, following `ACTIVE=` in `/run/systemd/seats/seat0` by
+  inotify (`sd_login_monitor`'s mechanism). Any number of sessions attach; each names its logind
+  session in `Hello`, accepted only if that session is on seat0, owned by the peer's uid, and —
+  when the peer runs in a session scope — that scope's. A background session's presents are
+  discarded at once and kept as its latest frame. On a switch the outer shows the new session's
+  latest frame, or the plate until it draws one — never the previous session's frame. A departing
+  fronted session's last frame stays up until replaced.
 - **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
-  backend takes it; renders like headless into three scanout slots; paces off `Presented` as the
-  tty does off vblank. On losing the outer it keeps running, retries, re-registers its buffers
-  and redraws in full.
+  backend takes it; renders like headless into three scanout slots, only while logind has it
+  active; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
+  retries, re-registers its buffers and redraws in full.
 
 Measured 2026-10-11 on enhanced F44 under Limina (venus), session autologged on tty1, no fbcon: injected input reaches the session through logind and the frames flip contiguously
 through the session's own buffers; SIGKILL of the outer is invisible on screen (the session's
 frame stays up, the outer restarts with the stored fd still master, the session reattaches within
 the 0.5 s retry); SIGKILL of the session leaves its last frame up until the next session's first.
+With two sessions (tty1, tty2), an injected Ctrl+Alt+F2 in one switched logind and the outer
+followed: the other session's frames on screen, its overview answering Super, and the first
+session's desktop back untouched by those keys after Ctrl+Alt+F1. Switching to a session that has
+never drawn shows the plate for one frame (~50 ms) — what §5 step 6 removes.
 
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
-more than one output; switching, transitions, the greeter, the chord matcher.
+more than one output; transitions, the greeter, the chord matcher.
