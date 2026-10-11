@@ -24,17 +24,13 @@ pub enum PanelStyle {
     Transparent,
 }
 
+/// One mode's record. Only the flags something reads are here; the rest of a mode (overview,
+/// windows, run dialog, screencast, notifications) is enforced by the shield's own gates for now,
+/// and joins as a surface starts asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionMode {
     pub name: &'static str,
-    pub has_overview: bool,
-    pub show_calendar_events: bool,
     pub allow_settings: bool,
-    pub allow_screencast: bool,
-    pub has_run_dialog: bool,
-    pub has_workspaces: bool,
-    pub has_windows: bool,
-    pub has_notifications: bool,
     pub is_locked: bool,
     pub is_greeter: bool,
     /// Every panel role the mode shows, across its three boxes.
@@ -51,14 +47,7 @@ impl SessionMode {
 /// `restrictive` (`sessionMode.js:22-48`), the defaults the others override.
 const RESTRICTIVE: SessionMode = SessionMode {
     name: "restrictive",
-    has_overview: false,
-    show_calendar_events: false,
     allow_settings: false,
-    allow_screencast: false,
-    has_run_dialog: false,
-    has_workspaces: false,
-    has_windows: false,
-    has_notifications: false,
     is_locked: false,
     is_greeter: false,
     panel_roles: &[],
@@ -69,14 +58,7 @@ const RESTRICTIVE: SessionMode = SessionMode {
 /// a user's session does.
 pub const USER: SessionMode = SessionMode {
     name: "user",
-    has_overview: true,
-    show_calendar_events: true,
     allow_settings: true,
-    allow_screencast: true,
-    has_run_dialog: true,
-    has_workspaces: true,
-    has_windows: true,
-    has_notifications: true,
     panel_roles: &[
         ROLE_ACTIVITIES,
         ROLE_DATE_MENU,
@@ -99,11 +81,10 @@ pub const UNLOCK_DIALOG: SessionMode = SessionMode {
     ..RESTRICTIVE
 };
 
-/// `gdm` (`sessionMode.js:50-63`): the greeter. Notifications stay (the network agent's prompts
-/// and the like); a11y is the login dialog's own button rather than a panel item.
+/// `gdm` (`sessionMode.js:50-63`): the greeter. a11y is the login dialog's own button rather than
+/// a panel item.
 pub const GDM: SessionMode = SessionMode {
     name: "gdm",
-    has_notifications: true,
     is_greeter: true,
     panel_roles: &[ROLE_DATE_MENU, ROLE_KEYBOARD, ROLE_QUICK_SETTINGS],
     panel_style: PanelStyle::Transparent,
