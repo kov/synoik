@@ -84,13 +84,12 @@ pub fn banner_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The banner's natural size for `lines`.
-fn banner_natural(lines: &[String]) -> Size<f64, Logical> {
-    let px = base_px();
-    let w = lines
-        .iter()
-        .map(|l| synoik_vk::text::measure_line_width_weighted(l, px as f32, false))
-        .fold(0., f64::max);
+/// The banner's box for `lines`: the view's whole `max-width` (or the monitor's, if narrower),
+/// each line centred in it. gnome-shell sizes the view to its text and centres the view; centring
+/// the lines in a fixed box draws the same, and cannot cut a line whose shaped width differs from
+/// a measured one.
+fn banner_natural(lines: &[String], monitor_w: f64) -> Size<f64, Logical> {
+    let w = (BANNER_MAX_W_EM * base_px()).min(monitor_w);
     let h = lines.len() as f64 * crate::ui::line_height_px(crate::ui::base_font_pt());
     Size::from((w, h))
 }
@@ -152,7 +151,7 @@ impl LoginDialogChrome {
     ) -> Option<PromptElement> {
         let PageCtx { scale, monitor, .. } = ctx;
         let lines = banner_lines(text);
-        let natural = banner_natural(&lines);
+        let natural = banner_natural(&lines, monitor.size.w);
         let rect = banner_rect(
             monitor,
             crate::ui::panel::panel_height(),
