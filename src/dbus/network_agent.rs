@@ -246,8 +246,12 @@ impl SecretAgent {
 
 /// Start the agent. Returns the system-bus connection to keep alive and the sender the compositor
 /// answers dialogs with.
+/// `force_always_ask` is gnome-shell's for the greeter (`networkAgent.js:679`,
+/// `force_always_ask: Main.sessionMode.isGreeter`): every interactive request asks, and nothing is
+/// looked up in a keyring first. See [`asks_outright`].
 pub fn start(
     to_niri: calloop::channel::Sender<NetworkAgentToSynoik>,
+    force_always_ask: bool,
 ) -> anyhow::Result<(
     zbus::blocking::Connection,
     async_channel::Sender<NetworkAgentRequest>,
@@ -265,7 +269,10 @@ pub fn start(
         .detach();
     conn.inner()
         .executor()
-        .spawn(run(calls_rx, from_niri, to_niri), "network-agent")
+        .spawn(
+            run(calls_rx, from_niri, to_niri, force_always_ask),
+            "network-agent",
+        )
         .detach();
 
     Ok((conn, to_agent))
@@ -345,6 +352,7 @@ async fn run(
     calls: async_channel::Receiver<AgentCall>,
     responses: async_channel::Receiver<NetworkAgentRequest>,
     to_niri: calloop::channel::Sender<NetworkAgentToSynoik>,
+    force_always_ask: bool,
 ) {
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut keyring: Option<SecretSession> = None;
@@ -362,7 +370,9 @@ async fn run(
 
     while let Some(event) = events.next().await {
         match event {
-            Event::Call(call) => handle_call(call, &mut pending, &mut keyring, &to_niri).await,
+            Event::Call(call) => {
+                handle_call(call, &mut pending, &mut keyring, &to_niri, force_always_ask).await
+            }
             Event::Response(response) => {
                 handle_response(response, &mut pending, &mut keyring).await
             }
@@ -375,6 +385,7 @@ async fn handle_call(
     pending: &mut HashMap<String, Pending>,
     keyring: &mut Option<SecretSession>,
     to_niri: &calloop::channel::Sender<NetworkAgentToSynoik>,
+    force_always_ask: bool,
 ) {
     let AgentCall { kind, reply } = call;
     match kind {
@@ -394,6 +405,7 @@ async fn handle_call(
                 setting_name,
                 hints,
                 flags,
+                force_always_ask,
                 reply,
                 pending,
                 store,
@@ -435,6 +447,7 @@ async fn get_secrets(
     setting_name: String,
     hints: Vec<String>,
     flags: u32,
+    force_always_ask: bool,
     reply: async_channel::Sender<Result<NmConnection, AgentError>>,
     pending: &mut HashMap<String, Pending>,
     store: Option<&SecretSession>,
@@ -461,8 +474,7 @@ async fn get_secrets(
     }
 
     let key_flags = secret_key_flags(&connection, &setting_name);
-    let ask_outright = flags & flags::REQUEST_NEW != 0
-        || (flags & flags::ALLOW_INTERACTION != 0 && is_always_ask(&connection));
+    let ask_outright = asks_outright(flags, &connection, force_always_ask);
     let may_ask = flags & (flags::ALLOW_INTERACTION | flags::REQUEST_NEW) != 0;
 
     if !ask_outright {
@@ -696,6 +708,15 @@ fn secret_key_flags(connection: &NmConnection, setting_name: &str) -> HashMap<St
         .collect()
 }
 
+/// Whether a request goes straight to the dialog, without asking the keyring first
+/// (`shell-network-agent.c:390-397`): NM wants new secrets, or interaction is allowed and the
+/// connection is always-ask — or the agent is, which is the greeter's (`force_always_ask`).
+fn asks_outright(flags: u32, connection: &NmConnection, force_always_ask: bool) -> bool {
+    flags & flags::REQUEST_NEW != 0
+        || (flags & flags::ALLOW_INTERACTION != 0
+            && (force_always_ask || is_always_ask(connection)))
+}
+
 /// `is_connection_always_ask` (`shell-network-agent.c:202-243`): does any secret in the settings
 /// relevant to this connection's type carry `NOT_SAVED`?
 ///
@@ -864,6 +885,17 @@ mod tests {
     }
 
     #[test]
+    fn the_greeter_always_asks_but_never_unprompted() {
+        let saved = wifi_connection(secret_flags::AGENT_OWNED);
+        assert!(!asks_outright(flags::ALLOW_INTERACTION, &saved, false));
+        assert!(asks_outright(flags::ALLOW_INTERACTION, &saved, true));
+        assert!(
+            !asks_outright(0, &saved, true),
+            "a silent probe stays silent on the greeter too"
+        );
+    }
+
+    #[test]
     fn always_ask_ignores_settings_the_type_does_not_use() {
         let mut connection = wifi_connection(secret_flags::AGENT_OWNED);
         // A stale pppoe setting on a wireless connection must not force every activation to prompt.
@@ -905,6 +937,7 @@ mod tests {
                 "802-11-wireless-security".to_owned(),
                 Vec::new(),
                 flags,
+                false,
                 reply,
                 &mut pending,
                 None,

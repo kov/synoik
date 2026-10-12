@@ -239,8 +239,9 @@ is the **screen shield shown at startup** (`main.js:327-330` → `screenShield.s
 screen already has covers the greeter too. The mode is not locked, so the polkit and network
 agents' prompts show over it (`gdm` components, `sessionMode.js:55-57`) where a lock defers them;
 they and the end-session confirmation draw above the shield and take its input first
-(`modalDialogGroup` over `screenShieldGroup`, `layout.js:267-294`). Not built: the network
-agent's always-ask (`components/networkAgent.js:679`).
+(`modalDialogGroup` over `screenShieldGroup`, `layout.js:267-294`). The greeter's network agent
+always asks (`force_always_ask`, `components/networkAgent.js:679`): an interactive secret request
+goes straight to the dialog without asking a keyring, and a silent one stays silent.
 
 ### 4.1 Panel: clock and system-only quick settings
 

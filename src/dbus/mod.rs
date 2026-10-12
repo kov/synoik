@@ -443,7 +443,9 @@ impl DBusServers {
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            match network_agent::start(to_niri) {
+            // The greeter's agent always asks (`force_always_ask: Main.sessionMode.isGreeter`,
+            // `networkAgent.js:679`): its user has no keyring of saved secrets to answer from.
+            match network_agent::start(to_niri, synoik.greeter) {
                 Ok((conn, requests)) => {
                     dbus.conn_network_agent = Some(conn);
                     synoik.network_secret_requests = Some(requests);
