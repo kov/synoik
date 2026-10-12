@@ -41994,6 +41994,75 @@ fn the_greeters_name_entry_logs_a_typed_user_in() {
     assert!(f.gdm_requests().is_empty());
 }
 
+/// `_updateDisableUserList` (`loginDialog.js:914-930`): the greeter asks for a name when
+/// `disable-user-list` is set or the loaded list is empty, re-deciding as either changes while
+/// nobody is being asked; Escape on the name question stays there, with nothing to cancel.
+#[test]
+fn the_greeter_asks_for_a_name_without_a_user_list() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::VerifierRequest;
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Grid,
+        "not decided before AccountsService answers"
+    );
+
+    // Loaded and empty.
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(Vec::new()));
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+    assert_eq!(f.synoik().unlock_dialog.question(), Some("Username"));
+    assert!(f.synoik().unlock_dialog.is_entry_live());
+
+    // Escape asks again rather than leaving for a list that is not there.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+    assert!(f.synoik().unlock_dialog.is_entry_live());
+    assert!(!f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Cancel)));
+
+    // A user appears: back to the list.
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+
+    // The administrator disables the list.
+    f.synoik().gnome_settings.login_screen.disable_user_list = true;
+    f.synoik_state().sync_greeter_user_list();
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+
+    // A typed name's prompt goes back to the question, not the list.
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    assert!(f.synoik().login_page.is_asking_a_user());
+    f.synoik().gnome_settings.login_screen.disable_user_list = false;
+    f.synoik_state().sync_greeter_user_list();
+    assert!(
+        f.synoik().login_page.is_asking_a_user(),
+        "a conversation in progress is left alone"
+    );
+    f.synoik().gnome_settings.login_screen.disable_user_list = true;
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+}
+
 /// The name question dies with its page: picking a user after backing out of "Enter User Name"
 /// must not leave a live, unmasked entry waiting for gdm's password question.
 #[test]

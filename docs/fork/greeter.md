@@ -288,9 +288,9 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   no name (`js/gdm/loginDialog.js:262-276`), most frequent logins first then by name
   (`act_user_collate`), re-read on `UserAdded`/`UserDeleted`, any user's `Changed`, and logind's
   `SessionNew`/`SessionRemoved`. A user with a session on seat0 gets the accent ring
-  (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. Not built: an
-  empty list, more than twelve, or `disable-user-list` going straight to the username prompt
-  (`:914-944`).
+  (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. With `disable-user-list`, or once the list has loaded
+  empty or with more than twelve users, the greeter starts on the name question instead,
+  re-deciding whenever either changes while nobody is being asked (`:914-930`).
 - **Not listed?** the mockup's "Enter User Name ›" pill at the bottom-right opens the name page:
   the prompt with the generic picture and no name, asking "Username" in the clear with no
   conversation behind it (`:1141-1165`). Enter begins a login conversation for what was typed,
@@ -328,7 +328,8 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 `org.gnome.login-screen` keys to honour: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
 `banner-message-*`, `disable-restart-buttons`. Not honoured: `enable-smartcard-authentication`
-(out of scope). Read today: `enable-fingerprint-authentication` and `disable-restart-buttons`.
+(out of scope). Read today: `enable-fingerprint-authentication`, `disable-restart-buttons` and
+`disable-user-list`.
 
 The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
 needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which the

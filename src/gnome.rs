@@ -68,6 +68,8 @@ pub struct LoginScreenSettings {
     /// `disable-restart-buttons`: no Suspend, Restart or Power Off on the greeter
     /// (`systemActions.js:371-420`).
     pub disable_restart_buttons: bool,
+    /// `disable-user-list`: ask for a name instead of listing users (`loginDialog.js:914-930`).
+    pub disable_user_list: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -705,6 +707,9 @@ impl GnomeSettings {
         let l = &mut self.login_screen;
         if settings_has_key(login_screen, "disable-restart-buttons") {
             l.disable_restart_buttons = login_screen.boolean("disable-restart-buttons");
+        }
+        if settings_has_key(login_screen, "disable-user-list") {
+            l.disable_user_list = login_screen.boolean("disable-user-list");
         }
     }
 

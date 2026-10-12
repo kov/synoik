@@ -466,6 +466,9 @@ pub struct Synoik {
     pub is_session_instance: bool,
     /// The login screen's user list (greeter only), from AccountsService.
     pub login_users: Vec<crate::dbus::accounts_service::LoginUser>,
+    /// Whether AccountsService has answered at all: an empty list only disables the user list once
+    /// it is known to be empty (`_userListLoaded`, `loginDialog.js:917-919`).
+    pub login_users_loaded: bool,
     /// The login screen's user grid and which page it is on.
     pub login_grid: crate::ui::login_grid::LoginGrid,
     pub login_page: LoginPage,
@@ -2411,6 +2414,7 @@ impl State {
                             state.synoik.gnome_settings.shield.disable_show_password,
                         );
                         state.synoik.sync_power_policy();
+                        state.sync_greeter_user_list();
                         // `lock-enabled` and `disable-lock-screen` are two of the inhibitor's
                         // conditions, and GNOME wires both keys straight to `_syncInhibitor`
                         // (`screenShield.js:110,113`). Without this, turning locking back on
@@ -6225,7 +6229,7 @@ impl State {
         }
         if self.synoik.greeter && raw == Some(Keysym::Escape) {
             let cancel = self.synoik.login_page.is_asking_a_user();
-            self.greeter_back_to_grid(cancel);
+            self.greeter_back_to_start(cancel);
             return;
         }
         let now = self.synoik.shield_now();
@@ -6372,20 +6376,47 @@ impl State {
         self.apply_unlock_effects(effects);
     }
 
-    /// Back from the credentials page to the user list (`LoginDialog` `_onReset` /
+    /// Back from the credentials page to where a visitor starts (`LoginDialog` `_onReset` /
     /// `cancel`). `cancel` ends the conversation; after a verified one there is nothing to end, and
     /// ending it would close the session the daemon is starting.
-    fn greeter_back_to_grid(&mut self, cancel: bool) {
+    fn greeter_back_to_start(&mut self, cancel: bool) {
         if cancel {
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
             }
         }
         self.synoik.screen_shield.drop_authenticator();
-        let effects = self.synoik.unlock_dialog.show_clock();
-        self.apply_unlock_effects(effects);
-        self.synoik.login_page = LoginPage::Grid;
+        self.greeter_show_start();
+    }
+
+    /// Where a visitor starts (`_onReset` with `PROVIDE_USERNAME`, `loginDialog.js:1086-1090`): the
+    /// user list, or the name question when the list is disabled.
+    fn greeter_show_start(&mut self) {
+        if self.synoik.greeter_user_list_disabled() {
+            self.synoik.login_page = LoginPage::Name;
+            let now = self.synoik.shield_now();
+            let effects = self.synoik.unlock_dialog.ask_username(now);
+            self.apply_unlock_effects(effects);
+        } else {
+            let effects = self.synoik.unlock_dialog.show_clock();
+            self.apply_unlock_effects(effects);
+            self.synoik.login_page = LoginPage::Grid;
+        }
         self.synoik.queue_redraw_all();
+    }
+
+    /// `_updateDisableUserList` (`loginDialog.js:914-930`): when whether the list is disabled
+    /// changes while nobody is being asked for credentials, start over on the right page.
+    pub fn sync_greeter_user_list(&mut self) {
+        if !self.synoik.greeter || !self.synoik.screen_shield.is_active() {
+            return;
+        }
+        let on_list = self.synoik.login_page == LoginPage::Grid;
+        let on_name = self.synoik.login_page == LoginPage::Name;
+        let disabled = self.synoik.greeter_user_list_disabled();
+        if (on_list && disabled) || (on_name && !disabled) {
+            self.greeter_show_start();
+        }
     }
 
     /// A click while the shield is down: raise it, raise the prompt page
@@ -6605,7 +6636,7 @@ impl State {
         if effects.unlock && self.synoik.greeter {
             // Verified: the daemon is starting the session, or fronting the one it unlocked. The
             // greeter's shield stays, and its next visitor starts from the list.
-            self.greeter_back_to_grid(false);
+            self.greeter_back_to_start(false);
         } else if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
@@ -6924,7 +6955,12 @@ impl State {
                 self.synoik.can_switch_user = can;
             }
             AccountsToSynoik::Users(users) => {
+                let first_load = !self.synoik.login_users_loaded;
+                self.synoik.login_users_loaded = true;
                 if self.synoik.login_users == users {
+                    if first_load {
+                        self.sync_greeter_user_list();
+                    }
                     return;
                 }
                 let first = self.synoik.login_users.is_empty();
@@ -6935,6 +6971,7 @@ impl State {
                 } else {
                     self.synoik.login_grid.clamp(count);
                 }
+                self.sync_greeter_user_list();
                 self.synoik.queue_redraw_all();
             }
         }
@@ -6949,7 +6986,6 @@ impl State {
     /// down at once, on the login dialog rather than the clock.
     pub fn show_greeter_dialog(&mut self) {
         let now = self.synoik.shield_now();
-        self.synoik.login_page = LoginPage::Grid;
         self.synoik.login_grid.reset(self.synoik.login_users.len());
         self.synoik
             .screen_shield
@@ -6958,6 +6994,7 @@ impl State {
         self.synoik.lock_screen.set_page(true, now);
         self.synoik.lock_screen.settle();
         self.synoik.sync_session_mode();
+        self.greeter_show_start();
         self.synoik.queue_redraw_all();
     }
 
@@ -8535,6 +8572,7 @@ impl Synoik {
             is_session_instance,
             greeter: false,
             login_users: Vec::new(),
+            login_users_loaded: false,
             login_grid: crate::ui::login_grid::LoginGrid::new(),
             login_page: LoginPage::Grid,
             start_time: Instant::now(),
@@ -16912,6 +16950,17 @@ impl Synoik {
     ///
     /// Keyed on the scale like every other image, so warming the wrong one is a decode nobody
     /// reads — hence per output rather than once.
+    /// Whether the greeter asks for a name instead of showing users (`_updateDisableUserList`,
+    /// `loginDialog.js:914-930`): `disable-user-list`, or a loaded list the grid cannot show —
+    /// empty, as gnome-shell has it, or past [`login_grid::MAX_USERS`], the grid mockup's limit.
+    ///
+    /// [`login_grid::MAX_USERS`]: crate::ui::login_grid::MAX_USERS
+    pub fn greeter_user_list_disabled(&self) -> bool {
+        self.gnome_settings.login_screen.disable_user_list
+            || (self.login_users_loaded
+                && !crate::ui::login_grid::shows_grid(self.login_users.len()))
+    }
+
     /// Whether the prompt shows who it is asking: always on the lock screen, and on the greeter
     /// for a user picked from the list.
     pub fn shows_prompt_user(&self) -> bool {
