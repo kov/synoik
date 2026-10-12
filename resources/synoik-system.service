@@ -6,12 +6,20 @@ Documentation=https://github.com/kov/synoik/blob/main/docs/fork/system-composito
 Before=systemd-user-sessions.service
 # Both want the display; only one can hold DRM master.
 Conflicts=gdm.service
+# Plymouth holds the card until it quits, so the outer quits it, as GDM does; its splash stays on
+# screen until the first modeset replaces it. Should the outer fail, plymouth still has to go.
+After=plymouth-start.service
+Conflicts=plymouth-quit.service
+After=plymouth-quit.service
+OnFailure=plymouth-quit.service
 # Never give up restarting: a unit that hits the start limit fails, and a failed unit's fd store is
 # where master would be lost.
 StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+# As root (`+`), and harmless with no plymouth running (`-`).
+ExecStartPre=+-/usr/bin/plymouth quit --retain-splash
 ExecStart=synoik system-compositor
 # Unprivileged: DRM master comes from opening the card first, input from the `input` group, and
 # nothing else needs root (docs/fork/system-compositor.md §1).

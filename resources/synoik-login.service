@@ -6,9 +6,9 @@ Wants=synoik-system.service
 After=synoik-system.service systemd-user-sessions.service systemd-logind.service
 # One display manager.
 Conflicts=gdm.service
-# Seat0 sessions without a VT: a seat with VTs needs each session on one, which the worker does
-# not do yet (docs/fork/greeter.md §7).
-ConditionPathExists=!/sys/class/tty/tty0
+# On a seat with VTs the greeter takes tty1, as GDM's does (synoik-login/src/vt.rs).
+Conflicts=getty@tty1.service
+After=getty@tty1.service
 
 [Service]
 ExecStart=synoik-login

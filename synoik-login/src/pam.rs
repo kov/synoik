@@ -91,6 +91,7 @@ extern "C" {
     fn pam_open_session(handle: *mut PamHandle, flags: c_int) -> c_int;
     fn pam_close_session(handle: *mut PamHandle, flags: c_int) -> c_int;
     fn pam_putenv(handle: *mut PamHandle, name_value: *const c_char) -> c_int;
+    fn pam_set_item(handle: *mut PamHandle, item_type: c_int, item: *const libc::c_void) -> c_int;
     fn pam_getenv(handle: *mut PamHandle, name: *const c_char) -> *const c_char;
     fn pam_getenvlist(handle: *mut PamHandle) -> *mut *mut c_char;
     fn pam_strerror(handle: *mut PamHandle, errnum: c_int) -> *const c_char;
@@ -319,6 +320,15 @@ impl Pam {
         // SAFETY: live handle; libpam copies the string.
         let ret = unsafe { pam_putenv(self.handle, pair.as_ptr()) };
         self.check("pam_putenv", ret)
+    }
+
+    /// `PAM_TTY`: the terminal the session is on, which `pam_systemd` reads its VT from.
+    pub fn set_tty(&mut self, tty: &str) -> anyhow::Result<()> {
+        const PAM_TTY: c_int = 3;
+        let tty = CString::new(tty)?;
+        // SAFETY: live handle; libpam copies the string.
+        let ret = unsafe { pam_set_item(self.handle, PAM_TTY, tty.as_ptr().cast()) };
+        self.check("pam_set_item(PAM_TTY)", ret)
     }
 
     pub fn getenv(&self, name: &str) -> Option<String> {

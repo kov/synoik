@@ -12,6 +12,7 @@ mod daemon;
 mod ipc;
 mod pam;
 mod verify;
+mod vt;
 mod worker;
 
 fn main() {

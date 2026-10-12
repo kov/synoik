@@ -158,6 +158,13 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
         let _ = pam.setcred(pam::PAM_DELETE_CRED);
         return Ok(1);
     }
+    let vt = match crate::vt::prepare(&mut pam, false) {
+        Ok(vt) => vt,
+        Err(err) => {
+            let _ = pam.setcred(pam::PAM_DELETE_CRED);
+            return fail(&mut report, err);
+        }
+    };
     if let Err(err) = pam.open_session() {
         let _ = pam.setcred(pam::PAM_DELETE_CRED);
         return fail(&mut report, err);
@@ -178,7 +185,7 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
     // rather than drop it: PAM's conversation still holds a clone.
     let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(report);
-    worker::parent_session(pam, &account, program, &id)
+    worker::parent_session(pam, &account, program, &id, vt)
 }
 
 /// What a failed `pam_authenticate` tells the client, worded as GDM words it

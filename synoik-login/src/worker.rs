@@ -19,6 +19,7 @@ use anyhow::{bail, Context as _};
 use crate::config;
 use crate::ipc::Frame;
 use crate::pam::{Pam, PAM_DELETE_CRED, PAM_ESTABLISH_CRED};
+use crate::vt::{self, Vt};
 
 /// Where a worker talks to the daemon: a pipe (session workers) or a socket (verification).
 pub const STATUS_FD: i32 = 3;
@@ -144,6 +145,7 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
     pam.authenticate()?;
     pam.acct_mgmt()?;
     establish_credentials(&mut pam, &account)?;
+    let vt = vt::prepare(&mut pam, request.class == "greeter")?;
     pam.open_session()?;
 
     let id = pam.getenv("XDG_SESSION_ID").unwrap_or_default();
@@ -156,7 +158,7 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
     let _ = Frame::Opened(id.clone()).write_to(&mut status);
     drop(status);
 
-    parent_session(pam, &account, &request.program, &id)
+    parent_session(pam, &account, &request.program, &id, vt)
 }
 
 /// Everything pam_systemd reads, put in before the session opens (greeter.md §2.4).
@@ -182,12 +184,13 @@ pub fn establish_credentials(pam: &mut Pam, account: &Account) -> anyhow::Result
 }
 
 /// Start `program` in the open session `id` and stay its parent until it ends; then close the
-/// session. Returns the program's exit status.
+/// session. Returns the program's exit status. A session on a VT is switched to as it starts.
 pub fn parent_session(
     mut pam: Pam,
     account: &Account,
     program: &[String],
     id: &str,
+    vt: Option<Vt>,
 ) -> anyhow::Result<i32> {
     let env = session_environment(&pam, account)?;
     let argv: Vec<CString> = program
@@ -196,11 +199,14 @@ pub fn parent_session(
         .collect::<Result<_, _>>()?;
     let home = CString::new(account.home.as_str())?;
 
+    if let Some(vt) = &vt {
+        vt.activate();
+    }
     // SAFETY: this process is single-threaded, so the child may run ordinary code before exec.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => bail!("fork: {}", std::io::Error::last_os_error()),
-        0 => exec_session(pam, account.uid, &home, &argv, &env),
+        0 => exec_session(pam, account.uid, &home, &argv, &env, vt.as_ref()),
         _ => (),
     }
 
@@ -297,7 +303,14 @@ fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CStri
         .collect()
 }
 
-fn exec_session(pam: Pam, uid: libc::uid_t, home: &CStr, argv: &[CString], env: &[CString]) -> ! {
+fn exec_session(
+    pam: Pam,
+    uid: libc::uid_t,
+    home: &CStr,
+    argv: &[CString],
+    env: &[CString],
+    vt: Option<&Vt>,
+) -> ! {
     // The parent owns the session: end this copy of the transaction without tearing it down.
     pam.end_silently();
     let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
@@ -307,10 +320,15 @@ fn exec_session(pam: Pam, uid: libc::uid_t, home: &CStr, argv: &[CString], env: 
     // SAFETY: the child of a single-threaded process; every pointer outlives the exec.
     unsafe {
         libc::setsid();
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-        if devnull >= 0 {
-            libc::dup2(devnull, 0);
-            libc::close(devnull);
+        match vt {
+            Some(vt) => vt.attach_as_stdin(),
+            None => {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                if devnull >= 0 {
+                    libc::dup2(devnull, 0);
+                    libc::close(devnull);
+                }
+            }
         }
         if libc::setuid(uid) != 0 || libc::getuid() != uid {
             eprintln!("synoik-login: setuid: {}", std::io::Error::last_os_error());
