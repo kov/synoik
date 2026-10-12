@@ -34,10 +34,11 @@ impl Manager {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> fdo::Result<String> {
         let (uid, pid) = caller(&header, connection).await?;
-        let session = logind(connection, "GetSessionByPID", &(pid,))
+        // The greeter runs as a user unit under gnome-session, outside its session's scope: found
+        // as its uid's display session, as GDM finds its own (`gdm-manager.c:512`).
+        let session = caller_session(connection, pid, uid)
             .await
             .map_err(|err| fdo::Error::AccessDenied(format!("no session for the caller: {err}")))?;
-        let session = self::session(connection, session).await?;
         if crate::daemon::greeter_session().as_deref() != Some(session.id.as_str())
             || session.uid != uid
         {
