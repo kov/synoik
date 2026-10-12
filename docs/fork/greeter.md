@@ -236,8 +236,11 @@ while a user's shield is up, `gdm` for the greeter, each defaulting to `restrict
 is the **screen shield shown at startup** (`main.js:327-330` → `screenShield.showDialog`, the
 `LoginDialog` in the unlock dialog's place): down and locked from the first frame, never raised
 (`deactivate` only clears GNOME's `isActive`, `screenShield.js:530-541`), so every gate the lock
-screen already has covers the greeter too. Still to come from the mode: components
-`networkAgent` (always asking, `components/networkAgent.js:679`) and `polkitAgent`.
+screen already has covers the greeter too. The mode is not locked, so the polkit and network
+agents' prompts show over it (`gdm` components, `sessionMode.js:55-57`) where a lock defers them;
+they and the end-session confirmation draw above the shield and take its input first
+(`modalDialogGroup` over `screenShieldGroup`, `layout.js:267-294`). Not built: the network
+agent's always-ask (`components/networkAgent.js:679`).
 
 ### 4.1 Panel: clock and system-only quick settings
 
@@ -380,6 +383,11 @@ user → user switches, where it exists to take the previous user's screen away.
 **G1 — `XDG_SESSION_EXTRA_DEVICE_ACCESS`.** GDM 51 asks logind for `render:accel` on every
 session; read what logind does with it before copying it.
 
+**G2 — the greeter's polkit rights.** GDM's `20-gdm.rules` lets the `gdm` group modify
+NetworkManager's system connections (and use smartcards) without asking; our greeter user is not
+in that group, so editing a system connection from the greeter asks an administrator. Either the
+greeter user joins `gdm`'s rule, or we ship our own.
+
 **S4 (system-compositor) stays open:** the lock screen remains in the inner; this design does not
 need it moved.
 
@@ -475,4 +483,7 @@ session 2) and u2; picking u2 asks for u2's password (`OpenReauthenticationChann
 seat0 fronts. Back on the greeter u2 has the ring; picking Claude reauthenticates and fronts
 session 2. Left in step 3: the name entry, `org.gnome.login-screen` (`disable-user-list`,
 `allowed-failures`, `logo`, banner, `disable-restart-buttons`, the authentication toggles), the
-a11y button, and the greeter's network and polkit agents.
+and the a11y button. A polkit check run inside the greeter's session for an admin-only action
+(`systemd1.manage-units`) raises the prompt over the grid for Claude, the administrator, and
+Escape dismisses it; Restart from the greeter's menu with Claude logged in reboots without one,
+since Fedora allows `reboot-multiple-sessions` to an active session.
