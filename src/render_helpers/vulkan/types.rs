@@ -3,7 +3,7 @@
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
 use std::fmt;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
@@ -124,6 +124,9 @@ struct VkTextureInner {
     /// Stored as `vk::ImageLayout::as_raw()`; interior-mutable so it can be updated through a
     /// shared `&VkTexture` (sampling borrows the source immutably).
     layout: AtomicI32,
+    /// Whether a scanout frame has discarded this image's contents yet. Its first discard is the
+    /// expected one — a fresh image has nothing to preserve — however many images came before it.
+    cold_discarded: AtomicBool,
     width: u32,
     height: u32,
     format: Fourcc,
@@ -172,6 +175,7 @@ impl VkTexture {
             set,
             framebuffer: None,
             layout: AtomicI32::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw()),
+            cold_discarded: AtomicBool::new(false),
             width,
             height,
             format,
@@ -207,6 +211,7 @@ impl VkTexture {
             set,
             framebuffer: None,
             layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            cold_discarded: AtomicBool::new(false),
             width,
             height,
             format,
@@ -234,6 +239,7 @@ impl VkTexture {
             set,
             framebuffer: Some(framebuffer),
             layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            cold_discarded: AtomicBool::new(false),
             width,
             height,
             format,
@@ -261,6 +267,7 @@ impl VkTexture {
             set: vk::DescriptorSet::null(),
             framebuffer: Some(framebuffer),
             layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            cold_discarded: AtomicBool::new(false),
             width,
             height,
             format,
@@ -287,6 +294,7 @@ impl VkTexture {
             set: vk::DescriptorSet::null(),
             framebuffer: None,
             layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            cold_discarded: AtomicBool::new(false),
             width,
             height,
             format,
@@ -345,6 +353,11 @@ impl VkTexture {
     /// The image's tracked current layout.
     pub(super) fn layout(&self) -> vk::ImageLayout {
         vk::ImageLayout::from_raw(self.0.layout.load(Ordering::Acquire))
+    }
+
+    /// Whether this is the image's first scanout discard: marks it taken.
+    pub(super) fn take_cold_discard(&self) -> bool {
+        !self.0.cold_discarded.swap(true, Ordering::AcqRel)
     }
 
     /// Record the image's new layout after a barrier / render pass transition.

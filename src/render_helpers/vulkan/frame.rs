@@ -170,11 +170,12 @@ impl fmt::Debug for VulkanFrame<'_, '_> {
 /// how `f3f2f076` hid for a week, and how a 2026-08-15 wedge presented: a compositor submitting a
 /// clean 60 Hz onto a frozen screen.
 ///
-/// One discard per swapchain slot is expected and correct — a fresh image is `UNDEFINED` and the
-/// age-0 frame redraws it whole — so the first few are quiet. After that a discard means something
-/// left a scanout image in a layout the preserve test does not recognise, and the layout is the
-/// clue to which pass did it.
-fn note_scanout_discard(layout: vk::ImageLayout) {
+/// One discard per scanout image is expected and correct — a fresh image is `UNDEFINED` and the
+/// age-0 frame redraws it whole — so each image's first is quiet (`cold`), however many images a
+/// session allocates as displays come and go. Past those, the first few more are quiet too; after
+/// that a discard means something left a scanout image in a layout the preserve test does not
+/// recognise, and the layout is the clue to which pass did it.
+fn note_scanout_discard(layout: vk::ImageLayout, cold: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Enough for every slot of a swapchain to legitimately discard once on its first use.
@@ -183,6 +184,10 @@ fn note_scanout_discard(layout: vk::ImageLayout) {
     /// per-frame warning would itself cost frames.
     const WARN_EVERY: u64 = 300;
 
+    if cold && layout == vk::ImageLayout::UNDEFINED {
+        debug!(?layout, "scanout frame discarded a fresh image");
+        return;
+    }
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= EXPECTED_COLD_DISCARDS {
@@ -268,7 +273,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         };
         if !fb.offscreen && !preserve {
-            note_scanout_discard(fb.buffer.layout());
+            note_scanout_discard(fb.buffer.layout(), fb.buffer.take_cold_discard());
         }
         let render_pass = if preserve {
             renderer.continuation_render_pass
