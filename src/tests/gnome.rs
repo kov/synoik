@@ -17730,6 +17730,56 @@ fn any_key_that_raises_the_prompt_arms_the_reader() {
     );
 }
 
+/// Turning `enable-password-authentication` off under a raised unlock prompt starts the
+/// conversation over with the reader in front, the prompt kept (`_updateDefaultService`,
+/// `util.js:663-676`; `_onReset`, `unlockDialog.js:850-859`).
+#[test]
+fn the_unlock_prompt_starts_over_when_the_password_is_turned_off() {
+    use crate::dbus::fprintd::ReaderType;
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().on_fingerprint_reader(ReaderType::Press);
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    tap(&mut f, KEY_F10);
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
+    assert!(f.synoik().unlock_dialog.is_entry_live());
+    f.gdm_requests();
+
+    f.synoik().gnome_settings.shield.enable_password = false;
+    f.synoik_state().sync_verifier_foreground();
+    let requests = f.gdm_requests();
+    let at = |want: fn(&VerifierRequest) -> bool| requests.iter().position(want);
+    let cancel = at(|r| matches!(r, VerifierRequest::Cancel)).expect("cancelled");
+    let begin = at(|r| {
+        matches!(
+            r,
+            VerifierRequest::Begin {
+                password_enabled: false,
+                ..
+            }
+        )
+    })
+    .expect("begun again with the reader in front");
+    let start = at(|r| matches!(r, VerifierRequest::StartFingerprint)).expect("reader armed");
+    assert!(cancel < begin && begin < start, "{requests:?}");
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
+    assert!(
+        !f.synoik().unlock_dialog.is_entry_live(),
+        "the old question is gone"
+    );
+}
+
 /// The unlock entry has a caret from the moment the prompt is up, with nothing typed.
 ///
 /// The model half of `vulkan_an_empty_focused_entry_draws_its_caret`: the view is never handed the

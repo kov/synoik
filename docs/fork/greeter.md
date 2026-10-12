@@ -332,7 +332,8 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
   the entry, and each stop is a failed attempt, restarted and counted. Unlike GNOME, a reader that
   stops the instant it starts, three times silently, is given up on until the prompt is raised
   again rather than re-armed in a spin. A key or reader change that picks another foreground
-  service mid-conversation cancels it and starts over (`:663-676`). Same on the lock screen.
+  service mid-conversation cancels it and starts over (`:663-676`): the greeter back at its start,
+  the lock screen with its prompt kept and the same user (`unlockDialog.js:850-859`).
 - "Fingerprint reader unavailable" is said only to a user with prints enrolled. The greeter cannot
   ask fprintd about another user (`setusername` is `auth_admin_keep`), so the `gdm-fingerprint`
   worker, which is root, asks and puts the line in `ServiceUnavailable`'s message, which gnome-shell

@@ -6966,11 +6966,16 @@ impl State {
         self.synoik.screen_shield.drop_authenticator();
         let effects = self.synoik.screen_shield.retry_authenticator();
         self.apply_shield_effects(effects);
+        // The prompt stays up and begins again for the same user (`_onReset`,
+        // `unlockDialog.js:850-859`); a reader it had armed is armed on the new channel, after
+        // that channel's `Begin`.
         let now = self.synoik.shield_now();
-        let effects = self
+        let mut effects = self
             .synoik
             .unlock_dialog
-            .on_verifier_event(crate::dbus::gdm::VerifierEvent::Lost, now);
+            .on_verifier_event(crate::dbus::gdm::VerifierEvent::Reset, now);
+        effects.start_fingerprint =
+            self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt;
         self.apply_unlock_effects(effects);
     }
 
