@@ -289,9 +289,13 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. Not built: an
   empty list, more than twelve, or `disable-user-list` going straight to the username prompt
   (`:914-944`).
-- **Not listed?** the mockup's "Enter User Name ›" pill at the bottom-right: asks "Username",
-  then begins verification for what was typed (`:1141-1165`). The pill is built; the page it opens
-  is not.
+- **Not listed?** the mockup's "Enter User Name ›" pill at the bottom-right opens the name page:
+  the prompt with the generic picture and no name, asking "Username" in the clear with no
+  conversation behind it (`:1141-1165`). Enter begins a login conversation for what was typed,
+  still drawn with the generic picture (`authPrompt.js:722-732`); an empty name stays on the
+  question, where gnome-shell would begin an anonymous conversation whose PAM stack asks for the
+  name again. Escape goes back to the grid. Not built: realmd's login-format hint under the entry
+  (`:1127-1139`).
 - **Banner** (`banner-message-enable`, `-source`, `-text`, `-path`) top-centre, moving into the
   free space above the prompt (`:946-1010`, `807-867`); **logo** (`logo`) bottom-centre
   (`:1018-1039`); **accessibility** button bottom-right, a two-column menu of the ten
@@ -480,9 +484,8 @@ Measured 2026-10-11 on the same guest, by injected keys: the greeter shows Claud
 session 2) and u2; picking u2 asks for u2's password (`OpenReauthenticationChannel` is
 `AccessDenied`, the client falls back to `OpenSession`) and the right one starts session 10, which
 seat0 fronts. Back on the greeter u2 has the ring; picking Claude reauthenticates and fronts
-session 2. Left in step 3: the name entry, `org.gnome.login-screen` (`disable-user-list`,
-`allowed-failures`, `logo`, banner, `disable-restart-buttons`, the authentication toggles), the
-and the a11y button. A polkit check run inside the greeter's session for an admin-only action
+session 2. Left in step 3: `org.gnome.login-screen` (`disable-user-list`, `allowed-failures`,
+`logo`, banner, `disable-restart-buttons`, the authentication toggles) and the a11y button. A polkit check run inside the greeter's session for an admin-only action
 (`systemd1.manage-units`) raises the prompt over the grid for Claude, the administrator, and
 Escape dismisses it; Restart from the greeter's menu with Claude logged in reboots without one,
 since Fedora allows `reboot-multiple-sessions` to an active session.

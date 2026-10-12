@@ -370,6 +370,8 @@ const AVATAR_SLOT: u64 = 0;
 const AVATAR_BG: Rgba = [1., 1., 1., 0.13];
 /// `.user-widget.vertical .user-widget-label` — 20pt, weight 400 (`:380-385`).
 const NAME_PT: f64 = 20.;
+/// What holds the name's row when nobody is named (`userWidget.js:206`). Measured, never drawn.
+const EMPTY_USER: &str = "Empty User";
 /// ...and its `margin-bottom: .75em`, where `em` is the label's own 20pt.
 const NAME_MARGIN_BOTTOM_EM: f64 = 0.75;
 /// `.login-dialog-message` `min-height: 2.75em` (`:92-95`), `em` at the base font.
@@ -400,6 +402,9 @@ const CAPS_FG: Rgba = FG;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptContent {
     pub display_name: String,
+    /// Asking someone unnamed — the greeter's typed name. The name's row is kept, empty, as
+    /// gnome-shell keeps a transparent "Empty User" label (`userWidget.js:203-209`).
+    pub name_hidden: bool,
     /// Masked or not, per the dialog. Never the raw secret.
     pub entry: String,
     /// The caret's byte offset **into `entry`** — already mapped through the mask by
@@ -1198,11 +1203,17 @@ impl LockScreen {
             Size::from((width, block_h)),
             widget::Revision::new()
                 .of(&content_owned.display_name)
+                .of(content_owned.name_hidden)
                 .px(width)
                 .done(),
             |renderer| {
                 let mut shaper = TextShaper::new(renderer, scale);
-                shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))
+                let name = if content_owned.name_hidden {
+                    EMPTY_USER
+                } else {
+                    &content_owned.display_name
+                };
+                shaper.shape(name, TextStyle::new(NAME_PT))
             },
             |frame, phys, name: &ShapedText| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -1221,15 +1232,17 @@ impl LockScreen {
                 p.fill_rounded(l.avatar, AVATAR_PX / 2., AVATAR_BG)?;
 
                 let cx = width / 2.;
-                p.text_band(
-                    name,
-                    cx,
-                    HAlign::Center,
-                    l.name.loc.y,
-                    l.name.size.h,
-                    FG,
-                    l.name,
-                )?;
+                if !content_owned.name_hidden {
+                    p.text_band(
+                        name,
+                        cx,
+                        HAlign::Center,
+                        l.name.loc.y,
+                        l.name.size.h,
+                        FG,
+                        l.name,
+                    )?;
+                }
                 Ok(())
             },
         );

@@ -41880,7 +41880,8 @@ fn the_greeter_grid_picks_a_user() {
     assert_eq!(
         f.synoik().login_page,
         LoginPage::Prompt {
-            user: Some("bob".to_owned())
+            user: "bob".to_owned(),
+            listed: true,
         }
     );
 
@@ -41890,7 +41891,149 @@ fn the_greeter_grid_picks_a_user() {
     pointer_motion_to(&mut f, pill.loc.x + 5., pill.loc.y + 5.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert_eq!(f.synoik().login_page, LoginPage::Prompt { user: None });
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+}
+
+/// "Enter User Name" asks for a name with nobody chosen and no conversation, then begins a login
+/// conversation for what was typed, showing the generic picture and no name
+/// (`loginDialog.js:1141-1165`, `authPrompt.js:722-732`).
+#[test]
+fn the_greeters_name_entry_logs_a_typed_user_in() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: "Amy".to_owned(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    let monitor = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((1920., 1080.)));
+    let pill = crate::ui::login_grid::enter_name_rect(monitor);
+    pointer_motion_to(&mut f, pill.loc.x + 5., pill.loc.y + 5.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let d = &f.synoik().unlock_dialog;
+    assert!(d.is_entry_live());
+    assert_eq!(d.question(), Some("Username"));
+    assert_eq!(d.entry_mask(), None, "a name is typed in the clear");
+    assert!(!f.synoik().shows_prompt_user());
+    assert!(f.gdm_requests().is_empty(), "nobody to ask gdm about yet");
+
+    // An empty name stays on the question.
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(f.synoik().login_page, LoginPage::Name);
+    assert!(f.gdm_requests().is_empty());
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Prompt {
+            user: "a".to_owned(),
+            listed: false,
+        }
+    );
+    let requests = f.gdm_requests();
+    let begun: Vec<_> = requests
+        .iter()
+        .filter_map(|r| match r {
+            VerifierRequest::Begin {
+                username,
+                epoch,
+                login: true,
+                ..
+            } => Some((username.clone(), *epoch)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(begun.len(), 1);
+    assert_eq!(begun[0].0, "a");
+    assert!(
+        !requests
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::Answer(_))),
+        "the name is not an answer to gdm"
+    );
+    assert!(!f.synoik().shows_prompt_user(), "a typed name is not shown");
+    assert!(f.synoik().avatar_source().is_none());
+    // Not live until gdm asks for the password.
+    assert!(!f.synoik().unlock_dialog.is_entry_live());
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::Ready(begun[0].1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    assert!(f.synoik().unlock_dialog.entry_mask().is_some());
+
+    // Escape from the name page goes back to the list without a conversation to cancel.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    pointer_motion_to(&mut f, pill.loc.x + 5., pill.loc.y + 5.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.gdm_requests();
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f.gdm_requests().is_empty());
+}
+
+/// The name question dies with its page: picking a user after backing out of "Enter User Name"
+/// must not leave a live, unmasked entry waiting for gdm's password question.
+#[test]
+fn a_name_question_does_not_outlive_its_page() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::VerifierEvent;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    let monitor = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((1920., 1080.)));
+    let pill = crate::ui::login_grid::enter_name_rect(monitor);
+    pointer_motion_to(&mut f, pill.loc.x + 5., pill.loc.y + 5.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    tap(&mut f, KEY_ESC);
+
+    let tile = crate::ui::login_grid::tile_rects(monitor, 1)[0];
+    pointer_motion_to(&mut f, tile.loc.x + 5., tile.loc.y + 5.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.synoik().shows_prompt_user());
+    assert!(!f.synoik().unlock_dialog.is_entry_live());
+    assert_eq!(f.synoik().unlock_dialog.question(), None);
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    assert!(f.synoik().unlock_dialog.is_entry_live());
+    assert!(f.synoik().unlock_dialog.entry_mask().is_some());
 }
 
 /// Picking a user on the greeter asks gdm for a login conversation for them; Escape cancels it and

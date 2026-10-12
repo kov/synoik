@@ -31,6 +31,9 @@ const ENTRY_CAPACITY: usize = 512;
 /// (`unlockDialog.js:25`, `:667`). The shield stays down; only the page changes.
 pub const PROMPT_IDLE: Duration = Duration::from_secs(120);
 
+/// The greeter's own question when nobody is picked (`loginDialog.js:1143`).
+const USERNAME_QUESTION: &str = "Username";
+
 /// `USER_READ_TIME` / `USER_READ_TIME_MIN` (`util.js:47-49`), comment and all:
 ///
 /// > Give user 48ms to read each character of a PAM message
@@ -65,6 +68,10 @@ pub enum Status {
     NotVerifying,
     /// gdm asked a question and is waiting for the answer — the entry is live.
     Asking,
+    /// The greeter is asking for a name itself, before there is any conversation
+    /// (`_askForUsernameAndBeginVerification`, `loginDialog.js:1141-1165`). The entry is live, and
+    /// its answer goes back to the greeter rather than to gdm.
+    AskingName,
     /// The answer is with PAM. The entry is insensitive until a verdict arrives, or a second
     /// Return would queue an answer to a question nobody asked.
     Answered,
@@ -117,6 +124,8 @@ pub struct UnlockEffects {
     /// page transition, and it is a transition rather than a state because starting a service
     /// twice is an error.
     pub start_fingerprint: bool,
+    /// The greeter's name entry was answered: begin verification for this user.
+    pub name_entered: Option<String>,
 }
 
 impl UnlockEffects {
@@ -396,7 +405,24 @@ impl UnlockDialog {
     /// Whether the entry accepts input: only while gdm is actually waiting for an answer
     /// (`updateSensitivity`, `unlockDialog.js:766-767`).
     pub fn is_entry_live(&self) -> bool {
-        self.page == Page::Prompt && self.status == Status::Asking
+        self.page == Page::Prompt && matches!(self.status, Status::Asking | Status::AskingName)
+    }
+
+    /// Ask for a name, with nobody chosen yet and no conversation behind the question:
+    /// gnome-shell's `setUser(null)` then `setQuestion(_('Username'))`
+    /// (`loginDialog.js:1141-1165`). The answer comes back as [`UnlockEffects::name_entered`].
+    ///
+    /// The reader is not started: there is nobody for it to verify until a name is given.
+    pub fn ask_username(&mut self, now: Duration) -> UnlockEffects {
+        self.user = UserInfo::default();
+        self.peek = false;
+        self.drop_messages();
+        self.clear_entry();
+        self.question = Some((USERNAME_QUESTION.to_owned(), false));
+        self.status = Status::AskingName;
+        self.page = Page::Prompt;
+        self.last_activity = Some(now);
+        UnlockEffects::redraw()
     }
 
     /// Raise the prompt page (`_showPrompt`, `:806`). Idempotent.
@@ -426,6 +452,12 @@ impl UnlockDialog {
     pub fn show_clock(&mut self) -> UnlockEffects {
         self.clear_entry();
         self.last_activity = None;
+        // A name question is the greeter's own, and dies with the page: left behind, the next
+        // user's prompt would come up live and unmasked before gdm asked for their password.
+        if self.status == Status::AskingName {
+            self.status = Status::NotVerifying;
+            self.question = None;
+        }
         // Not deferred: the message lives under the entry, and the entry is what we are leaving.
         // GNOME gets here by destroying the auth prompt outright (`_maybeDestroyAuthPrompt`).
         let cleared = self.drop_messages();
@@ -518,6 +550,21 @@ impl UnlockDialog {
         if !self.is_entry_live() {
             return UnlockEffects::default();
         }
+        if self.status == Status::AskingName {
+            // An empty name stays on the question. gnome-shell would begin an anonymous
+            // conversation, whose PAM stack asks for the name again (`util.js` `begin`).
+            if self.entry.text().is_empty() {
+                return UnlockEffects::default();
+            }
+            let name = self.entry.text().to_owned();
+            self.clear_entry();
+            self.question = None;
+            self.status = Status::NotVerifying;
+            return UnlockEffects {
+                name_entered: Some(name),
+                ..UnlockEffects::redraw()
+            };
+        }
         // Clone, then zero ours: `mem::take` would hand the request our allocation and leave the
         // dialog with a fresh zero-capacity `String`, restarting the reallocation ladder that
         // `ENTRY_CAPACITY` exists to avoid.
@@ -530,9 +577,8 @@ impl UnlockDialog {
         self.queue_message(None, now);
         UnlockEffects {
             request: Some(VerifierRequest::Answer(answer)),
-            unlock: false,
             redraw: true,
-            start_fingerprint: false,
+            ..Default::default()
         }
     }
 
@@ -652,10 +698,9 @@ impl UnlockDialog {
                 self.clear_entry();
                 self.question = None;
                 UnlockEffects {
-                    request: None,
                     unlock: true,
                     redraw: true,
-                    start_fingerprint: false,
+                    ..Default::default()
                 }
             }
 

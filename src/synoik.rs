@@ -241,8 +241,19 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 pub enum LoginPage {
     /// The user grid ([`crate::ui::login_grid`]).
     Grid,
-    /// Asking for credentials: for a picked user, or for a name first (`None`).
-    Prompt { user: Option<String> },
+    /// "Enter User Name": asking who is logging in.
+    Name,
+    /// Asking `user` for credentials. `listed`: picked from the grid, so shown with their picture
+    /// and name; a typed name is shown as gnome-shell shows a null user, the generic picture and
+    /// no name (`authPrompt.js:722-732`, `userWidget.js:172-209`).
+    Prompt { user: String, listed: bool },
+}
+
+impl LoginPage {
+    /// Whether a user is being asked for credentials, so there is a conversation to keep alive.
+    pub fn is_asking_a_user(&self) -> bool {
+        matches!(self, Self::Prompt { .. })
+    }
 }
 
 /// `$system_base_color` (`_colors.scss:20`, `_palette.scss`), behind the login screen.
@@ -6210,7 +6221,8 @@ impl State {
             return;
         }
         if self.synoik.greeter && raw == Some(Keysym::Escape) {
-            self.greeter_back_to_grid(true);
+            let cancel = self.synoik.login_page.is_asking_a_user();
+            self.greeter_back_to_grid(cancel);
             return;
         }
         let now = self.synoik.shield_now();
@@ -6314,26 +6326,38 @@ impl State {
     fn on_login_grid_action(&mut self, action: crate::ui::login_grid::GridAction) {
         use crate::ui::login_grid::GridAction;
 
-        let picked = match action {
-            GridAction::Pick(i) => self.synoik.login_users.get(i).cloned(),
-            GridAction::EnterName => None,
-        };
+        match action {
+            GridAction::Pick(i) => {
+                let Some(user) = self.synoik.login_users.get(i).cloned() else {
+                    return;
+                };
+                let user = crate::unlock_dialog::UserInfo {
+                    name: user.name,
+                    real_name: user.real_name,
+                };
+                self.greeter_ask_user(user, true);
+            }
+            GridAction::EnterName => {
+                // `_hideUserListAskForUsernameAndBeginVerification` (`loginDialog.js:1460-1463`).
+                self.synoik.login_page = LoginPage::Name;
+                let now = self.synoik.shield_now();
+                let effects = self.synoik.unlock_dialog.ask_username(now);
+                self.apply_unlock_effects(effects);
+            }
+        }
+    }
+
+    /// Ask `user` for credentials (`authPrompt.begin`), picked from the grid (`listed`) or typed.
+    fn greeter_ask_user(&mut self, user: crate::unlock_dialog::UserInfo, listed: bool) {
         self.synoik.login_page = LoginPage::Prompt {
-            user: picked.as_ref().map(|u| u.name.clone()),
+            user: user.name.clone(),
+            listed,
         };
         self.synoik.queue_redraw_all();
-        let Some(user) = picked else {
-            return;
-        };
 
-        // Ask for this user's credentials: the shield's own path to a conversation, so a channel
-        // that dies is retried like the lock screen's (`ScreenShield::retry_authenticator`).
-        self.synoik
-            .unlock_dialog
-            .set_user(crate::unlock_dialog::UserInfo {
-                name: user.name,
-                real_name: user.real_name,
-            });
+        // The shield's own path to a conversation, so a channel that dies is retried like the
+        // lock screen's (`ScreenShield::retry_authenticator`).
+        self.synoik.unlock_dialog.set_user(user);
         self.synoik.warm_avatar();
         // A fresh conversation for this pick, whatever an earlier one left awaiting.
         self.synoik.screen_shield.drop_authenticator();
@@ -6532,7 +6556,16 @@ impl State {
         self.sync_caps_warning();
     }
 
-    pub fn apply_unlock_effects(&mut self, effects: crate::unlock_dialog::UnlockEffects) {
+    pub fn apply_unlock_effects(&mut self, mut effects: crate::unlock_dialog::UnlockEffects) {
+        // The greeter's name entry answered: on to that user's credentials.
+        if let Some(name) = effects.name_entered.take() {
+            let user = crate::unlock_dialog::UserInfo {
+                name,
+                real_name: String::new(),
+            };
+            self.greeter_ask_user(user, false);
+        }
+
         if let Some(request) = effects.request {
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(request);
@@ -6802,7 +6835,7 @@ impl State {
             }
             // On the greeter's list nobody is being asked for, so there is nothing to recover.
             VerifierEvent::Lost
-                if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid =>
+                if self.synoik.greeter && !self.synoik.login_page.is_asking_a_user() =>
             {
                 self.synoik.screen_shield.drop_authenticator();
             }
@@ -7047,7 +7080,7 @@ impl State {
         if let Some(delay) = effects.retry_authenticator_after {
             self.synoik.timer_after(delay, |state| {
                 // The greeter's user went back to the list meanwhile: nobody to ask for.
-                if state.synoik.greeter && state.synoik.login_page == LoginPage::Grid {
+                if state.synoik.greeter && !state.synoik.login_page.is_asking_a_user() {
                     return None;
                 }
                 let effects = state.synoik.screen_shield.retry_authenticator();
@@ -12282,7 +12315,7 @@ impl Synoik {
             }
 
             // The greeter's credentials page is the unlock prompt, for the user it picked.
-            let prompt_page = !self.greeter || matches!(self.login_page, LoginPage::Prompt { .. });
+            let prompt_page = !self.greeter || self.login_page != LoginPage::Grid;
             if prompt_t.is_visible() && prompt_page {
                 let d = &self.unlock_dialog;
                 let (caret, selection) = match d.entry_mask() {
@@ -12292,6 +12325,7 @@ impl Synoik {
                 };
                 let content = crate::ui::lock_screen::PromptContent {
                     display_name: d.user().display_name().to_owned(),
+                    name_hidden: !self.shows_prompt_user(),
                     entry: d.entry_display(),
                     // The caret in *masked* coordinates: `d.entry()` never leaves the model.
                     cursor: caret,
@@ -16844,6 +16878,9 @@ impl Synoik {
     /// The account picture as an image source, if AccountsService gave us one that is on disk.
     pub fn avatar_source(&self) -> Option<crate::image_source::ImageSource> {
         // The greeter asks for whoever was picked from the list.
+        if !self.shows_prompt_user() {
+            return None;
+        }
         let icon = if self.greeter {
             let name = &self.unlock_dialog.user().name;
             self.login_users
@@ -16861,6 +16898,12 @@ impl Synoik {
     ///
     /// Keyed on the scale like every other image, so warming the wrong one is a decode nobody
     /// reads — hence per output rather than once.
+    /// Whether the prompt shows who it is asking: always on the lock screen, and on the greeter
+    /// for a user picked from the list.
+    pub fn shows_prompt_user(&self) -> bool {
+        !self.greeter || matches!(self.login_page, LoginPage::Prompt { listed: true, .. })
+    }
+
     pub fn warm_avatar(&self) {
         let Some(source) = self.avatar_source() else {
             return;
