@@ -41750,6 +41750,9 @@ fn the_greeter_is_gdm_mode() {
     let x = clock_center_x(&mut f, 1920.);
     click_panel_at(&mut f, x);
     assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_DATE_MENU));
+    // Just the calendar (`dateMenu.js:999-1015`).
+    let sections = f.synoik().panel_popover.date_menu().unwrap().sections();
+    assert!(!sections.message_list && !sections.displays);
 }
 
 /// The greeter has no gnome-session to ask, so its Power Off raises the confirmation itself, with

@@ -3347,6 +3347,7 @@ fn vulkan_renders_the_calendar_popover() {
             cal.show_week_numbers,
             accent,
             Vec::new(),
+            Default::default(),
         );
     }
     assert!(f.synoik().panel_popover.is_open());
@@ -3436,6 +3437,7 @@ fn vulkan_renders_the_message_list_card() {
                 has_urgent: card.critical,
                 cards: vec![card],
             }],
+            Default::default(),
         );
     }
     f.settle_animations();
@@ -3549,6 +3551,7 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
                     time_text: "Just now".to_owned(),
                 }],
             }],
+            Default::default(),
         );
     }
     f.settle_animations();
@@ -3670,6 +3673,7 @@ fn vulkan_renders_the_expanded_card_body() {
                 has_urgent: card.critical,
                 cards: vec![card],
             }],
+            Default::default(),
         );
     }
     f.settle_animations();
@@ -3804,6 +3808,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
                 has_urgent: false,
                 cards: vec![make_card(1), make_card(2), make_card(3)],
             }],
+            Default::default(),
         );
     }
     f.settle_animations();
@@ -3959,6 +3964,7 @@ fn vulkan_renders_the_scrolled_message_list() {
             cal.show_week_numbers,
             accent,
             groups,
+            Default::default(),
         );
     }
     f.settle_animations();
@@ -11139,6 +11145,7 @@ fn open_calendar(f: &mut Fixture, output: &Output) {
         cal.show_week_numbers,
         accent,
         Vec::new(),
+        Default::default(),
     );
 }
 
@@ -13060,6 +13067,7 @@ fn vulkan_renders_the_media_card() {
             cal.show_week_numbers,
             accent,
             Vec::new(),
+            Default::default(),
         );
     }
     f.synoik().refresh_popover_media();
@@ -13202,6 +13210,7 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
             cal.show_week_numbers,
             accent,
             Vec::new(),
+            Default::default(),
         );
     }
     f.synoik().refresh_popover_media();

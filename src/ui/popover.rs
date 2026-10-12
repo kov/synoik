@@ -730,7 +730,9 @@ impl PanelPopover {
     /// at `anchor` on `output`, or close it if it's already open (from the same
     /// button). `cards` is the notification-store snapshot for the message
     /// list. Returns whether it opened — the caller acknowledges the store
-    /// exactly then (`js/ui/messageList.js:1193-1199`), never on close.
+    /// exactly then (`js/ui/messageList.js:1193-1199`), never on close. `sections` is what the
+    /// session mode lets it show.
+    #[allow(clippy::too_many_arguments)]
     pub fn toggle_calendar(
         &mut self,
         output: Output,
@@ -739,6 +741,7 @@ impl PanelPopover {
         show_week_numbers: bool,
         accent: [u8; 3],
         groups: Vec<CardGroup>,
+        sections: crate::ui::calendar::DateMenuSections,
     ) -> bool {
         if self.is_showing::<CalendarTag>() {
             self.close();
@@ -749,6 +752,7 @@ impl PanelPopover {
         self.anchor = anchor;
         self.side = PopoverSide::Top;
         let mut date_menu = DateMenu::new(week_start, show_week_numbers, accent, groups);
+        date_menu.set_sections(sections);
         // Grow to fit the content but stay within the work area, leaving the
         // same margin at the bottom as the top (`js/ui/panelMenu.js:177-185`,
         // `js/ui/boxpointer.js:117-137`): output height minus the panel and both

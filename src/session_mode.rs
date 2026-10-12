@@ -31,6 +31,7 @@ pub enum PanelStyle {
 pub struct SessionMode {
     pub name: &'static str,
     pub allow_settings: bool,
+    pub has_notifications: bool,
     pub is_locked: bool,
     pub is_greeter: bool,
     /// Every panel role the mode shows, across its three boxes.
@@ -48,6 +49,7 @@ impl SessionMode {
 const RESTRICTIVE: SessionMode = SessionMode {
     name: "restrictive",
     allow_settings: false,
+    has_notifications: false,
     is_locked: false,
     is_greeter: false,
     panel_roles: &[],
@@ -59,6 +61,7 @@ const RESTRICTIVE: SessionMode = SessionMode {
 pub const USER: SessionMode = SessionMode {
     name: "user",
     allow_settings: true,
+    has_notifications: true,
     panel_roles: &[
         ROLE_ACTIVITIES,
         ROLE_DATE_MENU,
@@ -85,6 +88,7 @@ pub const UNLOCK_DIALOG: SessionMode = SessionMode {
 /// a panel item.
 pub const GDM: SessionMode = SessionMode {
     name: "gdm",
+    has_notifications: true,
     is_greeter: true,
     panel_roles: &[ROLE_DATE_MENU, ROLE_KEYBOARD, ROLE_QUICK_SETTINGS],
     panel_style: PanelStyle::Transparent,

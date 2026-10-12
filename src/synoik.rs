@@ -2848,6 +2848,7 @@ impl State {
             cal.show_week_numbers,
             accent,
             cards,
+            crate::ui::calendar::DateMenuSections::for_mode(self.synoik.session_mode()),
         );
         if opened {
             let effects = self.synoik.notifications.acknowledge_all();

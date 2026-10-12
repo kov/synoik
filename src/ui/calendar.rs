@@ -2816,6 +2816,36 @@ pub struct DateMenu {
     /// The popover background (rounded box + placeholder label / Clear pill),
     /// cached per scale; the stored revision is 0/1 for empty/non-empty.
     bg_cache: RefCell<TextureCache>,
+    /// Which columns the session mode shows.
+    sections: DateMenuSections,
+}
+
+/// What the session mode lets the date menu show (`DateMenu._sessionUpdated`,
+/// `dateMenu.js:999-1015`). The greeter has neither: just the calendar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateMenuSections {
+    /// The message list: `hasNotifications && !isGreeter`.
+    pub message_list: bool,
+    /// The Events and World Clocks cards under the grid: `allowSettings`.
+    pub displays: bool,
+}
+
+impl DateMenuSections {
+    pub fn for_mode(mode: &crate::session_mode::SessionMode) -> Self {
+        Self {
+            message_list: mode.has_notifications && !mode.is_greeter,
+            displays: mode.allow_settings,
+        }
+    }
+}
+
+impl Default for DateMenuSections {
+    fn default() -> Self {
+        Self {
+            message_list: true,
+            displays: true,
+        }
+    }
 }
 
 /// The x where the calendar column starts (also the list column's width).
@@ -2891,7 +2921,31 @@ impl DateMenu {
                 context: None,
                 textures: HashMap::new(),
             }),
+            sections: DateMenuSections::default(),
         }
+    }
+
+    pub fn set_sections(&mut self, sections: DateMenuSections) {
+        self.sections = sections;
+    }
+
+    pub fn sections(&self) -> DateMenuSections {
+        self.sections
+    }
+
+    /// Where the calendar column starts: past the message list, or at the box's padding without
+    /// one.
+    fn calendar_x(&self) -> f64 {
+        if self.sections.message_list {
+            calendar_col_x()
+        } else {
+            LIST_PAD
+        }
+    }
+
+    /// Whether `pos` (popover-local) is over the message-list column.
+    fn over_list(&self, pos: Point<f64, Logical>) -> bool {
+        self.sections.message_list && pos.x < calendar_col_x()
     }
 
     /// Adopt a freshly-formatted Events section model. Returns whether it changed.
@@ -2938,7 +2992,7 @@ impl DateMenu {
     /// bottom rows clip — the displays-section ScrollView is deferred (see the
     /// module docs).
     fn events_alloc_h(&self) -> f64 {
-        if !self.events.visible {
+        if !self.sections.displays || !self.events.visible {
             return 0.;
         }
         let section = self.events_card_h() + 2. * EVENTS_MARGIN;
@@ -2995,7 +3049,7 @@ impl DateMenu {
     /// The section texture's natural height (card + margins), clamped to the room
     /// left below the grid AND the events card. Overflow clips (ScrollView deferred).
     fn world_clocks_alloc_h(&self) -> f64 {
-        if !self.world_clocks.visible {
+        if !self.sections.displays || !self.world_clocks.visible {
             return 0.;
         }
         let section = self.world_clocks_card_h() + 2. * EVENTS_MARGIN;
@@ -3029,7 +3083,7 @@ impl DateMenu {
         let cal = self.calendar.logical_size();
         let top = cal.h + EVENTS_GAP + EVENTS_MARGIN;
         Some(Rectangle::new(
-            Point::from((calendar_col_x() + EVENTS_MARGIN, top)),
+            Point::from((self.calendar_x() + EVENTS_MARGIN, top)),
             Size::from((
                 (cal.w - 2. * EVENTS_MARGIN).max(0.),
                 (alloc - 2. * EVENTS_MARGIN).max(0.),
@@ -3049,7 +3103,7 @@ impl DateMenu {
         let cal = self.calendar.logical_size();
         let top = cal.h + self.events_height() + EVENTS_GAP + EVENTS_MARGIN;
         Some(Rectangle::new(
-            Point::from((calendar_col_x() + EVENTS_MARGIN, top)),
+            Point::from((self.calendar_x() + EVENTS_MARGIN, top)),
             Size::from((
                 (cal.w - 2. * EVENTS_MARGIN).max(0.),
                 (alloc - 2. * EVENTS_MARGIN).max(0.),
@@ -3073,9 +3127,14 @@ impl DateMenu {
         // `.popup-menu-content` bottom padding so the last card isn't flush with the
         // box edge (the left/right get the same `LIST_PAD` inset, below).
         let column_h = cal.h + self.events_height() + self.world_clocks_height() + LIST_PAD;
-        let natural = column_h.max(self.list.natural_height());
+        let list_h = if self.sections.message_list {
+            self.list.natural_height()
+        } else {
+            0.
+        };
+        let natural = column_h.max(list_h);
         let h = natural.min(self.available_h.max(column_h));
-        Size::from((calendar_col_x() + cal.w + LIST_PAD, h))
+        Size::from((self.calendar_x() + cal.w + LIST_PAD, h))
     }
 
     /// The popover box corner radius — for the drop shadow behind it.
@@ -3138,7 +3197,7 @@ impl DateMenu {
     /// popover stays open, like gnome-shell's grab).
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
         let size = self.logical_size();
-        if pos.x < calendar_col_x() {
+        if self.over_list(pos) {
             let Some(hit) = self.list.hit(pos, size.h) else {
                 return PopoverAction::Consumed;
             };
@@ -3165,7 +3224,7 @@ impl DateMenu {
             self.set_focus(Some(DateStop::WorldClocks));
             return world_clocks_action();
         }
-        let local = pos - Point::from((calendar_col_x(), 0.));
+        let local = pos - Point::from((self.calendar_x(), 0.));
         if let Some(zone) = self.calendar.zone_at(local) {
             self.set_focus(Some(DateStop::Cal(zone)));
         }
@@ -3176,13 +3235,16 @@ impl DateMenu {
     /// Every focus stop with its popover-local rect, in visual order. The calendar column's
     /// zones come from the calendar itself, shifted into popover coordinates.
     fn stops(&self) -> Vec<(DateStop, Rectangle<f64, Logical>)> {
-        let mut out: Vec<(DateStop, Rectangle<f64, Logical>)> = self
-            .list
-            .stops(self.logical_size().h)
-            .into_iter()
-            .map(|(hit, rect)| (DateStop::List(hit), rect))
-            .collect();
-        let shift = Point::from((calendar_col_x(), 0.));
+        let mut out: Vec<(DateStop, Rectangle<f64, Logical>)> = Vec::new();
+        if self.sections.message_list {
+            out.extend(
+                self.list
+                    .stops(self.logical_size().h)
+                    .into_iter()
+                    .map(|(hit, rect)| (DateStop::List(hit), rect)),
+            );
+        }
+        let shift = Point::from((self.calendar_x(), 0.));
         out.extend(self.calendar.zones().into_iter().map(|(zone, mut rect)| {
             rect.loc += shift;
             (DateStop::Cal(zone), rect)
@@ -3301,9 +3363,9 @@ impl DateMenu {
         let over_events = pos.is_some_and(|p| self.events_rect().is_some_and(|r| r.contains(p)));
         let over_wc = pos.is_some_and(|p| self.world_clocks_rect().is_some_and(|r| r.contains(p)));
         let (list_pos, cal_pos) = match pos {
-            Some(p) if p.x < calendar_col_x() => (Some(p), None),
+            Some(p) if self.over_list(p) => (Some(p), None),
             Some(_) if over_events || over_wc => (None, None),
-            Some(p) => (None, Some(p - Point::from((calendar_col_x(), 0.)))),
+            Some(p) => (None, Some(p - Point::from((self.calendar_x(), 0.)))),
             None => (None, None),
         };
         let mut changed = self.list.hover(list_pos, size.h);
@@ -3318,7 +3380,7 @@ impl DateMenu {
     /// month (gnome-shell `Calendar.vfunc_scroll_event`). Returns whether
     /// anything changed (so the caller can redraw).
     pub fn scroll(&mut self, pos: Point<f64, Logical>, delta: f64) -> bool {
-        if pos.x < calendar_col_x() {
+        if self.over_list(pos) {
             self.list.scroll_by(delta, self.logical_size().h)
         } else {
             self.calendar.scroll(delta)
@@ -3809,7 +3871,12 @@ impl DateMenu {
         // The keyboard focus ring over a focused list control, FIRST so it lands topmost — the
         // cards below are cached textures of their own, and threading a focus flag through their
         // bake would re-render a card's whole content on every arrow press.
-        if let Some((rect, radius)) = self.list.focus_ring_rect(size.h) {
+        let list_ring = self
+            .sections
+            .message_list
+            .then(|| self.list.focus_ring_rect(size.h))
+            .flatten();
+        if let Some((rect, radius)) = list_ring {
             let accent = self.calendar.accent();
             let revision = widget::Revision::new().color(accent).px(radius).done();
             match widget::bake_focus_ring(
@@ -3834,7 +3901,9 @@ impl DateMenu {
         }
 
         // The message-list cards, or the placeholder icon when empty.
-        if self.list.is_empty() {
+        if !self.sections.message_list {
+            // No list column on the greeter.
+        } else if self.list.is_empty() {
             let (icon_cy, _) = placeholder_centers(size.h);
             let center = Point::from((LIST_PAD + list_w() / 2., icon_cy));
             if let Some(tb) = icons.texture(
@@ -3875,7 +3944,7 @@ impl DateMenu {
                 );
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
-                    origin + Point::from((calendar_col_x(), 0.)),
+                    origin + Point::from((self.calendar_x(), 0.)),
                     1.,
                     None,
                     None,
@@ -3902,7 +3971,7 @@ impl DateMenu {
                     );
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
-                        origin + Point::from((calendar_col_x(), cal_h + EVENTS_GAP)),
+                        origin + Point::from((self.calendar_x(), cal_h + EVENTS_GAP)),
                         1.,
                         None,
                         None,
@@ -3931,7 +4000,7 @@ impl DateMenu {
                     );
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
-                        origin + Point::from((calendar_col_x(), top)),
+                        origin + Point::from((self.calendar_x(), top)),
                         1.,
                         None,
                         None,
@@ -3948,8 +4017,14 @@ impl DateMenu {
         // the bottom of the content stack. Reports NO opaque region: the `.popup-menu-content`
         // box fill (and its rounded opaque region) is now drawn by the shared popover chrome
         // behind this texture (`PanelPopover::render`).
-        match self.bg_texture(renderer, scale) {
-            Ok(texture) => {
+        let bg = if self.sections.message_list {
+            Some(self.bg_texture(renderer, scale))
+        } else {
+            None
+        };
+        match bg {
+            None => (),
+            Some(Ok(texture)) => {
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
@@ -3966,7 +4041,7 @@ impl DateMenu {
                     Kind::Unspecified,
                 ));
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 tracing::error!("error drawing the calendar popover background: {err:#}");
             }
         }
@@ -4697,6 +4772,49 @@ run it with --features reference-env, as the fedora CI job does"
             calendar_col_x() > 29. * list_em(),
             "the list column is 29em wide plus its margins"
         );
+    }
+
+    /// On the greeter the date menu is the calendar alone (`dateMenu.js:999-1015`): no message
+    /// list (`!isGreeter`), no Events or World Clocks (`allowSettings`). The calendar column moves
+    /// to the box's padding, and what was the list's ground is the calendar's.
+    #[test]
+    fn the_greeters_date_menu_is_just_the_calendar() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![single_group(sample_card(1))]);
+        dm.set_events(EventsSectionModel {
+            visible: true,
+            title: "Today".to_owned(),
+            rows: Vec::new(),
+        });
+        let sections = DateMenuSections::for_mode(&crate::session_mode::GDM);
+        assert_eq!(
+            sections,
+            DateMenuSections {
+                message_list: false,
+                displays: false,
+            }
+        );
+        assert_eq!(
+            DateMenuSections::for_mode(&crate::session_mode::USER),
+            DateMenuSections::default()
+        );
+        dm.set_sections(sections);
+
+        let cal = dm.calendar.logical_size();
+        let size = dm.logical_size();
+        assert_eq!(size.w, LIST_PAD + cal.w + LIST_PAD);
+        assert_eq!(size.h, cal.h + LIST_PAD, "no Events card under the grid");
+        assert!(dm.events_rect().is_none());
+        assert!(!dm
+            .stops()
+            .iter()
+            .any(|(s, _)| matches!(s, DateStop::List(_))));
+
+        // The next-month arrow, where the calendar now sits.
+        let before = (dm.calendar.year, dm.calendar.month);
+        let next = Layout::new(false).next_arrow();
+        let action = dm.pointer_click(center(next) + Point::<f64, Logical>::from((LIST_PAD, 0.)));
+        assert_eq!(action, PopoverAction::Consumed);
+        assert_ne!((dm.calendar.year, dm.calendar.month), before);
     }
 
     #[test]
