@@ -298,10 +298,14 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   question, where gnome-shell would begin an anonymous conversation whose PAM stack asks for the
   name again. Escape goes back to the grid. Not built: realmd's login-format hint under the entry
   (`:1127-1139`).
-- **Banner** (`banner-message-enable`, `-source`, `-text`, `-path`) top-centre, moving into the
-  free space above the prompt (`:946-1010`, `807-867`); **logo** (`logo`) bottom-centre
-  (`:1018-1039`); **accessibility** button bottom-right, a two-column menu of the ten
-  accessibility toggles (`:415-459`).
+- **Banner** (`banner-message-enable`, `-source`, `-text`, `-path`, `src/ui/login_dialog.rs`):
+  with the prompt and not the list, top-centre under the panel, wrapped at 25em and moved a quarter
+  of the spare room down towards the prompt; without room it keeps the top half and is cut
+  (`:754-858`, `946-1010`, `1115-1126`). Not built: the wide layout beside the prompt, the scroll
+  bar, and watching the file — it is read when the settings are. **Logo** (`logo`) bottom-centre at
+  its natural size above a 3em margin, on every page (`:705-717`, `1018-1039`).
+  **Accessibility** button bottom-right, a two-column menu of the ten accessibility toggles
+  (`:415-459`) — not built.
 
 ### 4.3 The auth prompt
 
@@ -331,7 +335,7 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
 `banner-message-*`, `disable-restart-buttons`. Not honoured: `enable-smartcard-authentication`
 (out of scope). Read today: `enable-fingerprint-authentication`, `disable-restart-buttons`,
-`disable-user-list` and `allowed-failures`.
+`disable-user-list`, `allowed-failures`, `logo` and `banner-message-*`.
 
 The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
 needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which the

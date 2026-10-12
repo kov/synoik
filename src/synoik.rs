@@ -474,6 +474,8 @@ pub struct Synoik {
     pub greeter_visit: u64,
     /// The login screen's user grid and which page it is on.
     pub login_grid: crate::ui::login_grid::LoginGrid,
+    /// The login dialog's banner and logo.
+    pub login_chrome: crate::ui::login_dialog::LoginDialogChrome,
     pub login_page: LoginPage,
     /// `synoik --greeter`: the login screen's session, in gnome-shell's `gdm` mode
     /// (`docs/fork/greeter.md` §4).
@@ -8597,6 +8599,7 @@ impl Synoik {
             login_users_loaded: false,
             greeter_visit: 0,
             login_grid: crate::ui::login_grid::LoginGrid::new(),
+            login_chrome: Default::default(),
             login_page: LoginPage::Grid,
             start_time: Instant::now(),
             is_at_startup: true,
@@ -12371,6 +12374,37 @@ impl Synoik {
             let mut clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
             prompt_t.translation_y += slide;
             clock_t.translation_y += slide;
+
+            // The administrator's banner (with the prompt) and logo (always), above the pages.
+            if self.greeter && prompt_t.is_visible() {
+                let ls = &self.gnome_settings.login_screen;
+                if let Some(logo) = &ls.logo {
+                    if let Some(el) = self.login_chrome.render_logo(
+                        ctx.renderer,
+                        &self.image_cache,
+                        page_ctx,
+                        logo,
+                        prompt_t,
+                    ) {
+                        match el {
+                            crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                            crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                        }
+                    }
+                }
+                if let (Some(text), true) = (&ls.banner, self.login_page != LoginPage::Grid) {
+                    let top = crate::ui::lock_screen::prompt_top(page_ctx.monitor);
+                    if let Some(el) =
+                        self.login_chrome
+                            .render_banner(ctx.renderer, page_ctx, text, top, prompt_t)
+                    {
+                        match el {
+                            crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                            crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                        }
+                    }
+                }
+            }
 
             if self.greeter && self.login_page == LoginPage::Grid && prompt_t.is_visible() {
                 for elem in self.login_grid.render(

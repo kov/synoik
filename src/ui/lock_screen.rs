@@ -574,6 +574,14 @@ pub fn switch_user_hit(monitor: Rectangle<f64, Logical>, pos: Point<f64, Logical
     widget::IconButton::new(rect, 0., style::TRANSPARENT).contains(pos)
 }
 
+/// Where the prompt block starts on `monitor` — what the login banner sits above.
+pub fn prompt_top(monitor: Rectangle<f64, Logical>) -> f64 {
+    stack_top(
+        monitor,
+        prompt_block_height(crate::ui::pt_to_px(crate::ui::base_font_pt())),
+    )
+}
+
 /// The prompt block's total height, sized before anything is shaped (see [`LINE_BOX_ESTIMATE`]).
 pub fn prompt_block_height(base_px: f64) -> f64 {
     let l = prompt_layout(

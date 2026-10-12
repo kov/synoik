@@ -16401,6 +16401,93 @@ fn vulkan_app_expose_fades_in_a_window_from_another_workspace() {
 /// The greeter's user grid on its flat `$system_base_color` (`_login-lock.scss:1,233-235`): three
 /// users make three tiles in a centred row, each drawn over the backdrop with its name, and the
 /// rest of the screen is the backdrop and nothing else of the desktop.
+/// The administrator's logo sits centred at the bottom on every page; the banner shows above the
+/// prompt and not over the user list (`loginDialog.js:705-717`, `754-858`, `1115-1126`).
+#[test]
+fn vulkan_draws_the_login_banner_and_logo() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    let output = f.synoik_output(1);
+    f.synoik().greeter = true;
+    let logo_path = std::env::temp_dir().join(format!("greeter-logo-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(120, 40, image::Rgba([220, 30, 30, 255]))
+        .save(&logo_path)
+        .expect("write the logo");
+    let logo = crate::ui::login_dialog::Logo::load(logo_path.to_str().unwrap()).expect("a logo");
+    assert_eq!(logo.size, (120, 40));
+    f.synoik().gnome_settings.login_screen.logo = Some(logo.clone());
+    f.synoik().gnome_settings.login_screen.banner = Some("Authorised use only.".to_owned());
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    f.synoik_complete_animations();
+
+    let light_in = |pixels: &[u8], w: i32, r: Rectangle<f64, Logical>| {
+        (r.loc.y as i32..(r.loc.y + r.size.h) as i32)
+            .flat_map(|y| (r.loc.x as i32..(r.loc.x + r.size.w) as i32).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = px(pixels, w, x, y);
+                p[0] > 150 && p[1] > 150 && p[2] > 150
+            })
+            .count()
+    };
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let monitor = Rectangle::from_size(Size::from((f64::from(w), f64::from(h))));
+    let r = crate::ui::login_dialog::logo_rect(monitor, &logo);
+    let centre = px(
+        &pixels,
+        w,
+        (r.loc.x + r.size.w / 2.) as i32,
+        (r.loc.y + r.size.h / 2.) as i32,
+    );
+    assert!(
+        centre[0] > 180 && centre[1] < 80,
+        "the logo is not drawn: {centre:?}"
+    );
+    let above_prompt = Rectangle::new(
+        Point::from((0., crate::ui::panel::panel_height() + 2.)),
+        Size::from((
+            f64::from(w),
+            crate::ui::lock_screen::prompt_top(monitor) - crate::ui::panel::panel_height() - 4.,
+        )),
+    );
+    assert_eq!(
+        light_in(&pixels, w, above_prompt),
+        0,
+        "no banner over the list"
+    );
+
+    f.synoik().gnome_settings.login_screen.disable_user_list = true;
+    f.synoik_state().sync_greeter_user_list();
+    f.synoik_complete_animations();
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    assert!(
+        light_in(&pixels, w, above_prompt) > 20,
+        "the banner is drawn over the prompt"
+    );
+    let _ = std::fs::remove_file(&logo_path);
+}
+
 #[test]
 fn vulkan_draws_the_greeter_user_grid() {
     use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};

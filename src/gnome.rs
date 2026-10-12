@@ -72,6 +72,11 @@ pub struct LoginScreenSettings {
     pub disable_user_list: bool,
     /// `allowed-failures`: attempts before a login goes back to the start (`util.js:165-167`).
     pub allowed_failures: u32,
+    /// The banner's text, resolved from `banner-message-enable`, `-source`, `-text` and `-path`
+    /// (`_getBannerText`, `loginDialog.js:974-990`); `None` hides it.
+    pub banner: Option<String>,
+    /// `logo`, read when the key is.
+    pub logo: Option<crate::ui::login_dialog::Logo>,
 }
 
 impl Default for LoginScreenSettings {
@@ -81,6 +86,8 @@ impl Default for LoginScreenSettings {
             disable_restart_buttons: false,
             disable_user_list: false,
             allowed_failures: 3,
+            banner: None,
+            logo: None,
         }
     }
 }
@@ -728,6 +735,10 @@ impl GnomeSettings {
             // An `i`; a negative count allows nothing, like zero.
             l.allowed_failures = login_screen.int("allowed-failures").max(0) as u32;
         }
+        if settings_has_key(login_screen, "logo") {
+            l.logo = crate::ui::login_dialog::Logo::load(&login_screen.string("logo"));
+        }
+        l.banner = banner_text(login_screen);
     }
 
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {
@@ -1044,6 +1055,39 @@ fn read_keybinding_table<K: AdoptedKey>(
             }
         })
         .collect()
+}
+
+/// `_getBannerText` (`loginDialog.js:974-990`): the text from the setting or the file, if enabled
+/// and not empty. **Divergence:** the file is read when the settings are, not watched for changes.
+fn banner_text(login_screen: &gio::Settings) -> Option<String> {
+    /// A banner is a paragraph or two; this only keeps a wrong path from reading something huge.
+    const MAX_BANNER_BYTES: u64 = 64 * 1024;
+
+    let has = |key| settings_has_key(login_screen, key);
+    if !has("banner-message-enable") || !login_screen.boolean("banner-message-enable") {
+        return None;
+    }
+    let from_file = has("banner-message-source")
+        && login_screen.string("banner-message-source") == "file"
+        && has("banner-message-path");
+    let text = if from_file {
+        use std::io::Read as _;
+
+        let path = login_screen.string("banner-message-path");
+        let mut text = String::new();
+        let read = std::fs::File::open(path.as_str())
+            .and_then(|f| f.take(MAX_BANNER_BYTES).read_to_string(&mut text));
+        if let Err(err) = read {
+            warn!("failed to read the login banner from {path}: {err}");
+            return None;
+        }
+        text
+    } else if has("banner-message-text") {
+        login_screen.string("banner-message-text").to_string()
+    } else {
+        return None;
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 fn settings_has_key(settings: &gio::Settings, key: &str) -> bool {

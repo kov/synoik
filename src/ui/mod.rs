@@ -22,6 +22,7 @@ pub mod hotkey_overlay;
 pub mod indicator_menu;
 pub mod input_source_menu;
 pub mod lock_screen;
+pub mod login_dialog;
 pub mod login_grid;
 pub mod media_card;
 /// Draws [`crate::network_secret_dialog`].
