@@ -25,15 +25,13 @@ use zbus::fdo;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::ipc::{Frame, Secret};
-use crate::worker::spawn_worker;
+use crate::worker::{spawn_worker, USER_SESSION_PROGRAM};
 
 const SESSION_PATH: &str = "/org/gnome/DisplayManager/Session";
 const VERIFIER_IFACE: &str = "org.gnome.DisplayManager.UserVerifier";
 const GREETER_IFACE: &str = "org.gnome.DisplayManager.Greeter";
 /// How long the client has to connect to the address it was handed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// What a login starts in its new session.
-const SESSION_PROGRAM: &str = "synoik-session";
 
 /// What a channel is for.
 pub enum Kind {
@@ -347,7 +345,7 @@ impl Verifier {
         let (ours, theirs) = UnixStream::pair().map_err(|e| fdo::Error::IOError(e.to_string()))?;
         let args: Vec<&str> = match shared.target.kind {
             Kind::Reauth { .. } => vec!["verify", pam, &user],
-            Kind::Login => vec!["login", pam, &user, "--", SESSION_PROGRAM],
+            Kind::Login => [&["login", pam, &user, "--"][..], &USER_SESSION_PROGRAM].concat(),
         };
         let pid = spawn_worker(&args, theirs.as_raw_fd())
             .map_err(|e| fdo::Error::Failed(format!("{e:#}")))?;

@@ -150,7 +150,8 @@ open is the one `SessionOpened` names. We make that the rule and open only it:
    (`gdm-session.c:1802-1822`).
 4. On `StartSessionWhenReady(service, true)`, fork: `setsid`, `setuid`, `chdir(HOME)`,
    `environment.d`, stdout/stderr to the journal, `pam_end(PAM_DATA_SILENT)` in the child, exec
-   `synoik-session` with `pam_getenvlist` plus `SYNOIK_SYSTEM_SOCKET`
+   `gnome-session --session synoik` (`resources/synoik.desktop`) with `pam_getenvlist`,
+   `SYNOIK_SYSTEM_SOCKET` and `XDG_CURRENT_DESKTOP=Synoik:GNOME`
    (`gdm-session-worker.c:2083-2236`).
 5. The worker stays the session's parent; when it exits, `pam_close_session`,
    `pam_setcred(DELETE)`, `pam_end`, `killpg(SIGHUP)` (`:1862-1880`).
@@ -514,10 +515,10 @@ times out (pam_fprintd's 30 s), reports unavailable and leaves the password work
   targets U's seat0 session and is `AccessDenied` when U has none; a verified reauthentication
   unlocks and activates that session.
 - **Login channel** (`channel.rs`): `UserVerifier` plus `Greeter` at the same path. Each
-  `BeginVerificationForUser` runs `synoik-login login SERVICE USER -- synoik-session`
+  `BeginVerificationForUser` runs `synoik-login login SERVICE USER -- gnome-session --session synoik`
   (`verify.rs`): authentication, account checks enforced, credentials established, then it waits.
   The first to verify wins (`Open`): it opens the session and reports its id, emitted as
-  `SessionOpened`; `StartSessionWhenReady` (`Start`) has it start `synoik-session` and parent it,
+  `SessionOpened`; `StartSessionWhenReady` (`Start`) has it start the session and parent it,
   and hands it to the daemon's main loop, so the channel closing does not end it and logout brings
   the greeter forward. Losers past verification are ended by closing their socket, so they drop
   their credentials; ones still inside PAM are killed. `StopConflictingSession` terminates the

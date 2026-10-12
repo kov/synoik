@@ -10,6 +10,10 @@
 Description=synoik login greeter
 OnFailure=gnome-session-shutdown.target
 OnFailureJobMode=replace-irreversibly
+# Unlike gnome-shell, synoik can quit on its own (the quit action): that ends the
+# session too, rather than leaving a headless gnome-session for the next login to rejoin.
+OnSuccess=gnome-session-shutdown.target
+OnSuccessJobMode=replace-irreversibly
 CollectMode=inactive-or-failed
 RefuseManualStart=on
 RefuseManualStop=on
@@ -26,5 +30,7 @@ Type=notify
 # Room to lock our memory out of swap; see resources/synoik.service.
 LimitMEMLOCK=768M
 ExecStart=synoik --greeter
+# What synoik exported to the user manager, which outlives the session.
+ExecStopPost=-systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY SYNOIK_SOCKET
 Restart=no
 TimeoutStopSec=5

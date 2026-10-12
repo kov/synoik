@@ -96,6 +96,8 @@ Requires:       bubblewrap
 
 # Loaded through dlopen
 Requires:       libwayland-server
+# The session runs under it (resources/synoik.session).
+Requires:       gnome-session
 
 # Integrated Xwayland support. Not packaged on EPEL
 %if 0%{?fedora}
@@ -147,11 +149,13 @@ target/rpm/synoik completions zsh > ./_synoik
 %install
 %cargo_install
 
-install -Dm755 -t %{buildroot}%{_bindir} ./resources/synoik-session
 install -Dm644 -t %{buildroot}%{_datadir}/wayland-sessions ./resources/synoik.desktop
 install -Dm644 -t %{buildroot}%{_datadir}/xdg-desktop-portal ./resources/synoik-portals.conf
+# The session runs under gnome-session, as GNOME's does.
+install -Dm644 -t %{buildroot}%{_datadir}/gnome-session/sessions ./resources/synoik.session
+install -Dm644 ./resources/synoik.session.conf \
+    %{buildroot}%{_userunitdir}/gnome-session@synoik.target.d/session.conf
 install -Dm644 -t %{buildroot}%{_userunitdir} ./resources/synoik.service
-install -Dm644 -t %{buildroot}%{_userunitdir} ./resources/synoik-shutdown.target
 
 # Our GSettings schemas, in a private dir rather than %%{_datadir}/glib-2.0/schemas:
 # our own keybindings, our copies of the mutter and gnome-shell schemas (so the
@@ -181,12 +185,15 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_synoik
 %doc README.md
 %doc docs/wiki
 %{_bindir}/synoik
-%{_bindir}/synoik-session
 %{_datadir}/wayland-sessions/synoik.desktop
 %dir %{_datadir}/xdg-desktop-portal
 %{_datadir}/xdg-desktop-portal/synoik-portals.conf
+%dir %{_datadir}/gnome-session
+%dir %{_datadir}/gnome-session/sessions
+%{_datadir}/gnome-session/sessions/synoik.session
+%dir %{_userunitdir}/gnome-session@synoik.target.d
+%{_userunitdir}/gnome-session@synoik.target.d/session.conf
 %{_userunitdir}/synoik.service
-%{_userunitdir}/synoik-shutdown.target
 %dir %{_datadir}/synoik
 %{_datadir}/synoik/glib-2.0/schemas/*.gschema.xml
 %{_datadir}/synoik/glib-2.0/schemas/*.gschema.override

@@ -16,7 +16,7 @@ use anyhow::Context as _;
 
 use crate::config::Config;
 use crate::ipc::Frame;
-use crate::worker::{spawn_worker, Request};
+use crate::worker::{spawn_worker, Request, USER_SESSION_PROGRAM};
 
 const GREETER_USER: &str = "synoik-greeter";
 /// Autologin runs once per boot: after that user logs out, the greeter is what comes up.
@@ -92,7 +92,7 @@ pub fn run() -> anyhow::Result<()> {
             service: "synoik-autologin".into(),
             user,
             class: "user".into(),
-            program: vec!["synoik-session".into()],
+            program: USER_SESSION_PROGRAM.map(Into::into).to_vec(),
         };
         daemon.spawn(Kind::User, request)?;
     }

@@ -249,6 +249,13 @@ pub fn parent_session(
     })
 }
 
+/// What a user's session runs: `Exec` of `resources/synoik.desktop`, the session GDM would start.
+pub const USER_SESSION_PROGRAM: [&str; 3] = ["gnome-session", "--session", "synoik"];
+
+/// `DesktopNames` of `resources/synoik.desktop`, joined with ':' as GDM does
+/// (`gdm-session.c:2808-2831`, set at `:2890`).
+const USER_DESKTOP_NAMES: &str = "Synoik:GNOME";
+
 /// `resources/synoik-greeter.dconf-profile`, installed under this name.
 const GREETER_DCONF_PROFILE: &str = "synoik-greeter";
 
@@ -282,6 +289,8 @@ fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CStri
         // GDM's greeter desktop names (`DesktopNames` in `data/gnome-greeter.desktop.in`, set at
         // `gdm-session.c:2890`).
         env.insert("XDG_CURRENT_DESKTOP".into(), "GNOME-Greeter:GNOME".into());
+    } else {
+        env.insert("XDG_CURRENT_DESKTOP".into(), USER_DESKTOP_NAMES.into());
     }
     env.into_iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(Into::into))

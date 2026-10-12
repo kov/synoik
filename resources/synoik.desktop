@@ -1,6 +1,7 @@
 [Desktop Entry]
 Name=Synoik
 Comment=A scrollable-tiling Wayland compositor
-Exec=synoik-session
+Exec=gnome-session --session synoik
+TryExec=gnome-session
 Type=Application
-DesktopNames=synoik
+DesktopNames=Synoik;GNOME;

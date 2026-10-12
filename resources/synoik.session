@@ -1,0 +1,5 @@
+# The user session's gnome-session session, as gnome-session's data/gnome.session.desktop
+# (50.1). Install as /usr/share/gnome-session/sessions/synoik.session; synoik.desktop and
+# synoik-login start it with `gnome-session --session synoik`.
+[GNOME Session]
+Name=synoik

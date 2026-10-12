@@ -1,12 +1,23 @@
+# The compositor of a user's session under gnome-session, as gnome-shell's
+# data/org.gnome.Shell@.service.in (50.3) runs `gnome-shell --mode=user`.
+# Install in /usr/lib/systemd/user.
 [Unit]
-Description=A scrollable-tiling Wayland compositor
-BindsTo=graphical-session.target
-Before=graphical-session.target
-Wants=graphical-session-pre.target
-After=graphical-session-pre.target
+Description=synoik
+OnFailure=gnome-session-shutdown.target
+OnFailureJobMode=replace-irreversibly
+# Unlike gnome-shell, synoik can quit on its own (the quit action): that ends the
+# session too, rather than leaving a headless gnome-session for the next login to rejoin.
+OnSuccess=gnome-session-shutdown.target
+OnSuccessJobMode=replace-irreversibly
+CollectMode=inactive-or-failed
+RefuseManualStart=on
+RefuseManualStop=on
 
-Wants=xdg-desktop-autostart.target
-Before=xdg-desktop-autostart.target
+After=gnome-session-manager.target
+
+Requisite=gnome-session-initialized.target
+PartOf=gnome-session-initialized.target
+Before=gnome-session-initialized.target
 
 [Service]
 Slice=session.slice
@@ -20,3 +31,7 @@ Environment=GSETTINGS_SCHEMA_DIR=/usr/share/synoik/glib-2.0/schemas
 # the default 8M is spent on its code alone.
 LimitMEMLOCK=768M
 ExecStart=synoik --session
+# What synoik exported to the user manager, which outlives the session.
+ExecStopPost=-systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY SYNOIK_SOCKET
+Restart=no
+TimeoutStopSec=5

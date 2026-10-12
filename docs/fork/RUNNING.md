@@ -126,6 +126,15 @@ This is the way to test the overlay key and anything input- or display-specific.
 4. Quit the compositor (its configured quit bind, default `Super+Shift+E`), then
    switch back to your GNOME session: **Ctrl+Alt+F1** (or F2).
 
+## The synoik session
+
+`resources/synoik.desktop` (the "Synoik" entry a display manager offers) runs
+`gnome-session --session synoik`, as GNOME's own entry runs `gnome-session`:
+`gnome-session@synoik.target` requires `gnome-session-services.target` (the
+`gsd-*` daemons) and `synoik.service`, which runs `synoik --session` in
+gnome-shell's place. `XDG_CURRENT_DESKTOP` is `Synoik:GNOME`, so
+`OnlyShowIn=GNOME` autostarts and `[…:GNOME]` GSettings overrides apply.
+
 ## Full GNOME session (our compositor in place of gnome-shell)
 
 The closest thing to the endgame: a complete GNOME session — gnome-session,

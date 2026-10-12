@@ -268,23 +268,24 @@ debug-assertions = true
 version = "26.04"
 assets = [
     { source = "target/release/synoik", dest = "/usr/bin/", mode = "755" },
-    { source = "resources/synoik-session", dest = "/usr/bin/", mode = "755" },
     { source = "resources/synoik.desktop", dest = "/usr/share/wayland-sessions/", mode = "644" },
     { source = "resources/synoik-portals.conf", dest = "/usr/share/xdg-desktop-portal/", mode = "644" },
+    { source = "resources/synoik.session", dest = "/usr/share/gnome-session/sessions/", mode = "644" },
+    { source = "resources/synoik.session.conf", dest = "/usr/lib/systemd/user/gnome-session@synoik.target.d/session.conf", mode = "644" },
     { source = "resources/synoik.service", dest = "/usr/lib/systemd/user/", mode = "644" },
-    { source = "resources/synoik-shutdown.target", dest = "/usr/lib/systemd/user/", mode = "644" },
 ]
 [package.metadata.generate-rpm.requires]
+gnome-session = "*"
 alacritty = "*"
 fuzzel = "*"
 
 [package.metadata.deb]
-depends = "alacritty, fuzzel"
+depends = "gnome-session, alacritty, fuzzel"
 assets = [
     ["target/release/synoik", "usr/bin/", "755"],
-    ["resources/synoik-session", "usr/bin/", "755"],
     ["resources/synoik.desktop", "/usr/share/wayland-sessions/", "644"],
     ["resources/synoik-portals.conf", "/usr/share/xdg-desktop-portal/", "644"],
+    ["resources/synoik.session", "/usr/share/gnome-session/sessions/", "644"],
+    ["resources/synoik.session.conf", "/usr/lib/systemd/user/gnome-session@synoik.target.d/session.conf", "644"],
     ["resources/synoik.service", "/usr/lib/systemd/user/", "644"],
-    ["resources/synoik-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
