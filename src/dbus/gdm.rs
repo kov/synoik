@@ -49,7 +49,8 @@
 //! `gdm_session_reset` is only reached from session start/migration. GNOME re-begins from the
 //! client: `util.js:929` → `_retry` (`:866`) → `_startService` (`:678`) issues another
 //! `BeginVerificationForUser`, and `_canRetry` (`:839-841`) is unconditionally true in unlock mode
-//! because `authPrompt.js:162-168` passes `reauthenticationOnly: true`.
+//! because `authPrompt.js:162-168` passes `reauthenticationOnly: true`. A login is different: it
+//! stops retrying after `allowed-failures` and says [`VerifierEvent::Exhausted`].
 //!
 //! Without that, one mistyped password is an unrecoverable lock screen — and a silent one, since
 //! `gdm_session_answer_query` (`gdm-session.c:3063-3078`) no-ops on a dead conversation after the
@@ -123,6 +124,9 @@ pub enum VerifierRequest {
         /// for a user who already has a session (`util.js:508-540`); without one it is a login
         /// channel, whose verified session is started (`loginDialog.js` `_onSessionOpened`).
         login: bool,
+        /// `org.gnome.login-screen allowed-failures`: how many refusals a login takes before
+        /// [`VerifierEvent::Exhausted`]. Ignored for reauthentication, which retries forever.
+        allowed_failures: u32,
     },
     /// Answer the outstanding query. **Carries a password** — see the `Debug` impl below.
     Answer(String),
@@ -143,12 +147,14 @@ impl std::fmt::Debug for VerifierRequest {
                 epoch,
                 reader,
                 login,
+                allowed_failures,
             } => f
                 .debug_struct("Begin")
                 .field("username", username)
                 .field("epoch", epoch)
                 .field("reader", reader)
                 .field("login", login)
+                .field("allowed_failures", allowed_failures)
                 .finish(),
             Self::Answer(answer) => write!(f, "Answer(<redacted, {} chars>)", answer.len()),
             Self::StartFingerprint => write!(f, "StartFingerprint"),
@@ -224,6 +230,10 @@ pub enum VerifierEvent {
     Lost,
     /// The conversation was reset; clear the entry and any message (`util.js:807-815`).
     Reset,
+    /// A login used up its `allowed-failures` (`_canRetry`, `util.js:839-841`): nothing is
+    /// restarted, and the greeter goes back to its start once the messages are read
+    /// (`_verificationFailed`, `:851-870`).
+    Exhausted,
 }
 
 /// Run the verifier client. Returns the system-bus connection to keep alive, and the sender the
@@ -261,6 +271,7 @@ async fn run(
                 epoch,
                 reader,
                 login,
+                allowed_failures,
             } => {
                 // Close the previous channel *before* opening another: gdm keeps a PAM worker per
                 // channel, and an orphan would go on emitting into the compositor — including a
@@ -268,7 +279,8 @@ async fn run(
                 if let Some(old) = session.take() {
                     old.close().await;
                 }
-                match Session::open(&system, &username, reader, login, to_niri.clone()).await {
+                let budget = login.then_some(allowed_failures);
+                match Session::open(&system, &username, reader, budget, to_niri.clone()).await {
                     Ok(new) => {
                         session = Some(new);
                         let _ = to_niri.send(VerifierEvent::Ready(epoch));
@@ -366,9 +378,11 @@ impl Session {
         system: &zbus::Connection,
         username: &str,
         reader: crate::dbus::fprintd::ReaderType,
-        login: bool,
+        // `Some(allowed-failures)` for a login; `None` for reauthentication.
+        budget: Option<u32>,
         to_niri: calloop::channel::Sender<VerifierEvent>,
     ) -> anyhow::Result<Self> {
+        let login = budget.is_some();
         use anyhow::Context as _;
 
         let manager = DisplayManagerProxy::new(system)
@@ -408,9 +422,12 @@ impl Session {
                 username.to_owned(),
                 reader,
                 fingerprint.clone(),
-                // fprintd lists only the caller's own prints without an admin's say-so, so only
-                // the lock screen can ask; the greeter's daemon answers for it.
-                (!login).then(|| system.clone()),
+                match budget {
+                    Some(allowed_failures) => Purpose::Login { allowed_failures },
+                    None => Purpose::Unlock {
+                        system: system.clone(),
+                    },
+                },
             ),
             "gdm-user-verifier-signals",
         );
@@ -514,11 +531,17 @@ async fn pump_signals(
     username: String,
     reader: crate::dbus::fprintd::ReaderType,
     flags: std::sync::Arc<FingerprintFlags>,
-    own_prints: Option<zbus::Connection>,
+    purpose: Purpose,
 ) {
     use std::sync::atomic::Ordering;
 
     let mut fingerprint = FingerprintState::default();
+    // Refused passwords and failed scans, for a login's `allowed-failures`.
+    let mut failures = FailureCount::new(match purpose {
+        Purpose::Login { allowed_failures } => Some(allowed_failures),
+        Purpose::Unlock { .. } => None,
+    });
+    let mut announced_exhausted = false;
     // When the reader's conversation last started. `None` until it has been started at all, which
     // is why an unarmed reader can never look like one that stopped immediately.
     let mut fingerprint_began: Option<Instant> = None;
@@ -629,12 +652,22 @@ async fn pump_signals(
             && service.as_deref() == Some(FINGERPRINT_SERVICE)
             && text.as_deref() == Some("")
         {
-            if let Some(system) = &own_prints {
+            if let Purpose::Unlock { system } = &purpose {
                 fingerprint.enrolled = crate::dbus::fprintd::has_prints(system, &username).await;
             }
         }
 
-        let event = match route(&member, service.as_deref(), text, reader, fingerprint) {
+        let routed = route(&member, service.as_deref(), text, reader, fingerprint);
+        // A refused password, and a scan that failed (`_onProblem`, `util.js:755-782`: pam_fprintd
+        // would otherwise let a finger try forever), count against a login's budget.
+        let password_refused =
+            matches!(&routed, Routed::Restart { service, .. } if *service == PASSWORD_SERVICE);
+        let failed_scan = member == "Problem" && service.as_deref() == Some(FINGERPRINT_SERVICE);
+        if password_refused || failed_scan {
+            failures.fail();
+        }
+        let spent = failures.is_spent();
+        let event = match routed {
             Routed::Ignore => continue,
             Routed::Event(event) => Some(event),
 
@@ -666,6 +699,9 @@ async fn pump_signals(
             // The conversation ended without accepting. gdm will not re-ask, so start another one
             // here — this is `_retry` (`util.js:866`). Without it, one wrong password leaves a lock
             // screen that can never be answered again.
+            // Out of attempts: say why, and restart nothing; the greeter starts over
+            // (`_verificationFailed` with `doneTrying`, `util.js:851-870`).
+            Routed::Restart { service, event } if service == PASSWORD_SERVICE && spent => event,
             Routed::Restart { service, event } => {
                 if service == FINGERPRINT_SERVICE {
                     let silent = if fingerprint.stopped_immediately && !fingerprint.spoke {
@@ -702,6 +738,12 @@ async fn pump_signals(
                 break;
             }
         }
+        if spent && !announced_exhausted {
+            announced_exhausted = true;
+            if to_niri.send(VerifierEvent::Exhausted).is_err() {
+                break;
+            }
+        }
     }
 
     // Falling out means the peer socket closed — gdm went away mid-conversation. GNOME watches for
@@ -709,6 +751,43 @@ async fn pump_signals(
     // sits in "answered" forever behind a shield that still reports itself locked.
     warn!("gdm: the reauthentication channel closed");
     let _ = to_niri.send(VerifierEvent::Lost);
+}
+
+/// What a channel is for, and what the pump needs because of it.
+enum Purpose {
+    /// The lock screen. fprintd lists only the caller's own prints without an admin's say-so, so
+    /// only here can the pump ask whether the user has any (the greeter's daemon answers for it);
+    /// `system` is the bus to ask on.
+    Unlock { system: zbus::Connection },
+    /// The greeter, with its `allowed-failures`.
+    Login { allowed_failures: u32 },
+}
+
+/// Failed attempts against a login's `allowed-failures` (`_failCounter` / `_canRetry`,
+/// `util.js:839-841`). Reauthentication has no budget: the lock screen retries forever.
+#[derive(Debug, Clone, Copy)]
+struct FailureCount {
+    allowed: Option<u32>,
+    failures: u32,
+}
+
+impl FailureCount {
+    fn new(allowed: Option<u32>) -> Self {
+        Self {
+            allowed,
+            failures: 0,
+        }
+    }
+
+    fn fail(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    /// No more retries. A budget of 0 behaves as 1: the first refusal ends it.
+    fn is_spent(&self) -> bool {
+        self.allowed
+            .is_some_and(|allowed| self.failures >= allowed.max(1))
+    }
 }
 
 /// How long a fingerprint conversation must survive for its ending to be something a person did.
@@ -837,9 +916,9 @@ fn route(
 
         // A `Problem` **is** shown, from either service (`_onProblem`, `util.js:749-751`): a finger
         // that did not read is something the user can do something about. GNOME also counts these
-        // towards `allowed-failures`, which on the unlock screen is moot — `_canRetry` is
-        // unconditionally true when `_reauthOnly` (`:839-842`), and that is always our case, so the
-        // fingerprint conversation is never failed from this side.
+        // towards `allowed-failures`; the pump does that for a login (see [`FailureCount`]). On
+        // the unlock screen it is moot — `_canRetry` is unconditionally true when `_reauthOnly`
+        // (`:839-842`).
         "Problem" => match text {
             Some(text) => Routed::Event(VerifierEvent::ShowMessage {
                 text,
@@ -963,6 +1042,32 @@ fn route(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+
+    /// `_canRetry` (`util.js:839-841`): a login is spent after `allowed-failures` attempts and
+    /// stays spent; reauthentication never is.
+    #[test]
+    fn a_login_runs_out_of_attempts_and_a_reauthentication_does_not() {
+        let mut login = super::FailureCount::new(Some(3));
+        for _ in 0..2 {
+            login.fail();
+            assert!(!login.is_spent());
+        }
+        login.fail();
+        assert!(login.is_spent());
+        login.fail();
+        assert!(login.is_spent(), "spent stays spent");
+
+        let mut zero = super::FailureCount::new(Some(0));
+        assert!(!zero.is_spent(), "nothing has failed yet");
+        zero.fail();
+        assert!(zero.is_spent());
+
+        let mut reauth = super::FailureCount::new(None);
+        for _ in 0..100 {
+            reauth.fail();
+        }
+        assert!(!reauth.is_spent());
+    }
 
     use super::*;
     use crate::dbus::fprintd::ReaderType;

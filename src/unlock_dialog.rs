@@ -284,6 +284,17 @@ impl UnlockDialog {
         changed
     }
 
+    /// When every message on screen and queued will have had its read time — what gnome-shell
+    /// waits for before it resets a failed login (`_handlePendingMessages`, `util.js:857-865`).
+    /// `None` when nothing is owed any.
+    pub fn messages_read_at(&self) -> Option<Duration> {
+        let mut at = self.message_until?;
+        for message in self.message_queue.iter().flatten() {
+            at += read_time(&message.text);
+        }
+        Some(at)
+    }
+
     /// Clear immediately, dropping anything queued.
     ///
     /// For the paths where the message is not merely superseded but *gone*: the page it belonged to
@@ -723,6 +734,9 @@ impl UnlockDialog {
                 }
                 UnlockEffects::redraw()
             }
+
+            // The greeter's to act on; nothing changes under the entry.
+            VerifierEvent::Exhausted => UnlockEffects::default(),
 
             VerifierEvent::Reset => {
                 self.status = Status::NotVerifying;

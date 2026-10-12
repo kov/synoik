@@ -316,8 +316,10 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 - **Escape** goes back to the grid, cancelling the conversation; a verified one goes back without
   cancelling, since the daemon is starting that session. Not built: a **Cancel** button, hidden
   while asking for a username with the list disabled;
-- after `allowed-failures` (default 3, `js/gdm/util.js:165-167`) failed attempts the prompt resets
-  to the grid instead of retrying forever as the lock screen does (`:839-842`);
+- after `allowed-failures` (default 3, `js/gdm/util.js:165-167`) failed attempts — refused
+  passwords and failed scans alike — the verifier stops retrying, and once the refusal has had its
+  read time the greeter cancels and starts over, instead of retrying forever as the lock screen
+  does (`:839-870`);
 - the channel is the login one (`OpenSession`), falling back from reauthentication (§2.5), and
   the client answers `SessionOpened` with `StartSessionWhenReady`.
 - "Fingerprint reader unavailable" is said only to a user with prints enrolled. The greeter cannot
@@ -328,8 +330,8 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 `org.gnome.login-screen` keys to honour: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
 `banner-message-*`, `disable-restart-buttons`. Not honoured: `enable-smartcard-authentication`
-(out of scope). Read today: `enable-fingerprint-authentication`, `disable-restart-buttons` and
-`disable-user-list`.
+(out of scope). Read today: `enable-fingerprint-authentication`, `disable-restart-buttons`,
+`disable-user-list` and `allowed-failures`.
 
 The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
 needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which the

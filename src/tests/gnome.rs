@@ -42063,6 +42063,83 @@ fn the_greeter_asks_for_a_name_without_a_user_list() {
     assert_eq!(f.synoik().login_page, LoginPage::Name);
 }
 
+/// `allowed-failures` (`util.js:839-870`): the login asks for it, and when the verifier says the
+/// attempts are spent the greeter waits for the messages to be read, then cancels and starts over.
+/// Backing out first leaves nothing to go back from.
+#[test]
+fn the_greeter_starts_over_after_the_allowed_failures() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::{MessageKind, MessageSource, VerifierEvent, VerifierRequest};
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik().gnome_settings.login_screen.allowed_failures = 5;
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    let exhaust = |f: &mut Fixture| {
+        tap(f, KEY_ENTER);
+        let epoch = f
+            .gdm_requests()
+            .into_iter()
+            .find_map(|r| match r {
+                VerifierRequest::Begin {
+                    epoch,
+                    allowed_failures,
+                    ..
+                } => {
+                    assert_eq!(allowed_failures, 5);
+                    Some(epoch)
+                }
+                _ => None,
+            })
+            .expect("a login begins");
+        let state = f.synoik_state();
+        state.on_verifier_event(VerifierEvent::Ready(epoch));
+        state.on_verifier_event(VerifierEvent::Failed);
+        state.on_verifier_event(VerifierEvent::ShowMessage {
+            text: "Sorry, that didn't work. Please try again.".to_owned(),
+            kind: MessageKind::Error,
+            source: MessageSource::Password,
+        });
+        state.on_verifier_event(VerifierEvent::Exhausted);
+    };
+
+    exhaust(&mut f);
+    f.turn();
+    assert!(
+        f.synoik().login_page.is_asking_a_user(),
+        "the refusal is read first"
+    );
+    f.advance_clock(Duration::from_secs(10));
+    f.turn();
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Cancel)));
+
+    // Spent, then backed out of and picked again: the old timer must not end the new visit.
+    exhaust(&mut f);
+    tap(&mut f, KEY_ESC);
+    tap(&mut f, KEY_ENTER);
+    f.gdm_requests();
+    f.advance_clock(Duration::from_secs(10));
+    f.turn();
+    assert!(f.synoik().login_page.is_asking_a_user());
+}
+
 /// The name question dies with its page: picking a user after backing out of "Enter User Name"
 /// must not leave a live, unmasked entry waiting for gdm's password question.
 #[test]

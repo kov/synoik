@@ -63,13 +63,26 @@ impl Default for SwitcherSettings {
 
 /// `org.gnome.login-screen` (GDM's schema, vendored in `resources/schemas`): how the greeter is
 /// set up. The greeter reads it from its own dconf profile (`docs/fork/greeter.md` §4.3).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginScreenSettings {
     /// `disable-restart-buttons`: no Suspend, Restart or Power Off on the greeter
     /// (`systemActions.js:371-420`).
     pub disable_restart_buttons: bool,
     /// `disable-user-list`: ask for a name instead of listing users (`loginDialog.js:914-930`).
     pub disable_user_list: bool,
+    /// `allowed-failures`: attempts before a login goes back to the start (`util.js:165-167`).
+    pub allowed_failures: u32,
+}
+
+impl Default for LoginScreenSettings {
+    fn default() -> Self {
+        // The schema's defaults.
+        Self {
+            disable_restart_buttons: false,
+            disable_user_list: false,
+            allowed_failures: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -710,6 +723,10 @@ impl GnomeSettings {
         }
         if settings_has_key(login_screen, "disable-user-list") {
             l.disable_user_list = login_screen.boolean("disable-user-list");
+        }
+        if settings_has_key(login_screen, "allowed-failures") {
+            // An `i`; a negative count allows nothing, like zero.
+            l.allowed_failures = login_screen.int("allowed-failures").max(0) as u32;
         }
     }
 

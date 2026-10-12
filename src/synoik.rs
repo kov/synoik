@@ -469,6 +469,9 @@ pub struct Synoik {
     /// Whether AccountsService has answered at all: an empty list only disables the user list once
     /// it is known to be empty (`_userListLoaded`, `loginDialog.js:917-919`).
     pub login_users_loaded: bool,
+    /// Bumped whenever the greeter starts asking someone or goes back to its start, so a timer
+    /// armed for one visit cannot act on the next.
+    pub greeter_visit: u64,
     /// The login screen's user grid and which page it is on.
     pub login_grid: crate::ui::login_grid::LoginGrid,
     pub login_page: LoginPage,
@@ -6356,6 +6359,7 @@ impl State {
 
     /// Ask `user` for credentials (`authPrompt.begin`), picked from the grid (`listed`) or typed.
     fn greeter_ask_user(&mut self, user: crate::unlock_dialog::UserInfo, listed: bool) {
+        self.synoik.greeter_visit += 1;
         self.synoik.login_page = LoginPage::Prompt {
             user: user.name.clone(),
             listed,
@@ -6386,6 +6390,7 @@ impl State {
             }
         }
         self.synoik.screen_shield.drop_authenticator();
+        self.synoik.greeter_visit += 1;
         self.greeter_show_start();
     }
 
@@ -6877,6 +6882,22 @@ impl State {
                 let effects = self.synoik.screen_shield.authenticator_lost();
                 self.apply_shield_effects(effects);
             }
+            // A login out of attempts: back to the start once its messages are read
+            // (`_verificationFailed`, `util.js:851-870`), unless the visitor left first.
+            VerifierEvent::Exhausted
+                if self.synoik.greeter && self.synoik.login_page.is_asking_a_user() =>
+            {
+                let visit = self.synoik.greeter_visit;
+                let now = self.synoik.shield_now();
+                let read = self.synoik.unlock_dialog.messages_read_at().unwrap_or(now);
+                self.synoik
+                    .timer_after(read.saturating_sub(now), move |state| {
+                        if state.synoik.greeter_visit == visit {
+                            state.greeter_back_to_start(true);
+                        }
+                        None
+                    });
+            }
             _ => (),
         }
 
@@ -7034,6 +7055,7 @@ impl State {
                         epoch,
                         reader: self.synoik.fingerprint_reader,
                         login: self.synoik.greeter,
+                        allowed_failures: self.synoik.gnome_settings.login_screen.allowed_failures,
                     })
                     .is_ok();
             }
@@ -8573,6 +8595,7 @@ impl Synoik {
             greeter: false,
             login_users: Vec::new(),
             login_users_loaded: false,
+            greeter_visit: 0,
             login_grid: crate::ui::login_grid::LoginGrid::new(),
             login_page: LoginPage::Grid,
             start_time: Instant::now(),
