@@ -575,6 +575,29 @@ impl Sliders {
 /// A system row that asks gnome-session to end the session, the way gnome-shell does: a direct
 /// `org.gnome.SessionManager` call (`systemActions.js:483-501`). We used to spawn
 /// `gnome-session-quit` for these, which put a GTK process start in front of every logout.
+/// The settings behind [`QuickSettings::power_actions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PowerPolicy {
+    /// `org.gnome.login-screen disable-restart-buttons`.
+    pub disable_restart_buttons: bool,
+    /// `org.gnome.desktop.screensaver restart-enabled`.
+    pub restart_enabled: bool,
+}
+
+/// The power card's machine-power rows, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PowerActions {
+    pub suspend: bool,
+    pub restart: bool,
+    pub power_off: bool,
+}
+
+impl PowerActions {
+    pub fn count(self) -> usize {
+        usize::from(self.suspend) + usize::from(self.restart) + usize::from(self.power_off)
+    }
+}
+
 fn session_row(label: &str, request: SessionRequest, separator_before: bool) -> DetailRow {
     ItemRow {
         label: label.to_string(),
@@ -697,6 +720,7 @@ impl DetailOwner {
         power: &PowerProfileStatus,
         bt: BtDetail<'_>,
         monitors: &[crate::brightness::MonitorView],
+        power_actions: PowerActions,
     ) -> Vec<DetailRow> {
         use crate::network_model::device_type;
         match self {
@@ -954,12 +978,20 @@ impl DetailOwner {
             // methods on `org.gnome.SessionManager`, as in gnome-shell — the first three come back
             // to us as EndSessionDialog.Open, Suspend is forwarded to logind and never does.
             // Switch User is deferred (needs a greeter jump).
-            DetailOwner::Power => vec![
-                session_row("Suspend", SessionRequest::Suspend, false),
-                session_row("Restart…", SessionRequest::Reboot, false),
-                session_row("Power Off…", SessionRequest::PowerOff, false),
-                session_row("Log Out…", SessionRequest::Logout, true),
-            ],
+            DetailOwner::Power => {
+                let mut rows = Vec::new();
+                if power_actions.suspend {
+                    rows.push(session_row("Suspend", SessionRequest::Suspend, false));
+                }
+                if power_actions.restart {
+                    rows.push(session_row("Restart…", SessionRequest::Reboot, false));
+                }
+                if power_actions.power_off {
+                    rows.push(session_row("Power Off…", SessionRequest::PowerOff, false));
+                }
+                rows.push(session_row("Log Out…", SessionRequest::Logout, true));
+                rows
+            }
             // gnome-shell's power-profile list: one row per KNOWN profile (already reversed to
             // performance→power-saver), the active one carrying a trailing check, clicking sets it;
             // then a separator + a "Power Settings" entry point (`powerProfiles.js:75-81`). Kept
@@ -1092,12 +1124,12 @@ impl DetailOwner {
                 shape.push(RowSpec::item(true));
                 shape
             }
-            DetailOwner::Power => vec![
-                RowSpec::item(false),
-                RowSpec::item(false),
-                RowSpec::item(false),
-                RowSpec::item(true),
-            ],
+            // The machine-power rows the mode allows, then Log Out past a separator.
+            DetailOwner::Power => {
+                let mut shape = vec![RowSpec::item(false); device_count];
+                shape.push(RowSpec::item(true));
+                shape
+            }
             // N device/profile rows, then a trailing settings row past a separator.
             DetailOwner::Output | DetailOwner::Input | DetailOwner::PowerProfile => {
                 let mut shape = vec![RowSpec::item(false); device_count.min(MAX_DEVICE_ROWS)];
@@ -1232,6 +1264,8 @@ struct Layout {
     /// The number of backlit monitors — the brightness card's row-pair count and the gate on its
     /// arrow.
     monitor_count: usize,
+    /// How many machine-power rows the power card has ([`PowerActions::count`]).
+    power_rows: usize,
     /// Which network tiles lead the grid. Every later tile's index is offset by their count.
     net: NetTiles,
     /// The row counts of the three network cards, in the order wired, wifi, vpn — what sizes each
@@ -1278,10 +1312,10 @@ impl Layout {
             DetailOwner::PowerProfile => self.profile_count,
             DetailOwner::Bluetooth => self.bt_device_count,
             DetailOwner::Brightness => self.monitor_count,
+            DetailOwner::Power => self.power_rows,
             DetailOwner::Wired => self.net_rows[0],
             DetailOwner::Wifi => self.net_rows[1],
             DetailOwner::Vpn => self.net_rows[2],
-            _ => 0,
         }
     }
 
@@ -1703,6 +1737,8 @@ pub struct QuickSettings {
     /// `js/misc/systemActions.js`): the lock screen and the greeter lose Settings, Lock and Log
     /// Out.
     mode: &'static SessionMode,
+    /// The two keys besides the mode that decide the power card's machine-power rows.
+    power_policy: PowerPolicy,
     toggles: QuickToggles,
     /// The full NetworkManager model behind the Wired / Wi-Fi / VPN tiles and their cards.
     net: crate::network_model::NetworkState,
@@ -2000,6 +2036,7 @@ impl QuickSettings {
     ) -> Self {
         Self {
             mode: &USER,
+            power_policy: PowerPolicy::default(),
             toggles,
             net: crate::network_model::NetworkState::default(),
             airplane,
@@ -2039,6 +2076,24 @@ impl QuickSettings {
 
     pub fn set_session_mode(&mut self, mode: &'static SessionMode) {
         self.mode = mode;
+    }
+
+    pub fn set_power_policy(&mut self, policy: PowerPolicy) {
+        self.power_policy = policy;
+    }
+
+    /// Which machine-power rows the mode allows (`systemActions.js:371-420`): none on a greeter
+    /// with `disable-restart-buttons`, and no Restart or Power Off on a locked screen without
+    /// `restart-enabled`. Not ported: hiding one that logind says needs authentication while
+    /// locked.
+    pub(crate) fn power_actions(&self) -> PowerActions {
+        let greeter_off = self.mode.is_greeter && self.power_policy.disable_restart_buttons;
+        let locked_off = self.mode.is_locked && !self.power_policy.restart_enabled;
+        PowerActions {
+            suspend: !greeter_off,
+            restart: !greeter_off && !locked_off,
+            power_off: !greeter_off && !locked_off,
+        }
     }
 
     /// The pill opens power settings, so it is only a control where Settings is allowed
@@ -2120,6 +2175,7 @@ impl QuickSettings {
                 busy: self.bt_busy.as_deref(),
             },
             &self.brightness.monitors,
+            self.power_actions(),
         )
     }
 
@@ -2137,6 +2193,7 @@ impl QuickSettings {
             profile_count: self.power.available.len(),
             bt_device_count: self.bluetooth.visible_devices().len(),
             monitor_count: self.monitor_count(),
+            power_rows: self.power_actions().count(),
             net: NetTiles::from_state(&self.net),
             net_rows: [
                 net_card_rows(&self.net, DetailOwner::Wired),
@@ -4468,6 +4525,7 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            power_rows: 3,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6076,6 +6134,7 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            power_rows: 3,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6101,6 +6160,7 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            power_rows: 3,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6213,6 +6273,7 @@ run it with --features reference-env, as the fedora CI job does"
                     profile_count: 0,
                     bt_device_count: 0,
                     monitor_count: 0,
+                    power_rows: 3,
                     net: NetTiles {
                         wired: false,
                         wifi: true,
@@ -6627,6 +6688,7 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            power_rows: 3,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6652,6 +6714,7 @@ run it with --features reference-env, as the fedora CI job does"
             profile_count: 0,
             bt_device_count: 0,
             monitor_count: 0,
+            power_rows: 3,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6664,7 +6727,7 @@ run it with --features reference-env, as the fedora CI job does"
             grid_len: BASE_GRID.len() + 1,
             block_scale: 1.,
         };
-        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0, &USER);
+        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(3, &USER);
         assert_eq!(
             sys_rect(SysButton::Power, false).loc.y,
             PAD,
@@ -7444,9 +7507,64 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
+    /// `systemActions.js:371-420`: `disable-restart-buttons` empties the greeter's power card, so
+    /// its button goes; a locked screen without `restart-enabled` (the default) keeps only
+    /// Suspend. Neither key touches a user's session. The card is sized from the same count.
+    #[test]
+    fn the_power_card_follows_the_restart_keys() {
+        use crate::session_mode::{GDM, UNLOCK_DIALOG, USER};
+
+        let actions = |q: &QuickSettings| -> Vec<PopoverAction> {
+            q.detail_rows(DetailOwner::Power)
+                .iter()
+                .filter_map(|r| match r {
+                    DetailRow::Item(row) => Some(row.action.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let suspend = PopoverAction::SessionRequest(SessionRequest::Suspend);
+        let reboot = PopoverAction::SessionRequest(SessionRequest::Reboot);
+        let power_off = PopoverAction::SessionRequest(SessionRequest::PowerOff);
+        let log_out = PopoverAction::SessionRequest(SessionRequest::Logout);
+        let strict = PowerPolicy {
+            disable_restart_buttons: true,
+            restart_enabled: false,
+        };
+
+        let mut q = qs(None);
+        q.set_session_mode(&GDM);
+        q.set_power_policy(strict);
+        assert!(actions(&q).is_empty());
+        assert!(!q.sys_buttons().iter().any(|(b, _)| *b == SysButton::Power));
+
+        q.set_session_mode(&UNLOCK_DIALOG);
+        assert_eq!(actions(&q), std::slice::from_ref(&suspend));
+        assert!(q.sys_buttons().iter().any(|(b, _)| *b == SysButton::Power));
+
+        q.set_session_mode(&USER);
+        assert_eq!(actions(&q), [suspend, reboot, power_off, log_out]);
+
+        for mode in [&GDM, &UNLOCK_DIALOG, &USER] {
+            q.set_session_mode(mode);
+            assert_eq!(
+                q.detail_rows(DetailOwner::Power)
+                    .iter()
+                    .map(DetailRow::spec)
+                    .collect::<Vec<_>>(),
+                DetailOwner::Power
+                    .row_shape(q.layout().owner_device_count(DetailOwner::Power), mode),
+                "{}",
+                mode.name
+            );
+        }
+    }
+
     /// The lock screen's and the greeter's menus (`system.js`, `systemActions.js`): no Settings,
     /// Lock or Log Out, no Settings rows, an inert battery pill; Power keeps Suspend / Restart /
-    /// Power Off. The buttons that remain pack where GNOME's box puts them.
+    /// Power Off where the policy allows them (see
+    /// [`the_power_card_follows_the_restart_keys`]). The buttons that remain pack where GNOME's
+    /// box puts them.
     #[test]
     fn restricted_modes_drop_settings_lock_and_log_out() {
         for mode in [
@@ -7456,6 +7574,10 @@ run it with --features reference-env, as the fedora CI job does"
             let mut q = qs(None);
             q.battery = Some(battery(50.));
             q.set_session_mode(mode);
+            q.set_power_policy(PowerPolicy {
+                restart_enabled: true,
+                ..Default::default()
+            });
             let buttons: Vec<_> = q.sys_buttons().into_iter().map(|(b, _)| b).collect();
             assert_eq!(buttons, [SysButton::Power], "{}", mode.name);
             assert_eq!(

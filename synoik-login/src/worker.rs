@@ -249,6 +249,9 @@ pub fn parent_session(
     })
 }
 
+/// `resources/synoik-greeter.dconf-profile`, installed under this name.
+const GREETER_DCONF_PROFILE: &str = "synoik-greeter";
+
 fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CString>> {
     let mut env = config::environment_d();
     env.insert("HOME".into(), account.home.clone());
@@ -259,14 +262,23 @@ fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CStri
     );
     env.insert("SHELL".into(), account.shell.clone());
     env.entry("PATH".into()).or_insert_with(|| PATH.to_owned());
-    if let Ok(socket) = std::env::var("SYNOIK_SYSTEM_SOCKET") {
-        env.insert("SYNOIK_SYSTEM_SOCKET".into(), socket);
+    // From the unit: where the system compositor listens, and synoik's private schema dir, which
+    // holds its copies of the schemas it reads (org.gnome.login-screen among them).
+    for key in ["SYNOIK_SYSTEM_SOCKET", "GSETTINGS_SCHEMA_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.into(), value);
+        }
     }
     // PAM's own (XDG_SESSION_ID, XDG_RUNTIME_DIR, ...) win.
     for pair in pam.envlist().context("reading the PAM environment")? {
         if let Some((k, v)) = pair.to_string_lossy().split_once('=') {
             env.insert(k.to_owned(), v.to_owned());
         }
+    }
+    // The greeter reads the administrator's login-screen settings from its own dconf profile, as
+    // GDM's greeter does from `gdm` (`gdm-launch-environment.c:304`; greeter.md §4.3).
+    if env.get("XDG_SESSION_CLASS").map(String::as_str) == Some("greeter") {
+        env.insert("DCONF_PROFILE".into(), GREETER_DCONF_PROFILE.into());
     }
     env.into_iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(Into::into))

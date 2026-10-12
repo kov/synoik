@@ -61,6 +61,15 @@ impl Default for SwitcherSettings {
     }
 }
 
+/// `org.gnome.login-screen` (GDM's schema, vendored in `resources/schemas`): how the greeter is
+/// set up. The greeter reads it from its own dconf profile (`docs/fork/greeter.md` §4.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoginScreenSettings {
+    /// `disable-restart-buttons`: no Suspend, Restart or Power Off on the greeter
+    /// (`systemActions.js:371-420`).
+    pub disable_restart_buttons: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GnomeSettings {
     /// `org.gnome.mutter overlay-key`: the keys whose lone tap toggles the
@@ -94,6 +103,8 @@ pub struct GnomeSettings {
     /// `lock-enabled` (screensaver). Kept as one struct because the shield
     /// consults them together and they live in different schemas.
     pub shield: crate::screen_shield::ShieldSettings,
+    /// `org.gnome.login-screen`, past the two authentication keys the shield keeps.
+    pub login_screen: LoginScreenSettings,
     /// `org.gnome.desktop.wm.preferences focus-new-windows`: whether new
     /// windows may take focus on map.
     pub focus_new_windows: FocusNewWindows,
@@ -433,6 +444,7 @@ impl Default for GnomeSettings {
             switchers: SwitcherSettings::default(),
             disable_command_line: false,
             shield: Default::default(),
+            login_screen: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             resize_with_right_button: false,
             edge_tiling: true,
@@ -690,6 +702,10 @@ impl GnomeSettings {
         if settings_has_key(login_screen, "enable-smartcard-authentication") {
             self.shield.enable_smartcard = login_screen.boolean("enable-smartcard-authentication");
         }
+        let l = &mut self.login_screen;
+        if settings_has_key(login_screen, "disable-restart-buttons") {
+            l.disable_restart_buttons = login_screen.boolean("disable-restart-buttons");
+        }
     }
 
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {
@@ -702,6 +718,9 @@ impl GnomeSettings {
         }
         if settings_has_key(screensaver, "user-switch-enabled") {
             self.shield.user_switch_enabled = screensaver.boolean("user-switch-enabled");
+        }
+        if settings_has_key(screensaver, "restart-enabled") {
+            self.shield.restart_enabled = screensaver.boolean("restart-enabled");
         }
     }
 

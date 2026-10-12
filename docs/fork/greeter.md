@@ -261,8 +261,10 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   (`systemActions.js:353`), log out and switch user (`:431`, `:446`), Thunderbolt
   (`status/thunderbolt.js:280`), every "Settings" menu entry (`popupMenu.js:689-691`, `723`).
   The battery pill shows but does not open settings (`status/system.js:66-68`).
-- **Power menu:** Suspend, Restart, Power Off — all hidden by `disable-restart-buttons`
-  (`systemActions.js:375-418`, not read yet). gnome-shell routes them through gnome-session,
+- **Power menu:** Suspend, Restart, Power Off — all hidden by `disable-restart-buttons`, and with
+  them the power button (`systemActions.js:371-420`, `system.js:239-241`). The lock screen offers
+  Restart and Power Off only with `org.gnome.desktop.screensaver restart-enabled`, false by
+  default. Not ported: hiding one while locked when logind says it needs authentication. gnome-shell routes them through gnome-session,
   which the greeter does not run: Restart and Power Off raise the end-session confirmation
   themselves, with gnome-session's 60 s countdown (`gsm-shell.c:40`), and the confirmation calls
   logind (`Reboot`, `PowerOff`); Suspend calls logind at once.
@@ -323,11 +325,19 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
   worker, which is root, asks and puts the line in `ServiceUnavailable`'s message, which gnome-shell
   would show as it is (`util.js:888-894`); GDM's message there is empty.
 
-Honoured `org.gnome.login-screen` keys: `enable-password-authentication`,
+`org.gnome.login-screen` keys to honour: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
 `banner-message-*`, `disable-restart-buttons`. Not honoured: `enable-smartcard-authentication`
-(out of scope). The greeter reads them from a system dconf profile, as GDM's `DCONF_PROFILE=gdm`
-does.
+(out of scope). Read today: `enable-fingerprint-authentication` and `disable-restart-buttons`.
+
+The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
+needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which
+the copy would otherwise shadow. Fedora's other override, its `logo`, is distro branding for the
+package to carry. The greeter reads the keys through its own dconf profile,
+`resources/synoik-greeter.dconf-profile` (`DCONF_PROFILE=synoik-greeter`, set by the daemon for
+the greeter session only, as GDM's greeter gets `DCONF_PROFILE=gdm`): its user database, then
+the administrator's `/etc/dconf/db/synoik-greeter.d/`. GDM's `gdm` database is not read. The
+daemon hands every session the `GSETTINGS_SCHEMA_DIR` its unit sets.
 
 ### 4.4 Leaving the greeter
 

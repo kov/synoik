@@ -2119,6 +2119,7 @@ impl State {
                 .synoik
                 .unlock_dialog
                 .set_peek_locked_down(state.synoik.gnome_settings.shield.disable_show_password);
+            state.synoik.sync_power_policy();
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
@@ -2409,6 +2410,7 @@ impl State {
                         state.synoik.unlock_dialog.set_peek_locked_down(
                             state.synoik.gnome_settings.shield.disable_show_password,
                         );
+                        state.synoik.sync_power_policy();
                         // `lock-enabled` and `disable-lock-screen` are two of the inhibitor's
                         // conditions, and GNOME wires both keys straight to `_syncInhibitor`
                         // (`screenShield.js:110,113`). Without this, turning locking back on
@@ -10234,6 +10236,17 @@ impl Synoik {
     }
 
     /// Bring what follows the session mode up to date with it — today the panel's roles and look.
+    /// Hand the power card the keys it reads besides the mode.
+    pub fn sync_power_policy(&mut self) {
+        let policy = crate::ui::quick_settings::PowerPolicy {
+            disable_restart_buttons: self.gnome_settings.login_screen.disable_restart_buttons,
+            restart_enabled: self.gnome_settings.shield.restart_enabled,
+        };
+        if self.panel_popover.set_power_policy(policy) {
+            self.queue_redraw_all();
+        }
+    }
+
     pub fn sync_session_mode(&mut self) {
         if self.panel.set_mode(self.session_mode()) {
             // A menu opened in the old mode offers what that mode allowed.

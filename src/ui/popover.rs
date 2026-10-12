@@ -531,6 +531,8 @@ pub enum PopoverSide {
 /// A single panel popover, owned on `Synoik` alongside the other overlays.
 pub struct PanelPopover {
     open: bool,
+    /// What the quick-settings power card may offer besides the mode's own rules.
+    power_policy: crate::ui::quick_settings::PowerPolicy,
     /// The output the popover is anchored on (drawn/hit-tested only there).
     output: Option<Output>,
     /// The rect it hangs from, output-local logical: a panel button, or the icon a
@@ -569,6 +571,7 @@ impl PanelPopover {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self {
             open: false,
+            power_policy: Default::default(),
             output: None,
             anchor: Rectangle::default(),
             side: PopoverSide::Top,
@@ -695,6 +698,22 @@ impl PanelPopover {
     /// The output the popover is anchored on, while open.
     pub fn output(&self) -> Option<&Output> {
         self.output.as_ref()
+    }
+
+    /// Set the power card's policy, for the next quick-settings menu and the one up. Returns
+    /// whether the one up changed.
+    pub fn set_power_policy(&mut self, policy: crate::ui::quick_settings::PowerPolicy) -> bool {
+        if self.power_policy == policy {
+            return false;
+        }
+        self.power_policy = policy;
+        match self.content.as_mut() {
+            Some(PopoverContent::QuickSettings(qs)) => {
+                qs.set_power_policy(policy);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The quick-settings menu, if that is what is up. A seam so a test can click a real control
@@ -1131,6 +1150,7 @@ impl PanelPopover {
         );
         qs.set_network_state(net);
         qs.set_session_mode(mode);
+        qs.set_power_policy(self.power_policy);
         self.content = Some(PopoverContent::QuickSettings(Box::new(qs)));
         self.anim = Some(self.make_anim(0., 1.));
     }

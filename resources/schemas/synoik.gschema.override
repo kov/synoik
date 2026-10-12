@@ -42,6 +42,12 @@ dynamic-workspaces=true
 workspaces-only-on-primary=true
 focus-change-on-pointer-rest=true
 
+# Not a divergence: the default Fedora's gdm package overrides, which our vendored
+# copy of org.gnome.login-screen would otherwise shadow. Smartcard login is not
+# built (docs/fork/greeter.md §0), so nothing should watch for tokens.
+[org.gnome.login-screen]
+enable-smartcard-authentication=false
+
 # DIVERGENCE (deliberate). GNOME reaches the screenshot keys through Print alone,
 # which a laptop keyboard without one cannot press at all. Each keeps its Print
 # chord and gains its macOS twin — Cmd+Shift+3/4/5 there is screen, region,

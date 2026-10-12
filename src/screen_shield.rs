@@ -105,6 +105,9 @@ pub struct ShieldSettings {
     /// `org.gnome.login-screen enable-smartcard-authentication` — whether to watch gsd's tokens at
     /// all. **Defaults to false**, so on most machines the whole path is inert.
     pub enable_smartcard: bool,
+    /// `org.gnome.desktop.screensaver restart-enabled` — whether the locked screen offers Restart
+    /// and Power Off (`systemActions.js:371-400`). **Defaults to false.**
+    pub restart_enabled: bool,
 }
 
 /// `STANDARD_FADE_TIME` (`:39`) — the fade GNOME runs when the session goes idle.
@@ -126,6 +129,7 @@ impl Default for ShieldSettings {
             disable_user_switching: false,
             enable_fingerprint: true,
             enable_smartcard: false,
+            restart_enabled: false,
         }
     }
 }

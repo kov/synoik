@@ -13,6 +13,8 @@ ConditionPathExists=!/sys/class/tty/tty0
 [Service]
 ExecStart=synoik-login
 Environment=SYNOIK_SYSTEM_SOCKET=/run/synoik-system/outer.sock
+# synoik's private schema dir (synoik.service has the same), handed on to every session.
+Environment=GSETTINGS_SCHEMA_DIR=/usr/share/synoik/glib-2.0/schemas
 # Holds the once-per-boot autologin marker, so it must outlive a restart.
 RuntimeDirectory=synoik-login
 RuntimeDirectoryPreserve=yes
