@@ -302,6 +302,9 @@ enum Shown {
         slot: usize,
         _fb: Rc<PrimeFramebuffer>,
         alpha: f32,
+        /// The incoming session frame it blends in, while that frame's present is unanswered:
+        /// the flip putting the blend on screen answers it.
+        samples: Option<(u64, u32)>,
     },
 }
 
@@ -319,11 +322,14 @@ enum Next {
         fb: Rc<PrimeFramebuffer>,
         fence: Option<Rc<OwnedFd>>,
         alpha: f32,
+        samples: Option<(u64, u32)>,
     },
 }
 
 /// A session switch being animated (§5): `from` crossfading to `to`, which is unknown until the
-/// incoming session's frame is ready.
+/// incoming session's frame is ready. `to` is live: each frame the incoming session presents during
+/// the fade replaces it, so whatever that session animates (an unlock, its startup) plays through
+/// the fade instead of freezing on its first frame and cutting at the end.
 struct Transition {
     from: Picture,
     to: Option<Target>,
@@ -869,6 +875,13 @@ impl Outer {
         if let Some(token) = transition.wait.take() {
             self.handle.remove(token);
         }
+        // A newer frame supersedes one still rendering: give that one back.
+        if let Some(token) = transition.pending_watch.take() {
+            self.handle.remove(token);
+        }
+        if let Some((g, stale, _)) = transition.pending.take() {
+            self.discard(g, stale);
+        }
         if signalled {
             self.target_ready(generation, buffer);
             return;
@@ -928,12 +941,26 @@ impl Outer {
             .ok()
     }
 
+    /// Make `target` what the fade goes to. The first target starts the fade's clock; a newer
+    /// frame replacing it (the live `to`) keeps it, and gives back the frame it replaces if no
+    /// blend has shown that one yet.
     fn set_target(&mut self, target: Target) {
         let Some(transition) = &mut self.transition else {
             return;
         };
-        transition.to = Some(target);
-        transition.start = get_monotonic_time();
+        match transition.to.replace(target) {
+            None => transition.start = get_monotonic_time(),
+            Some(Target {
+                end:
+                    End::Session {
+                        generation,
+                        buffer,
+                        answer: true,
+                    },
+                ..
+            }) => self.discard(generation, buffer),
+            Some(_) => (),
+        }
         if self.in_flight.is_none() {
             self.advance();
         }
@@ -968,12 +995,21 @@ impl Outer {
             .compositor
             .as_mut()
             .expect("transitions need a compositor");
+        let samples = match to.end {
+            End::Session {
+                generation,
+                buffer,
+                answer: true,
+            } => Some((generation, buffer)),
+            _ => None,
+        };
         match compositor.compose(&self.drm_fd, busy, &transition.from, &to.picture, alpha) {
             Ok((slot, fb, fence)) => self.flip(Next::Composite {
                 slot,
                 fb,
                 fence: fence.map(Rc::new),
                 alpha,
+                samples,
             }),
             Err(err) => {
                 warn!("drawing a transition frame: {err:#}");
@@ -1179,9 +1215,21 @@ impl Outer {
                     .transition
                     .as_ref()
                     .map(|t| t.to.is_none() && t.pending.is_none());
+                let feeds_fade = self.transition.as_ref().is_some_and(|t| {
+                    t.pending.as_ref().is_some_and(|(g, ..)| *g == generation)
+                        || matches!(
+                            t.to,
+                            Some(Target { end: End::Session { generation: g, .. }, .. })
+                                if g == generation
+                        )
+                });
                 match (fronted, awaiting) {
-                    // The frame the switch to this session was waiting for (§5 step 6).
+                    // The frame the switch to this session was waiting for (§5 step 6), or a newer
+                    // one replacing it while the fade runs.
                     (true, Some(true)) => self.target_frame(generation, buffer, fence),
+                    (true, Some(false)) if feeds_fade => {
+                        self.target_frame(generation, buffer, fence)
+                    }
                     (true, None) => {
                         let over_plate = self.plate_showing();
                         self.fronted_frame(generation, buffer, fence, over_plate);
@@ -1230,6 +1278,7 @@ impl Outer {
                 fb,
                 fence,
                 alpha,
+                samples,
             } => {
                 let handle = *(*fb).as_ref();
                 (
@@ -1238,6 +1287,7 @@ impl Outer {
                         slot,
                         _fb: fb,
                         alpha,
+                        samples,
                     },
                     fence,
                 )
@@ -1276,6 +1326,32 @@ impl Outer {
         }
     }
 
+    /// Tell `generation` its `buffer` reached the screen.
+    fn presented(&mut self, generation: u64, buffer: u32, meta: Option<&DrmEventMetadata>) {
+        let Some(session) = self.sessions.get_mut(&generation) else {
+            return;
+        };
+        session.last_presented = Some(buffer);
+        let (sequence, time_ns) = match meta {
+            Some(DrmEventMetadata {
+                sequence,
+                time: DrmEventTime::Monotonic(time),
+            }) => (*sequence, time.as_nanos() as u64),
+            Some(DrmEventMetadata { sequence, .. }) => (*sequence, 0),
+            None => (0, 0),
+        };
+        let msg = ToInner::Presented {
+            output: self.display.connector_name.clone(),
+            buffer,
+            sequence,
+            time_ns,
+            refresh_ns: self.display.refresh.as_nanos() as u64,
+        };
+        if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
+            warn!("reporting a flip to a session: {err}");
+        }
+    }
+
     fn discard(&self, generation: u64, buffer: u32) {
         if let Some(session) = self.sessions.get(&generation) {
             debug!("discarding buffer {buffer} of {:?}", session.logind_id);
@@ -1295,34 +1371,37 @@ impl Outer {
             return;
         };
 
-        if let Shown::Session {
-            buffer,
-            generation,
-            answer: true,
-            ..
-        } = &shown
-        {
-            if let Some(session) = self.sessions.get_mut(generation) {
-                session.last_presented = Some(*buffer);
-                let (sequence, time_ns) = match meta {
-                    Some(DrmEventMetadata {
-                        sequence,
-                        time: DrmEventTime::Monotonic(time),
-                    }) => (sequence, time.as_nanos() as u64),
-                    Some(DrmEventMetadata { sequence, .. }) => (sequence, 0),
-                    None => (0, 0),
-                };
-                let msg = ToInner::Presented {
-                    output: self.display.connector_name.clone(),
-                    buffer: *buffer,
-                    sequence,
-                    time_ns,
-                    refresh_ns: self.display.refresh.as_nanos() as u64,
-                };
-                if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
-                    warn!("reporting a flip to a session: {err}");
+        match &shown {
+            Shown::Session {
+                buffer,
+                generation,
+                answer: true,
+                ..
+            } => self.presented(*generation, *buffer, meta.as_ref()),
+            // A blend of the incoming session's frame is that frame on screen, as far as the
+            // session's pacing goes: answer it, so it draws its next one.
+            Shown::Composite {
+                samples: Some((generation, buffer)),
+                ..
+            } => {
+                let target = self.transition.as_mut().and_then(|t| t.to.as_mut());
+                if let Some(Target {
+                    end:
+                        End::Session {
+                            generation: g,
+                            buffer: b,
+                            answer,
+                        },
+                    ..
+                }) = target
+                {
+                    if *g == *generation && *b == *buffer && *answer {
+                        *answer = false;
+                        self.presented(*generation, *buffer, meta.as_ref());
+                    }
                 }
             }
+            _ => (),
         }
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
         self.on_screen = shown;
