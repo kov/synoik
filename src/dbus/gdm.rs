@@ -408,6 +408,9 @@ impl Session {
                 username.to_owned(),
                 reader,
                 fingerprint.clone(),
+                // fprintd lists only the caller's own prints without an admin's say-so, so only
+                // the lock screen can ask; the greeter's daemon answers for it.
+                (!login).then(|| system.clone()),
             ),
             "gdm-user-verifier-signals",
         );
@@ -511,6 +514,7 @@ async fn pump_signals(
     username: String,
     reader: crate::dbus::fprintd::ReaderType,
     flags: std::sync::Arc<FingerprintFlags>,
+    own_prints: Option<zbus::Connection>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -617,6 +621,18 @@ async fn pump_signals(
         // at a time and has no clock.
         fingerprint.stopped_immediately =
             fingerprint_began.is_some_and(|began| began.elapsed() < FINGERPRINT_MIN_ALIVE);
+
+        // Whether the user has prints, asked only when it decides something: gdm's silent
+        // `ServiceUnavailable` for the reader (see [`READER_UNAVAILABLE`]). Asked then rather than
+        // at startup because enrolment changes under a running session.
+        if member == "ServiceUnavailable"
+            && service.as_deref() == Some(FINGERPRINT_SERVICE)
+            && text.as_deref() == Some("")
+        {
+            if let Some(system) = &own_prints {
+                fingerprint.enrolled = crate::dbus::fprintd::has_prints(system, &username).await;
+            }
+        }
 
         let event = match route(&member, service.as_deref(), text, reader, fingerprint) {
             Routed::Ignore => continue,
@@ -726,6 +742,9 @@ struct FingerprintState {
     /// a reader that is working: the user simply has to try again, and taking the option away
     /// from them for getting it wrong is precisely backwards.
     spoke: bool,
+    /// Whether the user has prints enrolled, when known. Only an enrolled user is told the reader
+    /// is unavailable: to anyone else it reads as a fault.
+    enrolled: Option<bool>,
 }
 
 /// Whether this signal is the reader answering — narrating a scan or complaining about one.
@@ -846,11 +865,14 @@ fn route(
             // sets the error text to the literal empty string
             // (`gdm-session-worker.c:1272-1280`). Showing it would blank the line rather than
             // explain anything, and it would do so *by looking like a message*, outranking the
-            // hint it replaced. So an empty one is no message at all — and for the reader, our own
-            // line takes its place (see [`READER_UNAVAILABLE`]).
+            // hint it replaced. So an empty one is no message at all — and for the reader of a user
+            // with prints, our own line takes its place (see [`READER_UNAVAILABLE`]).
             event: text
                 .filter(|text| !text.is_empty())
-                .or_else(|| is_fingerprint.then(|| READER_UNAVAILABLE.to_owned()))
+                .or_else(|| {
+                    (is_fingerprint && fingerprint.enrolled == Some(true))
+                        .then(|| READER_UNAVAILABLE.to_owned())
+                })
                 .map(|text| VerifierEvent::ShowMessage {
                     text,
                     kind: MessageKind::Error,
@@ -1250,6 +1272,7 @@ mod tests {
             // ...but it spoke, so none of that counts.
             spoke: true,
             unavailable: false,
+            enrolled: None,
         };
         assert_eq!(
             route(
@@ -1415,15 +1438,19 @@ mod tests {
             kind: MessageKind::Error,
             source: MessageSource::Fingerprint,
         });
+        let enrolled = FingerprintState {
+            enrolled: Some(true),
+            ..healthy()
+        };
 
-        // gdm's own empty `ServiceUnavailable`, which is the common case.
+        // gdm's own empty `ServiceUnavailable`, which is the common case, for a user with prints.
         assert_eq!(
             route(
                 "ServiceUnavailable",
                 Some(FINGERPRINT_SERVICE),
                 msg(""),
                 ReaderType::Press,
-                healthy(),
+                enrolled,
             ),
             Routed::GiveUp {
                 service: FINGERPRINT_SERVICE,
@@ -1431,12 +1458,35 @@ mod tests {
             }
         );
 
+        // A user with no prints, or one whose prints the client cannot see (the greeter, which
+        // relies on its daemon's text), is told nothing.
+        for enrolled in [Some(false), None] {
+            assert_eq!(
+                route(
+                    "ServiceUnavailable",
+                    Some(FINGERPRINT_SERVICE),
+                    msg(""),
+                    ReaderType::Press,
+                    FingerprintState {
+                        enrolled,
+                        ..healthy()
+                    },
+                ),
+                Routed::GiveUp {
+                    service: FINGERPRINT_SERVICE,
+                    event: None,
+                },
+                "{enrolled:?}"
+            );
+        }
+
         // ...and the other way in, a reader that stops without ever saying anything.
         let fp = FingerprintState {
             silent_stops: FINGERPRINT_MAX_SILENT_STOPS - 1,
             stopped_immediately: true,
             spoke: false,
             unavailable: false,
+            enrolled: None,
         };
         assert_eq!(
             route(
@@ -1521,6 +1571,7 @@ mod tests {
             stopped_immediately: true,
             unavailable: true,
             spoke: false,
+            enrolled: None,
         };
         assert_eq!(
             route(

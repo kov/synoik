@@ -69,7 +69,7 @@ pub fn run(service: &str, user: &str) -> anyhow::Result<i32> {
     let code = pam.authenticate_code();
     if code != pam::PAM_SUCCESS {
         eprintln!("synoik-login: {service} for {user}: {}", pam.strerror(code));
-        report.send(refusal(service, code));
+        report.send(refusal(service, user, code));
         return Ok(1);
     }
 
@@ -128,7 +128,7 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
     let code = pam.authenticate_code();
     if code != pam::PAM_SUCCESS {
         eprintln!("synoik-login: {service} for {user}: {}", pam.strerror(code));
-        report.send(refusal(service, code));
+        report.send(refusal(service, user, code));
         return Ok(1);
     }
     // Logging in, unlike reauthenticating, is refused on an account problem; an expired password
@@ -140,7 +140,7 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
         }
     } else if code != pam::PAM_SUCCESS {
         eprintln!("synoik-login: {service} for {user}: {}", pam.strerror(code));
-        report.send(refusal(service, code));
+        report.send(refusal(service, user, code));
         return Ok(1);
     }
     let Some(account) = account else {
@@ -183,8 +183,12 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
 
 /// What a failed `pam_authenticate` tells the client, worded as GDM words it
 /// (`gdm-session-worker.c:819-877`, `1392-1440`).
-fn refusal(service: &str, code: libc::c_int) -> Frame {
+fn refusal(service: &str, user: &str, code: libc::c_int) -> Frame {
     match code {
+        // The reader would not open for a user who has prints: say so (see [`unavailable_text`]).
+        pam::PAM_AUTHINFO_UNAVAIL if service == "synoik-fingerprint" => {
+            Frame::Unavailable(unavailable_text(enrolment(user)).to_owned())
+        }
         // The service cannot run at all — no reader, a missing module. GDM says nothing.
         pam::PAM_AUTHINFO_UNAVAIL | pam::PAM_MODULE_UNKNOWN => Frame::Unavailable(String::new()),
         pam::PAM_MAXTRIES => Frame::Unavailable(max_tries_message(service).to_owned()),
@@ -214,5 +218,102 @@ fn max_tries_message(service: &str) -> &'static str {
             "You reached the maximum fingerprint authentication attempts, please try another method"
         }
         _ => "You reached the maximum authentication attempts, please try another method",
+    }
+}
+
+/// Whether a user has fingerprints enrolled, as fprintd answers root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Enrolment {
+    Enrolled,
+    NotEnrolled,
+    /// fprintd gone, slow, or saying something else.
+    Unknown,
+}
+
+/// `FINGERPRINT_SERVICE_PROXY_TIMEOUT` (`js/gdm/util.js:50`): fprintd talks to hardware, and the
+/// prompt waits on this answer.
+const FPRINTD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// **Divergence: GDM says nothing here** (`ServiceUnavailable` with an empty message,
+/// `gdm-session-worker.c:1394-1400`). `pam_fprintd` refuses the same way for a reader that will not
+/// open and for a user with no prints, and only the first is worth a word: telling someone with
+/// no fingerprints that the reader is unavailable reads as a fault. The client cannot tell them
+/// apart from the greeter — fprintd lets only root list another user's prints (`setusername` is
+/// `auth_admin_keep`) — so the worker, which is root, asks, and sends the line GNOME would show
+/// verbatim for a non-empty message (`_onServiceUnavailable`, `util.js:888-894`).
+fn unavailable_text(enrolment: Enrolment) -> &'static str {
+    match enrolment {
+        Enrolment::Enrolled => "Fingerprint reader unavailable",
+        // Silence is GDM's answer, and the safe one when we do not know.
+        Enrolment::NotEnrolled | Enrolment::Unknown => "",
+    }
+}
+
+fn enrolment(user: &str) -> Enrolment {
+    let reply = (|| -> zbus::Result<Vec<String>> {
+        let conn = zbus::blocking::connection::Builder::system()?
+            .method_timeout(FPRINTD_TIMEOUT)
+            .build()?;
+        let manager = zbus::blocking::Proxy::new(
+            &conn,
+            "net.reactivated.Fprint",
+            "/net/reactivated/Fprint/Manager",
+            "net.reactivated.Fprint.Manager",
+        )?;
+        let device: zbus::zvariant::OwnedObjectPath = manager.call("GetDefaultDevice", &())?;
+        let device = zbus::blocking::Proxy::new(
+            &conn,
+            "net.reactivated.Fprint",
+            device,
+            "net.reactivated.Fprint.Device",
+        )?;
+        device.call("ListEnrolledFingers", &(user,))
+    })();
+    let error_name = match &reply {
+        Err(zbus::Error::MethodError(name, _, _)) => Some(name.as_str()),
+        _ => None,
+    };
+    let enrolment = enrolment_of(reply.as_deref().map_err(|_| error_name));
+    if let (Err(err), Enrolment::Unknown) = (&reply, enrolment) {
+        eprintln!("synoik-login: fingerprints of {user}: {err}");
+    }
+    enrolment
+}
+
+/// fprintd says "none" with an error, `NoEnrolledPrints`, rather than an empty list.
+fn enrolment_of(reply: Result<&[String], Option<&str>>) -> Enrolment {
+    match reply {
+        Ok([]) => Enrolment::NotEnrolled,
+        Ok(_) => Enrolment::Enrolled,
+        Err(Some("net.reactivated.Fprint.Error.NoEnrolledPrints")) => Enrolment::NotEnrolled,
+        Err(_) => Enrolment::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_enrolled_user_hears_the_reader_is_unavailable() {
+        let fingers = ["right-index-finger".to_owned()];
+        assert_eq!(enrolment_of(Ok(&fingers)), Enrolment::Enrolled);
+        assert_eq!(enrolment_of(Ok(&[])), Enrolment::NotEnrolled);
+        assert_eq!(
+            enrolment_of(Err(Some("net.reactivated.Fprint.Error.NoEnrolledPrints"))),
+            Enrolment::NotEnrolled
+        );
+        assert_eq!(
+            enrolment_of(Err(Some("org.freedesktop.DBus.Error.ServiceUnknown"))),
+            Enrolment::Unknown
+        );
+        assert_eq!(enrolment_of(Err(None)), Enrolment::Unknown);
+
+        assert_eq!(
+            unavailable_text(Enrolment::Enrolled),
+            "Fingerprint reader unavailable"
+        );
+        assert_eq!(unavailable_text(Enrolment::NotEnrolled), "");
+        assert_eq!(unavailable_text(Enrolment::Unknown), "");
     }
 }

@@ -311,6 +311,10 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
   to the grid instead of retrying forever as the lock screen does (`:839-842`);
 - the channel is the login one (`OpenSession`), falling back from reauthentication (§2.5), and
   the client answers `SessionOpened` with `StartSessionWhenReady`.
+- "Fingerprint reader unavailable" is said only to a user with prints enrolled. The greeter cannot
+  ask fprintd about another user (`setusername` is `auth_admin_keep`), so the `gdm-fingerprint`
+  worker, which is root, asks and puts the line in `ServiceUnavailable`'s message, which gnome-shell
+  would show as it is (`util.js:888-894`); GDM's message there is empty.
 
 Honoured `org.gnome.login-screen` keys: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,

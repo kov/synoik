@@ -127,6 +127,38 @@ pub async fn detect(conn: &zbus::Connection) -> ReaderType {
     }
 }
 
+/// Whether `user` has prints enrolled on the default reader — `None` when fprintd will not say.
+///
+/// fprintd answers "none" with `NoEnrolledPrints` rather than an empty list, and lists another
+/// user's prints only to an admin (`net.reactivated.fprint.device.setusername`), so this is for the
+/// session's own user.
+pub async fn has_prints(conn: &zbus::Connection, user: &str) -> Option<bool> {
+    let manager = zbus::Proxy::new(conn, FPRINT, MANAGER_PATH, MANAGER_IFACE)
+        .await
+        .ok()?;
+    let device = with_timeout(manager.call_method("GetDefaultDevice", &()))
+        .await?
+        .ok()?
+        .body()
+        .deserialize::<zbus::zvariant::OwnedObjectPath>()
+        .ok()?;
+    let device = zbus::Proxy::new(conn, FPRINT, device, DEVICE_IFACE)
+        .await
+        .ok()?;
+    match with_timeout(device.call::<_, _, Vec<String>>("ListEnrolledFingers", &(user,))).await? {
+        Ok(fingers) => Some(!fingers.is_empty()),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "net.reactivated.Fprint.Error.NoEnrolledPrints" =>
+        {
+            Some(false)
+        }
+        Err(err) => {
+            report(&err);
+            None
+        }
+    }
+}
+
 /// `FingerprintReaderType[scanType.toUpperCase()]` (`_setFingerprintReaderType`,
 /// `util.js:445-451`).
 ///
