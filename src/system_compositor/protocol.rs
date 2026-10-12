@@ -49,7 +49,13 @@ pub enum ToOuter {
     /// The session decides its display configuration and the outer executes it (§3), for the
     /// session on screen: sent before the first `Present`, after every `Connectors`, and whenever
     /// the session's own configuration changes — always before a `Present` drawn for it.
-    Configure { outputs: Vec<OutputConfig> },
+    ///
+    /// `active` is false while the session blanks its displays (idle, `PowerSaveMode`): the outer
+    /// turns them off and lights them again when it goes back to true.
+    Configure {
+        outputs: Vec<OutputConfig>,
+        active: bool,
+    },
     /// Register a scanout buffer. Carries its dmabuf as the one fd.
     ///
     /// Buffers are registered once and presented by id, so the outer imports each one exactly

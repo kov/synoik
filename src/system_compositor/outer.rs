@@ -518,8 +518,9 @@ struct Session {
     /// The logind session it proved to be, once `Hello` is accepted.
     logind_id: Option<String>,
     buffers: HashMap<u32, SessionBuffer>,
-    /// The displays it lights, as its last `Configure` asked; `None` until it sends one.
-    config: Option<Vec<OutputConfig>>,
+    /// The displays it lights, and whether they are on at all, as its last `Configure` asked;
+    /// `None` until it sends one.
+    config: Option<(Vec<OutputConfig>, bool)>,
     /// Per display, the newest frame it presented while that frame could not be shown — the
     /// session is in the background, or the display is not lit for it — left unanswered: the
     /// inner keeps that slot reserved for as long as the present is outstanding, so it can be
@@ -692,10 +693,15 @@ impl Outer {
         self.relayout_and_fill();
     }
 
-    /// The displays to light and their modes: what the fronted session configured, else every
-    /// connector at its preferred mode (§4.1). A configured mode the connector stopped advertising
-    /// keeps the mode it runs, rather than going dark until the session catches up: the session
-    /// answers the `Connectors` that told it with a `Configure` of its own.
+    /// The displays to light and their modes: what the fronted session configured. A configured
+    /// mode the connector stopped advertising keeps the mode it runs, rather than going dark until
+    /// the session catches up: the session answers the `Connectors` that told it with a
+    /// `Configure` of its own.
+    ///
+    /// Until the fronted session has configured — it is still starting, or not attached — the
+    /// layout stays as it is, so a login's fade does not modeset under it on the way: the new
+    /// session's `Configure` lands before its first frame, while the greeter is still held up.
+    /// A connector nothing lit yet comes on at its preferred mode (§4.1).
     fn wanted_layout(&self) -> Vec<(String, DrmMode)> {
         if self.shutting_down {
             return self
@@ -708,7 +714,8 @@ impl Outer {
             .fronted()
             .and_then(|g| self.sessions.get(&g)?.config.as_ref());
         match config {
-            Some(outputs) => outputs
+            Some((_, false)) => Vec::new(),
+            Some((outputs, true)) => outputs
                 .iter()
                 .filter_map(|o| {
                     let conn = self.connectors.get(&o.connector)?;
@@ -722,7 +729,13 @@ impl Outer {
             None => self
                 .connectors
                 .iter()
-                .map(|(name, c)| (name.clone(), c.preferred()))
+                .map(|(name, c)| {
+                    let mode = self
+                        .displays
+                        .get(name)
+                        .map_or_else(|| c.preferred(), |d| d.mode);
+                    (name.clone(), mode)
+                })
                 .collect(),
         }
     }
@@ -826,12 +839,13 @@ impl Outer {
         };
         let (crtc, handle) = (conn.crtc, conn.handle);
         // A restarted outer finds the display still lit by its predecessor, the session's last
-        // frame on it (§7): adopt it as it is.
-        let adopt = self.recovering
-            && self
-                .drm_fd
-                .get_crtc(crtc)
-                .is_ok_and(|info| info.mode() == Some(mode));
+        // frame on it (§7): adopt it as it is, at whatever mode the session had it.
+        let running = self
+            .recovering
+            .then(|| self.drm_fd.get_crtc(crtc).ok()?.mode())
+            .flatten();
+        let adopt = running.is_some();
+        let mode = running.unwrap_or(mode);
         let surface = match self.drm.create_surface(crtc, mode, &[handle]) {
             Ok(surface) => surface,
             Err(err) => {
@@ -1740,17 +1754,19 @@ impl Outer {
                 };
                 protocol::send(fd.as_fd(), &welcome, &[])?;
             }
-            ToOuter::Configure { outputs } => {
+            ToOuter::Configure { outputs, active } => {
                 debug!(
-                    "session {:?} configures {:?}",
+                    "session {:?} configures {:?}{}",
                     session.logind_id,
                     outputs
                         .iter()
                         .map(|o| (&o.connector, o.mode.width, o.mode.height))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
+                    if active { "" } else { ", blanked" }
                 );
-                let changed = session.config.as_ref() != Some(&outputs);
-                session.config = Some(outputs);
+                let config = Some((outputs, active));
+                let changed = session.config != config;
+                session.config = config;
                 if fronted && changed {
                     self.relayout_and_fill();
                 }

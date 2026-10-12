@@ -84,6 +84,10 @@ pub struct Nested {
     output_ids: HashMap<String, OutputId>,
     /// The displays this session lights, by connector name.
     outputs: HashMap<String, NestedOutput>,
+    /// The displays are on: false while the session blanks them.
+    monitors_active: bool,
+    /// The layout last decided, for the `Configure` that blanking re-sends.
+    layout: Vec<OutputConfig>,
     next_buffer_id: u32,
 }
 
@@ -189,6 +193,8 @@ impl Nested {
             connectors,
             output_ids: HashMap::new(),
             outputs: HashMap::new(),
+            monitors_active: true,
+            layout: Vec::new(),
             next_buffer_id: 1,
         };
         nested.attach(fd);
@@ -246,22 +252,37 @@ impl Nested {
         }
         self.refresh_ipc_outputs(synoik);
 
+        self.layout = wanted
+            .into_iter()
+            .map(|(c, mode)| OutputConfig {
+                connector: c.connector,
+                mode,
+            })
+            .collect();
+        self.send_configure();
+    }
+
+    fn send_configure(&self) {
         let Some(conn) = &self.conn else {
             return;
         };
         let msg = ToOuter::Configure {
-            outputs: wanted
-                .into_iter()
-                .map(|(c, mode)| OutputConfig {
-                    connector: c.connector,
-                    mode,
-                })
-                .collect(),
+            outputs: self.layout.clone(),
+            active: self.monitors_active,
         };
+        // A dead connection is noticed, and reconnected, by the read side.
         if let Err(err) = protocol::send(conn.fd.as_fd(), &msg, &[]) {
             warn!("configuring the displays with the system compositor: {err}");
-            self.detach(synoik);
         }
+    }
+
+    /// Blank the displays, or light them again: the outer does it, while this session is fronted.
+    pub fn set_monitors_active(&mut self, active: bool) {
+        if self.monitors_active == active {
+            return;
+        }
+        self.monitors_active = active;
+        self.send_configure();
     }
 
     /// The displays to light and their modes: off, mode and lid as the tty backend reads them
