@@ -2491,10 +2491,10 @@ impl State {
         // gets covered — our own shield and an `ext-session-lock` client — and only one of them
         // has an event we own. A held request that nobody resumes is polkitd waiting forever on a
         // dialog that will never be drawn.
-        if self.synoik.network_secret_deferred.is_some() && !self.synoik.screen_is_covered() {
+        if self.synoik.network_secret_deferred.is_some() && !self.synoik.session_mode().is_locked {
             self.resume_deferred_network_secret();
         }
-        if self.synoik.polkit_deferred.is_some() && !self.synoik.screen_is_covered() {
+        if self.synoik.polkit_deferred.is_some() && !self.synoik.session_mode().is_locked {
             self.resume_deferred_polkit();
         }
 
@@ -6611,8 +6611,8 @@ impl State {
                 // A password box must not be drawn over the shield, so it waits — the same rule
                 // the polkit dialog follows. NetworkManager's own 120 s agent timeout bounds the
                 // wait: a request still held when it expires arrives back as a Cancel and is
-                // withdrawn, so nothing is stranded.
-                if self.synoik.screen_is_covered() {
+                // withdrawn, so nothing is stranded. The greeter is not locked, and asks.
+                if self.synoik.session_mode().is_locked {
                     debug!(
                         "network agent: holding {} until the screen unlocks",
                         request.request_id
@@ -6690,9 +6690,10 @@ impl State {
 
         // Not over a lock screen. GNOME holds the request and re-runs it when the session mode
         // changes (`polkitAgent.js:439-450`); the one action it exempts is extending a
-        // parental-controls session limit, which we have no subsystem for.
+        // parental-controls session limit, which we have no subsystem for. The greeter is not
+        // locked (`gdm`, `sessionMode.js:50-63`): its dialog shows over the login screen.
         if let PolkitToSynoik::Begin(request) = &msg {
-            if self.synoik.screen_is_covered() {
+            if self.synoik.session_mode().is_locked {
                 debug!(
                     "polkit: holding {} until the screen unlocks",
                     request.action_id
@@ -12151,9 +12152,9 @@ impl Synoik {
             &mut |elem| push(elem.into()),
         );
 
-        // Next, the polkit authentication dialog. Above the three above it and below the lock
-        // surface, which is the order it can actually be in: it defers rather than stacking on a
-        // shield.
+        // Next, the polkit authentication dialog, above the shield (`modalDialogGroup` over
+        // `screenShieldGroup`, `layout.js:267-294`): over a lock it defers instead, but the
+        // greeter shows it.
         self.polkit_ui.render(
             ctx.renderer,
             output,

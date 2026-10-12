@@ -16474,3 +16474,96 @@ fn vulkan_draws_the_greeter_user_grid() {
     );
     let _ = std::fs::remove_file(&picture);
 }
+
+/// The modal dialogs paint above the greeter's shield (`modalDialogGroup` over
+/// `screenShieldGroup`, `layout.js:267-294`): the polkit prompt and the end-session confirmation
+/// each change the pixels under their Cancel button.
+#[test]
+fn vulkan_draws_dialogs_over_the_greeter() {
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitToSynoik};
+    use crate::end_session::SessionRequest;
+    use crate::polkit_dialog::Focus;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    let output = f.synoik_output(1);
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    f.synoik_complete_animations();
+    let (bare, w, h) = render_output_vulkan(&mut f, &output);
+    let size = Size::from((f64::from(w), f64::from(h)));
+    let changed = |a: &[u8], b: &[u8], r: Rectangle<f64, smithay::utils::Logical>| {
+        let (x0, y0) = (r.loc.x as i32, r.loc.y as i32);
+        let (x1, y1) = ((r.loc.x + r.size.w) as i32, (r.loc.y + r.size.h) as i32);
+        let total = (x1 - x0) * (y1 - y0);
+        let differ = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(a, w, x, y) != px(b, w, x, y))
+            .count() as i32;
+        differ * 2 > total
+    };
+
+    let (to_agent, _from_dialog) = async_channel::unbounded();
+    f.synoik().polkit_requests = Some(to_agent);
+    f.synoik_state()
+        .on_polkit_msg(PolkitToSynoik::Begin(Box::new(BeginRequest {
+            action_id: "org.freedesktop.login1.power-off-multiple-sessions".to_owned(),
+            message: "Authentication is required to power off".to_owned(),
+            user_name: "root".to_owned(),
+            passwordless: false,
+            avatar: None,
+        })));
+    f.synoik_state().on_polkit_msg(PolkitToSynoik::Request {
+        prompt: "Password:".to_owned(),
+        echo_on: false,
+    });
+    f.synoik_complete_animations();
+    let synoik = f.synoik();
+    let (x, y) = (0..w)
+        .step_by(4)
+        .flat_map(|x| (0..h).step_by(4).map(move |y| (x, y)))
+        .find(|&(x, y)| {
+            synoik.polkit_ui.hit(
+                &synoik.polkit_dialog,
+                size,
+                Point::from((f64::from(x), f64::from(y))),
+            ) == Some(Focus::Cancel)
+        })
+        .expect("the polkit dialog is up");
+    let (with_polkit, _, _) = render_output_vulkan(&mut f, &output);
+    assert!(
+        changed(
+            &bare,
+            &with_polkit,
+            Rectangle::new(
+                Point::from((f64::from(x), f64::from(y))),
+                Size::from((24., 12.))
+            )
+        ),
+        "the polkit dialog is not drawn over the greeter"
+    );
+
+    f.synoik_state()
+        .on_polkit_msg(PolkitToSynoik::Completed(false));
+    f.synoik_state().on_polkit_msg(PolkitToSynoik::Cancel);
+    f.synoik_complete_animations();
+    assert!(!f.synoik().polkit_is_open());
+    f.synoik_state()
+        .request_session_action(SessionRequest::PowerOff);
+    f.synoik_complete_animations();
+    let cancel = f.synoik().end_session_dialog.cancel_button_rect(size);
+    let (with_end_session, _, _) = render_output_vulkan(&mut f, &output);
+    assert!(
+        changed(&bare, &with_end_session, cancel),
+        "the end-session dialog is not drawn over the greeter"
+    );
+}

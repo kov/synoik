@@ -1113,10 +1113,35 @@ impl State {
                         return FilterResult::Forward;
                     }
 
-                    // The end-session confirmation is above the shield (`modalDialogGroup` over
-                    // `screenShieldGroup`, `layout.js:267-294`), and it counts down: it must take
-                    // its keys here, or nothing could cancel it.
-                    if this.synoik.end_session_dialog.is_open() {
+                    // The modal dialogs are above the shield (`modalDialogGroup` over
+                    // `screenShieldGroup`, `layout.js:267-294`) and take their keys here, topmost
+                    // first. Over a lock only the end-session confirmation gets this far — the
+                    // other two wait for the unlock — but the greeter is not locked
+                    // (`sessionMode.js:50-63`) and shows them, as gdm mode runs both agents.
+                    let dialog = if this.synoik.polkit_is_open() {
+                        Some(ShellEntry::Polkit)
+                    } else if this.synoik.network_secret_is_open() {
+                        Some(ShellEntry::NetworkSecret)
+                    } else {
+                        None
+                    };
+                    if let Some(entry) = dialog {
+                        let text = modified
+                            .key_char()
+                            .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        this.shell_key(
+                            entry,
+                            raw,
+                            text,
+                            edit_mods(mods),
+                            modified.raw(),
+                            key_code,
+                            pressed,
+                            key_repeats,
+                        );
+                    // The end-session confirmation counts down: without its keys here nothing
+                    // could cancel it.
+                    } else if this.synoik.end_session_dialog.is_open() {
                         match this.synoik.end_session_dialog.handle_key(raw, pressed) {
                             DialogOutcome::Handled => this.synoik.queue_redraw_all(),
                             DialogOutcome::Confirm => this.confirm_end_session(),
@@ -8931,7 +8956,20 @@ impl State {
             if button_state == ButtonState::Pressed {
                 let pos = self.synoik.seat.get_pointer().unwrap().current_location();
                 let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
-                // The end-session confirmation is above the shield, and modal.
+                // The modal dialogs are above the shield, topmost first (see the keyboard branch).
+                if self.synoik.polkit_is_open() || self.synoik.network_secret_is_open() {
+                    if button == Some(MouseButton::Left) {
+                        if let Some((output, local)) = &under {
+                            if self.synoik.polkit_is_open() {
+                                self.polkit_pointer_click(output_size(output), *local);
+                            } else {
+                                self.network_secret_pointer_click(output_size(output), *local);
+                            }
+                        }
+                    }
+                    self.synoik.queue_redraw_all();
+                    return;
+                }
                 if self.synoik.end_session_dialog.is_open() {
                     if button == Some(MouseButton::Left) {
                         if let Some((output, local)) = &under {

@@ -42080,3 +42080,107 @@ fn a_lost_channel_on_the_greeters_list_asks_for_nobody() {
     tap(&mut f, KEY_ENTER);
     assert_eq!(begun(&mut f), ["bob"]);
 }
+
+/// The greeter is not locked (`gdm`, `sessionMode.js:50-63`) and runs the polkit agent, so a
+/// request — a power-off with other users logged in asks for an administrator — shows over the
+/// login screen at once and takes the keyboard and pointer from the user list beneath it.
+#[test]
+fn the_greeter_shows_a_polkit_prompt_over_the_list() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::VerifierRequest;
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToSynoik};
+    use crate::polkit_dialog::Focus;
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![LoginUser {
+            name: "amy".to_owned(),
+            real_name: String::new(),
+            icon_file: None,
+            uid: 1000,
+            logged_in: true,
+            login_frequency: 0,
+        }]));
+
+    let (to_agent, from_dialog) = async_channel::unbounded();
+    f.synoik().polkit_requests = Some(to_agent);
+    let sent = move || from_dialog.try_recv().ok();
+    let ask = |f: &mut Fixture| {
+        f.synoik_state()
+            .on_polkit_msg(PolkitToSynoik::Begin(Box::new(BeginRequest {
+                action_id: "org.freedesktop.login1.power-off-multiple-sessions".to_owned(),
+                message: "Authentication is required to power off".to_owned(),
+                user_name: "amy".to_owned(),
+                passwordless: false,
+                avatar: None,
+            })));
+        f.synoik_state().on_polkit_msg(PolkitToSynoik::Request {
+            prompt: "Password:".to_owned(),
+            echo_on: false,
+        });
+        f.synoik().polkit_ui.settle();
+    };
+
+    ask(&mut f);
+    assert!(f.synoik().polkit_is_open(), "not deferred on the greeter");
+    assert!(matches!(sent(), Some(PolkitRequest::Initiate { .. })));
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_E);
+    tap(&mut f, KEY_ENTER);
+    match sent() {
+        Some(PolkitRequest::Respond(response)) => assert_eq!(response, "ae"),
+        other => panic!("expected a response, got {other:?}"),
+    }
+    assert!(
+        !f.gdm_requests()
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::Begin { .. })),
+        "Enter went to the dialog, not to the list"
+    );
+
+    tap(&mut f, KEY_ESC);
+    assert!(matches!(
+        sent(),
+        Some(PolkitRequest::Done { dismissed: true })
+    ));
+    f.synoik().polkit_ui.settle();
+    assert!(!f.synoik().polkit_is_open());
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Grid,
+        "Escape stayed in the dialog"
+    );
+
+    // And by pointer: its Cancel takes the click.
+    ask(&mut f);
+    let _ = sent();
+    let size = smithay::utils::Size::from((1920., 1080.));
+    let synoik = f.synoik();
+    let cancel = (0..1920)
+        .step_by(8)
+        .flat_map(|x| {
+            (0..1080)
+                .step_by(8)
+                .map(move |y| (f64::from(x), f64::from(y)))
+        })
+        .find(|&(x, y)| {
+            synoik
+                .polkit_ui
+                .hit(&synoik.polkit_dialog, size, Point::from((x, y)))
+                == Some(Focus::Cancel)
+        })
+        .expect("a cancel button");
+    pointer_motion_to(&mut f, cancel.0, cancel.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(matches!(
+        sent(),
+        Some(PolkitRequest::Done { dismissed: true })
+    ));
+}
