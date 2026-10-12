@@ -2631,7 +2631,7 @@ impl State {
         // The hold is cleared as well as the strip, and unconditionally: with no timer behind it
         // a hold whose release the shield swallowed would sit there forever, and a stale one reads
         // every later tap as a long hold — which is the overview becoming unreachable by tap.
-        if self.synoik.is_locked() || self.synoik.screen_shield.is_active() {
+        if self.synoik.is_locked() || self.synoik.shield_is_up() {
             self.synoik.end_peek();
             // Nor App Exposé: its input is the shell's, and a locked session has none.
             self.synoik.layout.close_app_expose();
@@ -5002,7 +5002,7 @@ impl State {
 
         // A lock arriving mid-countdown cancels: the delay was armed against a screen the user
         // could see, and firing into a lock screen would capture what the lock exists to hide.
-        if self.synoik.is_locked() || self.synoik.screen_shield.is_active() {
+        if self.synoik.is_locked() || self.synoik.shield_is_up() {
             debug!("screen locked mid-countdown; dropping the delayed capture");
             self.cancel_pending_capture();
             return None;
@@ -6271,7 +6271,7 @@ impl State {
     ) {
         use smithay::input::keyboard::Keysym;
 
-        if !self.synoik.screen_shield.is_active() {
+        if !self.synoik.shield_is_up() {
             return;
         }
         if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid {
@@ -6492,7 +6492,7 @@ impl State {
     /// `_updateDisableUserList` (`loginDialog.js:914-930`): when whether the list is disabled
     /// changes while nobody is being asked for credentials, start over on the right page.
     pub fn sync_greeter_user_list(&mut self) {
-        if !self.synoik.greeter || !self.synoik.screen_shield.is_active() {
+        if !self.synoik.greeter {
             return;
         }
         let on_list = self.synoik.login_page == LoginPage::Grid;
@@ -6518,7 +6518,7 @@ impl State {
     /// A click while the shield is down: raise it, raise the prompt page
     /// (`unlockDialog.js:571-573`'s click gesture), or hit something on the prompt.
     pub fn on_shield_click(&mut self, pos: Point<f64, Logical>) {
-        if !self.synoik.screen_shield.is_active() {
+        if !self.synoik.shield_is_up() {
             return;
         }
         self.synoik.login_dwell += 1;
@@ -6674,7 +6674,7 @@ impl State {
     ///   `is_dismissible` is the shield that raises on any input, and it must not display a
     ///   password entry with no conversation behind it.
     fn sync_lock_page(&mut self) {
-        if !self.synoik.screen_shield.is_active() {
+        if !self.synoik.shield_is_up() {
             return;
         }
         // The greeter has only the login dialog: no clock page to go back to.
@@ -7143,7 +7143,7 @@ impl State {
                 self.synoik.queue_redraw_all();
             }
         }
-        if self.synoik.screen_shield.is_active() {
+        if self.synoik.shield_is_up() {
             self.synoik.queue_redraw_all();
         }
     }
@@ -7155,9 +7155,7 @@ impl State {
     pub fn show_greeter_dialog(&mut self) {
         let now = self.synoik.shield_now();
         self.synoik.login_grid.reset(self.synoik.login_users.len());
-        self.synoik
-            .screen_shield
-            .show_dialog(crate::utils::get_monotonic_time());
+        self.synoik.screen_shield.show_dialog();
         self.synoik.lock_screen.set_shown(true, now);
         self.synoik.lock_screen.set_page(true, now);
         self.synoik.lock_screen.settle();
@@ -7168,9 +7166,9 @@ impl State {
 
     pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
         // The curtain follows `active`, not `locked`: a shield down without a lock is still a
-        // shield, and it is what a `lock-enabled = false` screensaver is.
+        // shield, and it is what a `lock-enabled = false` screensaver is. The greeter's stays.
         if effects.active_changed.is_some() {
-            let now = self.synoik.screen_shield.is_active();
+            let now = self.synoik.shield_is_up();
             self.synoik
                 .lock_screen
                 .set_shown(now, crate::utils::get_monotonic_time());
@@ -9122,7 +9120,7 @@ impl Synoik {
                 // The shield's curtain shows the same clock and is the only thing on screen
                 // while it is down, so it rides this tick too — explicitly, rather than
                 // relying on the panel's label happening to change on the same boundary.
-                if state.synoik.panel.update_clock() || state.synoik.screen_shield.is_active() {
+                if state.synoik.panel.update_clock() || state.synoik.shield_is_up() {
                     state.synoik.queue_redraw_all();
                 }
                 // ...and so does the unlock prompt's two-minute escape back to the clock.

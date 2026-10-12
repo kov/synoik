@@ -598,7 +598,7 @@ impl State {
     /// keystroke lands — deriving it from anything else would let the engine be focused on one
     /// entry while the keys went to another.
     fn shell_im_entry(&self) -> Option<ShellEntry> {
-        if self.synoik.screen_shield.is_active() {
+        if self.synoik.shield_is_up() {
             return Some(ShellEntry::Shield);
         }
         if self.synoik.run_dialog.is_open() {

@@ -240,13 +240,16 @@ impl ScreenShield {
 
     /// `showDialog` (`:321-327`) — the greeter's shield, put down at startup with the login dialog
     /// on it (`main.js:327-330`). Locked from the start, with no conversation to wait for: the
-    /// login dialog opens its own once a user is picked. No `ActiveChanged` or `locked-changed`,
-    /// as in GNOME, which sets the fields without the signals.
-    pub fn show_dialog(&mut self, now: Duration) {
+    /// login dialog opens its own once a user is picked. No `locked-changed`, as in GNOME, which
+    /// sets the field without the signal.
+    ///
+    /// **Not active.** `showDialog` sets `_isLocked` and never `_isActive`: the greeter is a login
+    /// screen, not a running screensaver. It goes active on the idle fade like any session, and
+    /// gsd-power and gnome-session read it that way — a greeter that claimed to be a screensaver
+    /// from boot would be blanked on gsd's short screensaver timeout instead of `idle-delay`.
+    pub fn show_dialog(&mut self) {
         self.greeter = true;
-        self.active = true;
         self.locked = true;
-        self.activation_time = Some(now);
     }
 
     /// `activate` (`:586-616`) — put the shield down *without* requiring authentication.
@@ -265,10 +268,13 @@ impl ScreenShield {
     /// Clears `locked` too: GNOME only reaches here once the dialog has authenticated (or was
     /// never needed), so the caller owes that check, not this.
     pub fn deactivate(&mut self) -> ShieldEffects {
-        // The greeter's shield stays. GNOME also clears `isActive` there, so gnome-session resets
-        // its idle counter and gsd stops blanking (`:530-541`); not ported yet — ours stays set.
+        // The greeter's shield stays, but stops being active, so gnome-session resets its idle
+        // counter and gsd stops blanking (`:530-541`).
         if self.greeter {
-            return ShieldEffects::default();
+            self.activation_time = None;
+            let mut effects = self.set_active(false);
+            effects.wake_up_screen = true;
+            return effects;
         }
         self.activation_time = None;
         self.awaiting_authenticator = None;
@@ -328,7 +334,7 @@ impl ScreenShield {
     pub fn authenticator_ready(&mut self, epoch: u64, ready: bool) -> ShieldEffects {
         // Ignore an answer for a lock that no longer applies: a different epoch, or a shield that
         // has since been raised. Either way, locking now would be a lock nobody asked for.
-        if self.awaiting_authenticator != Some(epoch) || !self.active {
+        if self.awaiting_authenticator != Some(epoch) || !self.is_up() {
             return ShieldEffects::default();
         }
         self.awaiting_authenticator = None;
@@ -356,7 +362,7 @@ impl ScreenShield {
     /// GNOME leaves the dialog stuck on a dead channel; this keeps the lock and recovers it.
     pub fn authenticator_lost(&mut self) -> ShieldEffects {
         self.awaiting_authenticator = None;
-        if !self.locked || !self.active {
+        if !self.locked || !self.is_up() {
             return ShieldEffects::default();
         }
         warn!("the unlock channel died; keeping the lock and asking for a new channel");
@@ -366,7 +372,7 @@ impl ScreenShield {
     /// Ask again for a channel to the lock a shield lost its channel to. Nothing if the shield was
     /// raised or unlocked meanwhile, or a request is already out.
     pub fn retry_authenticator(&mut self) -> ShieldEffects {
-        if !self.locked || !self.active || self.awaiting_authenticator.is_some() {
+        if !self.locked || !self.is_up() || self.awaiting_authenticator.is_some() {
             return ShieldEffects::default();
         }
         self.epoch += 1;
@@ -540,6 +546,12 @@ impl ScreenShield {
         let mut effects = self.on_user_active();
         effects.wake_up_screen = true;
         effects
+    }
+
+    /// Whether the shield is down over the screen: while active, and on the greeter always, whose
+    /// login dialog is the shield even while it is not a screensaver (see [`Self::show_dialog`]).
+    fn is_up(&self) -> bool {
+        self.active || self.greeter
     }
 
     fn set_active(&mut self, active: bool) -> ShieldEffects {

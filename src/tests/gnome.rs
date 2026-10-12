@@ -41992,6 +41992,10 @@ fn the_lock_screen_panel_ignores_a_fullscreen_window() {
 
 /// The greeter is the screen shield shown at startup (`main.js:327-330` → `showDialog`): down at
 /// once, locked, on the login page, and nothing raises it — not input, not a deactivate.
+///
+/// It is not a screensaver, though: `showDialog` never sets `isActive` (`screenShield.js:321-327`),
+/// the greeter goes active on the idle fade like any session, and a deactivate clears it again
+/// without raising anything (`:530-541`) — what gnome-session and gsd-power read.
 #[test]
 fn the_greeter_is_a_shield_that_stays_down() {
     let mut f = Fixture::new();
@@ -42002,16 +42006,25 @@ fn the_greeter_is_a_shield_that_stays_down() {
 
     let now = f.synoik().shield_now();
     assert!(f.synoik().screen_shield.is_locked());
+    assert!(!f.synoik().screen_shield.is_active(), "not a screensaver");
     assert!(f.synoik().lock_screen.is_covering(now));
     assert_eq!(f.synoik().lock_screen.page_progress(now), 1.);
     assert!(f.gdm_requests().is_empty(), "no user to ask for yet");
+
+    let effects = f
+        .synoik()
+        .screen_shield
+        .activate(crate::utils::get_monotonic_time());
+    f.synoik_state().apply_shield_effects(effects);
+    assert!(f.synoik().screen_shield.is_active(), "idle makes it one");
 
     tap(&mut f, KEY_A);
     let effects = f.synoik().screen_shield.deactivate();
     f.synoik_state().apply_shield_effects(effects);
     f.turn();
     let now = f.synoik().shield_now();
-    assert!(f.synoik().screen_shield.is_active());
+    assert!(!f.synoik().screen_shield.is_active());
+    assert!(f.synoik().screen_shield.is_locked());
     assert!(f.synoik().lock_screen.is_covering(now));
 }
 
@@ -42617,7 +42630,7 @@ fn the_greeter_logs_a_picked_user_in() {
         .any(|r| matches!(r, VerifierRequest::Answer(a) if a == "a")));
     f.synoik_state().on_verifier_event(VerifierEvent::Complete);
     assert_eq!(f.synoik().login_page, LoginPage::Grid);
-    assert!(f.synoik().screen_shield.is_active(), "the greeter stays");
+    assert!(f.synoik().shield_is_up(), "the greeter stays");
     assert!(
         !f.gdm_requests()
             .iter()
