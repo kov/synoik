@@ -6025,6 +6025,12 @@ impl State {
             Login1ToSynoik::SessionActive(active) => {
                 self.synoik.session_active = active;
                 self.synoik.sync_sleep_inhibitor();
+                // `_loginScreenSessionActivated` (`loginDialog.js:1177-1202`): coming back to the
+                // greeter — a switch user, a logout — finds it where it was left only if nobody
+                // was being asked for credentials; a conversation left running starts over.
+                if active && self.synoik.greeter && self.synoik.login_page.is_asking_a_user() {
+                    self.greeter_back_to_start(true);
+                }
             }
             // The machine is going down for real, by whatever route. Freeze the session here:
             // this is the only signal `systemctl poweroff`, the power button and an offline update
@@ -6607,6 +6613,16 @@ impl State {
     /// does and for the same stated reason ([`crate::unlock_dialog::UnlockDialog::show_clock`]) —
     /// against a lock screen nobody can get past. Cancelling becomes safe once a locked shield can
     /// re-Begin on demand; `authenticator_lost` re-Begins only for a channel that died.
+    /// The power menu's "Switch User…": lock, then go to the login screen
+    /// (`activateSwitchUser`, `systemActions.js:467-478`) — the session is locked behind the
+    /// greeter, as GNOME leaves it.
+    pub fn activate_switch_user(&mut self) {
+        self.on_screen_saver_msg(crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(
+            None,
+        ));
+        self.switch_user();
+    }
+
     pub fn switch_user(&mut self) {
         let now = self.synoik.shield_now();
         let effects = self.synoik.unlock_dialog.cancel();
@@ -7115,12 +7131,14 @@ impl State {
                     return;
                 }
                 self.synoik.multiple_users = multiple;
+                self.synoik.sync_power_policy();
             }
             AccountsToSynoik::CanSwitch(can) => {
                 if self.synoik.can_switch_user == can {
                     return;
                 }
                 self.synoik.can_switch_user = can;
+                self.synoik.sync_power_policy();
             }
             AccountsToSynoik::Users(users) => {
                 let first_load = !self.synoik.login_users_loaded;
@@ -10515,6 +10533,9 @@ impl Synoik {
         let policy = crate::ui::quick_settings::PowerPolicy {
             disable_restart_buttons: self.gnome_settings.login_screen.disable_restart_buttons,
             restart_enabled: self.gnome_settings.shield.restart_enabled,
+            switch_user: self.can_switch_user
+                && self.multiple_users
+                && !self.screen_shield.settings().disable_user_switching,
         };
         if self.panel_popover.set_power_policy(policy) {
             self.queue_redraw_all();

@@ -2644,6 +2644,7 @@ impl State {
             //
             // Only `Logout` hides the overview first (`activateLogout`, `:483-489`);
             // `activatePowerOff` and `activateRestart` deliberately do not, so neither do we.
+            PopoverAction::SwitchUser => self.activate_switch_user(),
             PopoverAction::SessionRequest(request) => {
                 if request == crate::end_session::SessionRequest::Logout {
                     self.synoik.layout.close_overview();

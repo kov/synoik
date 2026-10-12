@@ -66,6 +66,20 @@ const FADE: Duration = Duration::from_millis(250);
 /// previous user's screen is not left in front of whoever is at the seat now.
 const TARGET_WAIT: Duration = Duration::from_millis(300);
 
+/// How long the greeter's picture may stay up instead (greeter.md §4.4). A user session's first
+/// frame takes seconds after a login, and the greeter shows nothing private, so it holds until the
+/// incoming frame rather than fading the login to the plate; bounded, so a session that never
+/// draws still gets the plate.
+const GREETER_TARGET_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a switch away from a session of logind class `outgoing` waits for the incoming frame.
+fn target_wait(outgoing: Option<&str>) -> Duration {
+    match outgoing {
+        Some("greeter") => GREETER_TARGET_WAIT,
+        _ => TARGET_WAIT,
+    }
+}
+
 /// Run the system compositor until it is told to stop.
 pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<'static, Outer> = EventLoop::try_new()?;
@@ -400,6 +414,9 @@ struct Outer {
     transition: Option<Transition>,
     /// A switch waiting for the flip in flight to land before it snapshots the screen.
     switch_pending: bool,
+    /// How long the switch in progress waits for the incoming frame: the outgoing session's
+    /// class decides (`target_wait`).
+    switch_wait: Duration,
     /// What the last finished transition faded to, standing in for its frame on screen.
     last_to: Option<Picture>,
 }
@@ -447,6 +464,7 @@ impl Outer {
             compositor,
             transition: None,
             switch_pending: false,
+            switch_wait: TARGET_WAIT,
             last_to: None,
         };
         // A restarted outer leaves the screen alone: it still shows the session's last frame
@@ -642,6 +660,8 @@ impl Outer {
             return;
         }
         info!("seat0 fronts session {front:?} (was {:?})", self.front);
+        let outgoing = self.front.as_deref().and_then(read_session_class);
+        self.switch_wait = target_wait(outgoing.as_deref());
         self.front = front;
 
         if self.compositor.is_some() {
@@ -793,7 +813,7 @@ impl Outer {
     fn arm_target_wait(&mut self) {
         // Not the compositor clock of `Synoik::timer_after`: the outer holds no `Synoik`.
         #[allow(clippy::disallowed_methods)]
-        let timer = Timer::from_duration(TARGET_WAIT);
+        let timer = Timer::from_duration(self.switch_wait);
         let token = self
             .handle
             .insert_source(timer, |_, _, outer: &mut Outer| {
@@ -1473,6 +1493,15 @@ fn verify_session_claim(id: &str, uid: u32, pid: i32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A logind session's class (`user`, `greeter`, …), from its state file.
+fn read_session_class(id: &str) -> Option<String> {
+    let state = std::fs::read_to_string(format!("/run/systemd/sessions/{id}")).ok()?;
+    state
+        .lines()
+        .find_map(|line| line.strip_prefix("CLASS="))
+        .map(|class| class.trim().to_owned())
+}
+
 /// The logind session whose scope `pid` runs in, read the way `sd_pid_get_session` does.
 fn session_of_pid(pid: i32) -> Option<String> {
     let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
@@ -1514,12 +1543,14 @@ fn drain_inotify(fd: BorrowedFd<'_>) {
     while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
-/// The sessions on `seat` that can be fronted, oldest login first.
+/// The sessions on `seat` that can be fronted: the greeter, then users, oldest login first. The
+/// greeter leads even when it was reopened after the users logged in, so Ctrl+Alt+F1 is always
+/// the login screen, as VT1 is under GDM (greeter.md §5).
 fn seat_sessions(seat: &str) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir("/run/systemd/sessions") else {
         return Vec::new();
     };
-    let mut sessions: Vec<(u64, String)> = dir
+    let sessions: Vec<(String, u64, String)> = dir
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let id = entry.file_name().into_string().ok()?;
@@ -1537,11 +1568,16 @@ fn seat_sessions(seat: &str) -> Vec<String> {
                 && matches!(field("CLASS"), Some("user" | "greeter"))
                 && matches!(field("STATE"), Some("online" | "active"));
             let since = field("REALTIME")?.parse().ok()?;
-            fronts.then_some((since, id))
+            fronts.then_some((field("CLASS")?.to_owned(), since, id))
         })
         .collect();
-    sessions.sort();
-    sessions.into_iter().map(|(_, id)| id).collect()
+    front_order(sessions)
+}
+
+/// `(class, login time, id)` in chord order: greeter-class first, then by login time.
+fn front_order(mut sessions: Vec<(String, u64, String)>) -> Vec<String> {
+    sessions.sort_by_key(|(class, since, _)| (class != "greeter", *since));
+    sessions.into_iter().map(|(_, _, id)| id).collect()
 }
 
 /// Ask logind to make session `id` the active one on its seat. Off the event loop: the call goes
@@ -1566,5 +1602,30 @@ fn activate_session(id: String) {
         });
     if let Err(err) = spawned {
         warn!("spawning the session activation: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A greeter reopened after the users logged in still answers Ctrl+Alt+F1.
+    #[test]
+    fn the_greeter_leads_the_chord_order() {
+        let order = front_order(vec![
+            ("user".into(), 20, "2".into()),
+            ("greeter".into(), 30, "c3".into()),
+            ("user".into(), 10, "5".into()),
+        ]);
+        assert_eq!(order, ["c3", "5", "2"]);
+    }
+
+    /// Leaving the greeter holds its picture for the incoming session's first frame; leaving a user
+    /// does not (greeter.md §4.4).
+    #[test]
+    fn only_the_greeter_holds_for_the_incoming_frame() {
+        assert_eq!(target_wait(Some("greeter")), GREETER_TARGET_WAIT);
+        assert_eq!(target_wait(Some("user")), TARGET_WAIT);
+        assert_eq!(target_wait(None), TARGET_WAIT);
     }
 }

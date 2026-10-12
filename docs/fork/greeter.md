@@ -394,16 +394,21 @@ user → user switches, where it exists to take the previous user's screen away.
 
 ## 5. Switching and logout
 
-- **Switch user** (lock screen button, user menu): activate the greeter session. Today
-  `user_switching::find_greeter` matches `Service == gdm-launch-environment` and falls back to
-  GDM's `CreateTransientDisplay`; it also matches `synoik-greeter`, and there is no fallback to
-  need — the greeter always exists (§2.6).
-- **Coming back:** when logind makes the greeter `Active` again it resets to the grid
-  (`loginDialog.js:1177-1202`).
+- **Switch user** — the lock screen's button, and "Switch User…" past Log Out in the power menu
+  (`system.js:199-208`), shown as `_updateSwitchUser` decides (`systemActions.js:428-438`): not
+  locked down, a seat to switch on, more than one user, and never on the lock screen or the
+  greeter. The menu's locks the session first (`activateSwitchUser`, `:467-478`). Both run
+  `user_switching::goto_login_session`, whose `find_greeter` takes GDM's `gdm-launch-environment`
+  or our `synoik-greeter`; the greeter always exists (§2.6), so GDM's `CreateTransientDisplay`
+  fallback never runs under synoik-login.
+- **Coming back:** when logind makes the greeter `Active` again with a user's prompt up, the
+  conversation is cancelled and it starts over (`_loginScreenSessionActivated`,
+  `loginDialog.js:1177-1202`); left on the grid, it stays as it was.
 - **Logout:** the session's worker sees it exit and closes PAM (§2.4); logind fronts whatever it
   activates next, and the daemon activates the greeter if nothing else is.
-- **Chord:** the greeter is seat0's earliest session, so Ctrl+Alt+F1 is the greeter, as VT1 is
-  under GDM; users follow in login order (system-compositor §10 Chord).
+- **Chord:** Ctrl+Alt+F1 is the greeter, as VT1 is under GDM — greeter-class sessions lead the
+  order even when the greeter was reopened after the users logged in; users follow in login order
+  (system-compositor §10 Chord).
 
 ---
 
@@ -544,3 +549,12 @@ session 2. A polkit check run inside the greeter's session for an admin-only act
 (`systemd1.manage-units`) raises the prompt over the grid for Claude, the administrator, and
 Escape dismisses it; Restart from the greeter's menu with Claude logged in reboots without one,
 since Fedora allows `reboot-multiple-sessions` to an active session.
+
+§7 step 4, switching and logout (§5) and the greeter hold (§4.4, `GREETER_TARGET_WAIT` in the
+outer).
+
+Measured 2026-10-12 on the same guest, by injected keys: "Switch User…" from Claude's power menu
+locks session 2 and fronts the greeter; logging u2 in from it fronts the new session seven seconds
+after the password, and the outer keeps the greeter up until u2's first frame instead of fading
+to the plate; Ctrl+Alt+F1 fronts the greeter and F3 u2's session; terminating u2's session closes
+its PAM session and the daemon fronts the greeter.

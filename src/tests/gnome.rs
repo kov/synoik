@@ -41913,6 +41913,65 @@ fn the_greeter_is_gdm_mode() {
     assert!(!sections.message_list && !sections.displays);
 }
 
+/// Coming back to the greeter with a user's prompt left up starts over
+/// (`loginDialog.js:1177-1202`): the conversation is cancelled and the grid is back, as GNOME
+/// resets its auth prompt.
+#[test]
+fn the_greeter_starts_over_when_it_comes_back() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
+    use crate::dbus::gdm::VerifierRequest;
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user]));
+
+    // Left on the grid, coming back changes nothing.
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionActive(true));
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f.gdm_requests().is_empty());
+
+    tap(&mut f, KEY_ENTER);
+    assert!(f.synoik().login_page.is_asking_a_user());
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionActive(false));
+    assert!(f.synoik().login_page.is_asking_a_user(), "leaving keeps it");
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionActive(true));
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Cancel)));
+}
+
+/// "Switch User…" locks the session before going to the login screen (`activateSwitchUser`,
+/// `systemActions.js:467-478`), so what the greeter leaves behind is a locked session.
+#[test]
+fn switch_user_locks_the_session_first() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    assert!(!f.synoik().screen_shield.is_active());
+    f.synoik_state().activate_switch_user();
+    assert!(f.synoik().screen_shield.is_active());
+    assert!(f.synoik().shield_is_up());
+}
+
 /// The greeter's Power Off asks its gnome-session, as gnome-shell's does
 /// (`systemActions.js:491-496`): no confirmation comes up until gnome-session's `Open` does.
 #[test]

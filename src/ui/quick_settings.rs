@@ -554,6 +554,9 @@ pub struct PowerPolicy {
     pub disable_restart_buttons: bool,
     /// `org.gnome.desktop.screensaver restart-enabled`.
     pub restart_enabled: bool,
+    /// `_updateSwitchUser`'s inputs but the mode (`systemActions.js:428-438`): switching is not
+    /// locked down, there is a seat to switch on, and more than one user.
+    pub switch_user: bool,
 }
 
 /// The power card's machine-power rows, top to bottom.
@@ -562,6 +565,8 @@ pub(crate) struct PowerActions {
     pub suspend: bool,
     pub restart: bool,
     pub power_off: bool,
+    /// "Switch User…", past Log Out in the session group.
+    pub switch_user: bool,
 }
 
 impl PowerActions {
@@ -949,7 +954,6 @@ impl DetailOwner {
             // ones that go through a confirmation dialog; Suspend acts immediately. All four are
             // methods on `org.gnome.SessionManager`, as in gnome-shell — the first three come back
             // to us as EndSessionDialog.Open, Suspend is forwarded to logind and never does.
-            // Switch User is deferred (needs a greeter jump).
             DetailOwner::Power => {
                 let mut rows = Vec::new();
                 if power_actions.suspend {
@@ -962,6 +966,21 @@ impl DetailOwner {
                     rows.push(session_row("Power Off…", SessionRequest::PowerOff, false));
                 }
                 rows.push(session_row("Log Out…", SessionRequest::Logout, true));
+                if power_actions.switch_user {
+                    rows.push(
+                        ItemRow {
+                            label: "Switch User…".to_string(),
+                            icons: Vec::new(),
+                            badge: None,
+                            action: PopoverAction::SwitchUser,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into(),
+                    );
+                }
                 rows
             }
             // gnome-shell's power-profile list: one row per KNOWN profile (already reversed to
@@ -1146,18 +1165,9 @@ impl DetailOwner {
     }
 
     /// The card's logical height: top pad + header + gap + rows + separators + bottom pad.
+    #[cfg(test)]
     fn detail_height(self, device_count: usize, mode: &SessionMode) -> f64 {
-        let shape = self.row_shape(device_count, mode);
-        let rows = shape.len() as f64;
-        let seps = shape.iter().filter(|s| s.separator_before).count() as f64;
-        let row_h: f64 = shape.iter().map(|s| s.kind.height()).sum();
-        DETAIL_PAD
-            + DETAIL_HEADER_H
-            + DETAIL_HEADER_GAP
-            + row_h
-            + (rows - 1.).max(0.) * DETAIL_ROW_GAP
-            + seps * DETAIL_SEP_EXTRA
-            + DETAIL_PAD
+        detail_height_of(&self.row_shape(device_count, mode))
     }
 
     /// The natural (pre-shift) y of the bottom edge of the owner's row — where the detail card is
@@ -1238,6 +1248,8 @@ struct Layout {
     monitor_count: usize,
     /// How many machine-power rows the power card has ([`PowerActions::count`]).
     power_rows: usize,
+    /// Whether the power card ends in "Switch User…" ([`PowerActions::switch_user`]).
+    power_switch_user: bool,
     /// Which network tiles lead the grid. Every later tile's index is offset by their count.
     net: NetTiles,
     /// The row counts of the three network cards, in the order wired, wifi, vpn — what sizes each
@@ -1275,6 +1287,16 @@ impl Layout {
         }
     }
 
+    /// `owner`'s row shape in this layout: [`DetailOwner::row_shape`] from the live count, plus the
+    /// power card's "Switch User…" after Log Out when it shows.
+    fn row_shape(self, owner: DetailOwner) -> Vec<RowSpec> {
+        let mut shape = owner.row_shape(self.owner_device_count(owner), self.mode);
+        if owner == DetailOwner::Power && self.power_switch_user {
+            shape.push(RowSpec::item(false));
+        }
+        shape
+    }
+
     /// The live device count feeding an owner's detail card (never frozen — the card always sizes
     /// to the real rows). Fixed owners return 0 (ignored by their `row_shape`).
     fn owner_device_count(self, owner: DetailOwner) -> usize {
@@ -1299,7 +1321,7 @@ impl Layout {
     /// the container height gnome-shell eases (`QuickSettingsMenu.open`, `quickSettings.js:459`).
     fn detail_block(self) -> Option<(f64, f64)> {
         let owner = self.expanded?;
-        let full = DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner), self.mode);
+        let full = DETAIL_MARGIN + detail_height_of(&self.row_shape(owner));
         Some((owner.anchor_row_bottom(self), full * self.block_scale))
     }
 
@@ -2071,6 +2093,8 @@ impl QuickSettings {
             suspend: !greeter_off,
             restart: !greeter_off && !locked_off,
             power_off: !greeter_off && !locked_off,
+            switch_user: self.power_policy.switch_user
+                && !(self.mode.is_locked || self.mode.is_greeter),
         }
     }
 
@@ -2172,6 +2196,7 @@ impl QuickSettings {
             bt_device_count: self.bluetooth.visible_devices().len(),
             monitor_count: self.monitor_count(),
             power_rows: self.power_actions().count(),
+            power_switch_user: self.power_actions().switch_user,
             net: NetTiles::from_state(&self.net),
             net_rows: [
                 net_card_rows(&self.net, DetailOwner::Wired),
@@ -2206,7 +2231,7 @@ impl QuickSettings {
         let layout = self.layout();
         self.expand
             .advance(self.expanded, clock, params, dim_params, |owner| {
-                DETAIL_MARGIN + owner.detail_height(layout.owner_device_count(owner), layout.mode)
+                DETAIL_MARGIN + detail_height_of(&layout.row_shape(owner))
             })
     }
 
@@ -3621,7 +3646,7 @@ impl QuickSettings {
             // (count + separator positions) so the geometry can't drift from what's drawn.
             debug_assert_eq!(
                 rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
-                owner.row_shape(self.layout().owner_device_count(owner), self.mode),
+                self.layout().row_shape(owner),
                 "rows() must match row_shape() for correct card sizing"
             );
             let row_runs = rows
@@ -3714,7 +3739,7 @@ impl QuickSettings {
 
             // The group-separator rules (`.popup-separator-menu-item`): one 1px rule per row
             // that opens a new group (the shutdown menu's machine-power vs session split).
-            let sep_shape = owner.row_shape(layout.owner_device_count(owner), layout.mode);
+            let sep_shape = layout.row_shape(owner);
             for (k, row_run) in row_runs.iter().enumerate() {
                 // Card-local, like `card`: the row rects come out in menu coordinates.
                 let Some(mut rrect) = detail_row_rect(k, layout) else {
@@ -4304,7 +4329,7 @@ fn tile_body_rect(i: usize, tile: GridTile, layout: Layout) -> Rectangle<f64, Lo
 fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let (insert_y, block_h) = layout.detail_block()?;
-    let card_h = owner.detail_height(layout.owner_device_count(owner), layout.mode);
+    let card_h = detail_height_of(&layout.row_shape(owner));
     // The card's *bottom* rides the bottom of the gap, so it slides down out of the owner's row as
     // the gap opens rather than being revealed in place: at `block_scale == 1` this is the settled
     // `insert_y + DETAIL_MARGIN`, and below that the card sits higher, with everything above
@@ -4334,6 +4359,20 @@ fn detail_clip(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     ))
 }
 
+/// A detail card's logical height for row `shape`.
+fn detail_height_of(shape: &[RowSpec]) -> f64 {
+    let rows = shape.len() as f64;
+    let seps = shape.iter().filter(|s| s.separator_before).count() as f64;
+    let row_h: f64 = shape.iter().map(|s| s.kind.height()).sum();
+    DETAIL_PAD
+        + DETAIL_HEADER_H
+        + DETAIL_HEADER_GAP
+        + row_h
+        + (rows - 1.).max(0.) * DETAIL_ROW_GAP
+        + seps * DETAIL_SEP_EXTRA
+        + DETAIL_PAD
+}
+
 /// The rectangle of detail row `k` (0-based, top to bottom), accounting for the header, inter-row
 /// gaps, and any group separators above earlier rows. `None` if there's no open detail / no row
 /// `k`. Placed from the pure `row_shape` (the same shape `detail_height` sizes the card from), so
@@ -4342,7 +4381,7 @@ fn detail_clip(layout: Layout) -> Option<Rectangle<f64, Logical>> {
 fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let card = detail_rect(layout)?;
-    let shape = owner.row_shape(layout.owner_device_count(owner), layout.mode);
+    let shape = layout.row_shape(owner);
     if k >= shape.len() {
         return None;
     }
@@ -4508,6 +4547,7 @@ run it with --features reference-env, as the fedora CI job does"
             bt_device_count: 0,
             monitor_count: 0,
             power_rows: 3,
+            power_switch_user: false,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6117,6 +6157,7 @@ run it with --features reference-env, as the fedora CI job does"
             bt_device_count: 0,
             monitor_count: 0,
             power_rows: 3,
+            power_switch_user: false,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6143,6 +6184,7 @@ run it with --features reference-env, as the fedora CI job does"
             bt_device_count: 0,
             monitor_count: 0,
             power_rows: 3,
+            power_switch_user: false,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6256,6 +6298,7 @@ run it with --features reference-env, as the fedora CI job does"
                     bt_device_count: 0,
                     monitor_count: 0,
                     power_rows: 3,
+                    power_switch_user: false,
                     net: NetTiles {
                         wired: false,
                         wifi: true,
@@ -6671,6 +6714,7 @@ run it with --features reference-env, as the fedora CI job does"
             bt_device_count: 0,
             monitor_count: 0,
             power_rows: 3,
+            power_switch_user: false,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -6697,6 +6741,7 @@ run it with --features reference-env, as the fedora CI job does"
             bt_device_count: 0,
             monitor_count: 0,
             power_rows: 3,
+            power_switch_user: false,
             net: NetTiles {
                 wired: false,
                 wifi: true,
@@ -7489,6 +7534,56 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
+    /// "Switch User…" follows Log Out in a user's session when switching is allowed
+    /// (`system.js:199-208`, `systemActions.js:428-438`), never on the lock screen or the greeter;
+    /// the card is sized for it.
+    #[test]
+    fn switch_user_ends_the_power_card() {
+        use crate::session_mode::{GDM, UNLOCK_DIALOG, USER};
+
+        let mut q = qs(None);
+        q.set_power_policy(PowerPolicy {
+            restart_enabled: true,
+            switch_user: true,
+            ..Default::default()
+        });
+        q.set_session_mode(&USER);
+        let rows = q.detail_rows(DetailOwner::Power);
+        assert!(matches!(
+            rows.last(),
+            Some(DetailRow::Item(row)) if row.action == PopoverAction::SwitchUser
+        ));
+        assert_eq!(
+            rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
+            q.layout().row_shape(DetailOwner::Power)
+        );
+        for mode in [&UNLOCK_DIALOG, &GDM] {
+            q.set_session_mode(mode);
+            let rows = q.detail_rows(DetailOwner::Power);
+            assert!(
+                !rows.iter().any(
+                    |r| matches!(r, DetailRow::Item(row) if row.action == PopoverAction::SwitchUser)
+                ),
+                "{}",
+                mode.name
+            );
+            assert_eq!(
+                rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
+                q.layout().row_shape(DetailOwner::Power)
+            );
+        }
+
+        q.set_session_mode(&USER);
+        q.set_power_policy(PowerPolicy {
+            restart_enabled: true,
+            ..Default::default()
+        });
+        assert!(!q
+            .detail_rows(DetailOwner::Power)
+            .iter()
+            .any(|r| matches!(r, DetailRow::Item(row) if row.action == PopoverAction::SwitchUser)));
+    }
+
     /// `systemActions.js:371-420`: `disable-restart-buttons` empties the greeter's power card, so
     /// its button goes; a locked screen without `restart-enabled` (the default) keeps only
     /// Suspend. Neither key touches a user's session. The card is sized from the same count.
@@ -7512,6 +7607,7 @@ run it with --features reference-env, as the fedora CI job does"
         let strict = PowerPolicy {
             disable_restart_buttons: true,
             restart_enabled: false,
+            switch_user: false,
         };
 
         let mut q = qs(None);

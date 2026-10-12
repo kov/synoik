@@ -219,6 +219,8 @@ pub enum PopoverAction {
     /// (`systemActions.js:483-501`) — rather than running the `gnome-session-quit` helper, which
     /// is what we used to do: a whole GTK process start on the logout path.
     SessionRequest(crate::end_session::SessionRequest),
+    /// The power menu's "Switch User…" (`activateSwitchUser`, `systemActions.js:467-478`).
+    SwitchUser,
     /// Close this notification, reason Dismissed (a message-list card's close
     /// button). The popover stays open.
     CloseNotification(u32),
@@ -362,6 +364,7 @@ impl PopoverAction {
                 | PopoverAction::ActivateApp(_)
                 | PopoverAction::LaunchSettingsPanel { .. }
                 | PopoverAction::SessionRequest(_)
+                | PopoverAction::SwitchUser
                 | PopoverAction::ActivateNotification { .. }
                 | PopoverAction::InvokeNotificationAction { .. }
                 // Picking a layout closes the popup, like gnome-shell's popup menu.

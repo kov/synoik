@@ -10,7 +10,8 @@
 //!
 //! 1. find our own session's **seat**;
 //! 2. look for a greeter already on that seat — a session whose `Class` is `greeter`, whose `State`
-//!    is not `closing`, and whose `Service` is `gdm-launch-environment` — and if one is there,
+//!    is not `closing`, and whose `Service` is `gdm-launch-environment` (or `synoik-greeter`, our
+//!    own login daemon's, which keeps one open for the machine's lifetime) — and if one is there,
 //!    `ActivateSessionOnSeat` it;
 //! 3. otherwise, and **only on `seat0`**, ask GDM's `LocalDisplayFactory` for a
 //!    `CreateTransientDisplay`.
@@ -39,8 +40,9 @@ const GDM_FACTORY_PATH: &str = "/org/gnome/DisplayManager/LocalDisplayFactory";
 const GDM_FACTORY: &str = "org.gnome.DisplayManager.LocalDisplayFactory";
 
 /// The greeter's `Service`, which is what distinguishes GDM's login screen from any other session
-/// that calls itself a greeter (`gdm-user-switching.c:151-157`).
-const GREETER_SERVICE: &str = "gdm-launch-environment";
+/// that calls itself a greeter (`gdm-user-switching.c:151-157`): GDM's, and synoik-login's
+/// (greeter.md §5).
+const GREETER_SERVICES: [&str; 2] = ["gdm-launch-environment", "synoik-greeter"];
 /// The seat GDM is willing to create a transient display on (`:230`).
 const SEAT0: &str = "seat0";
 
@@ -111,7 +113,8 @@ async fn find_greeter(conn: &zbus::Connection, seat: &str) -> Option<OwnedObject
         if session.get_property::<String>("State").await.as_deref() == Ok("closing") {
             continue;
         }
-        if session.get_property::<String>("Service").await.as_deref() == Ok(GREETER_SERVICE) {
+        let service = session.get_property::<String>("Service").await;
+        if service.is_ok_and(|s| GREETER_SERVICES.contains(&s.as_str())) {
             return Some(path);
         }
     }
