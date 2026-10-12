@@ -536,6 +536,9 @@ pub struct Synoik {
 
     // When false, we're idling with monitors powered off.
     pub monitors_active: bool,
+    /// `monitors_active` as DisplayConfig's `PowerSaveMode`, shared with the D-Bus thread;
+    /// `UNSUPPORTED` on a backend that cannot power monitors down.
+    pub power_save_mode: Arc<std::sync::atomic::AtomicI32>,
 
     /// Whether the laptop lid is closed.
     ///
@@ -4622,6 +4625,17 @@ impl State {
         });
 
         self.reload_output_config();
+    }
+
+    /// A `PowerSaveMode` write (gsd-power's blank and unblank): `ON` powers the monitors up, and
+    /// `STANDBY`, `SUSPEND` and `OFF` all power them down, as the native monitor manager does
+    /// (`meta-monitor-manager-native.c:103-127`).
+    pub fn set_power_save_mode(&mut self, mode: i32) {
+        match mode {
+            0 => self.synoik.activate_monitors(&mut self.backend),
+            1..=3 => self.synoik.deactivate_monitors(&mut self.backend),
+            other => warn!("ignoring unknown PowerSaveMode {other}"),
+        }
     }
 
     /// Applies a display configuration coming from `org.gnome.Mutter.DisplayConfig`
@@ -8753,6 +8767,13 @@ impl Synoik {
             blocker_cleared_tx,
             blocker_cleared_rx,
             monitors_active: true,
+            power_save_mode: Arc::new(std::sync::atomic::AtomicI32::new(
+                if backend.supports_power_save() {
+                    crate::dbus::mutter_display_config::power_save::ON
+                } else {
+                    crate::dbus::mutter_display_config::power_save::UNSUPPORTED
+                },
+            )),
             is_lid_closed: false,
 
             devices: HashSet::new(),
@@ -9816,6 +9837,57 @@ impl Synoik {
 
         self.monitors_active = false;
         backend.set_monitors_active(false);
+        self.publish_power_save_mode();
+    }
+
+    /// Publish `monitors_active` as DisplayConfig's `PowerSaveMode`, with its change signal, as
+    /// mutter's `meta_monitor_manager_power_save_mode_changed` does.
+    pub fn publish_power_save_mode(&self) {
+        use std::sync::atomic::Ordering;
+
+        use crate::dbus::mutter_display_config::{power_save, DisplayConfig};
+
+        let mode = if self.monitors_active {
+            power_save::ON
+        } else {
+            power_save::OFF
+        };
+        let previous = self.power_save_mode.load(Ordering::Relaxed);
+        if previous == power_save::UNSUPPORTED || previous == mode {
+            return;
+        }
+        self.power_save_mode.store(mode, Ordering::Relaxed);
+
+        let Some(conn) = self
+            .dbus
+            .as_ref()
+            .and_then(|d| d.conn_display_config.clone())
+        else {
+            return;
+        };
+        let res = thread::Builder::new()
+            .name("DisplayConfig PowerSaveMode Emitter".to_owned())
+            .spawn(move || {
+                let iface = match conn
+                    .object_server()
+                    .interface::<_, DisplayConfig>("/org/gnome/Mutter/DisplayConfig")
+                {
+                    Ok(iface) => iface,
+                    Err(err) => {
+                        warn!("error getting DisplayConfig interface: {err:?}");
+                        return;
+                    }
+                };
+                async_io::block_on(async move {
+                    let emitter = iface.signal_emitter();
+                    if let Err(err) = iface.get().power_save_mode_changed(emitter).await {
+                        warn!("error emitting PowerSaveMode change: {err:?}");
+                    }
+                });
+            });
+        if let Err(err) = res {
+            warn!("error spawning a thread to send PowerSaveMode: {err:?}");
+        }
     }
 
     pub fn activate_monitors(&mut self, backend: &mut Backend) {
@@ -9825,6 +9897,7 @@ impl Synoik {
 
         self.monitors_active = true;
         backend.set_monitors_active(true);
+        self.publish_power_save_mode();
 
         self.queue_redraw_all();
     }

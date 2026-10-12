@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,23 @@ use crate::utils::scale::supported_scales;
 use crate::utils::{is_laptop_panel, make_display_name};
 
 pub struct DisplayConfig {
-    to_niri: calloop::channel::Sender<AppliedConfig>,
+    to_niri: calloop::channel::Sender<DisplayConfigToSynoik>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    power_save_mode: Arc<AtomicI32>,
+}
+
+/// `MetaPowerSave` (`meta-monitor-manager.h`): what `PowerSaveMode` carries.
+pub mod power_save {
+    pub const UNSUPPORTED: i32 = -1;
+    pub const ON: i32 = 0;
+    pub const OFF: i32 = 3;
+}
+
+pub enum DisplayConfigToSynoik {
+    Apply(AppliedConfig),
+    /// A `PowerSaveMode` write — gsd-power blanking the screens (`OFF`, or `STANDBY`/`SUSPEND`,
+    /// which mutter treats the same) or waking them (`ON`).
+    SetPowerSaveMode(i32),
 }
 
 /// One `ApplyMonitorsConfig` on its way to the compositor.
@@ -295,10 +311,13 @@ impl DisplayConfig {
             // 0 means "verify", so don't actually apply here
             return Ok(());
         }
-        if let Err(err) = self.to_niri.send(AppliedConfig {
-            outputs: new_conf,
-            primary,
-        }) {
+        if let Err(err) = self
+            .to_niri
+            .send(DisplayConfigToSynoik::Apply(AppliedConfig {
+                outputs: new_conf,
+                primary,
+            }))
+        {
             warn!("error sending message to synoik: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
@@ -317,14 +336,28 @@ impl DisplayConfig {
     #[zbus(signal)]
     pub async fn monitors_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 
+    /// The monitors' power state, published by the compositor (`Synoik::publish_power_save_mode`).
     #[zbus(property)]
     fn power_save_mode(&self) -> i32 {
-        -1
+        self.power_save_mode.load(Ordering::Relaxed)
     }
 
+    /// As `power_save_mode_changed` (`meta-monitor-manager.c:313-340`): a write is applied by the
+    /// compositor, which then publishes the new state. Where it cannot power monitors down the
+    /// property stays `UNSUPPORTED`, as mutter forces it back, and the write is not an error.
     #[zbus(property)]
-    fn set_power_save_mode(&self, _mode: i32) -> zbus::Result<()> {
-        Err(zbus::Error::Unsupported)
+    fn set_power_save_mode(&self, mode: i32) {
+        if mode == power_save::UNSUPPORTED
+            || self.power_save_mode.load(Ordering::Relaxed) == power_save::UNSUPPORTED
+        {
+            return;
+        }
+        if let Err(err) = self
+            .to_niri
+            .send(DisplayConfigToSynoik::SetPowerSaveMode(mode))
+        {
+            warn!("error sending message to synoik: {err:?}");
+        }
     }
 
     #[zbus(property)]
@@ -345,12 +378,14 @@ impl DisplayConfig {
 
 impl DisplayConfig {
     pub fn new(
-        to_niri: calloop::channel::Sender<AppliedConfig>,
+        to_niri: calloop::channel::Sender<DisplayConfigToSynoik>,
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+        power_save_mode: Arc<AtomicI32>,
     ) -> Self {
         Self {
             to_niri,
             ipc_outputs,
+            power_save_mode,
         }
     }
 }

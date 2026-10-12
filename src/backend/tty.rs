@@ -775,6 +775,7 @@ impl Tty {
                 synoik.notify_activity();
                 synoik.monitors_active = true;
                 self.set_monitors_active(true);
+                synoik.publish_power_save_mode();
                 synoik.queue_redraw_all();
             }
         }

@@ -61,7 +61,7 @@ use self::gnome_shell::GnomeShell;
 use self::gnome_shell_brightness::Brightness;
 use self::gnome_shell_introspect::Introspect;
 use self::gtk_notifications::GtkNotifications;
-use self::mutter_display_config::DisplayConfig;
+use self::mutter_display_config::{DisplayConfig, DisplayConfigToSynoik};
 use self::mutter_idle_monitor::IdleMonitor;
 use self::mutter_service_channel::ServiceChannel;
 use self::status_notifier::StatusNotifierWatcher;
@@ -152,12 +152,19 @@ impl DBusServers {
 
         if is_session_instance || config.debug.dbus_interfaces_in_non_session_instances {
             let (to_niri, from_display_config) = calloop::channel::channel();
-            let display_config = DisplayConfig::new(to_niri, backend.ipc_outputs());
+            let display_config = DisplayConfig::new(
+                to_niri,
+                backend.ipc_outputs(),
+                synoik.power_save_mode.clone(),
+            );
             synoik
                 .event_loop
                 .insert_source(from_display_config, move |event, _, state| match event {
-                    calloop::channel::Event::Msg(applied) => {
+                    calloop::channel::Event::Msg(DisplayConfigToSynoik::Apply(applied)) => {
                         state.apply_display_config(applied);
+                    }
+                    calloop::channel::Event::Msg(DisplayConfigToSynoik::SetPowerSaveMode(mode)) => {
+                        state.set_power_save_mode(mode)
                     }
                     calloop::channel::Event::Closed => (),
                 })

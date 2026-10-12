@@ -187,6 +187,12 @@ impl Backend {
         }
     }
 
+    /// Whether [`Self::set_monitors_active`] does anything: only the TTY backend owns the
+    /// connectors. A nested session's outer would have to blank them; headless has none.
+    pub fn supports_power_save(&self) -> bool {
+        matches!(self, Backend::Tty(_))
+    }
+
     pub fn set_monitors_active(&mut self, active: bool) {
         match self {
             Backend::Tty(tty) => tty.set_monitors_active(active),

@@ -14913,6 +14913,49 @@ fn idle_monitor_input_activity_resets_idle_time() {
 ///
 /// The clock is pinned through the `ResetIdletime` handler so the deadlines are deterministic —
 /// `refresh` is then called directly rather than waiting on the real-time calloop timer.
+/// gsd-power blanks and unblanks through DisplayConfig's `PowerSaveMode`, and reads back what the
+/// monitors are doing (`meta-monitor-manager.c:283-340`). Headless cannot power monitors down, so
+/// it starts `UNSUPPORTED`; the test plays a backend that can.
+#[test]
+fn power_save_mode_blanks_and_wakes_the_monitors() {
+    use std::sync::atomic::Ordering;
+
+    use crate::dbus::mutter_display_config::power_save;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    assert_eq!(
+        f.synoik().power_save_mode.load(Ordering::Relaxed),
+        power_save::UNSUPPORTED
+    );
+    f.synoik()
+        .power_save_mode
+        .store(power_save::ON, Ordering::Relaxed);
+
+    f.synoik_state().set_power_save_mode(power_save::OFF);
+    assert!(!f.synoik().monitors_active);
+    assert_eq!(
+        f.synoik().power_save_mode.load(Ordering::Relaxed),
+        power_save::OFF
+    );
+
+    f.synoik_state().set_power_save_mode(power_save::ON);
+    assert!(f.synoik().monitors_active);
+    assert_eq!(
+        f.synoik().power_save_mode.load(Ordering::Relaxed),
+        power_save::ON
+    );
+
+    // Our own wake (input, an unlock) is published too, so gsd-power sees the screen come back.
+    f.synoik_state().set_power_save_mode(2);
+    let state = f.synoik_state();
+    state.synoik.activate_monitors(&mut state.backend);
+    assert_eq!(
+        f.synoik().power_save_mode.load(Ordering::Relaxed),
+        power_save::ON
+    );
+}
+
 #[test]
 fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
     use crate::dbus::mutter_idle_monitor::IdleMonitorToSynoik;
