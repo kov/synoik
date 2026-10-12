@@ -14,6 +14,9 @@ pub const CONFIG_PATH: &str = "/etc/synoik/login.conf";
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub autologin: Option<String>,
+    /// `[debug] TestUsers`: who root may log in without credentials (`synoik-login
+    /// open-session`), for a test seat beside the administrator's own. Ours, not GDM's.
+    pub test_users: Vec<String>,
 }
 
 impl Config {
@@ -28,6 +31,7 @@ impl Config {
         let mut group = String::new();
         let mut enabled = false;
         let mut user = None;
+        let mut test_users = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -40,17 +44,24 @@ impl Config {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if group != "daemon" {
-                continue;
-            }
-            match key.trim() {
-                "AutomaticLoginEnable" => enabled = is_true(value.trim()),
-                "AutomaticLogin" => user = Some(value.trim().to_owned()).filter(|u| !u.is_empty()),
+            match (group.as_str(), key.trim()) {
+                ("daemon", "AutomaticLoginEnable") => enabled = is_true(value.trim()),
+                ("daemon", "AutomaticLogin") => {
+                    user = Some(value.trim().to_owned()).filter(|u| !u.is_empty());
+                }
+                ("debug", "TestUsers") => {
+                    test_users = value
+                        .split([',', ' '])
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 _ => (),
             }
         }
         Self {
             autologin: user.filter(|_| enabled),
+            test_users,
         }
     }
 }
@@ -154,6 +165,15 @@ mod tests {
 
         let unnamed = "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=\n";
         assert_eq!(Config::parse(unnamed).autologin, None);
+    }
+
+    #[test]
+    fn test_users_come_from_debug_only() {
+        let listed = "[debug]\nTestUsers=gsrs, u2\n";
+        assert_eq!(Config::parse(listed).test_users, ["gsrs", "u2"]);
+
+        let elsewhere = "[daemon]\nTestUsers=gsrs\n";
+        assert!(Config::parse(elsewhere).test_users.is_empty());
     }
 
     #[test]

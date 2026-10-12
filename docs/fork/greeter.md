@@ -213,6 +213,16 @@ activate it (§5), so there is never a greeter to spawn on the interactive path.
 (no prompts) for that user and opens the session as in §2.4, then starts the greeter behind it.
 Once per boot: after that user logs out, the greeter is what comes up.
 
+**Test sessions** (ours, not GDM's): root may log in a user listed in `[debug] TestUsers` of
+`/etc/synoik/login.conf` with `synoik-login open-session USER [--background]`, which calls
+`org.synoik.Login.OpenSession` on the daemon's name (root only, by bus policy and by the method's
+own check; one seat0 session per user). It is autologin on demand: the `synoik-autologin`
+conversation, the session as in §2.4, `gnome-session` and all. `--background` leaves it behind the
+active session — on a seat with VTs by not switching to its VT, so it is never fronted; on one
+without by giving the seat straight back, since logind fronts a new session there on its own
+(measured: for about 220 ms). Which binary the session runs is the user's own business, a drop-in on their
+`synoik.service` (`ExecStart=`), so the daemon never execs a path a caller names.
+
 ---
 
 ## 3. PAM stacks

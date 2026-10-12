@@ -92,6 +92,7 @@ pub fn run() -> anyhow::Result<()> {
             service: "synoik-autologin".into(),
             user,
             class: "user".into(),
+            background: false,
             program: USER_SESSION_PROGRAM.map(Into::into).to_vec(),
         };
         daemon.spawn(Kind::User, request)?;
@@ -166,11 +167,58 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Open a session for `user` without credentials, as autologin does, for root's
+/// `synoik-login open-session` (`[debug] TestUsers`, `config.rs`). Called off the main loop; the
+/// session is handed to it like one the greeter started. A `background` session is left behind
+/// the active one: on a seat with VTs by not switching to its VT, on one without by giving the
+/// seat back, since logind makes a new session active there on its own.
+pub fn open_test_session(user: &str, background: bool) -> anyhow::Result<String> {
+    let previous = read_seat_active();
+    let request = Request {
+        service: "synoik-autologin".into(),
+        user: user.to_owned(),
+        class: "user".into(),
+        background,
+        program: USER_SESSION_PROGRAM.map(Into::into).to_vec(),
+    };
+    let (read, write) = pipe()?;
+    let args = request.to_args();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let pid = spawn_worker(&args, write.as_raw_fd())?;
+    drop(write);
+    eprintln!("synoik-login: worker {pid}: test session for {user}");
+
+    let mut pfd = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    if unsafe { libc::poll(&mut pfd, 1, 15_000) } <= 0 {
+        anyhow::bail!("worker {pid} did not report a session");
+    }
+    let Ok(Some(Frame::Opened(id))) = Frame::read_from(&mut std::fs::File::from(read)) else {
+        anyhow::bail!("worker {pid} opened no session (see its log)");
+    };
+    adopt(pid, &id);
+
+    if background {
+        if let Some(previous) = previous.filter(|p| *p != id) {
+            if read_seat_active().as_deref() == Some(id.as_str()) {
+                activate_session(&previous)
+                    .with_context(|| format!("giving seat0 back to session {previous}"))?;
+            }
+        }
+    }
+    Ok(id)
+}
+
 fn greeter_request() -> Request {
     Request {
         service: "synoik-greeter".into(),
         user: GREETER_USER.into(),
         class: "greeter".into(),
+        background: false,
         // Under gnome-session, as GDM's greeter (`data/gnome-greeter.desktop.in`): the session's
         // targets bring up synoik (`resources/synoik-greeter.service`), IBus and the settings
         // daemons.

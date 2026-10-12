@@ -20,6 +20,8 @@
 #
 # Autologin: /etc/synoik/login.conf, GDM's keys ([daemon] AutomaticLoginEnable,
 # AutomaticLogin). It is created with autologin off and never overwritten.
+# [debug] TestUsers there lets root log those users in on demand: synoik-login open-session
+# (docs/fork/greeter.md §2.6).
 #
 # Env knobs:
 #   PROFILE=release   which build to install (default: release)

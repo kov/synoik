@@ -12,4 +12,5 @@ description = "The synoik login daemon: runs PAM and opens the greeter's and use
 anyhow.workspace = true
 serde.workspace = true
 libc = "0.2.185"
+blocking = "1.7.0"
 zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "async-io", "p2p"] }

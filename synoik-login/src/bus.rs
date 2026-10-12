@@ -15,12 +15,53 @@ use crate::channel::{self, Kind, Target};
 const NAME: &str = "org.gnome.DisplayManager";
 const PATH: &str = "/org/gnome/DisplayManager/Manager";
 
+/// Our own interface beside GDM's, for root (`synoik-login open-session`).
+pub const LOGIN_PATH: &str = "/org/synoik/Login";
+pub const LOGIN_INTERFACE: &str = "org.synoik.Login";
+
 /// Own the name and serve the manager. The returned connection must be kept alive.
 pub fn serve() -> anyhow::Result<zbus::blocking::Connection> {
     Ok(zbus::blocking::connection::Builder::system()?
         .name(NAME)?
         .serve_at(PATH, Manager)?
+        .serve_at(LOGIN_PATH, Login)?
         .build()?)
+}
+
+struct Login;
+
+#[zbus::interface(name = "org.synoik.Login")]
+impl Login {
+    /// Log `user` in without credentials and return the logind session id: a test seat beside
+    /// the administrator's (`docs/fork/greeter.md` §2.6). Root only, and only for the users
+    /// `[debug] TestUsers` lists, re-read on every call; one session per user on seat0.
+    async fn open_session(
+        &self,
+        user: String,
+        background: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<String> {
+        let (uid, _) = caller(&header, connection).await?;
+        if uid != 0 {
+            return Err(fdo::Error::AccessDenied("only root opens sessions".into()));
+        }
+        if !crate::config::Config::load().test_users.contains(&user) {
+            return Err(fdo::Error::AccessDenied(format!(
+                "{user} is not in [debug] TestUsers of {}",
+                crate::config::CONFIG_PATH
+            )));
+        }
+        if let Ok(id) = seat0_session_of(connection, &user).await {
+            return Err(fdo::Error::Failed(format!(
+                "{user} already has session {id} on seat0"
+            )));
+        }
+        // Blocking: it waits for the worker to open the session.
+        blocking::unblock(move || crate::daemon::open_test_session(&user, background))
+            .await
+            .map_err(|err| fdo::Error::Failed(format!("{err:#}")))
+    }
 }
 
 struct Manager;

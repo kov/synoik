@@ -52,32 +52,44 @@ pub struct Request {
     pub service: String,
     pub user: String,
     pub class: String,
+    /// Open the session without switching to its VT, so it stays behind the active one.
+    pub background: bool,
     pub program: Vec<String>,
 }
 
 impl Request {
     pub fn parse(args: &[String]) -> anyhow::Result<Self> {
+        let (background, args) = match args {
+            [flag, rest @ ..] if flag == "--background" => (true, rest),
+            _ => (false, args),
+        };
         match args {
             [service, user, class, sep, program @ ..] if sep == "--" && !program.is_empty() => {
                 Ok(Self {
                     service: service.clone(),
                     user: user.clone(),
                     class: class.clone(),
+                    background,
                     program: program.to_vec(),
                 })
             }
-            _ => bail!("usage: synoik-login session SERVICE USER CLASS -- PROGRAM [ARG...]"),
+            _ => bail!(
+                "usage: synoik-login session [--background] SERVICE USER CLASS -- PROGRAM [ARG...]"
+            ),
         }
     }
 
     pub fn to_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "session".to_owned(),
+        let mut args = vec!["session".to_owned()];
+        if self.background {
+            args.push("--background".to_owned());
+        }
+        args.extend([
             self.service.clone(),
             self.user.clone(),
             self.class.clone(),
             "--".to_owned(),
-        ];
+        ]);
         args.extend(self.program.iter().cloned());
         args
     }
@@ -158,7 +170,8 @@ pub fn run(request: &Request) -> anyhow::Result<i32> {
     let _ = Frame::Opened(id.clone()).write_to(&mut status);
     drop(status);
 
-    parent_session(pam, &account, &request.program, &id, vt)
+    let front = !request.background;
+    parent_session(pam, &account, &request.program, &id, vt, front)
 }
 
 /// Everything pam_systemd reads, put in before the session opens (greeter.md §2.4).
@@ -184,13 +197,15 @@ pub fn establish_credentials(pam: &mut Pam, account: &Account) -> anyhow::Result
 }
 
 /// Start `program` in the open session `id` and stay its parent until it ends; then close the
-/// session. Returns the program's exit status. A session on a VT is switched to as it starts.
+/// session. Returns the program's exit status. A session on a VT is switched to as it starts,
+/// unless it is not to be `front`ed.
 pub fn parent_session(
     mut pam: Pam,
     account: &Account,
     program: &[String],
     id: &str,
     vt: Option<Vt>,
+    front: bool,
 ) -> anyhow::Result<i32> {
     let env = session_environment(&pam, account)?;
     let argv: Vec<CString> = program
@@ -199,7 +214,7 @@ pub fn parent_session(
         .collect::<Result<_, _>>()?;
     let home = CString::new(account.home.as_str())?;
 
-    if let Some(vt) = &vt {
+    if let Some(vt) = vt.as_ref().filter(|_| front) {
         vt.activate();
     }
     // SAFETY: this process is single-threaded, so the child may run ordinary code before exec.

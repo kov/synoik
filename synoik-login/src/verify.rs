@@ -185,7 +185,7 @@ pub fn run_login(service: &str, user: &str, program: &[String]) -> anyhow::Resul
     // rather than drop it: PAM's conversation still holds a clone.
     let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(report);
-    worker::parent_session(pam, &account, program, &id, vt)
+    worker::parent_session(pam, &account, program, &id, vt, true)
 }
 
 /// What a failed `pam_authenticate` tells the client, worded as GDM words it
