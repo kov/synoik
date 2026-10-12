@@ -6032,8 +6032,13 @@ impl State {
                 // `_loginScreenSessionActivated` (`loginDialog.js:1177-1202`): coming back to the
                 // greeter — a switch user, a logout — finds it where it was left only if nobody
                 // was being asked for credentials; a conversation left running starts over.
-                if active && self.synoik.greeter && self.synoik.login_page.is_asking_a_user() {
-                    self.greeter_back_to_start(true);
+                if active && self.synoik.greeter {
+                    if self.synoik.login_page.is_asking_a_user() {
+                        self.greeter_back_to_start(true);
+                    }
+                    let now = self.synoik.shield_now();
+                    self.synoik.lock_screen.fade_dialog(true, now);
+                    self.synoik.queue_redraw_all();
                 }
             }
             // The machine is going down for real, by whatever route. Freeze the session here:
@@ -6755,9 +6760,10 @@ impl State {
         }
 
         if effects.unlock && self.synoik.greeter {
-            // Verified: the daemon is starting the session, or fronting the one it unlocked. The
-            // greeter's shield stays, and its next visitor starts from the list.
-            self.greeter_back_to_start(false);
+            // Verified (`VERIFICATION_SUCCEEDED`): the prompt stays as it is while the daemon
+            // fronts the session it unlocked, or until ours opens and the dialog fades out. The
+            // greeter starts over when it is next made active (`_loginScreenSessionActivated`).
+            self.synoik.queue_redraw_all();
         } else if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
@@ -6997,6 +7003,25 @@ impl State {
             VerifierEvent::Lost => {
                 let effects = self.synoik.screen_shield.authenticator_lost();
                 self.apply_shield_effects(effects);
+            }
+            // `_startSession` (`loginDialog.js:1254-1265`): fade the dialog out, then start the
+            // session. The screen behind stays the greeter's until the session has drawn (the
+            // system compositor holds it, `GREETER_TARGET_WAIT`), so it is the empty greeter that
+            // gives way to the session, not a dialog cut off mid-sentence.
+            VerifierEvent::SessionOpened(service) if self.synoik.greeter => {
+                let now = self.synoik.shield_now();
+                self.synoik.lock_screen.fade_dialog(false, now);
+                self.synoik.queue_redraw_all();
+                let service = service.clone();
+                self.synoik
+                    .timer_after(crate::ui::lock_screen::DIALOG_FADE_TIME, move |state| {
+                        if let Some(tx) = state.synoik.gdm_requests.as_ref() {
+                            let _ = tx.send_blocking(
+                                crate::dbus::gdm::VerifierRequest::StartSession(service.clone()),
+                            );
+                        }
+                        None
+                    });
             }
             // A login out of attempts: back to the start once its messages are read
             // (`_verificationFailed`, `util.js:851-870`), unless the visitor left first.
@@ -11830,7 +11855,8 @@ impl Synoik {
                 || self.lock_screen.is_sliding(now)
                 || self.lock_screen.is_fading(now)
                 || self.lock_screen.caps_is_animating(now)
-                || self.lock_screen.wiggle_is_animating(now),
+                || self.lock_screen.wiggle_is_animating(now)
+                || self.lock_screen.dialog_is_animating(now),
         );
 
         // Also keep redrawing if the current cursor is animated.
@@ -12621,6 +12647,10 @@ impl Synoik {
 
             let mut prompt_t = crate::ui::lock_screen::PageTransform::prompt(progress);
             let mut clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
+            if self.greeter {
+                // The whole `LoginDialog` — list, prompt, logo, banner, buttons — fades as one.
+                prompt_t.alpha *= self.lock_screen.dialog_alpha(now);
+            }
             prompt_t.translation_y += slide;
             clock_t.translation_y += slide;
 

@@ -737,6 +737,8 @@ impl UnlockDialog {
 
             // The greeter's to act on; nothing changes under the entry.
             VerifierEvent::Exhausted => UnlockEffects::default(),
+            // The greeter's business: the dialog fades out before the session starts.
+            VerifierEvent::SessionOpened(_) => UnlockEffects::default(),
 
             VerifierEvent::Reset => {
                 self.status = Status::NotVerifying;

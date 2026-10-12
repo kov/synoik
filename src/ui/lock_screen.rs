@@ -166,6 +166,9 @@ pub const SLIDE_TIME: Duration = Duration::from_millis(250);
 
 /// `CROSSFADE_TIME` (`unlockDialog.js:30`) — how long the clock↔prompt swap takes.
 pub const CROSSFADE_TIME: Duration = Duration::from_millis(300);
+/// The login dialog's own fade, out before a session starts and back in when the greeter is
+/// returned to: `_FADE_ANIMATION_TIME`, `EASE_OUT_QUAD` (`loginDialog.js:46,1185-1191,1255-1264`).
+pub const DIALOG_FADE_TIME: Duration = Duration::from_millis(250);
 /// `FADE_OUT_TRANSLATION` (`:31`) — how far the outgoing page slides, in logical px.
 const FADE_OUT_TRANSLATION: f64 = 200.;
 /// `FADE_OUT_SCALE` (`:32`) — how small a page is when fully faded out.
@@ -675,6 +678,10 @@ pub struct LockScreen {
     /// The switch-user button's circle. Its own cache because its revision moves on *hover*, which
     /// nothing else on the page cares about.
     switch_cache: RefCell<widget::BakeCache>,
+    /// The login dialog's opacity: where its fade is going, and from where and since when. `None`
+    /// is settled at `dialog_shown`. Only the greeter fades it.
+    dialog_fade: Option<(Duration, f64)>,
+    dialog_hidden: bool,
 }
 
 /// One drawable of the prompt page.
@@ -899,6 +906,39 @@ impl LockScreen {
         } else {
             1. - eased
         }
+    }
+
+    /// Fade the login dialog out (`_startSession`) or back in (`_loginScreenSessionActivated`),
+    /// from wherever it stands.
+    pub fn fade_dialog(&mut self, shown: bool, now: Duration) {
+        if shown != self.dialog_hidden && self.dialog_fade.is_none() {
+            return;
+        }
+        let from = self.dialog_alpha(now);
+        self.dialog_hidden = !shown;
+        self.dialog_fade = Some((now, from));
+    }
+
+    /// Whether the login dialog is faded out, or on its way.
+    pub fn dialog_hidden(&self) -> bool {
+        self.dialog_hidden
+    }
+
+    /// The login dialog's opacity now.
+    pub fn dialog_alpha(&self, now: Duration) -> f64 {
+        let to = if self.dialog_hidden { 0. } else { 1. };
+        let Some((since, from)) = self.dialog_fade else {
+            return to;
+        };
+        let t = (now.saturating_sub(since).as_secs_f64() / DIALOG_FADE_TIME.as_secs_f64())
+            .clamp(0., 1.);
+        from + (to - from) * Curve::EaseOutQuad.y(t)
+    }
+
+    /// Whether the dialog's fade still owes frames.
+    pub fn dialog_is_animating(&self, now: Duration) -> bool {
+        self.dialog_fade
+            .is_some_and(|(since, _)| now.saturating_sub(since) < DIALOG_FADE_TIME)
     }
 
     /// Whether the crossfade still owes frames.

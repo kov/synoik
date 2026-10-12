@@ -340,6 +340,11 @@ struct Transition {
     start: Duration,
     /// Armed while there is neither `to` nor `pending` (`TARGET_WAIT`).
     wait: Option<RegistrationToken>,
+    /// The outgoing greeter, still drawing: until the incoming session has a frame, the greeter's
+    /// frames go on screen as they come, so its dialog fades out in front of the user — logind
+    /// activates a new session on a VT-less seat the moment it is created, before the greeter has
+    /// had the chance (`seat_attach_session`). `from` is re-taken when the target arrives.
+    from_live: Option<u64>,
 }
 
 struct Target {
@@ -425,6 +430,8 @@ struct Outer {
     switch_wait: Duration,
     /// What the last finished transition faded to, standing in for its frame on screen.
     last_to: Option<Picture>,
+    /// The greeter the switch in progress leaves, for [`Transition::from_live`].
+    outgoing_greeter: Option<u64>,
 }
 
 impl Outer {
@@ -472,6 +479,7 @@ impl Outer {
             switch_pending: false,
             switch_wait: TARGET_WAIT,
             last_to: None,
+            outgoing_greeter: None,
         };
         // A restarted outer leaves the screen alone: it still shows the session's last frame
         // (`close_inherited_framebuffers`), and the session's next present replaces it. Lighting
@@ -668,6 +676,9 @@ impl Outer {
         info!("seat0 fronts session {front:?} (was {:?})", self.front);
         let outgoing = self.front.as_deref().and_then(read_session_class);
         self.switch_wait = target_wait(outgoing.as_deref());
+        self.outgoing_greeter = (outgoing.as_deref() == Some("greeter"))
+            .then(|| self.fronted())
+            .flatten();
         self.front = front;
 
         if self.compositor.is_some() {
@@ -736,6 +747,7 @@ impl Outer {
             pending_watch: None,
             start: get_monotonic_time(),
             wait: None,
+            from_live: self.outgoing_greeter.take(),
         });
 
         let held = self
@@ -945,6 +957,24 @@ impl Outer {
     /// frame replacing it (the live `to`) keeps it, and gives back the frame it replaces if no
     /// blend has shown that one yet.
     fn set_target(&mut self, target: Target) {
+        // The outgoing greeter stops being live: the fade starts from its newest frame on screen.
+        if let Some(live) = self.transition.as_mut().and_then(|t| t.from_live.take()) {
+            if let Some(Next::Session {
+                generation,
+                buffer,
+                answer: true,
+                ..
+            }) = self
+                .queued
+                .take_if(|n| matches!(n, Next::Session { generation, .. } if *generation == live))
+            {
+                self.discard(generation, buffer);
+            }
+            let from = self.snapshot_screen();
+            if let Some(transition) = &mut self.transition {
+                transition.from = from;
+            }
+        }
         let Some(transition) = &mut self.transition else {
             return;
         };
@@ -1078,6 +1108,7 @@ impl Outer {
                 pending_watch: None,
                 start: get_monotonic_time(),
                 wait: None,
+                from_live: None,
             });
             self.target_frame(generation, buffer, fence);
         } else {
@@ -1229,6 +1260,19 @@ impl Outer {
                     (true, Some(true)) => self.target_frame(generation, buffer, fence),
                     (true, Some(false)) if feeds_fade => {
                         self.target_frame(generation, buffer, fence)
+                    }
+                    (false, Some(true))
+                        if self
+                            .transition
+                            .as_ref()
+                            .is_some_and(|t| t.from_live == Some(generation)) =>
+                    {
+                        self.show(Next::Session {
+                            generation,
+                            buffer,
+                            fence,
+                            answer: true,
+                        })
                     }
                     (true, None) => {
                         let over_plate = self.plate_showing();

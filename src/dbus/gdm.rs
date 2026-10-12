@@ -157,6 +157,9 @@ pub enum VerifierRequest {
     StartFingerprint,
     /// Tear the conversation down: the shield was raised, or the user cancelled.
     Cancel,
+    /// Start the session [`VerifierEvent::SessionOpened`] reported, now that the dialog has faded
+    /// out (`_startSession`, `loginDialog.js:1254-1265`).
+    StartSession(String),
 }
 
 /// Hand-written so a stray `{:?}` cannot put a password in the journal. `derive(Debug)` would print
@@ -183,6 +186,7 @@ impl std::fmt::Debug for VerifierRequest {
             Self::Answer(answer) => write!(f, "Answer(<redacted, {} chars>)", answer.len()),
             Self::StartFingerprint => write!(f, "StartFingerprint"),
             Self::Cancel => write!(f, "Cancel"),
+            Self::StartSession(service) => write!(f, "StartSession({service})"),
         }
     }
 }
@@ -246,6 +250,9 @@ pub enum VerifierEvent {
     },
     /// PAM accepted. The one event that may raise a locked shield.
     Complete,
+    /// A login channel's verified session is open, under this service (`_onSessionOpened`). It
+    /// waits for [`VerifierRequest::StartSession`].
+    SessionOpened(String),
     /// The conversation ended without accepting. A fresh one has already been started, so the
     /// dialog can expect a new question.
     Failed,
@@ -351,6 +358,16 @@ async fn run(
             VerifierRequest::Cancel => {
                 if let Some(open) = session.take() {
                     open.close().await;
+                }
+            }
+
+            VerifierRequest::StartSession(service) => {
+                let Some(open) = session.as_ref() else {
+                    warn!("gdm: a session to start with no channel open");
+                    continue;
+                };
+                if let Err(err) = open.start_session(&service).await {
+                    warn!("gdm: could not start the session: {err:?}");
                 }
             }
         }
@@ -519,6 +536,20 @@ impl Session {
         }
     }
 
+    /// `StartSessionWhenReady` for the session this channel opened.
+    async fn start_session(&self, service: &str) -> zbus::Result<()> {
+        self.conn
+            .call_method(
+                None::<&str>,
+                SESSION_PATH,
+                Some(GREETER_IFACE),
+                "StartSessionWhenReady",
+                &(service, true),
+            )
+            .await
+            .map(|_| ())
+    }
+
     async fn answer(&self, answer: &str) -> zbus::Result<()> {
         self.conn
             .call_method(
@@ -601,26 +632,15 @@ async fn pump_signals(
 
     while let Some(Ok(msg)) = stream.next().await {
         let header = msg.header();
-        // A login channel's verified session is open: start it (`_onSessionOpened` →
-        // `_startSession` → `StartSessionWhenReady`, `loginDialog.js`). The verifier's own
-        // `VerificationComplete` has already told the compositor.
+        // A login channel's verified session is open (`_onSessionOpened`). The compositor fades
+        // the dialog out and only then asks for it to start ([`VerifierRequest::StartSession`]).
+        // The verifier's own `VerificationComplete` has already told it.
         if header.message_type() == zbus::message::Type::Signal
             && header.interface().map(|i| i.as_str()) == Some(GREETER_IFACE)
             && header.member().map(|m| m.as_str()) == Some("SessionOpened")
         {
             if let Ok((service, _id)) = msg.body().deserialize::<(String, String)>() {
-                let started = conn
-                    .call_method(
-                        None::<&str>,
-                        SESSION_PATH,
-                        Some(GREETER_IFACE),
-                        "StartSessionWhenReady",
-                        &(service.as_str(), true),
-                    )
-                    .await;
-                if let Err(err) = started {
-                    warn!("gdm: could not start the session: {err:?}");
-                }
+                let _ = to_niri.send(VerifierEvent::SessionOpened(service));
             }
             continue;
         }

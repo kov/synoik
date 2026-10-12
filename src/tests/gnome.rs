@@ -41915,7 +41915,7 @@ fn the_greeter_is_gdm_mode() {
 
 /// Coming back to the greeter with a user's prompt left up starts over
 /// (`loginDialog.js:1177-1202`): the conversation is cancelled and the grid is back, as GNOME
-/// resets its auth prompt.
+/// resets its auth prompt, and a dialog that faded out for a session fades back in.
 #[test]
 fn the_greeter_starts_over_when_it_comes_back() {
     use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
@@ -41957,6 +41957,20 @@ fn the_greeter_starts_over_when_it_comes_back() {
         .gdm_requests()
         .iter()
         .any(|r| matches!(r, VerifierRequest::Cancel)));
+
+    // A dialog faded out for a session that started fades back in.
+    f.synoik_state()
+        .on_verifier_event(crate::dbus::gdm::VerifierEvent::SessionOpened(
+            "gdm-password".to_owned(),
+        ));
+    f.advance_clock(crate::ui::lock_screen::DIALOG_FADE_TIME);
+    let now = f.synoik().shield_now();
+    assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 0.);
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionActive(true));
+    f.advance_clock(crate::ui::lock_screen::DIALOG_FADE_TIME);
+    let now = f.synoik().shield_now();
+    assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 1.);
 }
 
 /// "Switch User…" locks the session before going to the login screen (`activateSwitchUser`,
@@ -42625,8 +42639,9 @@ fn the_greeters_accessibility_button_opens_its_toggles() {
 }
 
 /// Picking a user on the greeter asks gdm for a login conversation for them; Escape cancels it and
-/// goes back to the list; a verified one goes back to the list without cancelling, because the
-/// daemon is starting that session.
+/// goes back to the list. A verified one stays on its prompt, uncancelled, and once its session
+/// opens the dialog fades out before the session is started (`_startSession`,
+/// `loginDialog.js:1254-1265`).
 #[test]
 fn the_greeter_logs_a_picked_user_in() {
     use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
@@ -42697,7 +42712,10 @@ fn the_greeter_logs_a_picked_user_in() {
         .iter()
         .any(|r| matches!(r, VerifierRequest::Answer(a) if a == "a")));
     f.synoik_state().on_verifier_event(VerifierEvent::Complete);
-    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(
+        f.synoik().login_page.is_asking_a_user(),
+        "the verified prompt stays up"
+    );
     assert!(f.synoik().shield_is_up(), "the greeter stays");
     assert!(
         !f.gdm_requests()
@@ -42705,6 +42723,22 @@ fn the_greeter_logs_a_picked_user_in() {
             .any(|r| matches!(r, VerifierRequest::Cancel)),
         "a verified conversation is not cancelled"
     );
+
+    // The session opens: the dialog fades out, and only then is the session started.
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::SessionOpened("gdm-password".to_owned()));
+    let start = |f: &mut Fixture| {
+        f.gdm_requests()
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::StartSession(s) if s == "gdm-password"))
+    };
+    f.turn();
+    assert!(!start(&mut f), "not before the dialog has faded");
+    f.advance_clock(crate::ui::lock_screen::DIALOG_FADE_TIME);
+    f.turn();
+    let now = f.synoik().shield_now();
+    assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 0.);
+    assert!(start(&mut f));
 }
 
 /// The end-session confirmation sits above the shield (`modalDialogGroup` over
