@@ -1,9 +1,12 @@
 # Install as /usr/share/dconf/profile/synoik-greeter.
 #
 # The greeter's dconf profile (DCONF_PROFILE, set by synoik-login): its own user database, then
-# the administrator's settings for the login screen, kept in /etc/dconf/db/synoik-greeter.d/ and
+# the administrator's settings for the login screen, kept in /etc/dconf/db/synoik_greeter.d/ and
 # compiled with `dconf update` (docs/fork/greeter.md §4.3). Create that directory and run
 # `dconf update` on install even with nothing in it: without the compiled database dconf warns at
 # every start.
+#
+# The database name has no '-': dconf announces a change on /ca/desrt/dconf/Writer/<name>, and a
+# D-Bus object path cannot hold one, so a running greeter would never hear of the change.
 user-db:user
-system-db:synoik-greeter
+system-db:synoik_greeter

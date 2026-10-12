@@ -331,13 +331,13 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 (out of scope). Read today: `enable-fingerprint-authentication` and `disable-restart-buttons`.
 
 The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
-needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which
-the copy would otherwise shadow. Fedora's other override, its `logo`, is distro branding for the
+needs GDM installed; our override keeps Fedora's `enable-smartcard-authentication=false`, which the
+copy would otherwise shadow. Fedora's other override, its `logo`, is distro branding for the
 package to carry. The greeter reads the keys through its own dconf profile,
-`resources/synoik-greeter.dconf-profile` (`DCONF_PROFILE=synoik-greeter`, set by the daemon for
-the greeter session only, as GDM's greeter gets `DCONF_PROFILE=gdm`): its user database, then
-the administrator's `/etc/dconf/db/synoik-greeter.d/`. GDM's `gdm` database is not read. The
-daemon hands every session the `GSETTINGS_SCHEMA_DIR` its unit sets.
+`resources/synoik-greeter.dconf-profile` (`DCONF_PROFILE=synoik-greeter`, set by the daemon for the
+greeter session only, as GDM's greeter gets `DCONF_PROFILE=gdm`): its user database, then the
+administrator's `/etc/dconf/db/synoik_greeter.d/`, applied while the greeter runs. GDM's `gdm`
+database is not read. The daemon hands every session the `GSETTINGS_SCHEMA_DIR` its unit sets.
 
 ### 4.4 Leaving the greeter
 

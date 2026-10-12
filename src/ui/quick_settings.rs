@@ -2074,12 +2074,18 @@ impl QuickSettings {
         self.battery.is_some()
     }
 
+    /// Both setters change what the chrome bake draws (the system row's buttons, the cards'
+    /// rows), so both re-key it.
     pub fn set_session_mode(&mut self, mode: &'static SessionMode) {
         self.mode = mode;
+        self.content_bumped();
+        self.normalize_expanded();
     }
 
     pub fn set_power_policy(&mut self, policy: PowerPolicy) {
         self.power_policy = policy;
+        self.content_bumped();
+        self.normalize_expanded();
     }
 
     /// Which machine-power rows the mode allows (`systemActions.js:371-420`): none on a greeter
@@ -2377,6 +2383,8 @@ impl QuickSettings {
             // The brightness card the same, off its slider + the >1-scale arrow gate
             // (`brightness.js:61`).
             Some(DetailOwner::Brightness) => !sliders.brightness || self.monitor_count() <= 1,
+            // The power card goes with its button.
+            Some(DetailOwner::Power) => self.detail_rows(DetailOwner::Power).is_empty(),
             _ => false,
         };
         if invalid {
@@ -7534,7 +7542,12 @@ run it with --features reference-env, as the fedora CI job does"
 
         let mut q = qs(None);
         q.set_session_mode(&GDM);
+        q.toggle_detail(Some(DetailOwner::Power));
+        let revision = q.revision;
+        // A key flipping under the open menu re-keys its bake and closes the emptied card.
         q.set_power_policy(strict);
+        assert_ne!(q.revision, revision, "the system row is baked chrome");
+        assert_eq!(q.expanded, None);
         assert!(actions(&q).is_empty());
         assert!(!q.sys_buttons().iter().any(|(b, _)| *b == SysButton::Power));
 
