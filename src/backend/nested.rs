@@ -73,6 +73,8 @@ pub struct Nested {
     /// The displays the outer described, by connector name.
     outputs: HashMap<String, NestedOutput>,
     next_buffer_id: u32,
+    /// Whether a frame has gone to the outer yet. The first waits for the wallpaper.
+    presented_once: bool,
     /// The outputs the handshake described, until `init` can hand them to the compositor.
     pending_outputs: Vec<OutputInfo>,
 }
@@ -172,6 +174,7 @@ impl Nested {
             ipc_outputs: Default::default(),
             outputs: HashMap::new(),
             next_buffer_id: 1,
+            presented_once: false,
             pending_outputs: outputs,
         };
         nested.attach(fd);
@@ -466,9 +469,22 @@ impl Nested {
     ) -> RenderResult {
         let _span = tracy_client::span!("Nested::render");
 
-        if self.conn.is_none() || !self.session.is_active() {
+        // A greeter whose dialog is fading out for a new session draws on in the background: logind
+        // fronted that session when it was created, before the fade began (a VT-less seat
+        // activates a session as it attaches), and the outer keeps the greeter's frames on screen
+        // until the session has one of its own. It shows nothing private.
+        let fading_greeter = synoik.greeter && synoik.lock_screen.dialog_hidden();
+        if self.conn.is_none() || !(self.session.is_active() || fading_greeter) {
             // Nowhere to show it. Pace off the clock until the outer is back or the session is
             // fronted again, the same as a tty frame that failed to queue.
+            queue_estimated_vblank_timer(synoik, output.clone());
+            return RenderResult::Skipped;
+        }
+
+        // GNOME shows the stage only once the background has loaded (`_doStartupAnimation`,
+        // `layout.js:693-707`). A first frame without it is a flat grey screen that the outer
+        // fades to, with the wallpaper cutting in a frame later; the greeter is held up meanwhile.
+        if !self.presented_once && !synoik.wallpaper.is_loaded() {
             queue_estimated_vblank_timer(synoik, output.clone());
             return RenderResult::Skipped;
         }
@@ -612,6 +628,7 @@ impl Nested {
         // The client buffers this frame sampled are latched; a new commit waits for the flip.
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
+        self.presented_once = true;
         RenderResult::Submitted
     }
 

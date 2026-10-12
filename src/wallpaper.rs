@@ -326,6 +326,13 @@ impl Wallpaper {
         }
     }
 
+    /// Whether the picture the settings ask for has been decoded (or failed to be): nothing is in
+    /// flight. The stage waits for this before it is first shown (`_loadBackground`,
+    /// `layout.js:709-731`).
+    pub fn is_loaded(&self) -> bool {
+        self.pending.borrow().is_none()
+    }
+
     /// The wallpaper we're heading toward: the in-flight decode if any, else the one
     /// on screen. Everything that decides whether to decode compares against this, so a
     /// slideshow tick that lands on the same picture and the same fade step is a no-op.
