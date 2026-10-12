@@ -1076,7 +1076,17 @@ impl Outer {
                         answer: true,
                     },
                 ..
-            }) => self.discard(generation, buffer),
+            }) => {
+                // A blend in flight may still be reading it: the inner must not draw into it
+                // until that blend lands, which gives it back then (`on_flip`).
+                let sampled = matches!(
+                    self.in_flight,
+                    Some(Shown::Composite { samples: Some(s), .. }) if s == (generation, buffer)
+                );
+                if !sampled {
+                    self.discard(generation, buffer);
+                }
+            }
             Some(_) => (),
         }
         if self.in_flight.is_none() {
@@ -1146,6 +1156,16 @@ impl Outer {
         };
         if let Some(token) = transition.wait {
             self.handle.remove(token);
+        }
+        // A newer frame still rendering when the fade ends — routine with a live target — is the
+        // session's newest: held, so the flip after the fade's end shows it. Dropped, its present
+        // would go unanswered and the session would never draw again.
+        if let Some(token) = transition.pending_watch {
+            self.handle.remove(token);
+        }
+        if let Some((generation, buffer, fence)) = transition.pending {
+            debug!("a fade ended with frame {buffer} still rendering");
+            self.hold(generation, buffer, fence);
         }
         let Some(to) = transition.to else {
             return;
@@ -1465,6 +1485,25 @@ impl Outer {
         }
     }
 
+    /// Whether `buffer` is still spoken for — held, queued, awaited by a fade, or what the session
+    /// was last told is on screen — so it must not be given back.
+    fn reserved(&self, generation: u64, buffer: u32) -> bool {
+        let session = self.sessions.get(&generation);
+        session.is_some_and(|s| {
+            s.held.as_ref().is_some_and(|(b, _)| *b == buffer) || s.last_presented == Some(buffer)
+        }) || matches!(
+            self.queued,
+            Some(Next::Session { generation: g, buffer: b, .. }) if g == generation && b == buffer
+        ) || self.transition.as_ref().is_some_and(|t| {
+            matches!(t.pending, Some((g, b, _)) if g == generation && b == buffer)
+                || matches!(
+                    t.to,
+                    Some(Target { end: End::Session { generation: g, buffer: b, .. }, .. })
+                        if g == generation && b == buffer
+                )
+        })
+    }
+
     /// Tell `generation` its `buffer` reached the screen.
     fn presented(&mut self, generation: u64, buffer: u32, meta: Option<&DrmEventMetadata>) {
         let Some(session) = self.sessions.get_mut(&generation) else {
@@ -1523,21 +1562,27 @@ impl Outer {
                 samples: Some((generation, buffer)),
                 ..
             } => {
-                let target = self.transition.as_mut().and_then(|t| t.to.as_mut());
-                if let Some(Target {
-                    end:
-                        End::Session {
-                            generation: g,
-                            buffer: b,
-                            answer,
-                        },
-                    ..
-                }) = target
-                {
-                    if *g == *generation && *b == *buffer && *answer {
-                        *answer = false;
-                        self.presented(*generation, *buffer, meta.as_ref());
-                    }
+                let (generation, buffer) = (*generation, *buffer);
+                // `Some(unanswered)` while it is still the target.
+                let target = match self.transition.as_mut().and_then(|t| t.to.as_mut()) {
+                    Some(Target {
+                        end:
+                            End::Session {
+                                generation: g,
+                                buffer: b,
+                                answer,
+                            },
+                        ..
+                    }) if *g == generation && *b == buffer => Some(std::mem::take(answer)),
+                    _ => None,
+                };
+                match target {
+                    Some(true) => self.presented(generation, buffer, meta.as_ref()),
+                    Some(false) => (),
+                    // Replaced while this blend was reading it (`set_target`): free now — unless
+                    // it went back to the session meanwhile (a cancelled fade holds its target).
+                    None if !self.reserved(generation, buffer) => self.discard(generation, buffer),
+                    None => (),
                 }
             }
             _ => (),
