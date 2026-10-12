@@ -1,0 +1,6 @@
+# The greeter's gnome-session session, as GDM's data/gnome-login.session
+# (gdm 51.0). Install as /usr/share/gnome-session/sessions/synoik-greeter.session;
+# synoik-login starts it with `gnome-session --session synoik-greeter`.
+[GNOME Session]
+Name=synoik greeter
+Kiosk=true

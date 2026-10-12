@@ -886,6 +886,33 @@ fn connect(path: &Path) -> anyhow::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// The logind session this inner belongs to, the way mutter finds its own: the session scope the
+/// process runs in, else the uid's graphical session (`sd_pid_get_session`, then
+/// `sd_uid_get_display`, read from logind's state files as libsystemd does). A session compositor
+/// started as a user service — the greeter, under gnome-session — runs in the user manager, outside
+/// any scope, and its environment has no `XDG_SESSION_ID`: gnome-session does not export one into
+/// a manager every session of the uid shares.
+fn own_session_id() -> Option<String> {
+    if let Ok(id) = std::env::var("XDG_SESSION_ID") {
+        return Some(id);
+    }
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let scope = cgroup
+        .split('/')
+        .find_map(|part| part.strip_prefix("session-")?.strip_suffix(".scope"))
+        .map(|id| id.trim().to_owned());
+    scope.or_else(|| {
+        // SAFETY: `getuid` is always successful and touches no memory.
+        let uid = unsafe { libc::getuid() };
+        let state = std::fs::read_to_string(format!("/run/systemd/users/{uid}")).ok()?;
+        state
+            .lines()
+            .find_map(|line| line.strip_prefix("DISPLAY="))
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+    })
+}
+
 /// What the outer's `Welcome` gives a session: its render node and its outputs.
 type Welcomed = (Option<(u64, u64)>, Vec<OutputInfo>);
 
@@ -894,7 +921,7 @@ type Welcomed = (Option<(u64, u64)>, Vec<OutputInfo>);
 fn handshake(fd: BorrowedFd<'_>) -> anyhow::Result<Welcomed> {
     let hello = ToOuter::Hello {
         version: protocol::VERSION,
-        session: std::env::var("XDG_SESSION_ID").ok(),
+        session: own_session_id(),
     };
     protocol::send(fd, &hello, &[])?;
 

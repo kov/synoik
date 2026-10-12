@@ -171,7 +171,14 @@ fn greeter_request() -> Request {
         service: "synoik-greeter".into(),
         user: GREETER_USER.into(),
         class: "greeter".into(),
-        program: vec!["synoik".into(), "--greeter".into()],
+        // Under gnome-session, as GDM's greeter (`data/gnome-greeter.desktop.in`): the session's
+        // targets bring up synoik (`resources/synoik-greeter.service`), IBus and the settings
+        // daemons.
+        program: vec![
+            "gnome-session".into(),
+            "--session".into(),
+            "synoik-greeter".into(),
+        ],
     }
 }
 

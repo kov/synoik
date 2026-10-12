@@ -258,9 +258,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => WaylandSocket::Auto,
         },
         cli.session,
+        cli.greeter,
     )
     .unwrap();
-    state.synoik.greeter = cli.greeter;
     if cli.greeter {
         state.show_greeter_dialog();
     }

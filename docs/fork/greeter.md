@@ -184,8 +184,18 @@ stays a plain parent that never talks PAM again after the session starts.
 
 At boot the daemon opens the greeter's own session: PAM service `synoik-greeter`, user
 `synoik-greeter`, `XDG_SESSION_CLASS=greeter`, `XDG_SEAT=seat0`, running
-`synoik --greeter` with `SYNOIK_SYSTEM_SOCKET` (GDM's `gdm-launch-environment`,
-`daemon/gdm-launch-environment.c:495-510`, `568-629`). That session lives for the machine's lifetime and is
+`gnome-session --session synoik-greeter` with `SYNOIK_SYSTEM_SOCKET`, `DCONF_PROFILE=synoik-greeter`
+and `XDG_CURRENT_DESKTOP=GNOME-Greeter:GNOME` (GDM's `gdm-launch-environment`,
+`daemon/gdm-launch-environment.c:495-510`, `568-629`, and `data/gnome-greeter.desktop.in`).
+gnome-session exports that environment into the greeter user's manager and starts
+`gnome-session@synoik-greeter.target`, which requires `gnome-session-basic-services.target` (the
+settings daemons; IBus comes with `gnome-session.target`) and `synoik-greeter.service`, the user
+unit running `synoik --greeter` — GDM's `gnome-login` session with synoik in gnome-shell's place.
+The files are `resources/synoik-greeter.session` (in `/usr/share/gnome-session/sessions`),
+`synoik-greeter.session.conf` (as `gnome-session@synoik-greeter.target.d/session.conf`) and
+`synoik-greeter.service`. A user unit runs outside the session scope, so the greeter names its
+logind session to the outer from the uid's display session, as mutter does. The input-method worker
+never starts IBus on the greeter: the session's target owns it (`ibusManager.js:97-102`). That session lives for the machine's lifetime and is
 restarted if it dies. After a login it stays, in the background, ready: logout and "switch user"
 activate it (§5), so there is never a greeter to spawn on the interactive path.
 
@@ -267,9 +277,9 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
 - **Power menu:** Suspend, Restart, Power Off — all hidden by `disable-restart-buttons`, and with
   them the power button (`systemActions.js:371-420`, `system.js:239-241`). The lock screen offers
   Restart and Power Off only with `org.gnome.desktop.screensaver restart-enabled`, false by
-  default. Not ported: hiding one while locked when logind says it needs authentication. gnome-shell routes them through gnome-session,
-  which the greeter does not run: Restart and Power Off raise the end-session confirmation
-  themselves, with gnome-session's 60 s countdown (`gsm-shell.c:40`), and the confirmation calls
+  default. Not ported: hiding one while locked when logind says it needs authentication. gnome-shell routes them through gnome-session;
+  ours do not yet, although the greeter now runs one: Restart and Power Off raise the end-session
+  confirmation themselves, with gnome-session's 60 s countdown (`gsm-shell.c:40`), and the confirmation calls
   logind (`Reboot`, `PowerOff`); Suspend calls logind at once.
 - **Behind the menus:** while the mode is locked or the greeter, no menu action may start an app,
   a command or the screenshot UI — the one Settings hand-off GNOME leaves there (a network's
@@ -462,8 +472,13 @@ the greeter (`c1`) then `claude`'s session (`2`, active), both attached to the o
 Ctrl+Alt+F1/F2 switch between them. Restarting the daemon replaces the greeter and gives the seat
 back to session 2 at once. Logging out (`loginctl terminate-session 2`) closes its PAM session in
 its worker, and logind leaves seat0 with **no** active session — the greeter is in front 15 ms
-later because the daemon activates it. Left: the greeter's user manager may not start IBus
-(`xdm_t` denied `start`).
+later because the daemon activates it.
+
+Measured 2026-10-12, same guest, greeter under gnome-session: the target brings up IBus and the
+gsd A11ySettings, Keyboard, MediaKeys, Power, Rfkill, Sharing, Smartcard and UsbProtection daemons
+with no AVC, and the greeter's environment carries the four variables above. `kill -9` of the
+greeter's synoik takes the target down and the daemon opens a fresh greeter session; restarting the
+daemon does the same, leaving one set of greeter processes either way.
 
 §7 step 2: reauthentication, for the lock screen.
 

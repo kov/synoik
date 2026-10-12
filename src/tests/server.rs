@@ -38,6 +38,7 @@ impl Server {
             BackendMode::HeadlessTest,
             crate::synoik::WaylandSocket::None,
             false,
+            false,
         )
         .unwrap();
 

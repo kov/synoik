@@ -1,0 +1,30 @@
+# The login greeter under gnome-session, as gnome-shell's
+# data/org.gnome.Shell@.service.in (50.3) runs `gnome-shell --mode=gdm`.
+# Install in /usr/lib/systemd/user.
+#
+# Its environment comes from the greeter session's launcher, which gnome-session
+# exports into the user manager: SYNOIK_SYSTEM_SOCKET, DCONF_PROFILE,
+# GSETTINGS_SCHEMA_DIR and XDG_CURRENT_DESKTOP among it (synoik-login's worker
+# sets them).
+[Unit]
+Description=synoik login greeter
+OnFailure=gnome-session-shutdown.target
+OnFailureJobMode=replace-irreversibly
+CollectMode=inactive-or-failed
+RefuseManualStart=on
+RefuseManualStop=on
+
+After=gnome-session-manager.target
+
+Requisite=gnome-session-initialized.target
+PartOf=gnome-session-initialized.target
+Before=gnome-session-initialized.target
+
+[Service]
+Slice=session.slice
+Type=notify
+# Room to lock our memory out of swap; see resources/synoik.service.
+LimitMEMLOCK=768M
+ExecStart=synoik --greeter
+Restart=no
+TimeoutStopSec=5

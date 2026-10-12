@@ -2042,6 +2042,7 @@ impl State {
         mode: BackendMode,
         wayland_socket: WaylandSocket,
         is_session_instance: bool,
+        greeter: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let _span = tracy_client::span!("State::new");
 
@@ -2080,6 +2081,9 @@ impl State {
         backend.init(&mut synoik);
 
         let mut state = Self { backend, synoik };
+        // Before anything below reads it: the settings load and the services started here differ
+        // on the greeter.
+        state.synoik.greeter = greeter;
 
         // Pull in the GNOME settings we honor (overlay-key, …) from the live
         // GSettings/dconf backend — the same store gnome-shell uses — and keep the
@@ -2310,7 +2314,11 @@ impl State {
                 let (to_worker, requests) =
                     async_channel::bounded(crate::input_method::REQUEST_QUEUE);
                 let (updates_tx, updates_rx) = calloop::channel::channel();
-                crate::input_method::worker::spawn(requests, updates_tx, is_session_instance);
+                // The greeter runs under gnome-session, whose target owns the IBus unit; reviving
+                // it ourselves is gnome-shell's rule broken (`_queueSpawn` never starts an existing
+                // unit, `ibusManager.js:97-102`), and the greeter's SELinux domain may not anyway.
+                let revive_daemon = is_session_instance && !state.synoik.greeter;
+                crate::input_method::worker::spawn(requests, updates_tx, revive_daemon);
                 state.synoik.input_method = Some(crate::input_method::InputMethod::new(to_worker));
 
                 let (events_tx, events_rx) = calloop::channel::channel();

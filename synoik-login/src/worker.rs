@@ -279,6 +279,9 @@ fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CStri
     // GDM's greeter does from `gdm` (`gdm-launch-environment.c:304`; greeter.md §4.3).
     if env.get("XDG_SESSION_CLASS").map(String::as_str) == Some("greeter") {
         env.insert("DCONF_PROFILE".into(), GREETER_DCONF_PROFILE.into());
+        // GDM's greeter desktop names (`DesktopNames` in `data/gnome-greeter.desktop.in`, set at
+        // `gdm-session.c:2890`).
+        env.insert("XDG_CURRENT_DESKTOP".into(), "GNOME-Greeter:GNOME".into());
     }
     env.into_iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(Into::into))
