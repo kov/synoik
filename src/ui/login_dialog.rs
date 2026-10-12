@@ -29,6 +29,16 @@ const BANNER_FG: Rgba = [
 ];
 /// `.login-dialog-logo-bin`'s `margin: 3em 0` (`_login-lock.scss:79-81`).
 const LOGO_MARGIN_EM: f64 = 3.;
+/// `.login-dialog-bottom-button-group`: `padding: 32px; spacing: 16px` (`_login-lock.scss:29-32`).
+const BUTTON_GROUP_PAD: f64 = 32.;
+pub const BUTTON_GROUP_SPACING: f64 = 16.;
+/// `.login-dialog-button.a11y-button`'s `padding: to_em(16px)` (`_login-lock.scss:37-45`).
+const A11Y_PAD_PX: f64 = 16.;
+/// `A11yMenuButton`'s icon (`loginDialog.js:420`), then the older name for themes without it.
+const A11Y_ICON: [&str; 2] = [
+    "org.gnome.Settings-accessibility-symbolic",
+    "preferences-desktop-accessibility-symbolic",
+];
 
 /// The logo file and its natural size, read when the setting is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,11 +140,43 @@ pub fn logo_rect(monitor: Rectangle<f64, Logical>, logo: &Logo) -> Rectangle<f64
     )
 }
 
-/// The two pieces' caches.
+/// The accessibility button: the last in the bottom button group, which sits in the dialog's
+/// bottom-right corner inside its padding (`_getBottomButtonGroupAllocation`,
+/// `loginDialog.js:719-735`). Shown on every page (`:793`).
+pub fn a11y_rect(monitor: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    let size = widget::IconButton::diameter(
+        crate::ui::scaled_px(widget::IconButton::ICON_PX),
+        crate::ui::scaled_px(A11Y_PAD_PX),
+    );
+    Rectangle::new(
+        Point::from((
+            monitor.loc.x + monitor.size.w - BUTTON_GROUP_PAD - size,
+            monitor.loc.y + monitor.size.h - BUTTON_GROUP_PAD - size,
+        )),
+        Size::from((size, size)),
+    )
+}
+
+/// Whether `pos` is on the button — round, like every [`widget::IconButton`].
+pub fn a11y_hit(monitor: Rectangle<f64, Logical>, pos: Point<f64, Logical>) -> bool {
+    widget::IconButton::new(a11y_rect(monitor), 0., style::TRANSPARENT).contains(pos)
+}
+
+/// What the accessibility button shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct A11yButtonState {
+    pub hovered: bool,
+    pub focused: bool,
+    /// Its menu is up (`:active`, `loginDialog.js:445-449`).
+    pub active: bool,
+}
+
+/// The three pieces' caches.
 #[derive(Default)]
 pub struct LoginDialogChrome {
     banner: RefCell<widget::BakeCache>,
     logo: RefCell<widget::ImageUploads>,
+    a11y: RefCell<widget::BakeCache>,
 }
 
 impl LoginDialogChrome {
@@ -224,6 +266,85 @@ impl LoginDialogChrome {
                 None
             }
         }
+    }
+
+    /// The accessibility button, on every page of the dialog.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_a11y(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
+        ctx: PageCtx,
+        state: A11yButtonState,
+        accent: [u8; 3],
+        t: PageTransform,
+    ) -> Vec<PromptElement> {
+        let PageCtx { scale, monitor, .. } = ctx;
+        let rect = a11y_rect(monitor);
+        let size = rect.size.w;
+        let icon_px = crate::ui::scaled_px(widget::IconButton::ICON_PX);
+        let centre = Point::from((rect.loc.x + size / 2., rect.loc.y + size / 2.));
+        let mut elements: Vec<PromptElement> = Vec::new();
+        if let Some(el) = widget::icon_element_scaled(
+            renderer,
+            icons,
+            &A11Y_ICON,
+            icon_px,
+            scale,
+            t.scale,
+            style::TEXT,
+            rect.loc,
+            t.place(centre, centre) - rect.loc,
+            t.alpha as f32,
+        ) {
+            elements.push(el.into());
+        }
+        let button = widget::IconButton::new(
+            Rectangle::from_size(Size::from((size, size))),
+            icon_px,
+            style::SYSTEM_BUTTON_BG,
+        )
+        .hovered(state.hovered)
+        .focused(state.focused)
+        .active(state.active);
+        let accent_rgba = style::accent_rgba(accent);
+        match widget::bake(
+            renderer,
+            &mut self.a11y.borrow_mut(),
+            scale,
+            Size::from((size, size)),
+            widget::Revision::new()
+                .of(state.hovered)
+                .of(state.focused)
+                .of(state.active)
+                .of(accent)
+                .px(size)
+                .done(),
+            |_| Ok(()),
+            |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.icon_button(&button, accent_rgba)?;
+                Ok(())
+            },
+        ) {
+            Ok(mut buffer) => {
+                buffer.set_texture_scale(t.buffer_scale(scale));
+                elements.push(
+                    TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        t.place(rect.loc, centre),
+                        t.alpha as f32,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                );
+            }
+            Err(err) => tracing::error!("error drawing the accessibility button: {err:#}"),
+        }
+        elements
     }
 
     /// The logo, on every page of the dialog.

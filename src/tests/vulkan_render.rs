@@ -16477,6 +16477,38 @@ fn vulkan_draws_the_login_banner_and_logo() {
         "no banner over the list"
     );
 
+    // The accessibility button: a disc lighter than the backdrop, with the pill left of it.
+    let button = crate::ui::login_dialog::a11y_rect(monitor);
+    let rim = px(
+        &pixels,
+        w,
+        (button.loc.x + 6.) as i32,
+        (button.loc.y + button.size.h / 2.) as i32,
+    );
+    assert!(
+        rim[0] > 0x30 && rim[0] < 0x60,
+        "the button's disc is drawn: {rim:?}"
+    );
+    // Its menu opens above it, with the ten toggles' titles.
+    f.synoik_state().on_shield_click(Point::from((
+        button.loc.x + button.size.w / 2.,
+        button.loc.y + button.size.h / 2.,
+    )));
+    // The popover's fade runs on its own clock (the headless-animation-clock trap).
+    f.settle_animations();
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let menu = Rectangle::new(
+        origin,
+        crate::ui::login_a11y_menu::LoginA11yMenu::new(Default::default(), [0; 3]).logical_size(),
+    );
+    assert!(
+        light_in(&pixels, w, menu) > 500,
+        "the menu's titles are drawn"
+    );
+    f.synoik().panel_popover.close();
+    f.synoik_complete_animations();
+
     f.synoik().gnome_settings.login_screen.disable_user_list = true;
     f.synoik_state().sync_greeter_user_list();
     f.synoik_complete_animations();

@@ -2875,6 +2875,9 @@ pub struct IconButton {
     pub bg: Rgba,
     pub hovered: bool,
     pub focused: bool,
+    /// `:active` — pressed, or latched while the menu it opens is up (the login screen's a11y
+    /// button, `loginDialog.js:445-449`).
+    pub active: bool,
 }
 
 impl IconButton {
@@ -2897,7 +2900,13 @@ impl IconButton {
             bg,
             hovered: false,
             focused: false,
+            active: false,
         }
+    }
+
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
     }
 
     pub fn hovered(mut self, hovered: bool) -> Self {
@@ -2927,6 +2936,83 @@ impl IconButton {
         let r = self.rect.size.w.min(self.rect.size.h) / 2.;
         let (dx, dy) = (p.x - c.x, p.y - c.y);
         dx * dx + dy * dy <= r * r
+    }
+}
+
+/// GNOME's `QuickToggle` body (`js/ui/quickSettings.js`, `.quick-toggle` in `_quick-settings.scss`)
+/// — the pill-shaped tile of a quick-settings grid, accent-filled when checked.
+///
+/// Shared by the panel's quick settings and the greeter's accessibility menu, which is a
+/// `QuickSettingsMenu` of ten of them (`loginDialog.js:415-438`). The glyph and the title are
+/// composited/shaped by the caller; this owns the geometry and [`Painter::quick_toggle`] the fill.
+#[derive(Debug, Clone, Copy)]
+pub struct QuickToggle {
+    pub rect: Rectangle<f64, Logical>,
+    pub checked: bool,
+    pub hovered: bool,
+    /// Keyboard-focused: the ring, in `$accent_borders_color` on a checked (accent) fill, where
+    /// the plain accent would vanish (`_drawing.scss:313-316`).
+    pub focused: bool,
+}
+
+impl QuickToggle {
+    /// `.quick-toggle` is a fixed `12em` (`min/max-width`, `_quick-settings.scss:17-18`). `1em` is
+    /// `$base_font_size` (11pt), so 12em = `12 * pt_to_px(11)` ≈ 176px — wider than the old 150,
+    /// which cramped two-line tiles (Power Mode) and made the whole menu narrower than
+    /// gnome-shell's.
+    pub fn width() -> f64 {
+        Self::EM * crate::ui::pt_to_px(11.0)
+    }
+
+    /// **DIVERGENCE (deliberate).** gnome-shell's `.quick-toggle` is `min/max-width: 12em`
+    /// (`_quick-settings.scss:17-18`). Ours is wider, because at 12em a menu-bearing tile has
+    /// 12em − 94 ≈ 82px for its label once the icon inset (15), icon (16), gap (9), the padding the
+    /// label keeps clear of the divider (9), the divider (1) and the arrow half (44) are taken —
+    /// and "Power Mode" measures ~90. Upstream gets away with 12em because it *ellipsizes*; we
+    /// clip, so too-narrow shows up as a chopped word rather than as "Power Mod…".
+    ///
+    /// 13em fits it with a little room. This is the width the whole popover derives from
+    /// (the quick-settings `menu_w`), so it widens the menu too.
+    ///
+    /// The real fix is ellipsis: a long enough Wi-Fi name will still clip at any width we pick.
+    /// When the toolkit grows it, this can go back to 12em.
+    pub const EM: f64 = 13.0;
+    /// `.quick-toggle` is `min-height: $scalable_icon_size * 3` = 48px (`_quick-settings.scss:19`)
+    /// — sized off the icon so the button scales with it, as the rule's own comment says.
+    /// Measured 48.0019 on a live 50.3 shell.
+    pub const HEIGHT: f64 = 48.;
+    /// `.quick-settings-grid` `spacing-rows`/`spacing-columns`: `$base_padding * 2` = 12px
+    /// (`_quick-settings.scss:11-12`).
+    pub const GAP: f64 = 12.;
+    /// Icon size inside a tile, and its inset from the tile's left edge.
+    pub const ICON_PX: f64 = 16.;
+    /// The tile icon's inset from the tile's left edge: `.quick-toggle > StBoxLayout`'s
+    /// `padding-left: $base_padding * 2.5` = 15px (`_quick-settings.scss:35`, the `:ltr` rule — the
+    /// base rule's `0 $base_padding * 2` = 12 is what the RTL side and the right edge keep).
+    pub const ICON_INSET: f64 = 15.;
+    /// Gap between a tile's icon and its label: that same box's `spacing: $base_padding * 1.5` =
+    /// 9px (`_quick-settings.scss:26`).
+    pub const ICON_GAP: f64 = 9.;
+    /// Tile-title / battery-percentage font size, logical px. GNOME's `.quick-toggle-title`
+    /// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
+    /// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
+    /// light/small.
+    pub const TITLE_PT: f64 = 11.;
+
+    /// The glyph's centre, in the same space as `rect`.
+    pub fn icon_centre(&self) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + Self::ICON_INSET + Self::ICON_PX / 2.,
+            self.rect.loc.y + self.rect.size.h / 2.,
+        ))
+    }
+
+    /// Where the title starts, left-middle aligned at the tile's vertical centre.
+    pub fn title_origin(&self) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + Self::ICON_INSET + Self::ICON_PX + Self::ICON_GAP,
+            self.rect.loc.y + self.rect.size.h / 2.,
+        ))
     }
 }
 
@@ -3139,11 +3225,35 @@ impl Painter<'_, '_, '_> {
         Ok(())
     }
 
+    /// A [`QuickToggle`]'s pill: the accent when checked, the raised button fill when not
+    /// (`.quick-toggle` extends `.button`, `_quick-settings.scss:5,15`), with the hover wash. The
+    /// radius is `$forced_circular_radius`: half the height, a pill.
+    pub fn quick_toggle(&mut self, t: &QuickToggle, accent: Rgba) -> anyhow::Result<()> {
+        let radius = t.rect.size.h / 2.;
+        let bg = if t.checked { accent } else { style::BUTTON_BG };
+        self.fill_rounded(t.rect, radius, bg)?;
+        if t.hovered {
+            self.fill_rounded(t.rect, radius, style::HOVER_WASH)?;
+        }
+        if t.focused {
+            let ring = if t.checked {
+                style::accent_borders(accent)
+            } else {
+                accent
+            };
+            self.focus_ring(t.rect, radius, ring)?;
+        }
+        Ok(())
+    }
+
     pub fn icon_button(&mut self, b: &IconButton, accent: Rgba) -> anyhow::Result<()> {
         // `border-radius: $forced_circular_radius` on a square box.
         let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
         self.fill_rounded(b.rect, radius, b.bg)?;
-        if b.hovered {
+        if b.active {
+            // `:active` lightens 9% where `:hover` lightens 4% (`_drawing.scss:182-183`).
+            self.fill_rounded(b.rect, radius, style::SELECTED_WASH)?;
+        } else if b.hovered {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
         }
         if b.focused {

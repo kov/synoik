@@ -761,6 +761,8 @@ pub struct Synoik {
     pub can_switch_user: bool,
     /// Whether the pointer is on the switch-user button.
     pub switch_user_hovered: bool,
+    /// The pointer is on the greeter's accessibility button.
+    pub login_a11y_hovered: bool,
 
     /// The last `active` we told the session bus about — see [`Self::publish_shield_active`].
     ///
@@ -6353,6 +6355,11 @@ impl State {
                 };
                 self.greeter_ask_user(user, true);
             }
+            GridAction::A11y => {
+                if let Some(output) = self.synoik.layout.active_output().cloned() {
+                    self.toggle_login_a11y_menu(output);
+                }
+            }
             GridAction::EnterName => {
                 // `_hideUserListAskForUsernameAndBeginVerification` (`loginDialog.js:1460-1463`).
                 self.synoik.login_page = LoginPage::Name;
@@ -6430,11 +6437,34 @@ impl State {
         }
     }
 
+    /// The login dialog's accessibility button (`A11yMenuButton`, `loginDialog.js:455`): its menu,
+    /// above it, on `output`.
+    fn toggle_login_a11y_menu(&mut self, output: Output) {
+        let anchor = crate::ui::login_dialog::a11y_rect(Rectangle::from_size(output_size(&output)));
+        let a11y = self.synoik.gnome_settings.a11y;
+        let accent = self.synoik.gnome_settings.accent_color;
+        self.synoik
+            .panel_popover
+            .toggle_login_a11y(output, anchor, a11y, accent);
+        self.synoik.queue_redraw_all();
+    }
+
     /// A click while the shield is down: raise it, raise the prompt page
     /// (`unlockDialog.js:571-573`'s click gesture), or hit something on the prompt.
     pub fn on_shield_click(&mut self, pos: Point<f64, Logical>) {
         if !self.synoik.screen_shield.is_active() {
             return;
+        }
+        // The greeter's accessibility button, on every page.
+        if self.synoik.greeter {
+            let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
+            if let Some((output, local)) = under {
+                let monitor = Rectangle::from_size(output_size(&output));
+                if crate::ui::login_dialog::a11y_hit(monitor, local) {
+                    self.toggle_login_a11y_menu(output);
+                    return;
+                }
+            }
         }
         if self.synoik.greeter && self.synoik.login_page == LoginPage::Grid {
             let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
@@ -8782,6 +8812,7 @@ impl Synoik {
             smartcard_detected: false,
             can_switch_user: false,
             switch_user_hovered: false,
+            login_a11y_hovered: false,
             multiple_users: false,
             gdm_requests: None,
             lock_timer: None,
@@ -12445,6 +12476,25 @@ impl Synoik {
                             crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
                             crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
                         }
+                    }
+                }
+                let a11y = crate::ui::login_dialog::A11yButtonState {
+                    hovered: self.login_a11y_hovered,
+                    focused: self.login_page == LoginPage::Grid
+                        && self.login_grid.focused() == Some(crate::ui::login_grid::GridHit::A11y),
+                    active: self.panel_popover.is_login_a11y_open(),
+                };
+                for el in self.login_chrome.render_a11y(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    page_ctx,
+                    a11y,
+                    self.gnome_settings.accent_color,
+                    prompt_t,
+                ) {
+                    match el {
+                        crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                        crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
                     }
                 }
                 if let (Some(text), true) = (&ls.banner, self.login_page != LoginPage::Grid) {

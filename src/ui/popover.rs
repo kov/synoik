@@ -330,6 +330,12 @@ pub enum PopoverAction {
         toggle: crate::gnome::A11yToggle,
         on: bool,
     },
+    /// Flip one of the login screen's accessibility quick toggles: the same write, but the menu
+    /// stays, as a `QuickToggle` never closes its menu.
+    FlipA11yQuickToggle {
+        toggle: crate::gnome::A11yToggle,
+        on: bool,
+    },
 }
 
 impl PopoverAction {
@@ -403,6 +409,8 @@ pub enum PopoverContent {
     QuickSettings(Box<QuickSettings>),
     InputSources(InputSourceMenu),
     A11y(Box<A11yMenu>),
+    /// The login screen's accessibility button's menu.
+    LoginA11y(Box<crate::ui::login_a11y_menu::LoginA11yMenu>),
     App(Box<AppMenu>),
     /// An app indicator's remote menu, which opens empty and fills in when the client answers.
     Indicator(Box<IndicatorMenu>),
@@ -437,6 +445,7 @@ impl PopoverContent {
             PopoverContent::QuickSettings(qs) => qs.logical_size(),
             PopoverContent::InputSources(m) => m.logical_size(),
             PopoverContent::A11y(m) => m.logical_size(),
+            PopoverContent::LoginA11y(m) => m.logical_size(),
             PopoverContent::App(m) => m.logical_size(),
             PopoverContent::Indicator(m) => m.logical_size(),
             PopoverContent::Window(m) => m.logical_size(),
@@ -463,6 +472,7 @@ impl PopoverContent {
             PopoverContent::Background(m) => (m.nav(dir), None),
             PopoverContent::InputSources(m) => (m.nav(dir), None),
             PopoverContent::A11y(m) => (m.nav(dir), None),
+            PopoverContent::LoginA11y(m) => (m.nav(dir), None),
             PopoverContent::QuickSettings(qs) => qs.nav(dir),
             PopoverContent::Calendar(dm) => (dm.nav(dir), None),
         }
@@ -486,6 +496,7 @@ impl PopoverContent {
             }
             PopoverContent::QuickSettings(qs) => Activation::new(qs.activate_focused()),
             PopoverContent::Calendar(dm) => Activation::new(dm.activate_focused()),
+            PopoverContent::LoginA11y(m) => Activation::new(m.activate_focused()),
         }
     }
 
@@ -496,6 +507,7 @@ impl PopoverContent {
             PopoverContent::QuickSettings(qs) => qs.corner_radius(),
             PopoverContent::InputSources(m) => m.corner_radius(),
             PopoverContent::A11y(m) => m.corner_radius(),
+            PopoverContent::LoginA11y(m) => m.corner_radius(),
             PopoverContent::App(m) => m.corner_radius(),
             PopoverContent::Indicator(m) => m.corner_radius(),
             PopoverContent::Window(m) => m.corner_radius(),
@@ -637,7 +649,41 @@ impl PanelPopover {
             // would have to name *which* icon; it does not, and lighting the whole cluster would
             // be worse than lighting none of it.
             PopoverContent::Indicator(_) => None,
+            // It hangs off the login dialog's own button, which reads `is_login_a11y_open`.
+            PopoverContent::LoginA11y(_) => None,
         }
+    }
+
+    /// Whether the login screen's accessibility menu is up — its button's `:active`
+    /// (`loginDialog.js:445-449`). False once it starts closing, as `open-state-changed` is.
+    pub fn is_login_a11y_open(&self) -> bool {
+        self.open && !self.closing && self.is_showing::<LoginA11yTag>()
+    }
+
+    /// The login screen's accessibility button was clicked (`this._menu.toggle()`,
+    /// `loginDialog.js:455`). The box goes **above** the button: `QuickSettingsMenu` asks for
+    /// `St.Side.TOP` (`quickSettings.js:733`) and `BoxPointer._calculateArrowSide` flips it at the
+    /// screen's bottom edge.
+    pub fn toggle_login_a11y(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        settings: crate::gnome::A11ySettings,
+        accent: [u8; 3],
+    ) {
+        if self.is_showing::<LoginA11yTag>() {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Bottom;
+        self.content = Some(PopoverContent::LoginA11y(Box::new(
+            crate::ui::login_a11y_menu::LoginA11yMenu::new(settings, accent),
+        )));
+        self.anim = Some(self.make_anim(0., 1.));
     }
 
     /// Build an open/close fade animation from `from` to `to` using the configured
@@ -1228,6 +1274,7 @@ impl PanelPopover {
     pub fn set_a11y(&mut self, a11y: crate::gnome::A11ySettings) -> bool {
         match &mut self.content {
             Some(PopoverContent::A11y(m)) if self.open => m.set_settings(a11y),
+            Some(PopoverContent::LoginA11y(m)) if self.open => m.set_settings(a11y),
             _ => false,
         }
     }
@@ -1293,6 +1340,7 @@ impl PanelPopover {
     pub fn focused_row_label(&self) -> Option<String> {
         match self.content.as_ref()? {
             PopoverContent::A11y(m) => m.focused_label().map(str::to_owned),
+            PopoverContent::LoginA11y(m) => m.focused_label().map(str::to_owned),
             PopoverContent::InputSources(m) => m.focused_label().map(str::to_owned),
             PopoverContent::App(m) => m.focused_label(),
             PopoverContent::Indicator(m) => m.focused_label(),
@@ -1464,6 +1512,7 @@ impl PanelPopover {
             Some(PopoverContent::QuickSettings(qs)) => qs.pointer_hover(local),
             Some(PopoverContent::InputSources(m)) => m.pointer_hover(local),
             Some(PopoverContent::A11y(m)) => m.pointer_hover(local),
+            Some(PopoverContent::LoginA11y(m)) => m.pointer_hover(local),
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
             Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
             Some(PopoverContent::Window(m)) => m.pointer_hover(local),
@@ -1639,6 +1688,9 @@ impl PanelPopover {
             Some(PopoverContent::A11y(m)) => {
                 m.nav(widget::Dir::Down);
             }
+            Some(PopoverContent::LoginA11y(m)) => {
+                m.nav(widget::Dir::Down);
+            }
             Some(PopoverContent::Calendar(dm)) => dm.focus_first(),
             None => (),
         }
@@ -1688,6 +1740,7 @@ impl PanelPopover {
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
                 Some(PopoverContent::InputSources(m)) => m.pointer_click(local),
                 Some(PopoverContent::A11y(m)) => m.pointer_click(local),
+                Some(PopoverContent::LoginA11y(m)) => m.pointer_click(local),
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
                 Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
                 Some(PopoverContent::Window(m)) => m.pointer_click(local),
@@ -1845,6 +1898,7 @@ impl PanelPopover {
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::LoginA11y(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
@@ -2011,6 +2065,12 @@ impl ContentTag for InputSourcesTag {
     }
 }
 struct A11yTag;
+struct LoginA11yTag;
+impl ContentTag for LoginA11yTag {
+    fn matches(content: &PopoverContent) -> bool {
+        matches!(content, PopoverContent::LoginA11y(_))
+    }
+}
 impl ContentTag for A11yTag {
     fn matches(content: &PopoverContent) -> bool {
         matches!(content, PopoverContent::A11y(_))

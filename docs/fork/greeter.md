@@ -291,7 +291,9 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. With `disable-user-list`, or once the list has loaded
   empty or with more than twelve users, the greeter starts on the name question instead,
   re-deciding whenever either changes while nobody is being asked (`:914-930`).
-- **Not listed?** the mockup's "Enter User Name ›" pill at the bottom-right opens the name page:
+- **Not listed?** the mockup's "Enter User Name ›" pill opens the name page. It sits in GNOME's
+  bottom button group, left of the accessibility button, where GDM's session button would be,
+  centred on the same line:
   the prompt with the generic picture and no name, asking "Username" in the clear with no
   conversation behind it (`:1141-1165`). Enter begins a login conversation for what was typed,
   still drawn with the generic picture (`authPrompt.js:722-732`); an empty name stays on the
@@ -304,8 +306,13 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   (`:754-858`, `946-1010`, `1115-1126`). Not built: the wide layout beside the prompt, the scroll
   bar, and watching the file — it is read when the settings are. **Logo** (`logo`) bottom-centre at
   its natural size above a 3em margin, on every page (`:705-717`, `1018-1039`).
-  **Accessibility** button bottom-right, a two-column menu of the ten accessibility toggles
-  (`:415-459`) — not built.
+  **Accessibility** button (`src/ui/login_dialog.rs`, `src/ui/login_a11y_menu.rs`): a round
+  system button in the bottom button group's corner (32px in, `_login-lock.scss:29-45`), on every
+  page, `:active` while its menu is up. The menu is a two-column `QuickSettingsMenu` of the ten
+  accessibility quick toggles (`:415-459`, `status/accessibility.js:148-330`), above the button;
+  a toggle writes its key and leaves the menu up. On the grid it is the focus stop after the pill;
+  on the other pages it is pointer-only. The keys go to the greeter user's own dconf, as in
+  GNOME; what each one turns on is the accessibility work's, not this page's.
 
 ### 4.3 The auth prompt
 
@@ -510,7 +517,7 @@ Measured 2026-10-11 on the same guest, by injected keys: the greeter shows Claud
 session 2) and u2; picking u2 asks for u2's password (`OpenReauthenticationChannel` is
 `AccessDenied`, the client falls back to `OpenSession`) and the right one starts session 10, which
 seat0 fronts. Back on the greeter u2 has the ring; picking Claude reauthenticates and fronts
-session 2. Left in step 3: the a11y button. A polkit check run inside the greeter's session for an admin-only action
+session 2. A polkit check run inside the greeter's session for an admin-only action
 (`systemd1.manage-units`) raises the prompt over the grid for Claude, the administrator, and
 Escape dismisses it; Restart from the greeter's menu with Claude logged in reboots without one,
 since Fedora allows `reboot-multiple-sessions` to an active session.

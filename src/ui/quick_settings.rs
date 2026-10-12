@@ -63,48 +63,20 @@ use crate::utils::to_physical_precise_round;
 /// `.quick-settings` padding is `$base_padding * 3` (`$base_padding: 6px` → 18px) — the uniform
 /// outer margin every element insets from (`_quick-settings.scss:2`).
 const PAD: f64 = 18.;
-/// `.quick-toggle` is a fixed `12em` (`min/max-width`, `_quick-settings.scss:17-18`). `1em` is
-/// `$base_font_size` (11pt), so 12em = `12 * pt_to_px(11)` ≈ 176px — wider than the old 150, which
-/// cramped two-line tiles (Power Mode) and made the whole menu narrower than gnome-shell's.
+/// The toggle's geometry is [`widget::QuickToggle`]'s, shared with the greeter's accessibility
+/// menu.
 fn tile_w() -> f64 {
-    TILE_EM * crate::ui::pt_to_px(11.0)
+    widget::QuickToggle::width()
 }
-
-/// **DIVERGENCE (deliberate).** gnome-shell's `.quick-toggle` is `min/max-width: 12em`
-/// (`_quick-settings.scss:17-18`). Ours is wider, because at 12em a menu-bearing tile has
-/// 12em − 94 ≈ 82px for its label once the icon inset (15), icon (16), gap (9), the padding the
-/// label keeps clear of the divider (9), the divider (1) and the arrow half (44) are taken — and
-/// "Power Mode" measures ~90. Upstream gets away with 12em because it *ellipsizes*; we clip, so
-/// too-narrow shows up as a chopped word rather than as "Power Mod…".
-///
-/// 13em fits it with a little room. This is the width the whole popover derives from
-/// ([`menu_w`]), so it widens the menu too.
-///
-/// The real fix is ellipsis: a long enough Wi-Fi name will still clip at any width we pick. When
-/// the toolkit grows it, this can go back to 12em.
-const TILE_EM: f64 = 13.0;
-/// `.quick-toggle` is `min-height: $scalable_icon_size * 3` = 48px (`_quick-settings.scss:19`) —
-/// sized off the icon so the button scales with it, as the rule's own comment says. Measured
-/// 48.0019 on a live 50.3 shell.
-const TILE_H: f64 = 48.;
+const TILE_H: f64 = widget::QuickToggle::HEIGHT;
 /// `.quick-settings-grid` `spacing-rows`/`spacing-columns`: `$base_padding * 2` = 12px
 /// (`_quick-settings.scss:11-12`).
-const TILE_GAP: f64 = 12.;
+const TILE_GAP: f64 = widget::QuickToggle::GAP;
 const COLS: usize = 2;
-/// Icon size inside a tile, and its inset from the tile's left edge.
-const TILE_ICON: f64 = 16.;
-/// The tile icon's inset from the tile's left edge: `.quick-toggle > StBoxLayout`'s
-/// `padding-left: $base_padding * 2.5` = 15px (`_quick-settings.scss:35`, the `:ltr` rule — the
-/// base rule's `0 $base_padding * 2` = 12 is what the RTL side and the right edge keep).
-const TILE_ICON_INSET: f64 = 15.;
-/// Gap between a tile's icon and its label: that same box's `spacing: $base_padding * 1.5` = 9px
-/// (`_quick-settings.scss:26`).
-const TILE_ICON_GAP: f64 = 9.;
-/// Tile-title / battery-percentage font size, logical px. GNOME's `.quick-toggle-title`
-/// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
-/// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
-/// light/small.
-const LABEL_PT: f64 = 11.;
+const TILE_ICON: f64 = widget::QuickToggle::ICON_PX;
+const TILE_ICON_INSET: f64 = widget::QuickToggle::ICON_INSET;
+const TILE_ICON_GAP: f64 = widget::QuickToggle::ICON_GAP;
+const LABEL_PT: f64 = widget::QuickToggle::TITLE_PT;
 
 /// A tile subtitle's font size — gnome-shell's `.quick-toggle-subtitle` is `%caption` (9pt),
 /// regular weight (`gnome-shell-sass/widgets/_quick-settings.scss`). Only Power Mode uses a
@@ -3917,14 +3889,16 @@ impl QuickSettings {
                     &self.power,
                     self.bluetooth.powered,
                 );
-                let bg = if on { self.accent } else { TILE_OFF };
-                // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
-                // half-height radius clamps to the pill in `sdf_rect.frag`. The cut corners fall
-                // back to the chrome's menu bg behind this texture.
-                p.fill_rounded(rect, rect.size.h / 2., bg)?;
-                if self.hovered == Some(QsHover::Tile(i)) {
-                    p.fill_rounded(rect, rect.size.h / 2., style::HOVER_WASH)?;
-                }
+                p.quick_toggle(
+                    &widget::QuickToggle {
+                        rect,
+                        checked: on,
+                        hovered: self.hovered == Some(QsHover::Tile(i)),
+                        // The grid's ring is drawn below with the other stops'.
+                        focused: false,
+                    },
+                    self.accent,
+                )?;
 
                 // A menu tile's arrow-half is separated from the body by a 1px divider
                 // (`.quick-toggle-separator`); v1 keeps one pill background and marks the split

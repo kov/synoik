@@ -2549,7 +2549,9 @@ impl State {
                 }
                 set_toggle(self, |t, v| t.night_light = v, v);
             }
-            PopoverAction::SetA11yToggle { toggle, on } => {
+            // The login menu's quick toggles write the same keys; that menu simply stays open.
+            PopoverAction::SetA11yToggle { toggle, on }
+            | PopoverAction::FlipA11yQuickToggle { toggle, on } => {
                 if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_a11y_toggle(toggle, on);
                 }
@@ -6201,6 +6203,15 @@ impl State {
             });
             if self.synoik.panel.set_hovered_role(role) {
                 self.synoik.queue_redraw_all();
+            }
+            if self.synoik.greeter {
+                let on_a11y = self.synoik.output_under(pos).is_some_and(|(output, p)| {
+                    crate::ui::login_dialog::a11y_hit(Rectangle::from_size(output_size(output)), p)
+                });
+                if self.synoik.login_a11y_hovered != on_a11y {
+                    self.synoik.login_a11y_hovered = on_a11y;
+                    self.synoik.queue_redraw_all();
+                }
             }
             if self.synoik.greeter && self.synoik.login_page == crate::synoik::LoginPage::Grid {
                 let count = self.synoik.login_users.len();

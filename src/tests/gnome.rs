@@ -42289,6 +42289,89 @@ fn a_name_question_does_not_outlive_its_page() {
     assert!(f.synoik().unlock_dialog.entry_mask().is_some());
 }
 
+/// The login dialog's accessibility button (`A11yMenuButton`, `loginDialog.js:415-459`): a click
+/// opens its menu of quick toggles above it, a toggle flips its key and leaves the menu up, and
+/// it is also the stop after the "Enter User Name" pill.
+#[test]
+fn the_greeters_accessibility_button_opens_its_toggles() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::gnome::A11yToggle;
+    use crate::synoik::LoginPage;
+    use crate::ui::login_a11y_menu::LoginA11yMenu;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    let monitor = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((1920., 1080.)));
+    let button = crate::ui::login_dialog::a11y_rect(monitor);
+    let pill = crate::ui::login_grid::enter_name_rect(monitor);
+    assert!(
+        pill.loc.x + pill.size.w < button.loc.x,
+        "the pill is left of the button"
+    );
+
+    let click = |f: &mut Fixture, x: f64, y: f64| {
+        pointer_motion_to(f, x, y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    click(
+        &mut f,
+        button.loc.x + button.size.w / 2.,
+        button.loc.y + button.size.h / 2.,
+    );
+    assert!(f.synoik().panel_popover.is_login_a11y_open());
+    let origin = f.synoik().panel_popover.content_location(&output);
+    assert!(origin.y < button.loc.y, "the menu opens upward: {origin:?}");
+    assert!(
+        origin.x
+            + LoginA11yMenu::new(Default::default(), [0; 3])
+                .logical_size()
+                .w
+            <= 1920.,
+        "and stays on screen: {origin:?}"
+    );
+
+    let zoom = origin + LoginA11yMenu::tile_centre(1);
+    click(&mut f, zoom.x, zoom.y);
+    assert!(f.synoik().gnome_settings.a11y.get(A11yToggle::Zoom));
+    assert!(
+        f.synoik().panel_popover.is_login_a11y_open(),
+        "a quick toggle leaves its menu up"
+    );
+
+    tap(&mut f, KEY_ESC);
+    f.synoik().advance_animations();
+    assert!(!f.synoik().panel_popover.is_login_a11y_open());
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Grid,
+        "Escape closed the menu, not the page"
+    );
+
+    // Tab: the tile, the pill, then the button; Enter opens it.
+    tap(&mut f, KEY_TAB);
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.synoik().login_grid.focused(),
+        Some(crate::ui::login_grid::GridHit::A11y)
+    );
+    tap(&mut f, KEY_ENTER);
+    assert!(f.synoik().panel_popover.is_login_a11y_open());
+}
+
 /// Picking a user on the greeter asks gdm for a login conversation for them; Escape cancels it and
 /// goes back to the list; a verified one goes back to the list without cancelling, because the
 /// daemon is starting that session.

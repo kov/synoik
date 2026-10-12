@@ -40,10 +40,8 @@ pub const MAX_COLUMNS: usize = 4;
 /// "Grid continues to expand until there is no more room or a maximum of 12 users are displayed
 /// (after this point, it is better for someone to enter a username)."
 pub const MAX_USERS: usize = 12;
-/// The "Enter User Name" pill: height, and its margins from the bottom-right corner.
+/// The "Enter User Name" pill's height.
 const PILL_H: f64 = 40.;
-const PILL_RIGHT: f64 = 21.;
-const PILL_BOTTOM: f64 = 28.;
 const PILL_PAD: f64 = 18.;
 const PILL_ICON_PX: f64 = 16.;
 const PILL_ICON_GAP: f64 = 8.;
@@ -66,6 +64,9 @@ const TINT_SAMPLE_PX: f64 = 8.;
 pub enum GridHit {
     Tile(usize),
     EnterName,
+    /// The dialog's accessibility button — a stop in the page's focus chain, after the pill. Never
+    /// a pointer hit here: the button is on every page, so the dialog tracks its hover.
+    A11y,
 }
 
 /// What the page asks of its owner.
@@ -75,6 +76,8 @@ pub enum GridAction {
     Pick(usize),
     /// Ask for a name.
     EnterName,
+    /// Open the accessibility menu.
+    A11y,
 }
 
 /// Whether there is a grid to show for `count` listed users.
@@ -123,11 +126,15 @@ fn pill_width() -> f64 {
 
 /// The "Enter User Name" pill at the monitor's bottom-right.
 pub fn enter_name_rect(monitor: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    // In the dialog's bottom button group, before the accessibility button: GNOME's group holds
+    // the session button there (`loginDialog.js:643-658`), which this greeter does not have. The
+    // pill is shorter than the round button, so the two share a centre line.
     let w = pill_width();
+    let a11y = crate::ui::login_dialog::a11y_rect(monitor);
     Rectangle::new(
         Point::from((
-            monitor.loc.x + monitor.size.w - PILL_RIGHT - w,
-            monitor.loc.y + monitor.size.h - PILL_BOTTOM - PILL_H,
+            a11y.loc.x - crate::ui::login_dialog::BUTTON_GROUP_SPACING - w,
+            a11y.loc.y + (a11y.size.h - PILL_H) / 2.,
         )),
         Size::from((w, PILL_H)),
     )
@@ -206,27 +213,26 @@ impl LoginGrid {
         }
     }
 
-    /// A key on the page. Arrows walk the grid, Tab and Shift+Tab walk the tiles then the pill,
-    /// Enter and space activate the focus. Returns what to do, if anything, and whether the focus
-    /// moved.
+    /// A key on the page. Arrows walk the grid, Tab and Shift+Tab walk the tiles, the pill and the
+    /// accessibility button, Enter and space activate the focus. Returns what to do, if anything,
+    /// and whether the focus moved.
     pub fn key(&mut self, key: GridKey, count: usize) -> (Option<GridAction>, bool) {
         if !shows_grid(count) {
             return (None, false);
         }
         let count = count.min(MAX_USERS);
         let before = self.focused;
-        let stops = count + 1;
+        let stops = count + 2;
         let index = |h: Option<GridHit>| match h {
             Some(GridHit::Tile(i)) => Some(i),
             Some(GridHit::EnterName) => Some(count),
+            Some(GridHit::A11y) => Some(count + 1),
             None => None,
         };
-        let from_index = |i: usize| {
-            if i == count {
-                GridHit::EnterName
-            } else {
-                GridHit::Tile(i)
-            }
+        let from_index = |i: usize| match i.checked_sub(count) {
+            Some(0) => GridHit::EnterName,
+            Some(_) => GridHit::A11y,
+            None => GridHit::Tile(i),
         };
         let current = index(self.focused);
         match key {
@@ -235,6 +241,7 @@ impl LoginGrid {
                     self.focused.map(|f| match f {
                         GridHit::Tile(i) => GridAction::Pick(i),
                         GridHit::EnterName => GridAction::EnterName,
+                        GridHit::A11y => GridAction::A11y,
                     }),
                     false,
                 );
@@ -261,13 +268,19 @@ impl LoginGrid {
                     }
                 } else if self.focused.is_none() {
                     self.focused = Some(GridHit::Tile(0));
+                } else if key == GridKey::Right && self.focused == Some(GridHit::EnterName) {
+                    self.focused = Some(GridHit::A11y);
+                } else if key == GridKey::Left && self.focused == Some(GridHit::A11y) {
+                    self.focused = Some(GridHit::EnterName);
                 }
             }
             GridKey::Up => match self.focused {
                 Some(GridHit::Tile(i)) if i >= MAX_COLUMNS => {
                     self.focused = Some(GridHit::Tile(i - MAX_COLUMNS));
                 }
-                Some(GridHit::EnterName) => self.focused = Some(GridHit::Tile(count - 1)),
+                Some(GridHit::EnterName | GridHit::A11y) => {
+                    self.focused = Some(GridHit::Tile(count - 1))
+                }
                 None => self.focused = Some(GridHit::Tile(0)),
                 _ => {}
             },
@@ -284,7 +297,7 @@ impl LoginGrid {
                     });
                 }
                 None => self.focused = Some(GridHit::Tile(0)),
-                Some(GridHit::EnterName) => {}
+                Some(GridHit::EnterName | GridHit::A11y) => {}
             },
         }
         (None, self.focused != before)
@@ -302,6 +315,7 @@ impl LoginGrid {
         Some(match h {
             GridHit::Tile(i) => GridAction::Pick(i),
             GridHit::EnterName => GridAction::EnterName,
+            GridHit::A11y => GridAction::A11y,
         })
     }
 
@@ -694,10 +708,17 @@ mod tests {
         g.key(GridKey::Down, 6);
         assert_eq!(g.focused(), Some(GridHit::EnterName));
         assert_eq!(g.key(GridKey::Activate, 6).0, Some(GridAction::EnterName));
+        g.key(GridKey::Right, 6);
+        assert_eq!(g.focused(), Some(GridHit::A11y), "the pill's neighbour");
+        assert_eq!(g.key(GridKey::Activate, 6).0, Some(GridAction::A11y));
+        g.key(GridKey::Left, 6);
+        assert_eq!(g.focused(), Some(GridHit::EnterName));
+        g.key(GridKey::Next, 6);
+        assert_eq!(g.focused(), Some(GridHit::A11y));
         g.key(GridKey::Next, 6);
         assert_eq!(g.focused(), Some(GridHit::Tile(0)));
         g.key(GridKey::Prev, 6);
-        assert_eq!(g.focused(), Some(GridHit::EnterName));
+        assert_eq!(g.focused(), Some(GridHit::A11y));
     }
 
     /// Pale pictures are darkened for the white name; an empty one has no tint.
