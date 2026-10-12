@@ -73,8 +73,6 @@ pub struct Nested {
     /// The displays the outer described, by connector name.
     outputs: HashMap<String, NestedOutput>,
     next_buffer_id: u32,
-    /// Whether a frame has gone to the outer yet. The first waits for the wallpaper.
-    presented_once: bool,
     /// The outputs the handshake described, until `init` can hand them to the compositor.
     pending_outputs: Vec<OutputInfo>,
 }
@@ -174,7 +172,6 @@ impl Nested {
             ipc_outputs: Default::default(),
             outputs: HashMap::new(),
             next_buffer_id: 1,
-            presented_once: false,
             pending_outputs: outputs,
         };
         nested.attach(fd);
@@ -481,14 +478,6 @@ impl Nested {
             return RenderResult::Skipped;
         }
 
-        // GNOME shows the stage only once the background has loaded (`_doStartupAnimation`,
-        // `layout.js:693-707`). A first frame without it is a flat grey screen that the outer
-        // fades to, with the wallpaper cutting in a frame later; the greeter is held up meanwhile.
-        if !self.presented_once && !synoik.wallpaper.is_loaded() {
-            queue_estimated_vblank_timer(synoik, output.clone());
-            return RenderResult::Skipped;
-        }
-
         let name = output.name();
         let Some(out) = self.outputs.get_mut(&name) else {
             error!("render on an output the outer never described: {name}");
@@ -628,7 +617,6 @@ impl Nested {
         // The client buffers this frame sampled are latched; a new commit waits for the flip.
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        self.presented_once = true;
         RenderResult::Submitted
     }
 

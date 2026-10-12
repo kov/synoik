@@ -42012,6 +42012,46 @@ fn the_lock_screen_hint_waits_without_frames() {
     assert_eq!(f.synoik().lock_screen.hint_alpha(now), 1.);
 }
 
+/// Nothing is drawn until the wallpaper has loaded (`_doStartupAnimation` shows the stage after
+/// `_loadBackground`, `layout.js:693-707`): a first frame without it is a flat screen with the
+/// picture cutting in a frame later.
+#[test]
+fn the_first_frame_waits_for_the_wallpaper() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // A decode the compositor's loop never collects — it lands on a loop of the test's own — so it
+    // stays in flight until the test hands it over.
+    let (sender, channel) = calloop::channel::channel();
+    let mut side =
+        calloop::EventLoop::<Option<crate::wallpaper::WallpaperDecoded>>::try_new().unwrap();
+    side.handle()
+        .insert_source(channel, |event, _, slot| {
+            if let calloop::channel::Event::Msg(decoded) = event {
+                *slot = Some(decoded);
+            }
+        })
+        .unwrap();
+    f.synoik().wallpaper.spawn_worker(sender);
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some("/nonexistent/wallpaper.png".into()),
+        options: Default::default(),
+    };
+    f.synoik().wallpaper.update(&settings, None);
+    f.synoik().queue_redraw_all();
+    f.turn();
+    assert!(!f.synoik().stage_shown, "no frame while the picture loads");
+
+    let mut slot = None;
+    while slot.is_none() {
+        side.dispatch(Duration::from_secs(5), &mut slot).unwrap();
+    }
+    let decoded = slot.unwrap();
+    assert!(f.synoik().wallpaper.apply_decoded(decoded));
+    f.synoik().queue_redraw_all();
+    f.turn();
+    assert!(f.synoik().stage_shown);
+}
+
 /// A user session starts in the overview (`_startupAnimationSession` → `runStartupAnimation`,
 /// `layout.js:811-823`): on its first frame the controls are transparent and out of place, the fade
 /// and the entry's drop take 500 ms, and the dash rises over the next 500 ms.

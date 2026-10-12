@@ -1290,6 +1290,11 @@ pub struct Synoik {
     /// A user session that has not run its startup animation yet: it runs on the first frame that
     /// has its wallpaper, as GNOME's waits on `_loadBackground` (`layout.js:693-707`).
     pub startup_animation_pending: bool,
+    /// Whether a frame has been drawn. The first waits for the wallpaper: GNOME shows the stage
+    /// only once the background has loaded (`_doStartupAnimation`, `layout.js:693-707`), and a
+    /// first frame without it is a flat grey screen — which the system compositor would fade
+    /// to, with the wallpaper cutting in a frame later.
+    pub(crate) stage_shown: bool,
     /// The wake-up for the lock screen hint's fade ([`LockScreen::hint_wait`]): its deadline, so
     /// a later input moves it rather than stacking another.
     ///
@@ -9104,6 +9109,7 @@ impl Synoik {
             overview_search_was_visible: false,
             overview_search_fade: None,
             startup_animation_pending: false,
+            stage_shown: false,
             hint_wake: None,
             startup_animation: None,
             overview_search_fade_target: false,
@@ -13794,7 +13800,8 @@ impl Synoik {
         self.update_render_elements(Some(output));
 
         let mut res = RenderResult::Skipped;
-        if self.monitors_active {
+        let stage_ready = self.stage_shown || self.wallpaper.is_loaded();
+        if self.monitors_active && stage_ready {
             // Accumulated as a *named* set rather than a bare bool: the frame log records
             // it, and "animating" alone could not distinguish a workspace switch from a
             // panel button's fill fade, which is exactly the question a stutter report
@@ -13835,6 +13842,9 @@ impl Synoik {
         }
 
         let is_locked = self.is_locked();
+        if res == RenderResult::Submitted {
+            self.stage_shown = true;
+        }
         let state = self.output_state.get_mut(output).unwrap();
 
         // Nothing went to the display, so nothing will come back to say it arrived — and leaving
