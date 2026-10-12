@@ -1,0 +1,5 @@
+# Install as /usr/lib/sysusers.d/synoik-system.conf.
+#
+# The system compositor's user: unprivileged, outside any logind session; the unit gives it the
+# video and input groups (docs/fork/system-compositor.md §1).
+u synoik-system - "synoik system compositor" - -
