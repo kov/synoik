@@ -41973,6 +41973,37 @@ fn the_greeter_starts_over_when_it_comes_back() {
     assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 1.);
 }
 
+/// A user session starts in the overview (`_startupAnimationSession` → `runStartupAnimation`,
+/// `layout.js:811-823`): on its first frame the controls are transparent and out of place, the fade
+/// and the entry's drop take 500 ms, and the dash rises over the next 500 ms.
+#[test]
+fn a_session_starts_in_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().startup_animation_pending = true;
+    f.turn();
+    assert!(f.synoik().layout.is_overview_open());
+    let first = f.synoik().startup_frame();
+    assert!(first.controls < 0.1, "{first:?}");
+    assert_eq!(first.dash, 0.);
+
+    f.advance_clock(Duration::from_millis(500));
+    f.turn();
+    let mid = f.synoik().startup_frame();
+    assert_eq!(mid.controls, 1.);
+    assert_eq!(mid.dash, 0., "the dash waits for the fade");
+
+    f.advance_clock(Duration::from_millis(500));
+    f.turn();
+    f.turn();
+    assert_eq!(
+        f.synoik().startup_frame(),
+        crate::synoik::StartupFrame::default()
+    );
+    assert!(f.synoik().layout.is_overview_open(), "it stays open");
+}
+
 /// "Switch User…" locks the session before going to the login screen (`activateSwitchUser`,
 /// `systemActions.js:467-478`), so what the greeter leaves behind is a locked session. The lock is
 /// `lock(false)` — the curtain is down at once, no slide — and the switch waits for the frame that

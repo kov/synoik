@@ -376,6 +376,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.session {
         state.synoik.a11y.start();
+        // A user session opens with GNOME's startup animation; the greeter's is its panel's
+        // (`layout.js:796-809`).
+        state.synoik.startup_animation_pending = !cli.greeter;
     }
 
     if env::var_os("SYNOIK_DISABLE_SYSTEM_MANAGER_NOTIFY").is_none_or(|x| x != "1") {

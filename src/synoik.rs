@@ -236,6 +236,28 @@ const DEVICE_MEMORY_CENSUS_TARGET: &str = "devmem";
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
+/// `STARTUP_ANIMATION_TIME` (`layout.js:21`).
+const STARTUP_ANIMATION_TIME: Duration = Duration::from_millis(500);
+
+/// How far through the startup animation the overview's controls are, each 0 (where they start)
+/// to 1 (in place).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartupFrame {
+    /// The controls' opacity, and the search entry's drop from above the screen.
+    pub controls: f64,
+    /// The dash's rise from below the screen.
+    pub dash: f64,
+}
+
+impl Default for StartupFrame {
+    fn default() -> Self {
+        Self {
+            controls: 1.,
+            dash: 1.,
+        }
+    }
+}
+
 /// Which page of the login screen is up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginPage {
@@ -1265,6 +1287,13 @@ pub struct Synoik {
     /// gnome-shell's search cross-fade (`_onSearchChanged`, `overviewControls.js:609-643`):
     /// 0 while the window picker is fully shown, 1 while a search covers it.
     overview_search_fade: Option<Animation>,
+    /// A user session that has not run its startup animation yet: it runs on the first frame that
+    /// has its wallpaper, as GNOME's waits on `_loadBackground` (`layout.js:693-707`).
+    pub startup_animation_pending: bool,
+    /// The session's startup animation (`_startupAnimationSession` → `runStartupAnimation`,
+    /// `layout.js:811-823`, `overviewControls.js:801-857`): its time base, linear over both of its
+    /// 500 ms legs. See [`Synoik::startup_frame`].
+    startup_animation: Option<Animation>,
     /// The settled target of [`Self::overview_search_fade`], for edge detection.
     overview_search_fade_target: bool,
     /// The search entry's grow/shrink between its resting puck and GNOME's full pill.
@@ -9067,6 +9096,8 @@ impl Synoik {
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
+            startup_animation_pending: false,
+            startup_animation: None,
             overview_search_fade_target: false,
             overview_search_expand: None,
             overview_search_expand_target: false,
@@ -11841,6 +11872,9 @@ impl Synoik {
             AnimCauses::OVERVIEW_SEARCH,
             self.overview_search_fade.is_some() || self.overview_search_expand.is_some(),
         );
+        if self.startup_animation.is_some() {
+            causes |= AnimCauses::OVERVIEW;
+        }
         // The shield's hint fades in four seconds after the last input, and there is by
         // definition no input coming — nothing else would ask for those frames.
         //
@@ -13082,7 +13116,8 @@ impl Synoik {
 
             // The overview dash (favorites) slides up with the overview — above the
             // zoomed workspaces (pushed later, below), below the panel/popover/banner.
-            if let Some((progress, controls)) = self
+            let startup = self.startup_frame();
+            if let Some((progress, mut controls)) = self
                 .layout
                 .monitor_for_output(output)
                 .and_then(|mon| Some((mon.expose_progress()?, mon.controls_layout())))
@@ -13094,6 +13129,14 @@ impl Synoik {
                 // The zoom animates out of (and back into) the source folder's tile, so the
                 // dialog needs that tile's box on *this* output — `None` while the tile is
                 // on another page, which draws it untransformed.
+                // The startup animation moves the controls on top of their layout: the entry drops
+                // from above the screen and the dash rises from below it (`overviewControls.js:
+                // 827-853`).
+                controls.search_entry.loc.y -= (controls.search_entry.loc.y
+                    + controls.search_entry.size.h)
+                    * (1. - startup.controls);
+                controls.dash.loc.y +=
+                    (output_size(output).h - controls.dash.loc.y) * (1. - startup.dash);
                 let source = self.folder_dialog.folder_id().and_then(|id| {
                     let i = self.app_grid.index_of(id)?;
                     self.app_grid.entry_rect(i, controls.app_display)
@@ -13116,8 +13159,9 @@ impl Synoik {
                     &self.icon_cache,
                     output,
                     controls.dash,
-                    // Opaque all the way: it slides in rather than fading, like the strip.
-                    1.,
+                    // Opaque all the way: it slides in rather than fading, like the strip — but
+                    // for the startup animation, which fades every control in.
+                    startup.controls,
                     false,
                     self.appearance(),
                     self.gnome_settings.accent_color,
@@ -13135,7 +13179,7 @@ impl Synoik {
                     output,
                     controls.into(),
                     crate::ui::overview_search::SearchFade {
-                        overview: progress,
+                        overview: progress * startup.controls,
                         search: self.overview_search_fade(),
                     },
                     self.gnome_settings.accent_color,
@@ -13160,8 +13204,10 @@ impl Synoik {
                     .monitor_for_output(output)
                     .map_or(0., |mon| mon.app_grid_leg());
                 if app_grid_leg > 0. {
-                    let alpha =
-                        (app_grid_leg * progress * (1. - self.overview_search_fade())) as f32;
+                    let alpha = (app_grid_leg
+                        * progress
+                        * (1. - self.overview_search_fade())
+                        * startup.controls) as f32;
                     for element in self.app_grid.render(
                         ctx.renderer,
                         &self.app_icon_cache,
@@ -13185,7 +13231,9 @@ impl Synoik {
         // The window picker and the workspace row cross-fade out as a search covers
         // them; outside the overview the fade is 0, so this is a plain pass-through.
         let fade_scale = output.current_scale().fractional_scale();
-        let row_alpha = (1. - self.overview_search_fade()) as f32;
+        // The startup animation fades the row in with the rest of the controls: GNOME's
+        // `workspacesDisplay` and thumbnails are children of the `ControlsManager` it eases.
+        let row_alpha = ((1. - self.overview_search_fade()) * self.startup_frame().controls) as f32;
         // The picker *also* fades away as the app grid opens — see below. Off the *leg*,
         // not the raw show-apps scalar: the scalar is frozen across a close, so reading it
         // here kept the picker at alpha 0 for the whole way back to the desktop.
@@ -13715,6 +13763,18 @@ impl Synoik {
         if let Some(scheduled_at) = aim.scheduled_at {
             self.frame_log
                 .record_dispatch_lateness(redraw_start.saturating_sub(scheduled_at));
+        }
+
+        if self.startup_animation_pending && self.wallpaper.is_loaded() {
+            self.startup_animation_pending = false;
+            self.run_startup_animation();
+        }
+        if self
+            .startup_animation
+            .as_ref()
+            .is_some_and(Animation::is_done)
+        {
+            self.startup_animation = None;
         }
 
         self.frame_log.begin(&output.name());
@@ -17056,6 +17116,38 @@ impl Synoik {
     }
 
     /// Arms (or retires) the cross-fade when the search engages or clears.
+    /// `runStartupAnimation` (`overview.js:618-639`, `overviewControls.js:801-857`): the session
+    /// opens in the overview, its controls fading in while the search entry drops from the top and
+    /// then the dash rises from the bottom.
+    fn run_startup_animation(&mut self) {
+        self.layout.open_overview();
+        self.startup_animation = Some(Animation::ease(
+            self.clock.clone(),
+            0.,
+            1.,
+            0.,
+            2 * STARTUP_ANIMATION_TIME.as_millis() as u64,
+            crate::animation::Curve::Linear,
+        ));
+        self.queue_redraw_all();
+    }
+
+    /// Where the startup animation stands. Settled — every control in place and opaque — when it
+    /// is not running.
+    pub fn startup_frame(&self) -> StartupFrame {
+        let Some(anim) = &self.startup_animation else {
+            return StartupFrame::default();
+        };
+        // Two 500 ms legs of one time base: the fade and the entry's drop, then the dash (`delay:
+        // STARTUP_ANIMATION_TIME`), each `EASE_OUT_QUAD`.
+        let t = anim.clamped_value() * 2.;
+        let ease = |x: f64| crate::animation::Curve::EaseOutQuad.y(x.clamp(0., 1.));
+        StartupFrame {
+            controls: ease(t),
+            dash: ease(t - 1.),
+        }
+    }
+
     fn update_overview_search_fade(&mut self) {
         let target = self.overview_search.is_active();
         if target != self.overview_search_fade_target {
