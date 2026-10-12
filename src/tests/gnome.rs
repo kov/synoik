@@ -41973,6 +41973,45 @@ fn the_greeter_starts_over_when_it_comes_back() {
     assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 1.);
 }
 
+/// The lock screen's hint fades in after four seconds of idle (`HINT_TIMEOUT`,
+/// `unlockDialog.js:28`), and those four seconds are a wake-up, not frames: a keystroke on the
+/// prompt used to keep the screen redrawing at the refresh rate until the hint was due.
+#[test]
+fn the_lock_screen_hint_waits_without_frames() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::frame_log::AnimCauses;
+    use crate::ui::lock_screen::{HINT_FADE, HINT_IDLE};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik().lock_screen.settle();
+    f.turn();
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let animating = |f: &mut Fixture| {
+        f.synoik()
+            .anim_causes(&out)
+            .contains(AnimCauses::LOCK_SCREEN)
+    };
+    assert!(!animating(&mut f), "waiting for idle draws nothing");
+    assert!(
+        f.synoik().hint_wake.is_some(),
+        "a wake-up is armed for the fade"
+    );
+
+    // The wake-up lands the fade, which then animates on its own frames.
+    f.advance_clock(HINT_IDLE);
+    f.turn();
+    assert!(animating(&mut f));
+    f.advance_clock(HINT_FADE);
+    f.turn();
+    assert!(!animating(&mut f));
+    let now = f.synoik().shield_now();
+    assert_eq!(f.synoik().lock_screen.hint_alpha(now), 1.);
+}
+
 /// A user session starts in the overview (`_startupAnimationSession` → `runStartupAnimation`,
 /// `layout.js:811-823`): on its first frame the controls are transparent and out of place, the fade
 /// and the entry's drop take 500 ms, and the dash rises over the next 500 ms.

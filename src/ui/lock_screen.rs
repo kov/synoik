@@ -1010,13 +1010,23 @@ impl LockScreen {
         Curve::EaseOutCubic.y(t)
     }
 
-    /// Whether the curtain still needs frames — the fade is time-driven, so nothing else would ask
-    /// for one and the hint would appear only when some unrelated damage happened to land.
+    /// Whether the hint's fade needs frames. Only the fade itself: the four seconds before it are
+    /// [`hint_wait`](Self::hint_wait)'s, a wake-up rather than a frame per vblank spent watching
+    /// the clock — which a keystroke on the prompt used to start, every time.
     pub fn is_animating(&self, now: Duration) -> bool {
         let Some(since) = self.idle_since else {
             return false;
         };
-        now.saturating_sub(since) < HINT_IDLE + HINT_FADE
+        let idle = now.saturating_sub(since);
+        (HINT_IDLE..HINT_IDLE + HINT_FADE).contains(&idle)
+    }
+
+    /// How long until the hint starts fading in, while it is still waiting for idle.
+    pub fn hint_wait(&self, now: Duration) -> Option<Duration> {
+        let since = self.idle_since?;
+        HINT_IDLE
+            .checked_sub(now.saturating_sub(since))
+            .filter(|wait| !wait.is_zero())
     }
 
     /// The prompt page: avatar, name, entry, message. Front-to-back like every other `render`.
@@ -1893,11 +1903,14 @@ mod tests {
         assert_eq!(shield.hint_alpha(T0 + HINT_IDLE + HINT_FADE), 1.);
         assert!(!shield.is_animating(T0 + HINT_IDLE + HINT_FADE));
 
-        // Input restarts the watch.
+        // Input restarts the watch. Waiting for idle is a wake-up, not frames.
         let t = T0 + Duration::from_secs(10);
         shield.note_activity(t);
         assert_eq!(shield.hint_alpha(t), 0., "back to nothing");
-        assert!(shield.is_animating(t));
+        assert!(!shield.is_animating(t));
+        assert_eq!(shield.hint_wait(t), Some(HINT_IDLE));
+        assert!(shield.is_animating(t + HINT_IDLE));
+        assert_eq!(shield.hint_wait(t + HINT_IDLE), None);
         assert_eq!(shield.hint_alpha(t + HINT_IDLE + HINT_FADE), 1.);
 
         // And raising the shield stops it entirely — `note_activity` must not resurrect it.

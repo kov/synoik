@@ -1290,6 +1290,11 @@ pub struct Synoik {
     /// A user session that has not run its startup animation yet: it runs on the first frame that
     /// has its wallpaper, as GNOME's waits on `_loadBackground` (`layout.js:693-707`).
     pub startup_animation_pending: bool,
+    /// The wake-up for the lock screen hint's fade ([`LockScreen::hint_wait`]): its deadline, so
+    /// a later input moves it rather than stacking another.
+    ///
+    /// [`LockScreen::hint_wait`]: crate::ui::lock_screen::LockScreen::hint_wait
+    pub(crate) hint_wake: Option<(Duration, TimerToken)>,
     /// The session's startup animation (`_startupAnimationSession` → `runStartupAnimation`,
     /// `layout.js:811-823`, `overviewControls.js:801-857`): its time base, linear over both of its
     /// 500 ms legs. See [`Synoik::startup_frame`].
@@ -7237,10 +7242,12 @@ impl State {
         // The curtain follows `active`, not `locked`: a shield down without a lock is still a
         // shield, and it is what a `lock-enabled = false` screensaver is. The greeter's stays.
         if effects.active_changed.is_some() {
-            let now = self.synoik.shield_is_up();
-            self.synoik
-                .lock_screen
-                .set_shown(now, crate::utils::get_monotonic_time());
+            let shown = self.synoik.shield_is_up();
+            // On the clock every read of the curtain uses (`shield_now`). The raw monotonic clock
+            // runs ahead of a pinned one, so a slide started on it read as not yet begun — and
+            // the hint's idle watch as younger than it was.
+            let now = self.synoik.shield_now();
+            self.synoik.lock_screen.set_shown(shown, now);
             if effects.curtain_instant {
                 // The idle path's shield lands on an already-black screen; sliding onto it would
                 // animate something nobody can see.
@@ -9097,6 +9104,7 @@ impl Synoik {
             overview_search_was_visible: false,
             overview_search_fade: None,
             startup_animation_pending: false,
+            hint_wake: None,
             startup_animation: None,
             overview_search_fade_target: false,
             overview_search_expand: None,
@@ -13776,6 +13784,7 @@ impl Synoik {
         {
             self.startup_animation = None;
         }
+        self.sync_hint_wake();
 
         self.frame_log.begin(&output.name());
         // Taken now: whatever asks during this redraw is asking for the next one.
@@ -17116,6 +17125,26 @@ impl Synoik {
     }
 
     /// Arms (or retires) the cross-fade when the search engages or clears.
+    /// Keep a wake-up armed for when the lock screen's hint starts fading in.
+    fn sync_hint_wake(&mut self) {
+        let now = self.shield_now();
+        let deadline = self.lock_screen.hint_wait(now).map(|wait| now + wait);
+        if self.hint_wake.as_ref().map(|(at, _)| *at) == deadline {
+            return;
+        }
+        if let Some((_, token)) = self.hint_wake.take() {
+            self.cancel_timer(token);
+        }
+        if let Some(at) = deadline {
+            let token = self.timer_after(at - now, |state| {
+                state.synoik.hint_wake = None;
+                state.synoik.queue_redraw_all();
+                None
+            });
+            self.hint_wake = Some((at, token));
+        }
+    }
+
     /// `runStartupAnimation` (`overview.js:618-639`, `overviewControls.js:801-857`): the session
     /// opens in the overview, its controls fading in while the search entry drops from the top and
     /// then the dash rises from the bottom.
