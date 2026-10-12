@@ -41858,10 +41858,11 @@ fn the_greeter_is_gdm_mode() {
     assert!(!sections.message_list && !sections.displays);
 }
 
-/// The greeter has no gnome-session to ask, so its Power Off raises the confirmation itself, with
-/// gnome-session's 60 s countdown (`gsm-shell.c:40`); Suspend asks nothing.
+/// The greeter's Power Off asks its gnome-session, as gnome-shell's does
+/// (`systemActions.js:491-496`): no confirmation comes up until gnome-session's `Open` does.
 #[test]
-fn the_greeters_power_off_confirms_like_gnome_session() {
+fn the_greeters_power_off_asks_gnome_session() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
     use crate::end_session::{EndSessionType, SessionRequest};
 
     let mut f = Fixture::new();
@@ -41871,17 +41872,18 @@ fn the_greeters_power_off_confirms_like_gnome_session() {
     f.synoik_state().show_greeter_dialog();
 
     f.synoik_state()
-        .request_session_action(SessionRequest::Suspend);
+        .request_session_action(SessionRequest::PowerOff);
     assert!(!f.synoik().end_session.is_open());
 
     f.synoik_state()
-        .request_session_action(SessionRequest::PowerOff);
-    let now = f.synoik().clock.now_unadjusted();
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 1,
+            seconds: 60,
+        });
     assert_eq!(
         f.synoik().end_session.kind(),
         Some(EndSessionType::Shutdown)
     );
-    assert_eq!(f.synoik().end_session.seconds_left(now), Some(60));
 }
 
 /// A menu open over the lock screen takes keys, and nothing past it does: the overlay key does not
@@ -42575,7 +42577,7 @@ fn the_greeter_logs_a_picked_user_in() {
 /// runs on.
 #[test]
 fn the_greeters_power_off_can_be_cancelled() {
-    use crate::end_session::SessionRequest;
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -42583,7 +42585,10 @@ fn the_greeters_power_off_can_be_cancelled() {
     f.synoik().greeter = true;
     f.synoik_state().show_greeter_dialog();
     f.synoik_state()
-        .request_session_action(SessionRequest::PowerOff);
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 1,
+            seconds: 60,
+        });
     // Keys reach the dialog once it has faded in (`is_interactive`).
     f.settle_animations();
     assert!(f.synoik().end_session.is_open());

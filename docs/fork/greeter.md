@@ -277,10 +277,9 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
 - **Power menu:** Suspend, Restart, Power Off — all hidden by `disable-restart-buttons`, and with
   them the power button (`systemActions.js:371-420`, `system.js:239-241`). The lock screen offers
   Restart and Power Off only with `org.gnome.desktop.screensaver restart-enabled`, false by
-  default. Not ported: hiding one while locked when logind says it needs authentication. gnome-shell routes them through gnome-session;
-  ours do not yet, although the greeter now runs one: Restart and Power Off raise the end-session
-  confirmation themselves, with gnome-session's 60 s countdown (`gsm-shell.c:40`), and the confirmation calls
-  logind (`Reboot`, `PowerOff`); Suspend calls logind at once.
+  default. Not ported: hiding one while locked when logind says it needs authentication. Every one asks the
+  greeter's gnome-session (`systemActions.js:491-509`), which raises the end-session confirmation
+  through `EndSessionDialog.Open` and carries out the confirmed action, as in a user's session.
 - **Behind the menus:** while the mode is locked or the greeter, no menu action may start an app,
   a command or the screenshot UI — the one Settings hand-off GNOME leaves there (a network's
   802.1x form, `network.js:943-952`) goes nowhere.

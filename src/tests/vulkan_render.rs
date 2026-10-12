@@ -16608,8 +16608,8 @@ fn vulkan_draws_the_greeter_user_grid() {
 /// each change the pixels under their Cancel button.
 #[test]
 fn vulkan_draws_dialogs_over_the_greeter() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
     use crate::dbus::polkit_agent::{BeginRequest, PolkitToSynoik};
-    use crate::end_session::SessionRequest;
     use crate::polkit_dialog::Focus;
 
     if let Err(e) = VulkanRenderer::new() {
@@ -16686,7 +16686,10 @@ fn vulkan_draws_dialogs_over_the_greeter() {
     f.synoik_complete_animations();
     assert!(!f.synoik().polkit_is_open());
     f.synoik_state()
-        .request_session_action(SessionRequest::PowerOff);
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 1,
+            seconds: 60,
+        });
     f.synoik_complete_animations();
     let cancel = f.synoik().end_session_dialog.cancel_button_rect(size);
     let (with_end_session, _, _) = render_output_vulkan(&mut f, &output);

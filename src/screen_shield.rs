@@ -265,8 +265,8 @@ impl ScreenShield {
     /// Clears `locked` too: GNOME only reaches here once the dialog has authenticated (or was
     /// never needed), so the caller owes that check, not this.
     pub fn deactivate(&mut self) -> ShieldEffects {
-        // The greeter's shield stays: GNOME only clears `isActive` there, for gnome-session's idle
-        // counter (`:530-541`), and the greeter session has no gnome-session.
+        // The greeter's shield stays. GNOME also clears `isActive` there, so gnome-session resets
+        // its idle counter and gsd stops blanking (`:530-541`); not ported yet — ours stays set.
         if self.greeter {
             return ShieldEffects::default();
         }
