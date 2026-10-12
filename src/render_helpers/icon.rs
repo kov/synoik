@@ -546,6 +546,15 @@ pub const EMBEDDED_ICON_NAMES: &[&str] = &[
     "battery-alert-symbolic",
     "battery-alert-halo-symbolic",
     "battery-bolt-halo-symbolic",
+    "accessibility-high-contrast-symbolic",
+    "accessibility-zoom-symbolic",
+    "accessibility-large-text-symbolic",
+    "accessibility-screen-reader-symbolic",
+    "accessibility-visual-alerts-symbolic",
+    "accessibility-sticky-keys-symbolic",
+    "accessibility-slow-keys-symbolic",
+    "accessibility-bounce-keys-symbolic",
+    "accessibility-mouse-keys-symbolic",
 ];
 
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
@@ -612,6 +621,34 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         )),
         "screenshot-ui-show-pointer-symbolic" => Some(include_bytes!(
             "../../resources/icons/screenshot-ui-show-pointer-symbolic.svg"
+        )),
+        // The accessibility quick toggles' glyphs (`status/accessibility.js:154-318`).
+        "accessibility-high-contrast-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-high-contrast-symbolic.svg"
+        )),
+        "accessibility-zoom-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-zoom-symbolic.svg"
+        )),
+        "accessibility-large-text-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-large-text-symbolic.svg"
+        )),
+        "accessibility-screen-reader-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-screen-reader-symbolic.svg"
+        )),
+        "accessibility-visual-alerts-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-visual-alerts-symbolic.svg"
+        )),
+        "accessibility-sticky-keys-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-sticky-keys-symbolic.svg"
+        )),
+        "accessibility-slow-keys-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-slow-keys-symbolic.svg"
+        )),
+        "accessibility-bounce-keys-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-bounce-keys-symbolic.svg"
+        )),
+        "accessibility-mouse-keys-symbolic" => Some(include_bytes!(
+            "../../resources/icons/accessibility-mouse-keys-symbolic.svg"
         )),
         _ => None,
     }
