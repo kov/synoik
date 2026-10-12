@@ -41960,7 +41960,9 @@ fn the_greeter_starts_over_when_it_comes_back() {
 }
 
 /// "Switch User…" locks the session before going to the login screen (`activateSwitchUser`,
-/// `systemActions.js:467-478`), so what the greeter leaves behind is a locked session.
+/// `systemActions.js:467-478`), so what the greeter leaves behind is a locked session. The lock is
+/// `lock(false)` — the curtain is down at once, no slide — and the switch waits for the frame that
+/// shows it (`POST_PAINT`): a slide or a desktop is never the picture the switch fades away from.
 #[test]
 fn switch_user_locks_the_session_first() {
     let mut f = Fixture::new();
@@ -41970,6 +41972,13 @@ fn switch_user_locks_the_session_first() {
     f.synoik_state().activate_switch_user();
     assert!(f.synoik().screen_shield.is_active());
     assert!(f.synoik().shield_is_up());
+    assert!(f.synoik().shield_curtain_landed(), "no slide");
+    assert!(
+        f.synoik().switch_user_on_shield_frame,
+        "the switch waits for the locked frame"
+    );
+    f.turn();
+    assert!(!f.synoik().switch_user_on_shield_frame);
 }
 
 /// The greeter's Power Off asks its gnome-session, as gnome-shell's does

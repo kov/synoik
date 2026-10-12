@@ -325,6 +325,19 @@ impl ScreenShield {
         Ok(effects)
     }
 
+    /// `lock(false)`: [`lock`](Self::lock) with the curtain put down without its slide — logind's
+    /// `Lock` and Switch User (`screenShield.js:147-148`, `systemActions.js:474`), where the
+    /// picture that matters is the locked one, not the way there.
+    pub fn lock_instant(
+        &mut self,
+        now: Duration,
+        password_mode_none: bool,
+    ) -> Result<ShieldEffects, LockRefused> {
+        let mut effects = self.lock(now, password_mode_none)?;
+        effects.curtain_instant = true;
+        Ok(effects)
+    }
+
     /// The verifier answered: `true` if a reauthentication channel is open and the conversation
     /// has begun, `false` if it could not be had.
     ///

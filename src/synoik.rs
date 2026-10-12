@@ -816,6 +816,10 @@ pub struct Synoik {
     /// any that have gone away: an output unplugged mid-suspend owes nothing, and making the
     /// removal path remember that would be a second place to get it wrong.
     pub shield_frames_owed: HashSet<Output>,
+    /// Switch User is waiting for the locked shield to reach the screen before it goes to the
+    /// login screen (`activateSwitchUser`'s `POST_PAINT`, `systemActions.js:476-479`), so the
+    /// picture left behind is the lock screen, never the desktop.
+    pub switch_user_on_shield_frame: bool,
     /// The bound on the above (see [`Self::SHIELD_PRESENT_DEADLINE`]).
     pub shield_present_deadline: Option<TimerToken>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
@@ -6010,7 +6014,7 @@ impl State {
             Login1ToSynoik::SessionLock(lock) => {
                 let now = self.synoik.shield_now();
                 let effects = if lock {
-                    match self.synoik.screen_shield.lock(now, false) {
+                    match self.synoik.screen_shield.lock_instant(now, false) {
                         Ok(effects) => effects,
                         Err(crate::screen_shield::LockRefused::LockedDown) => {
                             debug!("screen lock is locked down, ignoring logind Lock");
@@ -6617,10 +6621,22 @@ impl State {
     /// (`activateSwitchUser`, `systemActions.js:467-478`) — the session is locked behind the
     /// greeter, as GNOME leaves it.
     pub fn activate_switch_user(&mut self) {
-        self.on_screen_saver_msg(crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(
-            None,
-        ));
-        self.switch_user();
+        let now = self.synoik.shield_now();
+        let passwordless = self.synoik.user_account.password_mode.is_none();
+        match self.synoik.screen_shield.lock_instant(now, passwordless) {
+            Ok(effects) => self.apply_shield_effects(effects),
+            // GNOME goes to the login screen all the same (`lock` only logs, `:638-641`).
+            Err(crate::screen_shield::LockRefused::LockedDown) => {
+                debug!("screen lock is locked down; switching users unlocked")
+            }
+        }
+        self.synoik.switch_user_on_shield_frame = true;
+        self.synoik.arm_shield_present_wait();
+        // Nothing is drawing (no output), so no frame will come to say the shield is up.
+        if self.synoik.shield_frames_owed.is_empty() {
+            self.synoik.clear_shield_present_wait();
+        }
+        self.synoik.queue_redraw_all();
     }
 
     pub fn switch_user(&mut self) {
@@ -6628,26 +6644,7 @@ impl State {
         let effects = self.synoik.unlock_dialog.cancel();
         self.apply_unlock_effects(effects);
         self.synoik.lock_screen.note_activity(now);
-
-        let Some(conn) = self
-            .synoik
-            .dbus
-            .as_ref()
-            .and_then(|d| d.conn_accounts.as_ref())
-        else {
-            warn!("cannot switch users: no system bus connection");
-            return;
-        };
-        // Detached: this is several system-bus round trips and the event loop is also the render
-        // loop. Nothing waits for it — the outcome is a session switch, not a frame.
-        let async_conn = conn.inner().clone();
-        conn.inner()
-            .executor()
-            .spawn(
-                async move { crate::dbus::user_switching::goto_login_session(&async_conn).await },
-                "goto-login-session",
-            )
-            .detach();
+        self.synoik.goto_login_session();
     }
 
     /// Publish an [`UnlockEffects`](crate::unlock_dialog::UnlockEffects).
@@ -8910,6 +8907,7 @@ impl Synoik {
             session_active: true,
             sleep_inhibitor: None,
             shield_frames_owed: HashSet::new(),
+            switch_user_on_shield_frame: false,
             shield_present_deadline: None,
             shield_snapshot: Default::default(),
             screen_saver_emit: None,
@@ -12145,7 +12143,7 @@ impl Synoik {
             Self::SHIELD_PRESENT_DEADLINE,
             move |state| {
                 if !state.synoik.shield_frames_owed.is_empty() {
-                    warn!("the shield never reached the screen; letting the suspend go ahead");
+                    warn!("the shield never reached the screen; going ahead without it");
                     state.synoik.clear_shield_present_wait();
                 }
                 None
@@ -12164,6 +12162,27 @@ impl Synoik {
             state.shield_frame_queued = false;
         }
         self.sync_sleep_inhibitor();
+        if std::mem::take(&mut self.switch_user_on_shield_frame) {
+            self.goto_login_session();
+        }
+    }
+
+    /// Ask the display manager for the login screen (`Gdm.goto_login_session_sync`).
+    pub fn goto_login_session(&self) {
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_accounts.as_ref()) else {
+            warn!("cannot switch users: no system bus connection");
+            return;
+        };
+        // Detached: this is several system-bus round trips and the event loop is also the render
+        // loop. Nothing waits for it — the outcome is a session switch, not a frame.
+        let async_conn = conn.inner().clone();
+        conn.inner()
+            .executor()
+            .spawn(
+                async move { crate::dbus::user_switching::goto_login_session(&async_conn).await },
+                "goto-login-session",
+            )
+            .detach();
     }
 
     /// A frame carrying the settled curtain has been presented on `output`.
