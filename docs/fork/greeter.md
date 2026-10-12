@@ -245,9 +245,11 @@ too — to be designed on its own.
 **session mode** (`src/session_mode.rs`, `js/ui/sessionMode.js:22-102`): `user`, `unlock-dialog`
 while a user's shield is up, `gdm` for the greeter, each defaulting to `restrictive`. The greeter
 is the **screen shield shown at startup** (`main.js:327-330` → `screenShield.showDialog`, the
-`LoginDialog` in the unlock dialog's place): down and locked from the first frame, never raised
-(`deactivate` only clears GNOME's `isActive`, `screenShield.js:530-541`), so every gate the lock
-screen already has covers the greeter too. The mode is not locked, so the polkit and network
+`LoginDialog` in the unlock dialog's place): down and locked from the first frame, never raised,
+so every gate the lock screen already has covers the greeter too. It is not a screensaver:
+`showDialog` never sets `isActive`, which goes up on the idle fade like any session's and is
+cleared by a `deactivate` that leaves the dialog in place (`screenShield.js:321-327`, `:530-541`) —
+the state gnome-session and gsd-power read. The mode is not locked, so the polkit and network
 agents' prompts show over it (`gdm` components, `sessionMode.js:55-57`) where a lock defers them;
 they and the end-session confirmation draw above the shield and take its input first
 (`modalDialogGroup` over `screenShieldGroup`, `layout.js:267-294`). The greeter's network agent
