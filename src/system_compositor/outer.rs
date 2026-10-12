@@ -121,9 +121,53 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
             warn!("no switch chord: {err:#}");
         }
     }
+    if let Err(err) = watch_shutdown(&handle) {
+        warn!("no fade at shutdown: {err:#}");
+    }
 
     notify(&[sd_notify::NotifyState::Ready]);
     event_loop.run(None, &mut outer, |_| ())?;
+    Ok(())
+}
+
+/// What the screen fades to as the machine goes down.
+const BLACK: [f32; 3] = [0., 0., 0.];
+
+/// Deliver logind's `PrepareForShutdown` to the loop. A thread of its own: the outer's loop is
+/// calloop, not an executor, and the signal is all it wants from the bus.
+fn watch_shutdown(handle: &LoopHandle<'static, Outer>) -> anyhow::Result<()> {
+    let (tx, rx) = smithay::reexports::calloop::channel::channel::<bool>();
+    handle
+        .insert_source(rx, |event, _, outer: &mut Outer| {
+            if let smithay::reexports::calloop::channel::Event::Msg(going) = event {
+                outer.on_prepare_for_shutdown(going);
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("inserting the shutdown channel: {err}"))?;
+    std::thread::Builder::new()
+        .name("logind-shutdown".into())
+        .spawn(move || {
+            let watch = || -> zbus::Result<()> {
+                let bus = zbus::blocking::Connection::system()?;
+                let manager = zbus::blocking::Proxy::new(
+                    &bus,
+                    "org.freedesktop.login1",
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                )?;
+                for signal in manager.receive_signal("PrepareForShutdown")? {
+                    let going: bool = signal.body().deserialize()?;
+                    if tx.send(going).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            };
+            if let Err(err) = watch() {
+                warn!("watching for shutdown: {err}");
+            }
+        })
+        .context("spawning the shutdown watch")?;
     Ok(())
 }
 
@@ -355,6 +399,8 @@ struct Target {
 
 #[derive(Clone, Copy, PartialEq)]
 enum End {
+    /// Nothing replaces the fade's last frame: the shutdown's black stays on screen.
+    Hold,
     Plate,
     Session {
         generation: u64,
@@ -432,6 +478,9 @@ struct Outer {
     last_to: Option<Picture>,
     /// The greeter the switch in progress leaves, for [`Transition::from_live`].
     outgoing_greeter: Option<u64>,
+    /// logind announced the machine is going down (`PrepareForShutdown(true)`): the screen fades
+    /// to black and stays there, whatever logind fronts as the sessions end.
+    shutting_down: bool,
 }
 
 impl Outer {
@@ -480,6 +529,7 @@ impl Outer {
             switch_wait: TARGET_WAIT,
             last_to: None,
             outgoing_greeter: None,
+            shutting_down: false,
         };
         // A restarted outer leaves the screen alone: it still shows the session's last frame
         // (`close_inherited_framebuffers`), and the session's next present replaces it. Lighting
@@ -640,6 +690,31 @@ impl Outer {
         }
     }
 
+    /// `PrepareForShutdown`: fade to black and hold it while the machine goes down (§5), or, when
+    /// another inhibitor calls the shutdown off, bring back whatever logind fronts.
+    fn on_prepare_for_shutdown(&mut self, going: bool) {
+        if going == self.shutting_down {
+            return;
+        }
+        self.shutting_down = going;
+        if !going {
+            info!("the shutdown was called off");
+            // Re-read from scratch so the session logind fronts comes back as a switch.
+            self.front = None;
+            self.refresh_front();
+            return;
+        }
+        info!("the machine is going down: fading to black");
+        if self.compositor.is_none() {
+            return;
+        }
+        if self.in_flight.is_some() {
+            self.switch_pending = true;
+        } else {
+            self.begin_switch();
+        }
+    }
+
     /// Ctrl+Alt+F<n>: front the n-th session on seat0, in login order, by asking logind to
     /// activate it (§2.2) — the screen then follows the active session as for any switch.
     fn on_chord(&mut self, n: u32) {
@@ -671,6 +746,11 @@ impl Outer {
     fn refresh_front(&mut self) {
         let front = read_seat_active("seat0");
         if front == self.front {
+            return;
+        }
+        if self.shutting_down {
+            // The sessions are ending under the fade to black; none of them comes back on.
+            self.front = front;
             return;
         }
         info!("seat0 fronts session {front:?} (was {:?})", self.front);
@@ -749,6 +829,14 @@ impl Outer {
             wait: None,
             from_live: self.outgoing_greeter.take(),
         });
+
+        if self.shutting_down {
+            self.set_target(Target {
+                picture: Picture::Color(BLACK),
+                end: End::Hold,
+            });
+            return;
+        }
 
         let held = self
             .fronted()
@@ -1011,12 +1099,15 @@ impl Outer {
             return;
         };
         let t = self.progress(transition.start);
-        if t >= 1. {
+        let settled = matches!(self.on_screen, Shown::Composite { alpha, .. } if alpha >= 1.);
+        if t >= 1. && (to.end != End::Hold || settled) {
             self.finish_transition();
             return;
         }
-        // Ease out: most of the change early, settling into the incoming picture.
+        // Ease out: most of the change early, settling into the incoming picture. A fade nothing
+        // replaces draws its end too: its last frame is what stays on screen.
         let alpha = 1. - (1. - t).powi(3);
+        let alpha = if t >= 1. { 1. } else { alpha };
         let busy = match &self.on_screen {
             Shown::Composite { slot, .. } => Some(*slot),
             _ => None,
@@ -1060,6 +1151,9 @@ impl Outer {
             return;
         };
         self.last_to = Some(to.picture);
+        if to.end == End::Hold {
+            return;
+        }
         let end = match to.end {
             End::Session {
                 generation,
@@ -1153,7 +1247,8 @@ impl Outer {
         msg: ToOuter,
         mut fds: Vec<OwnedFd>,
     ) -> anyhow::Result<()> {
-        let fronted = self.fronted() == Some(generation);
+        // Going down, no session reaches the screen again: their frames are held, unanswered.
+        let fronted = !self.shutting_down && self.fronted() == Some(generation);
         let session = self
             .sessions
             .get_mut(&generation)
