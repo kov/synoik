@@ -18,7 +18,7 @@
 //! in systemd's fd store, so a restarted outer is still master and the session's last frame stays
 //! on screen across the gap (§1, §7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -27,11 +27,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
-use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, DrmSurface,
     NodeType, PlaneConfig, PlaneState,
 };
+use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
@@ -39,13 +40,16 @@ use smithay::reexports::calloop::{
 };
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
-use smithay::reexports::drm::control::{connector, crtc, framebuffer, Device as _, ModeTypeFlags};
+use smithay::reexports::drm::control::{
+    connector, crtc, framebuffer, Device as _, Mode as DrmMode, ModeFlags, ModeTypeFlags,
+};
 use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
+use smithay_drm_extras::drm_scanner::DrmScanner;
 
 use super::chord;
-use super::compose::{Compositor, Picture};
-use super::protocol::{self, ModeInfo, OutputInfo, Received, ToInner, ToOuter};
+use super::compose::{Canvas, Compositor, Picture};
+use super::protocol::{self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter};
 use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
 use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
 use crate::render_helpers::vulkan::VkTexture;
@@ -90,6 +94,9 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
         close_inherited_framebuffers(fd.as_fd());
     }
     let mut outer = Outer::new(fd, recovered, handle.clone())?;
+    if let Err(err) = watch_hotplug(&handle, &outer) {
+        warn!("displays plugged in later will not light: {err:#}");
+    }
 
     let listener = listen(&socket)?;
     handle
@@ -127,6 +134,25 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
 
     notify(&[sd_notify::NotifyState::Ready]);
     event_loop.run(None, &mut outer, |_| ())?;
+    Ok(())
+}
+
+/// Follow the card's connectors: udev reports a change on the card for every hotplug, mode-list
+/// or EDID change, which is all a resized VM window is.
+fn watch_hotplug(handle: &LoopHandle<'static, Outer>, outer: &Outer) -> anyhow::Result<()> {
+    let card = rfs::fstat(outer.drm_fd.as_fd())
+        .context("stat of the DRM fd")?
+        .st_rdev;
+    let udev = UdevBackend::new("seat0").context("opening udev")?;
+    handle
+        .insert_source(udev, move |event, _, outer: &mut Outer| {
+            if let UdevEvent::Changed { device_id } = event {
+                if device_id == card {
+                    outer.on_hotplug();
+                }
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("inserting the udev source: {err}"))?;
     Ok(())
 }
 
@@ -324,7 +350,7 @@ fn listen(path: &Path) -> anyhow::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// What is on (or on its way to) the screen.
+/// What is on (or on its way to) a display.
 enum Shown {
     Plate,
     Session {
@@ -370,10 +396,10 @@ enum Next {
     },
 }
 
-/// A session switch being animated (§5): `from` crossfading to `to`, which is unknown until the
-/// incoming session's frame is ready. `to` is live: each frame the incoming session presents during
-/// the fade replaces it, so whatever that session animates (an unlock, its startup) plays through
-/// the fade instead of freezing on its first frame and cutting at the end.
+/// A session switch being animated on one display (§5): `from` crossfading to `to`, which is
+/// unknown until the incoming session's frame is ready. `to` is live: each frame the incoming
+/// session presents during the fade replaces it, so whatever that session animates (an unlock, its
+/// startup) plays through the fade instead of freezing on its first frame and cutting at the end.
 struct Transition {
     from: Picture,
     to: Option<Target>,
@@ -415,16 +441,69 @@ struct SessionBuffer {
     dmabuf: Dmabuf,
 }
 
-/// The display this cut drives: one connector, one CRTC.
+/// A connected connector the outer can light: it has a CRTC to drive it.
+struct Connector {
+    handle: connector::Handle,
+    crtc: crtc::Handle,
+    info: ConnectorInfo,
+    /// `info.modes`' DRM modes, index for index.
+    modes: Vec<DrmMode>,
+}
+
+impl Connector {
+    fn preferred(&self) -> DrmMode {
+        self.modes
+            .iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .unwrap_or(&self.modes[0])
+            .to_owned()
+    }
+
+    /// The advertised mode a session asked for.
+    fn find(&self, mode: &ModeInfo) -> Option<DrmMode> {
+        self.info
+            .modes
+            .iter()
+            .position(|m| {
+                (m.width, m.height, m.refresh_mhz) == (mode.width, mode.height, mode.refresh_mhz)
+            })
+            .map(|i| self.modes[i])
+    }
+}
+
+/// A lit display: one connector on its CRTC, and everything on its way to it.
 struct Display {
-    connector_name: String,
+    crtc: crtc::Handle,
     surface: DrmSurface,
-    mode: smithay::reexports::drm::control::Mode,
-    info: OutputInfo,
+    mode: DrmMode,
     refresh: Duration,
     /// Kept alive for as long as the plate may be shown.
     _plate_buffer: DumbBuffer,
     plate: framebuffer::Handle,
+    /// The outer's own scanout slots here, for transitions.
+    canvas: Canvas,
+    /// The last frame whose flip completed.
+    on_screen: Shown,
+    /// The flip in flight, if any. One at a time: the kernel refuses a second flip on a CRTC with
+    /// one pending.
+    in_flight: Option<Shown>,
+    /// What to show once the flip in flight lands; latest wins.
+    queued: Option<Next>,
+    transition: Option<Transition>,
+    /// A switch waiting for the flip in flight to land before it snapshots the screen.
+    switch_pending: bool,
+    /// The layout changes this display (its mode, or off), and waits for the flip in flight to
+    /// land first: a modeset on a CRTC with a flip pending would have the flip's completion
+    /// answer for whatever is flipped after it.
+    relayout_pending: bool,
+    /// What the last finished transition faded to, standing in for its frame on screen.
+    last_to: Option<Picture>,
+}
+
+impl Display {
+    fn size(&self) -> (u16, u16) {
+        self.mode.size()
+    }
 }
 
 /// An attached session.
@@ -439,48 +518,51 @@ struct Session {
     /// The logind session it proved to be, once `Hello` is accepted.
     logind_id: Option<String>,
     buffers: HashMap<u32, SessionBuffer>,
-    /// The newest frame it presented while in the background, left unanswered: the inner keeps
-    /// that slot reserved for as long as the present is outstanding, so it can be flipped the
-    /// moment the session is fronted without the inner rendering into it underneath the scanout.
-    held: Option<(u32, Option<Rc<OwnedFd>>)>,
-    /// The last frame reported `Presented` to it. The inner never draws into the slot it was last
-    /// told is on screen, so this too is safe to show again on a switch back.
-    last_presented: Option<u32>,
+    /// The displays it lights, as its last `Configure` asked; `None` until it sends one.
+    config: Option<Vec<OutputConfig>>,
+    /// Per display, the newest frame it presented while that frame could not be shown — the
+    /// session is in the background, or the display is not lit for it — left unanswered: the
+    /// inner keeps that slot reserved for as long as the present is outstanding, so it can be
+    /// flipped the moment the session is fronted without the inner rendering into it underneath
+    /// the scanout.
+    held: HashMap<String, (u32, Option<Rc<OwnedFd>>)>,
+    /// Per display, the last frame reported `Presented` to it. The inner never draws into the slot
+    /// it was last told is on screen, so this too is safe to show again on a switch back.
+    last_presented: HashMap<String, u32>,
 }
 
 struct Outer {
     handle: LoopHandle<'static, Outer>,
     drm_fd: DrmDeviceFd,
-    _drm: DrmDevice,
-    display: Display,
+    drm: DrmDevice,
+    scanner: DrmScanner,
+    /// Every connected connector with a CRTC, by name.
+    connectors: BTreeMap<String, Connector>,
+    /// The lit ones, by connector name.
+    displays: BTreeMap<String, Display>,
+    /// A restarted outer adopts the CRTCs its predecessor lit instead of lighting them again,
+    /// until the first layout is applied.
+    recovering: bool,
     render_node: Option<(u64, u64)>,
     sessions: HashMap<u64, Session>,
     next_generation: u64,
     /// seat0's active logind session, as logind last wrote it.
     front: Option<String>,
-    /// The last frame whose flip completed.
-    on_screen: Shown,
-    /// The flip in flight, if any. One at a time: the kernel refuses a second flip on a CRTC with
-    /// one pending.
-    in_flight: Option<Shown>,
-    /// What to show once the flip in flight lands; latest wins.
-    queued: Option<Next>,
     /// The outer's own drawing, for switch transitions. `None` without a usable GPU, and then a
     /// switch is a cut.
     compositor: Option<Compositor>,
-    transition: Option<Transition>,
-    /// A switch waiting for the flip in flight to land before it snapshots the screen.
-    switch_pending: bool,
     /// How long the switch in progress waits for the incoming frame: the outgoing session's
     /// class decides (`target_wait`).
     switch_wait: Duration,
-    /// What the last finished transition faded to, standing in for its frame on screen.
-    last_to: Option<Picture>,
     /// The greeter the switch in progress leaves, for [`Transition::from_live`].
     outgoing_greeter: Option<u64>,
     /// logind announced the machine is going down (`PrepareForShutdown(true)`): the screen fades
     /// to black and stays there, whatever logind fronts as the sessions end.
     shutting_down: bool,
+}
+
+fn plate_picture() -> Picture {
+    Picture::Color(PLATE.map(|c| f32::from(c) / 255.))
 }
 
 impl Outer {
@@ -496,7 +578,7 @@ impl Outer {
             .map(|node| (u64::from(node.major()), u64::from(node.minor())));
 
         // `false`: a restarted outer must not blank the session frame still on screen.
-        let (mut drm, notifier) =
+        let (drm, notifier) =
             DrmDevice::new(drm_fd.clone(), false).context("creating the DRM device")?;
         handle
             .insert_source(notifier, |event, meta, outer: &mut Outer| match event {
@@ -505,72 +587,335 @@ impl Outer {
             })
             .map_err(|err| anyhow::anyhow!("inserting the DRM notifier: {err}"))?;
 
-        let display = open_display(&drm_fd, &mut drm)?;
         let compositor = render_node.and_then(|node| {
-            Compositor::new(node, display.mode.size())
+            Compositor::new(node)
                 .map_err(|err| warn!("no transitions, session switches will cut: {err:#}"))
                 .ok()
         });
-        let outer = Self {
+        let mut outer = Self {
             handle,
             drm_fd,
-            _drm: drm,
-            display,
+            drm,
+            scanner: DrmScanner::new(),
+            connectors: BTreeMap::new(),
+            displays: BTreeMap::new(),
+            recovering: recovered,
             render_node,
             sessions: HashMap::new(),
             next_generation: 1,
             front: None,
-            on_screen: Shown::Plate,
-            in_flight: None,
-            queued: None,
             compositor,
-            transition: None,
-            switch_pending: false,
             switch_wait: TARGET_WAIT,
-            last_to: None,
             outgoing_greeter: None,
             shutting_down: false,
         };
-        // A restarted outer leaves the screen alone: it still shows the session's last frame
-        // (`close_inherited_framebuffers`), and the session's next present replaces it. Lighting
-        // the plate here would flash it across every restart.
-        if !recovered {
-            outer.commit_plate()?;
+        outer.scan_connectors();
+        if outer.connectors.is_empty() {
+            bail!("no connected display");
         }
+        outer.relayout_and_fill();
+        outer.recovering = false;
         Ok(outer)
     }
 
-    /// Light the display with the plate. A modeset, so a commit rather than a flip.
-    fn commit_plate(&self) -> anyhow::Result<()> {
-        let size = self.mode_size();
-        let plane = PlaneState {
-            handle: self.display.surface.plane(),
-            config: Some(PlaneConfig {
-                src: Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
-                dst: Rectangle::from_size((size.0 as i32, size.1 as i32).into()),
-                transform: Transform::Normal,
-                alpha: 1.0,
-                damage_clips: None,
-                fb: self.display.plate,
-                fence: None,
-                hotspot: None,
-            }),
-        };
-        // No page-flip event wanted: nothing waits on the plate, and an event here would land
-        // as a flip completion with nothing in flight.
-        self.display
-            .surface
-            .commit([plane], false)
-            .context("modesetting the display")?;
-        info!(
-            "{} lit at {}x{}",
-            self.display.connector_name, size.0, size.1
-        );
-        Ok(())
+    /// Re-read the connectors. Returns whether anything a session sees changed.
+    fn scan_connectors(&mut self) -> bool {
+        if let Err(err) = self.scanner.scan_connectors(&self.drm_fd) {
+            warn!("scanning connectors: {err}");
+            return false;
+        }
+        let mut connectors = BTreeMap::new();
+        for (conn, crtc) in self.scanner.crtcs() {
+            if conn.state() != connector::State::Connected {
+                continue;
+            }
+            let modes: Vec<DrmMode> = conn
+                .modes()
+                .iter()
+                // Interlaced modes don't work (the tty's `pick_mode` skips them too).
+                .filter(|m| !m.flags().contains(ModeFlags::INTERLACE))
+                .copied()
+                .collect();
+            if modes.is_empty() {
+                continue;
+            }
+            let name = format_connector_name(conn);
+            let info = ConnectorInfo {
+                connector: name.clone(),
+                edid: edid_blob(&self.drm, conn.handle())
+                    .map_err(|err| debug!("no EDID for {name}: {err:#}"))
+                    .ok(),
+                physical_size_mm: conn.size().unwrap_or((0, 0)),
+                modes: modes.iter().map(mode_info).collect(),
+            };
+            connectors.insert(
+                name,
+                Connector {
+                    handle: conn.handle(),
+                    crtc,
+                    info,
+                    modes,
+                },
+            );
+        }
+        let changed = connectors.len() != self.connectors.len()
+            || connectors
+                .iter()
+                .zip(&self.connectors)
+                .any(|((a, ca), (b, cb))| a != b || ca.info != cb.info);
+        self.connectors = connectors;
+        changed
     }
 
-    fn mode_size(&self) -> (u16, u16) {
-        self.display.mode.size()
+    fn connector_infos(&self) -> Vec<ConnectorInfo> {
+        self.connectors.values().map(|c| c.info.clone()).collect()
+    }
+
+    /// A display was plugged, unplugged or changed: tell every session, and follow the fronted
+    /// one's configuration onto what is there now.
+    fn on_hotplug(&mut self) {
+        if !self.scan_connectors() {
+            return;
+        }
+        info!(
+            "displays now: {:?}",
+            self.connectors.keys().collect::<Vec<_>>()
+        );
+        let msg = ToInner::Connectors {
+            connectors: self.connector_infos(),
+        };
+        for session in self.sessions.values().filter(|s| s.logind_id.is_some()) {
+            if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
+                warn!("telling a session the displays changed: {err}");
+            }
+        }
+        self.relayout_and_fill();
+    }
+
+    /// The displays to light and their modes: what the fronted session configured, else every
+    /// connector at its preferred mode (§4.1). A configured mode the connector stopped advertising
+    /// keeps the mode it runs, rather than going dark until the session catches up: the session
+    /// answers the `Connectors` that told it with a `Configure` of its own.
+    fn wanted_layout(&self) -> Vec<(String, DrmMode)> {
+        if self.shutting_down {
+            return self
+                .displays
+                .iter()
+                .map(|(name, d)| (name.clone(), d.mode))
+                .collect();
+        }
+        let config = self
+            .fronted()
+            .and_then(|g| self.sessions.get(&g)?.config.as_ref());
+        match config {
+            Some(outputs) => outputs
+                .iter()
+                .filter_map(|o| {
+                    let conn = self.connectors.get(&o.connector)?;
+                    let mode = conn
+                        .find(&o.mode)
+                        .or_else(|| Some(self.displays.get(&o.connector)?.mode))
+                        .unwrap_or_else(|| conn.preferred());
+                    Some((o.connector.clone(), mode))
+                })
+                .collect(),
+            None => self
+                .connectors
+                .iter()
+                .map(|(name, c)| (name.clone(), c.preferred()))
+                .collect(),
+        }
+    }
+
+    /// Bring the displays to [`Self::wanted_layout`]. Returns the displays it left as they were;
+    /// every other lit one shows the plate, or waits for its flip to land first.
+    fn relayout(&mut self) -> HashSet<String> {
+        let wanted = self.wanted_layout();
+        let names: Vec<String> = self.displays.keys().cloned().collect();
+        for name in names {
+            if !wanted.iter().any(|(n, _)| *n == name) {
+                self.unlight(&name);
+            }
+        }
+        let mut kept = HashSet::new();
+        for (name, mode) in wanted {
+            match self.displays.get(&name) {
+                Some(d) if d.mode == mode && !d.relayout_pending => {
+                    kept.insert(name);
+                }
+                Some(_) => self.remode(&name, mode),
+                None => self.light(&name, mode),
+            }
+        }
+        kept
+    }
+
+    /// [`Self::relayout`], then put the fronted session's newest frame on every display that was
+    /// changed under it.
+    fn relayout_and_fill(&mut self) {
+        let kept = self.relayout();
+        let changed: Vec<String> = self
+            .displays
+            .iter()
+            .filter(|(name, d)| !kept.contains(*name) && !d.relayout_pending)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in changed {
+            self.show_held(&name, true);
+        }
+    }
+
+    /// The fronted session's held frame for `d`, if it was drawn for the display as it is now.
+    /// One drawn for another mode is given back: it can never be shown.
+    fn take_held(&mut self, d: &str) -> Option<(u64, u32, Option<Rc<OwnedFd>>)> {
+        let generation = self.fronted()?;
+        let (buffer, fence) = self.sessions.get_mut(&generation)?.held.remove(d)?;
+        if self.fits(generation, buffer, d) {
+            Some((generation, buffer, fence))
+        } else {
+            self.discard(generation, d, buffer);
+            None
+        }
+    }
+
+    /// Show the fronted session's held frame on `d`, if it has one.
+    fn show_held(&mut self, d: &str, over_plate: bool) {
+        if let Some((generation, buffer, fence)) = self.take_held(d) {
+            self.fronted_frame(d, generation, buffer, fence, over_plate);
+        }
+    }
+
+    /// Whether `buffer` is the size of display `d`'s mode.
+    fn fits(&self, generation: u64, buffer: u32, d: &str) -> bool {
+        let Some(display) = self.displays.get(d) else {
+            return false;
+        };
+        let (w, h) = display.size();
+        self.sessions
+            .get(&generation)
+            .and_then(|s| s.buffers.get(&buffer))
+            .is_some_and(|b| {
+                let size = b.dmabuf.size();
+                (size.w, size.h) == (i32::from(w), i32::from(h))
+            })
+    }
+
+    /// Stop showing frames on `d`: a modeset or a turn-off follows. Everything owed an answer gets
+    /// one, or goes back to its session.
+    fn retire(&mut self, d: &str) {
+        self.cancel_transition(d);
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        display.switch_pending = false;
+        display.last_to = None;
+        if let Some(Next::Session {
+            generation,
+            buffer,
+            answer: true,
+            ..
+        }) = display.queued.take()
+        {
+            self.discard(generation, d, buffer);
+        }
+    }
+
+    fn light(&mut self, d: &str, mode: DrmMode) {
+        let Some(conn) = self.connectors.get(d) else {
+            return;
+        };
+        let (crtc, handle) = (conn.crtc, conn.handle);
+        // A restarted outer finds the display still lit by its predecessor, the session's last
+        // frame on it (§7): adopt it as it is.
+        let adopt = self.recovering
+            && self
+                .drm_fd
+                .get_crtc(crtc)
+                .is_ok_and(|info| info.mode() == Some(mode));
+        let surface = match self.drm.create_surface(crtc, mode, &[handle]) {
+            Ok(surface) => surface,
+            Err(err) => {
+                warn!("lighting {d}: {err}");
+                return;
+            }
+        };
+        let (plate_buffer, plate) = match make_plate(&self.drm_fd, mode.size()) {
+            Ok(plate) => plate,
+            Err(err) => {
+                warn!("lighting {d}: {err:#}");
+                return;
+            }
+        };
+        let display = Display {
+            crtc,
+            surface,
+            mode,
+            refresh: refresh_interval(mode),
+            _plate_buffer: plate_buffer,
+            plate,
+            canvas: Canvas::new(mode.size()),
+            on_screen: Shown::Plate,
+            in_flight: None,
+            queued: None,
+            transition: None,
+            switch_pending: false,
+            relayout_pending: false,
+            last_to: None,
+        };
+        if adopt {
+            info!("{d} adopted at {}x{}", mode.size().0, mode.size().1);
+        } else if let Err(err) = commit_plate(d, &display) {
+            warn!("{err:#}");
+            return;
+        }
+        self.displays.insert(d.to_owned(), display);
+    }
+
+    fn unlight(&mut self, d: &str) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        if display.in_flight.is_some() {
+            display.relayout_pending = true;
+            return;
+        }
+        self.retire(d);
+        // Dropping the surface turns the CRTC off.
+        self.displays.remove(d);
+        info!("{d} off");
+    }
+
+    fn remode(&mut self, d: &str, mode: DrmMode) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        if display.in_flight.is_some() {
+            display.relayout_pending = true;
+            return;
+        }
+        self.retire(d);
+        let (plate_buffer, plate) = match make_plate(&self.drm_fd, mode.size()) {
+            Ok(plate) => plate,
+            Err(err) => {
+                warn!("changing the mode of {d}: {err:#}");
+                return;
+            }
+        };
+        let display = self.displays.get_mut(d).expect("checked above");
+        if let Err(err) = display.surface.use_mode(mode) {
+            warn!("changing the mode of {d}: {err}");
+            return;
+        }
+        display.mode = mode;
+        display.refresh = refresh_interval(mode);
+        display._plate_buffer = plate_buffer;
+        display.plate = plate;
+        display.canvas = Canvas::new(mode.size());
+        display.on_screen = Shown::Plate;
+        if let Err(err) = commit_plate(d, display) {
+            warn!("{err:#}");
+            self.displays.remove(d);
+        }
     }
 
     fn accept(&mut self, listener: BorrowedFd<'_>) {
@@ -621,8 +966,9 @@ impl Outer {
                 pid: cred.pid,
                 logind_id: None,
                 buffers: HashMap::new(),
-                held: None,
-                last_presented: None,
+                config: None,
+                held: HashMap::new(),
+                last_presented: HashMap::new(),
             },
         );
     }
@@ -672,21 +1018,29 @@ impl Outer {
         if let Some(session) = self.sessions.remove(&generation) {
             self.handle.remove(session.token);
         }
-        if matches!(self.queued, Some(Next::Session { generation: g, .. }) if g == generation) {
-            self.queued = None;
-        }
-        // A switch waiting on this session's frame would wait forever.
-        let pending = self.transition.as_mut().and_then(|t| {
-            t.pending
-                .take_if(|(g, _, _)| *g == generation)
-                .and(t.pending_watch.take())
-        });
-        if let Some(token) = pending {
-            self.handle.remove(token);
-            self.set_target(Target {
-                picture: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
-                end: End::Plate,
+        let names: Vec<String> = self.displays.keys().cloned().collect();
+        for d in names {
+            let display = self.displays.get_mut(&d).expect("listed above");
+            if matches!(display.queued, Some(Next::Session { generation: g, .. }) if g == generation)
+            {
+                display.queued = None;
+            }
+            // A switch waiting on this session's frame would wait forever.
+            let pending = display.transition.as_mut().and_then(|t| {
+                t.pending
+                    .take_if(|(g, _, _)| *g == generation)
+                    .and(t.pending_watch.take())
             });
+            if let Some(token) = pending {
+                self.handle.remove(token);
+                self.set_target(
+                    &d,
+                    Target {
+                        picture: plate_picture(),
+                        end: End::Plate,
+                    },
+                );
+            }
         }
     }
 
@@ -708,10 +1062,10 @@ impl Outer {
         if self.compositor.is_none() {
             return;
         }
-        if self.in_flight.is_some() {
-            self.switch_pending = true;
-        } else {
-            self.begin_switch();
+        self.outgoing_greeter = None;
+        let names: Vec<String> = self.displays.keys().cloned().collect();
+        for d in names {
+            self.switch_display(&d);
         }
     }
 
@@ -761,13 +1115,32 @@ impl Outer {
             .flatten();
         self.front = front;
 
+        // The incoming session's display configuration first (§3: the fronted session's wins). A
+        // display it changes the mode of, lights or turns off is a cut — through the plate, under
+        // which the modeset is hidden (§4.2); every other one crossfades.
+        let kept = self.relayout();
+        let names: Vec<String> = self.displays.keys().cloned().collect();
+        for d in names {
+            if kept.contains(&d) {
+                self.switch_display(&d);
+            } else if !self.displays[&d].relayout_pending {
+                self.show_held(&d, true);
+            }
+        }
+    }
+
+    /// Switch display `d` to the fronted session: a crossfade with a compositor, else a cut.
+    fn switch_display(&mut self, d: &str) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
         if self.compositor.is_some() {
-            if self.in_flight.is_some() {
+            if display.in_flight.is_some() {
                 // The snapshot must be of what is on screen, and that changes when this flip
                 // lands; start from there.
-                self.switch_pending = true;
+                display.switch_pending = true;
             } else {
-                self.begin_switch();
+                self.begin_switch(d);
             }
             return;
         }
@@ -776,108 +1149,119 @@ impl Outer {
         // the new session's newest frame, or the plate until it draws one. Only frames the inner
         // cannot be drawing into qualify (`held`, `last_presented`); a frame it was told was
         // discarded is a free slot to it, and scanning that out would race its next render.
-        let next = match self.fronted().and_then(|g| self.sessions.get_mut(&g)) {
-            Some(session) => match (session.held.take(), session.last_presented) {
-                (Some((buffer, fence)), _) => Next::Session {
-                    generation: session.generation,
-                    buffer,
-                    fence,
-                    answer: true,
-                },
-                (None, Some(buffer)) => Next::Session {
-                    generation: session.generation,
+        let next = match self.take_held(d) {
+            Some((generation, buffer, fence)) => Next::Session {
+                generation,
+                buffer,
+                fence,
+                answer: true,
+            },
+            None => match self.last_presented_on(d) {
+                Some((generation, buffer)) => Next::Session {
+                    generation,
                     buffer,
                     fence: None,
                     answer: false,
                 },
-                (None, None) => Next::Plate,
+                None => Next::Plate,
             },
-            None => Next::Plate,
         };
-        self.show(next);
+        self.show(d, next);
     }
 
-    /// Start animating to the newly fronted session (§5).
+    /// The fronted session's last frame answered on `d`, if it still fits the display.
+    fn last_presented_on(&self, d: &str) -> Option<(u64, u32)> {
+        let generation = self.fronted()?;
+        let buffer = *self.sessions.get(&generation)?.last_presented.get(d)?;
+        self.fits(generation, buffer, d)
+            .then_some((generation, buffer))
+    }
+
+    /// Start animating display `d` to the newly fronted session (§5).
     ///
     /// Step 1 is the snapshot: the outgoing picture is copied out of the session's buffer, so the
     /// fade does not depend on that session drawing, answering or even living. logind already
     /// moved input when it changed the active session, so nothing typed during the fade reaches
     /// the outgoing session.
-    fn begin_switch(&mut self) {
-        let from = self.snapshot_screen();
-        self.cancel_transition();
+    fn begin_switch(&mut self, d: &str) {
+        let from = self.snapshot_screen(d);
+        self.cancel_transition(d);
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
         // A frame of the outgoing session waiting to flip is that session's newest; it waits for
         // the switch back instead, still reserved.
-        if let Some(next) = self.queued.take() {
-            match next {
-                Next::Session {
-                    generation,
-                    buffer,
-                    fence,
-                    answer: true,
-                } => self.hold(generation, buffer, fence),
-                Next::Session { answer: false, .. } => (),
-                Next::Plate | Next::Composite { .. } => (),
-            }
-        }
-        self.transition = Some(Transition {
+        let queued = display.queued.take();
+        display.transition = Some(Transition {
             from,
             to: None,
             pending: None,
             pending_watch: None,
             start: get_monotonic_time(),
             wait: None,
-            from_live: self.outgoing_greeter.take(),
+            from_live: self.outgoing_greeter,
         });
+        if let Some(Next::Session {
+            generation,
+            buffer,
+            fence,
+            answer: true,
+        }) = queued
+        {
+            self.hold(generation, d, buffer, fence);
+        }
 
         if self.shutting_down {
-            self.set_target(Target {
-                picture: Picture::Color(BLACK),
-                end: End::Hold,
-            });
+            self.set_target(
+                d,
+                Target {
+                    picture: Picture::Color(BLACK),
+                    end: End::Hold,
+                },
+            );
             return;
         }
 
-        let held = self
-            .fronted()
-            .and_then(|g| Some((g, self.sessions.get_mut(&g)?.held.take()?)));
-        match held {
+        match self.take_held(d) {
             // Its newest frame is already here: the session drew it, then was switched away
             // before it could be shown, and it draws nothing more until that frame is answered.
-            Some((generation, (buffer, fence))) => self.target_frame(generation, buffer, fence),
-            None => self.arm_target_wait(),
+            Some((generation, buffer, fence)) => self.target_frame(d, generation, buffer, fence),
+            None => self.arm_target_wait(d),
         }
     }
 
-    /// The picture on screen now, as something a fade can start from.
-    fn snapshot_screen(&mut self) -> Picture {
-        let plate = Picture::Color(PLATE.map(|c| f32::from(c) / 255.));
+    /// The picture on display `d` now, as something a fade can start from.
+    fn snapshot_screen(&mut self, d: &str) -> Picture {
+        let Some(display) = self.displays.get(d) else {
+            return plate_picture();
+        };
+        let size = display.size();
         let compositor = self.compositor.as_mut().expect("only with a compositor");
-        let captured = match &self.on_screen {
-            Shown::Plate => return plate,
+        let captured = match &display.on_screen {
+            Shown::Plate => return plate_picture(),
             Shown::Session { dmabuf, .. } => compositor.snapshot(dmabuf),
             // Mid-fade: the blend on screen, redrawn, so the next fade starts where this one
             // stands instead of jumping to either end.
-            Shown::Composite { alpha, .. } => match &self.transition {
+            Shown::Composite { alpha, .. } => match &display.transition {
                 Some(Transition {
                     from, to: Some(to), ..
-                }) => compositor.capture(from, &to.picture, *alpha),
+                }) => compositor.capture(size, from, &to.picture, *alpha),
                 Some(Transition { from, .. }) => return from.clone(),
-                None => return self.last_to.clone().unwrap_or(plate),
+                None => return display.last_to.clone().unwrap_or_else(plate_picture),
             },
         };
         match captured {
             Ok(texture) => Picture::Texture(texture),
             Err(err) => {
-                warn!("snapshotting the screen: {err:#}");
-                plate
+                warn!("snapshotting {d}: {err:#}");
+                plate_picture()
             }
         }
     }
 
-    /// Drop the transition, returning a session frame it was holding to that session's `held`.
-    fn cancel_transition(&mut self) {
-        let Some(transition) = self.transition.take() else {
+    /// Drop `d`'s transition, returning a session frame it was holding to that session's `held`.
+    fn cancel_transition(&mut self, d: &str) {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.take()) else {
             return;
         };
         if let Some(token) = transition.wait {
@@ -887,7 +1271,7 @@ impl Outer {
             self.handle.remove(token);
         }
         if let Some((generation, buffer, fence)) = transition.pending {
-            self.hold(generation, buffer, fence);
+            self.hold(generation, d, buffer, fence);
         }
         if let Some(Target {
             end:
@@ -900,51 +1284,53 @@ impl Outer {
         }) = transition.to
         {
             // Unanswered still; the session is waiting on it.
-            self.hold(generation, buffer, None);
+            self.hold(generation, d, buffer, None);
         }
     }
 
-    /// Keep `buffer` as `generation`'s newest unanswered frame, giving back the one it replaces.
-    fn hold(&mut self, generation: u64, buffer: u32, fence: Option<Rc<OwnedFd>>) {
+    /// Keep `buffer` as `generation`'s newest unanswered frame for `d`, giving back the one it
+    /// replaces.
+    fn hold(&mut self, generation: u64, d: &str, buffer: u32, fence: Option<Rc<OwnedFd>>) {
         let Some(session) = self.sessions.get_mut(&generation) else {
             return;
         };
-        if let Some((stale, _)) = session.held.replace((buffer, fence)) {
+        if let Some((stale, _)) = session.held.insert(d.to_owned(), (buffer, fence)) {
             if stale != buffer {
-                self.discard(generation, stale);
+                self.discard(generation, d, stale);
             }
         }
     }
 
-    fn arm_target_wait(&mut self) {
+    fn arm_target_wait(&mut self, d: &str) {
         // Not the compositor clock of `Synoik::timer_after`: the outer holds no `Synoik`.
         #[allow(clippy::disallowed_methods)]
         let timer = Timer::from_duration(self.switch_wait);
+        let name = d.to_owned();
         let token = self
             .handle
-            .insert_source(timer, |_, _, outer: &mut Outer| {
-                outer.on_target_wait();
+            .insert_source(timer, move |_, _, outer: &mut Outer| {
+                outer.on_target_wait(&name);
                 TimeoutAction::Drop
             })
             .expect("inserting a timer");
-        if let Some(transition) = &mut self.transition {
-            transition.wait = Some(token);
+        match self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) {
+            Some(transition) => transition.wait = Some(token),
+            None => self.handle.remove(token),
         }
     }
 
-    /// The incoming session has not drawn in time: fade to its last frame, or the plate.
-    fn on_target_wait(&mut self) {
-        let Some(transition) = &mut self.transition else {
+    /// The incoming session has not drawn on `d` in time: fade to its last frame there, or the
+    /// plate.
+    fn on_target_wait(&mut self, d: &str) {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) else {
             return;
         };
         transition.wait = None;
         if transition.to.is_some() || transition.pending.is_some() {
             return;
         }
-        let last = self
-            .fronted()
-            .and_then(|g| Some((g, self.sessions.get(&g)?.last_presented?)));
-        debug!("switch target late; fading to {last:?}");
+        let last = self.last_presented_on(d);
+        debug!("switch target on {d} late; fading to {last:?}");
         let target = last
             .and_then(|(generation, buffer)| {
                 let texture = self.import_frame(generation, buffer)?;
@@ -958,76 +1344,94 @@ impl Outer {
                 })
             })
             .unwrap_or(Target {
-                picture: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
+                picture: plate_picture(),
                 end: End::Plate,
             });
-        self.set_target(target);
+        self.set_target(d, target);
     }
 
-    /// A frame of the incoming session becomes the target once its render is complete. Its
+    /// A frame of the incoming session becomes `d`'s target once its render is complete. Its
     /// present stays unanswered until it is flipped as it is at the end (§3.1: a target is not
     /// told it is on screen before it is).
-    fn target_frame(&mut self, generation: u64, buffer: u32, fence: Option<Rc<OwnedFd>>) {
+    fn target_frame(&mut self, d: &str, generation: u64, buffer: u32, fence: Option<Rc<OwnedFd>>) {
         let signalled = fence.as_ref().is_none_or(|fd| fence_signalled(fd.as_fd()));
-        let Some(transition) = &mut self.transition else {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) else {
             return;
         };
-        if let Some(token) = transition.wait.take() {
-            self.handle.remove(token);
-        }
+        let wait = transition.wait.take();
         // A newer frame supersedes one still rendering: give that one back.
-        if let Some(token) = transition.pending_watch.take() {
+        let watch = transition.pending_watch.take();
+        let stale = transition.pending.take();
+        if let Some(token) = wait {
             self.handle.remove(token);
         }
-        if let Some((g, stale, _)) = transition.pending.take() {
-            self.discard(g, stale);
+        if let Some(token) = watch {
+            self.handle.remove(token);
+        }
+        if let Some((g, stale, _)) = stale {
+            self.discard(g, d, stale);
         }
         if signalled {
-            self.target_ready(generation, buffer);
+            self.target_ready(d, generation, buffer);
             return;
         }
         let fd = fence.clone().expect("unsignalled means fenced");
+        let name = d.to_owned();
         let token = self
             .handle
             .insert_source(
                 Generic::new(FdRef(fd), Interest::READ, Mode::OneShot),
                 move |_, _, outer: &mut Outer| {
-                    if let Some(transition) = &mut outer.transition {
+                    let transition = outer
+                        .displays
+                        .get_mut(&name)
+                        .and_then(|d| d.transition.as_mut());
+                    if let Some(transition) = transition {
                         if matches!(transition.pending, Some((g, b, _)) if g == generation && b == buffer)
                         {
                             transition.pending = None;
                             transition.pending_watch = None;
-                            outer.target_ready(generation, buffer);
+                            outer.target_ready(&name, generation, buffer);
                         }
                     }
                     Ok(PostAction::Remove)
                 },
             )
             .expect("inserting a fence watch");
-        let transition = self.transition.as_mut().expect("checked above");
+        let transition = self
+            .displays
+            .get_mut(d)
+            .and_then(|d| d.transition.as_mut())
+            .expect("checked above");
         transition.pending = Some((generation, buffer, fence));
         transition.pending_watch = Some(token);
     }
 
-    fn target_ready(&mut self, generation: u64, buffer: u32) {
+    fn target_ready(&mut self, d: &str, generation: u64, buffer: u32) {
         match self.import_frame(generation, buffer) {
-            Some(texture) => self.set_target(Target {
-                picture: Picture::Texture(texture),
-                end: End::Session {
-                    generation,
-                    buffer,
-                    answer: true,
+            Some(texture) => self.set_target(
+                d,
+                Target {
+                    picture: Picture::Texture(texture),
+                    end: End::Session {
+                        generation,
+                        buffer,
+                        answer: true,
+                    },
                 },
-            }),
+            ),
             None => {
                 // Unusable as a picture; show it without the fade rather than not at all.
-                self.cancel_transition();
-                self.show(Next::Session {
-                    generation,
-                    buffer,
-                    fence: None,
-                    answer: true,
-                });
+                self.cancel_transition(d);
+                self.show(
+                    d,
+                    Next::Session {
+                        generation,
+                        buffer,
+                        fence: None,
+                        answer: true,
+                    },
+                );
             }
         }
     }
@@ -1041,29 +1445,38 @@ impl Outer {
             .ok()
     }
 
-    /// Make `target` what the fade goes to. The first target starts the fade's clock; a newer
+    /// Make `target` what `d`'s fade goes to. The first target starts the fade's clock; a newer
     /// frame replacing it (the live `to`) keeps it, and gives back the frame it replaces if no
     /// blend has shown that one yet.
-    fn set_target(&mut self, target: Target) {
+    fn set_target(&mut self, d: &str, target: Target) {
         // The outgoing greeter stops being live: the fade starts from its newest frame on screen.
-        if let Some(live) = self.transition.as_mut().and_then(|t| t.from_live.take()) {
+        let live = self
+            .displays
+            .get_mut(d)
+            .and_then(|d| d.transition.as_mut())
+            .and_then(|t| t.from_live.take());
+        if let Some(live) = live {
+            let display = self.displays.get_mut(d).expect("has a transition");
             if let Some(Next::Session {
                 generation,
                 buffer,
                 answer: true,
                 ..
-            }) = self
+            }) = display
                 .queued
                 .take_if(|n| matches!(n, Next::Session { generation, .. } if *generation == live))
             {
-                self.discard(generation, buffer);
+                self.discard(generation, d, buffer);
             }
-            let from = self.snapshot_screen();
-            if let Some(transition) = &mut self.transition {
+            let from = self.snapshot_screen(d);
+            if let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) {
                 transition.from = from;
             }
         }
-        let Some(transition) = &mut self.transition else {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        let Some(transition) = &mut display.transition else {
             return;
         };
         match transition.to.replace(target) {
@@ -1080,45 +1493,44 @@ impl Outer {
                 // A blend in flight may still be reading it: the inner must not draw into it
                 // until that blend lands, which gives it back then (`on_flip`).
                 let sampled = matches!(
-                    self.in_flight,
+                    display.in_flight,
                     Some(Shown::Composite { samples: Some(s), .. }) if s == (generation, buffer)
                 );
                 if !sampled {
-                    self.discard(generation, buffer);
+                    self.discard(generation, d, buffer);
                 }
             }
             Some(_) => (),
         }
-        if self.in_flight.is_none() {
-            self.advance();
+        if self.displays.get(d).is_some_and(|d| d.in_flight.is_none()) {
+            self.advance(d);
         }
     }
 
-    fn progress(&self, start: Duration) -> f32 {
-        let elapsed = get_monotonic_time().saturating_sub(start);
-        (elapsed.as_secs_f32() / FADE.as_secs_f32()).clamp(0., 1.)
-    }
-
-    /// Draw and flip the next frame of the fade, or finish it. Runs once per flip completion, so
-    /// the fade is paced by the display.
-    fn advance(&mut self) {
-        let Some(transition) = &self.transition else {
+    /// Draw and flip the next frame of `d`'s fade, or finish it. Runs once per flip completion,
+    /// so the fade is paced by the display.
+    fn advance(&mut self, d: &str) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        let Some(transition) = &display.transition else {
             return;
         };
         let Some(to) = &transition.to else {
             return;
         };
-        let t = self.progress(transition.start);
-        let settled = matches!(self.on_screen, Shown::Composite { alpha, .. } if alpha >= 1.);
+        let elapsed = get_monotonic_time().saturating_sub(transition.start);
+        let t = (elapsed.as_secs_f32() / FADE.as_secs_f32()).clamp(0., 1.);
+        let settled = matches!(display.on_screen, Shown::Composite { alpha, .. } if alpha >= 1.);
         if t >= 1. && (to.end != End::Hold || settled) {
-            self.finish_transition();
+            self.finish_transition(d);
             return;
         }
         // Ease out: most of the change early, settling into the incoming picture. A fade nothing
         // replaces draws its end too: its last frame is what stays on screen.
         let alpha = 1. - (1. - t).powi(3);
         let alpha = if t >= 1. { 1. } else { alpha };
-        let busy = match &self.on_screen {
+        let busy = match &display.on_screen {
             Shown::Composite { slot, .. } => Some(*slot),
             _ => None,
         };
@@ -1134,24 +1546,35 @@ impl Outer {
             } => Some((generation, buffer)),
             _ => None,
         };
-        match compositor.compose(&self.drm_fd, busy, &transition.from, &to.picture, alpha) {
-            Ok((slot, fb, fence)) => self.flip(Next::Composite {
-                slot,
-                fb,
-                fence: fence.map(Rc::new),
-                alpha,
-                samples,
-            }),
+        let composed = compositor.compose(
+            &mut display.canvas,
+            &self.drm_fd,
+            busy,
+            &transition.from,
+            &to.picture,
+            alpha,
+        );
+        match composed {
+            Ok((slot, fb, fence)) => self.flip(
+                d,
+                Next::Composite {
+                    slot,
+                    fb,
+                    fence: fence.map(Rc::new),
+                    alpha,
+                    samples,
+                },
+            ),
             Err(err) => {
-                warn!("drawing a transition frame: {err:#}");
-                self.finish_transition();
+                warn!("drawing a transition frame on {d}: {err:#}");
+                self.finish_transition(d);
             }
         }
     }
 
-    /// Step 8: the fade is over, so put the incoming session's frame on screen as it is.
-    fn finish_transition(&mut self) {
-        let Some(transition) = self.transition.take() else {
+    /// Step 8: the fade on `d` is over, so put the incoming session's frame on screen as it is.
+    fn finish_transition(&mut self, d: &str) {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.take()) else {
             return;
         };
         if let Some(token) = transition.wait {
@@ -1164,13 +1587,15 @@ impl Outer {
             self.handle.remove(token);
         }
         if let Some((generation, buffer, fence)) = transition.pending {
-            debug!("a fade ended with frame {buffer} still rendering");
-            self.hold(generation, buffer, fence);
+            debug!("a fade on {d} ended with frame {buffer} still rendering");
+            self.hold(generation, d, buffer, fence);
         }
         let Some(to) = transition.to else {
             return;
         };
-        self.last_to = Some(to.picture);
+        if let Some(display) = self.displays.get_mut(d) {
+            display.last_to = Some(to.picture);
+        }
         if to.end == End::Hold {
             return;
         }
@@ -1194,29 +1619,28 @@ impl Outer {
             _ => Next::Plate,
         };
         let ended_on_plate = matches!(end, Next::Plate);
-        self.show(end);
+        self.show(d, end);
 
         // The incoming session drew while the fade was running on a stand-in.
-        let held = self
-            .fronted()
-            .and_then(|g| Some((g, self.sessions.get_mut(&g)?.held.take()?)));
-        if let Some((generation, (buffer, fence))) = held {
-            self.fronted_frame(generation, buffer, fence, ended_on_plate);
-        }
+        self.show_held(d, ended_on_plate);
     }
 
-    /// A frame of the fronted session, outside a switch. It replaces the plate with a fade, and
-    /// anything else as it is.
+    /// A frame of the fronted session for `d`, outside a switch. It replaces the plate with a
+    /// fade, and anything else as it is.
     fn fronted_frame(
         &mut self,
+        d: &str,
         generation: u64,
         buffer: u32,
         fence: Option<Rc<OwnedFd>>,
         over_plate: bool,
     ) {
         if over_plate && self.compositor.is_some() {
-            self.transition = Some(Transition {
-                from: Picture::Color(PLATE.map(|c| f32::from(c) / 255.)),
+            let Some(display) = self.displays.get_mut(d) else {
+                return;
+            };
+            display.transition = Some(Transition {
+                from: plate_picture(),
                 to: None,
                 pending: None,
                 pending_watch: None,
@@ -1224,40 +1648,49 @@ impl Outer {
                 wait: None,
                 from_live: None,
             });
-            self.target_frame(generation, buffer, fence);
+            self.target_frame(d, generation, buffer, fence);
         } else {
-            self.show(Next::Session {
-                generation,
-                buffer,
-                fence,
-                answer: true,
-            });
+            self.show(
+                d,
+                Next::Session {
+                    generation,
+                    buffer,
+                    fence,
+                    answer: true,
+                },
+            );
         }
     }
 
-    /// Show `next` now, or once the flip in flight lands.
-    fn show(&mut self, next: Next) {
-        if self.in_flight.is_some() {
+    /// Show `next` on `d` now, or once the flip in flight lands.
+    fn show(&mut self, d: &str, next: Next) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        if display.in_flight.is_some() {
             if let Some(Next::Session {
                 generation,
                 buffer,
                 answer: true,
                 ..
-            }) = self.queued.replace(next)
+            }) = display.queued.replace(next)
             {
-                self.discard(generation, buffer);
+                self.discard(generation, d, buffer);
             }
         } else {
-            self.flip(next);
+            self.flip(d, next);
         }
     }
 
-    /// Whether the plate is what the screen shows, or is about to.
-    fn plate_showing(&self) -> bool {
-        match (&self.in_flight, &self.queued) {
+    /// Whether the plate is what `d` shows, or is about to.
+    fn plate_showing(&self, d: &str) -> bool {
+        let Some(display) = self.displays.get(d) else {
+            return false;
+        };
+        match (&display.in_flight, &display.queued) {
             (_, Some(next)) => matches!(next, Next::Plate),
             (Some(shown), None) => matches!(shown, Shown::Plate),
-            (None, None) => matches!(self.on_screen, Shown::Plate),
+            (None, None) => matches!(display.on_screen, Shown::Plate),
         }
     }
 
@@ -1299,12 +1732,28 @@ impl Outer {
                     session.pid, session.uid
                 );
                 session.logind_id = Some(id);
+                let fd = session.fd.clone();
                 let welcome = ToInner::Welcome {
                     version: protocol::VERSION,
                     render_node: self.render_node,
-                    outputs: vec![self.display.info.clone()],
+                    connectors: self.connector_infos(),
                 };
-                protocol::send(session.fd.as_fd(), &welcome, &[])?;
+                protocol::send(fd.as_fd(), &welcome, &[])?;
+            }
+            ToOuter::Configure { outputs } => {
+                debug!(
+                    "session {:?} configures {:?}",
+                    session.logind_id,
+                    outputs
+                        .iter()
+                        .map(|o| (&o.connector, o.mode.width, o.mode.height))
+                        .collect::<Vec<_>>()
+                );
+                let changed = session.config.as_ref() != Some(&outputs);
+                session.config = Some(outputs);
+                if fronted && changed {
+                    self.relayout_and_fill();
+                }
             }
             ToOuter::AddBuffer {
                 id,
@@ -1338,30 +1787,32 @@ impl Outer {
             }
             ToOuter::RemoveBuffer { id } => {
                 session.buffers.remove(&id);
-                if matches!(session.held, Some((b, _)) if b == id) {
-                    session.held = None;
-                }
-                if session.last_presented == Some(id) {
-                    session.last_presented = None;
-                }
+                session.held.retain(|_, (b, _)| *b != id);
+                session.last_presented.retain(|_, b| *b != id);
             }
             ToOuter::Present {
                 output,
                 buffer,
                 fenced,
             } => {
-                if output != self.display.connector_name {
-                    bail!("present on unknown output {output}");
-                }
                 if !session.buffers.contains_key(&buffer) {
                     bail!("present of unknown buffer {buffer}");
                 }
                 let fence = fenced.then(|| Rc::new(fds.remove(0)));
-                let awaiting = self
+                let d = output.as_str();
+                // A frame for a display that is not lit, or not at the size it was drawn for — the
+                // session drew it before a layout change reached it, or the outer could not apply
+                // what the session asked — waits unanswered, as a background frame does.
+                if !self.fits(generation, buffer, d) {
+                    self.hold(generation, d, buffer, fence);
+                    return Ok(());
+                }
+                let display = self.displays.get(d).expect("fits a lit display");
+                let awaiting = display
                     .transition
                     .as_ref()
                     .map(|t| t.to.is_none() && t.pending.is_none());
-                let feeds_fade = self.transition.as_ref().is_some_and(|t| {
+                let feeds_fade = display.transition.as_ref().is_some_and(|t| {
                     t.pending.as_ref().is_some_and(|(g, ..)| *g == generation)
                         || matches!(
                             t.to,
@@ -1369,46 +1820,49 @@ impl Outer {
                                 if g == generation
                         )
                 });
+                let from_live = display
+                    .transition
+                    .as_ref()
+                    .is_some_and(|t| t.from_live == Some(generation));
                 match (fronted, awaiting) {
                     // The frame the switch to this session was waiting for (§5 step 6), or a newer
                     // one replacing it while the fade runs.
-                    (true, Some(true)) => self.target_frame(generation, buffer, fence),
+                    (true, Some(true)) => self.target_frame(d, generation, buffer, fence),
                     (true, Some(false)) if feeds_fade => {
-                        self.target_frame(generation, buffer, fence)
+                        self.target_frame(d, generation, buffer, fence)
                     }
-                    (false, Some(true))
-                        if self
-                            .transition
-                            .as_ref()
-                            .is_some_and(|t| t.from_live == Some(generation)) =>
-                    {
-                        self.show(Next::Session {
+                    (false, Some(true)) if from_live => self.show(
+                        d,
+                        Next::Session {
                             generation,
                             buffer,
                             fence,
                             answer: true,
-                        })
-                    }
+                        },
+                    ),
                     (true, None) => {
-                        let over_plate = self.plate_showing();
-                        self.fronted_frame(generation, buffer, fence, over_plate);
+                        let over_plate = self.plate_showing(d);
+                        self.fronted_frame(d, generation, buffer, fence, over_plate);
                     }
                     // A background session does not reach the screen, nor does a fronted one
                     // while the switch to it runs on another frame. Its newest frame is held
                     // unanswered; the one it supersedes is given back.
-                    _ => self.hold(generation, buffer, fence),
+                    _ => self.hold(generation, d, buffer, fence),
                 }
             }
         }
         Ok(())
     }
 
-    /// Put `next` on the screen. A session frame is gated on its fence in the kernel
+    /// Put `next` on display `d`. A session frame is gated on its fence in the kernel
     /// (`IN_FENCE_FD`), so it is never shown half-rendered and the outer never blocks on it.
-    fn flip(&mut self, next: Next) {
-        let size = self.mode_size();
+    fn flip(&mut self, d: &str, next: Next) {
+        let Some(display) = self.displays.get(d) else {
+            return;
+        };
+        let size = display.size();
         let (fb_handle, shown, fence) = match next {
-            Next::Plate => (self.display.plate, Shown::Plate, None),
+            Next::Plate => (display.plate, Shown::Plate, None),
             Next::Session {
                 generation,
                 buffer,
@@ -1453,7 +1907,7 @@ impl Outer {
             }
         };
         let plane = PlaneState {
-            handle: self.display.surface.plane(),
+            handle: display.surface.plane(),
             config: Some(PlaneConfig {
                 src: Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
                 dst: Rectangle::from_size((size.0 as i32, size.1 as i32).into()),
@@ -1465,51 +1919,67 @@ impl Outer {
                 hotspot: None,
             }),
         };
-        match self.display.surface.page_flip([plane], true) {
-            Ok(()) => self.in_flight = Some(shown),
+        match display.surface.page_flip([plane], true) {
+            Ok(()) => {
+                self.displays.get_mut(d).expect("looked up above").in_flight = Some(shown);
+            }
             Err(err) => {
-                warn!("flip refused: {err}");
+                warn!("flip on {d} refused: {err}");
                 match shown {
                     Shown::Session {
                         generation,
                         buffer,
                         answer: true,
                         ..
-                    } => self.discard(generation, buffer),
+                    } => self.discard(generation, d, buffer),
                     Shown::Session { answer: false, .. } => (),
                     // No flip completion will come to draw the next frame: end the fade now.
-                    Shown::Composite { .. } => self.finish_transition(),
+                    Shown::Composite { .. } => self.finish_transition(d),
                     Shown::Plate => (),
                 }
             }
         }
     }
 
-    /// Whether `buffer` is still spoken for — held, queued, awaited by a fade, or what the session
-    /// was last told is on screen — so it must not be given back.
-    fn reserved(&self, generation: u64, buffer: u32) -> bool {
+    /// Whether `buffer` is still spoken for on `d` — held, queued, awaited by a fade, or what the
+    /// session was last told is on screen — so it must not be given back.
+    fn reserved(&self, generation: u64, d: &str, buffer: u32) -> bool {
         let session = self.sessions.get(&generation);
+        let display = self.displays.get(d);
         session.is_some_and(|s| {
-            s.held.as_ref().is_some_and(|(b, _)| *b == buffer) || s.last_presented == Some(buffer)
-        }) || matches!(
-            self.queued,
-            Some(Next::Session { generation: g, buffer: b, .. }) if g == generation && b == buffer
-        ) || self.transition.as_ref().is_some_and(|t| {
-            matches!(t.pending, Some((g, b, _)) if g == generation && b == buffer)
-                || matches!(
-                    t.to,
-                    Some(Target { end: End::Session { generation: g, buffer: b, .. }, .. })
-                        if g == generation && b == buffer
-                )
+            s.held.get(d).is_some_and(|(b, _)| *b == buffer)
+                || s.last_presented.get(d) == Some(&buffer)
+        }) || display.is_some_and(|display| {
+            matches!(
+                display.queued,
+                Some(Next::Session { generation: g, buffer: b, .. }) if g == generation && b == buffer
+            ) || display.transition.as_ref().is_some_and(|t| {
+                matches!(t.pending, Some((g, b, _)) if g == generation && b == buffer)
+                    || matches!(
+                        t.to,
+                        Some(Target { end: End::Session { generation: g, buffer: b, .. }, .. })
+                            if g == generation && b == buffer
+                    )
+            })
         })
     }
 
-    /// Tell `generation` its `buffer` reached the screen.
-    fn presented(&mut self, generation: u64, buffer: u32, meta: Option<&DrmEventMetadata>) {
+    /// Tell `generation` its `buffer` reached display `d`.
+    fn presented(
+        &mut self,
+        generation: u64,
+        d: &str,
+        buffer: u32,
+        meta: Option<&DrmEventMetadata>,
+    ) {
+        let refresh = self
+            .displays
+            .get(d)
+            .map_or(0, |d| d.refresh.as_nanos() as u64);
         let Some(session) = self.sessions.get_mut(&generation) else {
             return;
         };
-        session.last_presented = Some(buffer);
+        session.last_presented.insert(d.to_owned(), buffer);
         let (sequence, time_ns) = match meta {
             Some(DrmEventMetadata {
                 sequence,
@@ -1519,22 +1989,25 @@ impl Outer {
             None => (0, 0),
         };
         let msg = ToInner::Presented {
-            output: self.display.connector_name.clone(),
+            output: d.to_owned(),
             buffer,
             sequence,
             time_ns,
-            refresh_ns: self.display.refresh.as_nanos() as u64,
+            refresh_ns: refresh,
         };
         if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
             warn!("reporting a flip to a session: {err}");
         }
     }
 
-    fn discard(&self, generation: u64, buffer: u32) {
+    fn discard(&self, generation: u64, d: &str, buffer: u32) {
         if let Some(session) = self.sessions.get(&generation) {
-            debug!("discarding buffer {buffer} of {:?}", session.logind_id);
+            debug!(
+                "discarding buffer {buffer} on {d} of {:?}",
+                session.logind_id
+            );
             let msg = ToInner::Discarded {
-                output: self.display.connector_name.clone(),
+                output: d.to_owned(),
                 buffer,
             };
             if let Err(err) = protocol::send(session.fd.as_fd(), &msg, &[]) {
@@ -1543,9 +2016,19 @@ impl Outer {
         }
     }
 
-    fn on_flip(&mut self, _crtc: crtc::Handle, meta: Option<DrmEventMetadata>) {
-        let Some(shown) = self.in_flight.take() else {
-            debug!("flip completion with nothing in flight");
+    fn on_flip(&mut self, crtc: crtc::Handle, meta: Option<DrmEventMetadata>) {
+        let Some(d) = self
+            .displays
+            .iter()
+            .find(|(_, display)| display.crtc == crtc)
+            .map(|(name, _)| name.clone())
+        else {
+            debug!("flip completion on a CRTC no display drives");
+            return;
+        };
+        let d = d.as_str();
+        let Some(shown) = self.displays.get_mut(d).and_then(|d| d.in_flight.take()) else {
+            debug!("flip completion on {d} with nothing in flight");
             return;
         };
 
@@ -1555,7 +2038,7 @@ impl Outer {
                 generation,
                 answer: true,
                 ..
-            } => self.presented(*generation, *buffer, meta.as_ref()),
+            } => self.presented(*generation, d, *buffer, meta.as_ref()),
             // A blend of the incoming session's frame is that frame on screen, as far as the
             // session's pacing goes: answer it, so it draws its next one.
             Shown::Composite {
@@ -1564,7 +2047,12 @@ impl Outer {
             } => {
                 let (generation, buffer) = (*generation, *buffer);
                 // `Some(unanswered)` while it is still the target.
-                let target = match self.transition.as_mut().and_then(|t| t.to.as_mut()) {
+                let target = match self
+                    .displays
+                    .get_mut(d)
+                    .and_then(|d| d.transition.as_mut())
+                    .and_then(|t| t.to.as_mut())
+                {
                     Some(Target {
                         end:
                             End::Session {
@@ -1577,28 +2065,103 @@ impl Outer {
                     _ => None,
                 };
                 match target {
-                    Some(true) => self.presented(generation, buffer, meta.as_ref()),
+                    Some(true) => self.presented(generation, d, buffer, meta.as_ref()),
                     Some(false) => (),
                     // Replaced while this blend was reading it (`set_target`): free now — unless
                     // it went back to the session meanwhile (a cancelled fade holds its target).
-                    None if !self.reserved(generation, buffer) => self.discard(generation, buffer),
+                    None if !self.reserved(generation, d, buffer) => {
+                        self.discard(generation, d, buffer)
+                    }
                     None => (),
                 }
             }
             _ => (),
         }
+        let display = self.displays.get_mut(d).expect("found above");
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
-        self.on_screen = shown;
+        display.on_screen = shown;
 
-        if self.switch_pending {
-            // Now that the screen has settled, take the switch from what it shows.
-            self.switch_pending = false;
-            self.begin_switch();
-        } else if let Some(next) = self.queued.take() {
-            self.flip(next);
-        } else if self.transition.is_some() {
-            self.advance();
+        if std::mem::take(&mut display.relayout_pending) {
+            // The layout changed under the flip; it can be applied now.
+            self.relayout_and_fill();
         }
+        // Turned off, or a frame already on its way at the new layout.
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        if display.in_flight.is_some() {
+            return;
+        }
+        if std::mem::take(&mut display.switch_pending) {
+            // Now that the screen has settled, take the switch from what it shows.
+            self.begin_switch(d);
+        } else if let Some(next) = display.queued.take() {
+            self.flip(d, next);
+        } else if display.transition.is_some() {
+            self.advance(d);
+        }
+    }
+}
+
+/// Light `display` with its plate. A modeset, so a commit rather than a flip.
+fn commit_plate(name: &str, display: &Display) -> anyhow::Result<()> {
+    let size = display.size();
+    let plane = PlaneState {
+        handle: display.surface.plane(),
+        config: Some(PlaneConfig {
+            src: Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
+            dst: Rectangle::from_size((size.0 as i32, size.1 as i32).into()),
+            transform: Transform::Normal,
+            alpha: 1.0,
+            damage_clips: None,
+            fb: display.plate,
+            fence: None,
+            hotspot: None,
+        }),
+    };
+    // No page-flip event wanted: nothing waits on the plate, and an event here would land as a
+    // flip completion with nothing in flight.
+    display
+        .surface
+        .commit([plane], false)
+        .with_context(|| format!("modesetting {name}"))?;
+    info!("{name} lit at {}x{}", size.0, size.1);
+    Ok(())
+}
+
+/// The plate at `size`: a flat buffer and its framebuffer.
+fn make_plate(
+    drm_fd: &DrmDeviceFd,
+    size: (u16, u16),
+) -> anyhow::Result<(DumbBuffer, framebuffer::Handle)> {
+    let (w, h) = size;
+    let mut plate_buffer = drm_fd
+        .create_dumb_buffer((u32::from(w), u32::from(h)), DrmFourcc::Xrgb8888, 32)
+        .context("allocating the plate")?;
+    {
+        let mut map = drm_fd
+            .map_dumb_buffer(&mut plate_buffer)
+            .context("mapping the plate")?;
+        // Opaque and flat: this is a herald surface, not chrome.
+        let [r, g, b] = PLATE;
+        for px in map.as_mut().as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[b, g, r, 0xff]);
+        }
+    }
+    let plate = drm_fd
+        .add_framebuffer(&plate_buffer, 24, 32)
+        .context("adding the plate framebuffer")?;
+    Ok((plate_buffer, plate))
+}
+
+/// A mode as a session sees it; the refresh counted as `smithay::output::Mode` counts it, so a
+/// session's mode selection compares rates as the tty backend's does.
+fn mode_info(m: &DrmMode) -> ModeInfo {
+    ModeInfo {
+        width: m.size().0,
+        height: m.size().1,
+        refresh_mhz: smithay::output::Mode::from(*m).refresh as u32,
+        preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
     }
 }
 
@@ -1619,82 +2182,6 @@ impl AsFd for FdRef {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
-}
-
-/// Pick the first connected connector, its preferred mode and a CRTC that can drive it, and make
-/// the plate for it.
-fn open_display(drm_fd: &DrmDeviceFd, drm: &mut DrmDevice) -> anyhow::Result<Display> {
-    let res = drm_fd.resource_handles().context("reading DRM resources")?;
-    let conn = res
-        .connectors()
-        .iter()
-        .filter_map(|&c| drm_fd.get_connector(c, true).ok())
-        .find(|c| c.state() == connector::State::Connected && !c.modes().is_empty())
-        .context("no connected display")?;
-    let connector_name = format_connector_name(&conn);
-
-    let modes = conn.modes();
-    let mode = modes
-        .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .unwrap_or(&modes[0])
-        .to_owned();
-
-    let crtc = conn
-        .encoders()
-        .iter()
-        .filter_map(|&e| drm_fd.get_encoder(e).ok())
-        .flat_map(|e| res.filter_crtcs(e.possible_crtcs()))
-        .next()
-        .context("no CRTC can drive the display")?;
-    let surface = drm
-        .create_surface(crtc, mode, &[conn.handle()])
-        .context("creating the DRM surface")?;
-
-    let (w, h) = mode.size();
-    let mut plate_buffer = drm_fd
-        .create_dumb_buffer((u32::from(w), u32::from(h)), DrmFourcc::Xrgb8888, 32)
-        .context("allocating the plate")?;
-    {
-        let mut map = drm_fd
-            .map_dumb_buffer(&mut plate_buffer)
-            .context("mapping the plate")?;
-        // Opaque and flat: this is a herald surface, not chrome.
-        let [r, g, b] = PLATE;
-        for px in map.as_mut().as_chunks_mut::<4>().0 {
-            px.copy_from_slice(&[b, g, r, 0xff]);
-        }
-    }
-    let plate = drm_fd
-        .add_framebuffer(&plate_buffer, 24, 32)
-        .context("adding the plate framebuffer")?;
-
-    let refresh = refresh_interval(mode);
-    let to_info = |m: &smithay::reexports::drm::control::Mode| ModeInfo {
-        width: m.size().0,
-        height: m.size().1,
-        refresh_mhz: (1_000_000_000_000u64 / refresh_interval(*m).as_nanos().max(1) as u64) as u32,
-        preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
-    };
-    let info = OutputInfo {
-        connector: connector_name.clone(),
-        edid: edid_blob(drm, conn.handle())
-            .map_err(|err| debug!("no EDID for {connector_name}: {err:#}"))
-            .ok(),
-        physical_size_mm: conn.size().unwrap_or((0, 0)),
-        mode: to_info(&mode),
-        modes: modes.iter().map(to_info).collect(),
-    };
-
-    Ok(Display {
-        connector_name,
-        surface,
-        mode,
-        info,
-        refresh,
-        _plate_buffer: plate_buffer,
-        plate,
-    })
 }
 
 struct PeerCred {

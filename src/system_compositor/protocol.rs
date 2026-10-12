@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any change to the messages below.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Where the outer listens unless told otherwise. The unit's `RuntimeDirectory=` creates it.
 pub const DEFAULT_SOCKET: &str = "/run/synoik-system/outer.sock";
@@ -45,6 +45,11 @@ pub enum ToOuter {
         version: u32,
         session: Option<String>,
     },
+    /// The displays this session lights, each at its mode; every other connector is off for it.
+    /// The session decides its display configuration and the outer executes it (§3), for the
+    /// session on screen: sent before the first `Present`, after every `Connectors`, and whenever
+    /// the session's own configuration changes — always before a `Present` drawn for it.
+    Configure { outputs: Vec<OutputConfig> },
     /// Register a scanout buffer. Carries its dmabuf as the one fd.
     ///
     /// Buffers are registered once and presented by id, so the outer imports each one exactly
@@ -78,8 +83,11 @@ pub enum ToInner {
         /// The render node of the device the outer scans out from, as `(major, minor)`. The inner
         /// must allocate its scanout buffers there, or the outer cannot import them.
         render_node: Option<(u64, u64)>,
-        outputs: Vec<OutputInfo>,
+        connectors: Vec<ConnectorInfo>,
     },
+    /// The connected displays changed: one was plugged or unplugged, or its mode list or identity
+    /// changed (a resized VM window is a new preferred mode). The whole set, as in `Welcome`.
+    Connectors { connectors: Vec<ConnectorInfo> },
     /// A `Present` reached the screen.
     ///
     /// `time_ns` is the flip's `CLOCK_MONOTONIC` timestamp from the kernel, passed through
@@ -97,16 +105,22 @@ pub enum ToInner {
     Discarded { output: String, buffer: u32 },
 }
 
-/// One display, as the inner needs it to name and configure the output the way the tty backend
-/// would: the connector name is `monitors.xml`'s identity key (§3).
+/// One connected display, as the inner needs it to name and configure the output the way the tty
+/// backend would: the connector name is `monitors.xml`'s identity key (§3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OutputInfo {
+pub struct ConnectorInfo {
     pub connector: String,
     pub edid: Option<Vec<u8>>,
     pub physical_size_mm: (u32, u32),
-    /// The mode the CRTC is running. The inner renders at exactly this size.
-    pub mode: ModeInfo,
+    /// What it advertises, interlaced modes left out (they do not work, as on the tty).
     pub modes: Vec<ModeInfo>,
+}
+
+/// A display a session lights, and its mode — one of the connector's `modes`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutputConfig {
+    pub connector: String,
+    pub mode: ModeInfo,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,7 +138,10 @@ impl ToOuter {
         match self {
             ToOuter::AddBuffer { .. } => 1,
             ToOuter::Present { fenced: true, .. } => 1,
-            ToOuter::Hello { .. } | ToOuter::RemoveBuffer { .. } | ToOuter::Present { .. } => 0,
+            ToOuter::Hello { .. }
+            | ToOuter::Configure { .. }
+            | ToOuter::RemoveBuffer { .. }
+            | ToOuter::Present { .. } => 0,
         }
     }
 }

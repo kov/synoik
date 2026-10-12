@@ -48,11 +48,19 @@ use smithay::wayland::presentation::Refresh;
 
 use super::vulkan_scanout::{VulkanScanoutAllocator, VulkanScanoutBuffer};
 use super::{IpcOutputMap, OutputId, RenderResult};
+use crate::backend::tty::{
+    applied_config_is_stale, choose_target_mode, forget_applied_config, output_name_from_edid,
+    AdvertisedMode,
+};
+use crate::frame_clock::FrameClock;
+use crate::monitors_xml::MonitorsConfig;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::synoik::{RedrawState, State, Synoik};
-use crate::system_compositor::protocol::{self, OutputInfo, Received, ToInner, ToOuter};
-use crate::utils::{get_monotonic_time, logical_output};
+use crate::system_compositor::protocol::{
+    self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter,
+};
+use crate::utils::{get_monotonic_time, is_laptop_panel};
 
 /// Scanout buffers per output: one on screen, one in flight, one to render the next frame into.
 const SLOTS: usize = 3;
@@ -70,11 +78,13 @@ pub struct Nested {
     render_node: Option<DrmNode>,
     dmabuf_global: Option<DmabufGlobal>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-    /// The displays the outer described, by connector name.
+    /// Every display the outer has connected, as it last described them.
+    connectors: Vec<ConnectorInfo>,
+    /// Each connector's id in `ipc_outputs`, stable while it stays connected.
+    output_ids: HashMap<String, OutputId>,
+    /// The displays this session lights, by connector name.
     outputs: HashMap<String, NestedOutput>,
     next_buffer_id: u32,
-    /// The outputs the handshake described, until `init` can hand them to the compositor.
-    pending_outputs: Vec<OutputInfo>,
 }
 
 /// A live connection to the outer.
@@ -85,7 +95,10 @@ struct Connection {
 
 struct NestedOutput {
     output: Output,
-    info: OutputInfo,
+    /// The display, as the outer described it when this output was made for it.
+    connector: ConnectorInfo,
+    /// The mode this session runs it at; its buffers are this size.
+    mode: ModeInfo,
     damage_tracker: OutputDamageTracker,
     slots: Vec<Slot>,
     /// Frames rendered, from 1, so that a slot's `0` can mean "never drawn".
@@ -95,6 +108,9 @@ struct NestedOutput {
     in_flight: Option<(usize, OutputPresentationFeedback, Duration)>,
     /// The slot the outer last reported on screen. Never rendered into: it is being scanned out.
     on_screen: Option<usize>,
+    /// The buffer that was in flight when the mode changed: the outer still answers it, and that
+    /// answer is expected, not a protocol slip.
+    abandoned: Option<u32>,
 }
 
 struct Slot {
@@ -147,7 +163,7 @@ impl Nested {
         // The first connection is synchronous: the outputs, and the device to render on, come
         // from the outer, and nothing else can be set up without them.
         let fd = connect(&socket_path)?;
-        let (render_node, outputs) = handshake(fd.as_fd())?;
+        let (render_node, connectors) = handshake(fd.as_fd())?;
         let render_node = render_node.context("the outer named no render node")?;
         let renderer =
             VulkanRenderer::for_drm_render_node(render_node.0 as u32, render_node.1 as u32)
@@ -155,9 +171,9 @@ impl Nested {
         let render_node =
             DrmNode::from_dev_id(rfs::makedev(render_node.0 as u32, render_node.1 as u32)).ok();
         info!(
-            "nested in the system compositor at {}: {} output(s)",
+            "nested in the system compositor at {}: {} display(s)",
             socket_path.display(),
-            outputs.len()
+            connectors.len()
         );
 
         let mut nested = Self {
@@ -170,9 +186,10 @@ impl Nested {
             render_node,
             dmabuf_global: None,
             ipc_outputs: Default::default(),
+            connectors,
+            output_ids: HashMap::new(),
             outputs: HashMap::new(),
             next_buffer_id: 1,
-            pending_outputs: outputs,
         };
         nested.attach(fd);
         Ok(nested)
@@ -180,9 +197,7 @@ impl Nested {
 
     pub fn init(&mut self, synoik: &mut Synoik) {
         self.add_dmabuf_global(synoik);
-        for info in mem::take(&mut self.pending_outputs) {
-            self.add_output(synoik, info);
-        }
+        self.reconfigure(synoik);
     }
 
     fn add_dmabuf_global(&mut self, synoik: &mut Synoik) {
@@ -204,17 +219,116 @@ impl Nested {
         }
     }
 
-    fn add_output(&mut self, synoik: &mut Synoik, info: OutputInfo) {
-        let name = crate::backend::tty::output_name_from_edid(
-            info.connector.clone(),
-            info.edid.as_deref(),
-        );
+    /// Decide this session's displays — which connectors it lights, at which mode — as the tty
+    /// backend does (`Tty::on_output_config_changed`), bring the outputs to that, and tell the
+    /// outer, which lights them while this session is the one on screen (§3).
+    pub fn reconfigure(&mut self, synoik: &mut Synoik) {
+        let wanted = self.decide(synoik);
+
+        let names: Vec<String> = self.outputs.keys().cloned().collect();
+        for name in names {
+            // A different display on the same connector is a new output, as on the tty
+            // (`refresh_changed_identities`): nothing of the old one's state carries over.
+            let same = wanted
+                .iter()
+                .find(|(c, _)| c.connector == name)
+                .is_some_and(|(c, _)| c.edid == self.outputs[&name].connector.edid);
+            if !same {
+                self.remove_output(synoik, &name);
+            }
+        }
+        for (connector, mode) in &wanted {
+            match self.outputs.get_mut(&connector.connector) {
+                Some(out) if out.mode == *mode => out.connector = connector.clone(),
+                Some(_) => self.change_mode(synoik, connector.clone(), *mode),
+                None => self.add_output(synoik, connector.clone(), *mode),
+            }
+        }
+        self.refresh_ipc_outputs(synoik);
+
+        let Some(conn) = &self.conn else {
+            return;
+        };
+        let msg = ToOuter::Configure {
+            outputs: wanted
+                .into_iter()
+                .map(|(c, mode)| OutputConfig {
+                    connector: c.connector,
+                    mode,
+                })
+                .collect(),
+        };
+        if let Err(err) = protocol::send(conn.fd.as_fd(), &msg, &[]) {
+            warn!("configuring the displays with the system compositor: {err}");
+            self.detach(synoik);
+        }
+    }
+
+    /// The displays to light and their modes: off, mode and lid as the tty backend reads them
+    /// from the config, the live-applied display config and `monitors.xml`.
+    fn decide(&self, synoik: &mut Synoik) -> Vec<(ConnectorInfo, ModeInfo)> {
+        // A live-applied config for a mode the display no longer offers belongs to the display
+        // that offered it (`Tty::forget_inapplicable_applied_config`).
+        for c in &self.connectors {
+            let name = output_name_from_edid(c.connector.clone(), c.edid.as_deref());
+            if !synoik.applied_display_config.contains_key(&name.connector) {
+                continue;
+            }
+            let config_mode = synoik
+                .config
+                .borrow()
+                .outputs
+                .find(&name)
+                .and_then(|c| c.mode);
+            if applied_config_is_stale(&advertised(c), config_mode) {
+                forget_applied_config(synoik, &name, "its mode is gone");
+            }
+        }
+
+        let config = synoik.config.borrow();
+        // `Tty::should_disable_laptop_panels`: a closed lid turns the panel off when there is
+        // another display to use.
+        let lid_off = synoik.is_lid_closed
+            && !config.debug.keep_laptop_panel_on_when_lid_is_closed
+            && self
+                .connectors
+                .iter()
+                .any(|c| !is_laptop_panel(&c.connector));
+        let store = MonitorsConfig::load();
+        let mut wanted = Vec::new();
+        for c in &self.connectors {
+            let name = output_name_from_edid(c.connector.clone(), c.edid.as_deref());
+            let output = config.outputs.find(&name).cloned().unwrap_or_default();
+            if output.off || (lid_off && is_laptop_panel(&c.connector)) {
+                continue;
+            }
+            if output.modeline.is_some() {
+                warn!(
+                    "output {:?}: a custom modeline cannot be driven nested; \
+                     using the advertised modes",
+                    c.connector
+                );
+            }
+            let saved: Vec<_> = store
+                .as_ref()
+                .map(|store| store.saved_modes_for(&name).collect())
+                .unwrap_or_default();
+            let target = choose_target_mode(&advertised(c), output.mode, &saved);
+            if let Some(mode) = pick_mode(&c.modes, target) {
+                wanted.push((c.clone(), mode));
+            }
+        }
+        wanted
+    }
+
+    fn add_output(&mut self, synoik: &mut Synoik, connector: ConnectorInfo, mode: ModeInfo) {
+        let name = output_name_from_edid(connector.connector.clone(), connector.edid.as_deref());
         let output = Output::new(
-            info.connector.clone(),
+            connector.connector.clone(),
             PhysicalProperties {
                 size: (
-                    info.physical_size_mm.0 as i32,
-                    info.physical_size_mm.1 as i32,
+                    connector.physical_size_mm.0 as i32,
+                    connector.physical_size_mm.1 as i32,
                 )
                     .into(),
                 subpixel: Subpixel::Unknown,
@@ -223,57 +337,140 @@ impl Nested {
                 serial_number: name.serial.clone().unwrap_or_else(|| "Unknown".into()),
             },
         );
-        let mode = Mode {
-            size: (i32::from(info.mode.width), i32::from(info.mode.height)).into(),
-            refresh: info.mode.refresh_mhz as i32,
-        };
-        output.change_current_state(Some(mode), None, None, None);
-        output.set_preferred(mode);
+        let wl_mode = wl_mode(mode);
+        output.change_current_state(Some(wl_mode), None, None, None);
+        output.set_preferred(wl_mode);
         output.user_data().insert_if_missing(|| name.clone());
 
-        self.ipc_outputs.lock().unwrap().insert(
-            OutputId::next(),
-            synoik_ipc::Output {
-                name: output.name(),
-                make: output.physical_properties().make,
-                vendor: name.vendor.clone(),
-                model: output.physical_properties().model,
-                serial: name.serial.clone(),
-                physical_size: Some(info.physical_size_mm),
-                modes: info
-                    .modes
-                    .iter()
-                    .map(|m| synoik_ipc::Mode {
-                        width: m.width,
-                        height: m.height,
-                        refresh_rate: m.refresh_mhz,
-                        is_preferred: m.preferred,
-                    })
-                    .collect(),
-                current_mode: info.modes.iter().position(|m| *m == info.mode),
-                is_custom_mode: false,
-                vrr_supported: false,
-                vrr_enabled: false,
-                logical: Some(logical_output(&output, false)),
-                max_bpc: None,
-            },
-        );
-
-        let refresh =
-            Duration::from_nanos(1_000_000_000_000 / u64::from(info.mode.refresh_mhz.max(1)));
         self.outputs.insert(
-            info.connector.clone(),
+            connector.connector.clone(),
             NestedOutput {
                 damage_tracker: OutputDamageTracker::from_output(&output),
                 output: output.clone(),
-                info,
+                connector,
+                mode,
                 slots: Vec::new(),
                 frame: 0,
                 in_flight: None,
                 on_screen: None,
+                abandoned: None,
             },
         );
-        synoik.add_output(output, Some(refresh), false);
+        synoik.add_output(output, Some(refresh(mode)), false);
+    }
+
+    fn remove_output(&mut self, synoik: &mut Synoik, name: &str) {
+        let Some(mut out) = self.outputs.remove(name) else {
+            return;
+        };
+        self.free_slots(&mut out);
+        synoik.remove_output(&out.output);
+    }
+
+    /// The display runs at another mode now: everything sized for the old one goes.
+    fn change_mode(&mut self, synoik: &mut Synoik, connector: ConnectorInfo, mode: ModeInfo) {
+        let Some(mut out) = self.outputs.remove(&connector.connector) else {
+            return;
+        };
+        let slot_ids: Vec<u32> = out.slots.iter().map(|s| s.id).collect();
+        self.free_slots(&mut out);
+        // The outer answers the frame in flight as the old mode's last; that answer finds nothing
+        // in flight, so the redraw machinery is released here instead.
+        out.abandoned = None;
+        if let Some((index, _, _)) = out.in_flight.take() {
+            out.abandoned = Some(slot_ids[index]);
+            if let Some(state) = synoik.output_state.get_mut(&out.output) {
+                state.redraw_state = RedrawState::Idle;
+            }
+        }
+        out.on_screen = None;
+        out.frame = 0;
+        out.mode = mode;
+        out.connector = connector;
+
+        let output = out.output.clone();
+        let wl_mode = wl_mode(mode);
+        output.change_current_state(Some(wl_mode), None, None, None);
+        output.set_preferred(wl_mode);
+        out.damage_tracker = OutputDamageTracker::from_output(&output);
+        self.outputs.insert(out.connector.connector.clone(), out);
+
+        if let Some(state) = synoik.output_state.get_mut(&output) {
+            state.frame_clock = FrameClock::new(Some(refresh(mode)), false);
+        }
+        // Scale and transform are keyed on the mode (`Tty::on_output_config_changed`).
+        let monitors_config = MonitorsConfig::load();
+        let (scale, transform) =
+            synoik.derive_output_scale_transform(&output, monitors_config.as_ref());
+        output.change_current_state(
+            None,
+            Some(transform),
+            Some(smithay::output::Scale::Fractional(scale)),
+            None,
+        );
+        synoik.output_resized(&output);
+        synoik.queue_redraw(&output);
+    }
+
+    /// Give back an output's scanout buffers. The outer keeps a removed buffer's framebuffer for
+    /// as long as it is on screen.
+    fn free_slots(&mut self, out: &mut NestedOutput) {
+        let conn = self.conn.as_ref().map(|c| c.fd.clone());
+        for slot in out.slots.drain(..) {
+            if let Some(conn) = &conn {
+                if let Err(err) =
+                    protocol::send(conn.as_fd(), &ToOuter::RemoveBuffer { id: slot.id }, &[])
+                {
+                    warn!("removing buffer {}: {err}", slot.id);
+                }
+            }
+        }
+    }
+
+    /// Every connected display for IPC and `DisplayConfig`, lit or not: an output this session
+    /// turned off is still one Settings can turn back on.
+    fn refresh_ipc_outputs(&mut self, synoik: &mut Synoik) {
+        self.output_ids
+            .retain(|name, _| self.connectors.iter().any(|c| c.connector == *name));
+        let mut map = IpcOutputMap::new();
+        for c in &self.connectors {
+            let name = output_name_from_edid(c.connector.clone(), c.edid.as_deref());
+            let id = *self
+                .output_ids
+                .entry(c.connector.clone())
+                .or_insert_with(OutputId::next);
+            let lit = self.outputs.get(&c.connector);
+            map.insert(
+                id,
+                synoik_ipc::Output {
+                    name: c.connector.clone(),
+                    make: name.make.clone().unwrap_or_else(|| "Unknown".into()),
+                    vendor: name.vendor.clone(),
+                    model: name.model.clone().unwrap_or_else(|| "Unknown".into()),
+                    serial: name.serial.clone(),
+                    physical_size: Some(c.physical_size_mm),
+                    modes: c
+                        .modes
+                        .iter()
+                        .map(|m| synoik_ipc::Mode {
+                            width: m.width,
+                            height: m.height,
+                            refresh_rate: m.refresh_mhz,
+                            is_preferred: m.preferred,
+                        })
+                        .collect(),
+                    current_mode: lit.and_then(|o| c.modes.iter().position(|m| *m == o.mode)),
+                    is_custom_mode: false,
+                    vrr_supported: false,
+                    vrr_enabled: false,
+                    // `State::refresh_ipc_outputs` fills it in from the space.
+                    logical: None,
+                    max_bpc: None,
+                },
+            );
+        }
+        *self.ipc_outputs.lock().unwrap() = map;
+        synoik.ipc_outputs_changed = true;
     }
 
     fn on_session_event(&mut self, synoik: &mut Synoik, event: SessionEvent) {
@@ -336,6 +533,10 @@ impl Nested {
     fn on_message(&mut self, synoik: &mut Synoik, msg: ToInner) {
         match msg {
             ToInner::Welcome { .. } => warn!("unexpected Welcome outside the handshake"),
+            ToInner::Connectors { connectors } => {
+                self.connectors = connectors;
+                self.reconfigure(synoik);
+            }
             ToInner::Presented {
                 output,
                 buffer,
@@ -379,24 +580,13 @@ impl Nested {
                 return false;
             }
         };
-        let outputs = match handshake(fd.as_fd()) {
-            Ok((_, outputs)) => outputs,
+        let connectors = match handshake(fd.as_fd()) {
+            Ok((_, connectors)) => connectors,
             Err(err) => {
                 warn!("reattaching to the system compositor: {err:#}");
                 return false;
             }
         };
-        for info in &outputs {
-            match self.outputs.get(&info.connector) {
-                Some(out) if out.info.mode == info.mode => (),
-                // Topology changes across an outer restart are the next milestone's (§3); this cut
-                // keeps the outputs it started with.
-                _ => warn!(
-                    "the system compositor came back with a different {}",
-                    info.connector
-                ),
-            }
-        }
         info!("reattached to the system compositor");
         self.attach(fd);
 
@@ -409,6 +599,9 @@ impl Nested {
                 }
             }
         }
+        // The displays may have changed while it was gone; this also tells it the layout.
+        self.connectors = connectors;
+        self.reconfigure(synoik);
         synoik.queue_redraw_all();
         true
     }
@@ -490,10 +683,7 @@ impl Nested {
             return RenderResult::Skipped;
         }
 
-        let size = Size::from((
-            i32::from(out.info.mode.width),
-            i32::from(out.info.mode.height),
-        ));
+        let size = Size::from((i32::from(out.mode.width), i32::from(out.mode.height)));
         if out.slots.is_empty() {
             let conn = self.conn.as_ref().expect("checked above").fd.clone();
             if let Err(err) = allocate_slots(
@@ -640,9 +830,13 @@ impl Nested {
             .in_flight
             .as_ref()
             .map(|(index, _, _)| *index)
-            .filter(|&index| out.slots[index].id == buffer)
+            .filter(|&index| out.slots.get(index).is_some_and(|s| s.id == buffer))
         else {
-            warn!("Presented buffer {buffer} on {name}, which is not in flight");
+            if out.abandoned.take() == Some(buffer) {
+                debug!("Presented buffer {buffer} on {name}, of the mode it ran before");
+            } else {
+                warn!("Presented buffer {buffer} on {name}, which is not in flight");
+            }
             return;
         };
         let (_, mut feedback, target) = out.in_flight.take().expect("checked above");
@@ -720,9 +914,13 @@ impl Nested {
             .in_flight
             .as_ref()
             .map(|(index, _, _)| *index)
-            .filter(|&index| out.slots[index].id == buffer)
+            .filter(|&index| out.slots.get(index).is_some_and(|s| s.id == buffer))
         else {
-            warn!("Discarded buffer {buffer} on {name}, which is not in flight");
+            if out.abandoned.take() == Some(buffer) {
+                debug!("Discarded buffer {buffer} on {name}, of the mode it ran before");
+            } else {
+                warn!("Discarded buffer {buffer} on {name}, which is not in flight");
+            }
             return;
         };
         out.in_flight = None;
@@ -760,6 +958,54 @@ impl Nested {
             synoik.send_frame_callbacks(&output);
         }
     }
+}
+
+fn wl_mode(mode: ModeInfo) -> Mode {
+    Mode {
+        size: (i32::from(mode.width), i32::from(mode.height)).into(),
+        refresh: mode.refresh_mhz as i32,
+    }
+}
+
+fn refresh(mode: ModeInfo) -> Duration {
+    Duration::from_nanos(1_000_000_000_000 / u64::from(mode.refresh_mhz.max(1)))
+}
+
+fn advertised(c: &ConnectorInfo) -> Vec<AdvertisedMode> {
+    c.modes
+        .iter()
+        .map(|m| AdvertisedMode {
+            width: m.width,
+            height: m.height,
+            refresh: m.refresh_mhz as i32,
+        })
+        .collect()
+}
+
+/// `pick_mode` of the tty backend over the outer's mode list: the target's size at its refresh,
+/// or that size's fastest; else the fastest preferred mode; else the first.
+fn pick_mode(modes: &[ModeInfo], target: Option<synoik_config::output::Mode>) -> Option<ModeInfo> {
+    if let Some(target) = target.filter(|t| !t.custom) {
+        let refresh = target.mode.refresh.map(|r| (r * 1000.).round() as u32);
+        let found = modes
+            .iter()
+            .filter(|m| (m.width, m.height) == (target.mode.width, target.mode.height))
+            .filter(|m| refresh.is_none_or(|r| m.refresh_mhz == r))
+            .max_by_key(|m| m.refresh_mhz);
+        if found.is_some() {
+            return found.copied();
+        }
+        warn!(
+            "configured mode {}x{} could not be found, falling back to preferred",
+            target.mode.width, target.mode.height
+        );
+    }
+    modes
+        .iter()
+        .filter(|m| m.preferred)
+        .max_by_key(|m| m.refresh_mhz)
+        .or(modes.first())
+        .copied()
 }
 
 /// Knock on the outer's door until it answers, on the compositor's clock.
@@ -918,8 +1164,8 @@ fn own_session_id() -> Option<String> {
     })
 }
 
-/// What the outer's `Welcome` gives a session: its render node and its outputs.
-type Welcomed = (Option<(u64, u64)>, Vec<OutputInfo>);
+/// What the outer's `Welcome` gives a session: its render node and the connected displays.
+type Welcomed = (Option<(u64, u64)>, Vec<ConnectorInfo>);
 
 /// Say hello and wait for the welcome. Bounded, so a wedged outer fails startup instead of hanging
 /// it.
@@ -943,7 +1189,7 @@ fn handshake(fd: BorrowedFd<'_>) -> anyhow::Result<Welcomed> {
             ToInner::Welcome {
                 version,
                 render_node,
-                outputs,
+                connectors,
             },
             _,
         ) => {
@@ -953,7 +1199,7 @@ fn handshake(fd: BorrowedFd<'_>) -> anyhow::Result<Welcomed> {
                     protocol::VERSION
                 );
             }
-            Ok((render_node, outputs))
+            Ok((render_node, connectors))
         }
         Received::Message(other, _) => bail!("expected Welcome, got {other:?}"),
         Received::WouldBlock | Received::Closed => {
@@ -968,5 +1214,63 @@ struct FdRef(Rc<OwnedFd>);
 impl AsFd for FdRef {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode(width: u16, height: u16, refresh_mhz: u32, preferred: bool) -> ModeInfo {
+        ModeInfo {
+            width,
+            height,
+            refresh_mhz,
+            preferred,
+        }
+    }
+
+    fn target(width: u16, height: u16, refresh: Option<f64>) -> synoik_config::output::Mode {
+        synoik_config::output::Mode {
+            custom: false,
+            mode: synoik_ipc::ConfiguredMode {
+                width,
+                height,
+                refresh,
+            },
+        }
+    }
+
+    /// The tty backend's rules, over the outer's list.
+    #[test]
+    fn a_mode_is_picked_as_the_tty_picks_it() {
+        let modes = [
+            mode(2560, 1600, 60_000, true),
+            mode(1920, 1080, 60_000, false),
+            mode(1920, 1080, 120_000, false),
+            mode(2560, 1600, 120_000, true),
+        ];
+        // No target: the fastest preferred mode.
+        assert_eq!(pick_mode(&modes, None), Some(modes[3]));
+        // A size without a rate: that size's fastest.
+        assert_eq!(
+            pick_mode(&modes, Some(target(1920, 1080, None))),
+            Some(modes[2])
+        );
+        // A rate narrows it.
+        assert_eq!(
+            pick_mode(&modes, Some(target(1920, 1080, Some(60.)))),
+            Some(modes[1])
+        );
+        // A mode the display does not offer falls back to preferred.
+        assert_eq!(
+            pick_mode(&modes, Some(target(800, 600, None))),
+            Some(modes[3])
+        );
+        // No preferred mode at all: the first.
+        assert_eq!(
+            pick_mode(&[mode(1024, 768, 60_000, false)], None),
+            Some(mode(1024, 768, 60_000, false))
+        );
     }
 }

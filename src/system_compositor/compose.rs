@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, Context as _};
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
-use smithay::backend::allocator::{Allocator as _, Fourcc, Modifier};
+use smithay::backend::allocator::{Allocator as _, Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode};
 use smithay::backend::renderer::{
     Bind as _, Color32F, Frame as _, ImportDma as _, Offscreen as _, Renderer as _, Texture as _,
@@ -36,11 +36,25 @@ pub(super) enum Picture {
     Texture(VkTexture),
 }
 
+/// The outer's drawing device, shared by every display.
 pub(super) struct Compositor {
     renderer: VulkanRenderer,
     node: Option<DrmNode>,
+}
+
+/// One display's scanout buffers for the outer's frames, at that display's mode.
+pub(super) struct Canvas {
     size: Size<i32, Physical>,
     slots: Vec<Slot>,
+}
+
+impl Canvas {
+    pub fn new(size: (u16, u16)) -> Self {
+        Self {
+            size: Size::from((i32::from(size.0), i32::from(size.1))),
+            slots: Vec::new(),
+        }
+    }
 }
 
 struct Slot {
@@ -50,17 +64,12 @@ struct Slot {
 }
 
 impl Compositor {
-    pub fn new(render_node: (u64, u64), size: (u16, u16)) -> anyhow::Result<Self> {
+    pub fn new(render_node: (u64, u64)) -> anyhow::Result<Self> {
         let (major, minor) = render_node;
         let renderer = VulkanRenderer::for_drm_render_node(major as u32, minor as u32)
             .map_err(|err| anyhow!("bringing up Vulkan on {major}:{minor}: {err:?}"))?;
         let node = DrmNode::from_dev_id(libc::makedev(major as u32, minor as u32)).ok();
-        Ok(Self {
-            renderer,
-            node,
-            size: Size::from((i32::from(size.0), i32::from(size.1))),
-            slots: Vec::new(),
-        })
+        Ok(Self { renderer, node })
     }
 
     /// A session frame as a texture. The caller guarantees its render is complete: the frame was
@@ -75,17 +84,20 @@ impl Compositor {
     /// does next — draw into that buffer again, take it back, or die (§5 step 1).
     pub fn snapshot(&mut self, dmabuf: &Dmabuf) -> anyhow::Result<VkTexture> {
         let source = Picture::Texture(self.import(dmabuf)?);
-        self.capture(&source, &source, 0.)
+        let size = (dmabuf.width() as u16, dmabuf.height() as u16);
+        self.capture(size, &source, &source, 0.)
     }
 
-    /// `from` crossfaded towards `to` at `alpha`, drawn into a texture the outer owns.
+    /// `from` crossfaded towards `to` at `alpha`, drawn into a texture the outer owns, `size`
+    /// pixels.
     pub fn capture(
         &mut self,
+        size: (u16, u16),
         from: &Picture,
         to: &Picture,
         alpha: f32,
     ) -> anyhow::Result<VkTexture> {
-        let size = self.size;
+        let size: Size<i32, Physical> = Size::from((i32::from(size.0), i32::from(size.1)));
         let mut target = self
             .renderer
             .create_buffer(
@@ -113,29 +125,30 @@ impl Compositor {
         Ok(target)
     }
 
-    /// Draw `from` crossfaded towards `to` at `t` (0 is all `from`) into a free scanout slot,
+    /// Draw `from` crossfaded towards `to` at `t` (0 is all `from`) into a free slot of `canvas`,
     /// avoiding `busy`. Returns the slot, its framebuffer and the fence that completes the draw.
     pub fn compose(
         &mut self,
+        canvas: &mut Canvas,
         drm_fd: &DrmDeviceFd,
         busy: Option<usize>,
         from: &Picture,
         to: &Picture,
         t: f32,
     ) -> anyhow::Result<(usize, Rc<PrimeFramebuffer>, Option<OwnedFd>)> {
-        if self.slots.is_empty() {
-            self.allocate(drm_fd)?;
+        if canvas.slots.is_empty() {
+            self.allocate(canvas, drm_fd)?;
         }
-        let index = (0..self.slots.len())
+        let index = (0..canvas.slots.len())
             .find(|&i| Some(i) != busy)
             .context("no free scanout slot")?;
-        let size = self.size;
+        let size = canvas.size;
         let full = Rectangle::from_size(size);
 
         // The fence goes to the kernel as `IN_FENCE_FD`, so the submit may stay in flight.
         self.renderer.set_finish_may_defer(true);
         let result = (|| {
-            let slot = &mut self.slots[index];
+            let slot = &mut canvas.slots[index];
             let mut fb = self
                 .renderer
                 .bind(&mut slot.dmabuf)
@@ -158,17 +171,17 @@ impl Compositor {
             sync.wait()
                 .map_err(|err| anyhow!("waiting for a frame: {err:?}"))?;
         }
-        Ok((index, self.slots[index].fb.clone(), fence))
+        Ok((index, canvas.slots[index].fb.clone(), fence))
     }
 
-    fn allocate(&mut self, drm_fd: &DrmDeviceFd) -> anyhow::Result<()> {
+    fn allocate(&mut self, canvas: &mut Canvas, drm_fd: &DrmDeviceFd) -> anyhow::Result<()> {
         let mut allocator = VulkanScanoutAllocator::new(self.renderer.gpu().clone(), self.node)?;
         for _ in 0..SLOTS {
             // The format and layout a session's own scanout buffers use (`backend::nested`).
             let buffer = allocator
                 .create_buffer(
-                    self.size.w as u32,
-                    self.size.h as u32,
+                    canvas.size.w as u32,
+                    canvas.size.h as u32,
                     Fourcc::Xrgb8888,
                     &[Modifier::Linear],
                 )
@@ -176,7 +189,7 @@ impl Compositor {
             let dmabuf = buffer.export().context("exporting a scanout slot")?;
             let fb = framebuffer_from_dmabuf(drm_fd, &dmabuf, true)
                 .map_err(|err| anyhow!("adding a scanout slot framebuffer: {err}"))?;
-            self.slots.push(Slot {
+            canvas.slots.push(Slot {
                 _buffer: buffer,
                 dmabuf,
                 fb: Rc::new(fb),

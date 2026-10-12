@@ -2481,29 +2481,8 @@ impl Tty {
         }
     }
 
-    /// Drops the live-applied config for one output: the override plus the fields the apply wrote
-    /// into the output config, so nothing of the old display is left for the configuration chain to
-    /// pick up. A no-op when there is no override, so a scale/mode the user wrote in their KDL
-    /// config by hand is never cleared.
     fn forget_applied_config(&mut self, synoik: &mut Synoik, name: &OutputName, reason: &str) {
-        if synoik
-            .applied_display_config
-            .remove(&name.connector)
-            .is_none()
-        {
-            return;
-        }
-
-        debug!(
-            "output {:?}: dropping the applied display config, {reason}",
-            name.connector
-        );
-        let mut config = self.config.borrow_mut();
-        if let Some(output) = config.outputs.find_mut(name) {
-            output.mode = None;
-            output.scale = None;
-            output.transform = synoik_ipc::Transform::Normal;
-        }
+        forget_applied_config(synoik, name, reason);
     }
 
     pub fn on_output_config_changed(&mut self, synoik: &mut Synoik) {
@@ -3838,17 +3817,42 @@ fn modeinfo_name_slice_from_string(mode_name: &str) -> [core::ffi::c_char; 32] {
     name
 }
 
+/// Drops the live-applied config for one output: the override plus the fields the apply wrote into
+/// the output config, so nothing of the old display is left for the configuration chain to pick up.
+/// A no-op when there is no override, so a scale/mode the user wrote in their KDL config by hand is
+/// never cleared.
+pub(crate) fn forget_applied_config(synoik: &mut Synoik, name: &OutputName, reason: &str) {
+    if synoik
+        .applied_display_config
+        .remove(&name.connector)
+        .is_none()
+    {
+        return;
+    }
+
+    debug!(
+        "output {:?}: dropping the applied display config, {reason}",
+        name.connector
+    );
+    let mut config = synoik.config.borrow_mut();
+    if let Some(output) = config.outputs.find_mut(name) {
+        output.mode = None;
+        output.scale = None;
+        output.transform = synoik_ipc::Transform::Normal;
+    }
+}
+
 /// One mode a connector advertises, reduced to what mode selection cares about.
 ///
 /// Selection is expressed over this rather than over `drm::control::Mode` so it can be tested
 /// without a DRM device: the plumbing around it (scanning connectors, setting the mode) needs
 /// real hardware, but the *decisions* do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AdvertisedMode {
-    width: u16,
-    height: u16,
+pub(crate) struct AdvertisedMode {
+    pub width: u16,
+    pub height: u16,
     /// Refresh in mHz, as `smithay::output::Mode` counts it.
-    refresh: i32,
+    pub refresh: i32,
 }
 
 impl AdvertisedMode {
@@ -3893,7 +3897,7 @@ fn mode_is_available(advertised: &[AdvertisedMode], mode: synoik_config::output:
 /// `is_config_applicable`); otherwise it is discarded and the chain re-runs from the store. This
 /// is that test: the connector no longer offers the mode the apply asked for, so this is a
 /// different display and the scale that came with it means nothing here.
-fn applied_config_is_stale(
+pub(crate) fn applied_config_is_stale(
     advertised: &[AdvertisedMode],
     config_mode: Option<synoik_config::output::Mode>,
 ) -> bool {
@@ -3911,7 +3915,7 @@ fn applied_config_is_stale(
 ///
 /// Everything returned is either a custom modeline or a mode the connector advertises, so this can
 /// never trip `pick_mode`'s "configured mode could not be found" fallback.
-fn choose_target_mode(
+pub(crate) fn choose_target_mode(
     advertised: &[AdvertisedMode],
     config_mode: Option<synoik_config::output::Mode>,
     saved: &[SavedMode],

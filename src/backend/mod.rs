@@ -222,7 +222,8 @@ impl Backend {
     pub fn on_output_config_changed(&mut self, synoik: &mut Synoik) {
         match self {
             Backend::Tty(tty) => tty.on_output_config_changed(synoik),
-            Backend::Headless(_) | Backend::Nested(_) => (),
+            Backend::Nested(nested) => nested.reconfigure(synoik),
+            Backend::Headless(_) => (),
         }
     }
 
