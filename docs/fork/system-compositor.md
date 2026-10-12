@@ -395,10 +395,16 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
 - **Switch** (`system_compositor::compose`, the outer's own Vulkan device on the render node): on
   a change of active session the outer snapshots what is on screen into its own texture (§5 step
   1; mid-fade, the blend on screen) and crossfades to the incoming session's frame, 250 ms
-  ease-out, into two outer-owned scanout buffers, then flips that frame itself — the session's
-  first `Presented` (§5 step 8). The target is the incoming session's held frame, else its next
-  present, gated on its render fence polled readable (§5 step 6). A fronted frame that replaces
-  the plate fades in the same way. Without a usable GPU a switch is a cut.
+  ease-out, into two outer-owned scanout buffers, then flips the session's frame itself (§5 step
+  8). The target is the incoming session's held frame, else its next present, gated on its render
+  fence polled readable (§5 step 6), and it is live: each frame the session presents during the
+  fade replaces it, answered `Presented` by the flip that shows a blend of it, so whatever the
+  session animates meanwhile (an unlock, its startup) plays through the fade. A fronted frame that
+  replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+- **Shutdown**: on logind's `PrepareForShutdown(true)` the outer stops following the seat and
+  fades what is on screen to black, drawing the end so it is what systemd's fd store keeps scanned
+  out after the outer exits; `false` brings back the session logind fronts. The boot/shutdown
+  splash (§6) hooks in here.
 - **Chord** (`system_compositor::chord`): on a seat without VTs the outer reads every evdev node
   itself (the `input` group, nothing grabbed) for Ctrl+Alt+F<n>, which activates the n-th seat0
   session in login order through logind's `ActivateSession` — off the event loop, allowed by
@@ -407,7 +413,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   overrides the detection.
 - **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
   backend takes it; renders like headless into three scanout slots, only while logind has it
-  active; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
+  active (and the greeter while its dialog fades out for a new session, `greeter.md` §4.4), its
+  first frame waiting for the wallpaper; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
   retries, re-registers its buffers and redraws in full.
 
 Divergence from §5 step 6: the in-animation is gated on the incoming frame, but the outgoing
@@ -437,5 +444,4 @@ session's own buffer following. Neither inner logged a warning, though each also
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
 more than one output; the mode-change path of §4.2/§4.3; the inner asking the outer for a switch
-over IPC (§2.1's normal path); the greeter (`greeter.md`), including its rule that a greeter-class
-outgoing picture is held until the incoming session's first frame (`greeter.md` §4.4).
+over IPC (§2.1's normal path); the boot and shutdown splash (§6).

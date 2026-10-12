@@ -382,13 +382,24 @@ database is not read. The daemon hands every session the `GSETTINGS_SCHEMA_DIR` 
 
 ### 4.4 Leaving the greeter
 
-gnome-shell fades its own UI out over 250 ms before starting the session
-(`loginDialog.js:1254-1265`). We do not: the new session becomes `Active`, and the outer's switch
-crossfade (system-compositor §5) is the transition. A user session's first frame takes seconds,
-not the 300 ms the outer waits before fading to the plate — but the outgoing picture here is the
-greeter, which shows nothing private, so the outer **holds a greeter-class outgoing picture until
-the incoming frame** (bounded at 10 s) rather than fading to the plate. The 300 ms rule stays for
-user → user switches, where it exists to take the previous user's screen away.
+As gnome-shell's: the verified prompt stays up, and once the session opens the login dialog fades
+out over 250 ms before `StartSessionWhenReady` (`_startSession`, `loginDialog.js:1254-1265`); the
+gdm pump reports `SessionOpened` and the compositor sends `StartSession` when the fade is done.
+
+On a VT-less seat logind activates a session the moment it attaches (`seat_attach_session`),
+which is PAM's open — before `SessionOpened`, so the greeter is already backgrounded when its fade
+starts. It keeps drawing while its dialog is hidden (`backend::nested`), and the outer flips the
+outgoing greeter's frames while it waits for the incoming session's first one
+(`Transition::from_live`), so the fade plays in front of the user. The outer **holds a
+greeter-class outgoing picture until the incoming frame** (bounded at 10 s,
+`GREETER_TARGET_WAIT`) rather than fading to the plate after 300 ms: the greeter shows nothing
+private, and a session's first frame takes most of a second. The 300 ms rule stays for user → user
+switches, where it exists to take the previous user's screen away.
+
+The session's first frame waits for its wallpaper (`_loadBackground`, `layout.js:693-707`), and
+the session opens in the overview with GNOME's startup animation (`runStartupAnimation`,
+`overviewControls.js:801-857`), which plays through the outer's crossfade because the fade's
+target follows the incoming session's frames.
 
 ---
 
@@ -397,13 +408,16 @@ user → user switches, where it exists to take the previous user's screen away.
 - **Switch user** — the lock screen's button, and "Switch User…" past Log Out in the power menu
   (`system.js:199-208`), shown as `_updateSwitchUser` decides (`systemActions.js:428-438`): not
   locked down, a seat to switch on, more than one user, and never on the lock screen or the
-  greeter. The menu's locks the session first (`activateSwitchUser`, `:467-478`). Both run
+  greeter. The menu's locks the session without the curtain's slide and goes on only once that
+  frame is presented (`activateSwitchUser`'s `lock(false)` and `POST_PAINT`, `:467-479`), so the
+  switch fades away from the lock screen. Both run
   `user_switching::goto_login_session`, whose `find_greeter` takes GDM's `gdm-launch-environment`
   or our `synoik-greeter`; the greeter always exists (§2.6), so GDM's `CreateTransientDisplay`
   fallback never runs under synoik-login.
 - **Coming back:** when logind makes the greeter `Active` again with a user's prompt up, the
-  conversation is cancelled and it starts over (`_loginScreenSessionActivated`,
-  `loginDialog.js:1177-1202`); left on the grid, it stays as it was.
+  conversation is cancelled and it starts over, and a dialog faded out for a session fades back in
+  (`_loginScreenSessionActivated`, `loginDialog.js:1177-1202`); left on the grid, it stays as it
+  was.
 - **Logout:** the session's worker sees it exit and closes PAM (§2.4); logind fronts whatever it
   activates next, and the daemon activates the greeter if nothing else is.
 - **Chord:** Ctrl+Alt+F1 is the greeter, as VT1 is under GDM — greeter-class sessions lead the
@@ -553,8 +567,10 @@ since Fedora allows `reboot-multiple-sessions` to an active session.
 §7 step 4, switching and logout (§5) and the greeter hold (§4.4, `GREETER_TARGET_WAIT` in the
 outer).
 
-Measured 2026-10-12 on the same guest, by injected keys: "Switch User…" from Claude's power menu
-locks session 2 and fronts the greeter; logging u2 in from it fronts the new session seven seconds
-after the password, and the outer keeps the greeter up until u2's first frame instead of fading
-to the plate; Ctrl+Alt+F1 fronts the greeter and F3 u2's session; terminating u2's session closes
-its PAM session and the daemon fronts the greeter.
+Measured 2026-10-12 on the same guest, by injected keys and Limina's frame capture: "Switch
+User…" puts Claude's lock screen up at once and crossfades it to the greeter; logging u2 in fades
+the dialog out, holds the empty greeter until u2's first frame (about 0.7 s), and crossfades into
+the overview's startup animation; returning to u2's locked session crossfades with its shield
+sliding up; logging u2 out crossfades to the greeter, whose list fades back in; Ctrl+Alt+F1/F2
+switch with the same crossfade. Every crossfade is 16 composited frames at 16–17 ms, none more than
+21 ms apart. Restart fades to black (system-compositor §10).
