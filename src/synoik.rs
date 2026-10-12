@@ -256,6 +256,10 @@ impl LoginPage {
     }
 }
 
+/// How long the greeter's keyboard focus rests on a user's tile before it picks them
+/// (`State::arm_login_tile_dwell`).
+pub const LOGIN_TILE_DWELL: Duration = Duration::from_secs(3);
+
 /// `$system_base_color` (`_colors.scss:20`, `_palette.scss`), behind the login screen.
 const GREETER_BG: [f32; 4] = [
     0x22 as f32 / 255.,
@@ -763,6 +767,9 @@ pub struct Synoik {
     pub switch_user_hovered: bool,
     /// The pointer is on the greeter's accessibility button.
     pub login_a11y_hovered: bool,
+    /// Bumped by every key and click on the user grid, so a pending dwell (see
+    /// [`LOGIN_TILE_DWELL`]) knows it was overtaken.
+    pub login_dwell: u64,
 
     /// The last `active` we told the session bus about — see [`Self::publish_shield_active`].
     ///
@@ -6317,7 +6324,7 @@ impl State {
     ) {
         use smithay::input::keyboard::Keysym;
 
-        use crate::ui::login_grid::GridKey;
+        use crate::ui::login_grid::{GridHit, GridKey};
 
         let key = match raw {
             Some(Keysym::Left | Keysym::KP_Left) => GridKey::Left,
@@ -6331,13 +6338,39 @@ impl State {
             _ => return,
         };
         let count = self.synoik.login_users.len();
+        self.synoik.login_dwell += 1;
         let (action, moved) = self.synoik.login_grid.key(key, count);
         if moved {
             self.synoik.queue_redraw_all();
+            if let Some(GridHit::Tile(i)) = self.synoik.login_grid.focused() {
+                self.arm_login_tile_dwell(i);
+            }
         }
         if let Some(action) = action {
             self.on_login_grid_action(action);
         }
+    }
+
+    /// **Divergence:** a keyboard focus that rests on a user's tile for [`LOGIN_TILE_DWELL`] picks
+    /// that user, as Enter would. GDM's list has no such thing, and it starts the reader for
+    /// whichever row the arrows select; here walking the grid starts nothing, and only a pick —
+    /// Enter, a click, or this — raises the prompt and arms the reader. Only a keyboard move arms
+    /// it, so the focus the grid starts with never opens anyone's prompt by itself.
+    fn arm_login_tile_dwell(&mut self, tile: usize) {
+        use crate::ui::login_grid::GridHit;
+
+        let dwell = self.synoik.login_dwell;
+        self.synoik.timer_after(LOGIN_TILE_DWELL, move |state| {
+            let synoik = &state.synoik;
+            if synoik.login_dwell == dwell
+                && synoik.login_page == LoginPage::Grid
+                && synoik.login_grid.focused() == Some(GridHit::Tile(tile))
+                && !synoik.panel_popover.is_open()
+            {
+                state.on_login_grid_action(crate::ui::login_grid::GridAction::Pick(tile));
+            }
+            None
+        });
     }
 
     /// The grid picked a user, or asked for a name.
@@ -6455,6 +6488,7 @@ impl State {
         if !self.synoik.screen_shield.is_active() {
             return;
         }
+        self.synoik.login_dwell += 1;
         // The greeter's accessibility button, on every page.
         if self.synoik.greeter {
             let under = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p));
@@ -8813,6 +8847,7 @@ impl Synoik {
             can_switch_user: false,
             switch_user_hovered: false,
             login_a11y_hovered: false,
+            login_dwell: 0,
             multiple_users: false,
             gdm_requests: None,
             lock_timer: None,

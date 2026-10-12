@@ -42289,6 +42289,67 @@ fn a_name_question_does_not_outlive_its_page() {
     assert!(f.synoik().unlock_dialog.entry_mask().is_some());
 }
 
+/// Walking the user grid arms nothing — GDM starts the reader for every row the arrows select —
+/// but a keyboard focus that rests on a tile picks that user, prompt and reader at once. The
+/// focus the grid starts with never does.
+#[test]
+fn a_resting_focus_picks_the_user_and_walking_does_not() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::gdm::VerifierRequest;
+    use crate::synoik::{LoginPage, LOGIN_TILE_DWELL};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik_state().show_greeter_dialog();
+    let user = |name: &str| LoginUser {
+        name: name.to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![user("amy"), user("bob")]));
+    let half = LOGIN_TILE_DWELL / 2;
+
+    f.advance_clock(LOGIN_TILE_DWELL * 2);
+    f.turn();
+    assert_eq!(
+        f.synoik().login_page,
+        LoginPage::Grid,
+        "the start focus waits"
+    );
+
+    // Away and back to the same tile: the first rest's timer is stale, not early.
+    tap(&mut f, KEY_RIGHT);
+    f.advance_clock(half);
+    f.turn();
+    tap(&mut f, KEY_LEFT);
+    tap(&mut f, KEY_RIGHT);
+    f.advance_clock(half + Duration::from_millis(100));
+    f.turn();
+    assert_eq!(f.synoik().login_page, LoginPage::Grid, "a move restarts it");
+    assert!(!f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::StartFingerprint)));
+
+    f.advance_clock(half);
+    f.turn();
+    assert!(
+        matches!(&f.synoik().login_page, LoginPage::Prompt { user, .. } if user == "bob"),
+        "{:?}",
+        f.synoik().login_page
+    );
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::StartFingerprint)));
+}
+
 /// The login dialog's accessibility button (`A11yMenuButton`, `loginDialog.js:415-459`): a click
 /// opens its menu of quick toggles above it, a toggle flips its key and leaves the menu up, and
 /// it is also the stop after the "Enter User Name" pill.

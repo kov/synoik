@@ -288,7 +288,10 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
   no name (`js/gdm/loginDialog.js:262-276`), most frequent logins first then by name
   (`act_user_collate`), re-read on `UserAdded`/`UserDeleted`, any user's `Changed`, and logind's
   `SessionNew`/`SessionRemoved`. A user with a session on seat0 gets the accent ring
-  (`:logged-in`, `_login-lock.scss:200-207`). Arrows, Tab, Enter and clicks pick. With `disable-user-list`, or once the list has loaded
+  (`:logged-in`, `_login-lock.scss:200-207`). Arrows and Tab move the focus and start nothing;
+  Enter, a click, or the keyboard focus resting on a tile for 3 s picks that user, which raises
+  the prompt and arms the reader at once. **Divergence:** GDM starts the reader for whichever row
+  the arrows select, and has no resting pick. The focus the grid starts with never picks anyone. With `disable-user-list`, or once the list has loaded
   empty or with more than twelve users, the greeter starts on the name question instead,
   re-deciding whenever either changes while nobody is being asked (`:914-930`).
 - **Not listed?** the mockup's "Enter User Name ›" pill opens the name page. It sits in GNOME's
