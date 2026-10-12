@@ -1,9 +1,11 @@
 # The system compositor
 
-> Status: **design agreed 2026-08-15; partly built** — sessions nested and scanned out
-> unredirected, the screen following logind's active session with a crossfade, surviving a crash
-> of either side, and switchable by the outer's own chord where there are no VTs (§10). The
-> greeter is designed (`greeter.md`), not built. The outer is an unprivileged system user outside logind (§9 S1).
+> Status: **design agreed 2026-08-15; built far enough to replace GDM** — sessions nested and
+> scanned out unredirected on every connected display, each session deciding its own display
+> layout, the screen following logind's active session with a crossfade, surviving a crash of
+> either side, and switchable by the outer's own chord where there are no VTs (§10). The greeter
+> is `greeter.md`. The outer is an unprivileged system user outside logind (§9 S1);
+> `scripts/install-display-manager.sh` makes it a machine's display manager.
 
 A second synoik configuration — the **system compositor** — owns the display for the machine's
 whole lifetime, from bootloader hand-off to power-off. It hosts the greeter, heralds system
@@ -168,7 +170,8 @@ dialog is a real requirement.
 
 **Arbitration policy: the fronted session's config wins, and the outer inherits it** rather than
 imposing its own. The greeter, each session, and the outer's own transition rendering all want a
-mode; one rule settles all of them.
+mode; one rule settles all of them. Until the fronted session has said what it wants (it is still
+starting), the outer keeps the layout it has, so a login's fade never modesets under it.
 
 ### 3.1 Presentation and frame pacing
 
@@ -383,15 +386,27 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
   (kernel flip time and sequence, untouched, §3.1) or `Discarded`. Each `Present` is answered
   exactly once, and only by its own buffer id: a frame shown again is not re-answered.
-- **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): opens or recovers the
-  card, modesets the first connected display at its preferred mode, and flips the buffers of the
-  session logind has made active on seat0, following `ACTIVE=` in `/run/systemd/seats/seat0` by
-  inotify (`sd_login_monitor`'s mechanism). Any number of sessions attach; each names its logind
+- **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): quits plymouth
+  (`--retain-splash`, as GDM does), opens or recovers the card, lights every connected display
+  with its plate, and flips the buffers of the session logind has made active on seat0, following
+  `ACTIVE=` in `/run/systemd/seats/seat0` by inotify (`sd_login_monitor`'s mechanism). A
+  restarted outer adopts each lit CRTC at the mode it runs, with no modeset. Any number of sessions attach; each names its logind
   session in `Hello`, accepted only if that session is on seat0, owned by the peer's uid, and —
   when the peer runs in a session scope — that scope's. A background session's newest present is
   held unanswered (so its slot stays reserved) and the one it supersedes discarded. The screen
   never shows a buffer the inner may be drawing into: only a held frame, or the last one answered
   `Presented`.
+- **Displays** (§3): the outer describes every connected connector — name, EDID, physical size,
+  modes — in `Welcome`, and again in `Connectors` whenever udev reports a change on its card
+  (plug, unplug, a new mode list, which is all a resized VM window is). Each session answers with
+  `Configure`: the connectors it lights, each at one of its modes, and whether they are on at all
+  (an idle blank, `PowerSaveMode`). The outer applies the fronted session's; the session decides
+  as the tty backend does (`backend::nested`: off, the lid, the live-applied config,
+  `monitors.xml`'s saved mode, `pick_mode`), so GNOME Settings' resolution and "off" work.
+  Each display flips, fades and shows its plate on its own; a switch to a session with another
+  layout cuts a display whose mode, or on/off, changes through its plate (§4.2's black is not
+  built), and crossfades the rest. A frame for a display not lit at its size waits unanswered, as
+  a background frame does.
 - **Switch** (`system_compositor::compose`, the outer's own Vulkan device on the render node): on
   a change of active session the outer snapshots what is on screen into its own texture (§5 step
   1; mid-fade, the blend on screen) and crossfades to the incoming session's frame, 250 ms
@@ -442,6 +457,7 @@ and switching away and back found its overview intact. The crossfade fits as on 
 session's own buffer following. Neither inner logged a warning, though each also sees the chord.
 
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
-included); the inner deciding the display configuration (§3, §4); VRR and tearing passthrough;
-more than one output; the mode-change path of §4.2/§4.3; the inner asking the outer for a switch
-over IPC (§2.1's normal path); the boot and shutdown splash (§6).
+included); §3's atomic test-and-revert and the HDR, VRR and orientation fields; VRR and tearing
+passthrough; a modeset under black (§4.2: a changed display cuts through its plate); custom
+modelines nested; the inner asking the outer for a switch over IPC (§2.1's normal path); the boot
+and shutdown splash (§6).

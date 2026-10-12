@@ -1,8 +1,9 @@
 # The greeter and the login daemon
 
-> Status: **§7 steps 1-3 built** (§9) — the greeter session, autologin, the lock screen's
-> password and fingerprint reauthentication, and the greeter's grid and login; step 3's name
-> entry and `org.gnome.login-screen` keys are left. Our own replacement for GDM on the system compositor's seat: a
+> Status: **§7 steps 1-4 built** (§9) — the greeter session, autologin, the lock screen's
+> password and fingerprint reauthentication, the greeter's grid, name entry and login, switching
+> and logout, on seats with VTs and without; `scripts/install-display-manager.sh` installs it in
+> GDM's place. Our own replacement for GDM on the system compositor's seat: a
 > small root login daemon that runs PAM, and a greeter that is synoik in a greeter session mode,
 > nested in the outer like any session (`system-compositor.md`). Password and fingerprint;
 > autologin; the system-only clock and quick settings GDM's greeter shows.
@@ -153,15 +154,22 @@ open is the one `SessionOpened` names. We make that the rule and open only it:
    `gnome-session --session synoik` (`resources/synoik.desktop`) with `pam_getenvlist`,
    `SYNOIK_SYSTEM_SOCKET` and `XDG_CURRENT_DESKTOP=Synoik:GNOME`
    (`gdm-session-worker.c:2083-2236`).
-5. The worker stays the session's parent; when it exits, `pam_close_session`,
+5. On a seat0 with VTs (`CAN_TTY=1`), logind wants every session on one and activates a session
+   by switching to its VT. As GDM does (`set_up_for_new_vt`, `jump_to_vt`,
+   `gdm-session-worker.c:1101-1165`, `2271-2333`), the greeter takes tty1 and every other
+   session the first free VT (`VT_OPENQRY`), named to `pam_systemd` by `XDG_VTNR` and `PAM_TTY`
+   before step 3; the worker switches to it as the program starts and makes it the session's
+   controlling terminal (`synoik-login/src/vt.rs`). A VT is logind's bookkeeping here, never a
+   framebuffer: the system compositor holds the display either way.
+6. The worker stays the session's parent; when it exits, `pam_close_session`,
    `pam_setcred(DELETE)`, `pam_end`, `killpg(SIGHUP)` (`:1862-1880`).
 
 GDM 51 also puts `XDG_SESSION_EXTRA_DEVICE_ACCESS=render:accel` in every session's PAM
 environment (`gdm-session-worker.c:1338`); what logind grants for it is checked at bring-up
 before we copy it (§8 G1).
 
-logind makes a new seat0 session `Active` on its own (system-compositor §9 S1), so the outer
-fronts it with no call from anyone.
+Without VTs logind makes a new seat0 session `Active` on its own (system-compositor §9 S1); with
+them, the worker's switch to its VT does. Either way the outer fronts it with no call from anyone.
 
 ### 2.5 Reauthentication
 
@@ -574,3 +582,9 @@ the overview's startup animation; returning to u2's locked session crossfades wi
 sliding up; logging u2 out crossfades to the greeter, whose list fades back in; Ctrl+Alt+F1/F2
 switch with the same crossfade. Every crossfade is 16 composited frames at 16–17 ms, none more than
 21 ms apart. Restart fades to black (system-compositor §10).
+
+Measured 2026-10-12 on the same guest booted with its VT kernel (`CAN_TTY=1`), installed by
+`scripts/install-display-manager.sh`: the greeter on tty1, Claude's autologin on tty3 and active;
+"Switch User…" fronts tty1; logging u2 in puts it on tty2 with the same fade, hold and crossfade;
+Ctrl+Alt+F3/F2 switch VTs; ending u2's session fronts the greeter. `--use-gdm` and a reboot bring
+GDM back.
