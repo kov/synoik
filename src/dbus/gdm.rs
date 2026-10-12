@@ -71,6 +71,25 @@ const PASSWORD_SERVICE: &str = "gdm-password";
 /// ...and the one it runs for the reader, **beside** the password rather than instead of it
 /// (`FINGERPRINT_SERVICE_NAME`, `util.js:28`; `_maybeStartFingerprintVerification`, `:714-719`).
 const FINGERPRINT_SERVICE: &str = "gdm-fingerprint";
+
+/// The service the conversation is about — the one whose questions go in the entry and whose stop
+/// is a failure (`_getDetectedDefaultService`, `util.js:653-660`): the password unless
+/// `enable-password-authentication` is off, and then the reader if there is one. With neither it is
+/// the password anyway (`_updateDefaultService`, `:666-669`), so a machine with the key off and no
+/// reader can still be logged into. Smartcard, which would come before the reader, is not built.
+pub fn foreground_service(
+    password_enabled: bool,
+    reader: crate::dbus::fprintd::ReaderType,
+) -> &'static str {
+    if password_enabled {
+        PASSWORD_SERVICE
+    } else if reader.is_present() {
+        FINGERPRINT_SERVICE
+    } else {
+        info!("no authentication service is enabled, using password authentication");
+        PASSWORD_SERVICE
+    }
+}
 /// **Divergence: GNOME says nothing here, and we say this.**
 ///
 /// When the reader is given up on there is no text to show — gdm's `ServiceUnavailable` message is
@@ -127,6 +146,9 @@ pub enum VerifierRequest {
         /// `org.gnome.login-screen allowed-failures`: how many refusals a login takes before
         /// [`VerifierEvent::Exhausted`]. Ignored for reauthentication, which retries forever.
         allowed_failures: u32,
+        /// `org.gnome.login-screen enable-password-authentication`. Off, the reader is the
+        /// conversation (see [`foreground_service`]).
+        password_enabled: bool,
     },
     /// Answer the outstanding query. **Carries a password** — see the `Debug` impl below.
     Answer(String),
@@ -148,6 +170,7 @@ impl std::fmt::Debug for VerifierRequest {
                 reader,
                 login,
                 allowed_failures,
+                password_enabled,
             } => f
                 .debug_struct("Begin")
                 .field("username", username)
@@ -155,6 +178,7 @@ impl std::fmt::Debug for VerifierRequest {
                 .field("reader", reader)
                 .field("login", login)
                 .field("allowed_failures", allowed_failures)
+                .field("password_enabled", password_enabled)
                 .finish(),
             Self::Answer(answer) => write!(f, "Answer(<redacted, {} chars>)", answer.len()),
             Self::StartFingerprint => write!(f, "StartFingerprint"),
@@ -272,6 +296,7 @@ async fn run(
                 reader,
                 login,
                 allowed_failures,
+                password_enabled,
             } => {
                 // Close the previous channel *before* opening another: gdm keeps a PAM worker per
                 // channel, and an orphan would go on emitting into the compositor — including a
@@ -280,7 +305,17 @@ async fn run(
                     old.close().await;
                 }
                 let budget = login.then_some(allowed_failures);
-                match Session::open(&system, &username, reader, budget, to_niri.clone()).await {
+                let foreground = foreground_service(password_enabled, reader);
+                match Session::open(
+                    &system,
+                    &username,
+                    reader,
+                    foreground,
+                    budget,
+                    to_niri.clone(),
+                )
+                .await
+                {
                     Ok(new) => {
                         session = Some(new);
                         let _ = to_niri.send(VerifierEvent::Ready(epoch));
@@ -340,6 +375,9 @@ struct FingerprintFlags {
     /// state so that raising the prompt clears it in the same place it clears `given_up` — a fresh
     /// showing that inherited the last one's exhausted budget would give up on its first stop.
     silent_stops: std::sync::atomic::AtomicU32,
+    /// The reader is the foreground service (see [`foreground_service`]). Fixed for the channel's
+    /// life.
+    foreground: bool,
 }
 
 impl FingerprintFlags {
@@ -378,6 +416,7 @@ impl Session {
         system: &zbus::Connection,
         username: &str,
         reader: crate::dbus::fprintd::ReaderType,
+        foreground: &'static str,
         // `Some(allowed-failures)` for a login; `None` for reauthentication.
         budget: Option<u32>,
         to_niri: calloop::channel::Sender<VerifierEvent>,
@@ -413,7 +452,10 @@ impl Session {
         // promptly — cannot land before anything is listening.
         let stream = zbus::MessageStream::from(&conn);
 
-        let fingerprint = std::sync::Arc::new(FingerprintFlags::default());
+        let fingerprint = std::sync::Arc::new(FingerprintFlags {
+            foreground: foreground == FINGERPRINT_SERVICE,
+            ..Default::default()
+        });
         let pump = conn.executor().spawn(
             pump_signals(
                 stream,
@@ -432,13 +474,16 @@ impl Session {
             "gdm-user-verifier-signals",
         );
 
-        begin(&conn, PASSWORD_SERVICE, username)
-            .await
-            .context("BeginVerificationForUser")?;
-
         // The reader is **not** started here. It runs beside the password conversation
         // (`_maybeStartFingerprintVerification`, `util.js:714-719`) but only once the prompt is
         // actually up — see [`VerifierRequest::StartFingerprint`] and `UnlockDialog::show_prompt`.
+        // When it *is* the conversation, nothing is begun until then: a lock screen opens its
+        // channel while it shows the clock, and an armed sensor asks for a finger.
+        if foreground == PASSWORD_SERVICE {
+            begin(&conn, PASSWORD_SERVICE, username)
+                .await
+                .context("BeginVerificationForUser")?;
+        }
         Ok(Self {
             conn,
             pump,
@@ -535,7 +580,15 @@ async fn pump_signals(
 ) {
     use std::sync::atomic::Ordering;
 
-    let mut fingerprint = FingerprintState::default();
+    let foreground = if flags.foreground {
+        FINGERPRINT_SERVICE
+    } else {
+        PASSWORD_SERVICE
+    };
+    let mut fingerprint = FingerprintState {
+        foreground: flags.foreground,
+        ..Default::default()
+    };
     // Refused passwords and failed scans, for a login's `allowed-failures`.
     let mut failures = FailureCount::new(match purpose {
         Purpose::Login { allowed_failures } => Some(allowed_failures),
@@ -658,12 +711,13 @@ async fn pump_signals(
         }
 
         let routed = route(&member, service.as_deref(), text, reader, fingerprint);
-        // A refused password, and a scan that failed (`_onProblem`, `util.js:755-782`: pam_fprintd
-        // would otherwise let a finger try forever), count against a login's budget.
-        let password_refused =
-            matches!(&routed, Routed::Restart { service, .. } if *service == PASSWORD_SERVICE);
+        // A refusal of the foreground service (`_onConversationStopped`, `util.js:929-930`), and a
+        // scan that failed (`_onProblem`, `:755-782`: pam_fprintd would otherwise let a finger try
+        // forever), count against a login's budget. With the reader foreground a failed scan is
+        // both, and counts twice, as it does in GNOME.
+        let refused = matches!(&routed, Routed::Restart { service, .. } if *service == foreground);
         let failed_scan = member == "Problem" && service.as_deref() == Some(FINGERPRINT_SERVICE);
-        if password_refused || failed_scan {
+        if refused || failed_scan {
             failures.fail();
         }
         let spent = failures.is_spent();
@@ -701,7 +755,7 @@ async fn pump_signals(
             // screen that can never be answered again.
             // Out of attempts: say why, and restart nothing; the greeter starts over
             // (`_verificationFailed` with `doneTrying`, `util.js:851-870`).
-            Routed::Restart { service, event } if service == PASSWORD_SERVICE && spent => event,
+            Routed::Restart { service, event } if service == foreground && spent => event,
             Routed::Restart { service, event } => {
                 if service == FINGERPRINT_SERVICE {
                     let silent = if fingerprint.stopped_immediately && !fingerprint.spoke {
@@ -717,9 +771,10 @@ async fn pump_signals(
                 }
                 if let Err(err) = begin(&conn, service, &username).await {
                     warn!("gdm: could not restart {service} after a refusal: {err:?}");
-                    // Only the password service dying is fatal to the lock: without it there is no
-                    // way in at all. A reader that will not restart just stops being an option.
-                    if service == PASSWORD_SERVICE {
+                    // Only the foreground service dying is fatal to the lock: without it there is
+                    // no way in at all. A background reader that will not restart just stops being
+                    // an option.
+                    if service == foreground {
                         let _ = to_niri.send(VerifierEvent::Lost);
                         break;
                     }
@@ -824,6 +879,9 @@ struct FingerprintState {
     /// Whether the user has prints enrolled, when known. Only an enrolled user is told the reader
     /// is unavailable: to anyone else it reads as a fault.
     enrolled: Option<bool>,
+    /// The reader is the foreground service, not a background one beside the password (see
+    /// [`foreground_service`]). Fixed for the channel's life.
+    foreground: bool,
 }
 
 /// Whether this signal is the reader answering — narrating a scan or complaining about one.
@@ -878,7 +936,12 @@ fn route(
         return Routed::Event(VerifierEvent::Reset);
     }
 
-    let is_foreground = service == Some(PASSWORD_SERVICE);
+    let foreground_service = if fingerprint.foreground {
+        FINGERPRINT_SERVICE
+    } else {
+        PASSWORD_SERVICE
+    };
+    let is_foreground = service == Some(foreground_service);
     // `serviceIsFingerprint` requires a *detected reader*, not just the name (`util.js:616-619`) —
     // without one we never started the service, so a signal bearing its name is not ours.
     let is_fingerprint = reader.is_present() && service == Some(FINGERPRINT_SERVICE);
@@ -897,7 +960,7 @@ fn route(
         // foreground service, so its narration would read as an instruction about the password
         // prompt. GNOME substitutes its own parenthetical aside at HINT priority, and which one
         // depends on the reader's shape.
-        "Info" if is_fingerprint => match reader.hint() {
+        "Info" if is_fingerprint && !is_foreground => match reader.hint() {
             Some(hint) => Routed::Event(VerifierEvent::ShowMessage {
                 text: hint.to_owned(),
                 kind: MessageKind::Hint,
@@ -937,7 +1000,7 @@ fn route(
             service: if is_fingerprint {
                 FINGERPRINT_SERVICE
             } else {
-                PASSWORD_SERVICE
+                foreground_service
             },
             // **gdm's message here is usually empty**, and GNOME checks for exactly that
             // (`if (!errorMessage) return`, `util.js:892-893`): the `PAM_AUTHINFO_UNAVAIL` path
@@ -1012,6 +1075,10 @@ fn route(
                     event: None,
                 }
             } else if refused && fingerprint.silent_stops + 1 >= FINGERPRINT_MAX_SILENT_STOPS {
+                // Kept for a foreground reader too, though GNOME restarts it whatever it does: a
+                // reader that declines the instant it starts would otherwise be re-armed as fast
+                // as it declines. Raising the prompt afresh tries it again
+                // ([`FingerprintFlags::claim_for_new_showing`]).
                 // The other way to give up, and the one gdm never comments on at all: a reader that
                 // simply stops without a word, over and over. Same outcome for the user, so the
                 // same sentence.
@@ -1026,12 +1093,15 @@ fn route(
             } else {
                 Routed::Restart {
                     service: FINGERPRINT_SERVICE,
-                    event: None,
+                    // As the foreground service, a stop is a refused attempt: the entry's
+                    // `Failed` (`_onConversationStopped` → `_verificationFailed`,
+                    // `util.js:929-932`).
+                    event: fingerprint.foreground.then_some(VerifierEvent::Failed),
                 }
             }
         }
         "ConversationStopped" => Routed::Restart {
-            service: PASSWORD_SERVICE,
+            service: foreground_service,
             event: Some(VerifierEvent::Failed),
         },
 
@@ -1378,6 +1448,7 @@ mod tests {
             spoke: true,
             unavailable: false,
             enrolled: None,
+            foreground: false,
         };
         assert_eq!(
             route(
@@ -1592,6 +1663,7 @@ mod tests {
             spoke: false,
             unavailable: false,
             enrolled: None,
+            foreground: false,
         };
         assert_eq!(
             route(
@@ -1677,6 +1749,7 @@ mod tests {
             unavailable: true,
             spoke: false,
             enrolled: None,
+            foreground: false,
         };
         assert_eq!(
             route(
@@ -1691,5 +1764,89 @@ mod tests {
                 event: Some(VerifierEvent::Failed),
             }
         );
+    }
+
+    /// `_getDetectedDefaultService` (`util.js:653-669`): the reader is the conversation only with
+    /// the password off and a reader found; with neither, the password anyway.
+    #[test]
+    fn the_foreground_service_follows_the_password_key_and_the_reader() {
+        assert_eq!(
+            foreground_service(true, ReaderType::Press),
+            PASSWORD_SERVICE
+        );
+        assert_eq!(
+            foreground_service(false, ReaderType::Press),
+            FINGERPRINT_SERVICE
+        );
+        assert_eq!(
+            foreground_service(false, ReaderType::None),
+            PASSWORD_SERVICE
+        );
+    }
+
+    /// With the reader foreground its narration is the prompt's (`_onInfo`, `util.js:727-729`),
+    /// its stop is a refused attempt (`:929-932`), and the password service is nobody's.
+    #[test]
+    fn a_foreground_reader_is_the_conversation() {
+        let fg = FingerprintState {
+            foreground: true,
+            ..healthy()
+        };
+        assert_eq!(
+            route(
+                "Info",
+                Some(FINGERPRINT_SERVICE),
+                msg("Place your finger on the reader"),
+                ReaderType::Press,
+                fg,
+            ),
+            Routed::Event(VerifierEvent::ShowMessage {
+                text: "Place your finger on the reader".to_owned(),
+                kind: MessageKind::Info,
+                source: MessageSource::Fingerprint,
+            })
+        );
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fg,
+            ),
+            Routed::Restart {
+                service: FINGERPRINT_SERVICE,
+                event: Some(VerifierEvent::Failed),
+            }
+        );
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                FingerprintState {
+                    unavailable: true,
+                    ..fg
+                },
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: None,
+            }
+        );
+        for member in ["ConversationStopped", "SecretInfoQuery"] {
+            assert_eq!(
+                route(
+                    member,
+                    Some(PASSWORD_SERVICE),
+                    msg("Password:"),
+                    ReaderType::Press,
+                    fg
+                ),
+                Routed::Ignore,
+                "{member}"
+            );
+        }
     }
 }

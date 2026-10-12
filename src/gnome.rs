@@ -721,6 +721,9 @@ impl GnomeSettings {
             self.shield.enable_fingerprint =
                 login_screen.boolean("enable-fingerprint-authentication");
         }
+        if settings_has_key(login_screen, "enable-password-authentication") {
+            self.shield.enable_password = login_screen.boolean("enable-password-authentication");
+        }
         if settings_has_key(login_screen, "enable-smartcard-authentication") {
             self.shield.enable_smartcard = login_screen.boolean("enable-smartcard-authentication");
         }

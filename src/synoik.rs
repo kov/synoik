@@ -472,6 +472,9 @@ pub struct Synoik {
     /// Bumped whenever the greeter starts asking someone or goes back to its start, so a timer
     /// armed for one visit cannot act on the next.
     pub greeter_visit: u64,
+    /// The foreground service the open conversation began with, to notice the keys or the reader
+    /// picking another (`_updateDefaultService`, `util.js:663-676`).
+    pub verifier_foreground: Option<&'static str>,
     /// The login screen's user grid and which page it is on.
     pub login_grid: crate::ui::login_grid::LoginGrid,
     /// The login dialog's banner and logo.
@@ -2420,6 +2423,7 @@ impl State {
                         );
                         state.synoik.sync_power_policy();
                         state.sync_greeter_user_list();
+                        state.sync_verifier_foreground();
                         // `lock-enabled` and `disable-lock-screen` are two of the inhibitor's
                         // conditions, and GNOME wires both keys straight to `_syncInhibitor`
                         // (`screenShield.js:110,113`). Without this, turning locking back on
@@ -6929,6 +6933,45 @@ impl State {
             debug!("fingerprint reader detected: {reader:?}");
         }
         self.synoik.fingerprint_reader = reader;
+        self.sync_verifier_foreground();
+    }
+
+    /// `_updateDefaultService` (`util.js:663-676`): when the keys or the reader now pick another
+    /// foreground service than the open conversation began with, cancel it and start over — the
+    /// greeter back at its start, the lock screen with a fresh channel.
+    pub fn sync_verifier_foreground(&mut self) {
+        let Some(began) = self.synoik.verifier_foreground else {
+            return;
+        };
+        let now = crate::dbus::gdm::foreground_service(
+            self.synoik.gnome_settings.shield.enable_password,
+            self.synoik.fingerprint_reader,
+        );
+        if now == began {
+            return;
+        }
+        self.synoik.verifier_foreground = None;
+        if self.synoik.greeter {
+            if self.synoik.login_page.is_asking_a_user() {
+                self.greeter_back_to_start(true);
+            }
+            return;
+        }
+        if !self.synoik.screen_shield.is_locked() {
+            return;
+        }
+        if let Some(tx) = self.synoik.gdm_requests.as_ref() {
+            let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
+        }
+        self.synoik.screen_shield.drop_authenticator();
+        let effects = self.synoik.screen_shield.retry_authenticator();
+        self.apply_shield_effects(effects);
+        let now = self.synoik.shield_now();
+        let effects = self
+            .synoik
+            .unlock_dialog
+            .on_verifier_event(crate::dbus::gdm::VerifierEvent::Lost, now);
+        self.apply_unlock_effects(effects);
     }
 
     /// AccountsService answered, or the account changed under us.
@@ -7051,6 +7094,7 @@ impl State {
             let mut asked = false;
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let username = self.synoik.unlock_dialog.user().name.clone();
+                let password_enabled = self.synoik.gnome_settings.shield.enable_password;
                 asked = tx
                     .send_blocking(crate::dbus::gdm::VerifierRequest::Begin {
                         username,
@@ -7058,8 +7102,13 @@ impl State {
                         reader: self.synoik.fingerprint_reader,
                         login: self.synoik.greeter,
                         allowed_failures: self.synoik.gnome_settings.login_screen.allowed_failures,
+                        password_enabled,
                     })
                     .is_ok();
+                self.synoik.verifier_foreground = Some(crate::dbus::gdm::foreground_service(
+                    password_enabled,
+                    self.synoik.fingerprint_reader,
+                ));
             }
 
             if asked {
@@ -8598,6 +8647,7 @@ impl Synoik {
             login_users: Vec::new(),
             login_users_loaded: false,
             greeter_visit: 0,
+            verifier_foreground: None,
             login_grid: crate::ui::login_grid::LoginGrid::new(),
             login_chrome: Default::default(),
             login_page: LoginPage::Grid,

@@ -326,6 +326,13 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
   does (`:839-870`);
 - the channel is the login one (`OpenSession`), falling back from reauthentication (§2.5), and
   the client answers `SessionOpened` with `StartSessionWhenReady`.
+- with `enable-password-authentication` off and a reader found, the reader is the foreground
+  service (`_getDetectedDefaultService`, `util.js:653-669`; with neither, the password anyway):
+  nothing is begun until the prompt is up, its narration is shown as it is, nothing is asked in
+  the entry, and each stop is a failed attempt, restarted and counted. Unlike GNOME, a reader that
+  stops the instant it starts, three times silently, is given up on until the prompt is raised
+  again rather than re-armed in a spin. A key or reader change that picks another foreground
+  service mid-conversation cancels it and starts over (`:663-676`). Same on the lock screen.
 - "Fingerprint reader unavailable" is said only to a user with prints enrolled. The greeter cannot
   ask fprintd about another user (`setusername` is `auth_admin_keep`), so the `gdm-fingerprint`
   worker, which is root, asks and puts the line in `ServiceUnavailable`'s message, which gnome-shell
@@ -334,7 +341,8 @@ gnome-shell's two modes (`authPrompt.js:162-168`, `197`, `264-267`):
 `org.gnome.login-screen` keys to honour: `enable-password-authentication`,
 `enable-fingerprint-authentication`, `allowed-failures`, `disable-user-list`, `logo`,
 `banner-message-*`, `disable-restart-buttons`. Not honoured: `enable-smartcard-authentication`
-(out of scope). Read today: `enable-fingerprint-authentication`, `disable-restart-buttons`,
+(out of scope). Read today: `enable-password-authentication`,
+`enable-fingerprint-authentication`, `disable-restart-buttons`,
 `disable-user-list`, `allowed-failures`, `logo` and `banner-message-*`.
 
 The schema is GDM's, vendored in `resources/schemas` so neither the greeter nor the lock screen
@@ -501,8 +509,7 @@ Measured 2026-10-11 on the same guest, by injected keys: the greeter shows Claud
 session 2) and u2; picking u2 asks for u2's password (`OpenReauthenticationChannel` is
 `AccessDenied`, the client falls back to `OpenSession`) and the right one starts session 10, which
 seat0 fronts. Back on the greeter u2 has the ring; picking Claude reauthenticates and fronts
-session 2. Left in step 3: `org.gnome.login-screen` (`disable-user-list`, `allowed-failures`,
-`logo`, banner, `disable-restart-buttons`, the authentication toggles) and the a11y button. A polkit check run inside the greeter's session for an admin-only action
+session 2. Left in step 3: the a11y button. A polkit check run inside the greeter's session for an admin-only action
 (`systemd1.manage-units`) raises the prompt over the grid for Claude, the administrator, and
 Escape dismisses it; Restart from the greeter's menu with Claude logged in reboots without one,
 since Fedora allows `reboot-multiple-sessions` to an active session.

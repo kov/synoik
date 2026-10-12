@@ -42140,6 +42140,60 @@ fn the_greeter_starts_over_after_the_allowed_failures() {
     assert!(f.synoik().login_page.is_asking_a_user());
 }
 
+/// `enable-password-authentication=false` (`_getDetectedDefaultService`, `util.js:653-660`): with
+/// a reader the login asks for a finger and nothing goes in the entry; turning the password back on
+/// mid-conversation starts over (`_updateDefaultService`, `:663-676`).
+#[test]
+fn the_greeter_logs_in_by_fingerprint_alone() {
+    use crate::dbus::accounts_service::{AccountsToSynoik, LoginUser};
+    use crate::dbus::fprintd::ReaderType;
+    use crate::dbus::gdm::VerifierRequest;
+    use crate::synoik::LoginPage;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().greeter = true;
+    f.synoik().gnome_settings.shield.enable_password = false;
+    f.synoik_state().on_fingerprint_reader(ReaderType::Press);
+    f.synoik_state().show_greeter_dialog();
+    let amy = LoginUser {
+        name: "amy".to_owned(),
+        real_name: String::new(),
+        icon_file: None,
+        uid: 1000,
+        logged_in: false,
+        login_frequency: 0,
+    };
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::Users(vec![amy]));
+    tap(&mut f, KEY_ENTER);
+    let requests = f.gdm_requests();
+    assert!(
+        requests.iter().any(|r| matches!(
+            r,
+            VerifierRequest::Begin {
+                password_enabled: false,
+                reader: ReaderType::Press,
+                ..
+            }
+        )),
+        "{requests:?}"
+    );
+    assert!(requests
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::StartFingerprint)));
+    assert!(f.synoik().login_page.is_asking_a_user());
+    assert!(!f.synoik().unlock_dialog.is_entry_live());
+
+    f.synoik().gnome_settings.shield.enable_password = true;
+    f.synoik_state().sync_verifier_foreground();
+    assert_eq!(f.synoik().login_page, LoginPage::Grid);
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::Cancel)));
+}
+
 /// The name question dies with its page: picking a user after backing out of "Enter User Name"
 /// must not leave a live, unmasked entry waiting for gdm's password question.
 #[test]
