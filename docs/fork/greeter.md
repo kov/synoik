@@ -362,6 +362,10 @@ user → user switches, where it exists to take the previous user's screen away.
   redacts in `Debug`).
 - Every channel is bound to a logind session claim (§2.2) and dies with its connection.
 - An unknown user is indistinguishable from a wrong password.
+- The greeter's polkit rights are ours, not GDM's (`resources/synoik-greeter.rules`): while it is
+  the active local session it may edit the system's network connections, which `20-gdm.rules`
+  grants GDM's `gdm` group; nothing else. Smartcard access, GDM's other grant, comes with
+  smartcard login.
 - The greeter user owns nothing but its own session: an `Active` greeter-class session strips every
   user's device ACLs and grants none (system-compositor §9 S1), which is what we want here.
 
@@ -382,11 +386,6 @@ user → user switches, where it exists to take the previous user's screen away.
 
 **G1 — `XDG_SESSION_EXTRA_DEVICE_ACCESS`.** GDM 51 asks logind for `render:accel` on every
 session; read what logind does with it before copying it.
-
-**G2 — the greeter's polkit rights.** GDM's `20-gdm.rules` lets the `gdm` group modify
-NetworkManager's system connections (and use smartcards) without asking; our greeter user is not
-in that group, so editing a system connection from the greeter asks an administrator. Either the
-greeter user joins `gdm`'s rule, or we ship our own.
 
 **S4 (system-compositor) stays open:** the lock screen remains in the inner; this design does not
 need it moved.

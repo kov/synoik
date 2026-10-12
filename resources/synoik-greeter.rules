@@ -1,0 +1,13 @@
+// Install as /usr/share/polkit-1/rules.d/50-synoik-greeter.rules.
+//
+// What the greeter may do without an administrator, ours rather than borrowed from GDM's
+// 20-gdm.rules, which grants the same to its `gdm` group (docs/fork/greeter.md §6): edit the
+// system's network connections from the quick settings, as long as the greeter is the active,
+// local session. Smartcard access (GDM's other grant) joins when smartcard login does.
+polkit.addRule(function(action, subject) {
+    if (subject.user != "synoik-greeter" || !subject.local || !subject.active)
+        return undefined;
+
+    if (action.id == "org.freedesktop.NetworkManager.settings.modify.system")
+        return polkit.Result.YES;
+});
