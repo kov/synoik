@@ -9,9 +9,11 @@
 //! watches ("fire when the user comes back") to undo them. The compositor already detects activity;
 //! [`crate::idle_monitor::IdleMonitor`] holds the watch bookkeeping and this exposes it on the bus.
 //!
-//! Only the `Core` monitor at `/org/gnome/Mutter/IdleMonitor/Core` is served — the object
-//! gnome-desktop's `GnomeIdleMonitor` (used by gsd) talks to. mutter also serves per-input-device
-//! monitors under an ObjectManager, which nothing in the gsd path consumes; that is a follow-up.
+//! The `Core` monitor at `/org/gnome/Mutter/IdleMonitor/Core` is served under an ObjectManager at
+//! `/org/gnome/Mutter/IdleMonitor`, as mutter exports it (`meta-idle-manager.c:227-238`):
+//! gnome-desktop's `GnomeIdleMonitor` (gsd-power, gnome-session) finds `Core` through
+//! `GetManagedObjects` and gives up without it — and gnome-session's idle verdict is the screen
+//! shield's idle source (`dbus::gnome_session_presence`).
 //!
 //! Like `org.gnome.Shell`'s accelerator signals, `WatchFired` is emitted **unicast** to the client
 //! that owns the watch, from the main loop (`Synoik::emit_idle_watch_fired`); the request/reply for
@@ -24,6 +26,7 @@ use zbus::fdo::{self, RequestNameFlags};
 use zbus::interface;
 use zbus::message::Header;
 use zbus::names::BusName;
+use zbus::object_server::ResponseDispatchNotifier;
 
 use super::Start;
 
@@ -43,6 +46,10 @@ pub enum IdleMonitorToSynoik {
     AddUserActiveWatch {
         owner: String,
         reply: async_channel::Sender<u32>,
+    },
+    /// The reply carrying watch `id` has gone out; it may fire from now on.
+    Armed {
+        id: u32,
     },
     RemoveWatch {
         id: u32,
@@ -77,6 +84,23 @@ impl IdleMonitor {
         })
     }
 
+    /// Reply with a new watch's `id`, and arm the watch once that reply is on the wire: a
+    /// `WatchFired` sent before it would name an id the client does not know yet.
+    fn arm_after_reply(&self, conn: &zbus::Connection, id: u32) -> ResponseDispatchNotifier<u32> {
+        let (reply, sent) = ResponseDispatchNotifier::new(id);
+        let to_niri = self.to_niri.clone();
+        conn.executor()
+            .spawn(
+                async move {
+                    sent.await;
+                    let _ = to_niri.send(IdleMonitorToSynoik::Armed { id });
+                },
+                "arm idle watch",
+            )
+            .detach();
+        reply
+    }
+
     fn notify(&self, msg: IdleMonitorToSynoik) -> fdo::Result<()> {
         self.to_niri.send(msg).map_err(|err| {
             warn!("error sending message to synoik: {err:?}");
@@ -95,21 +119,30 @@ impl IdleMonitor {
     async fn add_idle_watch(
         &self,
         #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         interval: u64,
-    ) -> fdo::Result<u32> {
+    ) -> fdo::Result<ResponseDispatchNotifier<u32>> {
         let owner = sender(&hdr)?;
-        self.request(|reply| IdleMonitorToSynoik::AddIdleWatch {
-            interval,
-            owner,
-            reply,
-        })
-        .await
+        let id = self
+            .request(|reply| IdleMonitorToSynoik::AddIdleWatch {
+                interval,
+                owner,
+                reply,
+            })
+            .await?;
+        Ok(self.arm_after_reply(conn, id))
     }
 
-    async fn add_user_active_watch(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<u32> {
+    async fn add_user_active_watch(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> fdo::Result<ResponseDispatchNotifier<u32>> {
         let owner = sender(&hdr)?;
-        self.request(|reply| IdleMonitorToSynoik::AddUserActiveWatch { owner, reply })
-            .await
+        let id = self
+            .request(|reply| IdleMonitorToSynoik::AddUserActiveWatch { owner, reply })
+            .await?;
+        Ok(self.arm_after_reply(conn, id))
     }
 
     async fn remove_watch(&self, id: u32) -> fdo::Result<()> {
@@ -137,6 +170,8 @@ impl Start for IdleMonitor {
             | RequestNameFlags::ReplaceExisting
             | RequestNameFlags::DoNotQueue;
 
+        conn.object_server()
+            .at("/org/gnome/Mutter/IdleMonitor", fdo::ObjectManager)?;
         conn.object_server()
             .at("/org/gnome/Mutter/IdleMonitor/Core", self)?;
         conn.request_name_with_flags("org.gnome.Mutter.IdleMonitor", flags)?;

@@ -14936,6 +14936,18 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
     let id = rx.try_recv().expect("AddIdleWatch must reply with an id");
     assert!(id > 0, "watch ids are greater than zero");
 
+    // Silent until the reply carrying its id is out: a fire ahead of it would name an id
+    // gnome-session has not learned, and be dropped.
+    assert!(
+        f.synoik()
+            .idle_monitor
+            .refresh(t0 + Duration::from_millis(5000))
+            .is_empty(),
+        "an unarmed watch must not fire",
+    );
+    f.synoik_state()
+        .on_idle_monitor_msg(IdleMonitorToSynoik::Armed { id });
+
     assert!(
         f.synoik()
             .idle_monitor

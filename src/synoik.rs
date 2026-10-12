@@ -7912,13 +7912,17 @@ impl State {
             } => {
                 let id = self.synoik.idle_monitor.add_idle_watch(interval, owner);
                 let _ = reply.send_blocking(id);
-                // Arms the timer; a watch already past its interval fires on the next iteration.
-                self.synoik.reschedule_idle_monitor_timer();
+                // Fires nothing until `Armed`, once the reply carrying `id` is out.
             }
             IdleMonitorToSynoik::AddUserActiveWatch { owner, reply } => {
                 let id = self.synoik.idle_monitor.add_user_active_watch(owner);
                 let _ = reply.send_blocking(id);
                 // No timer: an active watch fires from `notify_activity`, not from elapsed time.
+            }
+            IdleMonitorToSynoik::Armed { id } => {
+                self.synoik.idle_monitor.arm(id);
+                // Arms the timer; a watch already past its interval fires on the next iteration.
+                self.synoik.reschedule_idle_monitor_timer();
             }
             IdleMonitorToSynoik::RemoveWatch { id } => {
                 self.synoik.idle_monitor.remove_watch(id);

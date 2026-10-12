@@ -19,8 +19,12 @@
 //! - A **user-active watch** fires once the next time the user becomes active, then removes itself.
 //! - Adding an idle watch schedules it from the *last activity*, not from now, so one added while
 //!   the user is already idle past its interval fires at the next refresh.
+//! - A watch fires only once it is [armed](IdleMonitor::arm): after the reply carrying its id has
+//!   gone out. mutter replies inside the method handler, before its main loop can fire anything; we
+//!   reply from the D-Bus thread, and a fire that overtook the reply would name an id the client
+//!   has not learned yet, which `GnomeIdleMonitor` drops — gnome-session then never goes idle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// A fired watch: its id, and the bus name of the client that owns it (`WatchFired` is unicast to
@@ -57,6 +61,8 @@ pub struct IdleMonitor {
     /// Monotonic time of the last activity (or the last `ResetIdletime`).
     last_activity: Duration,
     watches: HashMap<u32, Watch>,
+    /// Watches whose id has not reached their owner yet: they fire nothing until [`Self::arm`].
+    unarmed: HashSet<u32>,
     /// Watch ids are "guaranteed to be greater than zero" (the interface contract), and never
     /// reused, so a client that removes a watch can't collide with a later one.
     next_id: u32,
@@ -67,6 +73,7 @@ impl IdleMonitor {
         Self {
             last_activity: now,
             watches: HashMap::new(),
+            unarmed: HashSet::new(),
             next_id: 1,
         }
     }
@@ -74,7 +81,13 @@ impl IdleMonitor {
     fn alloc_id(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        self.unarmed.insert(id);
         id
+    }
+
+    /// The reply carrying watch `id` has been sent: from now on it may fire.
+    pub fn arm(&mut self, id: u32) {
+        self.unarmed.remove(&id);
     }
 
     /// Milliseconds since the last activity — `GetIdletime`.
@@ -106,12 +119,15 @@ impl IdleMonitor {
     /// `RemoveWatch`. Unknown ids are ignored, matching mutter.
     pub fn remove_watch(&mut self, id: u32) {
         self.watches.remove(&id);
+        self.unarmed.remove(&id);
     }
 
     /// Drop every watch owned by `owner` — called when that client drops off the bus, so a crashed
     /// client doesn't leak watches (mutter watches the bus name for the same reason).
     pub fn remove_watches_for_owner(&mut self, owner: &str) {
         self.watches.retain(|_, w| w.owner() != owner);
+        let watches = &self.watches;
+        self.unarmed.retain(|id| watches.contains_key(id));
     }
 
     /// The user became active (any input, or `ResetIdletime`): reset the idle clock, fire and
@@ -120,7 +136,9 @@ impl IdleMonitor {
         self.last_activity = now;
 
         let mut fired = Vec::new();
+        let unarmed = &self.unarmed;
         self.watches.retain(|&id, watch| match watch {
+            Watch::UserActive { .. } if unarmed.contains(&id) => true,
             Watch::UserActive { owner } => {
                 fired.push(Fired {
                     id,
@@ -143,6 +161,9 @@ impl IdleMonitor {
         let idle = now.saturating_sub(self.last_activity);
         let mut fired = Vec::new();
         for (&id, watch) in self.watches.iter_mut() {
+            if self.unarmed.contains(&id) {
+                continue;
+            }
             if let Watch::Idle {
                 interval,
                 owner,
@@ -166,8 +187,9 @@ impl IdleMonitor {
     /// already fired this period). May be in the past — meaning "fire at the next opportunity".
     pub fn next_wakeup(&self) -> Option<Duration> {
         self.watches
-            .values()
-            .filter_map(|w| match w {
+            .iter()
+            .filter(|(id, _)| !self.unarmed.contains(id))
+            .filter_map(|(_, w)| match w {
                 Watch::Idle {
                     interval,
                     fired: false,
@@ -204,6 +226,7 @@ mod tests {
     fn idle_watch_fires_once_per_period_and_rearms_on_activity() {
         let mut m = IdleMonitor::new(ms(0));
         let id = m.add_idle_watch(5000, owner());
+        m.arm(id);
 
         // Not yet idle enough.
         assert!(m.refresh(ms(4999)).is_empty());
@@ -223,6 +246,7 @@ mod tests {
         let mut m = IdleMonitor::new(ms(0));
         // No activity since t=0; at t=10s add a 5s watch — already idle past it.
         let id = m.add_idle_watch(5000, owner());
+        m.arm(id);
         assert_eq!(
             m.refresh(ms(10_000)),
             vec![Fired { id, owner: owner() }],
@@ -230,10 +254,39 @@ mod tests {
         );
     }
 
+    /// A watch whose id has not reached its owner stays silent, overdue or not; armed, it fires.
+    #[test]
+    fn a_watch_fires_only_once_armed() {
+        let mut m = IdleMonitor::new(ms(0));
+        let idle = m.add_idle_watch(5000, owner());
+        let active = m.add_user_active_watch(owner());
+        assert!(m.refresh(ms(10_000)).is_empty());
+        assert_eq!(m.next_wakeup(), None);
+        m.arm(idle);
+        assert_eq!(m.next_wakeup(), Some(ms(5000)));
+        assert_eq!(
+            m.refresh(ms(10_000)),
+            vec![Fired {
+                id: idle,
+                owner: owner()
+            }]
+        );
+        assert!(m.on_activity(ms(10_001)).is_empty());
+        m.arm(active);
+        assert_eq!(
+            m.on_activity(ms(10_002)),
+            vec![Fired {
+                id: active,
+                owner: owner()
+            }]
+        );
+    }
+
     #[test]
     fn user_active_watch_fires_once_on_activity_then_self_removes() {
         let mut m = IdleMonitor::new(ms(0));
         let id = m.add_user_active_watch(owner());
+        m.arm(id);
 
         // It never fires from idle passing — only from activity.
         assert!(m.refresh(ms(100_000)).is_empty());
@@ -250,6 +303,7 @@ mod tests {
     fn remove_watch_stops_it_firing() {
         let mut m = IdleMonitor::new(ms(0));
         let id = m.add_idle_watch(1000, owner());
+        m.arm(id);
         m.remove_watch(id);
         assert!(m.refresh(ms(5000)).is_empty());
     }
@@ -258,7 +312,9 @@ mod tests {
     fn remove_watches_for_owner_drops_only_that_owner() {
         let mut m = IdleMonitor::new(ms(0));
         let a = m.add_idle_watch(1000, ":1.1".to_owned());
+        m.arm(a);
         let b = m.add_idle_watch(1000, ":1.2".to_owned());
+        m.arm(b);
         m.remove_watches_for_owner(":1.1");
         let fired = m.refresh(ms(2000));
         assert_eq!(fired.len(), 1);
@@ -271,8 +327,10 @@ mod tests {
         let mut m = IdleMonitor::new(ms(1000));
         assert_eq!(m.next_wakeup(), None, "no watches, nothing pending");
 
-        m.add_idle_watch(5000, owner());
-        m.add_idle_watch(2000, owner());
+        let id = m.add_idle_watch(5000, owner());
+        m.arm(id);
+        let id = m.add_idle_watch(2000, owner());
+        m.arm(id);
         // Earliest deadline = last_activity(1000) + min interval(2000).
         assert_eq!(m.next_wakeup(), Some(ms(3000)));
 
@@ -284,7 +342,8 @@ mod tests {
     #[test]
     fn reset_via_on_activity_reschedules_next_wakeup() {
         let mut m = IdleMonitor::new(ms(0));
-        m.add_idle_watch(5000, owner());
+        let id = m.add_idle_watch(5000, owner());
+        m.arm(id);
         assert_eq!(m.next_wakeup(), Some(ms(5000)));
         m.on_activity(ms(2000));
         assert_eq!(m.next_wakeup(), Some(ms(7000)));
@@ -294,10 +353,13 @@ mod tests {
     fn ids_are_positive_and_never_reused() {
         let mut m = IdleMonitor::new(ms(0));
         let a = m.add_idle_watch(1000, owner());
+        m.arm(a);
         let b = m.add_user_active_watch(owner());
+        m.arm(b);
         assert!(a > 0 && b > a);
         m.remove_watch(a);
         let c = m.add_idle_watch(1000, owner());
+        m.arm(c);
         assert!(c > b, "ids must not be reused after removal");
     }
 }
