@@ -441,6 +441,43 @@ pub struct InputSources {
     pub xkb_model: String,
 }
 
+impl InputSources {
+    /// The greeter's sources: the system's, from systemd-localed (`InputSourceSystemSettings`,
+    /// `js/ui/status/keyboard.js:190-272`, chosen when `isGreeter`, `:361-362`). Comma-separated
+    /// `X11Layout` and `X11Variant` pair up into xkb sources; options and model come along.
+    /// There is no MRU: a switch on the greeter is not remembered.
+    pub fn from_localed(xkb: &synoik_config::Xkb) -> Self {
+        let variants: Vec<&str> = xkb.variant.split(',').collect();
+        let sources = xkb
+            .layout
+            .split(',')
+            .take_while(|layout| !layout.is_empty())
+            .enumerate()
+            .map(|(i, layout)| {
+                let id = match variants.get(i).filter(|v| !v.is_empty()) {
+                    Some(variant) => format!("{layout}+{variant}"),
+                    None => layout.to_owned(),
+                };
+                ("xkb".to_owned(), id)
+            })
+            .collect();
+        Self {
+            present: true,
+            sources,
+            mru_sources: Vec::new(),
+            xkb_options: xkb
+                .options
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .filter(|o| !o.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            xkb_model: xkb.model.clone(),
+        }
+    }
+}
+
 /// The gsettings-backed quick-settings toggles (the "self-contained" ones that
 /// need no daemon): each mirrors one key, read for the tile's on/off state and
 /// written back by [`GnomeSettingsWriter`] when the tile is clicked.

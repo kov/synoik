@@ -4022,6 +4022,59 @@ fn super_space_switches_the_input_source() {
     );
 }
 
+/// The greeter's layouts are the system's, from localed (`InputSourceSystemSettings`,
+/// `keyboard.js:190-272,361-362`), whatever the greeter user's own GSettings say; a user session
+/// keeps preferring its GSettings.
+#[test]
+fn the_greeters_layouts_come_from_localed() {
+    use crate::dbus::freedesktop_locale1::Locale1ToSynoik;
+
+    let localed = synoik_config::Xkb {
+        layout: "us,de".to_owned(),
+        variant: ",nodeadkeys".to_owned(),
+        options: Some("grp:alt_shift_toggle".to_owned()),
+        ..Default::default()
+    };
+    let users = crate::gnome::InputSources {
+        present: true,
+        sources: vec![("xkb".to_owned(), "fr".to_owned())],
+        ..Default::default()
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().greeter = true;
+    f.synoik().gnome_settings.input_sources = users.clone();
+    f.synoik_state()
+        .on_locale1_msg(Locale1ToSynoik::XkbChanged(localed.clone()));
+    let sources = &f.synoik().gnome_settings.input_sources;
+    assert_eq!(
+        sources.sources,
+        [
+            ("xkb".to_owned(), "us".to_owned()),
+            ("xkb".to_owned(), "de+nodeadkeys".to_owned())
+        ]
+    );
+    assert_eq!(sources.xkb_options, ["grp:alt_shift_toggle"]);
+    // The seat's keymap was rebuilt from them.
+    let keyboard = f.synoik_state().synoik.seat.get_keyboard().unwrap();
+    let names: Vec<String> = keyboard.with_xkb_state(f.synoik_state(), |context| {
+        let xkb = context.xkb().lock().unwrap();
+        xkb.layouts()
+            .map(|l| xkb.layout_name(l).to_owned())
+            .collect()
+    });
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names[1].contains("German"), "{names:?}");
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().gnome_settings.input_sources = users.clone();
+    f.synoik_state()
+        .on_locale1_msg(Locale1ToSynoik::XkbChanged(localed));
+    assert_eq!(f.synoik().gnome_settings.input_sources, users);
+}
+
 /// `toggle-application-view` (`<Super>a`) is the show-apps button as a key:
 /// from a closed overview it opens straight into the app grid, and with the
 /// overview already up it flips between the window picker and the grid

@@ -2123,6 +2123,9 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
+            if let Some(sources) = state.synoik.greeter_input_sources() {
+                state.synoik.gnome_settings.input_sources = sources;
+            }
             state.synoik.refresh_keybinding_state();
             // Before anything can animate: `enable-animations` decides whether the clock completes
             // instantly, and the clock was built from the config alone (no settings existed yet).
@@ -2363,7 +2366,10 @@ impl State {
                 .synoik
                 .event_loop
                 .insert_source(rx, |event, _, state| {
-                    if let calloop::channel::Event::Msg(settings) = event {
+                    if let calloop::channel::Event::Msg(mut settings) = event {
+                        if let Some(sources) = state.synoik.greeter_input_sources() {
+                            settings.input_sources = sources;
+                        }
                         debug!("GNOME settings changed: {settings:?}");
                         state
                             .synoik
@@ -3004,6 +3010,11 @@ impl State {
             if !mru.contains(s) {
                 mru.push(s.clone());
             }
+        }
+        // The greeter's sources are localed's, which keeps no MRU (`InputSourceSystemSettings`
+        // has no `mruSources` setter): the switch is not remembered.
+        if self.synoik.greeter {
+            return;
         }
         if let Some(writer) = &self.synoik.gnome_settings_writer {
             writer.set_mru_sources(mru);
@@ -7547,6 +7558,18 @@ impl State {
 
         trace!("locale1 xkb settings changed: {xkb:?}");
         let xkb = self.synoik.xkb_from_locale1.insert(xkb);
+
+        // The greeter's input sources *are* localed's (`InputSourceSystemSettings`).
+        if self.synoik.greeter {
+            let sources = crate::gnome::InputSources::from_localed(xkb);
+            if self.synoik.gnome_settings.input_sources != sources {
+                self.synoik.gnome_settings.input_sources = sources;
+                self.apply_effective_xkb();
+                self.ipc_keyboard_layouts_changed();
+                self.synoik.queue_redraw_all();
+            }
+            return;
+        }
 
         // GNOME's input-sources take priority over systemd-localed when present;
         // keep the stored locale1 value (a capability for the no-GNOME fallback)
@@ -17141,6 +17164,17 @@ impl Synoik {
         };
         icon.as_ref()
             .map(|icon| crate::image_source::ImageSource::File(icon.path.clone()))
+    }
+
+    /// On the greeter, the input sources to use instead of the greeter user's GSettings: the
+    /// system's, from localed (`keyboard.js:361-362`) — empty until localed has answered.
+    pub fn greeter_input_sources(&self) -> Option<crate::gnome::InputSources> {
+        self.greeter.then(|| {
+            self.xkb_from_locale1
+                .as_ref()
+                .map(crate::gnome::InputSources::from_localed)
+                .unwrap_or_default()
+        })
     }
 
     /// Decode the account picture at every output's scale, at the size the unlock prompt draws it.

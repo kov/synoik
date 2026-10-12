@@ -254,8 +254,10 @@ always is (the `RIGHT_BOX_ORDER` divergence); keyboard layout and quick settings
 
 - **Clock:** the date menu with a plain month calendar — no events, no world clocks or weather, no
   message list (`js/ui/dateMenu.js:999-1015`).
-- **Keyboard layout:** the system's layouts from localed, not a user's GSettings
-  (`status/keyboard.js:361`); no "Show Keyboard Layout", no settings entry.
+- **Keyboard layout:** the system's layouts from localed, not the greeter user's GSettings
+  (`InputSourceSystemSettings`, `status/keyboard.js:190-272,361`): `X11Layout`/`X11Variant` pair
+  into xkb sources, with `X11Options` and `X11Model`, followed live; a switch is not remembered
+  (no MRU). No "Show Keyboard Layout", no settings entry.
 - **Quick settings:** everything hardware decides stays (network, Bluetooth, volume, brightness,
   power profiles, night light, dark style, Do Not Disturb, rfkill and the privacy indicators).
   Gone: screenshot (`status/system.js:117`), settings button (`:161-163`, `allowSettings`), lock
