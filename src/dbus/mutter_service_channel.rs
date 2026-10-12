@@ -21,7 +21,10 @@ impl ServiceChannel {
         &mut self,
         service_client_type: u32,
     ) -> fdo::Result<zvariant::OwnedFd> {
-        if service_client_type != 1 {
+        // `verify_service_client_type` (`meta-service-channel.c:117-129`): the portal backend,
+        // the file-chooser portal backend and the global-shortcuts portal backend (gnome-control-
+        // center's provider); mutter connects all three the same way.
+        if !(1..=3).contains(&service_client_type) {
             return Err(fdo::Error::InvalidArgs(
                 "Invalid service client type".to_owned(),
             ));
