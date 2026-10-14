@@ -357,7 +357,7 @@ impl Compositor {
         let mut measure = |text: &str, font: Font| match shaper.shape_named(
             text,
             font.px(),
-            splash::FAMILY,
+            synoik_vk::text::DEFAULT_SANS_FAMILY,
             font.weight(),
         ) {
             Ok(run) => {

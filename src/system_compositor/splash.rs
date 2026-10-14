@@ -18,15 +18,14 @@ use super::plymouth::{Mode, Splash};
 /// The theme's images: bgrt's `ImageDir`.
 pub const THEME_DIR: &str = "/usr/share/plymouth/themes/spinner";
 
-/// bgrt's `Font=Cantarell 12` and `TitleFont=Cantarell Light 30`: pango points at 96 dpi.
-pub const FAMILY: &str = "Cantarell";
-
-/// The faces the splash sets text in.
+/// The faces the splash sets text in: bgrt's sizes and weights (`Font=Cantarell 12`,
+/// `TitleFont=Cantarell Light 30`, pango points at 96 dpi), in the shell's own sans rather than
+/// bgrt's Cantarell (§4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Font {
-    /// Messages and subtitles: Cantarell 12.
+    /// Messages and subtitles: 12 pt.
     Regular,
-    /// Update titles: Cantarell Light 30.
+    /// Update titles: 30 pt, light.
     Title,
 }
 

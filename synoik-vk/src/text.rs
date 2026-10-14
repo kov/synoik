@@ -764,8 +764,8 @@ impl TextContext {
     }
 
     /// Shape `text` in the named `family` at `weight` (CSS scale: 400 regular, 300 light), for
-    /// surfaces whose face is fixed by their design rather than the UI font setting — the boot
-    /// splash draws plymouth's Cantarell before any session has settings to read.
+    /// surfaces that draw before any session has settings to read — the boot splash, in the
+    /// default sans.
     pub fn shape_line_named(
         &mut self,
         text: &str,
