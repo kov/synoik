@@ -246,6 +246,10 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    compositor with the theme's PNGs and the shell's text painter.
 3. **Boot handover** (§2.1, §2.2) and the crossfade from splash to greeter or session; validated on
    the harness VM, which runs the same plymouth.
+   What the splash code leaves to it: `H` sets `Splash::frozen`, which the layout ignores — the
+   outer stops redrawing; `$` after `H` restarts the spinner from frame 0 (`ply_throbber_start`
+   resets its clock); and until step 5, every `*` gets `answer_password(None)` at once, or its
+   client waits on a dialog nobody draws.
 4. **Shutdown and offline updates** (§2.3): a `pkcon offline-update` and a dnf5 offline upgrade on the
    harness.
 5. **Password prompts** (§4.2): a `systemd-ask-password` at boot on the harness, and a LUKS data

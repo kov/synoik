@@ -561,7 +561,9 @@ mod tests {
     }
 
     /// The installed theme, drawn where the layout says: the watermark, the spinner, the
-    /// progress bar's two colours and a message's ink, on black everywhere else.
+    /// progress bar's two colours and a message's ink, on black everywhere else. The image
+    /// positions come from the layout for the images actually installed (CI's distribution ships
+    /// its own); `splash::tests` pins the numbers for Fedora's.
     #[test]
     fn the_splash_draws_the_theme() {
         if !Path::new(splash::THEME_DIR).join("watermark.png").exists() {
@@ -576,14 +578,25 @@ mod tests {
             ..Splash::default()
         };
         let mut texture = c.splash_picture((1280, 800), &boot, 1., 0).unwrap();
+        let images = c.theme.as_ref().unwrap().images();
+        let (watermark, spinner) = (images.watermark.unwrap(), images.spinner.unwrap().0);
+        let items = splash::layout(&boot, (1280, 800).into(), &images, 0, &mut |_, _| {
+            (0, 0).into()
+        });
+        let place = |item: &Item| match item {
+            Item::Watermark(at) => Some(rect(at.x, at.y, watermark.w, watermark.h)),
+            Item::Spinner { at, .. } => Some(rect(at.x, at.y, spinner.w, spinner.h)),
+            _ => None,
+        };
+        let [wm, sp] = [0, 1].map(|i| place(&items[i]).unwrap());
         let px = pixels(&mut c, &mut texture);
-        // The watermark at 565×726, 149×43; the spinner at 624×544, 32×32.
-        assert!(brightest(&px, rect(565, 726, 149, 43)) > 128);
-        assert!(brightest(&px, rect(624, 544, 32, 32)) > 64);
-        // The message, 10 px under the spinner.
-        assert!(brightest(&px, rect(560, 586, 160, 24)) > 128);
-        // Black elsewhere.
-        assert_eq!(brightest(&px, rect(0, 0, 1280, 500)), 0);
+        assert!(brightest(&px, wm) > 128);
+        assert!(brightest(&px, sp) > 64);
+        // The message, under the spinner.
+        let below = sp.loc.y + sp.size.h;
+        assert!(brightest(&px, rect(540, below, 200, 40)) > 128);
+        // Black above the spinner.
+        assert_eq!(brightest(&px, rect(0, 0, 1280, sp.loc.y)), 0);
 
         let mut update = Splash {
             mode: Mode::Updates,
@@ -600,13 +613,15 @@ mod tests {
         assert_eq!(at(740, 558), 0x60);
         // The title, near 0.382 of the height, and no spinner.
         assert!(brightest(&px, rect(400, 250, 480, 60)) > 128);
-        assert_eq!(brightest(&px, rect(624, 520, 32, 30)), 0);
+        // (The bar crosses the spinner's square from 556 down.)
+        let above_bar = rect(sp.loc.x, sp.loc.y, sp.size.w, 556 - sp.loc.y);
+        assert_eq!(brightest(&px, above_bar), 0);
 
         // The retained frame: the watermark alone.
         update.shown = false;
         let mut texture = c.splash_picture((1280, 800), &update, 1., 0).unwrap();
         let px = pixels(&mut c, &mut texture);
-        assert!(brightest(&px, rect(565, 726, 149, 43)) > 128);
-        assert_eq!(brightest(&px, rect(0, 0, 1280, 720)), 0);
+        assert!(brightest(&px, wm) > 128);
+        assert_eq!(brightest(&px, rect(0, 0, 1280, wm.loc.y)), 0);
     }
 }
