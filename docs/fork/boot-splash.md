@@ -1,8 +1,9 @@
 # Boot splash: the system compositor takes over from plymouth
 
-> Status: **steps 1-3 of §5 built**: the outer answers plymouthd's protocol, draws the splash and
-> takes the screen over from plymouth at boot (`src/system_compositor/{plymouth,splash}.rs`,
-> `outer/boot.rs`). Shutdown, password prompts and the emergency path are design. Phase 1 of
+> Status: **steps 1-4 of §5 built**: the outer answers plymouthd's protocol, draws the splash,
+> takes the screen over from plymouth at boot and keeps it through shutdown and offline updates
+> (`src/system_compositor/{plymouth,splash}.rs`, `outer/boot.rs`). Password prompts and the
+> emergency path are design. Phase 1 of
 > `system-compositor.md` §6: the outer takes the screen from plymouth after switch_root and owns it
 > until power-off. Phase 2 (the outer in the initramfs) is out of scope here.
 
@@ -82,10 +83,16 @@ The installer writes these; `--use-gdm` removes them.
 
 `DefaultDependencies=no` drops `sysinit.target`/`basic.target` and the shutdown conflict, so the
 unit names what it needs instead: `After=systemd-journald.socket systemd-tmpfiles-setup.service
-systemd-sysusers.service systemd-udev-trigger.service`, and `WantsMountsFor=` (not `Requires…`, §2.3)
-its binary, Mesa's ICD and libraries, and its cache dir (`/usr`, `/var/cache`). That rules out
-`CacheDirectory=`, which implies `RequiresMountsFor=/var/cache`: the cache dir comes from the
-installer's tmpfiles entry, named to Mesa through `XDG_CACHE_HOME`. The card has no systemd device
+systemd-sysusers.service systemd-udev-trigger.service`, and for now `dbus.socket
+systemd-logind.service` too: the outer follows logind's seats and its `PrepareForShutdown`. Units
+by name, not `After=basic.target`: in an update boot basic.target was still active from the
+initramfs at switch_root, and the outer started there, before the real root's tmpfiles had handed
+it `/run/plymouth` (measured 2026-10-14). The cache dir is the installer's tmpfiles entry, named to
+Mesa through `XDG_CACHE_HOME`, not `CacheDirectory=`, which implies
+`RequiresMountsFor=/var/cache` (§2.3); ordered after those units, its mounts are up, so the
+`WantsMountsFor=` it would otherwise need is not there. Starting before logind — and so before
+`cryptsetup-pre.target`, for the prompts of real-root volumes — needs the outer to manage without
+logind until it is up: step 5. The card has no systemd device
 unit on Fedora (udev does not tag DRM cards for systemd), so the outer waits for it itself, from
 its udev monitor, when it is not there yet; at switch_root it normally is (virtio-gpu loads in the
 initramfs at ≈1.1 s on jabuticaba).
@@ -115,19 +122,24 @@ the outer's card with `fbcon=map:9` instead, which leaves the client in place
   final kill (`SurviveFinalKillSignal=yes`; plymouth's `@` argv mark protects only root processes,
   `systemd src/shared/killall.c:91-100`). The unit also leaves `system.slice` (`Slice=-.slice`),
   which shutdown stops; that one was not tested on its own.
-  Measured on the harness VM (2026-10-14) with all of them, from a systemd-shutdown hook writing to
-  the serial console after the final kill: the outer alive and its framebuffer on the plane at
-  "Power down". Without the mount fix, systemd stopped it 2 s before the end.
+  Measured on the harness VM (2026-10-14) with the installed unit, from a systemd-shutdown hook
+  writing to the serial console after the final kill: the outer, still the process the boot
+  started, alive and its framebuffer on the plane at "Power down", the session faded into the
+  turning splash. Without the mount fix, systemd stopped it 2 s before the end.
 - On `PrepareForShutdown` the outer crossfades from the session to the shutdown splash
   (it fades to black today) and spins until power-off. dracut's late `H` freezes the last frame.
   The mode (`C reboot|shutdown` from the rewritten units) arrives only after the display manager
   stops, long after `PrepareForShutdown`; the fade does not wait for it, because bgrt's boot,
   shutdown and reboot screens are identical (§4.1). Only an update's end changes the screen.
 - **Offline updates** (`system-update.target`) start the outer too, and PackageKit and dnf5 drive
-  its update screen through `C`, `u` and `M` (§3.3).
+  its update screen through `C`, `u` and `M` (§3.3). The unit's last `ExecStartPost=` waits for the
+  pid file, so the update starts only once the outer answers. Measured with a dnf5 offline
+  reinstall on the harness (permissive, §6): "Installing Updates…" with the bar at 0, 47 and 100 %,
+  then the reboot screen with dnf5's closing message under the spinner.
 - Open: the outer keeps files on the root filesystem mapped, so dracut's shutdown can only remount
-  it read-only. A binary replaced by the update and still mapped may block even that. To verify on
-  the harness.
+  it read-only. A binary replaced by the update and still mapped may block even that. The harness
+  printed no failure at the console's log level; an update replacing the outer's own libraries is
+  untested.
 
 ### 2.4 No console to hand back
 
@@ -272,8 +284,13 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
   domain (`/usr/share/locale/*/LC_MESSAGES/plymouth.mo`) in the system locale. The outer draws
   them in English; nothing in the shell reads `.mo` catalogs yet.
 
-- SELinux: on an enforcing system, confined clients may be allowed `connectto` only on
-  `plymouthd_t`. jabuticaba is permissive; check the policy before enabling enforcing.
+- **SELinux denies plymouth's clients.** The outer's socket carries its domain,
+  `unconfined_service_t`, and the targeted policy lets those clients (`init_t`: pid 1's unit-status
+  updates and the units' `plymouth` calls) `connectto` only `plymouthd_t`. Measured on the
+  enforcing harness: every request is denied, so an update screen gets no mode, progress or
+  message. jabuticaba is permissive. Two ways out: label the listening socket `plymouthd_t`
+  (`setsockcreatecon` before binding), which the existing policy then admits as it admits
+  plymouthd, or ship a policy module letting those domains connect to the outer. Not decided.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
   check the server, so a squatter would receive passwords. The window is a few milliseconds and no
   prompt is possible inside it (§2.1), but it is not zero.

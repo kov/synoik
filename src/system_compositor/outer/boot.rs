@@ -2,9 +2,9 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! The boot splash in the outer (`docs/fork/boot-splash.md` §2.1): plymouthd's socket, answered
-//! from the outer's loop, and the splash standing in for the plate from the first modeset until a
-//! session's screen replaces it.
+//! The splash in the outer (`docs/fork/boot-splash.md` §2): plymouthd's socket, answered from the
+//! outer's loop, and the splash standing in for the plate — at boot, from the first modeset until a
+//! session's screen replaces it, and at shutdown, from `PrepareForShutdown` until the power goes.
 
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -42,7 +42,7 @@ impl Plymouth {
     }
 }
 
-/// The boot splash while it stands in for the plate.
+/// The splash while it stands in for the plate, at boot or at shutdown.
 pub(super) struct BootSplash {
     /// When the spinner's turn began, on the monotonic clock.
     start: Duration,
@@ -65,8 +65,8 @@ impl AsFd for ConnectionFd {
 }
 
 impl Outer {
-    /// Put the boot splash up in place of the plate: a fresh start with something to draw it
-    /// with. A restarted outer adopts the session frame on screen instead.
+    /// Put the splash up in place of the plate: a fresh start with something to draw it with
+    /// (a restarted outer adopts the session frame on screen instead), or the machine going down.
     ///
     /// Shown from the first modeset: the frame `plymouth deactivate` leaves on screen has the
     /// spinner in it, so a first frame without one would blink it off (§2.1).
@@ -162,7 +162,7 @@ impl Outer {
         if let Some(token) = boot.timer {
             self.handle.remove(token);
         }
-        info!("the boot splash is over");
+        info!("the splash is over");
         self.plymouth.server.end();
         self.on_plymouth();
     }

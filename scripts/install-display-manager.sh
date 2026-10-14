@@ -42,8 +42,10 @@ if [ "${1:-}" = "--use-gdm" ]; then
     systemctl enable --force gdm.service
     # The text consoles come back with GDM, and plymouth runs after switch_root again.
     grubby --update-kernel=ALL --remove-args=fbcon=map:9
-    rm -f /etc/systemd/system/plymouth-start.service.d/synoik.conf \
-        /etc/systemd/system/plymouth-quit-wait.service.d/synoik.conf
+    for unit in plymouth-start plymouth-quit-wait plymouth-reboot plymouth-poweroff plymouth-halt \
+        plymouth-kexec; do
+        rm -f "/etc/systemd/system/$unit.service.d/synoik.conf"
+    done
     systemctl daemon-reload
     cat <<'EOF'
 GDM is the display manager again. Reboot to switch: the system compositor keeps the display (and
@@ -85,6 +87,10 @@ systemd-tmpfiles --create synoik-login.conf synoik-system.conf
 install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-login.service
 for unit in plymouth-start plymouth-quit-wait; do
     install -Dm644 $r/plymouth-real-root.conf "/etc/systemd/system/$unit.service.d/synoik.conf"
+done
+install -Dm644 $r/plymouth-reboot-mode.conf /etc/systemd/system/plymouth-reboot.service.d/synoik.conf
+for unit in plymouth-poweroff plymouth-halt plymouth-kexec; do
+    install -Dm644 $r/plymouth-shutdown-mode.conf "/etc/systemd/system/$unit.service.d/synoik.conf"
 done
 
 # On a Limina guest the system compositor draws through venus, which its environment file selects:

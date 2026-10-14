@@ -163,9 +163,6 @@ fn watch_hotplug(handle: &LoopHandle<'static, Outer>, outer: &Outer) -> anyhow::
     Ok(())
 }
 
-/// What the screen fades to as the machine goes down.
-const BLACK: [f32; 3] = [0., 0., 0.];
-
 /// Deliver logind's `PrepareForShutdown` to the loop. A thread of its own: the outer's loop is
 /// calloop, not an executor, and the signal is all it wants from the bus.
 fn watch_shutdown(handle: &LoopHandle<'static, Outer>) -> anyhow::Result<()> {
@@ -440,8 +437,7 @@ struct Target {
 
 #[derive(Clone, Copy, PartialEq)]
 enum End {
-    /// Nothing replaces the fade's last frame: the shutdown's black stays on screen.
-    Hold,
+    /// The plate, or the splash standing in for it.
     Plate,
     Session {
         generation: u64,
@@ -1131,8 +1127,9 @@ impl Outer {
         }
     }
 
-    /// `PrepareForShutdown`: fade to black and hold it while the machine goes down (§5), or, when
-    /// another inhibitor calls the shutdown off, bring back whatever logind fronts.
+    /// `PrepareForShutdown`: fade to the shutdown splash, which turns until the power goes
+    /// (boot-splash.md §2.3), or, when another inhibitor calls the shutdown off, bring back
+    /// whatever logind fronts.
     fn on_prepare_for_shutdown(&mut self, going: bool) {
         if going == self.shutting_down {
             return;
@@ -1140,14 +1137,19 @@ impl Outer {
         self.shutting_down = going;
         if !going {
             info!("the shutdown was called off");
+            self.end_boot_splash();
             // Re-read from scratch so the session logind fronts comes back as a switch.
             self.front = None;
             self.refresh_front();
             return;
         }
-        info!("the machine is going down: fading to black");
+        info!("the machine is going down: fading to the shutdown splash");
         if self.compositor.is_none() {
             return;
+        }
+        if self.boot.is_none() {
+            self.start_boot_splash();
+            self.begin_spinner();
         }
         self.outgoing_greeter = None;
         let names: Vec<String> = self.displays.keys().cloned().collect();
@@ -1312,11 +1314,13 @@ impl Outer {
         }
 
         if self.shutting_down {
+            // To the shutdown splash, which then turns on screen until the power goes.
+            let picture = self.base_picture(d);
             self.set_target(
                 d,
                 Target {
-                    picture: Picture::Color(BLACK),
-                    end: End::Hold,
+                    picture,
+                    end: End::Plate,
                 },
             );
             return;
@@ -1627,17 +1631,15 @@ impl Outer {
         };
         let elapsed = get_monotonic_time().saturating_sub(transition.start);
         let t = (elapsed.as_secs_f32() / FADE.as_secs_f32()).clamp(0., 1.);
-        let settled = matches!(display.on_screen, Shown::Composite { alpha, .. } if alpha >= 1.);
-        if t >= 1. && (to.end != End::Hold || settled) {
+        if t >= 1. {
             self.finish_transition(d);
             return;
         }
-        // Ease out: most of the change early, settling into the incoming picture. A fade nothing
-        // replaces draws its end too: its last frame is what stays on screen.
+        // Ease out: most of the change early, settling into the incoming picture.
         let alpha = 1. - (1. - t).powi(3);
-        let alpha = if t >= 1. { 1. } else { alpha };
+        // Both share the canvas: drawing into the slot on screen would show the draw.
         let busy = match &display.on_screen {
-            Shown::Composite { slot, .. } => Some(*slot),
+            Shown::Composite { slot, .. } | Shown::Splash { slot, .. } => Some(*slot),
             _ => None,
         };
         let compositor = self
@@ -1701,9 +1703,6 @@ impl Outer {
         };
         if let Some(display) = self.displays.get_mut(d) {
             display.last_to = Some(to.picture);
-        }
-        if to.end == End::Hold {
-            return;
         }
         let end = match to.end {
             End::Session {
@@ -2222,7 +2221,8 @@ impl Outer {
         let display = self.displays.get_mut(d).expect("found above");
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
         display.on_screen = shown;
-        if session_up {
+        // A frame in flight when the shutdown began lands after its splash has started.
+        if session_up && !self.shutting_down {
             self.end_boot_splash();
         }
         let display = self.displays.get_mut(d).expect("found above");
