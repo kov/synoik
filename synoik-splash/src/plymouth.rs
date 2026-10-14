@@ -195,7 +195,7 @@ impl Reply {
 }
 
 /// The screen plymouth's mode asks for (`plymouth change-mode`, `plymouth.c:828-841`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     #[default]
     BootUp,
@@ -223,7 +223,7 @@ impl Mode {
 }
 
 /// What the requests so far say the splash shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Splash {
     pub mode: Mode,
     /// `$` since the last quit.
@@ -237,6 +237,8 @@ pub struct Splash {
     /// `A`: the progress stays where it is until `a`.
     pub progress_paused: bool,
     /// The password the splash is asking for, if any: the prompt of the oldest unanswered `*`.
+    /// Its client's connection does not cross a handoff, so neither does the prompt.
+    #[serde(skip)]
     pub password_prompt: Option<Prompt>,
 }
 
@@ -342,6 +344,34 @@ impl Server {
         listener.set_nonblocking(true)?;
         self.listener = Some(listener);
         Ok(())
+    }
+
+    /// Take over a listener another process bound: the initramfs splash's, through the fd store.
+    pub fn adopt(&mut self, listener: UnixListener) -> io::Result<()> {
+        listener.set_nonblocking(true)?;
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    /// Carry on from the splash another process showed: what its clients had asked for.
+    pub fn restore(&mut self, splash: Splash) {
+        self.splash = Splash {
+            password_prompt: None,
+            ..splash
+        };
+        self.sync_pid_file();
+    }
+
+    /// Stop answering for the pid file: the process is handing the splash to another, which
+    /// writes its own once it answers.
+    pub fn release_pid_file(&mut self) {
+        if let Some(path) = self.pid_file.take() {
+            if let Err(err) = fs::remove_file(&path) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    warn!("plymouth pid file {}: {err}", path.display());
+                }
+            }
+        }
     }
 
     /// Keep `path` holding our pid while a splash is up, as plymouthd does with its own.
@@ -1105,6 +1135,52 @@ mod tests {
         // The socket stays: a later quit is answered at once.
         let mut late = h.connect();
         assert_eq!(h.send(&mut late, b"Q\0"), [ACK]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_handed_over_splash_carries_on() {
+        let dir = std::env::temp_dir().join(format!("synoik-plymouth-hand-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pid");
+        let mut h = Harness::new();
+        h.server.set_pid_file(path.clone());
+        h.server.show();
+        let mut asker = h.connect();
+        h.send(&mut asker, b"*\0");
+        let mut messenger = h.connect();
+        h.send(&mut messenger, b"M\x02\x06hello\0");
+        assert!(h.server.splash().password_prompt.is_some());
+
+        // The initramfs splash goes: its pid file with it, the listener stays in the fd store.
+        let listener = UnixListener::from(
+            h.server
+                .listener_fd()
+                .unwrap()
+                .try_clone_to_owned()
+                .unwrap(),
+        );
+        let splash = h.server.splash().clone();
+        h.server.release_pid_file();
+        assert!(!path.exists());
+        // A client that connects in the gap waits in the backlog.
+        let addr = SocketAddr::from_abstract_name(&h.name).unwrap();
+        let mut early = UnixStream::connect_addr(&addr).unwrap();
+        early.write_all(b"P\0").unwrap();
+        drop(h);
+
+        let mut next = Server::new(unsafe { libc::getuid() });
+        next.adopt(listener).unwrap();
+        next.set_pid_file(path.clone());
+        next.restore(splash);
+        assert!(path.exists());
+        assert!(next.splash().shown);
+        assert_eq!(next.splash().messages, ["hello"]);
+        // The prompt's client was the old process's connection: nobody to answer here.
+        assert_eq!(next.splash().password_prompt, None);
+        next.dispatch();
+        early.set_nonblocking(true).unwrap();
+        assert_eq!(read_now(&mut early), [ACK]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

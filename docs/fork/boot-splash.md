@@ -63,9 +63,10 @@ Prompts are dead between step 1 (plymouthd releases the keyboards) and step 5; a
 in plymouthd when it quits is lost (the agent sees EOF). The outer starts before
 `cryptsetup-pre.target`, so no real-root volume asks inside that window.
 
-A restarted outer (`Restart=always`) re-runs step 4 against its own socket: `Q` with no boot
-splash showing is an ACK and nothing else, as is a `deactivate` with no plymouthd to answer it
-(`-` on both).
+The outer keeps the listener it binds in the unit's fd store, so a restart (`Restart=always`)
+adopts the name rather than binding it again. Steps 1 and 4 run only while `/run/plymouth/pid`
+names a `plymouthd`: after a restart the name is the outer's own, its listener in the store with
+nobody accepting until the outer is up, and a `deactivate` sent there would wait forever.
 
 ### 2.2 Unit changes
 

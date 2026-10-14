@@ -32,11 +32,13 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 # GDM's order: plymouthd drops master but keeps its frame on screen, the outer modesets its own
-# copy of that frame, and only then does plymouthd go — no dark gap between the two. As root (`+`),
-# and harmless with no plymouth running (`-`).
-ExecStartPre=+-/usr/bin/plymouth deactivate
+# copy of that frame, and only then does plymouthd go — no dark gap between the two. As root (`+`).
+# Only while the pid file is plymouthd's: plymouth's name is otherwise the outer's own, its
+# listener waiting in the fd store with nobody to answer until the outer is up (boot-splash.md
+# §7.2), and a client would wait on it forever.
+ExecStartPre=+-/bin/sh -c 'read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth deactivate'
 ExecStart=synoik system-compositor
-ExecStartPost=+-/usr/bin/plymouth quit --retain-splash
+ExecStartPost=+-/bin/sh -c 'read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth quit --retain-splash'
 # Ready means answering plymouth's clients: the name frees a moment after that quit returns, and
 # the outer writes the pid file once it holds it (plymouthd removed its own before letting go).
 ExecStartPost=-/bin/sh -c 'for i in $$(seq 200); do [ -e /run/plymouth/pid ] && exit; sleep 0.01; done'

@@ -7,13 +7,14 @@
 //! session's screen replaces it, and at shutdown, from `PrepareForShutdown` until the power goes.
 
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken};
+use synoik_splash::handoff;
 
 use super::{Outer, Shown};
 use crate::system_compositor::plymouth::{self, Event, Server};
@@ -48,6 +49,8 @@ pub(super) struct BootSplash {
     start: Duration,
     /// The frame a frozen spinner (`H`) keeps.
     frozen: Option<usize>,
+    /// Carried on from another drawer's splash, its spinner's clock with it.
+    resumed: bool,
     /// Bumped with every change to what the splash shows, so a display knows its frame is stale.
     pub revision: u64,
     timer: Option<RegistrationToken>,
@@ -70,14 +73,28 @@ impl Outer {
     ///
     /// Shown from the first modeset: the frame `plymouth deactivate` leaves on screen has the
     /// spinner in it, so a first frame without one would blink it off (§2.1).
-    pub(super) fn start_boot_splash(&mut self) {
+    ///
+    /// With `resume`, the splash is the one the initramfs splash had up, its clients' requests
+    /// and its spinner's phase carried on (§7.2).
+    pub(super) fn start_boot_splash(&mut self, resume: Option<handoff::State>) {
+        let (start, frozen, resumed) = match &resume {
+            Some(state) => (state.spinner_start, state.frozen_frame, true),
+            None => (get_monotonic_time(), None, false),
+        };
         self.boot = Some(BootSplash {
-            start: get_monotonic_time(),
-            frozen: None,
+            start,
+            frozen,
+            resumed,
             revision: 0,
             timer: None,
         });
-        self.plymouth.server.show();
+        match resume {
+            Some(state) => {
+                info!("carrying on the initramfs splash");
+                self.plymouth.server.restore(state.splash);
+            }
+            None => self.plymouth.server.show(),
+        }
         // Nothing is on screen yet to redraw: the first modeset draws what this says.
         self.plymouth.server.take_events();
     }
@@ -85,7 +102,9 @@ impl Outer {
     /// Start the spinner turning, once the first modeset is on screen.
     pub(super) fn begin_spinner(&mut self) {
         let Some(boot) = &mut self.boot else { return };
-        boot.start = get_monotonic_time();
+        if !boot.resumed {
+            boot.start = get_monotonic_time();
+        }
         // Not the compositor clock of `Synoik::timer_after`: the outer holds no `Synoik`.
         #[allow(clippy::disallowed_methods)]
         let timer = Timer::from_duration(splash::SPINNER_FRAME_INTERVAL);
@@ -163,21 +182,36 @@ impl Outer {
             self.handle.remove(token);
         }
         info!("the splash is over");
+        // A later restart adopts the session's frame, not this splash.
+        if let Err(err) = handoff::remove(handoff::FD_SPLASH) {
+            debug!("removing the splash from the fd store: {err}");
+        }
         self.plymouth.server.end();
         self.on_plymouth();
     }
 
-    /// Start answering on plymouthd's name, retrying while plymouthd still holds it.
-    pub(super) fn bind_plymouth(&mut self) {
+    /// Start answering on plymouthd's name: on `inherited`, the listener a previous outer or the
+    /// initramfs splash left in the fd store, or else bound here, retrying while plymouthd still
+    /// holds the name.
+    pub(super) fn bind_plymouth(&mut self, inherited: Option<UnixListener>) {
+        if let Some(listener) = inherited {
+            match self.plymouth.server.adopt(listener) {
+                Ok(()) => return self.answer_plymouth(),
+                Err(err) => warn!("not adopting plymouth's listener: {err}"),
+            }
+        }
         match self.plymouth.server.try_bind(plymouth::SOCKET_NAME) {
             Ok(()) => {
                 self.plymouth.retry = None;
-                self.watch_plymouth_listener();
-                // Only now: the pid file is what tells systemd's agent a splash is listening.
-                self.plymouth
-                    .server
-                    .set_pid_file(PathBuf::from(plymouth::PID_FILE));
-                info!("answering plymouth's clients");
+                // Kept across a restart, so the name is never free for anyone else to take.
+                if let Some(fd) = self.plymouth.server.listener_fd() {
+                    if std::env::var_os("NOTIFY_SOCKET").is_some() {
+                        if let Err(err) = handoff::store(handoff::FD_PLYMOUTH, fd) {
+                            warn!("could not put plymouth's listener in the fd store: {err}");
+                        }
+                    }
+                }
+                self.answer_plymouth();
             }
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 #[allow(clippy::disallowed_methods)]
@@ -185,7 +219,7 @@ impl Outer {
                 let token = self
                     .handle
                     .insert_source(timer, |_, _, outer: &mut Outer| {
-                        outer.bind_plymouth();
+                        outer.bind_plymouth(None);
                         TimeoutAction::Drop
                     })
                     .expect("inserting a timer");
@@ -193,6 +227,15 @@ impl Outer {
             }
             Err(err) => warn!("not answering plymouth's clients: {err}"),
         }
+    }
+
+    fn answer_plymouth(&mut self) {
+        self.watch_plymouth_listener();
+        // Only now: the pid file is what tells systemd's agent a splash is listening.
+        self.plymouth
+            .server
+            .set_pid_file(PathBuf::from(plymouth::PID_FILE));
+        info!("answering plymouth's clients");
     }
 
     fn watch_plymouth_listener(&mut self) {

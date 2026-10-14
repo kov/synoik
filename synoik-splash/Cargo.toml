@@ -9,4 +9,7 @@ description = "The synoik boot splash: plymouthd's protocol, the splash layout, 
 
 [dependencies]
 libc = "0.2.185"
+sd-notify = { version = "0.5.0", features = ["fdstore"] }
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true

@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -46,7 +47,7 @@ use smithay::reexports::drm::control::{
 use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
 use smithay_drm_extras::drm_scanner::DrmScanner;
-use synoik_splash::peer_cred;
+use synoik_splash::{handoff, peer_cred};
 
 mod boot;
 
@@ -58,9 +59,6 @@ use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
 use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
 use crate::render_helpers::vulkan::VkTexture;
 use crate::utils::get_monotonic_time;
-
-/// The name the DRM fd is stored under in systemd's fd store.
-const FDSTORE_NAME: &str = "drm";
 
 /// GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a session's
 /// own background sits on.
@@ -93,15 +91,20 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<'static, Outer> = EventLoop::try_new()?;
     let handle = event_loop.handle();
 
-    let (fd, recovered) = acquire_card(card.as_deref())?;
+    let Inherited {
+        drm: fd,
+        recovered,
+        plymouth,
+        splash,
+    } = acquire_card(card.as_deref())?;
     if recovered {
         close_inherited_framebuffers(fd.as_fd());
     }
-    let mut outer = Outer::new(fd, recovered, handle.clone())?;
+    let mut outer = Outer::new(fd, recovered, splash, handle.clone())?;
     // The first modeset put plymouth's frame back up; the spinner turns from there, and the socket
     // is plymouthd's once it lets go of it (boot-splash.md §2.1).
     outer.begin_spinner();
-    outer.bind_plymouth();
+    outer.bind_plymouth(plymouth);
     if let Err(err) = watch_hotplug(&handle, &outer) {
         warn!("displays plugged in later will not light: {err:#}");
     }
@@ -208,17 +211,35 @@ fn watch_shutdown(handle: &LoopHandle<'static, Outer>) -> anyhow::Result<()> {
 /// Master belongs to the open file, not to us. Holding the file in systemd's fd store is what
 /// stops a crash from leaving a masterless card for anyone with a `uaccess` ACL to claim (§1).
 ///
-/// Returns whether the fd was recovered rather than freshly opened.
-fn acquire_card(card: Option<&Path>) -> anyhow::Result<(OwnedFd, bool)> {
+/// Also collects what else the store holds: the initramfs splash leaves plymouthd's listener and
+/// its splash there for the outer to carry on with (`boot-splash.md` §7.2).
+fn acquire_card(card: Option<&Path>) -> anyhow::Result<Inherited> {
+    let mut drm = None;
+    let mut plymouth = None;
+    let mut splash = None;
     if let Ok(fds) = sd_notify::listen_fds_with_names() {
         for (raw, name) in fds {
             // SAFETY: systemd passed this descriptor to us; it is ours to own from here on.
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            if name == FDSTORE_NAME {
-                info!("recovered the DRM fd from the fd store");
-                return Ok((fd, true));
+            match name.as_str() {
+                handoff::FD_DRM => drm = Some(fd),
+                handoff::FD_PLYMOUTH => plymouth = Some(UnixListener::from(fd)),
+                handoff::FD_SPLASH => match handoff::State::from_fd(fd.as_fd()) {
+                    Ok(state) => splash = Some(state),
+                    Err(err) => warn!("not resuming the splash: {err}"),
+                },
+                _ => (),
             }
         }
+    }
+    if let Some(drm) = drm {
+        info!("recovered the DRM fd from the fd store");
+        return Ok(Inherited {
+            drm,
+            recovered: true,
+            plymouth,
+            splash,
+        });
     }
 
     let path = match card {
@@ -236,14 +257,30 @@ fn acquire_card(card: Option<&Path>) -> anyhow::Result<(OwnedFd, bool)> {
         if let Err(err) = sd_notify::notify_with_fds(
             &[
                 sd_notify::NotifyState::FdStore,
-                sd_notify::NotifyState::FdName(FDSTORE_NAME),
+                sd_notify::NotifyState::FdName(handoff::FD_DRM),
             ],
             &[fd.as_fd()],
         ) {
             warn!("could not put the DRM fd in the fd store: {err}");
         }
     }
-    Ok((fd, false))
+    Ok(Inherited {
+        drm: fd,
+        recovered: false,
+        plymouth,
+        splash: None,
+    })
+}
+
+/// What a start begins with: the card, and what the fd store kept besides.
+struct Inherited {
+    drm: OwnedFd,
+    /// The card came from the fd store, master and frame on screen with it.
+    recovered: bool,
+    /// plymouthd's listener, still bound.
+    plymouth: Option<UnixListener>,
+    /// The splash a previous drawer had up: the initramfs splash's, at the handover.
+    splash: Option<handoff::State>,
 }
 
 /// Let go of the framebuffers a previous outer created on the fd we inherited, without taking
@@ -587,6 +624,7 @@ impl Outer {
     fn new(
         fd: OwnedFd,
         recovered: bool,
+        splash: Option<handoff::State>,
         handle: LoopHandle<'static, Outer>,
     ) -> anyhow::Result<Self> {
         let drm_fd = DrmDeviceFd::new(DeviceFd::from(fd));
@@ -629,8 +667,10 @@ impl Outer {
             plymouth: Plymouth::new(),
             boot: None,
         };
-        if !recovered && outer.compositor.is_some() {
-            outer.start_boot_splash();
+        // A restart adopts the frame on screen without a splash, unless it is taking the splash
+        // over (§7.2).
+        if outer.compositor.is_some() && (!recovered || splash.is_some()) {
+            outer.start_boot_splash(splash);
         }
         outer.scan_connectors();
         if outer.connectors.is_empty() {
@@ -1149,7 +1189,7 @@ impl Outer {
             return;
         }
         if self.boot.is_none() {
-            self.start_boot_splash();
+            self.start_boot_splash(None);
             self.begin_spinner();
         }
         self.outgoing_greeter = None;

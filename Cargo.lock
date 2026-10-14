@@ -3753,6 +3753,9 @@ name = "synoik-splash"
 version = "26.4.0"
 dependencies = [
  "libc",
+ "sd-notify",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
