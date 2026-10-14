@@ -242,14 +242,17 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 
 ## 6. Open
 
-- **On Limina, plymouth draws only by chance.** virtio-gpu reports the output connected only once
-  the host has answered for the display, ≈3.7-4.4 s into boot on the harness VM (measured
-  2026-10-14: a probing `GETCONNECTOR` as master returned connected from 3.71 s on). plymouthd probes
-  once in the initramfs (≈1.4 s, always too early) and once after switch_root (≈3.8-4.4 s, either
-  side of it), and no hotplug follows to make it retry: when both miss, the firmware's frame stays
-  until the outer's. A Limina issue, to report there. The outer starting early (§2.2) makes its
-  own splash the first one on screen in that case.
-
+- **The initramfs splash needs an in-kernel DRM client, which S6 of `system-compositor.md`
+  removes.** A connector reads `unknown` until something probes it. The kernel's fbdev client
+  probes at driver load, and its change uevent is what plymouthd waits for: without one (as with
+  `drm_kms_helper.fbdev_emulation=0`, S6's stock-kernel setting, which the installer adds where
+  `/dev/fb*` exists), nothing probes before the outer and plymouthd never shows a splash (measured on
+  the harness VM, 2026-10-14). Keeping fbdev keeps fbcon bound to the outer's card, the hazard S6
+  exists for; jabuticaba has exactly that today (`CONFIG_FB_DEVICE` is off, so there is no `/dev/fb*`
+  and the installer's check does not fire). The way to have both is S6's own fallback: keep fbdev
+  for the boot, and have the outer's unit unbind fbcon (`/sys/class/vtconsole/vtcon1/bind`, root,
+  `ExecStartPre=+`) as it takes the screen, binding it again on a console handback (§2.4).
+  Not decided.
 - SELinux: on an enforcing system, confined clients may be allowed `connectto` only on
   `plymouthd_t`. jabuticaba is permissive; check the policy before enabling enforcing.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
