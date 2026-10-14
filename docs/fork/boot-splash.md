@@ -46,10 +46,11 @@ GDM's order (`gdm-manager.c:153-198`), not today's quit-first:
 Measured on the harness VM (2026-10-14, plymouth 24.004.60, DRM plane state read from debugfs at
 each step and every presented frame captured on the host): after `deactivate` plymouthd's
 framebuffer is still on the primary plane; the outer's first frame replaces it directly; `quit`
-changes nothing on screen. Today's quit-first order leaves the plane empty, with the CRTC lit, for
-110-240 ms before the outer's first frame: a black flash. The frame plymouthd leaves is background
-+ watermark — `deactivate` stops the spinner first — so that is what the outer's first frame
-reproduces (§4.1), and the spinner starts from there.
+changes nothing on screen. The quit-first order leaves the plane empty, with the CRTC lit, for
+110-240 ms before the outer's first frame: a black flash. The frame `deactivate` leaves has the
+spinner in it, mid-turn, so the outer's first frame is the splash with its spinner at frame 0: the
+watermark matches plymouth's to within 1/255 per channel, and the spinner's phase jumps once, as
+plymouth's own is not knowable.
 
 The client side is root-only by plymouth's design (`SO_PEERCRED` uid 0 or NAK,
 `ply-boot-server.c:265-285`), so steps 1 and 3 run as `+`; the outer itself stays unprivileged and

@@ -67,6 +67,9 @@ impl AsFd for ConnectionFd {
 impl Outer {
     /// Put the boot splash up in place of the plate: a fresh start with something to draw it
     /// with. A restarted outer adopts the session frame on screen instead.
+    ///
+    /// Shown from the first modeset: the frame `plymouth deactivate` leaves on screen has the
+    /// spinner in it, so a first frame without one would blink it off (§2.1).
     pub(super) fn start_boot_splash(&mut self) {
         self.boot = Some(BootSplash {
             start: get_monotonic_time(),
@@ -74,10 +77,12 @@ impl Outer {
             revision: 0,
             timer: None,
         });
+        self.plymouth.server.show();
+        // Nothing is on screen yet to redraw: the first modeset draws what this says.
+        self.plymouth.server.take_events();
     }
 
-    /// The splash's frame now: the retained frame was the first modeset's, so the spinner turns
-    /// from here (§2.1).
+    /// Start the spinner turning, once the first modeset is on screen.
     pub(super) fn begin_spinner(&mut self) {
         let Some(boot) = &mut self.boot else { return };
         boot.start = get_monotonic_time();
@@ -97,8 +102,6 @@ impl Outer {
         if let Some(boot) = &mut self.boot {
             boot.timer = Some(token);
         }
-        self.plymouth.server.show();
-        self.on_plymouth();
     }
 
     /// The spinner frame to draw now.

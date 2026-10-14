@@ -97,8 +97,8 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
         close_inherited_framebuffers(fd.as_fd());
     }
     let mut outer = Outer::new(fd, recovered, handle.clone())?;
-    // The first modeset put plymouth's retained frame back up; the spinner turns from there, and
-    // the socket is plymouthd's once it lets go of it (boot-splash.md §2.1).
+    // The first modeset put plymouth's frame back up; the spinner turns from there, and the socket
+    // is plymouthd's once it lets go of it (boot-splash.md §2.1).
     outer.begin_spinner();
     outer.bind_plymouth();
     if let Err(err) = watch_hotplug(&handle, &outer) {
