@@ -362,14 +362,18 @@ screen in the inner, and moving it means the outer grows real UI — against §1
 
 **S6 — resolved: no fbcon on the outer's card, two supported setups.**
 
-- **Stock kernel, VTs present** — sessions keep their VTs; the install puts
-  `drm_kms_helper.fbdev_emulation=0` on the kernel command line, so no DRM device gets an fbdev
-  and fbcon never binds (measured: no `/dev/fb*`, only the dummy console, VT sessions unaffected,
-  a fronted inner killed or put to `KD_TEXT` leaves the plane on its framebuffer).
-  `drm_client_lib.active=` (empty) is equivalent; a one-shot root unbind of `/sys/class/vtconsole`
-  at boot is the fallback where the command line cannot be touched. The cost is shared by all
-  three: no kernel text console on the display — boot messages and an emergency shell go
-  unseen there.
+- **Stock kernel, VTs present** — sessions keep their VTs; the install puts `fbcon=map:9` on the
+  kernel command line: every console maps to a framebuffer that does not exist, so fbcon binds to
+  none, including through its deferred takeover (`fbcon.c` `do_fb_registered` only takes a
+  framebuffer some console maps to). Measured on the harness VM (2026-10-14, VT kernel, fbdev on):
+  without it, fbcon takes over at the first console output and `KD_TEXT` on the foreground VT puts
+  fbcon's framebuffer on the plane, where it stays after `KD_GRAPHICS`; with it, only the dummy
+  console binds and the plane keeps the outer's framebuffer. The kernel's fbdev client stays,
+  and with it the first probe of the displays at boot, which plymouth needs to find them
+  (`boot-splash.md` §6) — why this, not `drm_kms_helper.fbdev_emulation=0` (which removes the
+  client) or a root unbind of `/sys/class/vtconsole` at boot (which a deferred takeover outlives).
+  The cost: no kernel text console on the display — boot messages and an emergency shell go
+  unseen there. `--use-gdm` removes the argument.
 - **Enhanced-tier Limina guests** — `CONFIG_VT=n`: no VTs, so sessions are VT-less as on the S1
   seat and there is no fbcon (measured, §10: seat0 reports `CanTTY=no`, logind takes VT-less
   sessions there, and the outer's chord is the switch). If VT-less operation turns up too many

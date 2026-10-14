@@ -92,6 +92,15 @@ volume (a separate crypt `/var`). The installer orders the outer before `cryptse
 only when they do not; otherwise the outer starts after the volumes, and their prompts are
 answered by the initramfs plymouthd, still on screen.
 
+#### 2.2.2 fbcon stays off, the fbdev client stays
+
+**The initramfs splash needs the kernel's fbdev client.** A connector reads `unknown` until
+something probes it; the fbdev client probes at driver load, and its change uevent is what
+plymouthd waits for. Without it (`drm_kms_helper.fbdev_emulation=0`) nothing probes before the
+outer and plymouthd shows nothing (measured on the harness VM, 2026-10-14). So fbcon is kept off
+the outer's card with `fbcon=map:9` instead, which leaves the client in place
+(`system-compositor.md` S6).
+
 ### 2.3 Shutdown and offline updates
 
 - **The outer keeps the screen until power-off.** Today it is stopped for shutdown while systemd's
@@ -117,14 +126,12 @@ answered by the initramfs plymouthd, still on screen.
   it read-only. A binary replaced by the update and still mapped may block even that. To verify on
   the harness.
 
-### 2.4 Handing the console back
+### 2.4 No console to hand back
 
 `plymouth quit` *without* `--retain-splash` comes from emergency.service, rescue.service,
-dracut-emergency and sulogin: "give the text console back". The outer drops master, removes its
-copy from the fd store (`FDSTOREREMOVE=1`) and closes every DRM fd, so the kernel's last-close
-restores fbcon, and stays down until restarted. tty1 is left in `KD_GRAPHICS` by plymouthd's
-retained quit; switching it back to text needs root, so the outer's binary does it as
-`ExecStopPost=+synoik system-compositor --release-console` (`KDSETMODE KD_TEXT` on tty1).
+dracut-emergency and sulogin: "give the text console back". With fbcon kept off the outer's card
+(§2.2.2) there is none to give: the splash ends as with `--retain-splash`, and the emergency shell
+is reached on the serial console or over ssh — S6's stated cost.
 
 ## 3. The protocol
 
@@ -238,21 +245,11 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    harness.
 5. **Password prompts** (§4.2): a `systemd-ask-password` at boot on the harness, and a LUKS data
    volume there.
-6. **Console handback** (§2.4): `systemctl emergency` on the harness.
+6. **Emergency and rescue** (§2.4): `systemctl emergency` on the harness — the splash ends, the
+   shell answers on the serial console.
 
 ## 6. Open
 
-- **The initramfs splash needs an in-kernel DRM client, which S6 of `system-compositor.md`
-  removes.** A connector reads `unknown` until something probes it. The kernel's fbdev client
-  probes at driver load, and its change uevent is what plymouthd waits for: without one (as with
-  `drm_kms_helper.fbdev_emulation=0`, S6's stock-kernel setting, which the installer adds where
-  `/dev/fb*` exists), nothing probes before the outer and plymouthd never shows a splash (measured on
-  the harness VM, 2026-10-14). Keeping fbdev keeps fbcon bound to the outer's card, the hazard S6
-  exists for; jabuticaba has exactly that today (`CONFIG_FB_DEVICE` is off, so there is no `/dev/fb*`
-  and the installer's check does not fire). The way to have both is S6's own fallback: keep fbdev
-  for the boot, and have the outer's unit unbind fbcon (`/sys/class/vtconsole/vtcon1/bind`, root,
-  `ExecStartPre=+`) as it takes the screen, binding it again on a console handback (§2.4).
-  Not decided.
 - SELinux: on an enforcing system, confined clients may be allowed `connectto` only on
   `plymouthd_t`. jabuticaba is permissive; check the policy before enabling enforcing.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not

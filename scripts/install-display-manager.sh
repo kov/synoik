@@ -40,6 +40,8 @@ fi
 if [ "${1:-}" = "--use-gdm" ]; then
     systemctl disable synoik-login.service synoik-system.service || true
     systemctl enable --force gdm.service
+    # The text consoles come back with GDM.
+    grubby --update-kernel=ALL --remove-args=fbcon=map:9
     cat <<'EOF'
 GDM is the display manager again. Reboot to switch: the system compositor keeps the display (and
 DRM master, in systemd's fd store) until it is stopped, so after the reboot nothing of it runs.
@@ -141,10 +143,12 @@ if command -v semanage >/dev/null; then
 fi
 
 # A bound fbcon would take the display back from the system compositor whenever a session lets
-# go of its VT (docs/fork/system-compositor.md §9 S6).
-if compgen -G '/dev/fb*' >/dev/null && ! grep -q 'fbdev_emulation=0' /proc/cmdline; then
-    grubby --update-kernel=ALL --args=drm_kms_helper.fbdev_emulation=0
-    echo "Added drm_kms_helper.fbdev_emulation=0 to every kernel's command line."
+# go of its VT; mapping every console to a framebuffer that does not exist keeps it off them all,
+# deferred takeover included, while the kernel's fbdev client still probes the displays at boot,
+# which is what lets plymouth find them (docs/fork/system-compositor.md §9 S6).
+if [ -e /sys/class/graphics/fbcon ] && ! grep -q 'fbcon=map:' /proc/cmdline; then
+    grubby --update-kernel=ALL --args=fbcon=map:9
+    echo "Added fbcon=map:9 to every kernel's command line (no text console on the display)."
 fi
 
 systemctl daemon-reload
