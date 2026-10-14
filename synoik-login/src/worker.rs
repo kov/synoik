@@ -46,8 +46,6 @@ pub fn spawn_worker(args: &[&str], fd: libc::c_int) -> anyhow::Result<libc::pid_
     Ok(child.id() as libc::pid_t)
 }
 
-const PATH: &str = "/usr/local/bin:/usr/bin";
-
 pub struct Request {
     pub service: String,
     pub user: String,
@@ -289,7 +287,6 @@ fn session_environment(pam: &Pam, account: &Account) -> anyhow::Result<Vec<CStri
         account.name.to_string_lossy().into_owned(),
     );
     env.insert("SHELL".into(), account.shell.clone());
-    env.entry("PATH".into()).or_insert_with(|| PATH.to_owned());
     // From the unit: where the system compositor listens, and synoik's private schema dir, which
     // holds its copies of the schemas it reads (org.gnome.login-screen among them).
     for key in ["SYNOIK_SYSTEM_SOCKET", "GSETTINGS_SCHEMA_DIR"] {
