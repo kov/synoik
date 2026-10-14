@@ -2200,12 +2200,12 @@ impl AsFd for FdRef {
     }
 }
 
-struct PeerCred {
-    pid: i32,
-    uid: u32,
+pub(super) struct PeerCred {
+    pub pid: i32,
+    pub uid: u32,
 }
 
-fn peer_cred(fd: BorrowedFd<'_>) -> io::Result<PeerCred> {
+pub(super) fn peer_cred(fd: BorrowedFd<'_>) -> io::Result<PeerCred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
     let rv = unsafe {

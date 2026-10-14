@@ -8,4 +8,5 @@
 mod chord;
 mod compose;
 pub mod outer;
+pub mod plymouth;
 pub mod protocol;
