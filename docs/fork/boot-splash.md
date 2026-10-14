@@ -42,6 +42,14 @@ GDM's order (`gdm-manager.c:153-198`), not today's quit-first:
    `synoik-system` (`z`, applied by `systemd-tmpfiles-setup.service` before the outer starts), and
    the file is written only after the bind.
 
+Measured on the harness VM (2026-10-14, plymouth 24.004.60, DRM plane state read from debugfs at
+each step and every presented frame captured on the host): after `deactivate` plymouthd's
+framebuffer is still on the primary plane; the outer's first frame replaces it directly; `quit`
+changes nothing on screen. Today's quit-first order leaves the plane empty, with the CRTC lit, for
+110-240 ms before the outer's first frame: a black flash. The frame plymouthd leaves is background
++ watermark — `deactivate` stops the spinner first — so that is what the outer's first frame
+reproduces (§4.1), and the spinner starts from there.
+
 The client side is root-only by plymouth's design (`SO_PEERCRED` uid 0 or NAK,
 `ply-boot-server.c:265-285`), so steps 1 and 3 run as `+`; the outer itself stays unprivileged and
 applies the same check to its clients.
@@ -58,7 +66,7 @@ splash showing is an ACK and nothing else, as is a `deactivate` with no plymouth
 
 | Unit | Change | Why |
 |---|---|---|
-| `synoik-system.service` | `DefaultDependencies=no`, `SurviveFinalKillSignal=yes` (§2.3); started as early after switch_root as its files allow (§2.2.1); `Before=cryptsetup-pre.target`; `Wants=systemd-ask-password-plymouth.path`; `WantedBy=` both `graphical.target` and `system-update.target`, with `Before=system-update-pre.target` | §2.1; prompts; offline updates; §2.3 |
+| `synoik-system.service` | `DefaultDependencies=no`, `IgnoreOnIsolate=yes`, `Slice=-.slice`, `SurviveFinalKillSignal=yes`, and no `Requires=` on any mount (§2.3); started as early after switch_root as its files allow (§2.2.1); `Before=cryptsetup-pre.target`; `Wants=systemd-ask-password-plymouth.path`; `WantedBy=` both `graphical.target` and `system-update.target`, with `Before=system-update-pre.target` | §2.1; prompts; offline updates; §2.3 |
 | `plymouth-quit-wait.service` | masked | `plymouth --wait` sends nothing and returns only when the daemon closes it, with `TimeoutSec=0` before `multi-user.target`. The outer closes idle connections when the boot splash ends, but quit-wait may connect after that. |
 | `plymouth-start.service` (real root) | `ExecStart=` neutralised by drop-in | If the initramfs had no plymouthd, a fresh one would race the outer for the card. |
 | `plymouth-{reboot,poweroff,halt,kexec}.service` | `ExecStart=` replaced by `plymouth change-mode --reboot\|--shutdown` (a oneshot) | plymouth passes the shutdown mode only as a daemon argument (`--mode=`), never over the protocol. |
@@ -71,8 +79,10 @@ The installer writes these; `--use-gdm` removes them.
 
 `DefaultDependencies=no` drops `sysinit.target`/`basic.target` and the shutdown conflict, so the
 unit names what it needs instead: `After=systemd-journald.socket systemd-tmpfiles-setup.service
-systemd-sysusers.service systemd-udev-trigger.service`, and `RequiresMountsFor=` its binary,
-Mesa's ICD and libraries, and its cache dir (`/usr`, `/var/cache`). The card has no systemd device
+systemd-sysusers.service systemd-udev-trigger.service`, and `WantsMountsFor=` (not `Requires…`, §2.3)
+its binary, Mesa's ICD and libraries, and its cache dir (`/usr`, `/var/cache`). That rules out
+`CacheDirectory=`, which implies `RequiresMountsFor=/var/cache`: the cache dir comes from the
+installer's tmpfiles entry, named to Mesa through `XDG_CACHE_HOME`. The card has no systemd device
 unit on Fedora (udev does not tag DRM cards for systemd), so the outer waits for it itself, from
 its udev monitor, when it is not there yet; at switch_root it normally is (virtio-gpu loads in the
 initramfs at ≈1.1 s on jabuticaba).
@@ -86,9 +96,16 @@ answered by the initramfs plymouthd, still on screen.
 
 - **The outer keeps the screen until power-off.** Today it is stopped for shutdown while systemd's
   fd store keeps master, so the shutdown plymouthd cannot draw either: nothing shows the shutdown
-  splash. With `DefaultDependencies=no` the outer is not stopped by `shutdown.target`;
-  `SurviveFinalKillSignal=yes` keeps it through systemd-shutdown's final kill (plymouth's `@`
-  argv mark protects only root processes, `systemd src/shared/killall.c:91-100`).
+  splash. Four things each stop it on the way down, and each has its setting:
+  `shutdown.target`'s conflict (`DefaultDependencies=no`); `systemctl poweroff|reboot` isolating
+  its target (`IgnoreOnIsolate=yes`, as plymouth-start has); a `Requires=` on a mount that is
+  unmounted for shutdown — `CacheDirectory=` adds one on `/var` (§2.2.1); and systemd-shutdown's
+  final kill (`SurviveFinalKillSignal=yes`; plymouth's `@` argv mark protects only root processes,
+  `systemd src/shared/killall.c:91-100`). The unit also leaves `system.slice` (`Slice=-.slice`),
+  which shutdown stops; that one was not tested on its own.
+  Measured on the harness VM (2026-10-14) with all of them, from a systemd-shutdown hook writing to
+  the serial console after the final kill: the outer alive and its framebuffer on the plane at
+  "Power down". Without the mount fix, systemd stopped it 2 s before the end.
 - On `PrepareForShutdown` the outer crossfades from the session to the shutdown splash
   (it fades to black today) and spins until power-off. dracut's late `H` freezes the last frame.
   The mode (`C reboot|shutdown` from the rewritten units) arrives only after the display manager
@@ -206,13 +223,9 @@ Images scale bilinearly at scale 2; text renders at device resolution.
 
 ## 5. Build order
 
-0. **Spike with unit files only, on the harness VM**, before any code: the two kernel/systemd
-   claims everything above rests on, both untested. (a) `ExecStartPre=+-plymouth deactivate` and
-   `ExecStartPost=+-plymouth quit --retain-splash` around today's outer: plymouthd's frame stays on
-   screen until the outer's first modeset, no black frame or fbcon flash (screen capture from the
-   host). (b) `DefaultDependencies=no` + `SurviveFinalKillSignal=yes`: the outer is still drawing
-   when `systemctl poweroff` reaches the end (its fade stays up; the journal shows no SIGKILL).
-   If either fails, this design changes first.
+The two kernel/systemd claims the design rests on were spiked first, with unit files only, on the
+harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
+
 1. **Protocol server** in the outer: socket, framing, credential check, command table, per-connection
    ordering, idle-connection close at boot end, pid file. Tested headless against plymouth's own
    client binary and byte-level fixtures (every row of §3.2, the malformed inputs of §3.1).
@@ -228,6 +241,14 @@ Images scale bilinearly at scale 2; text renders at device resolution.
 6. **Console handback** (§2.4): `systemctl emergency` on the harness.
 
 ## 6. Open
+
+- **On Limina, plymouth draws only by chance.** virtio-gpu reports the output connected only once
+  the host has answered for the display, ≈3.7-4.4 s into boot on the harness VM (measured
+  2026-10-14: a probing `GETCONNECTOR` as master returned connected from 3.71 s on). plymouthd probes
+  once in the initramfs (≈1.4 s, always too early) and once after switch_root (≈3.8-4.4 s, either
+  side of it), and no hotplug follows to make it retry: when both miss, the firmware's frame stays
+  until the outer's. A Limina issue, to report there. The outer starting early (§2.2) makes its
+  own splash the first one on screen in that case.
 
 - SELinux: on an enforcing system, confined clients may be allowed `connectto` only on
   `plymouthd_t`. jabuticaba is permissive; check the policy before enabling enforcing.
