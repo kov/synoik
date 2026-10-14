@@ -118,10 +118,17 @@ impl Outer {
         splash::spinner_frame(elapsed, frames)
     }
 
-    /// The splash's revision and spinner frame as the screen should show them.
+    /// The splash's revision and spinner frame as the screen should show them. A splash not
+    /// shown has no spinner, so its frame stays put: a turning one would redraw the same picture
+    /// fifteen times a second.
     pub(super) fn splash_state(&mut self) -> (u64, usize) {
         let revision = self.boot.as_ref().map_or(0, |b| b.revision);
-        (revision, self.spinner_frame())
+        let frame = if self.plymouth.server.splash().shown {
+            self.spinner_frame()
+        } else {
+            0
+        };
+        (revision, frame)
     }
 
     /// Redraw the splash on every display that shows it, is idle and is out of date.

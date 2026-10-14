@@ -1,9 +1,10 @@
 # Boot splash: the system compositor takes over from plymouth
 
-> Status: **steps 1-2 of §5 built** (`src/system_compositor/{plymouth,splash}.rs`, not yet wired
-> into the outer); the rest is design. Phase 1 of `system-compositor.md` §6: the outer takes the screen
-> from plymouth after switch_root and owns it until power-off. Phase 2 (the outer in the
-> initramfs) is out of scope here.
+> Status: **steps 1-3 of §5 built**: the outer answers plymouthd's protocol, draws the splash and
+> takes the screen over from plymouth at boot (`src/system_compositor/{plymouth,splash}.rs`,
+> `outer/boot.rs`). Shutdown, password prompts and the emergency path are design. Phase 1 of
+> `system-compositor.md` §6: the outer takes the screen from plymouth after switch_root and owns it
+> until power-off. Phase 2 (the outer in the initramfs) is out of scope here.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -204,8 +205,9 @@ pixels for a display of W×H:
 - **Messages:** one line, the latest `M`, centred, 10 px under the spinner. two-step has no
   `hide_message`, so `m` does nothing there (systemd clears with an empty `M` for that reason);
   the outer hides the line when `m` names it, which is what the request asks for.
-- **No fades.** On quit the spinner simply stops: plymouth's retained frame is background +
-  watermark, which is the frame the outer crossfades from at login and to at shutdown.
+- **No fades within the splash.** A client's `quit` stops it at background + watermark, plymouth's
+  retained frame. The fades are the outer's: from the splash as it stands, spinner and all, to the
+  first session frame.
 
 ### 4.2 Password dialog
 
@@ -261,6 +263,10 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    shell answers on the serial console.
 
 ## 6. Open
+
+- Scale: the splash is drawn at scale 1 everywhere. §4.4's rule (mutter's, as Fedora's plymouth
+  applies it) is not implemented; both jabuticaba displays come out at 1 under it, a HiDPI display
+  would not.
 
 - Translation: plymouthd translates the update titles and "N% complete" through its gettext
   domain (`/usr/share/locale/*/LC_MESSAGES/plymouth.mo`) in the system locale. The outer draws
