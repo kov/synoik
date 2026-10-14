@@ -20,11 +20,12 @@ Before=systemd-user-sessions.service
 # Both want the display; only one can hold DRM master.
 Conflicts=gdm.service
 # Plymouth holds the card until it lets go of it, and the outer takes its place, splash and socket
-# both (docs/fork/boot-splash.md §2.1). Should the outer fail, plymouth still has to go.
+# both (docs/fork/boot-splash.md §2.1). Nothing quits plymouth on the outer's failure: a restart
+# follows, and plymouth's name is then the outer's, its listener waiting in the fd store, so a
+# `plymouth quit` would end the restarted outer's splash.
 After=plymouth-start.service
 Conflicts=plymouth-quit.service
 After=plymouth-quit.service
-OnFailure=plymouth-quit.service
 # Never give up restarting: a unit that hits the start limit fails, and a failed unit's fd store is
 # where master would be lost.
 StartLimitIntervalSec=0
@@ -36,9 +37,9 @@ Type=notify
 # Only while the pid file is plymouthd's: plymouth's name is otherwise the outer's own, its
 # listener waiting in the fd store with nobody to answer until the outer is up (boot-splash.md
 # §7.2), and a client would wait on it forever.
-ExecStartPre=+-/bin/sh -c 'read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth deactivate'
+ExecStartPre=+-/bin/sh -c '{ read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm; } 2>/dev/null && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth deactivate'
 ExecStart=synoik system-compositor
-ExecStartPost=+-/bin/sh -c 'read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth quit --retain-splash'
+ExecStartPost=+-/bin/sh -c '{ read -r pid </run/plymouth/pid && read -r comm </proc/$$pid/comm; } 2>/dev/null && [ "$$comm" = plymouthd ] && exec /usr/bin/plymouth quit --retain-splash'
 # Ready means answering plymouth's clients: the name frees a moment after that quit returns, and
 # the outer writes the pid file once it holds it (plymouthd removed its own before letting go).
 ExecStartPost=-/bin/sh -c 'for i in $$(seq 200); do [ -e /run/plymouth/pid ] && exit; sleep 0.01; done'
