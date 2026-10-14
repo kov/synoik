@@ -1,11 +1,10 @@
 # Boot splash: the system compositor takes over from plymouth
 
-> Status: **steps 1-4 of §5 built**: the outer answers plymouthd's protocol, draws the splash,
-> takes the screen over from plymouth at boot and keeps it through shutdown and offline updates
-> (`src/system_compositor/{plymouth,splash}.rs`, `outer/boot.rs`). Password prompts and the
-> emergency path are design. Phase 1 of
-> `system-compositor.md` §6: the outer takes the screen from plymouth after switch_root and owns it
-> until power-off. Phase 2 (the outer in the initramfs) is out of scope here.
+> Status: **phase 1 built** (steps 1-4 of §5): the outer answers plymouthd's protocol, draws the
+> splash, takes the screen over from plymouth at boot and keeps it through shutdown and offline
+> updates (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
+> **Phase 2 (§7) is being built:** the splash in the initramfs, in place of plymouth there.
+> Password prompts and the emergency path are design.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -15,8 +14,10 @@ plymouth checkout unless prefixed.
 
 ## 1. Decisions
 
-- **Real root first.** plymouth keeps the initramfs; the outer takes over after switch_root, with
-  no visible change, and keeps the screen through shutdown.
+- **Real root first, then the initramfs.** Phase 1: plymouth keeps the initramfs; the outer takes
+  over after switch_root, with no visible change, and keeps the screen through shutdown. Phase 2
+  (§7): a small splash program replaces plymouth in the initramfs, and the outer takes over from it
+  by a restart of the same unit.
 - **The outer speaks plymouthd's protocol.** Every tool that talks to plymouth today — systemd's
   password agent and unit-status updates, PackageKit and dnf5 offline updates, dracut, util-linux,
   battery-check, FIDO2 unlock — keeps working unchanged (§3).
@@ -243,9 +244,10 @@ is not built (§6).
 
 ### 4.4 Text and scale
 
-Cantarell Regular 16 px and Cantarell Light 40 px for titles: what plymouth's pango label plugin
-renders from the real root (the initramfs's freetype plugin uses Noto Sans, but nothing in phase 1
-draws there). Fedora's HiDPI rule is mutter's; both jabuticaba displays come out at scale 1.
+16 px regular and 40 px light for titles, bgrt's sizes and weights, but in the shell's sans
+(Adwaita Sans, the schema default of `org.gnome.desktop.interface font-name`) rather than bgrt's
+Cantarell: the splash fades into the greeter and session, which set their text in it. A deliberate
+divergence; the outer reads no user's settings, so it is the default, not a user's choice. Fedora's HiDPI rule is mutter's; both jabuticaba displays come out at scale 1.
 Images scale bilinearly at scale 2; text renders at device resolution.
 
 ## 5. Build order
@@ -294,3 +296,87 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
   check the server, so a squatter would receive passwords. The window is a few milliseconds and no
   prompt is possible inside it (§2.1), but it is not zero.
+
+## 7. Phase 2: the initramfs
+
+plymouth leaves the image; `synoik-splash`, a small program built from the outer's own splash code,
+takes its place. It is plymouthd for the initramfs: it answers the protocol (§3), draws the splash
+from the first DRM frame of the boot, and lives on across switch_root until the outer replaces it.
+
+### 7.1 One unit across switch_root
+
+The initramfs runs `synoik-system.service` — the same unit name as the real root's, with its own
+unit file. Measured on the harness VM (2026-10-14, systemd 259), with a probe service started from
+the initramfs:
+
+- A unit started in the initramfs is the same unit after switch_root: it stays `active` with the
+  same main PID, its configuration is now the real root's file, and the real root does not start
+  a second instance.
+- **Its fd store survives the switch.** The DRM fd stored in the initramfs is still master in the
+  real root.
+- **systemd TERMs every initramfs process at the switch**, sparing only those whose `argv[0]`
+  starts with `@` (plymouthd's mark). The unit runs `@/usr/libexec/synoik-splash @synoik-splash`.
+- A process that survives has its root in the initramfs, which systemd empties. The splash
+  needs no file after it starts: theme images are loaded up front, and its binary stays mapped.
+- It runs as `kernel_t` (no policy is loaded yet), and keeps that label.
+
+### 7.2 The handover is a restart
+
+Once the real root is up as far as the outer needs (§2.2.1), `synoik-splash-handover.service`
+runs `systemctl restart synoik-system.service`. systemd starts the outer from the real root's unit
+file, with all of its settings (user, groups, environment, directories, SELinux domain). Master and
+the frame on screen never move, because the DRM fd is in the fd store; the outer adopts them as it
+does after a crash (`system-compositor.md` §7). What else crosses over, also through the fd store:
+
+- **`plymouth`**: the bound listener. Clients that connect during the restart wait in its backlog,
+  not refused, and the socket keeps the label it got in the initramfs (§6, SELinux). The outer
+  stores the listener it binds itself too, so a crash restart keeps the name.
+- **`splash`**: a memfd with the splash state at TERM: mode, messages, progress, frozen and shown
+  flags, and the spinner's start on the monotonic clock. The outer resumes the splash from it, its
+  spinner phase continuing, and removes it when the splash ends; without it, the outer adopts the
+  screen as before.
+
+The splash removes `/run/plymouth/pid` at TERM, which the handover's `systemctl restart` waits
+on with the rest of the restart (`Type=notify`). The handover unit runs only while the splash is the
+unit's process: it is conditioned on `/run/synoik-system/initrd-splash`, which the splash creates
+and removes.
+
+The real root's unit keeps its plymouth calls for a boot whose initramfs still has plymouth
+(an image built before the install, or `--use-gdm` half undone). They are guarded on the pid file
+naming a `plymouthd`, so a restart never sends `deactivate` or `quit` to a socket nobody is
+answering yet, or to the outer itself.
+
+### 7.3 Drawing without a GPU
+
+The splash draws into dumb buffers on the CPU: no Mesa, no Vulkan driver, no shader compiler in
+the image. Each connected display gets its preferred mode and two dumb buffers, flipped by page
+flip. The layout is §4's, the outer's own code. The pixels are not identical to the outer's
+GPU drawing: the restart's first frame can differ by a filter rounding where the images blend.
+
+It probes the connectors itself (a `GETCONNECTOR` as master), so it does not depend on the kernel's
+fbdev client (§2.2.2). It waits for the card on udev, as plymouthd does.
+
+Text is not drawn in the initramfs yet: no message lines and no titles (update modes never start
+there). It comes with step 5's prompt, which needs it and Adwaita Sans in the image. Messages sent before the restart are kept in
+the state and drawn by the outer.
+
+### 7.4 The image
+
+A dracut module, `90synoik`, installs the program, its unit, the theme's images and the handover
+order; `/etc/dracut.conf.d/synoik.conf` adds it and omits `plymouth` (≈3 MB smaller,
+`initrd-size-and-time` measurements). The plymouth package stays installed, so `--use-gdm` brings
+everything back with a `dracut -f`.
+
+Not done when the root, or anything else the initramfs unlocks, is encrypted: no prompt is drawn
+until step 5, and with fbcon off the console agent is invisible. The installer checks `crypttab`
+and the root's device stack and leaves plymouth in the image when either has a LUKS volume.
+
+### 7.5 Build order
+
+7. **Crate split**: the protocol server and the layout move into `synoik-splash` (lib), with no
+   smithay; the outer uses them from there.
+8. **Fd-store handoff** in the outer: the `plymouth` listener and `splash` state adopted at start.
+9. **The program**: dumb buffers, the CPU painter, the TERM handoff; headless tests of the
+   painter against the layout.
+10. **Units, dracut module, installer**, and the boot on the harness: one PID from initramfs to
+    restart, no empty plane at either end, the spinner's phase across the restart.
