@@ -259,7 +259,8 @@ mid-animation, and settles the topology only once the target session is fronted.
 The highest-value slice — greeter, login, user switch, logout, lock — needs **none** of the
 early-boot work, and carries all of the architectural risk (§2, §3, §9 S1). Build that first.
 
-Plymouth replacement is a clean later phase. When we take it on, it means:
+Plymouth replacement is a clean later phase; its first phase — the outer takes over after
+switch_root and keeps the screen to power-off — is designed in `boot-splash.md`. In full it means:
 
 - **Living in the initramfs.** Start there, hold the DRM fd, keep running across `switch_root` —
   processes survive the pivot. This is literally plymouth's mechanism, so it is known-viable.
