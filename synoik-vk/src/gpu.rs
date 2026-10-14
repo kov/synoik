@@ -179,6 +179,9 @@ pub struct Gpu {
     enabled_extensions: Vec<String>,
     // Memoized DRM-modifier tiling features per format. See `modifier_features`.
     modifier_features: Mutex<HashMap<vk::Format, Vec<(u64, vk::FormatFeatureFlags)>>>,
+    /// Every blur chain's pipelines, built by the first chain and destroyed in `Drop`. See
+    /// [`crate::blur::BlurShared`].
+    blur_shared: Mutex<Option<crate::blur::BlurShared>>,
     /// Chains every submit on the queue after the previous one. See [`Self::submit`].
     /// `None` when the device does not support timeline semaphores, in which case
     /// submits are unordered relative to each other and the caller must keep
@@ -518,6 +521,7 @@ impl Gpu {
             drm_render_node: drm_render_node(&instance, phys),
             enabled_extensions,
             modifier_features: Mutex::new(HashMap::new()),
+            blur_shared: Mutex::new(None),
             order,
             external_fence,
             external_semaphore,
@@ -555,6 +559,20 @@ impl Gpu {
     /// different from a list that exists and omits a particular modifier.
     fn enumerates_modifiers(&self, format: vk::Format) -> bool {
         self.with_modifier_list(format, |list| !list.is_empty())
+    }
+
+    /// The pipelines and layouts every blur chain shares, built on first use.
+    pub(crate) fn blur_shared(&self) -> Result<crate::blur::BlurShared> {
+        let mut shared = self
+            .blur_shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(s) = *shared {
+            return Ok(s);
+        }
+        let s = crate::blur::BlurShared::new(self)?;
+        *shared = Some(s);
+        Ok(s)
     }
 
     fn with_modifier_list<R>(
@@ -969,6 +987,13 @@ impl Drop for Gpu {
         let _lifecycle = device_lifecycle_lock();
         unsafe {
             let _ = self.device.device_wait_idle();
+            let blur_shared = self
+                .blur_shared
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(shared) = blur_shared.take() {
+                shared.destroy(&self.device);
+            }
             if let Some(order) = self.order.as_ref() {
                 self.device.destroy_semaphore(order.semaphore, None);
             }

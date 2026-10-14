@@ -23,6 +23,8 @@
 //! gone: there is no Kawase shader, and every entry point on the chain is a gaussian one.
 //!
 //! Resources are freed explicitly in [`BlurChain::destroy`] (no `Drop` — teardown needs a `&Gpu`).
+//! The render pass, layouts, shaders and pipelines are the device's ([`BlurShared`], built once per
+//! [`Gpu`]); a chain owns only its levels and its descriptor pool.
 //! [`BlurChain::new`] unwinds a *failed* build via an internal guard (the compositor now rebuilds a
 //! chain at runtime — per output/size/pass change — where an error propagates instead of aborting
 //! `main`, so a partial build must not leak). `read_output`'s `?` paths still leak on failure, but
@@ -58,18 +60,15 @@ struct Level {
 }
 
 pub struct BlurChain {
-    render_pass: vk::RenderPass,
-    sampler: vk::Sampler,
-    set_layout: vk::DescriptorSetLayout,
+    /// The device's render pass, layouts and pipelines: shared by every chain, never destroyed by
+    /// one.
+    shared: BlurShared,
     desc_pool: vk::DescriptorPool,
-    pipeline_layout: vk::PipelineLayout,
-    /// GNOME's separable gaussian, and the plain resample its rungs use.
+    /// The gaussian path's ping-pong targets.
     ///
     /// Always `Some` today — every chain is built by a gaussian constructor. The `Option` is the
-    /// last trace of the dual-Kawase path, which needed neither these pipelines nor the scratch
-    /// levels, and it can go with the next change that touches the build.
+    /// last trace of the dual-Kawase path, which needed no scratch levels.
     gaussian: Option<Gaussian>,
-    vert: vk::ShaderModule,
     /// Level 0 is full-size (the output); levels 1..=passes shrink.
     levels: Vec<Level>,
     /// Descriptor set that samples the external source texture.
@@ -93,16 +92,12 @@ pub struct BlurChain {
     external_dst: Option<Level>,
 }
 
-/// The gaussian path's own pipelines, shaders and ping-pong targets.
+/// The gaussian path's ping-pong targets.
 ///
 /// A separable blur has to write H somewhere before reading it for V, and that somewhere must be
 /// the *same size* as the level being blurred — which no other level in a halving pyramid is.
 /// Hence a scratch twin for each shrinking level.
 struct Gaussian {
-    scale: vk::Pipeline,
-    blur: vk::Pipeline,
-    scale_frag: vk::ShaderModule,
-    blur_frag: vk::ShaderModule,
     /// Parallel to `levels[1..]`: `scratch[i - 1]` is the same size as `levels[i]`.
     scratch: Vec<Level>,
 }
@@ -185,20 +180,12 @@ pub fn downscale_levels_axis(extent: u32, radius: f64) -> usize {
 /// Unwind guard for [`BlurChain::new`]: destroys every handle created so far if the build fails
 /// partway (each field starts null — `vkDestroy*` is a no-op on a null handle — and is filled as
 /// `new` progresses). `armed` is cleared once `new` succeeds and moves the handles into the
-/// returned chain. Mirrors [`BlurChain::destroy`]'s teardown order.
+/// returned chain. Mirrors [`BlurChain::destroy`]'s teardown order. The [`BlurShared`] handles are
+/// the device's and are never the guard's to destroy.
 struct NewGuard<'a> {
     device: &'a ash::Device,
     armed: bool,
-    render_pass: vk::RenderPass,
-    sampler: vk::Sampler,
-    set_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
-    pipeline_layout: vk::PipelineLayout,
-    vert: vk::ShaderModule,
-    scale: vk::Pipeline,
-    gauss: vk::Pipeline,
-    scale_frag: vk::ShaderModule,
-    gauss_frag: vk::ShaderModule,
     levels: Vec<Level>,
     scratch: Vec<Level>,
 }
@@ -208,16 +195,7 @@ impl<'a> NewGuard<'a> {
         NewGuard {
             device,
             armed: true,
-            render_pass: vk::RenderPass::null(),
-            sampler: vk::Sampler::null(),
-            set_layout: vk::DescriptorSetLayout::null(),
             desc_pool: vk::DescriptorPool::null(),
-            pipeline_layout: vk::PipelineLayout::null(),
-            vert: vk::ShaderModule::null(),
-            scale: vk::Pipeline::null(),
-            gauss: vk::Pipeline::null(),
-            scale_frag: vk::ShaderModule::null(),
-            gauss_frag: vk::ShaderModule::null(),
             levels: Vec::new(),
             scratch: Vec::new(),
         }
@@ -238,16 +216,7 @@ impl Drop for NewGuard<'_> {
                 crate::devmem::untrack(level.memory);
                 d.free_memory(level.memory, None);
             }
-            d.destroy_pipeline(self.scale, None);
-            d.destroy_pipeline(self.gauss, None);
-            d.destroy_pipeline_layout(self.pipeline_layout, None);
-            d.destroy_shader_module(self.vert, None);
-            d.destroy_shader_module(self.scale_frag, None);
-            d.destroy_shader_module(self.gauss_frag, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
-            d.destroy_descriptor_set_layout(self.set_layout, None);
-            d.destroy_sampler(self.sampler, None);
-            d.destroy_render_pass(self.render_pass, None);
         }
     }
 }
@@ -270,25 +239,13 @@ impl BlurChain {
         let device = &gpu.device;
         let passes = passes.max(1);
         let (width, height) = (source.width, source.height);
+        let shared = gpu.blur_shared()?;
 
         // The compositor rebuilds a chain at runtime (per output/size/pass-count change — see the
         // `BackdropBlur` cache), where a failure no longer aborts the process, so a mid-build error
         // must unwind instead of leaking. Accumulate every created handle in the guard; `disarm` on
         // success. (`vkDestroy*` is a no-op on the null handles the guard starts with.)
         let mut guard = NewGuard::new(device);
-
-        guard.render_pass = create_blur_render_pass(device)?;
-
-        let sampler_ci = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        guard.sampler =
-            unsafe { device.create_sampler(&sampler_ci, None) }.context("blur sampler")?;
-
-        guard.set_layout = crate::render::sampler_set_layout(gpu)?;
 
         // One descriptor set per level (`passes + 1`), one for the external source, and one per
         // scratch twin (`passes`, the shrinking levels only).
@@ -302,32 +259,10 @@ impl BlurChain {
         guard.desc_pool =
             unsafe { device.create_descriptor_pool(&dp_ci, None) }.context("blur desc pool")?;
 
-        // Pipeline layout: set 0 = sampler, push constants = GaussianPush (fragment). The
-        // resample rungs read none of it and share the layout.
-        let push = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(std::mem::size_of::<GaussianPush>() as u32);
-        let layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&guard.set_layout))
-            .push_constant_ranges(std::slice::from_ref(&push));
-        guard.pipeline_layout =
-            unsafe { device.create_pipeline_layout(&layout_ci, None) }.context("blur layout")?;
-
-        guard.vert = load_module(device, FULLSCREEN_VERT)?;
-
         // Create the level pyramid.
         let (mut w, mut h) = (width, height);
         for _ in 0..=passes {
-            let level = create_level(
-                gpu,
-                guard.render_pass,
-                guard.sampler,
-                guard.set_layout,
-                guard.desc_pool,
-                w,
-                h,
-            )?;
+            let level = create_level(gpu, &shared, guard.desc_pool, w, h)?;
             guard.levels.push(level);
             // A directional chain halves only the axis it smears along. Shrinking the other one
             // too would soften detail *across* the motion, which is exactly the "mushy" look a
@@ -343,38 +278,12 @@ impl BlurChain {
             }
         }
 
-        {
-            guard.scale_frag = load_module(device, SCALE_FRAG)?;
-            guard.gauss_frag = load_module(device, GAUSSIAN_FRAG)?;
-            guard.scale = build_pipeline(
-                gpu,
-                guard.render_pass,
-                guard.pipeline_layout,
-                guard.vert,
-                guard.scale_frag,
-            )?;
-            guard.gauss = build_pipeline(
-                gpu,
-                guard.render_pass,
-                guard.pipeline_layout,
-                guard.vert,
-                guard.gauss_frag,
-            )?;
-            // A twin for every shrinking level; level 0 is the full-size output and is never
-            // ping-ponged through.
-            for i in 1..=passes {
-                let (w, h) = (guard.levels[i].w, guard.levels[i].h);
-                let twin = create_level(
-                    gpu,
-                    guard.render_pass,
-                    guard.sampler,
-                    guard.set_layout,
-                    guard.desc_pool,
-                    w,
-                    h,
-                )?;
-                guard.scratch.push(twin);
-            }
+        // A twin for every shrinking level; level 0 is the full-size output and is never
+        // ping-ponged through.
+        for i in 1..=passes {
+            let (w, h) = (guard.levels[i].w, guard.levels[i].h);
+            let twin = create_level(gpu, &shared, guard.desc_pool, w, h)?;
+            guard.scratch.push(twin);
         }
 
         // Descriptor set that samples the external source (freed with `desc_pool`, no separate
@@ -382,27 +291,19 @@ impl BlurChain {
         let source_set = alloc_sampler_set(
             gpu,
             guard.desc_pool,
-            guard.set_layout,
+            shared.set_layout,
             source.view,
             source.sampler,
         )?;
 
         guard.armed = false;
         let gaussian = Some(Gaussian {
-            scale: guard.scale,
-            blur: guard.gauss,
-            scale_frag: guard.scale_frag,
-            blur_frag: guard.gauss_frag,
             scratch: std::mem::take(&mut guard.scratch),
         });
         Ok(BlurChain {
+            shared,
             gaussian,
-            render_pass: guard.render_pass,
-            sampler: guard.sampler,
-            set_layout: guard.set_layout,
             desc_pool: guard.desc_pool,
-            pipeline_layout: guard.pipeline_layout,
-            vert: guard.vert,
             levels: std::mem::take(&mut guard.levels),
             source_set,
             passes,
@@ -436,7 +337,7 @@ impl BlurChain {
         h: u32,
     ) -> Result<()> {
         let fb_ci = vk::FramebufferCreateInfo::default()
-            .render_pass(self.render_pass)
+            .render_pass(self.shared.render_pass)
             .attachments(std::slice::from_ref(&view))
             .width(w)
             .height(h)
@@ -506,7 +407,7 @@ impl BlurChain {
             } else {
                 self.levels[i - 1].set
             };
-            self.pass_gaussian(gpu, cbuf, g.scale, &self.levels[i], src_set, None);
+            self.pass_gaussian(gpu, cbuf, self.shared.scale, &self.levels[i], src_set, None);
         }
 
         // Blur at the working size, ping-ponging through that level's twin.
@@ -518,7 +419,7 @@ impl BlurChain {
         self.pass_gaussian(
             gpu,
             cbuf,
-            g.blur,
+            self.shared.gauss,
             scratch,
             work_set,
             Some(GaussianPush {
@@ -531,7 +432,7 @@ impl BlurChain {
         self.pass_gaussian(
             gpu,
             cbuf,
-            g.blur,
+            self.shared.gauss,
             work,
             scratch.set,
             Some(GaussianPush {
@@ -549,7 +450,7 @@ impl BlurChain {
         // ever this pass's target (the descent reads `source_set`), so there is nothing else that
         // would go missing.
         let out = self.external_dst.as_ref().unwrap_or(full);
-        self.pass_gaussian(gpu, cbuf, g.scale, out, self.levels[k].set, None);
+        self.pass_gaussian(gpu, cbuf, self.shared.scale, out, self.levels[k].set, None);
     }
 
     /// Record a one-directional smear of `radius` along the chain's axis — a motion blur.
@@ -594,7 +495,7 @@ impl BlurChain {
             } else {
                 self.levels[i - 1].set
             };
-            self.pass_gaussian(gpu, cbuf, g.scale, &self.levels[i], src_set, None);
+            self.pass_gaussian(gpu, cbuf, self.shared.scale, &self.levels[i], src_set, None);
         }
 
         // The one smear, at the working size, into that level's twin.
@@ -603,7 +504,7 @@ impl BlurChain {
         self.pass_gaussian(
             gpu,
             cbuf,
-            g.blur,
+            self.shared.gauss,
             scratch,
             work.set,
             Some(GaussianPush {
@@ -619,7 +520,7 @@ impl BlurChain {
         // landed (`record_gaussian` magnifies out of `levels[k]` because its second direction
         // ping-pongs back into it; there is no second direction here).
         let out = self.external_dst.as_ref().unwrap_or(full);
-        self.pass_gaussian(gpu, cbuf, g.scale, out, scratch.set, None);
+        self.pass_gaussian(gpu, cbuf, self.shared.scale, out, scratch.set, None);
     }
 
     /// One gaussian-path pass. `push` is `None` for the resample rungs, which read no constants.
@@ -638,7 +539,7 @@ impl BlurChain {
             height: dst.h,
         };
         let begin = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass)
+            .render_pass(self.shared.render_pass)
             .framebuffer(dst.framebuffer)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -668,7 +569,7 @@ impl BlurChain {
             device.cmd_bind_descriptor_sets(
                 cbuf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
+                self.shared.pipeline_layout,
                 0,
                 &[src_set],
                 &[],
@@ -676,7 +577,7 @@ impl BlurChain {
             if let Some(push) = push {
                 device.cmd_push_constants(
                     cbuf,
-                    self.pipeline_layout,
+                    self.shared.pipeline_layout,
                     vk::ShaderStageFlags::FRAGMENT,
                     0,
                     as_bytes(&push),
@@ -909,15 +810,110 @@ impl BlurChain {
                 crate::devmem::untrack(level.memory);
                 d.free_memory(level.memory, None);
             }
-            if let Some(g) = &self.gaussian {
-                d.destroy_pipeline(g.scale, None);
-                d.destroy_pipeline(g.blur, None);
-                d.destroy_shader_module(g.scale_frag, None);
-                d.destroy_shader_module(g.blur_frag, None);
-            }
-            d.destroy_pipeline_layout(self.pipeline_layout, None);
-            d.destroy_shader_module(self.vert, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
+        }
+    }
+}
+
+/// What every [`BlurChain`] on a device has in common: render pass, sampler, layouts, shaders and
+/// the two pipelines. Built once per [`Gpu`] ([`Gpu::blur_shared`]) and destroyed with it.
+///
+/// Per chain this used to cost two `vkCreateGraphicsPipelines`, which is nothing on a driver that
+/// defers compilation (venus: ~0) and a real compile on one that does not (KosmicKrisp: ~0.5 ms
+/// warm, 17 ms cold) — on the frame path, every time an output, size or pass count changed. A
+/// chain's levels differ only in size and viewport/scissor are dynamic, so one set serves them all.
+#[derive(Clone, Copy)]
+pub(crate) struct BlurShared {
+    render_pass: vk::RenderPass,
+    sampler: vk::Sampler,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    vert: vk::ShaderModule,
+    scale_frag: vk::ShaderModule,
+    gauss_frag: vk::ShaderModule,
+    /// The plain resample the pyramid's rungs use, and GNOME's separable gaussian.
+    scale: vk::Pipeline,
+    gauss: vk::Pipeline,
+}
+
+impl BlurShared {
+    pub(crate) fn new(gpu: &Gpu) -> Result<Self> {
+        let mut shared = BlurShared {
+            render_pass: vk::RenderPass::null(),
+            sampler: vk::Sampler::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            vert: vk::ShaderModule::null(),
+            scale_frag: vk::ShaderModule::null(),
+            gauss_frag: vk::ShaderModule::null(),
+            scale: vk::Pipeline::null(),
+            gauss: vk::Pipeline::null(),
+        };
+        // `destroy` is a no-op on the handles still null, so a partial build unwinds through it.
+        if let Err(e) = shared.fill(gpu) {
+            unsafe { shared.destroy(&gpu.device) };
+            return Err(e);
+        }
+        Ok(shared)
+    }
+
+    fn fill(&mut self, gpu: &Gpu) -> Result<()> {
+        let device = &gpu.device;
+        self.render_pass = create_blur_render_pass(device)?;
+
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        self.sampler =
+            unsafe { device.create_sampler(&sampler_ci, None) }.context("blur sampler")?;
+
+        self.set_layout = crate::render::sampler_set_layout(gpu)?;
+
+        // Pipeline layout: set 0 = sampler, push constants = GaussianPush (fragment). The
+        // resample rungs read none of it and share the layout.
+        let push = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<GaussianPush>() as u32);
+        let layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&self.set_layout))
+            .push_constant_ranges(std::slice::from_ref(&push));
+        self.pipeline_layout =
+            unsafe { device.create_pipeline_layout(&layout_ci, None) }.context("blur layout")?;
+
+        self.vert = load_module(device, FULLSCREEN_VERT)?;
+        self.scale_frag = load_module(device, SCALE_FRAG)?;
+        self.gauss_frag = load_module(device, GAUSSIAN_FRAG)?;
+        self.scale = build_pipeline(
+            gpu,
+            self.render_pass,
+            self.pipeline_layout,
+            self.vert,
+            self.scale_frag,
+        )?;
+        self.gauss = build_pipeline(
+            gpu,
+            self.render_pass,
+            self.pipeline_layout,
+            self.vert,
+            self.gauss_frag,
+        )?;
+        Ok(())
+    }
+
+    /// # Safety
+    /// No chain built from these handles may still be recorded or pending on the GPU.
+    pub(crate) unsafe fn destroy(&self, d: &ash::Device) {
+        unsafe {
+            d.destroy_pipeline(self.scale, None);
+            d.destroy_pipeline(self.gauss, None);
+            d.destroy_shader_module(self.vert, None);
+            d.destroy_shader_module(self.scale_frag, None);
+            d.destroy_shader_module(self.gauss_frag, None);
+            d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
             d.destroy_sampler(self.sampler, None);
             d.destroy_render_pass(self.render_pass, None);
@@ -989,9 +985,7 @@ fn create_blur_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
 
 fn create_level(
     gpu: &Gpu,
-    render_pass: vk::RenderPass,
-    sampler: vk::Sampler,
-    set_layout: vk::DescriptorSetLayout,
+    shared: &BlurShared,
     desc_pool: vk::DescriptorPool,
     w: u32,
     h: u32,
@@ -1029,7 +1023,7 @@ fn create_level(
     let view = unsafe { device.create_image_view(&view_ci, None) }.context("blur level view")?;
 
     let fb_ci = vk::FramebufferCreateInfo::default()
-        .render_pass(render_pass)
+        .render_pass(shared.render_pass)
         .attachments(std::slice::from_ref(&view))
         .width(w)
         .height(h)
@@ -1037,7 +1031,7 @@ fn create_level(
     let framebuffer =
         unsafe { device.create_framebuffer(&fb_ci, None) }.context("blur level fb")?;
 
-    let set = alloc_sampler_set(gpu, desc_pool, set_layout, view, sampler)?;
+    let set = alloc_sampler_set(gpu, desc_pool, shared.set_layout, view, shared.sampler)?;
 
     Ok(Level {
         image,
@@ -1203,6 +1197,48 @@ mod tests {
         assert_eq!(downscale_levels(300, 300, 1000.), 1);
         assert_eq!(downscale_levels(600, 600, 1000.), 2);
         assert_eq!(downscale_levels(256, 256, 1000.), 0);
+    }
+
+    #[test]
+    fn chains_share_the_devices_pipelines() {
+        // A chain is rebuilt at runtime on every output/size/pass change; on a driver that
+        // compiles at `vkCreateGraphicsPipelines` (KosmicKrisp) a per-chain pipeline put a
+        // compile on the frame path each time. Two chains of different shapes must use the very
+        // same handles, and destroying one must leave them usable by the other.
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping chains_share_the_devices_pipelines: no Vulkan device");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.expect("pool");
+        let pixels = vec![128u8; 256 * 128 * 4];
+        let big =
+            Texture::from_rgba(&gpu, pool, 256, 128, &pixels, vk::Filter::LINEAR).expect("big");
+        let small = Texture::from_rgba(
+            &gpu,
+            pool,
+            64,
+            64,
+            &pixels[..64 * 64 * 4],
+            vk::Filter::LINEAR,
+        )
+        .expect("small");
+
+        let a = BlurChain::new(&gpu, &big, 3).expect("isotropic chain");
+        let b = BlurChain::new_directional(&gpu, &small, 1, Axis::Horizontal).expect("directional");
+        assert!(a.shared.scale == b.shared.scale && a.shared.gauss == b.shared.gauss);
+        assert!(a.shared.render_pass == b.shared.render_pass);
+        assert!(a.shared.scale != vk::Pipeline::null() && a.shared.gauss != vk::Pipeline::null());
+
+        a.destroy(&gpu);
+        gpu.run_commands(pool, crate::stats::SubmitSite::Blur, |cbuf| {
+            b.record_directional(&gpu, cbuf, 20., 1.0);
+        })
+        .expect("a surviving chain still records after another is destroyed");
+        b.destroy(&gpu);
+        big.destroy(&gpu);
+        small.destroy(&gpu);
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 
     /// The gaussian spreads an edge, in proportion to its radius, and honours brightness.
