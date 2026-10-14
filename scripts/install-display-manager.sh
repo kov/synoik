@@ -40,8 +40,11 @@ fi
 if [ "${1:-}" = "--use-gdm" ]; then
     systemctl disable synoik-login.service synoik-system.service || true
     systemctl enable --force gdm.service
-    # The text consoles come back with GDM.
+    # The text consoles come back with GDM, and plymouth runs after switch_root again.
     grubby --update-kernel=ALL --remove-args=fbcon=map:9
+    rm -f /etc/systemd/system/plymouth-start.service.d/synoik.conf \
+        /etc/systemd/system/plymouth-quit-wait.service.d/synoik.conf
+    systemctl daemon-reload
     cat <<'EOF'
 GDM is the display manager again. Reboot to switch: the system compositor keeps the display (and
 DRM master, in systemd's fd store) until it is stopped, so after the reboot nothing of it runs.
@@ -74,11 +77,15 @@ install -Dm755 "target/$profile/synoik-login" /usr/local/bin/synoik-login
 install -Dm644 $r/synoik-system.sysusers /usr/lib/sysusers.d/synoik-system.conf
 install -Dm644 $r/synoik-login.sysusers /usr/lib/sysusers.d/synoik-login.conf
 install -Dm644 $r/synoik-login.tmpfiles /usr/lib/tmpfiles.d/synoik-login.conf
+install -Dm644 $r/synoik-system.tmpfiles /usr/lib/tmpfiles.d/synoik-system.conf
 systemd-sysusers synoik-system.conf synoik-login.conf
-systemd-tmpfiles --create synoik-login.conf
+systemd-tmpfiles --create synoik-login.conf synoik-system.conf
 
-# System units.
+# System units. After switch_root the system compositor is plymouth (docs/fork/boot-splash.md §2.2).
 install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-login.service
+for unit in plymouth-start plymouth-quit-wait; do
+    install -Dm644 $r/plymouth-real-root.conf "/etc/systemd/system/$unit.service.d/synoik.conf"
+done
 
 # On a Limina guest the system compositor draws through venus, which its environment file selects:
 # a system service does not read environment.d.

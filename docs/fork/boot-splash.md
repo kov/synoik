@@ -68,8 +68,8 @@ splash showing is an ACK and nothing else, as is a `deactivate` with no plymouth
 | Unit | Change | Why |
 |---|---|---|
 | `synoik-system.service` | `DefaultDependencies=no`, `IgnoreOnIsolate=yes`, `Slice=-.slice`, `SurviveFinalKillSignal=yes`, and no `Requires=` on any mount (§2.3); started as early after switch_root as its files allow (§2.2.1); `Before=cryptsetup-pre.target`; `Wants=systemd-ask-password-plymouth.path`; `WantedBy=` both `graphical.target` and `system-update.target`, with `Before=system-update-pre.target` | §2.1; prompts; offline updates; §2.3 |
-| `plymouth-quit-wait.service` | masked | `plymouth --wait` sends nothing and returns only when the daemon closes it, with `TimeoutSec=0` before `multi-user.target`. The outer closes idle connections when the boot splash ends, but quit-wait may connect after that. |
-| `plymouth-start.service` (real root) | `ExecStart=` neutralised by drop-in | If the initramfs had no plymouthd, a fresh one would race the outer for the card. |
+| `plymouth-quit-wait.service` | drop-in `ConditionPathExists=/etc/initrd-release`: runs in the initramfs only | `plymouth --wait` sends nothing and returns only when the daemon closes it, with `TimeoutSec=0` before `multi-user.target`. The outer closes idle connections when the boot splash ends, but quit-wait may connect after that. |
+| `plymouth-start.service` | the same drop-in | If the initramfs had no plymouthd, a fresh one would race the outer for the card. A condition rather than a mask or an emptied `ExecStart=`, so a drop-in that reaches the initramfs image changes nothing there. |
 | `plymouth-{reboot,poweroff,halt,kexec}.service` | `ExecStart=` replaced by `plymouth change-mode --reboot\|--shutdown` (a oneshot) | plymouth passes the shutdown mode only as a daemon argument (`--mode=`), never over the protocol. |
 | `plymouth-quit.service` | stays `Conflicts=` | as now |
 | `plymouth-switch-root-initramfs.service` | unchanged | its `R` is ACKed and ignored |
@@ -244,8 +244,10 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 2. **The splash model and drawing:** modes, messages, progress, the spinner clock, and the layout of
    §4 as conformance tests (positions per display size), then drawing through the outer's
    compositor with the theme's PNGs and the shell's text painter.
-3. **Boot handover** (§2.1, §2.2) and the crossfade from splash to greeter or session; validated on
-   the harness VM, which runs the same plymouth.
+3. **Boot handover** (§2.1, and the rows of §2.2 that concern the boot: the deactivate/quit order,
+   the two plymouth drop-ins, `/run/plymouth`) and the crossfade from splash to greeter or session;
+   validated on the harness VM, which runs the same plymouth. §2.2's early start and shutdown
+   settings come with step 4, the password-agent ordering with step 5.
    What the splash code leaves to it: `H` sets `Splash::frozen`, which the layout ignores — the
    outer stops redrawing; `$` after `H` restarts the spinner from frame 0 (`ply_throbber_start`
    resets its clock); and until step 5, every `*` gets `answer_password(None)` at once, or its

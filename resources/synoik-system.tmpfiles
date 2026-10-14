@@ -1,0 +1,6 @@
+# Install as /usr/lib/tmpfiles.d/synoik-system.conf.
+#
+# The system compositor answers plymouthd's clients after it (docs/fork/boot-splash.md §2.1): its
+# pid file, which systemd's plymouth password agent and unit-status updates check for, lives here.
+# plymouthd made the directory root-owned in the initramfs; this hands it over.
+d /run/plymouth 0755 synoik-system synoik-system -

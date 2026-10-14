@@ -250,10 +250,6 @@ impl Compositor {
 
     /// Draw `splash` into a free slot of `canvas` (avoiding `busy`) at `scale`, its spinner at
     /// `spinner_frame`. Returns the slot, its framebuffer and the fence that completes the draw.
-    #[expect(
-        dead_code,
-        reason = "the boot handover draws with it (boot-splash.md §5 step 3)"
-    )]
     pub fn draw_splash(
         &mut self,
         canvas: &mut Canvas,
@@ -299,15 +295,18 @@ impl Compositor {
         Ok((index, canvas.slots[index].fb.clone(), fence))
     }
 
+    /// How many frames the theme's spinner has; 0 without one.
+    pub fn spinner_frames(&mut self) -> usize {
+        self.theme().spinner.len()
+    }
+
+    fn theme(&mut self) -> &Theme {
+        self.theme
+            .get_or_insert_with(|| Theme::load(&mut self.renderer, Path::new(splash::THEME_DIR)))
+    }
+
     /// `splash` drawn into a texture the outer owns, `size` pixels: the picture a crossfade
     /// starts or ends on.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the boot handover crossfades from it (boot-splash.md §5 step 3)"
-        )
-    )]
     pub fn splash_picture(
         &mut self,
         size: (u16, u16),
@@ -350,10 +349,7 @@ impl Compositor {
         scale: f64,
         spinner_frame: usize,
     ) -> PreparedSplash {
-        let theme = self
-            .theme
-            .get_or_insert_with(|| Theme::load(&mut self.renderer, Path::new(splash::THEME_DIR)));
-        let images = theme.images();
+        let images = self.theme().images();
         let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
 
         let mut shaper = TextShaper::new(&mut self.renderer, scale);

@@ -47,6 +47,9 @@ use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
 use smithay_drm_extras::drm_scanner::DrmScanner;
 
+mod boot;
+
+use self::boot::{BootSplash, Plymouth};
 use super::chord;
 use super::compose::{Canvas, Compositor, Picture};
 use super::protocol::{self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter};
@@ -94,6 +97,10 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
         close_inherited_framebuffers(fd.as_fd());
     }
     let mut outer = Outer::new(fd, recovered, handle.clone())?;
+    // The first modeset put plymouth's retained frame back up; the spinner turns from there, and
+    // the socket is plymouthd's once it lets go of it (boot-splash.md §2.1).
+    outer.begin_spinner();
+    outer.bind_plymouth();
     if let Err(err) = watch_hotplug(&handle, &outer) {
         warn!("displays plugged in later will not light: {err:#}");
     }
@@ -366,6 +373,14 @@ enum Shown {
         /// has in flight now.
         answer: bool,
     },
+    /// The boot splash in place of the plate, drawn in one of the outer's own scanout slots: its
+    /// `revision` and spinner `frame`, to tell when it is out of date.
+    Splash {
+        slot: usize,
+        _fb: Rc<PrimeFramebuffer>,
+        revision: u64,
+        frame: usize,
+    },
     /// A frame the outer drew itself, in its own scanout slot: the switch's `from` and `to`
     /// pictures blended at `alpha`.
     Composite {
@@ -560,6 +575,11 @@ struct Outer {
     /// logind announced the machine is going down (`PrepareForShutdown(true)`): the screen fades
     /// to black and stays there, whatever logind fronts as the sessions end.
     shutting_down: bool,
+    /// plymouthd's socket, answered by the outer.
+    plymouth: Plymouth,
+    /// The boot splash, while it stands in for the plate: from a fresh start until a session's
+    /// screen replaces it.
+    boot: Option<BootSplash>,
 }
 
 fn plate_picture() -> Picture {
@@ -609,7 +629,12 @@ impl Outer {
             switch_wait: TARGET_WAIT,
             outgoing_greeter: None,
             shutting_down: false,
+            plymouth: Plymouth::new(),
+            boot: None,
         };
+        if !recovered && outer.compositor.is_some() {
+            outer.start_boot_splash();
+        }
         outer.scan_connectors();
         if outer.connectors.is_empty() {
             bail!("no connected display");
@@ -876,13 +901,60 @@ impl Outer {
             relayout_pending: false,
             last_to: None,
         };
+        self.displays.insert(d.to_owned(), display);
         if adopt {
             info!("{d} adopted at {}x{}", mode.size().0, mode.size().1);
-        } else if let Err(err) = commit_plate(d, &display) {
+        } else if let Err(err) = self.commit_base(d) {
             warn!("{err:#}");
-            return;
+            self.displays.remove(d);
         }
-        self.displays.insert(d.to_owned(), display);
+    }
+
+    /// The frame that stands for no session on `d`: the boot splash while it is up, else the
+    /// plate. `None` when the splash cannot be drawn.
+    fn draw_base(&mut self, d: &str) -> Option<(framebuffer::Handle, Shown, Option<OwnedFd>)> {
+        if self.boot.is_none() {
+            let display = self.displays.get(d)?;
+            return Some((display.plate, Shown::Plate, None));
+        }
+        let (revision, frame) = self.splash_state();
+        let splash = self.plymouth.server.splash().clone();
+        let display = self.displays.get_mut(d)?;
+        let busy = match &display.on_screen {
+            Shown::Composite { slot, .. } | Shown::Splash { slot, .. } => Some(*slot),
+            _ => None,
+        };
+        let compositor = self.compositor.as_mut()?;
+        match compositor.draw_splash(&mut display.canvas, &self.drm_fd, busy, &splash, 1., frame) {
+            Ok((slot, fb, fence)) => Some((
+                *(*fb).as_ref(),
+                Shown::Splash {
+                    slot,
+                    _fb: fb,
+                    revision,
+                    frame,
+                },
+                fence,
+            )),
+            Err(err) => {
+                warn!("drawing the splash on {d}: {err:#}");
+                let display = self.displays.get(d)?;
+                Some((display.plate, Shown::Plate, None))
+            }
+        }
+    }
+
+    /// Modeset `d` showing [`Self::draw_base`].
+    fn commit_base(&mut self, d: &str) -> anyhow::Result<()> {
+        let (fb, shown, fence) = self.draw_base(d).context("no display")?;
+        if let Some(fence) = fence {
+            // Once per modeset: the commit carries no fence of its own.
+            wait_fence(fence.as_fd());
+        }
+        let display = self.displays.get_mut(d).context("no display")?;
+        commit_frame(d, display, fb)?;
+        display.on_screen = shown;
+        Ok(())
     }
 
     fn unlight(&mut self, d: &str) {
@@ -926,7 +998,7 @@ impl Outer {
         display.plate = plate;
         display.canvas = Canvas::new(mode.size());
         display.on_screen = Shown::Plate;
-        if let Err(err) = commit_plate(d, display) {
+        if let Err(err) = self.commit_base(d) {
             warn!("{err:#}");
             self.displays.remove(d);
         }
@@ -1047,10 +1119,11 @@ impl Outer {
             });
             if let Some(token) = pending {
                 self.handle.remove(token);
+                let picture = self.base_picture(&d);
                 self.set_target(
                     &d,
                     Target {
-                        picture: plate_picture(),
+                        picture,
                         end: End::Plate,
                     },
                 );
@@ -1198,6 +1271,19 @@ impl Outer {
     /// moved input when it changed the active session, so nothing typed during the fade reaches
     /// the outgoing session.
     fn begin_switch(&mut self, d: &str) {
+        // The boot splash keeps turning until the incoming session draws: its first frame fades
+        // in from it then (`fronted_frame`), rather than a still of the spinner sitting through
+        // the wait.
+        let splash_up = self.boot.is_some()
+            && !self.shutting_down
+            && self.plate_showing(d)
+            && self.displays.get(d).is_some_and(|d| d.transition.is_none());
+        if splash_up {
+            if let Some((generation, buffer, fence)) = self.take_held(d) {
+                self.fronted_frame(d, generation, buffer, fence, true);
+            }
+            return;
+        }
         let from = self.snapshot_screen(d);
         self.cancel_transition(d);
         let Some(display) = self.displays.get_mut(d) else {
@@ -1249,10 +1335,14 @@ impl Outer {
         let Some(display) = self.displays.get(d) else {
             return plate_picture();
         };
+        if matches!(display.on_screen, Shown::Plate | Shown::Splash { .. }) {
+            return self.base_picture(d);
+        }
+        let display = &self.displays[d];
         let size = display.size();
         let compositor = self.compositor.as_mut().expect("only with a compositor");
         let captured = match &display.on_screen {
-            Shown::Plate => return plate_picture(),
+            Shown::Plate | Shown::Splash { .. } => unreachable!("handled above"),
             Shown::Session { dmabuf, .. } => compositor.snapshot(dmabuf),
             // Mid-fade: the blend on screen, redrawn, so the next fade starts where this one
             // stands instead of jumping to either end.
@@ -1345,22 +1435,24 @@ impl Outer {
         }
         let last = self.last_presented_on(d);
         debug!("switch target on {d} late; fading to {last:?}");
-        let target = last
-            .and_then(|(generation, buffer)| {
-                let texture = self.import_frame(generation, buffer)?;
-                Some(Target {
-                    picture: Picture::Texture(texture),
-                    end: End::Session {
-                        generation,
-                        buffer,
-                        answer: false,
-                    },
-                })
+        let target = last.and_then(|(generation, buffer)| {
+            let texture = self.import_frame(generation, buffer)?;
+            Some(Target {
+                picture: Picture::Texture(texture),
+                end: End::Session {
+                    generation,
+                    buffer,
+                    answer: false,
+                },
             })
-            .unwrap_or(Target {
-                picture: plate_picture(),
+        });
+        let target = match target {
+            Some(target) => target,
+            None => Target {
+                picture: self.base_picture(d),
                 end: End::Plate,
-            });
+            },
+        };
         self.set_target(d, target);
     }
 
@@ -1650,11 +1742,12 @@ impl Outer {
         over_plate: bool,
     ) {
         if over_plate && self.compositor.is_some() {
+            let from = self.base_picture(d);
             let Some(display) = self.displays.get_mut(d) else {
                 return;
             };
             display.transition = Some(Transition {
-                from: plate_picture(),
+                from,
                 to: None,
                 pending: None,
                 pending_watch: None,
@@ -1696,6 +1789,28 @@ impl Outer {
         }
     }
 
+    /// The picture of [`Self::draw_base`] on `d`, for a fade to start or end on.
+    fn base_picture(&mut self, d: &str) -> Picture {
+        if self.boot.is_none() {
+            return plate_picture();
+        }
+        let Some(size) = self.displays.get(d).map(Display::size) else {
+            return plate_picture();
+        };
+        let (_, frame) = self.splash_state();
+        let splash = self.plymouth.server.splash().clone();
+        let Some(compositor) = self.compositor.as_mut() else {
+            return plate_picture();
+        };
+        match compositor.splash_picture(size, &splash, 1., frame) {
+            Ok(texture) => Picture::Texture(texture),
+            Err(err) => {
+                warn!("drawing the splash on {d}: {err:#}");
+                plate_picture()
+            }
+        }
+    }
+
     /// Whether the plate is what `d` shows, or is about to.
     fn plate_showing(&self, d: &str) -> bool {
         let Some(display) = self.displays.get(d) else {
@@ -1703,8 +1818,8 @@ impl Outer {
         };
         match (&display.in_flight, &display.queued) {
             (_, Some(next)) => matches!(next, Next::Plate),
-            (Some(shown), None) => matches!(shown, Shown::Plate),
-            (None, None) => matches!(display.on_screen, Shown::Plate),
+            (Some(shown), None) => matches!(shown, Shown::Plate | Shown::Splash { .. }),
+            (None, None) => matches!(display.on_screen, Shown::Plate | Shown::Splash { .. }),
         }
     }
 
@@ -1873,12 +1988,22 @@ impl Outer {
     /// Put `next` on display `d`. A session frame is gated on its fence in the kernel
     /// (`IN_FENCE_FD`), so it is never shown half-rendered and the outer never blocks on it.
     fn flip(&mut self, d: &str, next: Next) {
+        let base = match next {
+            Next::Plate => match self.draw_base(d) {
+                Some(base) => Some(base),
+                None => return,
+            },
+            _ => None,
+        };
         let Some(display) = self.displays.get(d) else {
             return;
         };
         let size = display.size();
         let (fb_handle, shown, fence) = match next {
-            Next::Plate => (display.plate, Shown::Plate, None),
+            Next::Plate => {
+                let (fb, shown, fence) = base.expect("drawn above");
+                (fb, shown, fence.map(Rc::new))
+            }
             Next::Session {
                 generation,
                 buffer,
@@ -1951,7 +2076,7 @@ impl Outer {
                     Shown::Session { answer: false, .. } => (),
                     // No flip completion will come to draw the next frame: end the fade now.
                     Shown::Composite { .. } => self.finish_transition(d),
-                    Shown::Plate => (),
+                    Shown::Plate | Shown::Splash { .. } => (),
                 }
             }
         }
@@ -2093,9 +2218,14 @@ impl Outer {
             }
             _ => (),
         }
+        let session_up = matches!(shown, Shown::Session { .. });
         let display = self.displays.get_mut(d).expect("found above");
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
         display.on_screen = shown;
+        if session_up {
+            self.end_boot_splash();
+        }
+        let display = self.displays.get_mut(d).expect("found above");
 
         if std::mem::take(&mut display.relayout_pending) {
             // The layout changed under the flip; it can be applied now.
@@ -2119,8 +2249,21 @@ impl Outer {
     }
 }
 
-/// Light `display` with its plate. A modeset, so a commit rather than a flip.
-fn commit_plate(name: &str, display: &Display) -> anyhow::Result<()> {
+/// Wait for a render to complete, bounded: a stuck GPU should not keep the display dark forever.
+fn wait_fence(fd: BorrowedFd<'_>) {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    if unsafe { libc::poll(&mut pfd, 1, 1000) } != 1 {
+        warn!("a splash render did not complete in time");
+    }
+}
+
+/// Light `display` with `fb`. A modeset, so a commit rather than a flip.
+fn commit_frame(name: &str, display: &Display, fb: framebuffer::Handle) -> anyhow::Result<()> {
     let size = display.size();
     let plane = PlaneState {
         handle: display.surface.plane(),
@@ -2130,7 +2273,7 @@ fn commit_plate(name: &str, display: &Display) -> anyhow::Result<()> {
             transform: Transform::Normal,
             alpha: 1.0,
             damage_clips: None,
-            fb: display.plate,
+            fb,
             fence: None,
             hotspot: None,
         }),

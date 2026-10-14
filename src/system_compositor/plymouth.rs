@@ -293,7 +293,9 @@ struct Connection {
 
 /// The socket, its connections and the splash they describe.
 pub struct Server {
-    listener: UnixListener,
+    /// `None` until [`Self::try_bind`] succeeds: at boot the name is plymouthd's until it quits,
+    /// and the splash is on screen before that.
+    listener: Option<UnixListener>,
     connections: HashMap<u64, Connection>,
     next_id: u64,
     /// plymouthd answers root only (`ply-boot-server.c:265-285`).
@@ -303,16 +305,16 @@ pub struct Server {
     password_waiters: VecDeque<(u64, Option<String>)>,
     events: Vec<Event>,
     pid_file: Option<PathBuf>,
+    /// Connections that are over, for the caller to stop watching before it drops them: a
+    /// watch outliving its fd could match the next fd given that number.
+    closing: Vec<(u64, UnixStream)>,
 }
 
 impl Server {
-    /// Listen on abstract `name`, answering only `allowed_uid`.
-    pub fn bind(name: &[u8], allowed_uid: u32) -> io::Result<Self> {
-        let addr = SocketAddr::from_abstract_name(name)?;
-        let listener = UnixListener::bind_addr(&addr)?;
-        listener.set_nonblocking(true)?;
-        Ok(Self {
-            listener,
+    /// A server answering only `allowed_uid`, not yet listening.
+    pub fn new(allowed_uid: u32) -> Self {
+        Self {
+            listener: None,
             connections: HashMap::new(),
             next_id: 1,
             allowed_uid,
@@ -320,7 +322,25 @@ impl Server {
             password_waiters: VecDeque::new(),
             events: Vec::new(),
             pid_file: None,
-        })
+            closing: Vec::new(),
+        }
+    }
+
+    /// Listen on abstract `name`, answering only `allowed_uid`.
+    #[cfg(test)]
+    pub fn bind(name: &[u8], allowed_uid: u32) -> io::Result<Self> {
+        let mut server = Self::new(allowed_uid);
+        server.try_bind(name)?;
+        Ok(server)
+    }
+
+    /// Start listening on abstract `name`. `AddrInUse` while plymouthd still holds it.
+    pub fn try_bind(&mut self, name: &[u8]) -> io::Result<()> {
+        let addr = SocketAddr::from_abstract_name(name)?;
+        let listener = UnixListener::bind_addr(&addr)?;
+        listener.set_nonblocking(true)?;
+        self.listener = Some(listener);
+        Ok(())
     }
 
     /// Keep `path` holding our pid while a splash is up, as plymouthd does with its own.
@@ -329,8 +349,19 @@ impl Server {
         self.sync_pid_file();
     }
 
-    pub fn listener_fd(&self) -> BorrowedFd<'_> {
-        self.listener.as_fd()
+    pub fn listener_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.listener.as_ref().map(|l| l.as_fd())
+    }
+
+    /// Whether connection `id` is over, waiting in [`Self::take_closing`].
+    pub fn is_closing(&self, id: u64) -> bool {
+        self.closing.iter().any(|(c, _)| *c == id)
+    }
+
+    /// The connections that ended since the last call. Stop watching each, then drop it: the drop
+    /// is what closes it, and the close is what `plymouth --wait` waits for.
+    pub fn take_closing(&mut self) -> Vec<(u64, UnixStream)> {
+        std::mem::take(&mut self.closing)
     }
 
     pub fn connection_fd(&self, id: u64) -> Option<BorrowedFd<'_>> {
@@ -348,8 +379,11 @@ impl Server {
     /// Accept every pending connection; returns their ids, for the caller to watch.
     pub fn accept(&mut self) -> Vec<u64> {
         let mut accepted = Vec::new();
+        let Some(listener) = &self.listener else {
+            return accepted;
+        };
         loop {
-            let stream = match self.listener.accept() {
+            let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -417,13 +451,28 @@ impl Server {
         self.reap(id)
     }
 
-    /// Accept and read everything pending. For driving the server without an event loop.
+    /// Accept and read everything pending, and close what ended. For driving the server without
+    /// an event loop.
+    #[cfg(test)]
     pub fn dispatch(&mut self) {
         self.accept();
         let ids: Vec<u64> = self.connections.keys().copied().collect();
         for id in ids {
             self.on_readable(id);
         }
+        self.take_closing();
+    }
+
+    /// Show the splash, as `$` does: the outer's own start, where nobody sends one.
+    pub fn show(&mut self) {
+        self.show_splash();
+    }
+
+    /// End the splash without a client asking: a session's screen replaced it. As a `Q` that
+    /// has completed, without the event.
+    pub fn end(&mut self) {
+        self.end_splash();
+        self.finish_quit();
     }
 
     /// Answer the password on screen: `Some` with what was typed, `None` when it was cancelled
@@ -534,12 +583,7 @@ impl Server {
                 Reply::Ack
             }
             Request::ShowSplash => {
-                if !self.splash.shown || self.splash.frozen {
-                    self.splash.shown = true;
-                    self.splash.frozen = false;
-                    self.changed();
-                    self.sync_pid_file();
-                }
+                self.show_splash();
                 Reply::Ack
             }
             Request::HideSplash => {
@@ -554,13 +598,7 @@ impl Server {
                     // Nothing to end: a restarted outer, or a second quit.
                     return Some(Reply::Ack);
                 }
-                self.splash.shown = false;
-                self.splash.frozen = false;
-                self.splash.messages.clear();
-                self.splash.progress = None;
-                self.cancel_passwords();
-                self.changed();
-                self.sync_pid_file();
+                self.end_splash();
                 self.events.push(Event::Quit { retain });
                 self.connections.get_mut(&id)?.waiting = Some(Waiting::Quit);
                 return None;
@@ -610,6 +648,28 @@ impl Server {
             Request::HasActiveVt | Request::Unknown(_) => Reply::Nak,
         };
         Some(reply)
+    }
+
+    fn show_splash(&mut self) {
+        if !self.splash.shown || self.splash.frozen {
+            self.splash.shown = true;
+            self.splash.frozen = false;
+            self.changed();
+            self.sync_pid_file();
+        }
+    }
+
+    fn end_splash(&mut self) {
+        if !self.splash.shown {
+            return;
+        }
+        self.splash.shown = false;
+        self.splash.frozen = false;
+        self.splash.messages.clear();
+        self.splash.progress = None;
+        self.cancel_passwords();
+        self.changed();
+        self.sync_pid_file();
     }
 
     /// The splash is going away: nobody can type into it, so every waiting `*` asks elsewhere.
@@ -698,7 +758,9 @@ impl Server {
             self.password_waiters.retain(|(w, _)| *w != id);
             self.update_prompt();
         }
-        self.connections.remove(&id);
+        if let Some(conn) = self.connections.remove(&id) {
+            self.closing.push((id, conn.stream));
+        }
         false
     }
 }
@@ -1009,8 +1071,50 @@ mod tests {
 
         h.server.finish_quit();
         assert_eq!(read_now(&mut quitter), [ACK]);
+        // Handed out, not dropped: the caller stops watching them first. All three, the quitter
+        // too, once answered: nothing is left to say to any of them.
+        assert_eq!(h.server.take_closing().len(), 3);
         assert!(closed(&mut waiter));
         assert!(closed(&mut asker));
+    }
+
+    #[test]
+    fn the_outer_shows_and_ends_the_splash_itself() {
+        let dir = std::env::temp_dir().join(format!("synoik-plymouth-end-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pid");
+        let mut h = Harness::new();
+        h.server.set_pid_file(path.clone());
+        h.server.show();
+        assert!(h.server.splash().shown);
+        assert!(path.exists());
+        assert_eq!(h.server.take_events(), [Event::Changed]);
+
+        let mut waiter = h.connect();
+        let mut asker = h.connect();
+        h.send(&mut asker, b"*\0");
+        h.server.end();
+        // Nobody asked to quit: no event to act on, only the change to draw.
+        assert_eq!(h.server.take_events(), [Event::Changed]);
+        assert!(!h.server.splash().shown);
+        assert!(!path.exists());
+        assert_eq!(read_now(&mut asker), [NO_ANSWER]);
+        h.server.take_closing();
+        assert!(closed(&mut waiter));
+        // The socket stays: a later quit is answered at once.
+        let mut late = h.connect();
+        assert_eq!(h.send(&mut late, b"Q\0"), [ACK]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_answered_before_the_bind() {
+        let mut server = Server::new(unsafe { libc::getuid() });
+        assert!(server.listener_fd().is_none());
+        assert!(server.accept().is_empty());
+        // The model works regardless: the splash is drawn before the name is free.
+        server.show();
+        assert!(server.splash().shown);
     }
 
     #[test]
