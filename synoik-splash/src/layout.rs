@@ -5,15 +5,52 @@
 //! Where the boot splash puts things (`docs/fork/boot-splash.md` §4): Fedora's `bgrt` theme as
 //! plymouth's `two-step` plugin lays it out (plymouth 24.004.60,
 //! `src/plugins/splash/two-step/plugin.c`; the numbers are `bgrt.plymouth`'s). Pure geometry, in
-//! logical pixels; [`super::compose`] draws it.
+//! logical pixels; the outer and the initramfs splash draw it.
 //!
 //! Positions truncate towards zero, as two-step's `long` coordinates do.
 
 use std::time::Duration;
 
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use crate::plymouth::{Mode, Splash};
 
-use super::plymouth::{Mode, Splash};
+/// A position in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<(i32, i32)> for Point {
+    fn from((x, y): (i32, i32)) -> Self {
+        Self { x, y }
+    }
+}
+
+/// A size in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Size {
+    pub w: i32,
+    pub h: i32,
+}
+
+impl From<(i32, i32)> for Size {
+    fn from((w, h): (i32, i32)) -> Self {
+        Self { w, h }
+    }
+}
+
+/// A rectangle in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    pub loc: Point,
+    pub size: Size,
+}
+
+impl Rect {
+    pub fn new(loc: Point, size: Size) -> Self {
+        Self { loc, size }
+    }
+}
 
 /// The theme's images: bgrt's `ImageDir`.
 pub const THEME_DIR: &str = "/usr/share/plymouth/themes/spinner";
@@ -72,29 +109,29 @@ pub const SPINNER_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 
 /// splash then leaves out.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Images {
-    pub watermark: Option<Size<i32, Logical>>,
+    pub watermark: Option<Size>,
     /// One frame's size, and how many frames there are.
-    pub spinner: Option<(Size<i32, Logical>, usize)>,
+    pub spinner: Option<(Size, usize)>,
 }
 
 /// One thing on screen, over a black background.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
-    Watermark(Point<i32, Logical>),
+    Watermark(Point),
     Spinner {
         frame: usize,
-        at: Point<i32, Logical>,
+        at: Point,
     },
     /// The update progress bar: `filled` pixels of foreground from the left, background after.
     Bar {
-        rect: Rectangle<i32, Logical>,
+        rect: Rect,
         filled: i32,
     },
     /// A line of text, `at` the top-left of its line box.
     Text {
         text: String,
         font: Font,
-        at: Point<i32, Logical>,
+        at: Point,
     },
 }
 
@@ -125,10 +162,10 @@ pub fn spinner_frame(elapsed: Duration, frames: usize) -> usize {
 /// first frame.
 pub fn layout(
     splash: &Splash,
-    screen: Size<i32, Logical>,
+    screen: Size,
     images: &Images,
     spinner_frame: usize,
-    measure: &mut dyn FnMut(&str, Font) -> Size<i32, Logical>,
+    measure: &mut dyn FnMut(&str, Font) -> Size,
 ) -> Vec<Item> {
     let (w, h) = (f64::from(screen.w), f64::from(screen.h));
     let mut items = Vec::new();
@@ -152,7 +189,7 @@ pub fn layout(
         let (bw, bh) = BAR_SIZE;
         let x = ANIMATION_ALIGN.0 * (w - f64::from(bw));
         let y = ANIMATION_ALIGN.1 * (h - f64::from(bh));
-        let rect = Rectangle::new((x as i32, y as i32).into(), (bw, bh).into());
+        let rect = Rect::new((x as i32, y as i32).into(), (bw, bh).into());
         let fraction = f64::from(splash.progress.unwrap_or(0)) / 100.;
         let filled = (f64::from(bw) * fraction) as i32;
         items.push(Item::Bar { rect, filled });
@@ -223,7 +260,7 @@ mod tests {
     }
 
     /// Every character 8 px wide, every line box 20 px tall; titles twice that.
-    fn measure(text: &str, font: Font) -> Size<i32, Logical> {
+    fn measure(text: &str, font: Font) -> Size {
         let k = if font == Font::Title { 2 } else { 1 };
         Size::from((8 * k * text.chars().count() as i32, 20 * k))
     }
@@ -295,7 +332,7 @@ mod tests {
             [
                 Item::Watermark(Point::from((565, 726))),
                 Item::Bar {
-                    rect: Rectangle::new((440, 556).into(), (400, 5).into()),
+                    rect: Rect::new((440, 556).into(), (400, 5).into()),
                     filled: 168,
                 },
                 Item::Text {

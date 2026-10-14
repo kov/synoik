@@ -2,13 +2,14 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! plymouthd's client protocol, answered by the outer (`docs/fork/boot-splash.md` §3), so every
-//! tool that talks to plymouth — systemd's password agent and unit updates, PackageKit and dnf5
-//! offline updates, dracut, util-linux — talks to the outer unchanged.
+//! plymouthd's client protocol, answered by the outer and the initramfs splash
+//! (`docs/fork/boot-splash.md` §3), so every tool that talks to plymouth — systemd's password agent
+//! and unit updates, PackageKit and dnf5 offline updates, dracut, util-linux — talks to them
+//! unchanged.
 //!
 //! Three layers: [`Parser`] turns the byte stream into [`Request`]s, [`Splash`] is what they say
 //! the screen should show, and [`Server`] holds the socket and the connections and keeps replies in
-//! request order. Drawing the splash is the outer's; it reads [`Server::splash`] and reports back
+//! request order. Drawing the splash is the caller's; it reads [`Server::splash`] and reports back
 //! through [`Server::answer_password`] and [`Server::finish_quit`].
 
 use std::collections::{HashMap, VecDeque};
@@ -19,7 +20,7 @@ use std::os::linux::net::SocketAddrExt as _;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::PathBuf;
 
-use super::outer::peer_cred;
+use crate::peer_cred;
 
 /// plymouthd's socket: the abstract name, without its leading NUL (`ply-boot-protocol.h:25`).
 pub const SOCKET_NAME: &[u8] = b"/org/freedesktop/plymouthd";

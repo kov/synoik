@@ -22,7 +22,8 @@ use smithay::backend::renderer::{
     Bind as _, Color32F, Frame as _, ImportDma as _, ImportMem as _, Offscreen as _, Renderer as _,
     Texture as _,
 };
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Rectangle, Size, Transform};
+use synoik_splash::layout as geo;
 
 use super::plymouth::Splash;
 use super::splash::{self, Font, Images, Item};
@@ -83,7 +84,7 @@ impl Theme {
     }
 
     fn images(&self) -> Images {
-        let size = |t: &VkTexture| Size::from((t.width() as i32, t.height() as i32));
+        let size = |t: &VkTexture| geo::Size::from((t.width() as i32, t.height() as i32));
         Images {
             watermark: self.watermark.as_ref().map(size),
             spinner: self.spinner.first().map(|t| (size(t), self.spinner.len())),
@@ -351,6 +352,7 @@ impl Compositor {
     ) -> PreparedSplash {
         let images = self.theme().images();
         let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
+        let logical = geo::Size::from((logical.w, logical.h));
 
         let mut shaper = TextShaper::new(&mut self.renderer, scale);
         let mut shaped = Vec::new();
@@ -362,7 +364,7 @@ impl Compositor {
         ) {
             Ok(run) => {
                 let (_, _, ink_w, _) = run.ink_bounds();
-                let size = Size::from((
+                let size = geo::Size::from((
                     (f64::from(ink_w) / scale).round() as i32,
                     (f64::from(run.line_box_height()) / scale).round() as i32,
                 ));
@@ -372,7 +374,7 @@ impl Compositor {
             Err(err) => {
                 warn!("splash: shaping {text:?}: {err:#}");
                 shaped.push((text.to_owned(), font, None));
-                Size::from((0, 0))
+                geo::Size::default()
             }
         };
         let laid = splash::layout(splash, logical, &images, spinner_frame, &mut measure);
@@ -432,10 +434,13 @@ fn paint_splash(
 ) -> anyhow::Result<()> {
     let mut painter = Painter::new(frame, prepared.scale, size);
     painter.clear([0., 0., 0., 1.])?;
-    let logical = |at: Point<i32, Logical>, size: Size<i32, Logical>| {
-        Rectangle::new(at.to_f64(), size.to_f64())
+    let logical = |at: geo::Point, size: geo::Size| {
+        Rectangle::<f64, Logical>::new(
+            (f64::from(at.x), f64::from(at.y)).into(),
+            (f64::from(size.w), f64::from(size.h)).into(),
+        )
     };
-    let size_of = |t: &VkTexture| Size::from((t.width() as i32, t.height() as i32));
+    let size_of = |t: &VkTexture| geo::Size::from((t.width() as i32, t.height() as i32));
     let mut texts = prepared.texts.iter();
     for item in &prepared.items {
         match item {
@@ -455,7 +460,7 @@ fn paint_splash(
                 painter.fill_rounded(full, 0., [r, g, b, 1.])?;
                 if *filled > 0 {
                     let [r, g, b] = splash::BAR_FOREGROUND;
-                    let done = logical(rect.loc, Size::from((*filled, rect.size.h)));
+                    let done = logical(rect.loc, geo::Size::from((*filled, rect.size.h)));
                     painter.fill_rounded(done, 0., [r, g, b, 1.])?;
                 }
             }

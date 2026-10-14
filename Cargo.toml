@@ -3,6 +3,7 @@ members = [
     "synoik-config",
     "synoik-ipc",
     "synoik-login",
+    "synoik-splash",
     "synoik-vk",
 ]
 
@@ -102,6 +103,7 @@ log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_de
 moxcms = { version = "0.9.0", features = ["in_place"] }
 synoik-config = { version = "26.4.0", path = "synoik-config" }
 synoik-ipc = { version = "26.4.0", path = "synoik-ipc", features = ["clap"] }
+synoik-splash = { version = "26.4.0", path = "synoik-splash" }
 synoik-vk = { version = "0.0.0", path = "synoik-vk" }
 ordered-float = "5.3.0"
 roxmltree = "0.21.1"

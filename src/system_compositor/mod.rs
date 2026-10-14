@@ -8,6 +8,6 @@
 mod chord;
 mod compose;
 pub mod outer;
-pub mod plymouth;
 pub mod protocol;
-pub mod splash;
+
+pub use synoik_splash::{layout as splash, plymouth};

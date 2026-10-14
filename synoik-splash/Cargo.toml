@@ -1,0 +1,12 @@
+[package]
+name = "synoik-splash"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+description = "The synoik boot splash: plymouthd's protocol, the splash layout, and the initramfs splash program."
+
+[dependencies]
+libc = "0.2.185"
+tracing.workspace = true

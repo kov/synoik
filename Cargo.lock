@@ -3691,6 +3691,7 @@ dependencies = [
  "smithay-drm-extras",
  "synoik-config",
  "synoik-ipc",
+ "synoik-splash",
  "synoik-vk",
  "tracing",
  "tracing-appender",
@@ -3745,6 +3746,14 @@ dependencies = [
  "libc",
  "serde",
  "zbus",
+]
+
+[[package]]
+name = "synoik-splash"
+version = "26.4.0"
+dependencies = [
+ "libc",
+ "tracing",
 ]
 
 [[package]]

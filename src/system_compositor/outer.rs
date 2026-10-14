@@ -46,6 +46,7 @@ use smithay::reexports::drm::control::{
 use smithay::reexports::rustix::fs as rfs;
 use smithay::utils::{DeviceFd, Rectangle, Transform};
 use smithay_drm_extras::drm_scanner::DrmScanner;
+use synoik_splash::peer_cred;
 
 mod boot;
 
@@ -2341,32 +2342,6 @@ impl AsFd for FdRef {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
-}
-
-pub(super) struct PeerCred {
-    pub pid: i32,
-    pub uid: u32,
-}
-
-pub(super) fn peer_cred(fd: BorrowedFd<'_>) -> io::Result<PeerCred> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-    let rv = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    };
-    if rv < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(PeerCred {
-        pid: cred.pid,
-        uid: cred.uid,
-    })
 }
 
 /// Check that a peer is entitled to the logind session it names.
