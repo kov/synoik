@@ -1,6 +1,7 @@
 # Boot splash: the system compositor takes over from plymouth
 
-> Status: **design, not built.** Phase 1 of `system-compositor.md` §6: the outer takes the screen
+> Status: **steps 1-2 of §5 built** (`src/system_compositor/{plymouth,splash}.rs`, not yet wired
+> into the outer); the rest is design. Phase 1 of `system-compositor.md` §6: the outer takes the screen
 > from plymouth after switch_root and owns it until power-off. Phase 2 (the outer in the
 > initramfs) is out of scope here.
 
@@ -199,7 +200,9 @@ pixels for a display of W×H:
   checkout's), 32×32, one turn per 2 s, top-left at (0.5W−16, 0.7H−16).
 - **Watermark:** `watermark.png` (149×43, the same file as `/usr/share/pixmaps/fedora-gdm-logo.png`),
   top-left at (0.5W−74.5, 0.96H−41.28), in every state.
-- **Messages:** centred, 10 px under the spinner.
+- **Messages:** one line, the latest `M`, centred, 10 px under the spinner. two-step has no
+  `hide_message`, so `m` does nothing there (systemd clears with an empty `M` for that reason);
+  the outer hides the line when `m` names it, which is what the request asks for.
 - **No fades.** On quit the spinner simply stops: plymouth's retained frame is background +
   watermark, which is the frame the outer crossfades from at login and to at shutdown.
 
@@ -218,8 +221,10 @@ never grabs; at boot no session has the keyboard yet.
 
 `updates`, `system-upgrade`, `firmware-upgrade` and `system-reset`: black background (no firmware
 logo), no spinner; a 400×5 progress bar (white on #606060); a 30 pt title and a 12 pt subtitle
-("Installing Updates…" and its siblings, then "Do not turn off your computer"); "N% complete". The
-strings are plymouth's, translated through its gettext domain.
+("Installing Updates…" and its siblings, then "Do not turn off your computer"); "N% complete",
+10 px under the bar, once progress is reported; `M` messages are suppressed. The bar sits at
+(0.5·(W−400), 0.7·(H−5)). The strings are plymouth's; translating them through its gettext domain
+is not built (§6).
 
 ### 4.4 Text and scale
 
@@ -249,6 +254,10 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    shell answers on the serial console.
 
 ## 6. Open
+
+- Translation: plymouthd translates the update titles and "N% complete" through its gettext
+  domain (`/usr/share/locale/*/LC_MESSAGES/plymouth.mo`) in the system locale. The outer draws
+  them in English; nothing in the shell reads `.mo` catalogs yet.
 
 - SELinux: on an enforcing system, confined clients may be allowed `connectto` only on
   `plymouthd_t`. jabuticaba is permissive; check the policy before enabling enforcing.

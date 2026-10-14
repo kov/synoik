@@ -10,3 +10,4 @@ mod compose;
 pub mod outer;
 pub mod plymouth;
 pub mod protocol;
+pub mod splash;

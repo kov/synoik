@@ -763,6 +763,32 @@ impl TextContext {
         self.resolve(&mut fonts, &buffer)
     }
 
+    /// Shape `text` in the named `family` at `weight` (CSS scale: 400 regular, 300 light), for
+    /// surfaces whose face is fixed by their design rather than the UI font setting — the boot
+    /// splash draws plymouth's Cantarell before any session has settings to read.
+    pub fn shape_line_named(
+        &mut self,
+        text: &str,
+        px: f32,
+        family: &'static str,
+        weight: u16,
+    ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
+        let _timed = crate::stats::shape();
+        let mut fonts = fonts();
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
+        buffer.set_hinting(Hinting::Enabled);
+        {
+            let mut b = buffer.borrow_with(&mut fonts);
+            b.set_size(None, None);
+            let attrs = Attrs::new()
+                .family(Family::Name(family))
+                .weight(Weight(weight));
+            b.set_text(text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(false);
+        }
+        self.resolve(&mut fonts, &buffer)
+    }
+
     /// Shape `text` as colour emoji at `px` pixels-per-em — [`SpanFamily::Emoji`] rather than the
     /// UI face, so a COLRv1 glyph reaches [`crate::colr`] instead of a monochrome fallback.
     ///

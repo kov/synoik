@@ -443,6 +443,8 @@ enum RunFace {
     Sans,
     Bold,
     Emoji,
+    /// A family by name, at a CSS weight.
+    Named(&'static str, u16),
 }
 
 /// The persistent glyph-atlas image, paired with the generation of the residency index that
@@ -1016,6 +1018,18 @@ impl VulkanRenderer {
         self.build_glyph_run_face(text, px, RunFace::Emoji)
     }
 
+    /// Shape `text` in the named `family` at `weight`: see
+    /// [`synoik_vk::text::TextCtx::shape_line_named`].
+    pub(crate) fn build_glyph_run_named(
+        &mut self,
+        text: &str,
+        px: f32,
+        family: &'static str,
+        weight: u16,
+    ) -> Result<GlyphRun, VulkanError> {
+        self.build_glyph_run_face(text, px, RunFace::Named(family, weight))
+    }
+
     fn build_glyph_run_face(
         &mut self,
         text: &str,
@@ -1092,6 +1106,9 @@ impl VulkanRenderer {
             RunFace::Emoji => self.text_ctx.shape_emoji(text, px)?,
             RunFace::Bold => self.text_ctx.shape_line_weighted(text, px, true)?,
             RunFace::Sans => self.text_ctx.shape_line_weighted(text, px, false)?,
+            RunFace::Named(family, weight) => {
+                self.text_ctx.shape_line_named(text, px, family, weight)?
+            }
         };
         let atlas = self.absorb_glyphs(&gpu, pool, pending)?;
         Ok((shaped, atlas))

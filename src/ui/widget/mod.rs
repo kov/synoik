@@ -27,7 +27,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
+use smithay::backend::renderer::{
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture as _,
+};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
@@ -2483,6 +2485,24 @@ impl<'a> TextShaper<'a> {
         Ok(ShapedText { run })
     }
 
+    /// Shape one line in the named `family` at `weight` (CSS scale), `logical_px` pixels per em:
+    /// for a surface whose face its design fixes, not the UI font setting.
+    pub fn shape_named(
+        &mut self,
+        text: &str,
+        logical_px: f64,
+        family: &'static str,
+        weight: u16,
+    ) -> anyhow::Result<ShapedText> {
+        let run = self.renderer.build_glyph_run_named(
+            text,
+            (logical_px * self.scale) as f32,
+            family,
+            weight,
+        )?;
+        Ok(ShapedText { run })
+    }
+
     /// Shape text known to be emoji, against the colour emoji face by name.
     ///
     /// `px` is a **logical** pixel em size rather than a point size: an emoji cell is sized in
@@ -3984,6 +4004,28 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             color,
             self.full,
             &Self::damage_of(self.full),
+        )?;
+        Ok(())
+    }
+
+    /// Draw `texture` stretched over logical `rect` (bilinear), blended at `alpha`.
+    pub fn image(
+        &mut self,
+        texture: &VkTexture,
+        rect: Rectangle<f64, Logical>,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
+        let dst = self.rect_px(rect);
+        let src =
+            Rectangle::from_size((f64::from(texture.width()), f64::from(texture.height())).into());
+        self.frame.render_texture_from_to(
+            texture,
+            src,
+            dst,
+            &Self::damage_of(dst),
+            &[],
+            Transform::Normal,
+            alpha,
         )?;
         Ok(())
     }
