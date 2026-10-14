@@ -872,8 +872,13 @@ mod tests {
         got
     }
 
-    /// Whether the server closed `client`.
+    /// Whether the server closed `client`, waiting for it: a child another test forks holds a copy
+    /// of the server's end until it execs, so the end-of-file can trail the close.
     fn closed(client: &mut UnixStream) -> bool {
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         matches!(client.read(&mut [0u8; 1]), Ok(0))
     }
 
