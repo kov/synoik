@@ -431,6 +431,8 @@ enum Shown {
         /// The incoming session frame it blends in, while that frame's present is unanswered:
         /// the flip putting the blend on screen answers it.
         samples: Option<(u64, u32)>,
+        /// The same for the outgoing session's frame it blends out (`Transition::from_session`).
+        samples_from: Option<(u64, u32)>,
     },
 }
 
@@ -449,6 +451,7 @@ enum Next {
         fence: Option<Rc<OwnedFd>>,
         alpha: f32,
         samples: Option<(u64, u32)>,
+        samples_from: Option<(u64, u32)>,
     },
 }
 
@@ -471,6 +474,17 @@ struct Transition {
     /// activates a new session on a VT-less seat the moment it is created, before the greeter has
     /// had the chance (`seat_attach_session`). `from` is re-taken when the target arrives.
     from_live: Option<u64>,
+    /// The outgoing session, still drawing while the machine goes down: each frame it presents
+    /// during the fade replaces `from`, so what it animates as it ends (its end-session dialog
+    /// closing) plays through the fade instead of freezing half-way.
+    from_session: Option<u64>,
+    /// That session's frame in `from`, and whether its present is still unanswered: the first
+    /// blend of it to reach the screen answers it, as for `to`.
+    from_frame: Option<(u32, bool)>,
+    /// That session's newest frame, waiting for its render fence before it can become `from`.
+    from_pending: Option<(u32, Option<Rc<OwnedFd>>)>,
+    /// `from` is the splash, which keeps turning: redrawn as its spinner moves.
+    from_splash: bool,
 }
 
 struct Target {
@@ -564,6 +578,10 @@ struct Display {
     relayout_pending: bool,
     /// What the last finished transition faded to, standing in for its frame on screen.
     last_to: Option<Picture>,
+    /// The splash as a picture for a fade, and the `splash_state` it shows: redrawn in place
+    /// when that changes, so a fade to or from the splash keeps its spinner turning without
+    /// allocating a picture per frame.
+    splash_picture: Option<(Picture, (u64, usize))>,
     /// Its CRTC's cursor plane, when it has one and its buffers could be made.
     cursor: Option<CursorPlane>,
     /// A commit of the cursor plane alone is in flight. It occupies the CRTC as a flip does.
@@ -682,6 +700,8 @@ struct Outer {
     boot: Option<BootSplash>,
     /// The next [`CursorImage::serial`].
     next_cursor_serial: u64,
+    /// The virtio-gpu resource each framebuffer was last seen backed by, for the flight recorder.
+    flight_resources: HashMap<u32, u32>,
 }
 
 fn plate_picture() -> Picture {
@@ -735,6 +755,7 @@ impl Outer {
             plymouth: Plymouth::new(),
             boot: None,
             next_cursor_serial: 1,
+            flight_resources: HashMap::new(),
         };
         // A restart adopts the frame on screen without a splash, unless it is taking the splash
         // over (§7.2).
@@ -1022,6 +1043,7 @@ impl Outer {
             switch_pending: false,
             relayout_pending: false,
             last_to: None,
+            splash_picture: None,
             cursor,
             cursor_flip: false,
             cursor_dirty: false,
@@ -1253,6 +1275,16 @@ impl Outer {
             {
                 display.queued = None;
             }
+            // A fade carrying this session's frames keeps the picture it has.
+            if let Some(t) = display
+                .transition
+                .as_mut()
+                .filter(|t| t.from_session == Some(generation))
+            {
+                t.from_session = None;
+                t.from_frame = None;
+                t.from_pending = None;
+            }
             // A switch waiting on this session's frame would wait forever.
             let pending = display.transition.as_mut().and_then(|t| {
                 t.pending
@@ -1438,14 +1470,20 @@ impl Outer {
             return;
         }
         debug!(target: FLIGHT, "switch on {d} begins (shutting down: {})", self.shutting_down);
+        let (from_splash, outgoing) = match self.displays.get(d).map(|d| &d.on_screen) {
+            Some(Shown::Plate | Shown::Splash { .. }) => (self.boot.is_some(), None),
+            Some(Shown::Session { generation, .. }) => (false, Some(*generation)),
+            _ => (false, None),
+        };
         let from = self.snapshot_screen(d);
         self.cancel_transition(d);
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
         // A frame of the outgoing session waiting to flip is that session's newest; it waits for
-        // the switch back instead, still reserved.
+        // the switch back instead, still reserved — or, at shutdown, carries on its picture.
         let queued = display.queued.take();
+        let from_session = outgoing.filter(|_| self.shutting_down);
         display.transition = Some(Transition {
             from,
             to: None,
@@ -1454,6 +1492,10 @@ impl Outer {
             start: get_monotonic_time(),
             wait: None,
             from_live: self.outgoing_greeter,
+            from_session,
+            from_frame: None,
+            from_pending: None,
+            from_splash,
         });
         if let Some(Next::Session {
             generation,
@@ -1462,7 +1504,11 @@ impl Outer {
             answer: true,
         }) = queued
         {
-            self.hold(generation, d, buffer, fence);
+            if from_session == Some(generation) {
+                self.outgoing_frame(d, generation, buffer, fence);
+            } else {
+                self.hold(generation, d, buffer, fence);
+            }
         }
 
         if self.shutting_down {
@@ -1525,6 +1571,7 @@ impl Outer {
             return;
         };
         debug!(target: FLIGHT, "fade on {d} cancelled");
+        self.give_back_from(d, &transition);
         if let Some(token) = transition.wait {
             self.handle.remove(token);
         }
@@ -1546,6 +1593,20 @@ impl Outer {
         {
             // Unanswered still; the session is waiting on it.
             self.hold(generation, d, buffer, None);
+        }
+    }
+
+    /// The outgoing session's frames a fade on `d` kept and never answered go back to it: the
+    /// fade is over, and nothing shows them again.
+    fn give_back_from(&self, d: &str, transition: &Transition) {
+        let Some(generation) = transition.from_session else {
+            return;
+        };
+        if let Some((buffer, _)) = transition.from_pending {
+            self.discard(generation, d, buffer);
+        }
+        if let Some((buffer, true)) = transition.from_frame {
+            self.discard(generation, d, buffer);
         }
     }
 
@@ -1773,9 +1834,95 @@ impl Outer {
         }
     }
 
+    /// A frame of the session a shutdown fade on `d` starts from: the newest becomes `from` once
+    /// its render is complete (`refresh_live_pictures`), and one it supersedes still waiting for
+    /// that goes back.
+    fn outgoing_frame(
+        &mut self,
+        d: &str,
+        generation: u64,
+        buffer: u32,
+        fence: Option<Rc<OwnedFd>>,
+    ) {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) else {
+            return;
+        };
+        if transition.from_session != Some(generation) {
+            return;
+        }
+        if let Some((stale, _)) = transition.from_pending.replace((buffer, fence)) {
+            self.discard(generation, d, stale);
+        }
+    }
+
+    /// Bring the live pictures of `d`'s fade up to date before its next frame is drawn: the
+    /// outgoing session's newest complete frame as `from`, and the splash at its spinner's
+    /// current frame on whichever end shows it.
+    fn refresh_live_pictures(&mut self, d: &str) {
+        let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.as_mut()) else {
+            return;
+        };
+        let ready = transition
+            .from_pending
+            .as_ref()
+            .is_some_and(|(_, fence)| fence.as_ref().is_none_or(|fd| fence_signalled(fd.as_fd())));
+        let generation = transition.from_session;
+        if let (true, Some(generation)) = (ready, generation) {
+            let (buffer, _) = transition.from_pending.take().expect("ready");
+            match self.import_frame(generation, buffer) {
+                Some(texture) => {
+                    let display = self.displays.get_mut(d).expect("has a transition");
+                    let sampled = matches!(
+                        display.in_flight,
+                        Some(Shown::Composite { samples_from: Some(s), .. }) if s.0 == generation
+                    );
+                    let transition = display.transition.as_mut().expect("checked above");
+                    transition.from = Picture::Texture(texture);
+                    let replaced = transition.from_frame.replace((buffer, true));
+                    // Unanswered and not being read: give it back. One a blend in flight reads
+                    // goes back when that blend lands (`on_flip`); an answered one is the
+                    // session's frame on screen, freed by the next answer.
+                    if let Some((stale, true)) = replaced {
+                        if !sampled {
+                            self.discard(generation, d, stale);
+                        }
+                    }
+                }
+                None => self.discard(generation, d, buffer),
+            }
+        }
+        let Some(transition) = self.displays.get(d).and_then(|d| d.transition.as_ref()) else {
+            return;
+        };
+        let from_splash = transition.from_splash;
+        let to_splash = matches!(
+            transition.to,
+            Some(Target {
+                end: End::Plate,
+                ..
+            })
+        );
+        if self.boot.is_none() || !(from_splash || to_splash) {
+            return;
+        }
+        let picture = self.base_picture(d);
+        let transition = self
+            .displays
+            .get_mut(d)
+            .and_then(|d| d.transition.as_mut())
+            .expect("checked above");
+        if from_splash {
+            transition.from = picture.clone();
+        }
+        if let Some(to) = transition.to.as_mut().filter(|_| to_splash) {
+            to.picture = picture;
+        }
+    }
+
     /// Draw and flip the next frame of `d`'s fade, or finish it. Runs once per flip completion,
     /// so the fade is paced by the display.
     fn advance(&mut self, d: &str) {
+        self.refresh_live_pictures(d);
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
@@ -1810,6 +1957,10 @@ impl Outer {
             } => Some((generation, buffer)),
             _ => None,
         };
+        let samples_from = match (transition.from_session, transition.from_frame) {
+            (Some(generation), Some((buffer, true))) => Some((generation, buffer)),
+            _ => None,
+        };
         let composed = compositor.compose(
             &mut display.canvas,
             &self.drm_fd,
@@ -1827,6 +1978,7 @@ impl Outer {
                     fence: fence.map(Rc::new),
                     alpha,
                     samples,
+                    samples_from,
                 },
             ),
             Err(err) => {
@@ -1844,6 +1996,7 @@ impl Outer {
         if let Some(token) = transition.wait {
             self.handle.remove(token);
         }
+        self.give_back_from(d, &transition);
         // A newer frame still rendering when the fade ends — routine with a live target — is the
         // session's newest: held, so the flip after the fade's end shows it. Dropped, its present
         // would go unanswered and the session would never draw again.
@@ -1901,6 +2054,7 @@ impl Outer {
         if over_plate && self.compositor.is_some() {
             debug!(target: FLIGHT, "fade on {d} from the plate to session {generation}");
             let from = self.base_picture(d);
+            let from_splash = self.boot.is_some();
             let Some(display) = self.displays.get_mut(d) else {
                 return;
             };
@@ -1912,6 +2066,10 @@ impl Outer {
                 start: get_monotonic_time(),
                 wait: None,
                 from_live: None,
+                from_session: None,
+                from_frame: None,
+                from_pending: None,
+                from_splash,
             });
             self.target_frame(d, generation, buffer, fence);
         } else {
@@ -1955,14 +2113,34 @@ impl Outer {
         let Some(size) = self.displays.get(d).map(Display::size) else {
             return plate_picture();
         };
-        let (_, frame) = self.splash_state();
+        let state = self.splash_state();
+        let cached = self
+            .displays
+            .get_mut(d)
+            .and_then(|d| d.splash_picture.take());
+        let reuse = match cached {
+            Some((picture, drawn)) if drawn == state => {
+                if let Some(display) = self.displays.get_mut(d) {
+                    display.splash_picture = Some((picture.clone(), drawn));
+                }
+                return picture;
+            }
+            Some((Picture::Texture(texture), _)) => Some(texture),
+            _ => None,
+        };
         let splash = self.plymouth.server.splash().clone();
         let dialog = self.splash_dialog();
         let Some(compositor) = self.compositor.as_mut() else {
             return plate_picture();
         };
-        match compositor.splash_picture(size, &splash, 1., frame, &dialog) {
-            Ok(texture) => Picture::Texture(texture),
+        match compositor.splash_picture(size, &splash, 1., state.1, &dialog, reuse) {
+            Ok(texture) => {
+                let picture = Picture::Texture(texture);
+                if let Some(display) = self.displays.get_mut(d) {
+                    display.splash_picture = Some((picture.clone(), state));
+                }
+                picture
+            }
             Err(err) => {
                 warn!("drawing the splash on {d}: {err:#}");
                 plate_picture()
@@ -2117,6 +2295,14 @@ impl Outer {
                     .transition
                     .as_ref()
                     .is_some_and(|t| t.from_live == Some(generation));
+                let carries_from = display
+                    .transition
+                    .as_ref()
+                    .is_some_and(|t| t.from_session == Some(generation));
+                if carries_from {
+                    self.outgoing_frame(d, generation, buffer, fence);
+                    return Ok(());
+                }
                 match (fronted, awaiting) {
                     // The frame the switch to this session was waiting for (§5 step 6), or a newer
                     // one replacing it while the fade runs.
@@ -2342,6 +2528,7 @@ impl Outer {
                 fence,
                 alpha,
                 samples,
+                samples_from,
             } => {
                 let handle = *(*fb).as_ref();
                 (
@@ -2351,6 +2538,7 @@ impl Outer {
                         _fb: fb,
                         alpha,
                         samples,
+                        samples_from,
                     },
                     fence,
                 )
@@ -2375,6 +2563,24 @@ impl Outer {
             .page_flip(std::iter::once(plane).chain(cursor_plane), true)
         {
             Ok(()) => {
+                if tracing::enabled!(target: FLIGHT, tracing::Level::DEBUG) {
+                    let fb = u32::from(fb_handle);
+                    let res = virtio_resource(&self.drm_fd, fb_handle);
+                    if let Some(res) = res.filter(|r| self.flight_resources.get(&fb) != Some(r)) {
+                        self.flight_resources.insert(fb, res);
+                        match &shown {
+                            Shown::Session {
+                                generation, buffer, ..
+                            } => debug!(
+                                target: FLIGHT,
+                                "fb {fb} is virtio-gpu resource {res}: session {generation} buffer {buffer}"
+                            ),
+                            _ => {
+                                debug!(target: FLIGHT, "fb {fb} is virtio-gpu resource {res}: the outer's")
+                            }
+                        }
+                    }
+                }
                 let display = self.displays.get_mut(d).expect("looked up above");
                 let steady = matches!(shown, Shown::Session { .. })
                     && display.transition.is_none()
@@ -2442,6 +2648,9 @@ impl Outer {
                         Some(Target { end: End::Session { generation: g, buffer: b, .. }, .. })
                             if g == generation && b == buffer
                     )
+                    || (t.from_session == Some(generation)
+                        && (t.from_frame.is_some_and(|(b, _)| b == buffer)
+                            || t.from_pending.as_ref().is_some_and(|(b, _)| *b == buffer)))
             })
         })
     }
@@ -2565,6 +2774,32 @@ impl Outer {
             }
             _ => (),
         }
+        if let Shown::Composite {
+            samples_from: Some((generation, buffer)),
+            ..
+        } = &shown
+        {
+            let (generation, buffer) = (*generation, *buffer);
+            // `Some(unanswered)` while it is still `from`.
+            let from_frame = self
+                .displays
+                .get_mut(d)
+                .and_then(|d| d.transition.as_mut())
+                .filter(|t| t.from_session == Some(generation))
+                .and_then(|t| t.from_frame.as_mut())
+                .filter(|(b, _)| *b == buffer)
+                .map(|(_, answer)| std::mem::take(answer));
+            match from_frame {
+                // Still `from`: its first blend on screen answers it.
+                Some(true) => self.presented(generation, d, buffer, meta.as_ref()),
+                Some(false) => (),
+                // Replaced while this blend was reading it, unanswered: free now.
+                None if !self.reserved(generation, d, buffer) => {
+                    self.discard(generation, d, buffer)
+                }
+                None => (),
+            }
+        }
         let session_up = matches!(shown, Shown::Session { .. });
         let display = self.displays.get_mut(d).expect("found above");
         // Dropping the previous frame here, not earlier: it was on the screen until this moment.
@@ -2604,6 +2839,37 @@ impl Outer {
             self.update_cursor(d);
         }
     }
+}
+
+/// The virtio-gpu resource behind `fb`, which a Limina capture names each frame by: what joins
+/// the flight recorder to a capture by identity rather than by clocks. None on any other driver.
+fn virtio_resource(drm_fd: &DrmDeviceFd, fb: framebuffer::Handle) -> Option<u32> {
+    #[repr(C)]
+    struct ResourceInfo {
+        bo_handle: u32,
+        res_handle: u32,
+        size: u32,
+        blob_mem: u32,
+    }
+    // DRM_IOWR(DRM_COMMAND_BASE + 0x05, struct drm_virtgpu_resource_info)
+    const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: libc::c_ulong = 0xC010_6445;
+    // A handle of our own to the framebuffer's buffer (we are master), closed again below.
+    let handle = drm_fd.get_planar_framebuffer(fb).ok()?.buffers()[0]?;
+    let mut arg = ResourceInfo {
+        bo_handle: handle.into(),
+        res_handle: 0,
+        size: 0,
+        blob_mem: 0,
+    };
+    let ok = unsafe {
+        libc::ioctl(
+            drm_fd.as_raw_fd(),
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO,
+            &raw mut arg,
+        )
+    } == 0;
+    let _ = drm_fd.close_buffer(handle);
+    ok.then_some(arg.res_handle)
 }
 
 /// Wait for a render to complete, bounded: a stuck GPU should not keep the display dark forever.

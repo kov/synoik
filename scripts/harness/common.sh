@@ -37,9 +37,17 @@ on_host() {
     ssh "$HARNESS_HOST" "$@"
 }
 
+GUEST_SSH=(ssh -J "$HARNESS_HOST" -p "$HARNESS_SSH_PORT" -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 root@127.0.0.1)
+
 on_guest() {
-    ssh -J "$HARNESS_HOST" -p "$HARNESS_SSH_PORT" -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 root@127.0.0.1 "$@"
+    "${GUEST_SSH[@]}" "$@"
+}
+
+# A `driver.jsonl` line tying the running guest boot's monotonic clock to the host's wall clock
+# (clock.py): how report.py puts that boot's journal on the capture's clock.
+clock_line() {
+    python3 "$(dirname "${BASH_SOURCE[0]}")/clock.py" ssh "$HARNESS_HOST" -- "${GUEST_SSH[@]}"
 }
 
 # The running VM's supervisor pid, which `limina debug` and `limina input` take; empty if none.

@@ -335,7 +335,10 @@ impl Compositor {
     }
 
     /// `splash` drawn into a texture the outer owns, `size` pixels: the picture a crossfade
-    /// starts or ends on.
+    /// starts or ends on. Drawn into `reuse` when that is a picture of the same size, so a splash
+    /// redrawn as its spinner turns allocates nothing. Queue order keeps the redraw after every
+    /// blend already submitted that reads it.
+    #[allow(clippy::too_many_arguments)]
     pub fn splash_picture(
         &mut self,
         size: (u16, u16),
@@ -343,16 +346,21 @@ impl Compositor {
         scale: f64,
         spinner_frame: usize,
         dialog: &Dialog,
+        reuse: Option<VkTexture>,
     ) -> anyhow::Result<VkTexture> {
         let size: Size<i32, Physical> = Size::from((i32::from(size.0), i32::from(size.1)));
         let prepared = self.prepare_splash(splash, size, scale, spinner_frame, dialog);
-        let mut target = self
-            .renderer
-            .create_buffer(
-                NATIVE_FOURCC,
-                size.to_logical(1).to_buffer(1, Transform::Normal),
-            )
-            .map_err(|err| anyhow!("allocating a splash picture: {err:?}"))?;
+        let reuse = reuse.filter(|t| (t.width() as i32, t.height() as i32) == (size.w, size.h));
+        let mut target = match reuse {
+            Some(texture) => texture,
+            None => self
+                .renderer
+                .create_buffer(
+                    NATIVE_FOURCC,
+                    size.to_logical(1).to_buffer(1, Transform::Normal),
+                )
+                .map_err(|err| anyhow!("allocating a splash picture: {err:?}"))?,
+        };
         {
             let mut fb = self
                 .renderer
@@ -639,7 +647,7 @@ mod tests {
             ..Splash::default()
         };
         let mut texture = c
-            .splash_picture((1280, 800), &boot, 1., 0, &Dialog::default())
+            .splash_picture((1280, 800), &boot, 1., 0, &Dialog::default(), None)
             .unwrap();
         let images = c.theme.as_ref().unwrap().images();
         let (watermark, spinner) = (images.watermark.unwrap(), images.spinner.unwrap().0);
@@ -672,8 +680,11 @@ mod tests {
             progress: Some(50),
             ..Splash::default()
         };
+        // Each picture after the first is redrawn into the one before, as the outer does while the
+        // spinner turns: nothing of the previous splash may show through.
+        let reuse = Some(texture.clone());
         let mut texture = c
-            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default())
+            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default(), reuse)
             .unwrap();
         let px = pixels(&mut c, &mut texture);
         // The bar at 440×556, 400×5: white to half, grey after.
@@ -701,7 +712,7 @@ mod tests {
             keymap: Some("English (US)".into()),
         };
         let mut texture = c
-            .splash_picture((1280, 800), &asking, 1., 0, &dialog)
+            .splash_picture((1280, 800), &asking, 1., 0, &dialog, Some(texture.clone()))
             .unwrap();
         let laid = splash::layout(
             &asking,
@@ -731,7 +742,14 @@ mod tests {
         // The retained frame: the watermark alone.
         update.shown = false;
         let mut texture = c
-            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default())
+            .splash_picture(
+                (1280, 800),
+                &update,
+                1.,
+                0,
+                &Dialog::default(),
+                Some(texture.clone()),
+            )
             .unwrap();
         let px = pixels(&mut c, &mut texture);
         assert!(brightest(&px, wm) > 128);

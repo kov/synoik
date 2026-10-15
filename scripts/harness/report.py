@@ -3,18 +3,17 @@
 #
 # Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-"""Read a harness run (`shutdown.sh`) back: what reached the screen, when, and what the outer meant.
+"""Read a harness run (`shutdown.sh`, `reboot.sh`) back: what reached the screen, when, and what the outer meant.
 
     scripts/harness/report.py RUN [--strip N] [--all]
 
-Everything is on the capture's clock (the host's), in ms from the driver's first step. The guest's
-journal is put on it by its own wall clock (synoik's lines by the time they were written, not
-received), which agrees with the host's to tens of ms: close enough to read the order of a fade
-and a disconnect, not to attribute a single frame by time. Frames are attributed by order instead.
-Each flip the flight recorder logs votes, with the first captured frame after it, on whether that
-frame's virtio-gpu resource is one of the outer's own slots or a session's buffer; a split vote is
-printed. The outer's frames, in capture order, are then paired with its logged flips in order,
-which names each one (composite at alpha, splash, plate) — a count that differs is printed too.
+Everything is on the capture's clock (the host's), in ms from the driver's first step. A guest
+boot's journal is put on it through that boot's `clock` line (clock.py): its monotonic clock,
+which never steps, tied to the host's to a few ms. (Its wall clock can be a second off early in
+a boot; a boot with no `clock` line falls back to it.) synoik's lines are placed when they were
+written, not when journald received them. Frames are named by identity: each captured frame carries its virtio-gpu resource, and the
+outer's flight recorder says which framebuffer of which session or of its own that is
+(`attribute`).
 
 Sections:
   timeline   frames merged with the driver's steps and the journal; a steady run of one label
@@ -29,6 +28,7 @@ Needs numpy and Pillow, and ImageMagick's `montage` for the filmstrip.
 """
 
 import argparse
+import bisect
 import json
 import re
 import subprocess
@@ -95,59 +95,52 @@ def main():
     args = ap.parse_args()
     run = args.run
 
-    frames = [r for r in load_jsonl(run / 'frames.jsonl') if 'seq' in r]
+    # A record without a file is a frame presented but not captured.
+    frames = [r for r in load_jsonl(run / 'frames.jsonl') if 'seq' in r and 'file' in r]
     steps = load_jsonl(run / 'driver.jsonl')
     journal = [e for e in load_jsonl(run / 'journal.jsonl') if interesting(e)]
     if not frames:
         sys.exit(f'{run}: no frames captured')
 
+    clocks = {s['boot_id']: s['t_realtime_ns'] - s['guest_monotonic_ns'] for s in steps if s['step'] == 'clock'}
+    steps = [s for s in steps if s['step'] != 'clock']
     t0 = steps[0]['t_realtime_ns'] / 1e6 if steps else frames[0]['t_realtime_ns'] / 1e6
     for f in frames:
         f['t'] = f['t_realtime_ns'] / 1e6 - t0
-    events = [(s['t_realtime_ns'] / 1e6 - t0, 'driver', s['step']) for s in steps]
+    events = [[s['t_realtime_ns'] / 1e6 - t0, None, 'driver', s['step']] for s in steps]
     flips = []
+    resources = []
     first = min(frames[0]['t'], 0) - 2000
     for e in journal:
-        t = int(e['__REALTIME_TIMESTAMP']) / 1e3 - t0
+        boot = e.get('_BOOT_ID')
+        received = int(e['__REALTIME_TIMESTAMP']) / 1e3
+        offset = clocks.get(boot)
+        t = (received if offset is None else (int(e['__MONOTONIC_TIMESTAMP']) * 1000 + offset) / 1e6) - t0
         written = re.match(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z', e['MESSAGE'])
         if written:
-            t = datetime.fromisoformat(written.group(1)).replace(tzinfo=timezone.utc).timestamp() * 1e3 - t0
+            # Both wall-clock readings in the guest, a moment apart: the lag survives a step.
+            at = datetime.fromisoformat(written.group(1)).replace(tzinfo=timezone.utc).timestamp() * 1e3
+            t += at - received
+        # Which buffer a resource is holds from when it was logged on, however long before.
+        m = re.search(r'flight: fb (\d+) is virtio-gpu resource (\d+): (.*)', e['MESSAGE'])
+        if m:
+            resources.append((t, boot, int(m.group(1)), int(m.group(2)), m.group(3)))
+            continue
         if t < first:
             continue
-        text = strip_message(e['MESSAGE']) if e.get('_COMM') == 'synoik' else e['MESSAGE']
-        who = e.get('_COMM') or e.get('SYSLOG_IDENTIFIER') or '?'
         if FLIGHT in e['MESSAGE']:
             m = re.search(r'flip (\S+) fb=(\d+) (.*)', e['MESSAGE'])
             if m:
-                flips.append((t, m.group(3)))
+                flips.append({'t': t, 'boot': boot, 'fb': int(m.group(2)), 'what': m.group(3)})
                 continue
-        events.append((t, who, text))
-    events.sort()
+        text = strip_message(e['MESSAGE']) if e.get('_COMM') == 'synoik' else e['MESSAGE']
+        who = e.get('_COMM') or e.get('SYSLOG_IDENTIFIER') or '?'
+        events.append([t, boot, who, text])
 
-    # Whose buffer each resource is, by vote.
-    flips.sort()
-    votes = defaultdict(Counter)
-    for t, what in flips:
-        owner = 'session' if what.startswith('session') else 'outer'
-        frame = next((f for f in frames if t <= f['t'] <= t + FLIP_TO_FRAME_MS), None)
-        if frame:
-            votes[frame['guest_resource']][owner] += 1
-    owner = {res: c.most_common(1)[0][0] for res, c in votes.items()}
     print(f'{run.name}: {len(frames)} frames from {frames[0]["t"]:.0f} to {frames[-1]["t"]:.0f} ms')
-    print('resources:', ', '.join(
-        f'{res}={owner[res]}' + (f' (split: {dict(votes[res])})' if len(votes[res]) > 1 else '')
-        for res in sorted(votes)) or 'no flight recorder lines')
-
-    # The outer's frames named by its flips, in order.
-    outer_frames = [f for f in frames if owner.get(f['guest_resource']) == 'outer']
-    outer_flips = [w for t, w in flips if not w.startswith('session') and t >= frames[0]['t'] - FLIP_TO_FRAME_MS]
-    if len(outer_frames) != len(outer_flips):
-        print(f'the outer logged {len(outer_flips)} flips of its own and the capture has {len(outer_frames)} '
-              'frames of its slots: names past the first difference are off')
-    for f, what in zip(outer_frames, outer_flips):
-        f['label'] = what
-    for f in frames:
-        f.setdefault('label', f"{owner.get(f['guest_resource'], 'session')} res {f['guest_resource']}")
+    attribute(frames, flips, resources, events)
+    events = sorted((t, who, text) for t, _, who, text in events)
+    flips = [(f['t'], f['what']) for f in flips]
     print()
 
     print('== timeline (ms)')
@@ -192,6 +185,87 @@ def main():
     fades(run, frames, flips, events)
     tail(frames, events, steps, t0)
     filmstrip(run, frames, args.strip)
+
+
+def attribute(frames, flips, resources, events):
+    """Name every frame, and put each boot's journal exactly on the capture's clock.
+
+    A frame's virtio-gpu resource is a framebuffer of that boot (the flight recorder's `fb … is
+    virtio-gpu resource …` lines); a session's framebuffer names the frame outright. The outer's
+    two slots show composites and the splash in turn, so a frame of one is named by the slot's
+    latest flip before it — on a clock fitted per boot: the shift that pairs the most of the
+    outer's logged flips one to one with a captured frame of the same framebuffer shortly after.
+    A boot's clock line gets within milliseconds when it has synced and is ~0.1-0.5 s off while
+    chrony still slews it, early in a boot; the pairing gets within a frame. The fitted shift is
+    applied to the boot's flips and journal lines alike.
+    """
+    starts = {}
+    for t, boot, *_ in sorted(resources) + sorted((f['t'], f['boot']) for f in flips):
+        starts.setdefault(boot, t)
+    order = sorted(starts, key=starts.get)
+
+    def boot_of(t):
+        owner = order[0] if order else None
+        for b in order:
+            if starts[b] <= t + 1000:
+                owner = b
+        return owner
+
+    names = defaultdict(dict)  # boot -> res -> (fb, owner)
+    for t, boot, fb, res, owner in sorted(resources):
+        names[boot][res] = (fb, owner)
+    for f in frames:
+        boot = boot_of(f['t'])
+        f['boot'] = boot
+        fb, owner = names.get(boot, {}).get(f['guest_resource'], (None, None))
+        f['fb'] = fb
+        f['label'] = owner if owner and owner.startswith('session') else f"res {f['guest_resource']}"
+        f['outer'] = owner == "the outer's"
+    window = 2 * FLIP_TO_FRAME_MS / 3
+    for boot in order:
+        logged = sorted((f for f in flips if f['boot'] == boot and not f['what'].startswith('session')),
+                        key=lambda f: f['t'])
+        seen = [f for f in frames if f['boot'] == boot and f['outer']]
+        if not logged or not seen:
+            continue
+        by_fb = defaultdict(list)
+        for f in seen:
+            by_fb[f['fb']].append(f['t'])
+
+        def score(shift):
+            used = set()
+            matched, delay = 0, 0.0
+            for flip in logged:
+                at = flip['t'] + shift
+                times = by_fb.get(flip['fb'], [])
+                i = bisect.bisect_left(times, at)
+                while i < len(times) and times[i] <= at + window and (flip['fb'], i) in used:
+                    i += 1
+                if i < len(times) and times[i] <= at + window:
+                    used.add((flip['fb'], i))
+                    matched += 1
+                    delay += times[i] - at
+            return matched, -delay
+
+        shift = max(range(-1000, 1001), key=score)
+        matched, _ = score(shift)
+        print(f'boot {boot[:8]}: journal shifted {shift:+d} ms onto the capture; '
+              f'{matched} of {len(logged)} logged flips of the outer paired with a frame')
+        for flip in flips:
+            if flip['boot'] == boot:
+                flip['t'] += shift
+        for e in events:
+            if e[1] == boot:
+                e[0] += shift
+        for fb, times in by_fb.items():
+            mine = [f for f in logged if f['fb'] == fb]
+            stamps = [f['t'] for f in mine]
+            for frame in (f for f in seen if f['fb'] == fb):
+                i = bisect.bisect_right(stamps, frame['t'] + 1) - 1
+                if i >= 0 and frame['t'] - stamps[i] <= window * 2:
+                    frame['label'] = mine[i]['what']
+                else:
+                    frame['label'] = f"the outer's, unlogged (res {frame['guest_resource']})"
 
 
 def kind_of(frame):
@@ -244,6 +318,7 @@ def fades(run, frames, flips, events):
             continue
         denom = float((d[mask] ** 2).sum())
         prev = None
+        worst = 0.0
         for f in seg:
             X = gray(run, f)
             alpha = float(((X - A)[mask] * d[mask]).sum() / denom)
@@ -255,6 +330,10 @@ def fades(run, frames, flips, events):
             print(f"  #{f['seq']:<5} {f['t']:8.1f}  fitted {alpha:5.3f}  logged {logged:>6}  "
                   f"residual {resid:5.1f}{note}")
             prev = alpha
+            worst = max(worst, resid)
+        if worst > 3:
+            print('  a residual this high means an end of the fade moved while it ran (a live session '
+                  'frame, the turning spinner): the fit is against stills and does not apply')
     print()
 
 

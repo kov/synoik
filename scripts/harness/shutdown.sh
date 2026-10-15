@@ -19,7 +19,8 @@
 # shutdown's journal (it needs the persistent journal of the boot that went down). A run is:
 #   frames.jsonl, s0-*.png   Limina's capture: one record and PNG per frame that reached the
 #                            screen, on the host's clock
-#   driver.jsonl             what the driver did, and when, on the same clock
+#   driver.jsonl             what the driver did, and when, on the same clock, and the boot's
+#                            clock line (clock.py)
 #   journal.jsonl            the outer's and the sessions' log lines and logind's, from the boot
 #                            that went down (`journalctl -o json`)
 set -euo pipefail
@@ -46,6 +47,7 @@ wait_session 3
 pid=$(supervisor)
 on_guest 'cat /proc/sys/kernel/random/boot_id' | tr -d - >"$out/boot_id"
 
+clock_line >"$out/driver.jsonl"
 on_host "mkdir -p '$HARNESS_DIR/captures' && '$LIMINA' debug $pid capture start '$capture' >/dev/null"
 sleep 1
 {
@@ -64,7 +66,7 @@ sleep 1
         on_guest 'systemctl --no-block poweroff' || true
         ;;
     esac
-} >"$out/driver.jsonl"
+} >>"$out/driver.jsonl"
 say "waiting for the power to go"
 wait_gone "$pid" >>"$out/driver.jsonl"
 
