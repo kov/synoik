@@ -5,10 +5,10 @@
 //! The password dialog's keyboard (`docs/fork/boot-splash.md` §4.2): every evdev keyboard, read
 //! through one xkb state, as plymouthd reads them (`ply-input-device.c`, `ply-keyboard.c`).
 //!
-//! Open only while a prompt is up. Nothing is grabbed — at boot no session holds the keyboard —
-//! but the foreground VT's keyboard is turned off meanwhile (`KDSKBMODE K_OFF`, as plymouthd's
-//! `ply_terminal_set_disabled_input`), so what is typed never reaches its line discipline: not
-//! its input queue, not its echo.
+//! Armed only while a prompt is up; unarmed, keystrokes only move the xkb state. Nothing is
+//! grabbed — at boot no session holds the keyboard — but the foreground VT's keyboard is turned
+//! off while armed (`KDSKBMODE K_OFF`, as plymouthd's `ply_terminal_set_disabled_input`), so what
+//! is typed never reaches its line discipline: not its input queue, not its echo.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -38,18 +38,9 @@ const LED_SCROLLL: u16 = 2;
 pub enum Key {
     Text(String),
     Backspace,
-    /// Ctrl+U, Ctrl+W.
+    /// Ctrl+U, Ctrl+W; and Ctrl+C, Ctrl+D, which cannot cancel (§3.2).
     EraseLine,
     Enter,
-    /// Ctrl+C, Ctrl+D: the client asks some other way (§3.2).
-    Cancel,
-}
-
-/// What [`Entry::apply`] leaves the prompt with.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Outcome {
-    Answer(String),
-    Cancel,
 }
 
 /// The password being typed.
@@ -64,18 +55,15 @@ impl Entry {
         self.text.chars().count()
     }
 
-    pub fn apply(&mut self, key: Key) -> Option<Outcome> {
+    /// Type `key`; Enter returns the password.
+    pub fn apply(&mut self, key: Key) -> Option<String> {
         match key {
             Key::Text(text) => self.text.push_str(&text),
             Key::Backspace => {
                 self.text.pop();
             }
             Key::EraseLine => self.clear(),
-            Key::Enter => return Some(Outcome::Answer(std::mem::take(&mut self.text))),
-            Key::Cancel => {
-                self.clear();
-                return Some(Outcome::Cancel);
-            }
+            Key::Enter => return Some(std::mem::take(&mut self.text)),
         }
         None
     }
@@ -232,8 +220,7 @@ fn key_event(state: &mut xkb::State, code: u16, value: i32) -> (Option<Key>, boo
             let text = state.key_get_utf8(keycode);
             match text.as_str() {
                 "" => None,
-                "\u{15}" | "\u{17}" => Some(Key::EraseLine),
-                "\u{3}" | "\u{4}" => Some(Key::Cancel),
+                "\u{15}" | "\u{17}" | "\u{3}" | "\u{4}" => Some(Key::EraseLine),
                 t if t.chars().any(char::is_control) => None,
                 _ => Some(Key::Text(text)),
             }
@@ -249,15 +236,15 @@ struct Device {
     path: PathBuf,
 }
 
-/// Every keyboard, open while a prompt is up.
+/// Every keyboard.
 pub struct Keyboard {
     epoll: OwnedFd,
     inotify: OwnedFd,
     devices: HashMap<RawFd, Device>,
     keymap: xkb::Keymap,
     state: xkb::State,
-    /// Held for its `Drop`, which turns the VT keyboard back on.
-    _vt: Option<Vt>,
+    vt: Vt,
+    armed: bool,
 }
 
 impl Keyboard {
@@ -286,18 +273,38 @@ impl Keyboard {
             devices: HashMap::new(),
             keymap,
             state,
-            _vt: Vt::disable(),
+            vt: Vt::open(),
+            armed: false,
         };
         if let Ok(entries) = fs::read_dir(INPUT_DIR) {
             for entry in entries.flatten() {
                 keyboard.add(&entry.path());
             }
         }
-        info!(
-            "reading {} keyboards for a password",
-            keyboard.devices.len()
-        );
+        info!("{} keyboards open", keyboard.devices.len());
         Ok(keyboard)
+    }
+
+    /// Start typing a password: what was typed before is dropped, and the VT's keyboard is off
+    /// until [`Self::disarm`].
+    pub fn arm(&mut self) {
+        if self.armed {
+            return;
+        }
+        self.dispatch();
+        self.vt.disable();
+        self.armed = true;
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    pub fn disarm(&mut self) {
+        if self.armed {
+            self.vt.restore();
+            self.armed = false;
+        }
     }
 
     /// Readable when [`Self::dispatch`] has something to read.
@@ -340,6 +347,9 @@ impl Keyboard {
         }
         if leds {
             self.write_leds();
+        }
+        if !self.armed {
+            keys.clear();
         }
         (keys, leds)
     }
@@ -456,10 +466,18 @@ impl Keyboard {
     }
 }
 
-/// The foreground VT's keyboard, off while the prompt is up.
+impl Drop for Keyboard {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
+/// The foreground VT, its keyboard off while armed. Opened with the keyboards, so a splash that
+/// outlives the initramfs keeps a descriptor its label no longer needs to open (§7.1).
 struct Vt {
-    fd: OwnedFd,
-    mode: libc::c_int,
+    fd: Option<OwnedFd>,
+    /// The mode to restore, while the keyboard is off.
+    saved: Option<libc::c_int>,
 }
 
 const KDGKBMODE: libc::c_ulong = 0x4B44;
@@ -467,9 +485,7 @@ const KDSKBMODE: libc::c_ulong = 0x4B45;
 const K_OFF: libc::c_int = 0x04;
 
 impl Vt {
-    /// Off, unless there is no VT or it is off already (a session's, or a VT a crashed splash
-    /// left off; restoring that would turn it back off).
-    fn disable() -> Option<Self> {
+    fn open() -> Self {
         // SAFETY: a static path.
         let raw = unsafe {
             libc::open(
@@ -477,15 +493,22 @@ impl Vt {
                 libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
             )
         };
-        if raw < 0 {
-            return None;
+        Self {
+            // SAFETY: just opened.
+            fd: (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw) }),
+            saved: None,
         }
-        // SAFETY: just opened.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    }
+
+    /// Off, unless there is no VT or it is off already (a session's, or one a crashed splash left
+    /// off: restoring that would turn it back off).
+    fn disable(&mut self) {
+        let Some(fd) = &self.fd else { return };
+        let raw = fd.as_raw_fd();
         let mut mode: libc::c_int = 0;
         // SAFETY: the ioctl's own argument.
         if unsafe { libc::ioctl(raw, KDGKBMODE, &raw mut mode) } < 0 || mode == K_OFF {
-            return None;
+            return;
         }
         // SAFETY: the ioctl takes its argument by value.
         if unsafe { libc::ioctl(raw, KDSKBMODE, K_OFF) } < 0 {
@@ -493,18 +516,19 @@ impl Vt {
                 "splash: turning the VT keyboard off: {}",
                 io::Error::last_os_error()
             );
-            return None;
+            return;
         }
-        Some(Self { fd, mode })
+        self.saved = Some(mode);
     }
-}
 
-impl Drop for Vt {
-    fn drop(&mut self) {
-        // SAFETY: our fd, the ioctl's own argument, then a flush of anything queued before.
+    fn restore(&mut self) {
+        let (Some(fd), Some(mode)) = (&self.fd, self.saved.take()) else {
+            return;
+        };
+        // SAFETY: our fd, the ioctl's own argument, after a flush of anything queued before.
         unsafe {
-            libc::tcflush(self.fd.as_raw_fd(), libc::TCIFLUSH);
-            libc::ioctl(self.fd.as_raw_fd(), KDSKBMODE, self.mode);
+            libc::tcflush(fd.as_raw_fd(), libc::TCIFLUSH);
+            libc::ioctl(fd.as_raw_fd(), KDSKBMODE, mode);
         }
     }
 }
@@ -633,24 +657,22 @@ mod tests {
         assert_eq!(entry.bullets(), 3);
         entry.apply(Key::Backspace);
         assert_eq!(entry.bullets(), 2);
-        assert_eq!(entry.apply(Key::Enter), Some(Outcome::Answer("aA".into())));
+        assert_eq!(entry.apply(Key::Enter).as_deref(), Some("aA"));
         assert_eq!(entry.bullets(), 0);
     }
 
     #[test]
-    fn control_keys_erase_and_cancel() {
+    fn control_keys_erase() {
         let Some(mut state) = us() else { return };
         key_event(&mut state, KEY_LEFTCTRL, 1);
         assert_eq!(tap(&mut state, KEY_U), Some(Key::EraseLine));
-        assert_eq!(tap(&mut state, KEY_C), Some(Key::Cancel));
+        // No cancelling: systemd's agent takes NO_ANSWER as no UI, and would never ask again.
+        assert_eq!(tap(&mut state, KEY_C), Some(Key::EraseLine));
         key_event(&mut state, KEY_LEFTCTRL, 0);
 
         let mut entry = Entry::default();
         entry.apply(Key::Text("abc".into()));
         assert_eq!(entry.apply(Key::EraseLine), None);
-        assert_eq!(entry.bullets(), 0);
-        entry.apply(Key::Text("x".into()));
-        assert_eq!(entry.apply(Key::Cancel), Some(Outcome::Cancel));
         assert_eq!(entry.bullets(), 0);
     }
 

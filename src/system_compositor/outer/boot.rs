@@ -15,7 +15,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken};
 use synoik_splash::handoff;
-use synoik_splash::keyboard::{self, Entry, Keyboard, Outcome};
+use synoik_splash::keyboard::{self, Entry, Keyboard};
 use synoik_splash::layout::Dialog;
 
 use super::{Outer, Shown};
@@ -32,8 +32,10 @@ pub(super) struct Plymouth {
     pub server: Server,
     retry: Option<RegistrationToken>,
     connections: std::collections::HashMap<u64, RegistrationToken>,
-    /// Open, and watched, while a password prompt is up (§4.2).
+    /// Open, armed and watched while a password prompt is up (§4.2).
     keyboard: Option<(Keyboard, RegistrationToken)>,
+    /// It would not open for this prompt; not tried again until the next.
+    keyboard_failed: bool,
     entry: Entry,
     /// Inside the keyboard's own callback, whose watch goes by returning `Remove`; set once it
     /// should.
@@ -48,6 +50,7 @@ impl Plymouth {
             retry: None,
             connections: std::collections::HashMap::new(),
             keyboard: None,
+            keyboard_failed: false,
             entry: Entry::default(),
             in_keyboard: None,
         }
@@ -324,23 +327,20 @@ impl Outer {
         self.close_plymouth_connections(current);
     }
 
-    /// Read the keyboard while a password prompt is up, and only then. A prompt with nothing to
-    /// type it on is cancelled: its client asks some other way.
+    /// Read the keyboard while a password prompt is up, and only then. Without a keyboard the
+    /// dialog still shows: NO_ANSWER would leave the asking unit waiting unseen (§3.2).
     fn follow_prompt(&mut self) {
         let prompting = self.plymouth.server.splash().password_prompt.is_some();
-        if prompting && self.plymouth.keyboard.is_none() {
-            if self.boot.is_none() {
-                self.plymouth.server.answer_password(None);
-                return;
-            }
-            let keyboard = match keyboard::open_system() {
+        if prompting && self.plymouth.keyboard.is_none() && !self.plymouth.keyboard_failed {
+            let mut keyboard = match keyboard::open_system() {
                 Ok(keyboard) => keyboard,
                 Err(err) => {
-                    warn!("not asking for the password: {err}");
-                    self.plymouth.server.answer_password(None);
+                    warn!("no keyboard for the password: {err}");
+                    self.plymouth.keyboard_failed = true;
                     return;
                 }
             };
+            keyboard.arm();
             // The keyboard lives in `self.plymouth` until the watch is removed.
             let fd = ConnectionFd(std::os::fd::AsRawFd::as_raw_fd(&keyboard.fd()));
             let token = self
@@ -360,6 +360,7 @@ impl Outer {
             self.plymouth.keyboard = Some((keyboard, token));
             self.dialog_changed();
         } else if !prompting {
+            self.plymouth.keyboard_failed = false;
             if let Some((keyboard, token)) = self.plymouth.keyboard.take() {
                 match &mut self.plymouth.in_keyboard {
                     Some(remove) => *remove = true,
@@ -390,12 +391,8 @@ impl Outer {
         let (keys, mut changed) = keyboard.dispatch();
         for key in keys {
             changed = true;
-            match self.plymouth.entry.apply(key) {
-                None => (),
-                Some(Outcome::Answer(password)) => {
-                    self.plymouth.server.answer_password(Some(password));
-                }
-                Some(Outcome::Cancel) => self.plymouth.server.answer_password(None),
+            if let Some(password) = self.plymouth.entry.apply(key) {
+                self.plymouth.server.answer_password(Some(password));
             }
         }
         if changed {

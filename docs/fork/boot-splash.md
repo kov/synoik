@@ -175,7 +175,7 @@ is reached on the serial console or over ssh — S6's stated cost.
 | `C` | change mode: `boot-up`, `shutdown`, `reboot`, `updates`, `system-upgrade`, `firmware-upgrade`, `system-reset` | switch screen (§4.3); unknown modes ACKed and ignored |
 | `u` | update progress 0-100 | progress bar |
 | `M` / `m` | show / hide message (exact match) | message list; an empty `M` clears it (systemd's FIDO2 code relies on that) |
-| `*` | ask for password, prompt optional | the password dialog (§4.2); ANSWER on Enter, NO_ANSWER when the splash cannot prompt so the client asks elsewhere |
+| `*` | ask for password, prompt optional | the password dialog (§4.2); ANSWER on Enter. Never NO_ANSWER while a splash is up: systemd's agent takes it as "no UI", leaves the request and waits for the next one, and the console agent stands down for `/run/plymouth/pid`, so the asking unit would wait unseen (crypttab's default timeout is none) |
 | `c` | cached passwords | NO_ANSWER — **never NAK**: systemd's agent turns anything but ANSWER/NO_ANSWER into -EIO |
 | `Q` | quit, 1-byte retain flag | ends the boot splash (ACK when done); without retain, §2.4 |
 | `U`, `A`/`a`, `R`, `S`, `!`, `D`, `r`, `l` | status, pause/unpause progress, newroot, sysinit, error, deactivate, reactivate, reload | ACK, no effect (`R` must never chroot) |
@@ -184,8 +184,9 @@ is reached on the serial console or over ssh — S6's stated cost.
 | `V` | has active VT | NAK |
 | other | | NAK |
 
-A cancelled password (Ctrl+C / Ctrl+D) answers NO_ANSWER, not plymouthd's `"\x03"`, which
-systemd's agent would take as the password. Answers are not cached.
+Ctrl+C and Ctrl+D clear the entry rather than cancel: plymouthd answers `"\x03"`, which systemd's
+agent would take as the password, and NO_ANSWER would leave the request unanswered for good (above).
+A dialog with no keyboard to type on stays up, for the same reason. Answers are not cached.
 
 ### 3.3 Callers on Fedora 44
 
@@ -236,8 +237,10 @@ are, where they were.
 Keyboard input (`synoik-splash/src/keyboard.rs`, shared by both drawers) comes from every evdev
 node that reports keys, opened while a prompt is up and closed when none is, through one xkbcommon
 state, as plymouthd's evdev path does: Return answers, BackSpace deletes a character, Ctrl+U and
-Ctrl+W clear the entry, Ctrl+C and Ctrl+D cancel (NO_ANSWER, §3.2), Escape does nothing (plymouthd
-shows its details), repeats type again, and the keyboards' LEDs follow the state. Nothing is
+Ctrl+W clear the entry, so do Ctrl+C and Ctrl+D (§3.2), Escape does nothing (plymouthd
+shows its details), repeats type again, and the keyboards' LEDs follow the state. The initramfs
+splash opens the keyboards when it starts and keeps them, reading them unarmed until a prompt:
+once the real root loads its SELinux policy, its `kernel_t` may not open them (§7.1). Nothing is
 grabbed: at boot no session has the keyboard yet. The foreground VT's keyboard is set to `K_OFF`
 meanwhile, its input flushed and its mode restored after (plymouthd's
 `ply_terminal_set_disabled_input`), so the password reaches no line discipline: neither its input

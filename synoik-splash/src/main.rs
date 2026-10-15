@@ -22,7 +22,7 @@ use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
 use drm::control::{connector, crtc, framebuffer, Device as _, Mode, ModeTypeFlags, PageFlipFlags};
 use synoik_splash::handoff::{self, State};
-use synoik_splash::keyboard::{self, Entry, Keyboard, Outcome};
+use synoik_splash::keyboard::{self, Entry, Keyboard};
 use synoik_splash::layout::{self, Dialog, Size};
 use synoik_splash::paint::{self, Canvas, Frame, Theme};
 use synoik_splash::plymouth::{self, Event, Server};
@@ -77,7 +77,8 @@ struct Splash {
     server: Server,
     theme: Theme,
     fonts: Fonts,
-    /// Open while a password prompt is up.
+    /// Open from the start, so the keyboards are open before the real root's SELinux policy
+    /// loads (§7.1); armed while a password prompt is up.
     keyboard: Option<Keyboard>,
     entry: Entry,
     card: Option<Card>,
@@ -152,7 +153,7 @@ fn run() -> io::Result<()> {
         server: Server::new(0),
         theme: Theme::load(Path::new(layout::THEME_DIR)),
         fonts: Fonts::load(&[Path::new(text::FONT_FILE)]),
-        keyboard: None,
+        keyboard: open_keyboard(),
         entry: Entry::default(),
         recovered: drm.is_some(),
         card: drm,
@@ -511,22 +512,20 @@ impl Splash {
         self.follow_prompt();
     }
 
-    /// Read the keyboard while a password prompt is up, and only then.
+    /// Type into the dialog while a password prompt is up, and only then. Without a keyboard
+    /// the dialog still shows: NO_ANSWER would leave the asking unit waiting unseen (§3.2).
     fn follow_prompt(&mut self) {
         let prompting = self.server.splash().password_prompt.is_some();
-        if prompting && self.keyboard.is_none() {
-            match keyboard::open_system() {
-                Ok(keyboard) => self.keyboard = Some(keyboard),
-                Err(err) => {
-                    // Nothing to type with: the client asks some other way.
-                    warn!("not asking for the password: {err}");
-                    self.server.answer_password(None);
-                    return self.on_plymouth();
-                }
+        if prompting {
+            if self.keyboard.is_none() {
+                self.keyboard = open_keyboard();
             }
-            self.revision += 1;
-        } else if !prompting && self.keyboard.is_some() {
-            self.keyboard = None;
+            if let Some(keyboard) = self.keyboard.as_mut().filter(|k| !k.is_armed()) {
+                keyboard.arm();
+                self.revision += 1;
+            }
+        } else if let Some(keyboard) = self.keyboard.as_mut().filter(|k| k.is_armed()) {
+            keyboard.disarm();
             self.entry.clear();
             self.revision += 1;
         }
@@ -546,13 +545,12 @@ impl Splash {
             return;
         };
         let (keys, leds) = keyboard.dispatch();
-        let mut changed = leds;
+        // Unarmed, caps lock changes nothing on screen.
+        let mut changed = leds && keyboard.is_armed();
         for key in keys {
             changed = true;
-            match self.entry.apply(key) {
-                None => (),
-                Some(Outcome::Answer(password)) => self.server.answer_password(Some(password)),
-                Some(Outcome::Cancel) => self.server.answer_password(None),
+            if let Some(password) = self.entry.apply(key) {
+                self.server.answer_password(Some(password));
             }
         }
         if changed {
@@ -783,6 +781,12 @@ fn close_inherited_framebuffers(card: &Card) {
             );
         }
     }
+}
+
+fn open_keyboard() -> Option<Keyboard> {
+    keyboard::open_system()
+        .inspect_err(|err| warn!("no keyboard for passwords: {err}"))
+        .ok()
 }
 
 /// TERM and INT come through a signalfd: the handoff runs from the loop, not a handler.
