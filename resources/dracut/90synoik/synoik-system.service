@@ -1,0 +1,30 @@
+# The initramfs's synoik-system.service: the splash, in plymouth's place (docs/fork/boot-splash.md
+# §7). The same unit as the real root's, which takes it over at switch_root still running, and
+# which synoik-splash-handover.service restarts into the system compositor.
+[Unit]
+Description=synoik boot splash
+Documentation=https://github.com/kov/synoik/blob/main/docs/fork/boot-splash.md
+DefaultDependencies=no
+# Kept through the isolate to initrd-switch-root.target, as plymouth-start.service is.
+IgnoreOnIsolate=yes
+# plymouth's switches: the splash honours them as plymouthd does.
+ConditionKernelCommandLine=!plymouth.enable=0
+ConditionKernelCommandLine=!rd.plymouth=0
+ConditionVirtualization=!container
+After=systemd-udev-trigger.service systemd-udevd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+# `@`: systemd TERMs every initramfs process at switch_root but those whose argv[0] starts with
+# it (§7.1).
+ExecStart=@/usr/local/libexec/synoik-splash @synoik-splash
+# Where the handover's marker lives, kept for the outer, which the restart makes its owner.
+RuntimeDirectory=synoik-system
+RuntimeDirectoryPreserve=yes
+# As the real root's unit: the card, plymouth's listener and, at the handover, the splash.
+FileDescriptorStoreMax=4
+FileDescriptorStorePreserve=yes
+Slice=-.slice
+Restart=always
+RestartSec=100ms

@@ -37,8 +37,20 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# The initramfs splash (docs/fork/boot-splash.md §7.4): where dracut finds it, and the conf that
+# swaps it for plymouth.
+dracut_module=/usr/lib/dracut/modules.d/90synoik
+dracut_conf=/etc/dracut.conf.d/90-synoik.conf
+
 if [ "${1:-}" = "--use-gdm" ]; then
-    systemctl disable synoik-login.service synoik-system.service || true
+    systemctl disable synoik-login.service synoik-system.service synoik-splash-handover.service ||
+        true
+    # plymouth back in the initramfs.
+    if [ -e "$dracut_conf" ] || [ -e "$dracut_module" ]; then
+        rm -rf "$dracut_conf" "$dracut_module"
+        echo "Rebuilding the initramfs images with plymouth..."
+        dracut -f --regenerate-all
+    fi
     systemctl enable --force gdm.service
     # The text consoles come back with GDM, and plymouth runs after switch_root again.
     grubby --update-kernel=ALL --remove-args=fbcon=map:9
@@ -58,7 +70,7 @@ EOF
     exit 0
 fi
 
-for bin in synoik synoik-login; do
+for bin in synoik synoik-login synoik-splash; do
     if [ ! -x "target/$profile/$bin" ]; then
         echo "error: target/$profile/$bin not found — build it first (as your normal user):" >&2
         echo "  cargo build --profile $profile --workspace" >&2
@@ -74,6 +86,7 @@ if [ -e /usr/local/bin/synoik ]; then
 fi
 install -Dm755 "target/$profile/synoik" /usr/local/bin/synoik
 install -Dm755 "target/$profile/synoik-login" /usr/local/bin/synoik-login
+install -Dm755 "target/$profile/synoik-splash" /usr/local/libexec/synoik-splash
 
 # Users and the greeter's home.
 install -Dm644 $r/synoik-system.sysusers /usr/lib/sysusers.d/synoik-system.conf
@@ -84,7 +97,8 @@ systemd-sysusers synoik-system.conf synoik-login.conf
 systemd-tmpfiles --create synoik-login.conf synoik-system.conf
 
 # System units. After switch_root the system compositor is plymouth (docs/fork/boot-splash.md §2.2).
-install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-login.service
+install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-login.service \
+    $r/synoik-splash-handover.service
 for unit in plymouth-start plymouth-quit-wait; do
     install -Dm644 $r/plymouth-real-root.conf "/etc/systemd/system/$unit.service.d/synoik.conf"
 done
@@ -151,7 +165,7 @@ if command -v semanage >/dev/null; then
     label xdm_exec_t /usr/local/bin/synoik-login
     label xdm_var_run_t '/run/synoik-system(/.*)?'
     label xdm_var_lib_t '/var/lib/synoik-greeter(/.*)?'
-    restorecon -F /usr/local/bin/synoik-login /usr/local/bin/synoik
+    restorecon -F /usr/local/bin/synoik-login /usr/local/bin/synoik /usr/local/libexec/synoik-splash
     restorecon -RF /var/lib/synoik-greeter
 fi
 
@@ -164,9 +178,33 @@ if [ -e /sys/class/graphics/fbcon ] && ! grep -q 'fbcon=map:' /proc/cmdline; the
     echo "Added fbcon=map:9 to every kernel's command line (no text console on the display)."
 fi
 
+# The splash replaces plymouth in the initramfs, unless the initramfs has a disk to unlock: it draws
+# no password prompt yet, and with fbcon off the console's is invisible (boot-splash.md §7.4).
+encrypted() {
+    grep -qvE '^[[:space:]]*(#|$)' /etc/crypttab 2>/dev/null && return 0
+    lsblk -nso TYPE "$(findmnt -nvo SOURCE /)" 2>/dev/null | grep -qx crypt
+}
+if encrypted; then
+    if [ -e "$dracut_conf" ] || [ -e "$dracut_module" ]; then
+        rm -rf "$dracut_conf" "$dracut_module"
+        rebuild_initramfs=1
+    fi
+    echo "An encrypted volume is unlocked at boot: plymouth stays in the initramfs."
+else
+    rm -rf "$dracut_module"
+    install -Dm755 $r/dracut/90synoik/module-setup.sh "$dracut_module/module-setup.sh"
+    install -Dm644 $r/dracut/90synoik/synoik-system.service "$dracut_module/synoik-system.service"
+    install -Dm644 $r/dracut/90-synoik.conf "$dracut_conf"
+    rebuild_initramfs=1
+fi
+if [ -n "${rebuild_initramfs:-}" ]; then
+    echo "Rebuilding the initramfs images..."
+    dracut -f --regenerate-all
+fi
+
 systemctl daemon-reload
 systemctl disable gdm.service || true
-systemctl enable synoik-system.service
+systemctl enable synoik-system.service synoik-splash-handover.service
 # The display-manager.service alias is GDM's until now.
 systemctl enable --force synoik-login.service
 

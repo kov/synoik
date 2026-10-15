@@ -939,7 +939,9 @@ impl Outer {
             last_to: None,
         };
         self.displays.insert(d.to_owned(), display);
-        if adopt {
+        // Adopted while carrying the initramfs splash on (boot-splash.md §7.2), the display gets
+        // the splash at once, at the mode it has, so its spinner keeps turning.
+        if adopt && self.boot.is_none() {
             info!("{d} adopted at {}x{}", mode.size().0, mode.size().1);
         } else if let Err(err) = self.commit_base(d) {
             warn!("{err:#}");

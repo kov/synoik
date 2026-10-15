@@ -1,9 +1,10 @@
 # Boot splash: the system compositor takes over from plymouth
 
 > Status: **phase 1 built** (steps 1-4 of §5): the outer answers plymouthd's protocol, draws the
-> splash, takes the screen over from plymouth at boot and keeps it through shutdown and offline
-> updates (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
-> **Phase 2 (§7) is being built:** the splash in the initramfs, in place of plymouth there.
+> splash, takes the screen over at boot and keeps it through shutdown and offline updates
+> (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
+> **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
+> (`synoik-splash/src/main.rs`), validated on the harness VM.
 > Password prompts and the emergency path are design.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
@@ -319,7 +320,9 @@ the initramfs:
   starts with `@` (plymouthd's mark). The unit runs `@/usr/libexec/synoik-splash @synoik-splash`.
 - A process that survives has its root in the initramfs, which systemd empties. The splash
   needs no file after it starts: theme images are loaded up front, and its binary stays mapped.
-- It runs as `kernel_t` (no policy is loaded yet), and keeps that label.
+- It runs as `kernel_t` (no policy is loaded yet), and keeps that label. Once the real root loads
+  its policy, `kernel_t` may no longer `map` the card (`device_t`, devtmpfs's label before
+  relabelling): the splash maps its buffers once, at setup, and a mapping it holds stays good.
 
 ### 7.2 The handover is a restart
 
@@ -337,8 +340,15 @@ does after a crash (`system-compositor.md` §7). What else crosses over, also th
   spinner phase continuing, and removes it when the splash ends; without it, the outer adopts the
   screen as before.
 
-The splash removes `/run/plymouth/pid` at TERM, which the handover's `systemctl restart` waits
-on with the rest of the restart (`Type=notify`). The handover unit runs only while the splash is the
+The splash removes `/run/plymouth/pid` at TERM; the outer writes it again once it answers, which
+the unit's last `ExecStartPost=` waits for, and the handover's `systemctl restart` returns after
+that (`Type=notify`). The outer adopts each display at the mode it has but, carrying the splash on,
+draws the splash on it at once, without waiting for a session's first frame.
+
+Measured on the harness VM (2026-10-14, 1280×800, frames captured on the host): the splash lit at
+1.32 s, turned through switch_root (2.24 s), and at the handover (4.87 s) the outer's first frame
+replaced its last 237 ms later, with the same watermark and the spinner still turning: no empty
+plane and no dark frame between them. Both drawers present at ≈15 fps on that VM. The handover unit runs only while the splash is the
 unit's process: it is conditioned on `/run/synoik-system/initrd-splash`, which the splash creates
 and removes.
 

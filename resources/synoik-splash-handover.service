@@ -1,0 +1,21 @@
+# Hand the boot splash to the system compositor (docs/fork/boot-splash.md §7.2): restart
+# synoik-system.service, which the initramfs started as the splash, into the real root's outer.
+# Master, the frame on screen, plymouth's listener and the splash cross in its fd store.
+[Unit]
+Description=synoik: hand the boot splash to the system compositor
+Documentation=https://github.com/kov/synoik/blob/main/docs/fork/boot-splash.md
+DefaultDependencies=no
+# Only while the splash is the unit's process; it removes this when it goes.
+ConditionPathExists=/run/synoik-system/initrd-splash
+# Where synoik-system.service itself starts when the initramfs had no splash (§2.2.1).
+After=systemd-journald.socket systemd-tmpfiles-setup.service systemd-sysusers.service
+After=systemd-udev-trigger.service dbus.socket systemd-logind.service
+Before=system-update-pre.target systemd-user-sessions.service synoik-login.service
+
+[Service]
+Type=oneshot
+# Returns once the outer is ready: the unit is Type=notify.
+ExecStart=/usr/bin/systemctl restart synoik-system.service
+
+[Install]
+WantedBy=graphical.target system-update.target
