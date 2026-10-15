@@ -288,13 +288,16 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
   domain (`/usr/share/locale/*/LC_MESSAGES/plymouth.mo`) in the system locale. The outer draws
   them in English; nothing in the shell reads `.mo` catalogs yet.
 
-- **SELinux denies plymouth's clients.** The outer's socket carries its domain,
-  `unconfined_service_t`, and the targeted policy lets those clients (`init_t`: pid 1's unit-status
-  updates and the units' `plymouth` calls) `connectto` only `plymouthd_t`. Measured on the
-  enforcing harness: every request is denied, so an update screen gets no mode, progress or
-  message. jabuticaba is permissive. Two ways out: label the listening socket `plymouthd_t`
-  (`setsockcreatecon` before binding), which the existing policy then admits as it admits
-  plymouthd, or ship a policy module letting those domains connect to the outer. Not decided.
+- **SELinux denies plymouth's clients when the outer binds the name itself.** A socket the outer
+  binds carries its domain, `unconfined_service_t`, and the targeted policy lets those clients
+  (`init_t`: pid 1's unit-status updates and the units' `plymouth` calls) `connectto` only
+  `plymouthd_t`: measured on the enforcing harness, pid 1's first update is denied, and an update
+  screen gets no mode, progress or message. The listener the initramfs splash binds (§7) is
+  `kernel_t`'s, and the outer adopts it: over a whole enforcing boot on the harness, no `connectto`
+  was denied, and a unit's `plymouth display-message` got through. So the gap remains only where
+  the initramfs still has plymouth (an encrypted volume, §7.4); the way out there is to label the
+  listening socket `plymouthd_t` (`setsockcreatecon` before binding) or a policy module. An update
+  screen under enforcing is untested on either path.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
   check the server, so a squatter would receive passwords. The window is a few milliseconds and no
   prompt is possible inside it (§2.1), but it is not zero.

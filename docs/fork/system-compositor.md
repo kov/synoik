@@ -259,12 +259,13 @@ mid-animation, and settles the topology only once the target session is fronted.
 The highest-value slice — greeter, login, user switch, logout, lock — needs **none** of the
 early-boot work, and carries all of the architectural risk (§2, §3, §9 S1). Build that first.
 
-Plymouth replacement is a clean later phase; its first phase — the outer takes over after
-switch_root and keeps the screen to power-off — is designed in `boot-splash.md`. In full it means:
+Plymouth replacement is built in two phases, both in `boot-splash.md`: the outer keeps the screen
+from switch_root to power-off, and a splash of ours holds it in the initramfs. In full it means:
 
-- **Living in the initramfs.** Start there, hold the DRM fd, keep running across `switch_root` —
-  processes survive the pivot. This is literally plymouth's mechanism, so it is known-viable.
-  Costs: mesa + a Vulkan driver in the initrd is 100 MB+, and we run a stale binary until re-exec.
+- **Living in the initramfs** (`boot-splash.md` §7): a small CPU-drawing splash program holds the
+  card from the boot's first frame, survives `switch_root` as plymouthd does, and the real root
+  restarts its unit into the outer, master and frame crossing in the fd store. No Mesa or Vulkan in
+  the image.
 - **Plymouth's other jobs come with it**: the FDE passphrase prompt (`systemd-ask-password`
   agent), fsck progress, `system-update.target` rendering.
 - **The seamless part is not fbcon** — it is `simpledrm`/`efifb` → real driver. Flicker-free means

@@ -48,7 +48,6 @@ const CARD_POLL: Duration = Duration::from_millis(20);
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Buf {
-    _db: DumbBuffer,
     fb: framebuffer::Handle,
     /// Mapped once, at setup: once the real root loads its SELinux policy, `kernel_t` may no
     /// longer map the card (the initramfs's devtmpfs label), but a mapping it has stays good.
@@ -512,8 +511,11 @@ impl Display {
             let fb = card.add_framebuffer(&db, 24, 32)?;
             let stride = drm::buffer::Buffer::pitch(&db) as usize;
             let map = Mapping::new(card, &db, stride * usize::from(h))?;
+            // The framebuffer and the mapping each hold the buffer; the handle would only keep it
+            // alive on the card's file, which outlives us in the fd store, past the outer's first
+            // flip: a whole screen's worth per buffer, every boot.
+            card.close_buffer(drm::buffer::Buffer::handle(&db))?;
             Ok(Buf {
-                _db: db,
                 fb,
                 map,
                 stride,
