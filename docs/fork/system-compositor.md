@@ -443,9 +443,18 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   window dragged by 120 moves at 16 ms flips 121 frames, cursor in step; a shape change (arrow to
   I-beam and back) lands image and position together.
 - **Shutdown**: on logind's `PrepareForShutdown(true)` the outer stops following the seat and
-  fades what is on screen to black, drawing the end so it is what systemd's fd store keeps scanned
-  out after the outer exits; `false` brings back the session logind fronts. The boot/shutdown
-  splash (§6) hooks in here.
+  fades what is on screen to the shutdown splash, which turns until the power goes
+  (`boot-splash.md` §2.3); `false` brings back the session logind fronts. From that signal no
+  session is fronted: the sessions keep presenting while they end, and none of their frames — new,
+  or held for a switch back — reaches the screen again. Measured on the harness (2026-10-15, both
+  the end-session dialog and `systemctl poweroff`): one 250 ms ease-out whose every frame's fitted
+  alpha matches the logged one, then the splash alone until power-off.
+- **Harness** (`scripts/harness/`): drivers that run a scenario on the Limina harness VM while
+  Limina records every frame that reaches its screen (`shutdown.sh`; `deploy.sh` installs a
+  build), and `report.py`, which reads a run back against the outer's flight recorder (the
+  `synoik::system_compositor::flight` debug target: every flip that is not a session's steady
+  frame, and every step of a fade): a timeline of frames, the driver's steps and the journal; each
+  fade's alpha fitted from the pixels; the tail before power-off; a filmstrip.
 - **Chord** (`system_compositor::chord`): on a seat without VTs the outer reads every evdev node
   itself (the `input` group, nothing grabbed) for Ctrl+Alt+F<n>, which activates the n-th seat0
   session in login order through logind's `ActivateSession` — off the event loop, allowed by
@@ -492,9 +501,10 @@ and shutdown splash (§6) is built: `boot-splash.md`.
 
 In order:
 
-1. **A way to exercise the outer's animations**, so they can be tuned: switch crossfades, the
-   splash to greeter and greeter to session handoffs, shutdown's fade, driven repeatably and
-   captured frame by frame on the harness. Then smooth the handoff between inner and outer.
+1. **The outer's animations on the harness** (§10 Harness): shutdown is covered; login, switch
+   and logout drivers next, then smoothing the handoffs between inner and outer they show. Seen on
+   the shutdown runs and open: each fade runs between stills — the session's own end-session
+   dialog freezes half-closed in the fade's `from`, and the spinner stands still in its `to`.
 2. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
    CPU splash keeps the spinner turning until the outer can draw.
 3. **Overlay planes through the outer**: a client's buffer scanned out on an overlay plane, which

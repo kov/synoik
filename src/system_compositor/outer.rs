@@ -61,6 +61,11 @@ use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
 use crate::render_helpers::vulkan::VkTexture;
 use crate::utils::get_monotonic_time;
 
+/// The flight recorder's log target: every flip that is not a session's own steady frame, and every
+/// step of a fade, so a harness capture can be read against what the outer meant to show
+/// (`scripts/harness/`).
+const FLIGHT: &str = "synoik::system_compositor::flight";
+
 /// GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a session's
 /// own background sits on.
 const PLATE: [u8; 3] = [0x24, 0x24, 0x24];
@@ -483,6 +488,17 @@ enum End {
         buffer: u32,
         answer: bool,
     },
+}
+
+impl std::fmt::Display for End {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            End::Plate => write!(f, "plate"),
+            End::Session {
+                generation, buffer, ..
+            } => write!(f, "session {generation} buffer {buffer}"),
+        }
+    }
 }
 
 /// A buffer a session registered.
@@ -1303,8 +1319,13 @@ impl Outer {
         activate_session(id.clone());
     }
 
-    /// The attached session logind has fronted, if any.
+    /// The attached session logind has fronted, if any. None once the machine is going down: the
+    /// sessions end under the shutdown splash, and no frame of theirs may come back over it — not
+    /// one they present, nor one held for the switch back.
     fn fronted(&self) -> Option<u64> {
+        if self.shutting_down {
+            return None;
+        }
         let front = self.front.as_deref()?;
         self.sessions
             .values()
@@ -1416,6 +1437,7 @@ impl Outer {
             }
             return;
         }
+        debug!(target: FLIGHT, "switch on {d} begins (shutting down: {})", self.shutting_down);
         let from = self.snapshot_screen(d);
         self.cancel_transition(d);
         let Some(display) = self.displays.get_mut(d) else {
@@ -1502,6 +1524,7 @@ impl Outer {
         let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.take()) else {
             return;
         };
+        debug!(target: FLIGHT, "fade on {d} cancelled");
         if let Some(token) = transition.wait {
             self.handle.remove(token);
         }
@@ -1719,6 +1742,9 @@ impl Outer {
         let Some(transition) = &mut display.transition else {
             return;
         };
+        if transition.to.is_none() {
+            debug!(target: FLIGHT, "fade on {d} to {}", target.end);
+        }
         match transition.to.replace(target) {
             None => transition.start = get_monotonic_time(),
             Some(Target {
@@ -1829,8 +1855,10 @@ impl Outer {
             self.hold(generation, d, buffer, fence);
         }
         let Some(to) = transition.to else {
+            debug!(target: FLIGHT, "fade on {d} ends with no target");
             return;
         };
+        debug!(target: FLIGHT, "fade on {d} ends on {}", to.end);
         if let Some(display) = self.displays.get_mut(d) {
             display.last_to = Some(to.picture);
         }
@@ -1871,6 +1899,7 @@ impl Outer {
         over_plate: bool,
     ) {
         if over_plate && self.compositor.is_some() {
+            debug!(target: FLIGHT, "fade on {d} from the plate to session {generation}");
             let from = self.base_picture(d);
             let Some(display) = self.displays.get_mut(d) else {
                 return;
@@ -1960,7 +1989,7 @@ impl Outer {
         mut fds: Vec<OwnedFd>,
     ) -> anyhow::Result<()> {
         // Going down, no session reaches the screen again: their frames are held, unanswered.
-        let fronted = !self.shutting_down && self.fronted() == Some(generation);
+        let fronted = self.fronted() == Some(generation);
         let session = self
             .sessions
             .get_mut(&generation)
@@ -2162,10 +2191,7 @@ impl Outer {
         showing: Option<u64>,
     ) -> Option<(Rc<CursorImage>, (i32, i32))> {
         let generation = showing?;
-        if self.shutting_down
-            || self.fronted() != Some(generation)
-            || self.displays.get(d)?.transition.is_some()
-        {
+        if self.fronted() != Some(generation) || self.displays.get(d)?.transition.is_some() {
             return None;
         }
         let cursor = self.sessions.get(&generation)?.cursors.get(d)?;
@@ -2350,6 +2376,29 @@ impl Outer {
         {
             Ok(()) => {
                 let display = self.displays.get_mut(d).expect("looked up above");
+                let steady = matches!(shown, Shown::Session { .. })
+                    && display.transition.is_none()
+                    && self.boot.is_none()
+                    && !self.shutting_down;
+                if !steady {
+                    let fb = u32::from(fb_handle);
+                    match &shown {
+                        Shown::Plate => debug!(target: FLIGHT, "flip {d} fb={fb} plate"),
+                        Shown::Splash {
+                            revision, frame, ..
+                        } => {
+                            debug!(target: FLIGHT, "flip {d} fb={fb} splash revision={revision} frame={frame}")
+                        }
+                        Shown::Session {
+                            generation, buffer, ..
+                        } => {
+                            debug!(target: FLIGHT, "flip {d} fb={fb} session {generation} buffer {buffer}")
+                        }
+                        Shown::Composite { alpha, .. } => {
+                            debug!(target: FLIGHT, "flip {d} fb={fb} composite alpha={alpha:.4}")
+                        }
+                    }
+                }
                 display.in_flight = Some(shown);
                 display.cursor_dirty = false;
                 if let (Some(cursor), Some(shown)) = (&mut display.cursor, cursor_shown) {
