@@ -4,14 +4,15 @@
 
 //! The splash on the CPU, into an XRGB8888 buffer: what the initramfs splash scans out
 //! (`docs/fork/boot-splash.md` §7.3). The layout is the outer's; this is only its pixels, at
-//! scale 1, without text.
+//! scale 1.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::layout::{self, Images, Item, Point, Rect, Size};
+use crate::layout::{self, Dialog, Font, Images, Item, Point, Rect, Size};
 use crate::plymouth::Splash;
+use crate::text::{Fonts, Line};
 
 /// An image, premultiplied, one `0xAARRGGBB` per pixel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,13 +65,21 @@ pub struct Theme {
     pub watermark: Option<Image>,
     /// All the frames or none: a spinner with a gap would stutter.
     pub spinner: Vec<Image>,
+    /// The password dialog's.
+    pub lock: Option<Image>,
+    pub entry: Option<Image>,
+    pub bullet: Option<Image>,
+    pub keyboard: Option<Image>,
+    pub caps_lock: Option<Image>,
 }
 
 impl Theme {
     pub fn load(dir: &Path) -> Self {
-        let watermark = Image::load(&dir.join("watermark.png"))
-            .map_err(|err| warn!("splash: watermark: {err}"))
-            .ok();
+        let load = |name: &str| {
+            Image::load(&dir.join(name))
+                .map_err(|err| warn!("splash: {name}: {err}"))
+                .ok()
+        };
         let spinner = (1..)
             .map(|i| dir.join(format!("throbber-{i:04}.png")))
             .take_while(|path| path.exists())
@@ -80,13 +89,27 @@ impl Theme {
                 warn!("splash: spinner: {err}");
                 Vec::new()
             });
-        Self { watermark, spinner }
+        Self {
+            watermark: load("watermark.png"),
+            spinner,
+            lock: load("lock.png"),
+            entry: load("entry.png"),
+            bullet: load("bullet.png"),
+            keyboard: load("keyboard.png"),
+            caps_lock: load("capslock.png"),
+        }
     }
 
     pub fn images(&self) -> Images {
+        let size = |i: &Option<Image>| i.as_ref().map(|i| i.size);
         Images {
-            watermark: self.watermark.as_ref().map(|i| i.size),
+            watermark: size(&self.watermark),
             spinner: self.spinner.first().map(|i| (i.size, self.spinner.len())),
+            lock: size(&self.lock),
+            entry: size(&self.entry),
+            bullet: size(&self.bullet),
+            keyboard: size(&self.keyboard),
+            caps_lock: size(&self.caps_lock),
         }
     }
 }
@@ -133,13 +156,25 @@ impl Canvas<'_> {
 
     /// `image` over what is there, its top-left `at`.
     pub fn blend(&mut self, image: &Image, at: Point) {
-        let rect = Rect::new(at, image.size);
-        let Some((x0, y0, x1, y1)) = self.clip(rect) else {
+        self.blend_region(image, Rect::new(Point::default(), image.size), at);
+    }
+
+    /// The part `src` of `image` over what is there, its top-left `at`.
+    pub fn blend_region(&mut self, image: &Image, src: Rect, at: Point) {
+        let src = Rect::new(
+            src.loc,
+            Size::from((
+                src.size.w.min(image.size.w - src.loc.x),
+                src.size.h.min(image.size.h - src.loc.y),
+            )),
+        );
+        let Some((x0, y0, x1, y1)) = self.clip(Rect::new(at, src.size)) else {
             return;
         };
         for y in y0..y1 {
             for x in x0..x1 {
-                let src = image.pixels[((y - at.y) * image.size.w + (x - at.x)) as usize];
+                let (ix, iy) = (x - at.x + src.loc.x, y - at.y + src.loc.y);
+                let src = image.pixels[(iy * image.size.w + ix) as usize];
                 let a = src >> 24;
                 let pixel = match a {
                     0 => continue,
@@ -158,15 +193,83 @@ impl Canvas<'_> {
             }
         }
     }
+
+    /// `line` in `rgb`, its origin at `origin`.
+    pub fn text(&mut self, line: &Line, origin: (i32, i32), rgb: [f32; 3]) {
+        let color = rgb.map(|c| (c.clamp(0., 1.) * 255.).round() as u32);
+        for g in &line.glyphs {
+            let at = Point::from((origin.0 + g.x, origin.1 + g.y));
+            let rect = Rect::new(at, Size::from((g.w as i32, g.h as i32)));
+            let Some((x0, y0, x1, y1)) = self.clip(rect) else {
+                continue;
+            };
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let a = u32::from(g.coverage[((y - at.y) * g.w as i32 + (x - at.x)) as usize]);
+                    if a == 0 {
+                        continue;
+                    }
+                    let dst = self.get(x, y);
+                    let mix = |c: u32, shift: u32| {
+                        let d = (dst >> shift) & 0xff;
+                        ((c * a + d * (255 - a) + 127) / 255) << shift
+                    };
+                    let pixel =
+                        0xff00_0000 | mix(color[0], 16) | mix(color[1], 8) | mix(color[2], 0);
+                    self.put(x, y, pixel);
+                }
+            }
+        }
+    }
 }
 
-/// Lay out `splash` on the whole canvas, its spinner at `spinner_frame`, without text.
-pub fn items(splash: &Splash, size: Size, theme: &Theme, spinner_frame: usize) -> Vec<Item> {
-    let mut layout = layout::layout(splash, size, &theme.images(), spinner_frame, &mut |_, _| {
-        Size::default()
-    });
-    layout.retain(|item| !matches!(item, Item::Text { .. }));
-    layout
+/// A splash laid out, its text shaped: what [`paint`] draws.
+#[derive(Debug, Clone, Default)]
+pub struct Frame {
+    pub items: Vec<Item>,
+    /// One per [`Item::Text`] in `items`, in order.
+    pub lines: Vec<Line>,
+}
+
+/// Lay out `splash` on the whole canvas, its spinner at `spinner_frame`, a password being typed
+/// as `dialog` says. Without `fonts`, or text they cannot shape, the text is left out.
+pub fn items(
+    splash: &Splash,
+    size: Size,
+    theme: &Theme,
+    spinner_frame: usize,
+    dialog: &Dialog,
+    mut fonts: Option<&mut Fonts>,
+) -> Frame {
+    let mut shaped: Vec<(String, Font, Line)> = Vec::new();
+    let mut measure = |text: &str, font: Font| {
+        let Some(fonts) = fonts.as_deref_mut() else {
+            return Size::default();
+        };
+        let line = fonts.line(text, font, 1.);
+        let size = line.size();
+        shaped.push((text.to_owned(), font, line));
+        size
+    };
+    let laid = layout::layout(
+        splash,
+        size,
+        &theme.images(),
+        spinner_frame,
+        dialog,
+        &mut measure,
+    );
+    let mut frame = Frame::default();
+    for item in laid {
+        if let Item::Text { text, font, .. } = &item {
+            let Some(at) = shaped.iter().position(|(t, f, _)| t == text && f == font) else {
+                continue;
+            };
+            frame.lines.push(shaped.swap_remove(at).2);
+        }
+        frame.items.push(item);
+    }
+    frame
 }
 
 /// The area the spinner occupies, whichever frame it is on: what a turn redraws.
@@ -178,11 +281,19 @@ pub fn spinner_rect(items: &[Item], theme: &Theme) -> Option<Rect> {
     })
 }
 
-/// Paint `items` over black.
-pub fn paint(canvas: &mut Canvas<'_>, items: &[Item], theme: &Theme) {
+/// Paint `frame` over black.
+pub fn paint(canvas: &mut Canvas<'_>, frame: &Frame, theme: &Theme) {
     let full = Rect::new(Point::default(), canvas.size);
     canvas.fill(full, [0., 0., 0.]);
-    for item in items {
+    let mut lines = frame.lines.iter();
+    for item in &frame.items {
+        if let Item::Text { font, at, .. } = item {
+            if let Some(line) = lines.next() {
+                let origin = line.origin(at.x, at.y, line.line_box_height());
+                canvas.text(line, origin, font.color());
+            }
+            continue;
+        }
         paint_item(canvas, item, theme);
     }
 }
@@ -219,7 +330,22 @@ fn paint_item(canvas: &mut Canvas<'_>, item: &Item, theme: &Theme) {
                 canvas.fill(done, layout::BAR_FOREGROUND);
             }
         }
+        Item::Lock(at) => blend(canvas, theme.lock.as_ref(), *at),
+        Item::Entry(at) => blend(canvas, theme.entry.as_ref(), *at),
+        Item::Keyboard(at) => blend(canvas, theme.keyboard.as_ref(), *at),
+        Item::CapsLock(at) => blend(canvas, theme.caps_lock.as_ref(), *at),
+        Item::Bullet { at, src } => {
+            if let Some(image) = &theme.bullet {
+                canvas.blend_region(image, *src, *at);
+            }
+        }
         Item::Text { .. } => (),
+    }
+}
+
+fn blend(canvas: &mut Canvas<'_>, image: Option<&Image>, at: Point) {
+    if let Some(image) = image {
+        canvas.blend(image, at);
     }
 }
 
@@ -243,6 +369,7 @@ mod tests {
             spinner: (0..30)
                 .map(|i| solid(32, 32, 0xff00_0000 | (i << 16)))
                 .collect(),
+            ..Theme::default()
         }
     }
 
@@ -281,8 +408,8 @@ mod tests {
             ..Splash::default()
         };
         let mut buf = Buffer::new(1280, 800);
-        let items = items(&splash, buf.size, &theme, 7);
-        paint(&mut buf.canvas(), &items, &theme);
+        let frame = items(&splash, buf.size, &theme, 7, &Dialog::default(), None);
+        paint(&mut buf.canvas(), &frame, &theme);
         // The layout's numbers for 1280×800 (`layout::tests`): watermark at 565×726, spinner
         // at 624×544.
         assert_eq!(buf.at(565, 726), 0xff80_8080);
@@ -304,9 +431,17 @@ mod tests {
         };
         let mut buf = Buffer::new(1280, 800);
         let size = buf.size;
-        paint(&mut buf.canvas(), &items(&splash, size, &theme, 7), &theme);
+        paint(
+            &mut buf.canvas(),
+            &items(&splash, size, &theme, 7, &Dialog::default(), None),
+            &theme,
+        );
         let before = buf.bytes.clone();
-        paint_spinner(&mut buf.canvas(), &items(&splash, size, &theme, 8), &theme);
+        paint_spinner(
+            &mut buf.canvas(),
+            &items(&splash, size, &theme, 8, &Dialog::default(), None).items,
+            &theme,
+        );
         assert_eq!(buf.at(624, 544), 0xff08_0000);
         // Everything outside the spinner is as it was.
         let changed = (0..800)
@@ -330,7 +465,11 @@ mod tests {
         };
         let mut buf = Buffer::new(1280, 800);
         let size = buf.size;
-        paint(&mut buf.canvas(), &items(&splash, size, &theme, 0), &theme);
+        paint(
+            &mut buf.canvas(),
+            &items(&splash, size, &theme, 0, &Dialog::default(), None),
+            &theme,
+        );
         // The bar at 440×556, 400×5: half white, half #606060.
         assert_eq!(buf.at(440, 556), 0xffff_ffff);
         assert_eq!(buf.at(639, 560), 0xffff_ffff);
@@ -349,7 +488,11 @@ mod tests {
         // Smaller than the watermark: everything clips, nothing panics.
         let mut buf = Buffer::new(100, 30);
         let size = buf.size;
-        paint(&mut buf.canvas(), &items(&splash, size, &theme, 0), &theme);
+        paint(
+            &mut buf.canvas(),
+            &items(&splash, size, &theme, 0, &Dialog::default(), None),
+            &theme,
+        );
         assert_eq!(buf.at(0, 0), 0xff80_8080);
     }
 

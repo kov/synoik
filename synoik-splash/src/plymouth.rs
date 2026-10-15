@@ -1323,7 +1323,20 @@ mod tests {
         // A password, typed on the splash.
         run(vec!["ask-for-password", "--prompt=Disk"]);
         wait(&mut server, &|s| s.splash().password_prompt.is_some());
-        server.answer_password(Some("hunter2".into()));
+        use crate::keyboard::{Entry, Key, Outcome};
+        let mut entry = Entry::default();
+        for key in [
+            Key::Text("hunter".into()),
+            Key::Text("x".into()),
+            Key::Backspace,
+            Key::Text("2".into()),
+        ] {
+            assert_eq!(entry.apply(key), None);
+        }
+        let Some(Outcome::Answer(typed)) = entry.apply(Key::Enter) else {
+            panic!("Enter answers");
+        };
+        server.answer_password(Some(typed));
         let asked = finished(&rx, &mut server);
         assert_eq!((asked[1].as_str(), asked[2].as_str()), ("0", "hunter2"));
 

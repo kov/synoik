@@ -60,10 +60,13 @@ pub const THEME_DIR: &str = "/usr/share/plymouth/themes/spinner";
 /// bgrt's Cantarell (§4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Font {
-    /// Messages and subtitles: 12 pt.
+    /// Messages, subtitles and the password prompt: 12 pt.
     Regular,
     /// Update titles: 30 pt, light.
     Title,
+    /// The keyboard layout's name beside the keyboard icon: `keymap-render.py`'s 30 px bold, in
+    /// its grey.
+    Keymap,
 }
 
 impl Font {
@@ -72,6 +75,7 @@ impl Font {
         match self {
             Self::Regular => 16.,
             Self::Title => 40.,
+            Self::Keymap => 30.,
         }
     }
 
@@ -80,6 +84,15 @@ impl Font {
         match self {
             Self::Regular => 400,
             Self::Title => 300,
+            Self::Keymap => 700,
+        }
+    }
+
+    /// The text's colour.
+    pub fn color(self) -> [f32; 3] {
+        match self {
+            Self::Regular | Self::Title => [1., 1., 1.],
+            Self::Keymap => [0.75, 0.75, 0.75],
         }
     }
 }
@@ -99,6 +112,20 @@ const TITLE_ALIGN: (f64, f64) = (0.5, 0.382);
 /// Messages sit this far under the spinner or the progress bar (`view_show_message`).
 const MESSAGE_GAP: i32 = 10;
 
+/// bgrt's `DialogHorizontalAlignment` and `DialogVerticalAlignment`.
+const DIALOG_ALIGN: (f64, f64) = (0.5, 0.382);
+
+/// Fedora's gap between the entry and the prompt under it (§4.2).
+const PROMPT_GAP: i32 = 5;
+
+/// Between the keyboard icon and the layout's name (`ply-keymap-icon.c` `SPACING`).
+const KEYMAP_SPACING: i32 = 10;
+
+/// The band the layout's name sits in, and the margin on either side of it: `keymap-render.py`'s
+/// strip, 50 px tall, its names `MARGIN` = 10 px apart from their neighbours.
+const KEYMAP_BAND: i32 = 50;
+const KEYMAP_MARGIN: i32 = 10;
+
 /// One turn of the spinner (`ply-throbber.c` `THROBBER_DURATION`).
 pub const SPINNER_PERIOD: Duration = Duration::from_secs(2);
 
@@ -112,6 +139,24 @@ pub struct Images {
     pub watermark: Option<Size>,
     /// One frame's size, and how many frames there are.
     pub spinner: Option<(Size, usize)>,
+    /// The password dialog's: `lock.png`, `entry.png`, `bullet.png`, `keyboard.png` and
+    /// `capslock.png`.
+    pub lock: Option<Size>,
+    pub entry: Option<Size>,
+    pub bullet: Option<Size>,
+    pub keyboard: Option<Size>,
+    pub caps_lock: Option<Size>,
+}
+
+/// What the keyboard says about a password being typed: the drawers' side of the dialog, which
+/// never crosses a handoff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dialog {
+    /// One per character typed.
+    pub bullets: usize,
+    pub caps_lock: bool,
+    /// The keyboard layout's name, as xkbcommon gives it ("English (US)").
+    pub keymap: Option<String>,
 }
 
 /// One thing on screen, over a black background.
@@ -133,6 +178,18 @@ pub enum Item {
         font: Font,
         at: Point,
     },
+    /// The password dialog: the lock, the entry field, a bullet per character, the keyboard
+    /// icon, and the caps-lock icon while caps lock is on.
+    Lock(Point),
+    Entry(Point),
+    /// The part `src` of the bullet image, its top-left `at`: all of it, but for the half bullet
+    /// that says more were typed than fit.
+    Bullet {
+        at: Point,
+        src: Rect,
+    },
+    Keyboard(Point),
+    CapsLock(Point),
 }
 
 /// The update modes' title and subtitle (bgrt's `Title=` and `SubTitle=`).
@@ -156,6 +213,7 @@ pub fn spinner_frame(elapsed: Duration, frames: usize) -> usize {
 
 /// Lay out `splash` on a `screen` of logical pixels. `measure` gives a line's width and line-box
 /// height in a font. `spinner_frame` is the frame to show, which a frozen splash (`H`) keeps.
+/// `dialog` is what has been typed into a password prompt, if one is up.
 ///
 /// A splash not `shown` is the frame plymouth leaves behind on `quit --retain-splash`: the
 /// background and the watermark. It is what the outer shows from the handover until the greeter's
@@ -165,6 +223,7 @@ pub fn layout(
     screen: Size,
     images: &Images,
     spinner_frame: usize,
+    dialog: &Dialog,
     measure: &mut dyn FnMut(&str, Font) -> Size,
 ) -> Vec<Item> {
     let (w, h) = (f64::from(screen.w), f64::from(screen.h));
@@ -181,6 +240,20 @@ pub fn layout(
         return items;
     }
 
+    // A password prompt replaces the animation, the progress bar and the titles (two-step's
+    // `display_password` stops the animation; `on_draw` draws the dialog instead).
+    let prompting = splash.password_prompt.is_some();
+    if let Some(prompt) = &splash.password_prompt {
+        lay_dialog(
+            prompt.text.as_deref(),
+            screen,
+            images,
+            dialog,
+            measure,
+            &mut items,
+        );
+    }
+
     // What the message sits under (`view->animation_bottom`).
     let mut animation_bottom = None;
     let titles = titles(splash.mode);
@@ -192,20 +265,24 @@ pub fn layout(
         let rect = Rect::new((x as i32, y as i32).into(), (bw, bh).into());
         let fraction = f64::from(splash.progress.unwrap_or(0)) / 100.;
         let filled = (f64::from(bw) * fraction) as i32;
-        items.push(Item::Bar { rect, filled });
+        if !prompting {
+            items.push(Item::Bar { rect, filled });
+        }
         animation_bottom = Some(rect.loc.y + bh);
     } else if let Some((size, frames)) = images.spinner {
         let x = ANIMATION_ALIGN.0 * w - f64::from(size.w) / 2.;
         let y = ANIMATION_ALIGN.1 * h - f64::from(size.h) / 2.;
         let at = Point::from((x as i32, y as i32));
-        items.push(Item::Spinner {
-            frame: spinner_frame.min(frames.saturating_sub(1)),
-            at,
-        });
+        if !prompting {
+            items.push(Item::Spinner {
+                frame: spinner_frame.min(frames.saturating_sub(1)),
+                at,
+            });
+        }
         animation_bottom = Some(at.y + size.h);
     }
 
-    if let Some((title, subtitle)) = titles {
+    if let Some((title, subtitle)) = titles.filter(|_| !prompting) {
         let title_size = measure(title, Font::Title);
         let subtitle_size = measure(subtitle, Font::Regular);
         // The subtitle's height separates the two (`view_show_title`).
@@ -227,8 +304,12 @@ pub fn layout(
 
     // One message line: the latest. The update modes suppress messages (`SuppressMessages`) and
     // put the percentage there once one is reported.
+    // The percentage is the progress bar's, and goes with it.
     let message = if titles.is_some() {
-        splash.progress.map(|p| format!("{p}% complete"))
+        splash
+            .progress
+            .filter(|_| !prompting)
+            .map(|p| format!("{p}% complete"))
     } else {
         splash.messages.last().cloned()
     };
@@ -247,6 +328,120 @@ pub fn layout(
     items
 }
 
+/// The password dialog, as two-step's `view_show_prompt` places it: the lock and the entry side by
+/// side, the prompt under them, and under that the keyboard indicators.
+fn lay_dialog(
+    prompt: Option<&str>,
+    screen: Size,
+    images: &Images,
+    dialog: &Dialog,
+    measure: &mut dyn FnMut(&str, Font) -> Size,
+    items: &mut Vec<Item>,
+) {
+    let (w, h) = (f64::from(screen.w), f64::from(screen.h));
+    let lock = images.lock.unwrap_or_default();
+    let entry = images.entry.unwrap_or_default();
+
+    let dialog_size = Size::from((lock.w + entry.w, lock.h.max(entry.h)));
+    let dialog_at = Point::from((
+        ((w - f64::from(dialog_size.w)) * DIALOG_ALIGN.0) as i32,
+        ((h - f64::from(dialog_size.h)) * DIALOG_ALIGN.1) as i32,
+    ));
+    let centred = |outer: i32, inner: i32| (f64::from(outer - inner) / 2.) as i32;
+    if images.lock.is_some() {
+        items.push(Item::Lock(Point::from((
+            dialog_at.x,
+            dialog_at.y + centred(dialog_size.h, lock.h),
+        ))));
+    }
+    let entry_at = Point::from((
+        dialog_at.x + lock.w,
+        dialog_at.y + centred(dialog_size.h, entry.h),
+    ));
+    if images.entry.is_some() {
+        items.push(Item::Entry(entry_at));
+    }
+
+    // `ply_entry_draw_area`: bullets a bullet's width apart, the first half a bullet in.
+    if let Some(bullet) = images.bullet.filter(|b| b.w > 0 && dialog.bullets > 0) {
+        let fit = entry.w / bullet.w - i32::from(entry.w % bullet.w < bullet.w / 2);
+        let fit = usize::try_from(fit).unwrap_or(0);
+        let y = (f64::from(entry_at.y) + f64::from(entry.h) / 2. - f64::from(bullet.h) / 2.) as i32;
+        let whole = Rect::new(Point::default(), bullet);
+        if dialog.bullets > fit {
+            // More than fit: half a bullet at the entry's left edge says so.
+            let x = (f64::from(entry_at.x) - f64::from(bullet.w) / 2.) as i32;
+            let cut = entry_at.x - x;
+            items.push(Item::Bullet {
+                at: Point::from((entry_at.x, y)),
+                src: Rect::new((cut, 0).into(), (bullet.w - cut, bullet.h).into()),
+            });
+        }
+        for i in 0..dialog.bullets.min(fit) as i32 {
+            let x = f64::from(entry_at.x + i * bullet.w) + f64::from(bullet.w) / 2.;
+            items.push(Item::Bullet {
+                at: Point::from((x as i32, y)),
+                src: whole,
+            });
+        }
+    }
+
+    let mut bottom = dialog_at.y + dialog_size.h;
+    // Fedora's prompts end without the ':' upstream's carry (§4.2).
+    if let Some(text) = prompt
+        .map(|p| p.strip_suffix(':').unwrap_or(p))
+        .filter(|p| !p.is_empty())
+    {
+        let size = measure(text, Font::Regular);
+        let y = bottom + PROMPT_GAP;
+        items.push(Item::Text {
+            text: text.to_owned(),
+            font: Font::Regular,
+            at: Point::from((((w - f64::from(size.w)) / 2.) as i32, y)),
+        });
+        bottom = y + size.h;
+    }
+
+    // The keyboard indicators: the layout (icon and name), then caps lock beside it. Only the
+    // layout's width centres them.
+    let Some(keyboard) = images.keyboard else {
+        return;
+    };
+    let name = dialog.keymap.as_deref().filter(|n| !n.is_empty());
+    let name_size = name.map(|n| measure(n, Font::Keymap));
+    let band = Size::from((
+        name_size.map_or(0, |s| s.w + 2 * KEYMAP_MARGIN),
+        if name.is_some() { KEYMAP_BAND } else { 0 },
+    ));
+    let keymap = Size::from((keyboard.w + KEYMAP_SPACING + band.w, keyboard.h.max(band.h)));
+    let caps = images.caps_lock.unwrap_or_default();
+    let indicators_h = caps.h.max(keymap.h);
+    let x = ((w - f64::from(keymap.w)) * DIALOG_ALIGN.0) as i32;
+    let y = (f64::from(bottom + indicators_h / 2) + f64::from(indicators_h - keymap.h) / 2.) as i32;
+    items.push(Item::Keyboard(Point::from((
+        x,
+        y + (keymap.h - keyboard.h) / 2,
+    ))));
+    if let (Some(name), Some(size)) = (name, name_size) {
+        // Where plymouth shows its strip's slice: the name starts at the slice's left edge, the
+        // two margins after it; centred in the band.
+        let band_y = y + (keymap.h - band.h) / 2;
+        items.push(Item::Text {
+            text: name.to_owned(),
+            font: Font::Keymap,
+            at: Point::from((
+                x + keyboard.w + KEYMAP_SPACING,
+                band_y + (band.h - size.h) / 2,
+            )),
+        });
+    }
+    if dialog.caps_lock && images.caps_lock.is_some() {
+        let y =
+            (f64::from(bottom + indicators_h / 2) + f64::from(indicators_h - caps.h) / 2.) as i32;
+        items.push(Item::CapsLock(Point::from((x + keymap.w, y))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +451,11 @@ mod tests {
         Images {
             watermark: Some(Size::from((149, 43))),
             spinner: Some((Size::from((32, 32)), 30)),
+            lock: Some(Size::from((35, 34))),
+            entry: Some(Size::from((305, 34))),
+            bullet: Some(Size::from((10, 10))),
+            keyboard: Some(Size::from((36, 36))),
+            caps_lock: Some(Size::from((24, 28))),
         }
     }
 
@@ -266,7 +466,14 @@ mod tests {
     }
 
     fn lay(splash: &Splash, w: i32, h: i32) -> Vec<Item> {
-        layout(splash, Size::from((w, h)), &images(), 7, &mut measure)
+        layout(
+            splash,
+            Size::from((w, h)),
+            &images(),
+            7,
+            &Dialog::default(),
+            &mut measure,
+        )
     }
 
     fn shown(mode: Mode) -> Splash {
@@ -412,9 +619,142 @@ mod tests {
             Size::from((1280, 800)),
             &Images::default(),
             0,
+            &Dialog::default(),
             &mut measure,
         );
         assert!(items.is_empty());
+    }
+
+    fn prompting(mode: Mode, text: Option<&str>) -> Splash {
+        let mut splash = shown(mode);
+        splash.password_prompt = Some(crate::plymouth::Prompt {
+            text: text.map(str::to_owned),
+        });
+        splash
+    }
+
+    fn lay_dialog(splash: &Splash, dialog: &Dialog) -> Vec<Item> {
+        layout(
+            splash,
+            Size::from((1280, 800)),
+            &images(),
+            7,
+            dialog,
+            &mut measure,
+        )
+    }
+
+    #[test]
+    fn a_password_prompt_replaces_the_spinner() {
+        let dialog = Dialog {
+            bullets: 3,
+            caps_lock: true,
+            keymap: Some("English (US)".into()),
+        };
+        let items = lay_dialog(
+            &prompting(Mode::BootUp, Some("Passphrase for data:")),
+            &dialog,
+        );
+        // The dialog, 340×34, at (0.5 × (1280 − 340), 0.382 × (800 − 34)).
+        assert_eq!(
+            items,
+            [
+                Item::Watermark(Point::from((565, 726))),
+                Item::Lock(Point::from((470, 292))),
+                Item::Entry(Point::from((505, 292))),
+                Item::Bullet {
+                    at: Point::from((510, 304)),
+                    src: Rect::new((0, 0).into(), (10, 10).into()),
+                },
+                Item::Bullet {
+                    at: Point::from((520, 304)),
+                    src: Rect::new((0, 0).into(), (10, 10).into()),
+                },
+                Item::Bullet {
+                    at: Point::from((530, 304)),
+                    src: Rect::new((0, 0).into(), (10, 10).into()),
+                },
+                // Without its ':', 19 characters, 5 px under the entry.
+                Item::Text {
+                    text: "Passphrase for data".into(),
+                    font: Font::Regular,
+                    at: Point::from((564, 331)),
+                },
+                // The layout: 36 + 10 + (96 + 20) = 162 wide, its 50 px band the tallest, half
+                // of it under the prompt's bottom at 351.
+                Item::Keyboard(Point::from((559, 383))),
+                Item::Text {
+                    text: "English (US)".into(),
+                    font: Font::Keymap,
+                    at: Point::from((605, 391)),
+                },
+                Item::CapsLock(Point::from((721, 387))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_entry_shows_half_a_bullet_at_its_edge() {
+        let dialog = Dialog {
+            bullets: 31,
+            ..Dialog::default()
+        };
+        let items = lay_dialog(&prompting(Mode::BootUp, None), &dialog);
+        let bullets: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Bullet { at, src } => Some((*at, *src)),
+                _ => None,
+            })
+            .collect();
+        // 305 / 10 = 30 whole ones, and the right half of one more at the entry's left edge.
+        assert_eq!(bullets.len(), 31);
+        assert_eq!(
+            bullets[0],
+            (
+                Point::from((505, 304)),
+                Rect::new((5, 0).into(), (5, 10).into())
+            )
+        );
+        assert_eq!(bullets[30].0, Point::from((800, 304)));
+        // No prompt and no layout name: the icon alone, 46 wide with its spacing, half its
+        // height under the dialog's bottom at 326; caps lock off.
+        assert!(items.contains(&Item::Keyboard(Point::from((617, 344)))));
+        assert!(!items.iter().any(|i| matches!(i, Item::CapsLock(_))));
+    }
+
+    #[test]
+    fn a_prompt_over_an_update_hides_the_bar_and_titles() {
+        let mut splash = prompting(Mode::Updates, Some("Password"));
+        splash.progress = Some(42);
+        let items = lay_dialog(&splash, &Dialog::default());
+        assert!(!items.iter().any(|i| matches!(
+            i,
+            Item::Bar { .. }
+                | Item::Spinner { .. }
+                | Item::Text {
+                    font: Font::Title,
+                    ..
+                }
+        )));
+        assert!(!items
+            .iter()
+            .any(|i| matches!(i, Item::Text { text, .. } if text.ends_with("complete"))));
+    }
+
+    #[test]
+    fn messages_stay_under_the_hidden_spinner() {
+        let mut splash = prompting(Mode::BootUp, None);
+        splash.messages = vec!["Touch the key".into()];
+        let items = lay_dialog(&splash, &Dialog::default());
+        assert_eq!(
+            items.last(),
+            Some(&Item::Text {
+                text: "Touch the key".into(),
+                font: Font::Regular,
+                at: Point::from((588, 586)),
+            })
+        );
     }
 
     #[test]

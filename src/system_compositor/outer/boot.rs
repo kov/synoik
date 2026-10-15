@@ -15,6 +15,8 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken};
 use synoik_splash::handoff;
+use synoik_splash::keyboard::{self, Entry, Keyboard, Outcome};
+use synoik_splash::layout::Dialog;
 
 use super::{Outer, Shown};
 use crate::system_compositor::plymouth::{self, Event, Server};
@@ -30,6 +32,12 @@ pub(super) struct Plymouth {
     pub server: Server,
     retry: Option<RegistrationToken>,
     connections: std::collections::HashMap<u64, RegistrationToken>,
+    /// Open, and watched, while a password prompt is up (§4.2).
+    keyboard: Option<(Keyboard, RegistrationToken)>,
+    entry: Entry,
+    /// Inside the keyboard's own callback, whose watch goes by returning `Remove`; set once it
+    /// should.
+    in_keyboard: Option<bool>,
 }
 
 impl Plymouth {
@@ -39,6 +47,9 @@ impl Plymouth {
             server: Server::new(0),
             retry: None,
             connections: std::collections::HashMap::new(),
+            keyboard: None,
+            entry: Entry::default(),
+            in_keyboard: None,
         }
     }
 }
@@ -138,11 +149,12 @@ impl Outer {
     }
 
     /// The splash's revision and spinner frame as the screen should show them. A splash not
-    /// shown has no spinner, so its frame stays put: a turning one would redraw the same picture
-    /// fifteen times a second.
+    /// shown has no spinner, nor has one asking for a password, so its frame stays put: a
+    /// turning one would redraw the same picture fifteen times a second.
     pub(super) fn splash_state(&mut self) -> (u64, usize) {
         let revision = self.boot.as_ref().map_or(0, |b| b.revision);
-        let frame = if self.plymouth.server.splash().shown {
+        let splash = self.plymouth.server.splash();
+        let frame = if splash.shown && splash.password_prompt.is_none() {
             self.spinner_frame()
         } else {
             0
@@ -292,10 +304,7 @@ impl Outer {
     /// returning `Remove` instead of through the handle.
     fn on_plymouth_except(&mut self, current: Option<u64>) {
         loop {
-            // No dialog until step 5 of the build order: the client asks some other way.
-            while self.plymouth.server.splash().password_prompt.is_some() {
-                self.plymouth.server.answer_password(None);
-            }
+            self.follow_prompt();
             let events = self.plymouth.server.take_events();
             if events.is_empty() {
                 break;
@@ -313,6 +322,93 @@ impl Outer {
             }
         }
         self.close_plymouth_connections(current);
+    }
+
+    /// Read the keyboard while a password prompt is up, and only then. A prompt with nothing to
+    /// type it on is cancelled: its client asks some other way.
+    fn follow_prompt(&mut self) {
+        let prompting = self.plymouth.server.splash().password_prompt.is_some();
+        if prompting && self.plymouth.keyboard.is_none() {
+            if self.boot.is_none() {
+                self.plymouth.server.answer_password(None);
+                return;
+            }
+            let keyboard = match keyboard::open_system() {
+                Ok(keyboard) => keyboard,
+                Err(err) => {
+                    warn!("not asking for the password: {err}");
+                    self.plymouth.server.answer_password(None);
+                    return;
+                }
+            };
+            // The keyboard lives in `self.plymouth` until the watch is removed.
+            let fd = ConnectionFd(std::os::fd::AsRawFd::as_raw_fd(&keyboard.fd()));
+            let token = self
+                .handle
+                .insert_source(
+                    Generic::new(fd, Interest::READ, Mode::Level),
+                    |_, _, outer: &mut Outer| {
+                        outer.plymouth.in_keyboard = Some(false);
+                        outer.on_keyboard();
+                        Ok(match outer.plymouth.in_keyboard.take() {
+                            Some(true) => PostAction::Remove,
+                            _ => PostAction::Continue,
+                        })
+                    },
+                )
+                .expect("inserting the keyboard");
+            self.plymouth.keyboard = Some((keyboard, token));
+            self.dialog_changed();
+        } else if !prompting {
+            if let Some((keyboard, token)) = self.plymouth.keyboard.take() {
+                match &mut self.plymouth.in_keyboard {
+                    Some(remove) => *remove = true,
+                    None => self.handle.remove(token),
+                }
+                // After the watch is gone, as a connection's stream (`close_plymouth_connections`).
+                self.handle.insert_idle(move |_| drop::<Keyboard>(keyboard));
+                self.plymouth.entry.clear();
+                self.dialog_changed();
+            }
+        }
+    }
+
+    /// What the keyboard says about the password being typed.
+    pub(super) fn splash_dialog(&self) -> Dialog {
+        let keyboard = self.plymouth.keyboard.as_ref().map(|(k, _)| k);
+        Dialog {
+            bullets: self.plymouth.entry.bullets(),
+            caps_lock: keyboard.is_some_and(Keyboard::caps_lock),
+            keymap: keyboard.and_then(Keyboard::layout_name),
+        }
+    }
+
+    fn on_keyboard(&mut self) {
+        let Some((keyboard, _)) = &mut self.plymouth.keyboard else {
+            return;
+        };
+        let (keys, mut changed) = keyboard.dispatch();
+        for key in keys {
+            changed = true;
+            match self.plymouth.entry.apply(key) {
+                None => (),
+                Some(Outcome::Answer(password)) => {
+                    self.plymouth.server.answer_password(Some(password));
+                }
+                Some(Outcome::Cancel) => self.plymouth.server.answer_password(None),
+            }
+        }
+        if changed {
+            self.dialog_changed();
+        }
+        self.on_plymouth();
+    }
+
+    fn dialog_changed(&mut self) {
+        if let Some(boot) = &mut self.boot {
+            boot.revision += 1;
+        }
+        self.redraw_splash();
     }
 
     fn on_splash_changed(&mut self) {

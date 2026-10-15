@@ -26,7 +26,7 @@ use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Rectangle, Size, 
 use synoik_splash::layout as geo;
 
 use super::plymouth::Splash;
-use super::splash::{self, Font, Images, Item};
+use super::splash::{self, Dialog, Font, Images, Item};
 use crate::backend::vulkan_scanout::{
     framebuffer_from_dmabuf, PrimeFramebuffer, VulkanScanoutAllocator, VulkanScanoutBuffer,
 };
@@ -55,21 +55,16 @@ pub(super) struct Compositor {
 struct Theme {
     watermark: Option<VkTexture>,
     spinner: Vec<VkTexture>,
+    /// The password dialog's.
+    lock: Option<VkTexture>,
+    entry: Option<VkTexture>,
+    bullet: Option<VkTexture>,
+    keyboard: Option<VkTexture>,
+    caps_lock: Option<VkTexture>,
 }
 
 impl Theme {
     fn load(renderer: &mut VulkanRenderer, dir: &Path) -> Self {
-        let mut load = |name: &str| {
-            let path = dir.join(name);
-            match load_image(renderer, &path) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    warn!("splash: {}: {err:#}", path.display());
-                    None
-                }
-            }
-        };
-        let watermark = load("watermark.png");
         // All the frames or none: a spinner with a gap would stutter.
         let spinner = (1..)
             .map(|i| dir.join(format!("throbber-{i:04}.png")))
@@ -80,7 +75,25 @@ impl Theme {
                 warn!("splash: spinner: {err:#}");
                 Vec::new()
             });
-        Self { watermark, spinner }
+        let mut load = |name: &str| {
+            let path = dir.join(name);
+            match load_image(renderer, &path) {
+                Ok(texture) => Some(texture),
+                Err(err) => {
+                    warn!("splash: {}: {err:#}", path.display());
+                    None
+                }
+            }
+        };
+        Self {
+            watermark: load("watermark.png"),
+            spinner,
+            lock: load("lock.png"),
+            entry: load("entry.png"),
+            bullet: load("bullet.png"),
+            keyboard: load("keyboard.png"),
+            caps_lock: load("capslock.png"),
+        }
     }
 
     fn images(&self) -> Images {
@@ -88,6 +101,11 @@ impl Theme {
         Images {
             watermark: self.watermark.as_ref().map(size),
             spinner: self.spinner.first().map(|t| (size(t), self.spinner.len())),
+            lock: self.lock.as_ref().map(size),
+            entry: self.entry.as_ref().map(size),
+            bullet: self.bullet.as_ref().map(size),
+            keyboard: self.keyboard.as_ref().map(size),
+            caps_lock: self.caps_lock.as_ref().map(size),
         }
     }
 }
@@ -250,7 +268,9 @@ impl Compositor {
     }
 
     /// Draw `splash` into a free slot of `canvas` (avoiding `busy`) at `scale`, its spinner at
-    /// `spinner_frame`. Returns the slot, its framebuffer and the fence that completes the draw.
+    /// `spinner_frame`, a password being typed as `dialog` says. Returns the slot, its framebuffer
+    /// and the fence that completes the draw.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_splash(
         &mut self,
         canvas: &mut Canvas,
@@ -259,6 +279,7 @@ impl Compositor {
         splash: &Splash,
         scale: f64,
         spinner_frame: usize,
+        dialog: &Dialog,
     ) -> anyhow::Result<(usize, Rc<PrimeFramebuffer>, Option<OwnedFd>)> {
         if canvas.slots.is_empty() {
             self.allocate(canvas, drm_fd)?;
@@ -267,7 +288,7 @@ impl Compositor {
             .find(|&i| Some(i) != busy)
             .context("no free scanout slot")?;
         let size = canvas.size;
-        let prepared = self.prepare_splash(splash, size, scale, spinner_frame);
+        let prepared = self.prepare_splash(splash, size, scale, spinner_frame, dialog);
 
         self.renderer.set_finish_may_defer(true);
         let result = (|| {
@@ -314,9 +335,10 @@ impl Compositor {
         splash: &Splash,
         scale: f64,
         spinner_frame: usize,
+        dialog: &Dialog,
     ) -> anyhow::Result<VkTexture> {
         let size: Size<i32, Physical> = Size::from((i32::from(size.0), i32::from(size.1)));
-        let prepared = self.prepare_splash(splash, size, scale, spinner_frame);
+        let prepared = self.prepare_splash(splash, size, scale, spinner_frame, dialog);
         let mut target = self
             .renderer
             .create_buffer(
@@ -349,6 +371,7 @@ impl Compositor {
         size: Size<i32, Physical>,
         scale: f64,
         spinner_frame: usize,
+        dialog: &Dialog,
     ) -> PreparedSplash {
         let images = self.theme().images();
         let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
@@ -377,7 +400,14 @@ impl Compositor {
                 geo::Size::default()
             }
         };
-        let laid = splash::layout(splash, logical, &images, spinner_frame, &mut measure);
+        let laid = splash::layout(
+            splash,
+            logical,
+            &images,
+            spinner_frame,
+            dialog,
+            &mut measure,
+        );
 
         // Each text item was measured exactly once, in order; keep the ones that shaped.
         let mut items = Vec::with_capacity(laid.len());
@@ -454,6 +484,26 @@ fn paint_splash(
                     painter.image(t, logical(*at, size_of(t)), 1.0)?;
                 }
             }
+            Item::Lock(at) | Item::Entry(at) | Item::Keyboard(at) | Item::CapsLock(at) => {
+                let texture = theme.and_then(|t| match item {
+                    Item::Lock(_) => t.lock.as_ref(),
+                    Item::Entry(_) => t.entry.as_ref(),
+                    Item::Keyboard(_) => t.keyboard.as_ref(),
+                    _ => t.caps_lock.as_ref(),
+                });
+                if let Some(t) = texture {
+                    painter.image(t, logical(*at, size_of(t)), 1.0)?;
+                }
+            }
+            Item::Bullet { at, src } => {
+                if let Some(t) = theme.and_then(|t| t.bullet.as_ref()) {
+                    let from = Rectangle::new(
+                        (f64::from(src.loc.x), f64::from(src.loc.y)).into(),
+                        (f64::from(src.size.w), f64::from(src.size.h)).into(),
+                    );
+                    painter.image_region(t, from, logical(*at, src.size), 1.0)?;
+                }
+            }
             Item::Bar { rect, filled } => {
                 let [r, g, b] = splash::BAR_BACKGROUND;
                 let full = logical(rect.loc, rect.size);
@@ -464,7 +514,7 @@ fn paint_splash(
                     painter.fill_rounded(done, 0., [r, g, b, 1.])?;
                 }
             }
-            Item::Text { at, .. } => {
+            Item::Text { at, font, .. } => {
                 let Some(run) = texts.next() else { continue };
                 let band = f64::from(run.line_box_height()) / prepared.scale;
                 let full = Rectangle::from_size(size.to_f64().to_logical(prepared.scale));
@@ -474,7 +524,10 @@ fn paint_splash(
                     HAlign::Left,
                     f64::from(at.y),
                     band,
-                    [1., 1., 1., 1.],
+                    {
+                        let [r, g, b] = font.color();
+                        [r, g, b, 1.]
+                    },
                     full,
                 )?;
             }
@@ -578,12 +631,19 @@ mod tests {
             messages: vec!["Hello".into()],
             ..Splash::default()
         };
-        let mut texture = c.splash_picture((1280, 800), &boot, 1., 0).unwrap();
+        let mut texture = c
+            .splash_picture((1280, 800), &boot, 1., 0, &Dialog::default())
+            .unwrap();
         let images = c.theme.as_ref().unwrap().images();
         let (watermark, spinner) = (images.watermark.unwrap(), images.spinner.unwrap().0);
-        let items = splash::layout(&boot, (1280, 800).into(), &images, 0, &mut |_, _| {
-            (0, 0).into()
-        });
+        let items = splash::layout(
+            &boot,
+            (1280, 800).into(),
+            &images,
+            0,
+            &Dialog::default(),
+            &mut |_, _| (0, 0).into(),
+        );
         let place = |item: &Item| match item {
             Item::Watermark(at) => Some(rect(at.x, at.y, watermark.w, watermark.h)),
             Item::Spinner { at, .. } => Some(rect(at.x, at.y, spinner.w, spinner.h)),
@@ -605,7 +665,9 @@ mod tests {
             progress: Some(50),
             ..Splash::default()
         };
-        let mut texture = c.splash_picture((1280, 800), &update, 1., 0).unwrap();
+        let mut texture = c
+            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default())
+            .unwrap();
         let px = pixels(&mut c, &mut texture);
         // The bar at 440×556, 400×5: white to half, grey after.
         let (width, bytes) = &px;
@@ -618,9 +680,52 @@ mod tests {
         let above_bar = rect(sp.loc.x, sp.loc.y, sp.size.w, 556 - sp.loc.y);
         assert_eq!(brightest(&px, above_bar), 0);
 
+        // A password prompt: the dialog where the layout puts it, its bullets, no spinner.
+        let asking = Splash {
+            shown: true,
+            password_prompt: Some(super::super::plymouth::Prompt {
+                text: Some("Passphrase:".into()),
+            }),
+            ..Splash::default()
+        };
+        let dialog = Dialog {
+            bullets: 3,
+            caps_lock: false,
+            keymap: Some("English (US)".into()),
+        };
+        let mut texture = c
+            .splash_picture((1280, 800), &asking, 1., 0, &dialog)
+            .unwrap();
+        let laid = splash::layout(
+            &asking,
+            (1280, 800).into(),
+            &images,
+            0,
+            &dialog,
+            &mut |_, _| (0, 0).into(),
+        );
+        let px = pixels(&mut c, &mut texture);
+        for item in &laid {
+            let (at, size) = match item {
+                Item::Lock(at) => (at, images.lock),
+                Item::Entry(at) => (at, images.entry),
+                Item::Keyboard(at) => (at, images.keyboard),
+                Item::Bullet { at, src } => (at, Some(src.size)),
+                _ => continue,
+            };
+            let size = size.unwrap();
+            assert!(
+                brightest(&px, rect(at.x, at.y, size.w, size.h)) > 64,
+                "{item:?}"
+            );
+        }
+        assert_eq!(brightest(&px, sp), 0);
+
         // The retained frame: the watermark alone.
         update.shown = false;
-        let mut texture = c.splash_picture((1280, 800), &update, 1., 0).unwrap();
+        let mut texture = c
+            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default())
+            .unwrap();
         let px = pixels(&mut c, &mut texture);
         assert!(brightest(&px, wm) > 128);
         assert_eq!(brightest(&px, rect(0, 0, 1280, wm.loc.y)), 0);

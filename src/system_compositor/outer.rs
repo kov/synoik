@@ -958,13 +958,22 @@ impl Outer {
         }
         let (revision, frame) = self.splash_state();
         let splash = self.plymouth.server.splash().clone();
+        let dialog = self.splash_dialog();
         let display = self.displays.get_mut(d)?;
         let busy = match &display.on_screen {
             Shown::Composite { slot, .. } | Shown::Splash { slot, .. } => Some(*slot),
             _ => None,
         };
         let compositor = self.compositor.as_mut()?;
-        match compositor.draw_splash(&mut display.canvas, &self.drm_fd, busy, &splash, 1., frame) {
+        match compositor.draw_splash(
+            &mut display.canvas,
+            &self.drm_fd,
+            busy,
+            &splash,
+            1.,
+            frame,
+            &dialog,
+        ) {
             Ok((slot, fb, fence)) => Some((
                 *(*fb).as_ref(),
                 Shown::Splash {
@@ -1841,10 +1850,11 @@ impl Outer {
         };
         let (_, frame) = self.splash_state();
         let splash = self.plymouth.server.splash().clone();
+        let dialog = self.splash_dialog();
         let Some(compositor) = self.compositor.as_mut() else {
             return plate_picture();
         };
-        match compositor.splash_picture(size, &splash, 1., frame) {
+        match compositor.splash_picture(size, &splash, 1., frame, &dialog) {
             Ok(texture) => Picture::Texture(texture),
             Err(err) => {
                 warn!("drawing the splash on {d}: {err:#}");

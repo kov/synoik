@@ -4030,6 +4030,28 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Draw the part `src` (texture pixels) of `texture` stretched over logical `rect`
+    /// (bilinear), blended at `alpha`.
+    pub fn image_region(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        rect: Rectangle<f64, Logical>,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
+        let dst = self.rect_px(rect);
+        self.frame.render_texture_from_to(
+            texture,
+            src,
+            dst,
+            &Self::damage_of(dst),
+            &[],
+            Transform::Normal,
+            alpha,
+        )?;
+        Ok(())
+    }
+
     /// Fill a **physical** sub-rect with a solid `color` (no rounding). The
     /// physical-coordinate counterpart to [`fill_rounded`](Self::fill_rounded) for
     /// content-sized widgets whose chrome (a dialog's border/interior, a keycap

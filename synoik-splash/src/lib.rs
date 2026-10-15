@@ -13,9 +13,11 @@ use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 pub mod handoff;
+pub mod keyboard;
 pub mod layout;
 pub mod paint;
 pub mod plymouth;
+pub mod text;
 
 /// A unix socket peer's credentials.
 pub struct PeerCred {

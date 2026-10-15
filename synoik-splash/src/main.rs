@@ -22,9 +22,11 @@ use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
 use drm::control::{connector, crtc, framebuffer, Device as _, Mode, ModeTypeFlags, PageFlipFlags};
 use synoik_splash::handoff::{self, State};
-use synoik_splash::layout::{self, Size};
-use synoik_splash::paint::{self, Canvas, Theme};
+use synoik_splash::keyboard::{self, Entry, Keyboard, Outcome};
+use synoik_splash::layout::{self, Dialog, Size};
+use synoik_splash::paint::{self, Canvas, Frame, Theme};
 use synoik_splash::plymouth::{self, Event, Server};
+use synoik_splash::text::{self, Fonts};
 
 /// The card, as the drm crate wants it.
 struct Card(OwnedFd);
@@ -74,6 +76,10 @@ struct Display {
 struct Splash {
     server: Server,
     theme: Theme,
+    fonts: Fonts,
+    /// Open while a password prompt is up.
+    keyboard: Option<Keyboard>,
+    entry: Entry,
     card: Option<Card>,
     recovered: bool,
     displays: Vec<Display>,
@@ -100,6 +106,17 @@ fn under_systemd() -> bool {
 }
 
 fn main() {
+    // At image build (`90synoik`): the system keymap, compiled for the image to carry.
+    if std::env::args().nth(1).as_deref() == Some("--compile-keymap") {
+        match keyboard::compile_system_keymap() {
+            Some(keymap) => print!("{keymap}"),
+            None => {
+                eprintln!("synoik-splash: the system keymap does not compile");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()
@@ -134,6 +151,9 @@ fn run() -> io::Result<()> {
         // plymouthd answers root only (`ply-boot-server.c:265-285`).
         server: Server::new(0),
         theme: Theme::load(Path::new(layout::THEME_DIR)),
+        fonts: Fonts::load(&[Path::new(text::FONT_FILE)]),
+        keyboard: None,
+        entry: Entry::default(),
         recovered: drm.is_some(),
         card: drm,
         displays: Vec::new(),
@@ -212,6 +232,13 @@ fn run() -> io::Result<()> {
                 revents: 0,
             });
         }
+        if let Some(keyboard) = &splash.keyboard {
+            fds.push(libc::pollfd {
+                fd: keyboard.fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         let ids: Vec<u64> = splash.connections.keys().copied().collect();
         for &id in &ids {
             if let Some(fd) = splash.server.connection_fd(id) {
@@ -255,6 +282,13 @@ fn run() -> io::Result<()> {
         {
             splash.on_card_readable();
         }
+        if splash
+            .keyboard
+            .as_ref()
+            .is_some_and(|k| ready(k.fd().as_raw_fd()))
+        {
+            splash.on_keyboard();
+        }
         for id in ids {
             let readable = splash
                 .server
@@ -271,7 +305,9 @@ fn run() -> io::Result<()> {
 impl Splash {
     /// The spinner frame to draw now.
     fn spinner_frame(&self) -> usize {
-        if !self.server.splash().shown {
+        // Nothing turns: no splash, or a password dialog in the spinner's place.
+        let splash = self.server.splash();
+        if !splash.shown || splash.password_prompt.is_some() {
             return 0;
         }
         if let Some(frame) = self.frozen {
@@ -287,7 +323,8 @@ impl Splash {
         if self.card.is_none() {
             return CARD_POLL.as_millis() as i32;
         }
-        let turning = self.server.splash().shown && self.frozen.is_none();
+        let splash = self.server.splash();
+        let turning = splash.shown && splash.password_prompt.is_none() && self.frozen.is_none();
         if !turning || self.displays.is_empty() {
             return -1;
         }
@@ -368,10 +405,18 @@ impl Splash {
     fn light(&mut self) {
         let state = (self.revision, self.spinner_frame());
         let splash = self.server.splash().clone();
+        let dialog = self.dialog();
         let Some(card) = &self.card else { return };
         for display in &mut self.displays {
-            let items = paint::items(&splash, display.size, &self.theme, state.1);
-            if let Err(err) = display.paint(0, self.revision, &items, &self.theme) {
+            let frame = paint::items(
+                &splash,
+                display.size,
+                &self.theme,
+                state.1,
+                &dialog,
+                Some(&mut self.fonts),
+            );
+            if let Err(err) = display.paint(0, self.revision, &frame, &self.theme) {
                 warn!("painting the splash: {err}");
                 continue;
             }
@@ -388,6 +433,7 @@ impl Splash {
     fn redraw(&mut self) {
         let state = (self.revision, self.spinner_frame());
         let splash = self.server.splash().clone();
+        let dialog = self.dialog();
         let Some(card) = &self.card else { return };
         for display in &mut self.displays {
             let Some(front) = display.front else { continue };
@@ -395,8 +441,15 @@ impl Splash {
                 continue;
             }
             let back = 1 - front;
-            let items = paint::items(&splash, display.size, &self.theme, state.1);
-            if let Err(err) = display.paint(back, self.revision, &items, &self.theme) {
+            let frame = paint::items(
+                &splash,
+                display.size,
+                &self.theme,
+                state.1,
+                &dialog,
+                Some(&mut self.fonts),
+            );
+            if let Err(err) = display.paint(back, self.revision, &frame, &self.theme) {
                 warn!("painting the splash: {err}");
                 continue;
             }
@@ -437,10 +490,6 @@ impl Splash {
     /// Act on what plymouth's clients changed.
     fn on_plymouth(&mut self) {
         loop {
-            // No dialog until step 5: the client asks some other way.
-            while self.server.splash().password_prompt.is_some() {
-                self.server.answer_password(None);
-            }
             let events = self.server.take_events();
             if events.is_empty() {
                 break;
@@ -459,6 +508,57 @@ impl Splash {
             self.connections.remove(&id);
             drop(stream);
         }
+        self.follow_prompt();
+    }
+
+    /// Read the keyboard while a password prompt is up, and only then.
+    fn follow_prompt(&mut self) {
+        let prompting = self.server.splash().password_prompt.is_some();
+        if prompting && self.keyboard.is_none() {
+            match keyboard::open_system() {
+                Ok(keyboard) => self.keyboard = Some(keyboard),
+                Err(err) => {
+                    // Nothing to type with: the client asks some other way.
+                    warn!("not asking for the password: {err}");
+                    self.server.answer_password(None);
+                    return self.on_plymouth();
+                }
+            }
+            self.revision += 1;
+        } else if !prompting && self.keyboard.is_some() {
+            self.keyboard = None;
+            self.entry.clear();
+            self.revision += 1;
+        }
+    }
+
+    /// What the keyboard says about the password being typed.
+    fn dialog(&self) -> Dialog {
+        Dialog {
+            bullets: self.entry.bullets(),
+            caps_lock: self.keyboard.as_ref().is_some_and(Keyboard::caps_lock),
+            keymap: self.keyboard.as_ref().and_then(Keyboard::layout_name),
+        }
+    }
+
+    fn on_keyboard(&mut self) {
+        let Some(keyboard) = &mut self.keyboard else {
+            return;
+        };
+        let (keys, leds) = keyboard.dispatch();
+        let mut changed = leds;
+        for key in keys {
+            changed = true;
+            match self.entry.apply(key) {
+                None => (),
+                Some(Outcome::Answer(password)) => self.server.answer_password(Some(password)),
+                Some(Outcome::Cancel) => self.server.answer_password(None),
+            }
+        }
+        if changed {
+            self.revision += 1;
+        }
+        self.on_plymouth();
     }
 
     fn on_splash_changed(&mut self) {
@@ -479,6 +579,9 @@ impl Splash {
     /// and the listener are in the fd store already; closing them here changes nothing on screen.
     fn hand_off(&mut self) {
         info!("handing the splash over");
+        // The VT keyboard back on. A prompt up now dies with its connection (§7.2).
+        self.keyboard = None;
+        self.entry.clear();
         if under_systemd() {
             let state = State {
                 splash: self.server.splash().clone(),
@@ -541,7 +644,7 @@ impl Display {
         &mut self,
         index: usize,
         revision: u64,
-        items: &[layout::Item],
+        frame: &Frame,
         theme: &Theme,
     ) -> io::Result<()> {
         let size = self.size;
@@ -553,9 +656,9 @@ impl Display {
             bytes: buf.map.bytes(),
         };
         if full {
-            paint::paint(&mut canvas, items, theme);
+            paint::paint(&mut canvas, frame, theme);
         } else {
-            paint::paint_spinner(&mut canvas, items, theme);
+            paint::paint_spinner(&mut canvas, &frame.items, theme);
         }
         buf.drawn = Some(revision);
         Ok(())

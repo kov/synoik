@@ -12,6 +12,11 @@ name = "synoik-splash"
 path = "src/main.rs"
 
 [dependencies]
+# The outer's shaping (`synoik-vk`), without fontconfig: the initramfs has none.
+cosmic-text = { version = "0.19.0", default-features = false, features = ["std", "swash"] }
+swash = "0.2"
+# The keyboard (`keyboard.rs`), without its Wayland keymap-fd support.
+xkbcommon = { version = "0.9.0", default-features = false }
 drm = "0.15.0"
 png = "0.18.1"
 tracing-subscriber.workspace = true

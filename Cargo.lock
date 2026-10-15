@@ -3767,14 +3767,17 @@ dependencies = [
 name = "synoik-splash"
 version = "26.4.0"
 dependencies = [
+ "cosmic-text",
  "drm 0.15.0",
  "libc",
  "png",
  "sd-notify",
  "serde",
  "serde_json",
+ "swash",
  "tracing",
  "tracing-subscriber",
+ "xkbcommon",
 ]
 
 [[package]]
