@@ -409,9 +409,8 @@ It probes the connectors itself (a `GETCONNECTOR` as master), so it does not dep
 fbdev client (§2.2.2). It waits for the card on udev, as plymouthd does.
 
 Text is drawn on the CPU too (`synoik-splash/src/text.rs`): the outer's shaping (cosmic-text,
-the same metrics and hinting) and its swash rasterization, from Adwaita Sans by path, since the
-image has no fontconfig. Unlike `synoik-vk`'s rasterizer it applies the variable face's `wght` axis
-to the outlines, so its bold and light differ from the outer's there.
+the same metrics, hinting and weight axis) and its swash rasterization, from Adwaita Sans by path,
+since the image has no fontconfig.
 
 ### 7.4 The image
 

@@ -1047,7 +1047,16 @@ impl TextContext {
             });
         }
 
-        let mut scaler = ctx.builder(swash).size(px).hint(true).build();
+        let mut scaler = ctx.builder(swash).size(px).hint(true);
+        // A variable face's outlines at the weight it was shaped at, as cosmic-text's own
+        // rasterizer does (`swash_image`): Adwaita Sans is one variable file for every weight.
+        let wght = swash::Tag::from_be_bytes(*b"wght");
+        if let Some(axis) = swash.variations().find_by_tag(wght) {
+            let weight = f32::from(key.font_weight.0).clamp(axis.min_value(), axis.max_value());
+            scaler =
+                scaler.normalized_coords(swash.variations().normalized_coords([(wght, weight)]));
+        }
+        let mut scaler = scaler.build();
 
         // Subpixel remainder from the cache key (0 once fully snapped).
         let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
@@ -1621,6 +1630,42 @@ mod tests {
                 .iter()
                 .any(|p| p[0] != p[1] || p[1] != p[2]),
             "the bitmap is grey, so it came from a mask and not from the paint graph"
+        );
+    }
+
+    /// A bold glyph from a variable face carries more ink than the regular one: its outline is
+    /// drawn at the weight it was shaped at, not only its advance widened.
+    #[test]
+    fn bold_outlines_follow_the_weight_axis() {
+        let ink = |weight| {
+            let mut ctx = TextContext::new();
+            let (_, pending) = ctx
+                .shape_line_named("l", 40., "Adwaita Sans", weight)
+                .unwrap();
+            pending
+                .iter()
+                .flat_map(|p| p.coverage.iter())
+                .map(|&a| u64::from(a))
+                .sum::<u64>()
+        };
+        let face = fonts()
+            .db()
+            .faces()
+            .find(|f| f.families.iter().any(|(name, _)| name == "Adwaita Sans"))
+            .map(|f| f.id);
+        let variable = face.is_some_and(|id| {
+            fonts()
+                .get_font(id, Weight::NORMAL)
+                .is_some_and(|f| f.as_swash().variations().len() > 0)
+        });
+        if !variable {
+            eprintln!("no variable Adwaita Sans installed; skipping");
+            return;
+        }
+        let (regular, bold) = (ink(400), ink(700));
+        assert!(
+            bold as f64 > regular as f64 * 1.2,
+            "bold {bold} vs regular {regular}"
         );
     }
 
