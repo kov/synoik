@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -42,10 +43,10 @@ use smithay::reexports::calloop::{
 use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{
-    connector, crtc, framebuffer, Device as _, Mode as DrmMode, ModeFlags, ModeTypeFlags,
+    connector, crtc, framebuffer, plane, Device as _, Mode as DrmMode, ModeFlags, ModeTypeFlags,
 };
 use smithay::reexports::rustix::fs as rfs;
-use smithay::utils::{DeviceFd, Rectangle, Transform};
+use smithay::utils::{DeviceFd, Point, Rectangle, Transform};
 use smithay_drm_extras::drm_scanner::DrmScanner;
 use synoik_splash::{handoff, peer_cred};
 
@@ -547,12 +548,59 @@ struct Display {
     relayout_pending: bool,
     /// What the last finished transition faded to, standing in for its frame on screen.
     last_to: Option<Picture>,
+    /// Its CRTC's cursor plane, when it has one and its buffers could be made.
+    cursor: Option<CursorPlane>,
+    /// A commit of the cursor plane alone is in flight. It occupies the CRTC as a flip does.
+    cursor_flip: bool,
+    /// The cursor changed while the CRTC was busy: commit it once it is free.
+    cursor_dirty: bool,
 }
 
 impl Display {
     fn size(&self) -> (u16, u16) {
         self.mode.size()
     }
+
+    /// A commit is in flight on the CRTC, so another would be refused.
+    fn busy(&self) -> bool {
+        self.in_flight.is_some() || self.cursor_flip
+    }
+}
+
+/// A display's cursor plane: two buffers, so a new image is never written into the one scanned
+/// out.
+struct CursorPlane {
+    handle: plane::Handle,
+    size: (u32, u32),
+    buffers: [(DumbBuffer, framebuffer::Handle); 2],
+    /// The image each buffer holds, by [`CursorImage::serial`].
+    loaded: [Option<u64>; 2],
+    /// What the plane was last committed to show: `None` before the first commit, when it is
+    /// unknown — a restarted outer inherits whatever its predecessor left on it.
+    shown: Option<Option<CursorShown>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct CursorShown {
+    buffer: usize,
+    serial: u64,
+    position: (i32, i32),
+}
+
+/// A session's pointer image for one display, as its last `CursorImage` sent it.
+struct CursorImage {
+    /// Unique across sessions, so a buffer is never mistaken for holding another image.
+    serial: u64,
+    size: (u32, u32),
+    hotspot: (i32, i32),
+    pixels: Vec<u8>,
+}
+
+/// A session's cursor on one display.
+#[derive(Default)]
+struct SessionCursor {
+    image: Option<Rc<CursorImage>>,
+    position: Option<(i32, i32)>,
 }
 
 /// An attached session.
@@ -579,6 +627,8 @@ struct Session {
     /// Per display, the last frame reported `Presented` to it. The inner never draws into the slot
     /// it was last told is on screen, so this too is safe to show again on a switch back.
     last_presented: HashMap<String, u32>,
+    /// Per display, its pointer, shown on the cursor plane over its own frames.
+    cursors: HashMap<String, SessionCursor>,
 }
 
 struct Outer {
@@ -614,6 +664,8 @@ struct Outer {
     /// The boot splash, while it stands in for the plate: from a fresh start until a session's
     /// screen replaces it.
     boot: Option<BootSplash>,
+    /// The next [`CursorImage::serial`].
+    next_cursor_serial: u64,
 }
 
 fn plate_picture() -> Picture {
@@ -666,6 +718,7 @@ impl Outer {
             shutting_down: false,
             plymouth: Plymouth::new(),
             boot: None,
+            next_cursor_serial: 1,
         };
         // A restart adopts the frame on screen without a splash, unless it is taking the splash
         // over (§7.2).
@@ -679,6 +732,18 @@ impl Outer {
         outer.relayout_and_fill();
         outer.recovering = false;
         Ok(outer)
+    }
+
+    /// The cursor plane of `crtc`, if it has one.
+    fn cursor_plane(&self, crtc: crtc::Handle) -> Option<plane::Handle> {
+        let planes = self.drm.planes(&crtc).ok()?;
+        planes.cursor.first().map(|p| p.handle)
+    }
+
+    /// The size of a cursor plane's buffer: what the driver asks for (`DRM_CAP_CURSOR_WIDTH`).
+    fn cursor_size(&self) -> (u32, u32) {
+        let size = self.drm.cursor_size();
+        (size.w, size.h)
     }
 
     /// Re-read the connectors. Returns whether anything a session sees changed.
@@ -709,6 +774,7 @@ impl Outer {
                     .map_err(|err| debug!("no EDID for {name}: {err:#}"))
                     .ok(),
                 physical_size_mm: conn.size().unwrap_or((0, 0)),
+                cursor_size: self.cursor_plane(crtc).map(|_| self.cursor_size()),
                 modes: modes.iter().map(mode_info).collect(),
             };
             connectors.insert(
@@ -922,6 +988,9 @@ impl Outer {
                 return;
             }
         };
+        let cursor = self
+            .cursor_plane(crtc)
+            .and_then(|handle| make_cursor_plane(&self.drm_fd, handle, self.cursor_size()));
         let display = Display {
             crtc,
             surface,
@@ -937,6 +1006,9 @@ impl Outer {
             switch_pending: false,
             relayout_pending: false,
             last_to: None,
+            cursor,
+            cursor_flip: false,
+            cursor_dirty: false,
         };
         self.displays.insert(d.to_owned(), display);
         // Adopted while carrying the initramfs splash on (boot-splash.md §7.2), the display gets
@@ -1002,6 +1074,9 @@ impl Outer {
         let display = self.displays.get_mut(d).context("no display")?;
         commit_frame(d, display, fb)?;
         display.on_screen = shown;
+        if let Some(cursor) = &mut display.cursor {
+            cursor.shown = Some(None);
+        }
         Ok(())
     }
 
@@ -1009,7 +1084,7 @@ impl Outer {
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
-        if display.in_flight.is_some() {
+        if display.busy() {
             display.relayout_pending = true;
             return;
         }
@@ -1023,7 +1098,7 @@ impl Outer {
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
-        if display.in_flight.is_some() {
+        if display.busy() {
             display.relayout_pending = true;
             return;
         }
@@ -1103,6 +1178,7 @@ impl Outer {
                 config: None,
                 held: HashMap::new(),
                 last_presented: HashMap::new(),
+                cursors: HashMap::new(),
             },
         );
     }
@@ -1154,6 +1230,8 @@ impl Outer {
         }
         let names: Vec<String> = self.displays.keys().cloned().collect();
         for d in names {
+            // Its frame may stay up; its pointer does not.
+            self.update_cursor(&d);
             let display = self.displays.get_mut(&d).expect("listed above");
             if matches!(display.queued, Some(Next::Session { generation: g, .. }) if g == generation)
             {
@@ -1276,7 +1354,7 @@ impl Outer {
             return;
         };
         if self.compositor.is_some() {
-            if display.in_flight.is_some() {
+            if display.busy() {
                 // The snapshot must be of what is on screen, and that changes when this flip
                 // lands; start from there.
                 display.switch_pending = true;
@@ -1664,7 +1742,7 @@ impl Outer {
             }
             Some(_) => (),
         }
-        if self.displays.get(d).is_some_and(|d| d.in_flight.is_none()) {
+        if self.displays.get(d).is_some_and(|d| !d.busy()) {
             self.advance(d);
         }
     }
@@ -1825,7 +1903,7 @@ impl Outer {
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
-        if display.in_flight.is_some() {
+        if display.busy() {
             if let Some(Next::Session {
                 generation,
                 buffer,
@@ -2033,8 +2111,158 @@ impl Outer {
                     _ => self.hold(generation, d, buffer, fence),
                 }
             }
+            ToOuter::CursorImage {
+                output,
+                width,
+                height,
+                hotspot,
+                position,
+            } => {
+                let limit = self
+                    .connectors
+                    .get(&output)
+                    .and_then(|c| c.info.cursor_size);
+                if limit.is_none_or(|(w, h)| width > w || height > h) {
+                    bail!(
+                        "a {width}x{height} cursor for {output}, whose cursor plane is {limit:?}"
+                    );
+                }
+                let mut pixels = vec![0; width as usize * height as usize * 4];
+                std::fs::File::from(fds.remove(0))
+                    .read_exact_at(&mut pixels, 0)
+                    .context("reading a cursor image")?;
+                let serial = self.next_cursor_serial;
+                self.next_cursor_serial += 1;
+                let session = self.sessions.get_mut(&generation).expect("looked up above");
+                let cursor = session.cursors.entry(output.clone()).or_default();
+                cursor.image = Some(Rc::new(CursorImage {
+                    serial,
+                    size: (width, height),
+                    hotspot,
+                    pixels,
+                }));
+                cursor.position = Some(position);
+                if fronted {
+                    self.update_cursor(&output);
+                }
+            }
+            ToOuter::CursorPosition { output, position } => {
+                session.cursors.entry(output.clone()).or_default().position = position;
+                if fronted {
+                    self.update_cursor(&output);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The cursor display `d` should show over a frame of `showing`: the fronted session's own,
+    /// outside a fade, while the machine is not going down.
+    fn wanted_cursor(
+        &self,
+        d: &str,
+        showing: Option<u64>,
+    ) -> Option<(Rc<CursorImage>, (i32, i32))> {
+        let generation = showing?;
+        if self.shutting_down
+            || self.fronted() != Some(generation)
+            || self.displays.get(d)?.transition.is_some()
+        {
+            return None;
+        }
+        let cursor = self.sessions.get(&generation)?.cursors.get(d)?;
+        Some((cursor.image.clone()?, cursor.position?))
+    }
+
+    /// The cursor plane's part of the next commit on `d`, if it changes, and what it then shows.
+    /// Loads the image into the buffer not on screen first: called only with the CRTC idle, so
+    /// the plane scans out the buffer it was last committed with.
+    fn cursor_commit(
+        &mut self,
+        d: &str,
+        showing: Option<u64>,
+    ) -> Option<(PlaneState<'static>, Option<CursorShown>)> {
+        let wanted = self.wanted_cursor(d, showing);
+        let cursor = self.displays.get_mut(d)?.cursor.as_mut()?;
+        let shown = match &wanted {
+            None => None,
+            Some((image, position)) => {
+                let buffer = match cursor.loaded.iter().position(|s| *s == Some(image.serial)) {
+                    Some(buffer) => buffer,
+                    None => {
+                        let buffer = cursor.shown.flatten().map_or(0, |s| 1 - s.buffer);
+                        if let Err(err) = load_cursor(&self.drm_fd, cursor, buffer, image) {
+                            warn!("loading a cursor image on {d}: {err:#}");
+                            return None;
+                        }
+                        buffer
+                    }
+                };
+                Some(CursorShown {
+                    buffer,
+                    serial: image.serial,
+                    position: *position,
+                })
+            }
+        };
+        if cursor.shown == Some(shown) {
+            return None;
+        }
+        let config = shown.zip(wanted).map(|(s, (image, _))| {
+            let (w, h) = cursor.size;
+            PlaneConfig {
+                src: Rectangle::from_size((f64::from(w), f64::from(h)).into()),
+                dst: Rectangle::new(s.position.into(), (w as i32, h as i32).into()),
+                transform: Transform::Normal,
+                alpha: 1.0,
+                damage_clips: None,
+                fb: cursor.buffers[s.buffer].1,
+                fence: None,
+                // A para-virtualized plane's host shows our cursor as its own pointer, aligned
+                // on this; smithay sets it where the plane has the property.
+                hotspot: Some(Point::from(image.hotspot)),
+            }
+        });
+        Some((
+            PlaneState {
+                handle: cursor.handle,
+                config,
+            },
+            shown,
+        ))
+    }
+
+    /// Bring `d`'s cursor plane up to date with what it shows, by a commit of its own; or, with
+    /// the CRTC busy, once the commit in flight lands.
+    fn update_cursor(&mut self, d: &str) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        if display.cursor.is_none() {
+            return;
+        }
+        if display.busy() {
+            display.cursor_dirty = true;
+            return;
+        }
+        display.cursor_dirty = false;
+        let showing = match display.on_screen {
+            Shown::Session { generation, .. } => Some(generation),
+            _ => None,
+        };
+        let Some((plane, shown)) = self.cursor_commit(d, showing) else {
+            return;
+        };
+        let display = self.displays.get_mut(d).expect("looked up above");
+        match display.surface.page_flip([plane], true) {
+            Ok(()) => {
+                display.cursor_flip = true;
+                if let Some(cursor) = &mut display.cursor {
+                    cursor.shown = Some(shown);
+                }
+            }
+            Err(err) => warn!("moving the cursor on {d}: {err}"),
+        }
     }
 
     /// Put `next` on display `d`. A session frame is gated on its fence in the kernel
@@ -2047,6 +2275,11 @@ impl Outer {
             },
             _ => None,
         };
+        let showing = match next {
+            Next::Session { generation, .. } => Some(generation),
+            _ => None,
+        };
+        let cursor = self.cursor_commit(d, showing);
         let Some(display) = self.displays.get(d) else {
             return;
         };
@@ -2112,9 +2345,18 @@ impl Outer {
                 hotspot: None,
             }),
         };
-        match display.surface.page_flip([plane], true) {
+        let (cursor_plane, cursor_shown) = cursor.unzip();
+        match display
+            .surface
+            .page_flip(std::iter::once(plane).chain(cursor_plane), true)
+        {
             Ok(()) => {
-                self.displays.get_mut(d).expect("looked up above").in_flight = Some(shown);
+                let display = self.displays.get_mut(d).expect("looked up above");
+                display.in_flight = Some(shown);
+                display.cursor_dirty = false;
+                if let (Some(cursor), Some(shown)) = (&mut display.cursor, cursor_shown) {
+                    cursor.shown = Some(shown);
+                }
             }
             Err(err) => {
                 warn!("flip on {d} refused: {err}");
@@ -2220,7 +2462,13 @@ impl Outer {
             return;
         };
         let d = d.as_str();
-        let Some(shown) = self.displays.get_mut(d).and_then(|d| d.in_flight.take()) else {
+        let display = self.displays.get_mut(d).expect("found above");
+        if std::mem::take(&mut display.cursor_flip) {
+            // Only the cursor moved: nothing to answer, but what waited for the CRTC goes now.
+            self.after_flip(d);
+            return;
+        }
+        let Some(shown) = display.in_flight.take() else {
             debug!("flip completion on {d} with nothing in flight");
             return;
         };
@@ -2278,8 +2526,14 @@ impl Outer {
         if session_up && !self.shutting_down {
             self.end_boot_splash();
         }
-        let display = self.displays.get_mut(d).expect("found above");
+        self.after_flip(d);
+    }
 
+    /// The CRTC of `d` is free again: start whatever waited for it.
+    fn after_flip(&mut self, d: &str) {
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
         if std::mem::take(&mut display.relayout_pending) {
             // The layout changed under the flip; it can be applied now.
             self.relayout_and_fill();
@@ -2288,7 +2542,7 @@ impl Outer {
         let Some(display) = self.displays.get_mut(d) else {
             return;
         };
-        if display.in_flight.is_some() {
+        if display.busy() {
             return;
         }
         if std::mem::take(&mut display.switch_pending) {
@@ -2298,6 +2552,9 @@ impl Outer {
             self.flip(d, next);
         } else if display.transition.is_some() {
             self.advance(d);
+        }
+        if self.displays.get(d).is_some_and(|d| d.cursor_dirty) {
+            self.update_cursor(d);
         }
     }
 }
@@ -2331,13 +2588,70 @@ fn commit_frame(name: &str, display: &Display, fb: framebuffer::Handle) -> anyho
             hotspot: None,
         }),
     };
+    // The cursor goes with a modeset: what follows is the plate or the splash.
+    let cursor = display.cursor.as_ref().map(|c| PlaneState {
+        handle: c.handle,
+        config: None,
+    });
     // No page-flip event wanted: nothing waits on the plate, and an event here would land as a
     // flip completion with nothing in flight.
     display
         .surface
-        .commit([plane], false)
+        .commit(std::iter::once(plane).chain(cursor), false)
         .with_context(|| format!("modesetting {name}"))?;
     info!("{name} lit at {}x{}", size.0, size.1);
+    Ok(())
+}
+
+/// A cursor plane's two buffers, cleared.
+fn make_cursor_plane(
+    drm_fd: &DrmDeviceFd,
+    handle: plane::Handle,
+    size: (u32, u32),
+) -> Option<CursorPlane> {
+    let make = || -> anyhow::Result<(DumbBuffer, framebuffer::Handle)> {
+        let buffer = drm_fd
+            .create_dumb_buffer(size, DrmFourcc::Argb8888, 32)
+            .context("allocating a cursor buffer")?;
+        let fb = drm_fd
+            .add_framebuffer(&buffer, 32, 32)
+            .context("adding a cursor framebuffer")?;
+        Ok((buffer, fb))
+    };
+    match make().and_then(|a| Ok([a, make()?])) {
+        Ok(buffers) => Some(CursorPlane {
+            handle,
+            size,
+            buffers,
+            loaded: [None; 2],
+            shown: None,
+        }),
+        Err(err) => {
+            warn!("no cursor plane, sessions draw their pointer: {err:#}");
+            None
+        }
+    }
+}
+
+/// Write `image` into cursor buffer `index`, clearing what it does not cover.
+fn load_cursor(
+    drm_fd: &DrmDeviceFd,
+    cursor: &mut CursorPlane,
+    index: usize,
+    image: &CursorImage,
+) -> anyhow::Result<()> {
+    let (buffer, _) = &mut cursor.buffers[index];
+    let pitch = smithay::reexports::drm::buffer::Buffer::pitch(buffer) as usize;
+    let mut map = drm_fd
+        .map_dumb_buffer(buffer)
+        .context("mapping a cursor buffer")?;
+    let dst = map.as_mut();
+    dst.fill(0);
+    let row = image.size.0 as usize * 4;
+    for (y, src) in image.pixels.chunks_exact(row).enumerate() {
+        dst[y * pitch..][..row].copy_from_slice(src);
+    }
+    cursor.loaded[index] = Some(image.serial);
     Ok(())
 }
 

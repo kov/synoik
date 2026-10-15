@@ -175,7 +175,7 @@ impl Outer {
             .displays
             .iter()
             .filter(|(_, d)| {
-                d.in_flight.is_none()
+                !d.busy()
                     && d.queued.is_none()
                     && d.transition.is_none()
                     && !d.switch_pending

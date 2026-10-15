@@ -392,6 +392,7 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
   (kernel flip time and sequence, untouched, §3.1) or `Discarded`. Each `Present` is answered
   exactly once, and only by its own buffer id: a frame shown again is not re-answered.
+  `CursorImage` (a memfd) and `CursorPosition` carry the pointer (below).
 - **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): quits plymouth
   (`--retain-splash`, as GDM does), opens or recovers the card, lights every connected display
   with its plate, and flips the buffers of the session logind has made active on seat0, following
@@ -422,6 +423,23 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   fade replaces it, answered `Presented` by the flip that shows a blend of it, so whatever the
   session animates meanwhile (an unlock, its startup) plays through the fade. A fronted frame that
   replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+- **Cursor plane**: a connector whose CRTC has a cursor plane advertises its buffer size
+  (`cursor_size`, the driver's `DRM_CAP_CURSOR_WIDTH`). The inner then leaves its pointer out of
+  its frames and sends it instead: the image, copied on the CPU from the cursor's own buffer
+  (xcursor memory or the client's shm, as the tty's cursor plane takes it), only when it
+  changes, carrying its position so a new image never shows at the old one's place; and the
+  position as it moves. A pointer the plane cannot take — a drag icon, a cursor surface with
+  subsurfaces, a scaled or transformed image, a rotated display, `debug.disable_cursor_plane` —
+  goes back into the frame. The outer keeps each session's cursor per display and shows only
+  the fronted session's, over that session's own frames: the plane is off over the plate, the
+  splash and every fade, and comes back with the frame that ends the fade. Each flip carries the
+  plane's state, so a frame and its cursor change together; a move with no frame is a commit of
+  the plane alone, or, with the CRTC busy, waits for the commit in flight. Two buffers, so a new
+  image is never written into the one scanned out. `HOTSPOT_X/Y` are set where the plane has
+  them (virtio-gpu draws our cursor as the host's pointer). Measured on the harness (2026-10-15,
+  sampling the planes' state every 10 ms): 100 pointer moves left the session's frame on the
+  primary plane untouched while the cursor plane followed, and a shape change (arrow to I-beam
+  and back) landed image and position in one commit.
 - **Shutdown**: on logind's `PrepareForShutdown(true)` the outer stops following the seat and
   fades what is on screen to black, drawing the end so it is what systemd's fd store keeps scanned
   out after the outer exits; `false` brings back the session logind fronts. The boot/shutdown
@@ -462,8 +480,8 @@ and switching away and back found its overview intact. The crossfade fits as on 
 (`a` = 0.20 at 15 ms, 0.51 at 50 ms, 0.80 at 100 ms, 1.0 by 223 ms; residual under 0.25/255), the
 session's own buffer following. Neither inner logged a warning, though each also sees the chord.
 
-Not built: cursor and client planes through the outer (the inner composites everything, cursor
-included); §3's atomic test-and-revert and the HDR, VRR and orientation fields; VRR and tearing
+Not built: client buffers on overlay planes through the outer (the inner composites every
+window); §3's atomic test-and-revert and the HDR, VRR and orientation fields; VRR and tearing
 passthrough; a modeset under black (§4.2: a changed display cuts through its plate); custom
 modelines nested; the inner asking the outer for a switch over IPC (§2.1's normal path). The boot
 and shutdown splash (§6) is built: `boot-splash.md`.
@@ -472,14 +490,10 @@ and shutdown splash (§6) is built: `boot-splash.md`.
 
 In order:
 
-1. **The cursor plane through the outer.** The inner composites its cursor into every frame, so
-   moving the pointer costs the inner a render and the outer a flip. The outer owns the planes
-   (§1), so the inner should pass its cursor image and position over the wire and the outer put
-   them on the cursor plane, as the tty backend does today. Other planes (a client's buffer
-   promoted to an overlay) come with it if they fit without blowing up the protocol; otherwise
-   they are booked separately.
-2. **A way to exercise the outer's animations**, so they can be tuned: switch crossfades, the
+1. **A way to exercise the outer's animations**, so they can be tuned: switch crossfades, the
    splash to greeter and greeter to session handoffs, shutdown's fade, driven repeatably and
    captured frame by frame on the harness. Then smooth the handoff between inner and outer.
-3. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
+2. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
    CPU splash keeps the spinner turning until the outer can draw.
+3. **Overlay planes through the outer**: a client's buffer scanned out on an overlay plane, which
+   needs the buffer forwarded across the wire and §3's atomic test-and-revert first.

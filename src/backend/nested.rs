@@ -30,6 +30,11 @@ use smithay::backend::allocator::{Allocator as _, Buffer as _, Fourcc, Modifier}
 use smithay::backend::drm::DrmNode;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::{
+    Element as _, Id, RenderElement as _, RenderElementPresentationState, RenderElementState,
+    UnderlyingStorage,
+};
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Bind as _, ImportDma as _};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session as _};
@@ -42,9 +47,10 @@ use smithay::reexports::calloop::{
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs as rfs;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use smithay::utils::Size;
+use smithay::utils::{Physical, Point, Scale, Size, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
+use smithay::wayland::shm;
 
 use super::vulkan_scanout::{VulkanScanoutAllocator, VulkanScanoutBuffer};
 use super::{IpcOutputMap, OutputId, RenderResult};
@@ -56,7 +62,7 @@ use crate::frame_clock::FrameClock;
 use crate::monitors_xml::MonitorsConfig;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
-use crate::synoik::{RedrawState, State, Synoik};
+use crate::synoik::{PointerRenderElements, RedrawState, State, Synoik};
 use crate::system_compositor::protocol::{
     self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter,
 };
@@ -115,7 +121,15 @@ struct NestedOutput {
     /// The buffer that was in flight when the mode changed: the outer still answers it, and that
     /// answer is expected, not a protocol slip.
     abandoned: Option<u32>,
+    /// The pointer image the outer last got for this display, `None` for none it can be trusted
+    /// to have (a reattach).
+    cursor_image: Option<CursorKey>,
+    /// The cursor position the outer last got, `None` for unknown.
+    cursor_position: Option<Option<(i32, i32)>>,
 }
+
+/// What a pointer image was made from: the element's identity, contents and size.
+type CursorKey = (Id, CommitCounter, Size<i32, Physical>);
 
 struct Slot {
     id: u32,
@@ -375,6 +389,8 @@ impl Nested {
                 in_flight: None,
                 on_screen: None,
                 abandoned: None,
+                cursor_image: None,
+                cursor_position: None,
             },
         );
         synoik.add_output(output, Some(refresh(mode)), false);
@@ -579,6 +595,8 @@ impl Nested {
         self.handle.remove(conn.token);
         for out in self.outputs.values_mut() {
             out.on_screen = None;
+            out.cursor_image = None;
+            out.cursor_position = None;
             // The frame in flight will never be answered; finish its bookkeeping as a frame that
             // did not present, so the redraw machinery is not left waiting for a vblank.
             if out.in_flight.take().is_some() {
@@ -730,12 +748,14 @@ impl Nested {
             return RenderResult::Skipped;
         };
 
+        let conn = self.conn.as_ref().expect("checked above").fd.clone();
+        let pointer = sync_cursor(&mut self.renderer, synoik, output, out, conn.as_fd());
         let ctx = RenderCtx {
             renderer: &mut self.renderer,
             target: RenderTarget::Output,
             appearance: Some(synoik.appearance()),
         };
-        let elements = synoik.render_to_vec(ctx, output, true);
+        let elements = synoik.render_to_vec(ctx, output, pointer == Pointer::InFrame);
 
         out.frame += 1;
         let slot = &mut out.slots[index];
@@ -764,7 +784,7 @@ impl Nested {
         };
         self.renderer.set_finish_may_defer(false);
 
-        let res = match rendered {
+        let mut res = match rendered {
             Ok(res) => res,
             Err(err) => {
                 warn!("rendering a frame for {name}: {err:?}");
@@ -772,6 +792,17 @@ impl Nested {
                 return RenderResult::Skipped;
             }
         };
+        // The pointer on the cursor plane is scanned out as it is, as the tty's would be.
+        if let Pointer::OnPlane(Some((id, visible_area))) = pointer {
+            res.states.states.insert(
+                id,
+                RenderElementState {
+                    visible_area,
+                    presentation_state: RenderElementPresentationState::ZeroCopy,
+                    needs_capture: false,
+                },
+            );
+        }
         synoik.update_primary_scanout_output(output, &res.states);
 
         if res.damage.is_none() {
@@ -1065,6 +1096,201 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
     });
     let output_state = synoik.output_state.get_mut(&output).unwrap();
     output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+}
+
+/// Where a frame's pointer goes.
+#[derive(PartialEq)]
+enum Pointer {
+    /// On the outer's cursor plane: the element there, with its visible area, or none while the
+    /// pointer is hidden.
+    OnPlane(Option<(Id, usize)>),
+    /// Drawn into the frame.
+    InFrame,
+}
+
+/// Put the pointer on the outer's cursor plane, when the display has one and the pointer fits it
+/// (§3): its image when that changed, and its position. Anything else is taken off the plane, and
+/// the frame draws it.
+fn sync_cursor(
+    renderer: &mut VulkanRenderer,
+    synoik: &Synoik,
+    output: &Output,
+    out: &mut NestedOutput,
+    conn: BorrowedFd<'_>,
+) -> Pointer {
+    let name = out.connector.connector.clone();
+    let send_position = |out: &mut NestedOutput, position: Option<(i32, i32)>| {
+        if out.cursor_position == Some(position) {
+            return;
+        }
+        let msg = ToOuter::CursorPosition {
+            output: name.clone(),
+            position,
+        };
+        // A dead connection is noticed, and reconnected, by the read side.
+        match protocol::send(conn, &msg, &[]) {
+            Ok(()) => out.cursor_position = Some(position),
+            Err(err) => warn!("moving the cursor: {err}"),
+        }
+    };
+
+    let Some((width, height)) = out.connector.cursor_size else {
+        return Pointer::InFrame;
+    };
+    // The plane is not rotated with the frame; a rotated display draws its pointer.
+    if synoik.config.borrow().debug.disable_cursor_plane
+        || output.current_transform() != Transform::Normal
+    {
+        send_position(out, None);
+        return Pointer::InFrame;
+    }
+
+    let mut elements = Vec::new();
+    synoik.render_pointer(renderer, output, &mut |e| elements.push(e));
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    // One element, the cursor's own image: a drag icon, or a cursor surface with subsurfaces,
+    // composes on the GPU, in the frame.
+    let element = match elements.as_slice() {
+        [] => {
+            send_position(out, None);
+            return Pointer::OnPlane(None);
+        }
+        [element] => element,
+        _ => {
+            send_position(out, None);
+            return Pointer::InFrame;
+        }
+    };
+    let geometry = element.geometry(scale);
+    if geometry.size.w > width as i32 || geometry.size.h > height as i32 {
+        send_position(out, None);
+        return Pointer::InFrame;
+    }
+
+    let key = (
+        element.id().clone(),
+        element.current_commit(),
+        geometry.size,
+    );
+    if out.cursor_image.as_ref() != Some(&key) {
+        let Some(pixels) = cursor_pixels(renderer, element, geometry.size, (width, height)) else {
+            send_position(out, None);
+            return Pointer::InFrame;
+        };
+        let pointer = synoik
+            .pointer_position_on(output)
+            .to_physical_precise_round(scale);
+        let hotspot: Point<i32, Physical> = pointer - geometry.loc;
+        let position = (geometry.loc.x, geometry.loc.y);
+        match send_cursor_image(conn, &name, (width, height), hotspot, position, &pixels) {
+            Ok(()) => {
+                out.cursor_image = Some(key);
+                out.cursor_position = Some(Some(position));
+            }
+            Err(err) => {
+                warn!("sending the pointer image: {err:#}");
+                send_position(out, None);
+                return Pointer::InFrame;
+            }
+        }
+    }
+    send_position(out, Some((geometry.loc.x, geometry.loc.y)));
+    let visible_area = (geometry.size.w * geometry.size.h) as usize;
+    Pointer::OnPlane(Some((element.id().clone(), visible_area)))
+}
+
+/// The pointer element's pixels, copied on the CPU into a `width`×`height` ARGB8888 image — as
+/// the tty's cursor plane takes them (smithay's `DrmCompositor`), with no GPU round trip. `None`
+/// for anything but an unscaled, untransformed ARGB8888 image in memory or shm: that one is drawn
+/// into the frame.
+fn cursor_pixels(
+    renderer: &mut VulkanRenderer,
+    element: &PointerRenderElements,
+    size: Size<i32, Physical>,
+    (width, height): (u32, u32),
+) -> Option<Vec<u8>> {
+    let src = element.src();
+    if src.loc != Point::default()
+        || src.size
+            != size
+                .to_f64()
+                .to_logical(1.)
+                .to_buffer(1., Transform::Normal)
+        || element.transform() != Transform::Normal
+    {
+        return None;
+    }
+    let row = width as usize * 4;
+    let mut image = vec![0u8; row * height as usize];
+    let mut copy = |pixels: &[u8], stride: usize| {
+        let len = size.w as usize * 4;
+        for (y, dst) in image
+            .chunks_exact_mut(row)
+            .take(size.h as usize)
+            .enumerate()
+        {
+            dst[..len].copy_from_slice(pixels.get(y * stride..y * stride + len)?);
+        }
+        Some(())
+    };
+    match element.underlying_storage(renderer)? {
+        UnderlyingStorage::Memory(memory) => {
+            if memory.format() != Fourcc::Argb8888 {
+                return None;
+            }
+            copy(memory, memory.stride() as usize)?;
+        }
+        UnderlyingStorage::Wayland(buffer) => {
+            shm::with_buffer_contents(buffer, |ptr, len, data| {
+                if shm::shm_format_to_fourcc(data.format) != Some(Fourcc::Argb8888) {
+                    return None;
+                }
+                let start = data.offset as usize;
+                let end = start + (data.stride * data.height) as usize;
+                if end > len {
+                    return None;
+                }
+                // SAFETY: smithay maps the pool for the duration of the closure, `len` bytes long.
+                let pixels = unsafe { std::slice::from_raw_parts(ptr.add(start), end - start) };
+                copy(pixels, data.stride as usize)
+            })
+            .ok()??
+        }
+    }
+    Some(image)
+}
+
+fn send_cursor_image(
+    conn: BorrowedFd<'_>,
+    output: &str,
+    (width, height): (u32, u32),
+    hotspot: Point<i32, Physical>,
+    position: (i32, i32),
+    pixels: &[u8],
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let len = width as usize * height as usize * 4;
+    if pixels.len() != len {
+        bail!(
+            "a {width}x{height} cursor read back as {} bytes",
+            pixels.len()
+        );
+    }
+    let fd =
+        rfs::memfd_create("synoik-cursor", rfs::MemfdFlags::CLOEXEC).context("creating a memfd")?;
+    std::fs::File::from(fd.try_clone()?)
+        .write_all(pixels)
+        .context("writing the cursor image")?;
+    let msg = ToOuter::CursorImage {
+        output: output.to_owned(),
+        width,
+        height,
+        hotspot: (hotspot.x, hotspot.y),
+        position,
+    };
+    protocol::send(conn, &msg, &[fd.as_fd()])?;
+    Ok(())
 }
 
 /// Allocate an output's scanout buffers on our device and register each with the outer.

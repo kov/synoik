@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any change to the messages below.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Where the outer listens unless told otherwise. The unit's `RuntimeDirectory=` creates it.
 pub const DEFAULT_SOCKET: &str = "/run/synoik-system/outer.sock";
@@ -78,6 +78,24 @@ pub enum ToOuter {
         buffer: u32,
         fenced: bool,
     },
+    /// The pointer's image on `output`, for the outer's cursor plane (§3): `width`×`height` — the
+    /// connector's `cursor_size` — premultiplied ARGB8888, rows of `width * 4` bytes, in the one
+    /// fd (a memfd). `hotspot` is where in it the pointer points. Sent when the image changes,
+    /// with its `position` (as `CursorPosition`): a new image shown at the old one's place would
+    /// jump for a frame.
+    CursorImage {
+        output: String,
+        width: u32,
+        height: u32,
+        hotspot: (i32, i32),
+        position: (i32, i32),
+    },
+    /// Where the cursor image's top-left corner sits on `output`, in its mode's pixels; `None`
+    /// takes the cursor off the display. The outer shows it over this session's frames only.
+    CursorPosition {
+        output: String,
+        position: Option<(i32, i32)>,
+    },
 }
 
 /// Outer → inner.
@@ -118,6 +136,9 @@ pub struct ConnectorInfo {
     pub connector: String,
     pub edid: Option<Vec<u8>>,
     pub physical_size_mm: (u32, u32),
+    /// The size of its cursor plane's buffer, when its CRTC has one: the session then sends its
+    /// pointer as `CursorImage`/`CursorPosition` instead of drawing it into its frames.
+    pub cursor_size: Option<(u32, u32)>,
     /// What it advertises, interlaced modes left out (they do not work, as on the tty).
     pub modes: Vec<ModeInfo>,
 }
@@ -143,11 +164,12 @@ impl ToOuter {
     pub fn fd_count(&self) -> usize {
         match self {
             ToOuter::AddBuffer { .. } => 1,
-            ToOuter::Present { fenced: true, .. } => 1,
+            ToOuter::Present { fenced: true, .. } | ToOuter::CursorImage { .. } => 1,
             ToOuter::Hello { .. }
             | ToOuter::Configure { .. }
             | ToOuter::RemoveBuffer { .. }
-            | ToOuter::Present { .. } => 0,
+            | ToOuter::Present { .. }
+            | ToOuter::CursorPosition { .. } => 0,
         }
     }
 }
@@ -335,6 +357,37 @@ mod tests {
                     assert!(fds.is_empty());
                 }
                 other => panic!("expected RemoveBuffer {id}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_image_carries_its_pixels_and_a_move_none() {
+        let image = ToOuter::CursorImage {
+            output: "Virtual-1".into(),
+            width: 64,
+            height: 64,
+            hotspot: (3, 2),
+            position: (10, 20),
+        };
+        let position = ToOuter::CursorPosition {
+            output: "Virtual-1".into(),
+            position: Some((-3, 700)),
+        };
+        assert_eq!(image.fd_count(), 1);
+        assert_eq!(position.fd_count(), 0);
+
+        let (a, b) = pair();
+        let (payload, _keep) = UnixDatagram::pair().unwrap();
+        send(a.as_fd(), &image, &[payload.as_fd()]).unwrap();
+        send(a.as_fd(), &position, &[]).unwrap();
+        for want in [image, position] {
+            match recv::<ToOuter>(b.as_fd()).unwrap() {
+                Received::Message(got, fds) => {
+                    assert_eq!(fds.len(), want.fd_count());
+                    assert_eq!(got, want);
+                }
+                other => panic!("expected {want:?}, got {other:?}"),
             }
         }
     }

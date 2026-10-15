@@ -11435,6 +11435,16 @@ impl Synoik {
         }
     }
 
+    /// Where the pointer is drawn, relative to `output`: the tablet cursor while there is one,
+    /// else the pointer.
+    pub fn pointer_position_on(&self, output: &Output) -> Point<f64, Logical> {
+        let output_pos = self.global_space.output_geometry(output).unwrap().loc;
+        let pointer_pos = self
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        pointer_pos - output_pos.to_f64()
+    }
+
     pub fn render_pointer(
         &self,
         renderer: &mut VulkanRenderer,
@@ -11443,13 +11453,7 @@ impl Synoik {
     ) {
         let _span = tracy_client::span!("Synoik::render_pointer");
         let output_scale = output.current_scale();
-        let output_pos = self.global_space.output_geometry(output).unwrap().loc;
-
-        // Check whether we need to draw the tablet cursor or the regular cursor.
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
-        let pointer_pos = pointer_pos - output_pos.to_f64();
+        let pointer_pos = self.pointer_position_on(output);
 
         // Get the render cursor to draw.
         let cursor_scale = output_scale.integer_scale();
