@@ -390,7 +390,7 @@ impl Keyboard {
             warn!("splash: {}: {err}", path.display());
             return;
         }
-        debug!("reading {} for a password", path.display());
+        info!("reading {} for a password", path.display());
         self.devices.insert(
             raw,
             Device {

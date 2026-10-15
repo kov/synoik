@@ -51,6 +51,10 @@ const MARKER: &str = "/run/synoik-system/initrd-splash";
 /// How often to look for the card while it is not there yet.
 const CARD_POLL: Duration = Duration::from_millis(20);
 
+/// How often to probe the card's connectors again while none is lit, between hotplug events: a
+/// forced probe reads EDID, so not at the card's rate.
+const CONNECTOR_POLL: Duration = Duration::from_secs(1);
+
 /// How long the TERM handoff waits for systemd to take the splash state.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -92,6 +96,11 @@ struct Splash {
     card: Option<Card>,
     recovered: bool,
     displays: Vec<Display>,
+    /// The kernel's uevents, read while the card has no display lit: a connector may come up after
+    /// the card does (a VM's host window), and plymouthd waits for its hotplug event too.
+    uevents: Option<OwnedFd>,
+    /// When the connectors were last probed, on the monotonic clock.
+    probed: Duration,
     connections: HashMap<u64, ()>,
     /// When the spinner's turn began, on the monotonic clock.
     start: Duration,
@@ -211,6 +220,10 @@ fn run() -> io::Result<()> {
         recovered: drm.is_some(),
         card: drm,
         displays: Vec::new(),
+        uevents: open_uevents()
+            .inspect_err(|err| warn!("not listening for hotplug events: {err}"))
+            .ok(),
+        probed: Duration::ZERO,
         connections: HashMap::new(),
         start: monotonic(),
         frozen: None,
@@ -261,9 +274,14 @@ fn run() -> io::Result<()> {
     loop {
         if splash.card.is_none() {
             splash.open_card();
+        } else if splash.displays.is_empty()
+            && monotonic().saturating_sub(splash.probed) >= CONNECTOR_POLL
+        {
+            splash.setup_displays();
         }
         if !splash.displays.is_empty() && splash.displays.iter().all(|d| d.front.is_none()) {
             splash.light();
+            splash.uevents = None;
         }
         splash.redraw();
 
@@ -289,6 +307,13 @@ fn run() -> io::Result<()> {
         if let Some(card) = &splash.card {
             fds.push(libc::pollfd {
                 fd: card.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if let Some(uevents) = &splash.uevents {
+            fds.push(libc::pollfd {
+                fd: uevents.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -355,6 +380,11 @@ fn run() -> io::Result<()> {
         {
             splash.on_card_readable();
         }
+        if let Some(uevents) = splash.uevents.as_ref().filter(|u| ready(u.as_raw_fd())) {
+            if drm_hotplug(uevents.as_fd()) && splash.displays.is_empty() {
+                splash.setup_displays();
+            }
+        }
         if splash
             .keyboard
             .as_ref()
@@ -396,6 +426,9 @@ impl Splash {
         if self.card.is_none() {
             return CARD_POLL.as_millis() as i32;
         }
+        if self.displays.is_empty() {
+            return CONNECTOR_POLL.as_millis() as i32;
+        }
         let splash = self.server.splash();
         let turning = splash.shown && splash.password_prompt.is_none() && self.frozen.is_none();
         if !turning || self.displays.is_empty() {
@@ -433,6 +466,7 @@ impl Splash {
 
     /// Every connected connector, at its preferred mode, with its own CRTC and two buffers.
     fn setup_displays(&mut self) {
+        self.probed = monotonic();
         let Some(card) = &self.card else { return };
         if self.recovered {
             close_inherited_framebuffers(card);
@@ -593,6 +627,7 @@ impl Splash {
                 self.keyboard = open_keyboard();
             }
             if let Some(keyboard) = self.keyboard.as_mut().filter(|k| !k.is_armed()) {
+                info!("asking for a password");
                 keyboard.arm();
                 self.revision += 1;
             }
@@ -880,6 +915,56 @@ fn close_inherited_framebuffers(card: &Card) {
                 io::Error::last_os_error()
             );
         }
+    }
+}
+
+/// A socket on the kernel's uevents (`NETLINK_KOBJECT_UEVENT`, its multicast group): no udev
+/// needed, which the initramfs stops before the switch.
+fn open_uevents() -> io::Result<OwnedFd> {
+    // SAFETY: plain syscalls; the fd is owned at once.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_KOBJECT_UEVENT,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: just created, and ours.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: an all-zero sockaddr_nl is valid.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    addr.nl_groups = 1;
+    // SAFETY: the address above, its size beside it.
+    let r = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Read every uevent waiting on `fd`: whether one was a DRM hotplug.
+fn drm_hotplug(fd: BorrowedFd<'_>) -> bool {
+    let mut buf = [0u8; 8192];
+    let mut hotplug = false;
+    loop {
+        // SAFETY: a buffer of ours, its length beside it.
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        let Ok(n) = usize::try_from(n) else {
+            return hotplug;
+        };
+        let mut fields = buf[..n].split(|&b| b == 0);
+        hotplug |=
+            fields.clone().any(|f| f == b"SUBSYSTEM=drm") && fields.any(|f| f == b"HOTPLUG=1");
     }
 }
 
