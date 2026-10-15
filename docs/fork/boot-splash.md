@@ -6,7 +6,7 @@
 > **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
 > (`synoik-splash/src/main.rs`), validated on the harness VM.
 > **Password prompts built** (step 5, §4.2) in both drawers, tested headless, not yet on the
-> harness. The emergency path is design.
+> harness. **Emergency and rescue** (step 6, §2.4) validated on the harness.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -147,7 +147,17 @@ the outer's card with `fbcon=map:9` instead, which leaves the client in place
 `plymouth quit` *without* `--retain-splash` comes from emergency.service, rescue.service,
 dracut-emergency and sulogin: "give the text console back". With fbcon kept off the outer's card
 (§2.2.2) there is none to give: the splash ends as with `--retain-splash`, and the emergency shell
-is reached on the serial console or over ssh — S6's stated cost.
+is reached on the serial console or over ssh — S6's stated cost. Measured on the harness:
+
+- **In the initramfs** (`rd.break`), dracut-emergency quits the splash through plymouth's client,
+  which the image carries for it (§7.4): the screen keeps the background and watermark, the shell
+  answers on the serial console, and the VT's keyboard is untouched (keys typed reach tty1). Once
+  the shell exits, the boot goes on and the handover follows as usual.
+- **In the real root** (`systemctl emergency`, `systemctl rescue`), the outer has no splash to end
+  and acknowledges the unit's `plymouth --wait quit` at once. It stays up (`IgnoreOnIsolate=`)
+  while the isolate stops the login daemon and every session with it, so the screen goes to the
+  outer's empty background, with no session's content left on it. Leaving the shell brings the
+  greeter back on the same outer.
 
 ## 3. The protocol
 
@@ -299,8 +309,10 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    synthetic xkb state, both drawers' pixels; then on the harness, a LUKS volume unlocked in the
    initramfs (`x-initrd.attach`), one unlocked in the real root before the handover, and a
    `systemd-ask-password` after it, from the outer.
-6. **Emergency and rescue** (§2.4): `systemctl emergency` on the harness — the splash ends, the
-   shell answers on the serial console.
+6. **Emergency and rescue** (§2.4): `rd.break`, `systemctl emergency` and `systemctl rescue` on the
+   harness — the splash ends, the shell answers on the serial console, and leaving it resumes the
+   boot. Still to run with step 5's volume: a LUKS password failed three times, which ends in
+   dracut's emergency shell with the dialog up.
 
 ## 6. Open
 
@@ -422,7 +434,8 @@ everything back with a `dracut -f`.
 For the prompt, the image also carries `AdwaitaSans-Regular.ttf` (880 KB), libxkbcommon, the
 keymap compiled at build time (`synoik-splash --compile-keymap`, the system layout of §4.2, at
 `/usr/share/synoik-splash/keymap.xkb`), and systemd's plymouth password agent, which dracut
-installs only alongside its plymouth module. The splash's unit stands in for
+installs only alongside its plymouth module. Like that module, it carries plymouth's client:
+dracut's emergency shell quits the splash through it (§2.4). The splash's unit stands in for
 `plymouth-start.service` there: it pulls the agent's path unit in, and is ordered before it and
 before the console agent's, both of which test `/run/plymouth/pid` once, when they start. The
 splash writes the pid file before it reports ready. A change of layout takes a `dracut -f`, as

@@ -41,6 +41,9 @@ install() {
         rm -f "$initdir/usr/share/synoik-splash/keymap.xkb"
         dwarning "synoik: no keymap; the splash cannot ask for passwords"
     fi
+    # plymouth's client, as 45plymouth installs it: dracut's emergency shell quits the splash
+    # through it, and does nothing without it.
+    inst_multiple -o plymouth
     # Forwards password requests to the splash, as 11systemd-ask-password does for plymouth; the
     # splash's unit pulls it in.
     inst_multiple -o \
