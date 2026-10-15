@@ -5,9 +5,10 @@
 > (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
 > **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
 > (`synoik-splash/src/main.rs`), validated on the harness VM.
-> **Password prompts built** (step 5, §4.2) in both drawers; a LUKS root unlocked through the
-> initramfs splash on Debian (§7.6), the other cases of §5 step 5 not yet run. **Emergency and
-> rescue** (step 6, §2.4) validated on the harness. **initramfs-tools** (Debian, §7.6) validated
+> **Password prompts built** (step 5, §4.2) in both drawers and validated: a LUKS root on Debian
+> (§7.6), and on the harness a volume asked in the initramfs, one asked in the real root before
+> the handover, and a prompt up across the handover, answered by the outer. **Emergency and
+> rescue** (step 6, §2.4) validated on the harness, a thrice-failed passphrase included. **initramfs-tools** (Debian, §7.6) validated
 > on a Debian VM with a LUKS root: prompt, unlock, handover and greeter, the splash on screen
 > throughout; an offline update there too.
 
@@ -311,12 +312,17 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 5. **Password prompts** (§4.2): the dialog's layout as conformance tests, the keyboard against a
    synthetic xkb state, both drawers' pixels; then on the harness, a LUKS volume unlocked in the
    initramfs (`x-initrd.attach`), one unlocked in the real root before the handover, and a
-   `systemd-ask-password` after it, from the outer. The first ran on Debian (§7.6); the other two,
-   and step 6's failed password, are to run on the harness VM with a LUKS data disk.
+   `systemd-ask-password` after it, from the outer. Measured on the harness (2026-10-15, enforcing,
+   a data disk with two LUKS partitions, keys injected on the virtio keyboard): the initramfs
+   splash asked for both volumes, the second from the real root's `systemd-cryptsetup@` while the
+   handover waited on `cryptsetup.target`; a `systemd-ask-password` started just before the
+   handover had its dialog killed by it and asked again of the outer (§7.2), which took the
+   answer; no SELinux denial.
 6. **Emergency and rescue** (§2.4): `rd.break`, `systemctl emergency` and `systemctl rescue` on the
    harness — the splash ends, the shell answers on the serial console, and leaving it resumes the
-   boot. Still to run with step 5's volume: a LUKS password failed three times, which ends in
-   dracut's emergency shell with the dialog up.
+   boot. A LUKS passphrase failed three times (`tries=3`, a volume the initramfs mounts) ends the
+   same way: dracut's emergency shell on the serial console, the splash quit with the watermark
+   kept, no dialog left on screen.
 
 ## 6. Open
 
@@ -412,11 +418,15 @@ plane and no dark frame between them. Both drawers present at ≈15 fps on that 
 unit's process: it is conditioned on `/run/synoik-system/initrd-splash`, which the splash creates
 and removes.
 
-**A password prompt does not cross the restart.** Its client's connection dies with the splash,
-and systemd's plymouth agent (v259, `tty-ask-password-agent.c`) takes the EOF as `-EIO`, logs it,
-and waits for the next change under `/run/systemd/ask-password`: the asking unit would wait until
-its own timeout. So the handover is ordered `After=cryptsetup.target`, and every crypttab volume is
-unlocked through the splash before it.
+**A password prompt is asked again after the restart.** Its client's connection dies with the
+splash, and systemd's plymouth agent (v259, `tty-ask-password-agent.c`) takes the EOF as `-EIO`,
+logs it, and waits for the next change under `/run/systemd/ask-password`: alone, the asking unit
+would wait until its own timeout. So once the outer answers, its unit try-restarts
+`systemd-ask-password-plymouth.service` (an `ExecStartPost=`), and the new agent asks every pending
+request of the outer; a crash restart is covered the same way. The handover is still ordered
+`After=cryptsetup.target`, so the crypttab volumes are asked through the splash before it and their
+dialogs do not flash away and back. A request made once logins are allowed goes to the wall agent,
+which stops the plymouth agent for good — systemd's arrangement, as with plymouthd.
 
 The real root's unit keeps its plymouth calls for a boot whose initramfs still has plymouth
 (an image built before the install, or `--use-gdm` half undone). They are guarded on the pid file
@@ -496,6 +506,7 @@ is the same program, started and taken over differently.
   waits, as on a dracut boot, the helper finds no socket and does nothing. Measured on Debian's
   systemd 261: a descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its
   name.
-- **Ordering.** The handover still kills a prompt that is up (§7.2), and the outer would start as
-  soon as its own dependencies are met: a drop-in orders it `After=cryptsetup.target` there. The
+- **Ordering.** The handover kills a prompt that is up, asked again of the outer (§7.2); the outer
+  would start as soon as its own dependencies are met, so a drop-in orders it
+  `After=cryptsetup.target` there, as the handover unit is on Fedora. The
   real root's plymouth units are conditioned off as on Fedora (§2.2).

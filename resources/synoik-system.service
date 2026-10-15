@@ -49,6 +49,11 @@ ExecStartPost=+-/bin/sh -c '{ read -r pid </run/plymouth/pid && read -r comm </p
 # Ready means answering plymouth's clients: the name frees a moment after that quit returns, and
 # the outer writes the pid file once it holds it (plymouthd removed its own before letting go).
 ExecStartPost=-/bin/sh -c 'for i in $$(seq 200); do [ -e /run/plymouth/pid ] && exit; sleep 0.01; done'
+# A password prompt up while plymouth's name changed hands died with its connection, and systemd's
+# agent does not ask again until the next request (boot-splash.md §7.2): a new agent asks every
+# pending one, of the outer. Only an agent already running: the wall agent stops it for good once
+# logins are allowed. As root (`+`).
+ExecStartPost=+-/usr/bin/systemctl --no-block try-restart systemd-ask-password-plymouth.service
 # Unprivileged: DRM master comes from opening the card first, input from the `input` group, the
 # render node from `render` (Debian keeps it 0660; Fedora opens it to all), and nothing else needs
 # root (docs/fork/system-compositor.md §1).
