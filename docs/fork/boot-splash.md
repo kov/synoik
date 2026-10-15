@@ -5,9 +5,11 @@
 > (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
 > **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
 > (`synoik-splash/src/main.rs`), validated on the harness VM.
-> **Password prompts built** (step 5, §4.2) in both drawers, tested headless, not yet on the
-> harness. **Emergency and rescue** (step 6, §2.4) validated on the harness. **initramfs-tools**
-> (Debian, §7.6) built, not yet booted.
+> **Password prompts built** (step 5, §4.2) in both drawers; a LUKS root unlocked through the
+> initramfs splash on Debian (§7.6), the other cases of §5 step 5 not yet run. **Emergency and
+> rescue** (step 6, §2.4) validated on the harness. **initramfs-tools** (Debian, §7.6) validated
+> on a Debian VM with a LUKS root: prompt, unlock, handover and greeter, the splash on screen
+> throughout.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
