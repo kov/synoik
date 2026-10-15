@@ -2055,10 +2055,13 @@ impl Outer {
                 output,
                 buffer,
                 fenced,
+                cursor,
             } => {
                 if !session.buffers.contains_key(&buffer) {
                     bail!("present of unknown buffer {buffer}");
                 }
+                // The frame's own cursor: whichever commit shows this frame shows it too.
+                session.cursors.entry(output.clone()).or_default().position = cursor;
                 let fence = fenced.then(|| Rc::new(fds.remove(0)));
                 let d = output.as_str();
                 // A frame for a display that is not lit, or not at the size it was drawn for — the
@@ -2116,13 +2119,12 @@ impl Outer {
                 width,
                 height,
                 hotspot,
-                position,
             } => {
                 let limit = self
                     .connectors
                     .get(&output)
                     .and_then(|c| c.info.cursor_size);
-                if limit.is_none_or(|(w, h)| width > w || height > h) {
+                if width == 0 || height == 0 || limit.is_none_or(|(w, h)| width > w || height > h) {
                     bail!(
                         "a {width}x{height} cursor for {output}, whose cursor plane is {limit:?}"
                     );
@@ -2133,18 +2135,14 @@ impl Outer {
                     .context("reading a cursor image")?;
                 let serial = self.next_cursor_serial;
                 self.next_cursor_serial += 1;
+                // Kept until the frame or the move that shows it.
                 let session = self.sessions.get_mut(&generation).expect("looked up above");
-                let cursor = session.cursors.entry(output.clone()).or_default();
-                cursor.image = Some(Rc::new(CursorImage {
+                session.cursors.entry(output).or_default().image = Some(Rc::new(CursorImage {
                     serial,
                     size: (width, height),
                     hotspot,
                     pixels,
                 }));
-                cursor.position = Some(position);
-                if fronted {
-                    self.update_cursor(&output);
-                }
             }
             ToOuter::CursorPosition { output, position } => {
                 session.cursors.entry(output.clone()).or_default().position = position;

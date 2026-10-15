@@ -124,7 +124,8 @@ struct NestedOutput {
     /// The pointer image the outer last got for this display, `None` for none it can be trusted
     /// to have (a reattach).
     cursor_image: Option<CursorKey>,
-    /// The cursor position the outer last got, `None` for unknown.
+    /// The cursor position the outer last got, `None` for unknown or owed: a new image is shown
+    /// only once a position follows it.
     cursor_position: Option<Option<(i32, i32)>>,
 }
 
@@ -793,11 +794,11 @@ impl Nested {
             }
         };
         // The pointer on the cursor plane is scanned out as it is, as the tty's would be.
-        if let Pointer::OnPlane(Some((id, visible_area))) = pointer {
+        if let Pointer::OnPlane(Some(cursor)) = &pointer {
             res.states.states.insert(
-                id,
+                cursor.id.clone(),
                 RenderElementState {
-                    visible_area,
+                    visible_area: cursor.visible_area,
                     presentation_state: RenderElementPresentationState::ZeroCopy,
                     needs_capture: false,
                 },
@@ -805,10 +806,23 @@ impl Nested {
         }
         synoik.update_primary_scanout_output(output, &res.states);
 
+        let cursor = pointer.position();
         if res.damage.is_none() {
             // Nothing changed: the slot's contents are what they were, so do not mark it drawn,
-            // and do not bother the outer with a frame identical to the one it shows.
+            // and do not bother the outer with a frame identical to the one it shows. A pointer
+            // that moved goes to the outer alone.
             out.frame -= 1;
+            if out.cursor_position != Some(cursor) {
+                let msg = ToOuter::CursorPosition {
+                    output: name.clone(),
+                    position: cursor,
+                };
+                // A dead connection is noticed, and reconnected, by the read side.
+                match protocol::send(conn.as_fd(), &msg, &[]) {
+                    Ok(()) => out.cursor_position = Some(cursor),
+                    Err(err) => warn!("moving the cursor: {err}"),
+                }
+            }
             queue_estimated_vblank_timer(synoik, output.clone());
             return RenderResult::NoDamage;
         }
@@ -827,8 +841,8 @@ impl Nested {
             output: name.clone(),
             buffer,
             fenced: fence.is_some(),
+            cursor,
         };
-        let conn = self.conn.as_ref().expect("checked above").fd.clone();
         let fds: Vec<BorrowedFd<'_>> = fence.iter().map(|fd| fd.as_fd()).collect();
         if let Err(err) = protocol::send(conn.as_fd(), &msg, &fds) {
             warn!("presenting to the system compositor: {err}");
@@ -840,6 +854,7 @@ impl Nested {
         let feedback = synoik.take_presentation_feedbacks(output, &res.states);
         let out = self.outputs.get_mut(&name).expect("looked up above");
         out.in_flight = Some((index, feedback, target_presentation_time));
+        out.cursor_position = Some(cursor);
         synoik
             .frame_log
             .queued(&name, target_presentation_time, get_monotonic_time());
@@ -1101,16 +1116,35 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
 /// Where a frame's pointer goes.
 #[derive(PartialEq)]
 enum Pointer {
-    /// On the outer's cursor plane: the element there, with its visible area, or none while the
-    /// pointer is hidden.
-    OnPlane(Option<(Id, usize)>),
+    /// On the outer's cursor plane, or nowhere on this display (hidden, or on another one).
+    OnPlane(Option<PlaneCursor>),
     /// Drawn into the frame.
     InFrame,
 }
 
-/// Put the pointer on the outer's cursor plane, when the display has one and the pointer fits it
-/// (§3): its image when that changed, and its position. Anything else is taken off the plane, and
-/// the frame draws it.
+#[derive(PartialEq)]
+struct PlaneCursor {
+    /// The pointer element, scanned out as it is.
+    id: Id,
+    visible_area: usize,
+    /// Where its image's top-left corner goes, in the display's pixels.
+    position: (i32, i32),
+}
+
+impl Pointer {
+    /// The cursor plane's position for this frame, `None` for off.
+    fn position(&self) -> Option<(i32, i32)> {
+        match self {
+            Pointer::OnPlane(Some(cursor)) => Some(cursor.position),
+            _ => None,
+        }
+    }
+}
+
+/// Decide where the pointer goes on this display (§3): the outer's cursor plane when the display
+/// has one and the pointer fits it, else the frame. A new image goes to the outer now; its
+/// position rides on the frame, or on a `CursorPosition` when there is no frame
+/// (`Nested::render`).
 fn sync_cursor(
     renderer: &mut VulkanRenderer,
     synoik: &Synoik,
@@ -1118,22 +1152,6 @@ fn sync_cursor(
     out: &mut NestedOutput,
     conn: BorrowedFd<'_>,
 ) -> Pointer {
-    let name = out.connector.connector.clone();
-    let send_position = |out: &mut NestedOutput, position: Option<(i32, i32)>| {
-        if out.cursor_position == Some(position) {
-            return;
-        }
-        let msg = ToOuter::CursorPosition {
-            output: name.clone(),
-            position,
-        };
-        // A dead connection is noticed, and reconnected, by the read side.
-        match protocol::send(conn, &msg, &[]) {
-            Ok(()) => out.cursor_position = Some(position),
-            Err(err) => warn!("moving the cursor: {err}"),
-        }
-    };
-
     let Some((width, height)) = out.connector.cursor_size else {
         return Pointer::InFrame;
     };
@@ -1141,7 +1159,6 @@ fn sync_cursor(
     if synoik.config.borrow().debug.disable_cursor_plane
         || output.current_transform() != Transform::Normal
     {
-        send_position(out, None);
         return Pointer::InFrame;
     }
 
@@ -1151,19 +1168,17 @@ fn sync_cursor(
     // One element, the cursor's own image: a drag icon, or a cursor surface with subsurfaces,
     // composes on the GPU, in the frame.
     let element = match elements.as_slice() {
-        [] => {
-            send_position(out, None);
-            return Pointer::OnPlane(None);
-        }
+        [] => return Pointer::OnPlane(None),
         [element] => element,
-        _ => {
-            send_position(out, None);
-            return Pointer::InFrame;
-        }
+        _ => return Pointer::InFrame,
     };
     let geometry = element.geometry(scale);
+    let display = Size::from((i32::from(out.mode.width), i32::from(out.mode.height)));
+    if !geometry.overlaps(smithay::utils::Rectangle::from_size(display)) {
+        // On another display: this one's plane stays off rather than parked out of sight.
+        return Pointer::OnPlane(None);
+    }
     if geometry.size.w > width as i32 || geometry.size.h > height as i32 {
-        send_position(out, None);
         return Pointer::InFrame;
     }
 
@@ -1174,29 +1189,26 @@ fn sync_cursor(
     );
     if out.cursor_image.as_ref() != Some(&key) {
         let Some(pixels) = cursor_pixels(renderer, element, geometry.size, (width, height)) else {
-            send_position(out, None);
             return Pointer::InFrame;
         };
         let pointer = synoik
             .pointer_position_on(output)
             .to_physical_precise_round(scale);
         let hotspot: Point<i32, Physical> = pointer - geometry.loc;
-        let position = (geometry.loc.x, geometry.loc.y);
-        match send_cursor_image(conn, &name, (width, height), hotspot, position, &pixels) {
-            Ok(()) => {
-                out.cursor_image = Some(key);
-                out.cursor_position = Some(Some(position));
-            }
-            Err(err) => {
-                warn!("sending the pointer image: {err:#}");
-                send_position(out, None);
-                return Pointer::InFrame;
-            }
+        let name = &out.connector.connector;
+        if let Err(err) = send_cursor_image(conn, name, (width, height), hotspot, &pixels) {
+            warn!("sending the pointer image: {err:#}");
+            return Pointer::InFrame;
         }
+        out.cursor_image = Some(key);
+        // The outer only keeps an image: a position has to follow to show it.
+        out.cursor_position = None;
     }
-    send_position(out, Some((geometry.loc.x, geometry.loc.y)));
-    let visible_area = (geometry.size.w * geometry.size.h) as usize;
-    Pointer::OnPlane(Some((element.id().clone(), visible_area)))
+    Pointer::OnPlane(Some(PlaneCursor {
+        id: element.id().clone(),
+        visible_area: (geometry.size.w * geometry.size.h) as usize,
+        position: (geometry.loc.x, geometry.loc.y),
+    }))
 }
 
 /// The pointer element's pixels, copied on the CPU into a `width`×`height` ARGB8888 image — as
@@ -1265,7 +1277,6 @@ fn send_cursor_image(
     output: &str,
     (width, height): (u32, u32),
     hotspot: Point<i32, Physical>,
-    position: (i32, i32),
     pixels: &[u8],
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
@@ -1287,7 +1298,6 @@ fn send_cursor_image(
         width,
         height,
         hotspot: (hotspot.x, hotspot.y),
-        position,
     };
     protocol::send(conn, &msg, &[fd.as_fd()])?;
     Ok(())

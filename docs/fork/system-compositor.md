@@ -392,7 +392,7 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   connector, EDID, modes), `AddBuffer`/`RemoveBuffer`, `Present` (+ fence), and back `Presented`
   (kernel flip time and sequence, untouched, §3.1) or `Discarded`. Each `Present` is answered
   exactly once, and only by its own buffer id: a frame shown again is not re-answered.
-  `CursorImage` (a memfd) and `CursorPosition` carry the pointer (below).
+  `CursorImage` (a memfd), `CursorPosition` and `Present`'s `cursor` carry the pointer (below).
 - **Outer** (`synoik system-compositor`, `resources/synoik-system.service`): quits plymouth
   (`--retain-splash`, as GDM does), opens or recovers the card, lights every connected display
   with its plate, and flips the buffers of the session logind has made active on seat0, following
@@ -425,21 +425,23 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
 - **Cursor plane**: a connector whose CRTC has a cursor plane advertises its buffer size
   (`cursor_size`, the driver's `DRM_CAP_CURSOR_WIDTH`). The inner then leaves its pointer out of
-  its frames and sends it instead: the image, copied on the CPU from the cursor's own buffer
-  (xcursor memory or the client's shm, as the tty's cursor plane takes it), only when it
-  changes, carrying its position so a new image never shows at the old one's place; and the
-  position as it moves. A pointer the plane cannot take — a drag icon, a cursor surface with
-  subsurfaces, a scaled or transformed image, a rotated display, `debug.disable_cursor_plane` —
-  goes back into the frame. The outer keeps each session's cursor per display and shows only
-  the fronted session's, over that session's own frames: the plane is off over the plate, the
-  splash and every fade, and comes back with the frame that ends the fade. Each flip carries the
-  plane's state, so a frame and its cursor change together; a move with no frame is a commit of
-  the plane alone, or, with the CRTC busy, waits for the commit in flight. Two buffers, so a new
-  image is never written into the one scanned out. `HOTSPOT_X/Y` are set where the plane has
-  them (virtio-gpu draws our cursor as the host's pointer). Measured on the harness (2026-10-15,
-  sampling the planes' state every 10 ms): 100 pointer moves left the session's frame on the
-  primary plane untouched while the cursor plane followed, and a shape change (arrow to I-beam
-  and back) landed image and position in one commit.
+  its frames and puts it on the plane instead. A new image (`CursorImage`, copied on the CPU from
+  the cursor's own buffer, xcursor memory or the client's shm, as the tty's cursor plane takes
+  it) is only kept by the outer; the position shows it. Each `Present` carries the cursor's
+  position for that frame, so a frame and its cursor change in one commit and a moving pointer
+  never holds a frame back; a pointer that moves with no frame to draw sends `CursorPosition`,
+  which the outer commits alone, or after the commit in flight. A pointer the plane cannot take
+  — a drag icon, a cursor surface with subsurfaces, a scaled or transformed image, a rotated
+  display, `debug.disable_cursor_plane` — goes back into the frame, in the same commit that takes
+  the plane off; a display the pointer is not on has its plane off. The outer keeps each
+  session's cursor per display and shows only the fronted session's, over that session's own
+  frames: the plane is off over the plate, the splash and every fade, and comes back with the
+  frame that ends the fade. Two buffers, so a new image is never written into the one scanned
+  out. `HOTSPOT_X/Y` are set where the plane has them (virtio-gpu shows our cursor as the host's
+  pointer). Measured on the harness (2026-10-15, sampling the planes' state every 2-10 ms): pointer
+  moves over a still desktop leave the primary plane untouched while the cursor plane follows; a
+  window dragged by 120 moves at 16 ms flips 121 frames, cursor in step; a shape change (arrow to
+  I-beam and back) lands image and position together.
 - **Shutdown**: on logind's `PrepareForShutdown(true)` the outer stops following the seat and
   fades what is on screen to black, drawing the end so it is what systemd's fd store keeps scanned
   out after the outer exits; `false` brings back the session logind fronts. The boot/shutdown

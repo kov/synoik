@@ -73,25 +73,31 @@ pub enum ToOuter {
     RemoveBuffer { id: u32 },
     /// Show `buffer` on `output`. When `fenced`, the one fd is a `sync_file` that signals when the
     /// inner's rendering into it is done; the flip must not happen before that.
+    ///
+    /// `cursor` is where the cursor plane's image goes with this frame, as `CursorPosition`'s
+    /// `position`: a frame and its cursor change in one commit, so the pointer neither lags its
+    /// frame nor holds it back a vblank.
     Present {
         output: String,
         buffer: u32,
         fenced: bool,
+        cursor: Option<(i32, i32)>,
     },
     /// The pointer's image on `output`, for the outer's cursor plane (§3): `width`×`height` — the
     /// connector's `cursor_size` — premultiplied ARGB8888, rows of `width * 4` bytes, in the one
-    /// fd (a memfd). `hotspot` is where in it the pointer points. Sent when the image changes,
-    /// with its `position` (as `CursorPosition`): a new image shown at the old one's place would
-    /// jump for a frame.
+    /// fd (a memfd). `hotspot` is where in it the pointer points. Sent when the image changes, and
+    /// only kept: the next `Present` or `CursorPosition` for `output` puts it on screen, with its
+    /// position, so a new image never shows at the old one's place.
     CursorImage {
         output: String,
         width: u32,
         height: u32,
         hotspot: (i32, i32),
-        position: (i32, i32),
     },
     /// Where the cursor image's top-left corner sits on `output`, in its mode's pixels; `None`
-    /// takes the cursor off the display. The outer shows it over this session's frames only.
+    /// takes the cursor off the display. For a pointer that moved with no frame to carry it (a
+    /// frame carries its own, `Present`): the outer commits it alone. The outer shows a session's
+    /// cursor over that session's frames only.
     CursorPosition {
         output: String,
         position: Option<(i32, i32)>,
@@ -328,6 +334,7 @@ mod tests {
             output: "Virtual-1".into(),
             buffer: 3,
             fenced: true,
+            cursor: Some((-3, 12)),
         };
         send(a.as_fd(), &msg, &[payload.as_fd()]).unwrap();
 
@@ -368,7 +375,6 @@ mod tests {
             width: 64,
             height: 64,
             hotspot: (3, 2),
-            position: (10, 20),
         };
         let position = ToOuter::CursorPosition {
             output: "Virtual-1".into(),
