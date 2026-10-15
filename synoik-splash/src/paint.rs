@@ -89,8 +89,12 @@ impl Theme {
                 warn!("splash: spinner: {err}");
                 Vec::new()
             });
+        let watermark = layout::watermark_file(dir);
+        let watermark = Image::load(&watermark)
+            .map_err(|err| warn!("splash: {}: {err}", watermark.display()))
+            .ok();
         Self {
-            watermark: load("watermark.png"),
+            watermark,
             spinner,
             lock: load("lock.png"),
             entry: load("entry.png"),
@@ -499,7 +503,7 @@ mod tests {
     #[test]
     fn the_installed_theme_loads() {
         let dir = Path::new(layout::THEME_DIR);
-        if !dir.join("watermark.png").exists() {
+        if !layout::watermark_file(dir).exists() {
             eprintln!("skipping: no plymouth spinner theme");
             return;
         }

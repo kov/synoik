@@ -75,6 +75,13 @@ impl Theme {
                 warn!("splash: spinner: {err:#}");
                 Vec::new()
             });
+        let watermark = match load_image(renderer, &geo::watermark_file(dir)) {
+            Ok(texture) => Some(texture),
+            Err(err) => {
+                warn!("splash: watermark: {err:#}");
+                None
+            }
+        };
         let mut load = |name: &str| {
             let path = dir.join(name);
             match load_image(renderer, &path) {
@@ -86,7 +93,7 @@ impl Theme {
             }
         };
         Self {
-            watermark: load("watermark.png"),
+            watermark,
             spinner,
             lock: load("lock.png"),
             entry: load("entry.png"),
@@ -620,7 +627,7 @@ mod tests {
     /// its own); `splash::tests` pins the numbers for Fedora's.
     #[test]
     fn the_splash_draws_the_theme() {
-        if !Path::new(splash::THEME_DIR).join("watermark.png").exists() {
+        if !geo::watermark_file(Path::new(splash::THEME_DIR)).exists() {
             eprintln!("skipping: no plymouth spinner theme");
             return;
         }

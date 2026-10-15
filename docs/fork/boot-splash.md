@@ -6,7 +6,8 @@
 > **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
 > (`synoik-splash/src/main.rs`), validated on the harness VM.
 > **Password prompts built** (step 5, §4.2) in both drawers, tested headless, not yet on the
-> harness. **Emergency and rescue** (step 6, §2.4) validated on the harness.
+> harness. **Emergency and rescue** (step 6, §2.4) validated on the harness. **initramfs-tools**
+> (Debian, §7.6) built, not yet booted.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -431,7 +432,8 @@ order; `/etc/dracut.conf.d/synoik.conf` adds it and omits `plymouth` (≈3 MB sm
 `initrd-size-and-time` measurements). The plymouth package stays installed, so `--use-gdm` brings
 everything back with a `dracut -f`.
 
-For the prompt, the image also carries `AdwaitaSans-Regular.ttf` (880 KB), libxkbcommon, the
+For the prompt, the image also carries the shell's sans (`AdwaitaSans-Regular.ttf`, 880 KB, the
+file fontconfig picks for Adwaita Sans, at `/usr/share/synoik-splash/sans.ttf`), libxkbcommon, the
 keymap compiled at build time (`synoik-splash --compile-keymap`, the system layout of §4.2, at
 `/usr/share/synoik-splash/keymap.xkb`), and systemd's plymouth password agent, which dracut
 installs only alongside its plymouth module. Like that module, it carries plymouth's client:
@@ -450,3 +452,36 @@ the i18n module's copy of `vconsole.conf` already does.
    painter against the layout.
 10. **Units, dracut module, installer**, and the boot on the harness: one PID from initramfs to
     restart, no empty plane at either end, the spinner's phase across the restart.
+
+### 7.6 initramfs-tools (Debian)
+
+Debian's initramfs runs no systemd: boot scripts, then `run-init` into the real root. The splash
+is the same program, started and taken over differently.
+
+- **Start.** The plymouth package's `init-premount/plymouth` starts plymouthd; the installer puts
+  a script of the same name in `/etc/initramfs-tools/scripts/init-premount/`, which mkinitramfs
+  copies over the package's, so the splash starts in its place, after udev, on the same switches
+  (`nosplash`, `plymouth.enable=0`). It runs in the background, logging to `/dev/kmsg`, and the
+  script waits for the pid file, written once the splash answers: plymouthd's readiness is its
+  daemonizing. The package's other scripts stay: `panic` quits the splash, `init-bottom` sends a
+  newroot it acknowledges. cryptsetup's askpass finds the splash with `plymouth --ping` and asks
+  through `plymouth ask-for-password`.
+- **The image.** A hook, `/usr/share/initramfs-tools/hooks/synoik`, installs what `90synoik` does
+  (§7.4): the program, plymouth's client, the theme's images, the face, the keymap, and the GPU
+  drivers by the plymouth hook's rules, which that hook adds only for a graphical theme. Debian's
+  spinner has no `watermark.png`; both drawers then use Debian's logo, the file the plymouth
+  hook puts in its place (`layout::WATERMARK_FALLBACK`).
+- **The handover.** The splash is no unit's process, so nothing restarts it and it has no fd
+  store. It listens on an abstract socket instead (`synoik-splash-handover`), and the real root's
+  `synoik-system.service` runs `synoik-splash --hand-over` as root before the outer
+  (`ExecStartPre=+`, `NotifyAccess=exec`): it takes the card, plymouth's listener and a `splash`
+  memfd over that socket and puts them in the unit's fd store under the names of §7.2, and the
+  outer adopts them exactly as after the restart. Both ends check that the other is root: anyone
+  can bind an abstract name. The splash lets go of the keyboard and the pid file before sending,
+  so the outer's pid file is never removed after the fact, and exits once sent. Where no splash
+  waits, as on a dracut boot, the helper finds no socket and does nothing. Measured on Debian's
+  systemd 261: a descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its
+  name.
+- **Ordering.** The handover still kills a prompt that is up (§7.2), and the outer would start as
+  soon as its own dependencies are met: a drop-in orders it `After=cryptsetup.target` there. The
+  real root's plymouth units are conditioned off as on Fedora (§2.2).

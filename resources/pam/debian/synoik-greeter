@@ -1,0 +1,13 @@
+#%PAM-1.0
+# The greeter's own session (docs/fork/greeter.md §2.6, §3): no password, and only its user.
+# Written for Debian's common-* stacks, after GDM 50's gdm-launch-environment there.
+auth       required    pam_succeed_if.so user = synoik-greeter quiet_success
+auth       required    pam_permit.so
+account    required    pam_succeed_if.so user = synoik-greeter quiet_success
+account    required    pam_permit.so
+password   required    pam_deny.so
+session    optional    pam_keyinit.so force revoke
+session    required    pam_limits.so
+session    required    pam_env.so readenv=1
+session    required    pam_env.so readenv=1 envfile=/etc/default/locale
+@include common-session

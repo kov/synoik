@@ -1,0 +1,80 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+# The synoik splash in an initramfs-tools image, in plymouthd's place (docs/fork/boot-splash.md
+# §7.6): what dracut's 90synoik installs, for Debian. Installed as
+# /usr/share/initramfs-tools/hooks/synoik; the boot script beside it starts the splash.
+
+PREREQ=""
+
+prereqs() {
+    echo "${PREREQ}"
+}
+
+case "${1}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+splash=/usr/local/libexec/synoik-splash
+[ -x "${splash}" ] || exit 0
+
+copy_exec "${splash}"
+# A release build carries its debug info, ten times the code. The symbols stay, for a panic's
+# backtrace.
+if command -v strip >/dev/null; then
+    strip --strip-debug "${DESTDIR}${splash}" || echo "W: synoik: could not strip the splash"
+fi
+
+# plymouth's client: cryptsetup's askpass asks the splash for passwords through it, and the
+# plymouth package's panic script quits the splash with it.
+copy_exec /usr/bin/plymouth
+
+# The splash's images, loaded at start: nothing is read after the switch empties the image.
+# Debian's logo is the watermark where the spinner has none (synoik-splash's layout.rs), as the
+# plymouth package's hook substitutes it.
+theme=/usr/share/plymouth/themes/spinner
+for image in "${theme}/watermark.png" "${theme}"/throbber-*.png "${theme}/lock.png" \
+    "${theme}/entry.png" "${theme}/bullet.png" "${theme}/keyboard.png" "${theme}/capslock.png" \
+    /usr/share/desktop-base/debian-logos/logo-text-version-64.png; do
+    [ -e "${image}" ] && copy_file image "${image}"
+done
+
+# The password prompt's: its text's face, at the path the splash reads, and the system keymap,
+# compiled here, since the image has no xkb data to compile it from.
+font=$(fc-match -f '%{file}' 'Adwaita Sans' 2>/dev/null)
+case "${font}" in
+    *AdwaitaSans*) copy_file font "${font}" /usr/share/synoik-splash/sans.ttf ;;
+    *) echo "W: synoik: no Adwaita Sans; the splash draws no text" ;;
+esac
+mkdir -p "${DESTDIR}/usr/share/synoik-splash"
+if ! "${splash}" --compile-keymap >"${DESTDIR}/usr/share/synoik-splash/keymap.xkb"; then
+    rm -f "${DESTDIR}/usr/share/synoik-splash/keymap.xkb"
+    echo "W: synoik: no keymap; the splash cannot ask for passwords"
+fi
+
+# The GPU drivers, so the card is there to draw on: the plymouth package's hook adds them only
+# for a graphical theme. Its rules, and its list of drivers left out.
+MODULES_EXCLUDE="mga r128 savage sis tdfx via panfrost"
+if [ "${MODULES}" = "dep" ]; then
+    for device in /sys/class/drm/*; do
+        device="$(readlink -f "${device}")" || continue
+        module="$(readlink -f "${device}/device/driver/module")" || continue
+        module="$(basename "${module}")" || continue
+        for excluded in ${MODULES_EXCLUDE}; do
+            [ "${module}" = "${excluded}" ] && continue 2
+        done
+        sys_walk_mod_add "${device}" || echo "W: synoik: no modules for '${device}'"
+    done
+elif [ "${MODULES}" = "list" ]; then
+    echo "W: synoik: not including DRM modules since MODULES=list"
+else
+    # shellcheck disable=SC2086
+    copy_modules_dir kernel/drivers/gpu/drm ${MODULES_EXCLUDE}
+fi

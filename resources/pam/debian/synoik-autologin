@@ -1,0 +1,19 @@
+#%PAM-1.0
+# Autologin (docs/fork/greeter.md §2.6, §3): no authentication, the account and session stacks
+# of a normal login. Written for Debian's common-* stacks, after GDM 50's gdm-autologin there,
+# without its pam_gdm (GDM's own unlock of the keyring with the disk's password).
+auth    requisite       pam_nologin.so
+auth    required        pam_succeed_if.so user != root quiet_success
+auth    optional        pam_gnome_keyring.so
+auth    required        pam_permit.so
+@include common-account
+session [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so close
+session required        pam_loginuid.so
+session [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so open
+session optional        pam_keyinit.so force revoke
+session required        pam_limits.so
+session required        pam_env.so readenv=1
+session required        pam_env.so readenv=1 envfile=/etc/default/locale
+@include common-session
+session optional        pam_gnome_keyring.so auto_start
+@include common-password

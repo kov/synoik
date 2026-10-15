@@ -9,6 +9,7 @@
 //!
 //! Positions truncate towards zero, as two-step's `long` coordinates do.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::plymouth::{Mode, Splash};
@@ -54,6 +55,21 @@ impl Rect {
 
 /// The theme's images: bgrt's `ImageDir`.
 pub const THEME_DIR: &str = "/usr/share/plymouth/themes/spinner";
+
+/// The watermark when the theme ships none: Debian's spinner has none, and its plymouth hook
+/// copies this logo into the image in its place (`/usr/share/initramfs-tools/hooks/plymouth`).
+pub const WATERMARK_FALLBACK: &str =
+    "/usr/share/desktop-base/debian-logos/logo-text-version-64.png";
+
+/// The watermark in theme directory `dir`, or [`WATERMARK_FALLBACK`] where `dir` has none.
+pub fn watermark_file(dir: &Path) -> PathBuf {
+    let own = dir.join("watermark.png");
+    if own.exists() || !Path::new(WATERMARK_FALLBACK).exists() {
+        own
+    } else {
+        PathBuf::from(WATERMARK_FALLBACK)
+    }
+}
 
 /// The faces the splash sets text in: bgrt's sizes and weights (`Font=Cantarell 12`,
 /// `TitleFont=Cantarell Light 30`, pango points at 96 dpi), in the shell's own sans rather than

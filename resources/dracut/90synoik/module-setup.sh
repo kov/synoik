@@ -28,13 +28,20 @@ install() {
     inst_simple "$moddir/synoik-system.service" "$systemdsystemunitdir/synoik-system.service"
     $SYSTEMCTL -q --root "$initdir" add-wants sysinit.target synoik-system.service
     # The splash's images: loaded at start, so nothing is read after switch_root empties the image.
+    # Debian's logo is the watermark where its spinner has none (synoik-splash's layout.rs).
     local theme=/usr/share/plymouth/themes/spinner
     inst_multiple -o "$theme/watermark.png" "$theme"/throbber-*.png \
         "$theme/lock.png" "$theme/entry.png" "$theme/bullet.png" \
-        "$theme/keyboard.png" "$theme/capslock.png"
+        "$theme/keyboard.png" "$theme/capslock.png" \
+        /usr/share/desktop-base/debian-logos/logo-text-version-64.png
     # The password prompt's: its text's face, and the system keymap, compiled here, since the image
     # has no xkb data to compile it from.
-    inst_simple /usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf
+    local font
+    font=$(fc-match -f '%{file}' 'Adwaita Sans')
+    case "$font" in
+        *AdwaitaSans*) inst_simple "$font" /usr/share/synoik-splash/sans.ttf ;;
+        *) dwarning "synoik: no Adwaita Sans; the splash draws no text" ;;
+    esac
     mkdir -p "$initdir/usr/share/synoik-splash"
     if ! /usr/local/libexec/synoik-splash --compile-keymap \
         > "$initdir/usr/share/synoik-splash/keymap.xkb"; then

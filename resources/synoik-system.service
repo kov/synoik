@@ -32,6 +32,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+# The control processes too: the splash handover below writes the fd store.
+NotifyAccess=exec
+# An initramfs without systemd (initramfs-tools) leaves its splash running outside any unit: take
+# its card, listener and splash into the fd store, where the outer adopts them as after the
+# restart of boot-splash.md §7.2 (§7.6). Nothing to take when no splash waits. As root (`+`).
+ExecStartPre=+-/usr/local/libexec/synoik-splash --hand-over
 # GDM's order: plymouthd drops master but keeps its frame on screen, the outer modesets its own
 # copy of that frame, and only then does plymouthd go — no dark gap between the two. As root (`+`).
 # Only while the pid file is plymouthd's: plymouth's name is otherwise the outer's own, its

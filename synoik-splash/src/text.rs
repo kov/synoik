@@ -22,8 +22,9 @@ use crate::layout::{Font, Size};
 /// The family the splash sets its text in: the shell's default sans (§4.4).
 pub const FAMILY: &str = "Adwaita Sans";
 
-/// Where Fedora installs it; the image carries the same path.
-pub const FONT_FILE: &str = "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf";
+/// Where the image carries it. The image builders copy the file fontconfig picks for [`FAMILY`]
+/// here: distributions install it under different paths.
+pub const FONT_FILE: &str = "/usr/share/synoik-splash/sans.ttf";
 
 /// One glyph's coverage, placed relative to the line's origin.
 #[derive(Debug, Clone)]
@@ -213,13 +214,20 @@ impl Fonts {
 mod tests {
     use super::*;
 
+    /// The installed face, found as the image builders find it.
     fn fonts() -> Option<Fonts> {
-        let fonts = Fonts::load(&[Path::new(FONT_FILE)]);
-        if fonts.is_empty() {
-            eprintln!("skipping: no {FONT_FILE}");
+        let file = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", FAMILY])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .filter(|file| file.contains("AdwaitaSans"));
+        let Some(file) = file else {
+            eprintln!("skipping: no {FAMILY} installed");
             return None;
-        }
-        Some(fonts)
+        };
+        let fonts = Fonts::load(&[Path::new(&file)]);
+        (!fonts.is_empty()).then_some(fonts)
     }
 
     #[test]

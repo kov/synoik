@@ -23,6 +23,9 @@
 # [debug] TestUsers there lets root log those users in on demand: synoik-login open-session
 # (docs/fork/greeter.md §2.6).
 #
+# Fedora (dracut, grubby, authselect's PAM stacks) and Debian (initramfs-tools, update-grub, the
+# common-* stacks) are told apart by /etc/os-release.
+#
 # Env knobs:
 #   PROFILE=release   which build to install (default: release)
 
@@ -37,23 +40,49 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# The initramfs splash (docs/fork/boot-splash.md §7.4): where dracut finds it, and the conf that
-# swaps it for plymouth.
+distro=fedora
+# shellcheck source=/dev/null
+. /etc/os-release
+case " ${ID:-} ${ID_LIKE:-} " in
+    *" debian "*) distro=debian ;;
+esac
+
+# The initramfs splash (docs/fork/boot-splash.md §7.4, §7.6). dracut: where it finds the module,
+# and the conf that swaps it for plymouth. initramfs-tools: the hook, the boot script that
+# overrides plymouth's by name, and the outer's ordering after the disks.
 dracut_module=/usr/lib/dracut/modules.d/90synoik
 dracut_conf=/etc/dracut.conf.d/90-synoik.conf
+itools_hook=/usr/share/initramfs-tools/hooks/synoik
+itools_script=/etc/initramfs-tools/scripts/init-premount/plymouth
+itools_dropin=/etc/systemd/system/synoik-system.service.d/initramfs-tools.conf
+# Debian's kernel command line: a grub.d snippet, which update-grub reads after /etc/default/grub.
+grub_snippet=/etc/default/grub.d/90-synoik.cfg
 
 if [ "${1:-}" = "--use-gdm" ]; then
     systemctl disable synoik-login.service synoik-system.service synoik-splash-handover.service ||
         true
     # plymouth back in the initramfs.
-    if [ -e "$dracut_conf" ] || [ -e "$dracut_module" ]; then
+    if [ "$distro" = debian ]; then
+        if [ -e "$itools_hook" ] || [ -e "$itools_script" ]; then
+            rm -f "$itools_hook" "$itools_script" "$itools_dropin"
+            echo "Rebuilding the initramfs images with plymouth..."
+            update-initramfs -u -k all
+        fi
+    elif [ -e "$dracut_conf" ] || [ -e "$dracut_module" ]; then
         rm -rf "$dracut_conf" "$dracut_module"
         echo "Rebuilding the initramfs images with plymouth..."
         dracut -f --regenerate-all
     fi
     systemctl enable --force gdm.service
     # The text consoles come back with GDM, and plymouth runs after switch_root again.
-    grubby --update-kernel=ALL --remove-args=fbcon=map:9
+    if [ "$distro" = debian ]; then
+        if [ -e "$grub_snippet" ]; then
+            rm -f "$grub_snippet"
+            update-grub
+        fi
+    else
+        grubby --update-kernel=ALL --remove-args=fbcon=map:9
+    fi
     for unit in plymouth-start plymouth-quit-wait plymouth-reboot plymouth-poweroff plymouth-halt \
         plymouth-kexec; do
         rm -f "/etc/systemd/system/$unit.service.d/synoik.conf"
@@ -68,6 +97,18 @@ To release it without rebooting, from outside the graphical session:
     systemctl start gdm
 EOF
     exit 0
+fi
+
+# The splash draws plymouth's spinner theme, and plymouth's client is how the boot's tools reach
+# it (cryptsetup's askpass, dracut's emergency shell).
+if [ ! -x /usr/bin/plymouth ] || [ ! -e /usr/share/plymouth/themes/spinner/throbber-0001.png ]; then
+    echo "error: plymouth and its spinner theme are needed:" >&2
+    if [ "$distro" = debian ]; then
+        echo "  apt install plymouth plymouth-themes" >&2
+    else
+        echo "  dnf install plymouth plymouth-theme-spinner" >&2
+    fi
+    exit 1
 fi
 
 for bin in synoik synoik-login synoik-splash; do
@@ -119,7 +160,11 @@ else
 fi
 
 # PAM, polkit, D-Bus.
-install -Dm644 -t /etc/pam.d $r/pam/*
+if [ "$distro" = debian ]; then
+    install -Dm644 -t /etc/pam.d $r/pam/debian/synoik-*
+else
+    install -Dm644 -t /etc/pam.d $r/pam/synoik-*
+fi
 install -Dm644 $r/synoik-system.rules /etc/polkit-1/rules.d/50-synoik-system.rules
 install -Dm644 $r/synoik-greeter.rules /usr/share/polkit-1/rules.d/50-synoik-greeter.rules
 install -Dm644 $r/synoik-login.dbus.conf /usr/share/dbus-1/system.d/synoik-login.conf
@@ -174,19 +219,33 @@ fi
 # deferred takeover included, while the kernel's fbdev client still probes the displays at boot,
 # which is what lets plymouth find them (docs/fork/system-compositor.md §9 S6).
 if [ -e /sys/class/graphics/fbcon ] && ! grep -q 'fbcon=map:' /proc/cmdline; then
-    grubby --update-kernel=ALL --args=fbcon=map:9
+    if [ "$distro" = debian ]; then
+        if [ ! -e "$grub_snippet" ]; then
+            install -d "$(dirname "$grub_snippet")"
+            # shellcheck disable=SC2016
+            printf '%s\n' '# synoik: no text console on the display (scripts/install-display-manager.sh).' \
+                'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX fbcon=map:9"' >"$grub_snippet"
+            update-grub
+        fi
+    else
+        grubby --update-kernel=ALL --args=fbcon=map:9
+    fi
     echo "Added fbcon=map:9 to every kernel's command line (no text console on the display)."
 fi
 
-# The splash replaces plymouth in the initramfs (boot-splash.md §7.4); it asks for the passwords
-# that unlock disks there too.
-rm -rf "$dracut_module"
-install -Dm755 $r/dracut/90synoik/module-setup.sh "$dracut_module/module-setup.sh"
-install -Dm644 $r/dracut/90synoik/synoik-system.service "$dracut_module/synoik-system.service"
-install -Dm644 $r/dracut/90-synoik.conf "$dracut_conf"
-rebuild_initramfs=1
-if [ -n "${rebuild_initramfs:-}" ]; then
-    echo "Rebuilding the initramfs images..."
+# The splash replaces plymouth in the initramfs (boot-splash.md §7.4, §7.6); it asks for the
+# passwords that unlock disks there too.
+echo "Rebuilding the initramfs images..."
+if [ "$distro" = debian ]; then
+    install -Dm755 $r/initramfs-tools/hook "$itools_hook"
+    install -Dm755 $r/initramfs-tools/init-premount "$itools_script"
+    install -Dm644 $r/initramfs-tools/synoik-system-after-cryptsetup.conf "$itools_dropin"
+    update-initramfs -u -k all
+else
+    rm -rf "$dracut_module"
+    install -Dm755 $r/dracut/90synoik/module-setup.sh "$dracut_module/module-setup.sh"
+    install -Dm644 $r/dracut/90synoik/synoik-system.service "$dracut_module/synoik-system.service"
+    install -Dm644 $r/dracut/90-synoik.conf "$dracut_conf"
     dracut -f --regenerate-all
 fi
 
