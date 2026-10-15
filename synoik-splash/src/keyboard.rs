@@ -182,10 +182,15 @@ pub fn open_system() -> io::Result<Keyboard> {
     Keyboard::open(keymap)
 }
 
-/// The system keymap as text, for the image to carry (`synoik-splash --compile-keymap`).
+/// The system keymap as text, for the image to carry (`synoik-splash --compile-keymap`);
+/// xkbcommon's default layout if the system's does not compile, since an image with no keymap could
+/// never take a password.
 pub fn compile_system_keymap() -> Option<String> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = Names::system().compile(&context)?;
+    let keymap = Names::system().compile(&context).or_else(|| {
+        eprintln!("synoik-splash: the system keymap does not compile; using the default");
+        Names::default().compile(&context)
+    })?;
     Some(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
 }
 
@@ -493,6 +498,13 @@ impl Vt {
                 libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
             )
         };
+        if raw < 0 {
+            // The outer, unprivileged: tty0 is root's (docs/fork/boot-splash.md §6).
+            warn!(
+                "splash: /dev/tty0: {}; typing reaches the VT too",
+                io::Error::last_os_error()
+            );
+        }
         Self {
             // SAFETY: just opened.
             fd: (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw) }),

@@ -242,6 +242,7 @@ shows its details), repeats type again, and the keyboards' LEDs follow the state
 splash opens the keyboards when it starts and keeps them, reading them unarmed until a prompt:
 once the real root loads its SELinux policy, its `kernel_t` may not open them (§7.1). Nothing is
 grabbed: at boot no session has the keyboard yet. The foreground VT's keyboard is set to `K_OFF`
+(by the initramfs splash; the outer lacks the privilege, §6)
 meanwhile, its input flushed and its mode restored after (plymouthd's
 `ply_terminal_set_disabled_input`), so the password reaches no line discipline: neither its input
 queue nor, through echo, the VT's screen buffer. A VT already in `K_OFF` is left alone.
@@ -321,6 +322,11 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
   the initramfs still has plymouth (an image built before the install); the way out there is to label the
   listening socket `plymouthd_t` (`setsockcreatecon` before binding) or a policy module. An update
   screen under enforcing is untested on either path.
+- **The outer cannot turn the VT keyboard off.** It runs unprivileged (`system-compositor.md`
+  §1), and `/dev/tty0` is root's, `KDSKBMODE` `CAP_SYS_TTY_CONFIG`'s; so a password typed into the
+  outer's dialog (a prompt after the handover, or at shutdown) also reaches the foreground VT's
+  input queue. The initramfs splash runs as root and is not affected. Granting the outer group
+  `tty` and that capability, or a root helper, would close it; neither is built.
 - Compose sequences: neither drawer feeds keys through an xkb compose table, so a password typed
   with dead keys gets the dead keysyms' text, or none. plymouthd composes with the locale's table
   (`/usr/share/X11/locale`); the image would have to carry it.

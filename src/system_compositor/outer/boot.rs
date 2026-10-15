@@ -361,7 +361,10 @@ impl Outer {
             self.dialog_changed();
         } else if !prompting {
             self.plymouth.keyboard_failed = false;
-            if let Some((keyboard, token)) = self.plymouth.keyboard.take() {
+            if let Some((mut keyboard, token)) = self.plymouth.keyboard.take() {
+                // Now, not with the drop: a keyboard opened for the next prompt within this
+                // dispatch must find the VT as it was.
+                keyboard.disarm();
                 match &mut self.plymouth.in_keyboard {
                     Some(remove) => *remove = true,
                     None => self.handle.remove(token),
