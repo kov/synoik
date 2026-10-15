@@ -19,6 +19,12 @@ depends() {
 
 install() {
     inst_binary /usr/local/libexec/synoik-splash
+    # A release build carries its debug info, ten times the code; dracut does not strip. The
+    # symbols stay, for a panic's backtrace.
+    if command -v strip >/dev/null; then
+        strip --strip-debug "$initdir/usr/local/libexec/synoik-splash" ||
+            dwarning "synoik: could not strip the splash"
+    fi
     inst_simple "$moddir/synoik-system.service" "$systemdsystemunitdir/synoik-system.service"
     $SYSTEMCTL -q --root "$initdir" add-wants sysinit.target synoik-system.service
     # The splash's images: loaded at start, so nothing is read after switch_root empties the image.
