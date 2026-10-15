@@ -5,7 +5,8 @@
 > (`synoik-splash/src/{plymouth,layout}.rs`, `src/system_compositor/outer/boot.rs`).
 > **Phase 2 built** (§7): the splash in the initramfs, in place of plymouth there
 > (`synoik-splash/src/main.rs`), validated on the harness VM.
-> Password prompts and the emergency path are design.
+> **Password prompts built** (step 5, §4.2) in both drawers, tested headless, not yet on the
+> harness. The emergency path is design.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -61,8 +62,9 @@ The client side is root-only by plymouth's design (`SO_PEERCRED` uid 0 or NAK,
 applies the same check to its clients.
 
 Prompts are dead between step 1 (plymouthd releases the keyboards) and step 5; a prompt pending
-in plymouthd when it quits is lost (the agent sees EOF). The outer starts before
-`cryptsetup-pre.target`, so no real-root volume asks inside that window.
+in plymouthd when it quits is lost (the agent sees EOF, and does not ask again, §7.2). This path is
+the fallback for an initramfs that still has plymouth; with the initramfs splash, real-root volumes
+are unlocked before the handover, through the splash (§7.2).
 
 The outer keeps the listener it binds in the unit's fd store, so a restart (`Restart=always`)
 adopts the name rather than binding it again. Steps 1 and 4 run only while `/run/plymouth/pid`
@@ -73,7 +75,7 @@ nobody accepting until the outer is up, and a `deactivate` sent there would wait
 
 | Unit | Change | Why |
 |---|---|---|
-| `synoik-system.service` | `DefaultDependencies=no`, `IgnoreOnIsolate=yes`, `Slice=-.slice`, `SurviveFinalKillSignal=yes`, and no `Requires=` on any mount (§2.3); started as early after switch_root as its files allow (§2.2.1); `Before=cryptsetup-pre.target`; `Wants=systemd-ask-password-plymouth.path`; `WantedBy=` both `graphical.target` and `system-update.target`, with `Before=system-update-pre.target` | §2.1; prompts; offline updates; §2.3 |
+| `synoik-system.service` | `DefaultDependencies=no`, `IgnoreOnIsolate=yes`, `Slice=-.slice`, `SurviveFinalKillSignal=yes`, and no `Requires=` on any mount (§2.3); started as early after switch_root as its files allow (§2.2.1); `WantedBy=` both `graphical.target` and `system-update.target`, with `Before=system-update-pre.target` | §2.1; offline updates; §2.3 |
 | `plymouth-quit-wait.service` | drop-in `ConditionPathExists=/etc/initrd-release`: runs in the initramfs only | `plymouth --wait` sends nothing and returns only when the daemon closes it, with `TimeoutSec=0` before `multi-user.target`. The outer closes idle connections when the boot splash ends, but quit-wait may connect after that. |
 | `plymouth-start.service` | the same drop-in | If the initramfs had no plymouthd, a fresh one would race the outer for the card. A condition rather than a mask or an emptied `ExecStart=`, so a drop-in that reaches the initramfs image changes nothing there. |
 | `plymouth-{reboot,poweroff,halt,kexec}.service` | `ExecStart=` replaced by `plymouth change-mode --reboot\|--shutdown` (a oneshot) | plymouth passes the shutdown mode only as a daemon argument (`--mode=`), never over the protocol. |
@@ -93,17 +95,13 @@ initramfs at switch_root, and the outer started there, before the real root's tm
 it `/run/plymouth` (measured 2026-10-14). The cache dir is the installer's tmpfiles entry, named to
 Mesa through `XDG_CACHE_HOME`, not `CacheDirectory=`, which implies
 `RequiresMountsFor=/var/cache` (§2.3); ordered after those units, its mounts are up, so the
-`WantsMountsFor=` it would otherwise need is not there. Starting before logind — and so before
-`cryptsetup-pre.target`, for the prompts of real-root volumes — needs the outer to manage without
-logind until it is up: step 5. The card has no systemd device
+`WantsMountsFor=` it would otherwise need is not there. The card has no systemd device
 unit on Fedora (udev does not tag DRM cards for systemd), so the outer waits for it itself, from
 its udev monitor, when it is not there yet; at switch_root it normally is (virtio-gpu loads in the
 initramfs at ≈1.1 s on jabuticaba).
 
-`Before=cryptsetup-pre.target` is a cycle wherever one of those paths lives on an encrypted
-volume (a separate crypt `/var`). The installer orders the outer before `cryptsetup-pre.target`
-only when they do not; otherwise the outer starts after the volumes, and their prompts are
-answered by the initramfs plymouthd, still on screen.
+Real-root volumes are not the outer's to unlock: their prompts are answered by whichever splash
+the initramfs started, still on screen, since the outer takes over only after them (§7.2).
 
 #### 2.2.2 fbcon stays off, the fbdev client stays
 
@@ -226,14 +224,30 @@ pixels for a display of W×H:
 
 ### 4.2 Password dialog
 
-A 35×34 lock beside a 305×34 entry, 340×34 in all, at ((W−340)/2, 0.382·(H−34)); bullets 10 px
-apart, at most 30; the prompt below, then the keyboard-layout and caps-lock indicators. Fedora
-drops the prompt's trailing ':' and puts 5 px between entry and prompt.
+two-step's `view_show_prompt` (`synoik-splash/src/layout.rs` `lay_dialog`): a 35×34 lock beside
+a 305×34 entry, 340×34 in all, at ((W−340)/2, 0.382·(H−34)); bullets 10 px apart from half a
+bullet in, at most 30, and past 30 the right half of one more at the entry's left edge; the prompt
+centred below; then the keyboard indicators, centred on the layout's (icon and name) width with
+caps lock beside it, shown only while it is on. Fedora drops the prompt's trailing ':' and puts
+5 px between entry and prompt. While the dialog is up, the spinner, the progress bar, the titles
+and the percentage are not drawn (two-step's `display_password` stops the animation); messages
+are, where they were.
 
-Keyboard input comes from the outer's own evdev fds (as the chord matcher's, §2.1 of
-`system-compositor.md`) through xkbcommon, with the system layout from localed
-(`/etc/vconsole.conf` / `/etc/X11/xorg.conf.d/00-keyboard.conf`), as plymouth does. The outer
-never grabs; at boot no session has the keyboard yet.
+Keyboard input (`synoik-splash/src/keyboard.rs`, shared by both drawers) comes from every evdev
+node that reports keys, opened while a prompt is up and closed when none is, through one xkbcommon
+state, as plymouthd's evdev path does: Return answers, BackSpace deletes a character, Ctrl+U and
+Ctrl+W clear the entry, Ctrl+C and Ctrl+D cancel (NO_ANSWER, §3.2), Escape does nothing (plymouthd
+shows its details), repeats type again, and the keyboards' LEDs follow the state. Nothing is
+grabbed: at boot no session has the keyboard yet. The foreground VT's keyboard is set to `K_OFF`
+meanwhile, its input flushed and its mode restored after (plymouthd's
+`ply_terminal_set_disabled_input`), so the password reaches no line discipline: neither its input
+queue nor, through echo, the VT's screen buffer. A VT already in `K_OFF` is left alone.
+
+The layout is localed's: `XKBLAYOUT`, `XKBMODEL`, `XKBVARIANT` and `XKBOPTIONS` from
+`/etc/vconsole.conf`, else the `Xkb*` options of `/etc/X11/xorg.conf.d/00-keyboard.conf` (Fedora
+writes only `KEYMAP` to the former), else xkbcommon's defaults. plymouthd reads the first only and
+falls back to the terminal without it. The initramfs carries the keymap compiled when the image
+was built (§7.4). Compose sequences (dead keys) are not supported (§6).
 
 ### 4.3 Update modes
 
@@ -249,7 +263,12 @@ is not built (§6).
 16 px regular and 40 px light for titles, bgrt's sizes and weights, but in the shell's sans
 (Adwaita Sans, the schema default of `org.gnome.desktop.interface font-name`) rather than bgrt's
 Cantarell: the splash fades into the greeter and session, which set their text in it. A deliberate
-divergence; the outer reads no user's settings, so it is the default, not a user's choice. Fedora's HiDPI rule is mutter's; both jabuticaba displays come out at scale 1.
+divergence; the outer reads no user's settings, so it is the default, not a user's choice. The
+layout's name beside the keyboard icon follows: plymouth blits it from `keymap-render.png`, a strip
+of every layout name prerendered in Cantarell Bold 30 px, light grey, located by a table compiled
+into plymouth; the splash sets the name xkbcommon gives (`English (US)`) in Adwaita Sans Bold 30 px
+in the same grey, where plymouth's slice of the strip would be. Fedora's HiDPI rule is mutter's;
+both jabuticaba displays come out at scale 1.
 Images scale bilinearly at scale 2; text renders at device resolution.
 
 ## 5. Build order
@@ -269,12 +288,13 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
    settings come with step 4, the password-agent ordering with step 5.
    What the splash code leaves to it: `H` sets `Splash::frozen`, which the layout ignores — the
    outer stops redrawing; `$` after `H` restarts the spinner from frame 0 (`ply_throbber_start`
-   resets its clock); and until step 5, every `*` gets `answer_password(None)` at once, or its
-   client waits on a dialog nobody draws.
+   resets its clock).
 4. **Shutdown and offline updates** (§2.3): a `pkcon offline-update` and a dnf5 offline upgrade on the
    harness.
-5. **Password prompts** (§4.2): a `systemd-ask-password` at boot on the harness, and a LUKS data
-   volume there.
+5. **Password prompts** (§4.2): the dialog's layout as conformance tests, the keyboard against a
+   synthetic xkb state, both drawers' pixels; then on the harness, a LUKS volume unlocked in the
+   initramfs (`x-initrd.attach`), one unlocked in the real root before the handover, and a
+   `systemd-ask-password` after it, from the outer.
 6. **Emergency and rescue** (§2.4): `systemctl emergency` on the harness — the splash ends, the
    shell answers on the serial console.
 
@@ -295,9 +315,12 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
   screen gets no mode, progress or message. The listener the initramfs splash binds (§7) is
   `kernel_t`'s, and the outer adopts it: over a whole enforcing boot on the harness, no `connectto`
   was denied, and a unit's `plymouth display-message` got through. So the gap remains only where
-  the initramfs still has plymouth (an encrypted volume, §7.4); the way out there is to label the
+  the initramfs still has plymouth (an image built before the install); the way out there is to label the
   listening socket `plymouthd_t` (`setsockcreatecon` before binding) or a policy module. An update
   screen under enforcing is untested on either path.
+- Compose sequences: neither drawer feeds keys through an xkb compose table, so a password typed
+  with dead keys gets the dead keysyms' text, or none. plymouthd composes with the locale's table
+  (`/usr/share/X11/locale`); the image would have to carry it.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
   check the server, so a squatter would receive passwords. The window is a few milliseconds and no
   prompt is possible inside it (§2.1), but it is not zero.
@@ -355,6 +378,12 @@ plane and no dark frame between them. Both drawers present at ≈15 fps on that 
 unit's process: it is conditioned on `/run/synoik-system/initrd-splash`, which the splash creates
 and removes.
 
+**A password prompt does not cross the restart.** Its client's connection dies with the splash,
+and systemd's plymouth agent (v259, `tty-ask-password-agent.c`) takes the EOF as `-EIO`, logs it,
+and waits for the next change under `/run/systemd/ask-password`: the asking unit would wait until
+its own timeout. So the handover is ordered `After=cryptsetup.target`, and every crypttab volume is
+unlocked through the splash before it.
+
 The real root's unit keeps its plymouth calls for a boot whose initramfs still has plymouth
 (an image built before the install, or `--use-gdm` half undone). They are guarded on the pid file
 naming a `plymouthd`, so a restart never sends `deactivate` or `quit` to a socket nobody is
@@ -370,9 +399,10 @@ GPU drawing: the restart's first frame can differ by a filter rounding where the
 It probes the connectors itself (a `GETCONNECTOR` as master), so it does not depend on the kernel's
 fbdev client (§2.2.2). It waits for the card on udev, as plymouthd does.
 
-Text is not drawn in the initramfs yet: no message lines and no titles (update modes never start
-there). It comes with step 5's prompt, which needs it and Adwaita Sans in the image. Messages sent before the restart are kept in
-the state and drawn by the outer.
+Text is drawn on the CPU too (`synoik-splash/src/text.rs`): the outer's shaping (cosmic-text,
+the same metrics and hinting) and its swash rasterization, from Adwaita Sans by path, since the
+image has no fontconfig. Unlike `synoik-vk`'s rasterizer it applies the variable face's `wght` axis
+to the outlines, so its bold and light differ from the outer's there.
 
 ### 7.4 The image
 
@@ -381,9 +411,14 @@ order; `/etc/dracut.conf.d/synoik.conf` adds it and omits `plymouth` (≈3 MB sm
 `initrd-size-and-time` measurements). The plymouth package stays installed, so `--use-gdm` brings
 everything back with a `dracut -f`.
 
-Not done when the root, or anything else the initramfs unlocks, is encrypted: no prompt is drawn
-until step 5, and with fbcon off the console agent is invisible. The installer checks `crypttab`
-and the root's device stack and leaves plymouth in the image when either has a LUKS volume.
+For the prompt, the image also carries `AdwaitaSans-Regular.ttf` (880 KB), libxkbcommon, the
+keymap compiled at build time (`synoik-splash --compile-keymap`, the system layout of §4.2, at
+`/usr/share/synoik-splash/keymap.xkb`), and systemd's plymouth password agent, which dracut
+installs only alongside its plymouth module. The splash's unit stands in for
+`plymouth-start.service` there: it pulls the agent's path unit in, and is ordered before it and
+before the console agent's, both of which test `/run/plymouth/pid` once, when they start. The
+splash writes the pid file before it reports ready. A change of layout takes a `dracut -f`, as
+the i18n module's copy of `vconsole.conf` already does.
 
 ### 7.5 Build order
 

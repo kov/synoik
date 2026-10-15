@@ -11,6 +11,9 @@ ConditionPathExists=/run/synoik-system/initrd-splash
 After=systemd-journald.socket systemd-tmpfiles-setup.service systemd-sysusers.service
 After=systemd-udev-trigger.service dbus.socket systemd-logind.service
 Before=system-update-pre.target systemd-user-sessions.service synoik-login.service
+# A password prompt up at the restart would die with its connection, and systemd's agent does not
+# ask again (§7.2): the disks are unlocked first.
+After=cryptsetup.target
 
 [Service]
 Type=oneshot

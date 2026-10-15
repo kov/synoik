@@ -12,6 +12,12 @@ ConditionKernelCommandLine=!plymouth.enable=0
 ConditionKernelCommandLine=!rd.plymouth=0
 ConditionVirtualization=!container
 After=systemd-udev-trigger.service systemd-udevd.service
+# plymouth-start.service's place for the password agents: theirs asks the splash, the console's
+# stands down for it. Both test for /run/plymouth/pid once, when they start, and the splash writes
+# it before it is ready.
+Wants=systemd-ask-password-plymouth.path
+Before=systemd-ask-password-plymouth.path systemd-ask-password-plymouth.service
+Before=systemd-ask-password-console.path systemd-ask-password-console.service
 StartLimitIntervalSec=0
 
 [Service]
