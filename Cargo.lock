@@ -976,6 +976,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "drm"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a41816e58f47f49acfd956651055ddcf137c4882c2098c30c448817af21183a"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytemuck",
+ "bytemuck_derive",
+ "drm-ffi",
+ "drm-fourcc",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "drm-ffi"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,7 +1376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce852e998d3ca5e4a97014fb31c940dc5ef344ec7d364984525fd11e8a547e6a"
 dependencies = [
  "bitflags 2.11.1",
- "drm",
+ "drm 0.14.1",
  "drm-fourcc",
  "gbm-sys",
  "libc",
@@ -3492,7 +3507,7 @@ dependencies = [
  "cgmath",
  "cursor-icon",
  "downcast-rs",
- "drm",
+ "drm 0.14.1",
  "drm-ffi",
  "drm-fourcc",
  "errno",
@@ -3526,7 +3541,7 @@ name = "smithay-drm-extras"
 version = "0.1.0"
 source = "git+https://github.com/kov/smithay.git?branch=synoik#2a1aab2abaac0285a9150129ad2132d31ccae093"
 dependencies = [
- "drm",
+ "drm 0.14.1",
  "libdisplay-info",
 ]
 
@@ -3752,11 +3767,14 @@ dependencies = [
 name = "synoik-splash"
 version = "26.4.0"
 dependencies = [
+ "drm 0.15.0",
  "libc",
+ "png",
  "sd-notify",
  "serde",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -7,7 +7,14 @@ edition.workspace = true
 
 description = "The synoik boot splash: plymouthd's protocol, the splash layout, and the initramfs splash program."
 
+[[bin]]
+name = "synoik-splash"
+path = "src/main.rs"
+
 [dependencies]
+drm = "0.15.0"
+png = "0.18.1"
+tracing-subscriber.workspace = true
 libc = "0.2.185"
 sd-notify = { version = "0.5.0", features = ["fdstore"] }
 serde.workspace = true

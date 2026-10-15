@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 pub mod handoff;
 pub mod layout;
+pub mod paint;
 pub mod plymouth;
 
 /// A unix socket peer's credentials.
