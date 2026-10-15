@@ -9,7 +9,7 @@ extern crate tracing;
 
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::os::fd::FromRawFd;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -102,6 +102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .with_writer(writer)
         .with_env_filter(env_filter)
+        // Colour for a terminal only: journald stores a line with escapes as a byte array, which
+        // `journalctl` shows as a blob and every reader of `-o json` has to decode.
+        .with_ansi(io::stderr().is_terminal())
         .with_ansi_sanitization(false)
         .init();
 
