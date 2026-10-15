@@ -9,7 +9,7 @@
 > initramfs splash on Debian (§7.6), the other cases of §5 step 5 not yet run. **Emergency and
 > rescue** (step 6, §2.4) validated on the harness. **initramfs-tools** (Debian, §7.6) validated
 > on a Debian VM with a LUKS root: prompt, unlock, handover and greeter, the splash on screen
-> throughout.
+> throughout; an offline update there too.
 
 References: plymouth **24.004.60** (`~/Projects/plymouth`, Fedora 44's version; Fedora's patches
 touch neither the protocol nor the layout math, only assets and HiDPI thresholds), systemd v259,
@@ -311,7 +311,8 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 5. **Password prompts** (§4.2): the dialog's layout as conformance tests, the keyboard against a
    synthetic xkb state, both drawers' pixels; then on the harness, a LUKS volume unlocked in the
    initramfs (`x-initrd.attach`), one unlocked in the real root before the handover, and a
-   `systemd-ask-password` after it, from the outer.
+   `systemd-ask-password` after it, from the outer. The first ran on Debian (§7.6); the other two,
+   and step 6's failed password, are to run on the harness VM with a LUKS data disk.
 6. **Emergency and rescue** (§2.4): `rd.break`, `systemctl emergency` and `systemctl rescue` on the
    harness — the splash ends, the shell answers on the serial console, and leaving it resumes the
    boot. Still to run with step 5's volume: a LUKS password failed three times, which ends in
@@ -340,11 +341,20 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 - **The outer cannot turn the VT keyboard off.** It runs unprivileged (`system-compositor.md`
   §1), and `/dev/tty0` is root's, `KDSKBMODE` `CAP_SYS_TTY_CONFIG`'s; so a password typed into the
   outer's dialog (a prompt after the handover, or at shutdown) also reaches the foreground VT's
-  input queue. The initramfs splash runs as root and is not affected. Granting the outer group
-  `tty` and that capability, or a root helper, would close it; neither is built.
+  input queue. The initramfs splash runs as root and is not affected. The fix chosen is a small
+  root helper that switches the keyboard off for the outer, keeping the outer unprivileged; it is
+  not built.
 - Compose sequences: neither drawer feeds keys through an xkb compose table, so a password typed
   with dead keys gets the dead keysyms' text, or none. plymouthd composes with the locale's table
   (`/usr/share/X11/locale`); the image would have to carry it.
+- **The spinner stops at the handover.** The initramfs splash draws its last frame and lets go
+  (at TERM on dracut, at the hand-over on initramfs-tools); the screen holds it until the outer's
+  first frame, 237 ms on the harness (§7.2) and longer while the outer sets up Vulkan on a slower
+  device. The splash should keep turning the spinner on the CPU until the outer is ready to draw,
+  then hand over.
+- **A display plugged in after the first is lit stays dark until the outer.** The initramfs splash
+  listens for DRM hotplug only while no display is lit (§7.3); the outer follows udev for all of
+  them.
 - Anyone can bind the abstract name while it is free (§2.1, between quit and bind). Clients do not
   check the server, so a squatter would receive passwords. The window is a few milliseconds and no
   prompt is possible inside it (§2.1), but it is not zero.

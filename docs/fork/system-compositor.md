@@ -465,5 +465,21 @@ session's own buffer following. Neither inner logged a warning, though each also
 Not built: cursor and client planes through the outer (the inner composites everything, cursor
 included); §3's atomic test-and-revert and the HDR, VRR and orientation fields; VRR and tearing
 passthrough; a modeset under black (§4.2: a changed display cuts through its plate); custom
-modelines nested; the inner asking the outer for a switch over IPC (§2.1's normal path); the boot
-and shutdown splash (§6).
+modelines nested; the inner asking the outer for a switch over IPC (§2.1's normal path). The boot
+and shutdown splash (§6) is built: `boot-splash.md`.
+
+## 11. Next
+
+In order:
+
+1. **The cursor plane through the outer.** The inner composites its cursor into every frame, so
+   moving the pointer costs the inner a render and the outer a flip. The outer owns the planes
+   (§1), so the inner should pass its cursor image and position over the wire and the outer put
+   them on the cursor plane, as the tty backend does today. Other planes (a client's buffer
+   promoted to an overlay) come with it if they fit without blowing up the protocol; otherwise
+   they are booked separately.
+2. **A way to exercise the outer's animations**, so they can be tuned: switch crossfades, the
+   splash to greeter and greeter to session handoffs, shutdown's fade, driven repeatably and
+   captured frame by frame on the harness. Then smooth the handoff between inner and outer.
+3. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
+   CPU splash keeps the spinner turning until the outer can draw.

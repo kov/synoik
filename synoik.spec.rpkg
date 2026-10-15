@@ -84,6 +84,9 @@ BuildRequires:  mesa-libEGL
 BuildRequires:  lcms2-devel
 BuildRequires:  fontconfig-devel
 BuildRequires:  libseccomp-devel
+# glslangValidator, for synoik-vk's shaders; PAM, for synoik-login (the workspace's tests build both)
+BuildRequires:  glslang
+BuildRequires:  pam-devel
 
 Requires:       mesa-dri-drivers
 Requires:       mesa-libEGL

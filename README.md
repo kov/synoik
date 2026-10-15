@@ -77,7 +77,8 @@ LimitMEMLOCK=768M
 LimitMEMLOCK=768M
 ```
 
-`resources/synoik.service` already carries the second. The first takes effect when the user
+`resources/synoik.service` already carries the second, and `scripts/install-display-manager.sh`
+installs the first where it is missing. The first takes effect when the user
 manager restarts — with lingering enabled that is a reboot (or `systemctl restart user@<uid>`), not
 a relog. To check a running session, read `/proc/<pid>/limits` (`Max locked memory`) and
 `VmLck`/`VmSwap` in `/proc/<pid>/status`.

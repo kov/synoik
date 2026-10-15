@@ -111,6 +111,12 @@ if [ ! -x /usr/bin/plymouth ] || [ ! -e /usr/share/plymouth/themes/spinner/throb
     exit 1
 fi
 
+# X11 clients reach the session through xwayland-satellite; without it they do not run (Debian
+# packages none).
+if ! command -v xwayland-satellite >/dev/null; then
+    echo "warning: no xwayland-satellite: X11 applications will not run" >&2
+fi
+
 for bin in synoik synoik-login synoik-splash; do
     if [ ! -x "target/$profile/$bin" ]; then
         echo "error: target/$profile/$bin not found — build it first (as your normal user):" >&2
@@ -189,6 +195,12 @@ install -d "$schemas"
 rm -f "$schemas"/*.gschema.xml "$schemas"/*.gschema.override
 install -Dm644 -t "$schemas" $r/schemas/*.gschema.xml $r/schemas/*.gschema.override
 glib-compile-schemas --strict "$schemas"
+
+# The user manager's ceiling for the sessions' LimitMEMLOCK (README.md): created, never
+# overwritten. It applies once the user managers restart: the reboot below.
+if [ ! -e /etc/systemd/system/user@.service.d/memlock.conf ]; then
+    install -Dm644 $r/user-memlock.conf /etc/systemd/system/user@.service.d/memlock.conf
+fi
 
 # Autologin is the administrator's: created off, never overwritten.
 if [ ! -e /etc/synoik/login.conf ]; then
