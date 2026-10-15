@@ -76,18 +76,19 @@ boot() {
         || die "the VM did not come up"
 }
 
-# Wait until the outer has a session attached that shows frames: the user session after an
-# autologin, or the greeter.
+# Wait until the running outer — this invocation of its unit, not an earlier one this boot — has
+# a session attached, then let it settle for $1 seconds (default 3) so its frames are on screen.
 wait_session() {
     local i
     for i in $(seq 120); do
-        if on_guest 'journalctl -b -u synoik-system -o cat | grep -q "the splash is over"'; then
+        if on_guest 'inv=$(systemctl show -p InvocationID --value synoik-system) && [ -n "$inv" ] &&
+            journalctl -b _SYSTEMD_INVOCATION_ID=$inv -o cat | grep -q "attached (pid"' 2>/dev/null; then
             sleep "${1:-3}"
             return
         fi
         sleep 1
     done
-    die "no session reached the screen"
+    die "no session attached to the outer"
 }
 
 # Wait for the VM to power off, and print a `driver.jsonl` line for the moment it did (its
