@@ -239,6 +239,8 @@ struct Device {
     fd: OwnedFd,
     leds: bool,
     path: PathBuf,
+    /// Whether a key came from it yet: logged once, never which.
+    heard: bool,
 }
 
 /// Every keyboard.
@@ -378,6 +380,7 @@ impl Keyboard {
         };
         if raw < 0 {
             // Not ours yet (udev has not opened it up), or already gone; `IN_ATTRIB` retries.
+            info!("{}: {}", path.display(), io::Error::last_os_error());
             return;
         }
         // SAFETY: just opened.
@@ -397,6 +400,7 @@ impl Keyboard {
                 fd,
                 leds: types & (1 << EV_LED) != 0,
                 path: path.to_owned(),
+                heard: false,
             },
         );
     }
@@ -430,6 +434,10 @@ impl Keyboard {
             for event in &events[..n as usize / size] {
                 if event.type_ != EV_KEY {
                     continue;
+                }
+                if let Some(device) = self.devices.get_mut(&fd).filter(|d| !d.heard) {
+                    device.heard = true;
+                    info!("keys from {}", device.path.display());
                 }
                 let (key, changed) = key_event(&mut self.state, event.code, event.value);
                 leds |= changed;

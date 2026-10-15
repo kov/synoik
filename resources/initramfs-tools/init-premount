@@ -33,6 +33,9 @@ for argument in $(cat /proc/cmdline); do
     esac
 done
 
+# The keyboards' event nodes, where evdev is a module: udev loads it only once an input device
+# shows up, and the splash reads them from the start.
+modprobe -q evdev
 mkdir -p /run/plymouth
 # Its log goes to the kernel's, which the real root's journal takes in.
 "${splash}" </dev/null >/dev/kmsg 2>&1 &

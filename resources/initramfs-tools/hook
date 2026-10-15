@@ -59,6 +59,10 @@ if ! "${splash}" --compile-keymap >"${DESTDIR}/usr/share/synoik-splash/keymap.xk
     echo "W: synoik: no keymap; the splash cannot ask for passwords"
 fi
 
+# evdev, whose /dev/input nodes the splash reads keys from: Debian builds it as a module, and
+# nothing else puts it in the image (plymouthd reads the terminal).
+manual_add_modules evdev
+
 # The GPU drivers, so the card is there to draw on: the plymouth package's hook adds them only
 # for a graphical theme. Its rules, and its list of drivers left out.
 MODULES_EXCLUDE="mga r128 savage sis tdfx via panfrost"
