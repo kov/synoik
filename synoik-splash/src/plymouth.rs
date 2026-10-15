@@ -731,7 +731,12 @@ impl Server {
     fn sync_pid_file(&self) {
         let Some(path) = &self.pid_file else { return };
         let result = if self.splash.shown {
-            fs::write(path, format!("{}\n", std::process::id()))
+            // Replaced, not rewritten: a pid file left by the splash before (root's, and out of
+            // reach of its own removal once the switch has moved `/run`, §7.6) cannot be
+            // opened by the outer, but can be renamed over in a directory that is its own.
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, format!("{}\n", std::process::id()))
+                .and_then(|()| fs::rename(&tmp, path))
         } else {
             fs::remove_file(path).or_else(|err| {
                 if err.kind() == io::ErrorKind::NotFound {

@@ -477,8 +477,10 @@ is the same program, started and taken over differently.
   (`ExecStartPre=+`, `NotifyAccess=exec`): it takes the card, plymouth's listener and a `splash`
   memfd over that socket and puts them in the unit's fd store under the names of §7.2, and the
   outer adopts them exactly as after the restart. Both ends check that the other is root: anyone
-  can bind an abstract name. The splash lets go of the keyboard and the pid file before sending,
-  so the outer's pid file is never removed after the fact, and exits once sent. Where no splash
+  can bind an abstract name. The splash lets go of the keyboard before sending and exits once
+  sent. Its pid file it cannot remove: past the switch its root is still the initramfs's, whose
+  `/run` the switch moved into the real root, so the outer replaces the file by rename (tmpfiles
+  has made the directory the outer's). Where no splash
   waits, as on a dracut boot, the helper finds no socket and does nothing. Measured on Debian's
   systemd 261: a descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its
   name.
