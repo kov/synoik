@@ -3,7 +3,7 @@
 #
 # Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-"""Read a harness run (`shutdown.sh`, `reboot.sh`) back: what reached the screen, when, and what the outer meant.
+"""Read a harness run (`shutdown.sh`, `reboot.sh`, `login.sh`, `switch.sh`, `logout.sh`) back: what reached the screen, when, and what the outer meant.
 
     scripts/harness/report.py RUN [--strip N] [--all]
 
@@ -19,7 +19,8 @@ Sections:
   timeline   frames merged with the driver's steps and the journal; a steady run of one label
              is one line (`--all` prints every frame)
   fades      per fade, each composite frame's alpha fitted from its pixels as A + a·(B − A),
-             against the frames before and after the fade, beside the alpha the outer logged
+             against the frames before and after the fade (before the first frame, the still the
+             run began with, `before.png`), beside the alpha the outer logged
   tail       the screen's last change before the power went, the longest still after the shutdown
              began, and how steadily the spinner turned
   filmstrip  RUN/filmstrip.png: up to N frames (default 40), every label change kept
@@ -303,9 +304,11 @@ def fades(run, frames, flips, events):
         print()
         return
     index = {f['seq']: i for i, f in enumerate(frames)}
+    # What was on the screen when the recording began (capture_start), for a fade that starts the run.
+    before = {'seq': 0, 'file': 'before.png', 'label': 'the screen before'} if (run / 'before.png').exists() else None
     for seg in segments:
         i, j = index[seg[0]['seq']], index[seg[-1]['seq']]
-        a = frames[i - 1] if i > 0 else seg[0]
+        a = frames[i - 1] if i > 0 else before or seg[0]
         b = frames[j + 1] if j + 1 < len(frames) else seg[-1]
         A, B = gray(run, a), gray(run, b)
         d = B - A

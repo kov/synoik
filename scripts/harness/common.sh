@@ -108,3 +108,66 @@ mark_on_host() {
     shift
     on_host "python3 -c 'import json,sys,time; print(json.dumps({\"step\": sys.argv[1], \"t_realtime_ns\": time.time_ns()}))' '$step' && { $*; } >&2"
 }
+
+# The seat0 session of user $1 (`greeter` for the greeter's), from logind; empty if none.
+seat_session() {
+    on_guest "loginctl list-sessions --json=short" | python3 -c '
+import json, sys
+want = sys.argv[1]
+for s in json.load(sys.stdin):
+    if s["seat"] == "seat0" and (s["class"] == "greeter" if want == "greeter" else s["user"] == want):
+        print(s["session"])
+        break' "$1"
+}
+
+# Run a command in user $1's seat0 session (`synoik msg …` reaches that session's compositor).
+as_user() {
+    local user=$1
+    shift
+    on_guest "u=\$(id -u $user) && S=\$(ls /run/user/\$u/synoik.*.sock | head -1) &&
+        setpriv --reuid $user --regid $user --init-groups env SYNOIK_SOCKET=\$S $*"
+}
+
+# The session the running outer fronts now, from its journal; empty for none.
+fronted_session() {
+    on_guest 'inv=$(systemctl show -p InvocationID --value synoik-system) &&
+        journalctl -b _SYSTEMD_INVOCATION_ID=$inv -o cat | grep "seat0 fronts session" | tail -1' |
+        sed -n 's/.*fronts session Some("\([^"]*\)").*/\1/p'
+}
+
+# Wait until the outer fronts session $1, then let it settle for $2 seconds (default 3).
+wait_fronted() {
+    local i
+    for i in $(seq 120); do
+        if [ "$(fronted_session)" = "$1" ]; then
+            sleep "${2:-3}"
+            return
+        fi
+        sleep 0.5
+    done
+    die "the outer does not front session $1"
+}
+
+# Start recording every frame on the screen of supervisor $1 into run $2's capture directory,
+# with a still of what is on it now as `before.png`: a still screen presents no frame, so a
+# transition's first end is otherwise not in the run.
+capture_start() {
+    on_host "mkdir -p '$HARNESS_DIR/captures' &&
+        '$LIMINA' debug $1 capture start '$HARNESS_DIR/captures/$2' >/dev/null &&
+        '$LIMINA' debug $1 capture still '$HARNESS_DIR/captures/$2/before.png' >/dev/null"
+    sleep 1
+}
+
+# Stop the recording of run $2 on supervisor $1 and bring its frames into directory $3.
+capture_stop() {
+    on_host "'$LIMINA' debug $1 capture stop >/dev/null"
+    scp -q "$HARNESS_HOST:$HARNESS_DIR/captures/$2/*" "$3/"
+    on_host "rm -r '$HARNESS_DIR/captures/$2'"
+}
+
+# This boot's log lines that report.py reads: the outer's, the sessions', logind's and pid 1's,
+# as `journalctl -o json`. The whole boot, since the outer names each framebuffer once.
+boot_journal() {
+    on_guest "journalctl -b ${1:-} -o json _COMM=synoik + _COMM=synoik-login + \
+        _SYSTEMD_UNIT=systemd-logind.service + _COMM=gnome-session-b + _PID=1"
+}
