@@ -109,22 +109,28 @@ impl Motion {
     };
 
     /// How long it runs: the crossfade's 250 ms; the curtain's slide (`CURTAIN_SLIDE_TIME`,
-    /// `screenShield.js`); gnome-shell's session start (`STARTUP_ANIMATION_TIME`, `layout.js`).
+    /// `screenShield.js`), twice between two users; gnome-shell's session start
+    /// (`STARTUP_ANIMATION_TIME`, `layout.js`).
     pub fn duration(self) -> Duration {
-        Duration::from_millis(match self.style {
-            Style::Fade => 250,
-            Style::Curtain => 300,
-            Style::Depth => 500,
+        Duration::from_millis(match (self.style, self.way) {
+            (Style::Fade, _) => 250,
+            (Style::Curtain, Way::Through) => 600,
+            (Style::Curtain, _) => 300,
+            (Style::Depth, _) => 500,
         })
     }
 
     /// Progress at `t` of the duration, eased out: the crossfade cubic, the motions quadratic as
-    /// gnome-shell's (`EASE_OUT_QUAD`).
+    /// gnome-shell's (`EASE_OUT_QUAD`). A curtain between two users is two slides, down and up,
+    /// each eased on its own: progress 0.5 is the curtain down, at half the duration.
     pub fn ease(self, t: f32) -> f32 {
         let t = t.clamp(0., 1.);
-        match self.style {
-            Style::Fade => 1. - (1. - t).powi(3),
-            Style::Curtain | Style::Depth => 1. - (1. - t).powi(2),
+        let quad = |t: f32| 1. - (1. - t).powi(2);
+        match (self.style, self.way) {
+            (Style::Fade, _) => 1. - (1. - t).powi(3),
+            (Style::Curtain, Way::Through) if t < 0.5 => quad(t * 2.) / 2.,
+            (Style::Curtain, Way::Through) => 0.5 + quad(t * 2. - 1.) / 2.,
+            (Style::Curtain | Style::Depth, _) => quad(t),
         }
     }
 }
@@ -867,6 +873,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A curtain between two users is down at half its duration, each slide eased on its own.
+    #[test]
+    fn a_curtain_between_users_is_two_slides() {
+        let through = Motion {
+            style: Style::Curtain,
+            way: Way::Through,
+        };
+        assert_eq!(through.ease(0.5), 0.5);
+        assert!(
+            through.ease(0.25) > 0.25 && through.ease(0.75) > 0.75,
+            "both eased out"
+        );
+        assert_eq!(
+            through.duration(),
+            2 * Motion {
+                way: Way::Leaves,
+                ..through
+            }
+            .duration()
+        );
     }
 
     /// Halfway, a curtain is half down: the greeter's side above, the session below. Leaving, the

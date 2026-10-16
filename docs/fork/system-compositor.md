@@ -423,8 +423,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   - `curtain` (the default): the greeter is a curtain over the sessions, as gnome-shell's lock
     screen is over one — a login or an unlock slides it up off the session, a logout or a switch
     user slides it down over it; 300 ms ease-out-quad (`CURTAIN_SLIDE_TIME`, `screenShield.js`).
-    Between two users' sessions the plate is the curtain, down over the one and up off the other
-    in one motion.
+    Between two users' sessions the plate is the curtain, down over the one and up off the other:
+    two slides, each 300 ms eased on its own.
   - `depth`: the greeter comes nearer (to 1.2×) and fades as the session lands from a distance
     (0.75× and transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
     same backwards for a logout or a switch user; between users the outgoing session leaves as the
