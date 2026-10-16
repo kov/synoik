@@ -10,11 +10,14 @@
 #
 #   scripts/harness/tour.sh prep STYLE   boot, make the outer draw switches as STYLE (fade, curtain
 #                                        or depth), turn autologin off, power off
-#   scripts/harness/tour.sh run          boot and drive the tour, until the VM powers off
+#   scripts/harness/tour.sh run [--video NAME]
+#                                        boot and drive the tour, until the VM powers off; with
+#                                        --video, Limina records it all, launch to power-off, as
+#                                        movies in NAME/ beside the harness disk on the host
 #   scripts/harness/tour.sh restore      boot, autologin back on, the outer's default style
 #
-# `prep` leaves the VM off, so a recording can start before `run` boots it. Nothing is captured
-# here: this is for eyes, the other drivers are for `report.py`.
+# `prep` leaves the VM off, so a recording can start before `run` boots it. The video is for eyes
+# (lossy, and capturing costs the host time): the other drivers are for `report.py`.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -70,6 +73,12 @@ prep)
     say "ready for a $2 tour, the VM off"
     ;;
 run)
+    if [ "${2:-}" = --video ]; then
+        [ -n "${3:-}" ] || die "--video takes a name"
+        video="$HARNESS_DIR/$3"
+        on_host "[ ! -e '$video' ]" || die "$video exists"
+        HARNESS_LAUNCH_ENV="LIMINA_WINDOW_CAPTURE_DIR='$video' LIMINA_WINDOW_CAPTURE_DIR_MODE=video"
+    fi
     boot
     wait_session 1
     # The greeter takes keys only a few seconds after its first frame.
@@ -102,6 +111,12 @@ run)
     keys 'key tap enter\n'
     wait_gone "$pid" >/dev/null
     say "tour done, the VM off"
+    if [ -n "${video:-}" ]; then
+        # Limina finishes the movies as it exits; give it a moment past the process.
+        sleep 4
+        on_host "ls '$video'"
+        say "video in $video"
+    fi
     ;;
 restore)
     boot

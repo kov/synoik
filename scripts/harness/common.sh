@@ -62,13 +62,14 @@ mount_limina() {
         >/dev/null; }" || die "cannot mount a Limina build"
 }
 
-# Boot the VM unless it runs, and wait for its ssh.
+# Boot the VM unless it runs, and wait for its ssh. `HARNESS_LAUNCH_ENV` goes in front of the
+# launch, e.g. Limina's whole-lifetime video capture.
 boot() {
     [ -n "$(supervisor)" ] && return
     mount_limina
     say "booting $HARNESS_DISK"
     on_host "cd '$HARNESS_DIR' && K=\$(cat ~/.ssh/id_ed25519.pub) && \
-        LIMINA_INPUT_INJECT=1 LIMINA_DEBUG_PORT=1 '$LIMINA' --disk '$HARNESS_DISK' --window --net \
+        LIMINA_INPUT_INJECT=1 LIMINA_DEBUG_PORT=1 ${HARNESS_LAUNCH_ENV:-} '$LIMINA' --disk '$HARNESS_DISK' --window --net \
         --ssh-port $HARNESS_SSH_PORT --display-resolution $HARNESS_SIZE --no-fingerprint --no-fido \
         --console '${HARNESS_DISK%.raw}.console' \
         --smbios-oem-string \"io.systemd.credential:ssh.authorized_keys.root=\$K\" --detach && \
