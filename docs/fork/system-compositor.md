@@ -495,8 +495,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
 - **Harness** (`scripts/harness/`): drivers that run a scenario on the Limina harness VM while
   Limina records every frame that reaches its screen (`shutdown.sh`, `reboot.sh`, `login.sh`
   through the greeter, `switch.sh` between two running sessions, `logout.sh` through the
-  end-session dialog, `switch-user.sh` through the power menu's Switch User; `deploy.sh` installs
-  a build), and `report.py`, which reads a run back against the outer's flight recorder
+  end-session dialog, `switch-user.sh` through the power menu's Switch User; `tour.sh` drives them
+  all in one boot for watching or recording, uncaptured; `deploy.sh` installs a build), and `report.py`, which reads a run back against the outer's flight recorder
   (the `synoik::system_compositor::flight` debug target: every flip that is not a session's steady
   frame, every step of a fade, and which virtio-gpu resource backs each framebuffer). Frames are
   named by that resource, not by time; each boot's journal is put on the capture's clock through
