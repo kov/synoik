@@ -10641,7 +10641,12 @@ fn overview_entry_floats_over_an_app_grid_sized_workspace_row() {
         // reserved height ends, which is where GNOME would have had its whole row.
         assert!(
             band.loc.y - crate::ui::panel::panel_height()
-                < crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
+                < crate::ui::overview_search::preferred_entry_height(
+                    crate::ui::overview_layout::chrome_ramp(Size::from((
+                        f64::from(size.0),
+                        f64::from(size.1)
+                    )))
+                ),
             "{size:?}: the entry still displaces the row (band at {})",
             band.loc.y
         );
@@ -20705,13 +20710,13 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
     assert_eq!(radius, 30., "…and the preview its 30px corner");
     assert!(gap <= 80., "…and the gap stays inside GNOME's clamps");
 
-    // 1024x665 (2048x1330 @ 2) — the canvas this divergence was written for. Ramp 0.8.
+    // 1024x665 (2048x1330 @ 2) — the canvas this divergence was written for. Ramp 0.53.
     let (s_icon, s_entry, s_radius, s_gap) = measure((1024, 665));
     assert_eq!(
-        s_icon, 48.,
-        "the dash steps down a ladder rung (64 x 0.8 = 51.2 -> 48)"
+        s_icon, 32.,
+        "the dash takes the nearest ladder rung (64 x 0.53 = 34.1 -> 32)"
     );
-    assert_eq!(s_entry, 282., "the entry keeps its share of the screen");
+    assert_eq!(s_entry, 188., "the entry keeps its share of the screen");
     assert!(
         s_gap < 80.,
         "the gap is no longer pegged at the un-ramped maximum: {s_gap}"

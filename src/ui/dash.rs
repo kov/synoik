@@ -190,14 +190,17 @@ impl DashMetrics {
 }
 
 /// What the dash asks for on a canvas of `view_size`: [`ICON_PX`] shrunk by the chrome
-/// ramp, snapped down to a ladder rung.
+/// ramp, snapped to the nearest ladder rung (the larger on a tie). Rounding down would skip
+/// a rung where they are 16 px apart: 42.7 would land on 32, a dash two sizes down beside
+/// chrome that shrank by a third.
 pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
     let ramp = crate::ui::overview_layout::chrome_ramp(view_size);
+    let want = ICON_PX * ramp;
     let icon = ICON_LADDER
         .iter()
         .rev()
         .copied()
-        .find(|&icon| icon <= ICON_PX * ramp)
+        .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
         .unwrap_or(ICON_LADDER[0]);
     DashMetrics::for_icon(icon).preferred_height()
 }

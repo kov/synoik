@@ -83,9 +83,9 @@ pub fn small_workspace_height(view_size: Size<f64, Logical>, start_y: f64) -> f6
 /// [`chrome_ramp`].
 const SEARCH_ENTRY_EDGE_MARGIN: f64 = 12.;
 
-/// The reference canvas: the smallest logical size GNOME's fixed chrome constants still
-/// read correctly on. Above it nothing changes; below it [`chrome_ramp`] shrinks.
-const REFERENCE_CANVAS: (f64, f64) = (1280., 800.);
+/// The reference canvas: the smallest logical size GNOME's fixed chrome constants read in
+/// proportion on. Above it nothing changes; below it [`chrome_ramp`] shrinks.
+const REFERENCE_CANVAS: (f64, f64) = (1920., 1080.);
 
 /// The floor: chrome may shrink to half GNOME's constants and no further, so hit targets
 /// and rings stay usable on an absurd canvas.
@@ -326,13 +326,13 @@ mod tests {
     fn the_chrome_ramp_is_monotone_clamped_and_neutral_at_the_reference() {
         let r = |w: f64, h: f64| chrome_ramp(Size::from((w, h)));
 
-        assert_eq!(r(1280., 800.), 1., "neutral at the reference canvas");
-        assert_eq!(r(1920., 1080.), 1., "and on anything bigger");
+        assert_eq!(r(1920., 1080.), 1., "neutral at the reference canvas");
+        assert_eq!(r(2560., 1440.), 1., "and on anything bigger");
         assert_eq!(r(3840., 2160.), 1.);
 
         // The axis that runs out first drives it, so a wide-but-short canvas ramps too.
-        assert_eq!(r(1920., 600.), 0.75, "height binds");
-        assert_eq!(r(640., 1080.), 0.5, "width binds, and the floor holds");
+        assert_eq!(r(1920., 810.), 0.75, "height binds");
+        assert_eq!(r(960., 1080.), 0.5, "width binds, and the floor holds");
         assert_eq!(r(200., 200.), CHROME_RAMP_FLOOR, "floored, never zero");
 
         // Monotone in both axes.
@@ -346,8 +346,10 @@ mod tests {
             prev = cur;
         }
 
-        // The canvas this divergence was written for (2048x1330 @ 2).
-        assert_eq!(r(1024., 665.), 0.8);
+        // The canvas this divergence was written for (2048x1330 @ 2): width binds.
+        assert_eq!(r(1024., 665.), 1024. / 1920.);
+        // A 1280x800 one: a third off.
+        assert_eq!(r(1280., 800.), 1280. / 1920.);
     }
 
     /// The heights the fork's own widgets publish, so the expectations below

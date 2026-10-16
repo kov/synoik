@@ -6,8 +6,10 @@ gate landed as `ce9325c1`; the canvas this was written for turned out to be the 
 on daily (the internal display, 2048x1330 @ 2 = **1024x665 logical**), so it was judged there
 rather than hypothetically. Trigger and evidence: `overview-port.md` §S11.
 
-**Open questions settled at implementation.** (A) Reference canvas: **1280x800** as proposed —
-the live canvas lands at ramp 0.8, which steps the dash one ladder rung and reads right. (B) Ramp
+**Open questions settled.** (A) Reference canvas: **1920x1080**. At 1280x800 GNOME's constants
+(a 64px dash, a 56px search button, a 40px gap over the workspace row) read oversized on the
+harness VM; from 1920x1080 up they are GNOME's own, and kov's displays (2048x1328, 3072x1728
+logical) are above it. (B) Ramp
 shape: linear, not snapped — no mushiness observed. (C) Layer B: untouched, as planned.
 
 **Method note.** Judging this needs a canvas, and `--headless` hardcoded 1920x1080; it now takes
@@ -43,13 +45,13 @@ to the band layout it feeds) and carried in the layout struct so it is inspectab
 same model as the rest of the overview state (control-plane tenet, STRATEGY §2):
 
 ```
-r = clamp(min(logical_w / 1280, logical_h / 800), 0.5, 1.0)
+r = clamp(min(logical_w / 1920, logical_h / 1080), 0.5, 1.0)
 ```
 
 - Never exceeds 1.0: a huge canvas gets GNOME's exact constants; this divergence only *shrinks*.
 - Floor 0.5 keeps hit targets and rings from vanishing on absurd canvases.
-- Reference canvas 1280×800 = the smallest shape GNOME's fixed constants visibly tolerate
-  (open question A below).
+- Reference canvas 1920×1080 = the smallest shape GNOME's fixed constants read in proportion on
+  (open question A).
 
 Two rules decide how each piece adapts — do not mix them per-widget ad hoc:
 
@@ -107,7 +109,8 @@ Rule 2: clamp bounds × `r` in `workspace_gap` (`monitor.rs:1571`). The vertical
 `TILE = icon+2·pad`, `ITEM_ADVANCE`, `PILL_PAD_H/V`, `PILL_H`, `PILL_RADIUS = 28.`,
 `PREFERRED_HEIGHT` (consumed by `overview_layout`), `SEPARATOR_H`, `DOT_PX`. GNOME's own ladder
 `baseIconSizes = [16, 22, 24, 32, 48, 64]` (`dash.js` `_adjustIconSize`) only engages on
-*overflow*; we additionally pick the largest ladder step ≤ `64 × r`, then let overflow shrink
+*overflow*; we additionally pick the ladder step nearest `64 × r` (the larger on a tie: rounding
+down skipped a rung, 42.7 → 32 at 1280×800), then let overflow shrink
 further exactly as GNOME does. Pill paddings/radius/dot/separator derive proportionally from the
 chosen icon size (rule 1, with the icon as the box). This piece is "medium" because
 `PREFERRED_HEIGHT` flows into `overview_layout`'s band reservation and the existing dash tests
@@ -122,7 +125,10 @@ shrink.
 `PREFERRED_ENTRY_HEIGHT` (`overview_search.rs:74`). Rule 2: `width = min(352, 352 × r … canvas_w
 − margins)`, height × `r` with the entry's font *not* ramped (exempt) — so the entry shrinks to
 its text plus padding at the floor. `STATUS_CARD_W = ENTRY_WIDTH` (`overview_search.rs:103`)
-follows automatically; verify the results-strip layout at the floor.
+follows automatically; verify the results-strip layout at the floor. The resting search button
+(the puck, a divergence of ours) ramps too, floored at the pill's 40px, and so do the entry's
+margins: the workspace row hangs from the button's midline, so the gap above the row shrinks with
+them.
 
 ### Piece 6 — app-grid label ellipsize (small, do regardless)
 
@@ -150,7 +156,7 @@ S11 method note; scale-sweep tests are the established pattern):
    and preview radius/preview_h match shape 1's ratios; picker gap < the un-ramped 80 max; dash
    ladder stepped down; entry ≤ ramped width; grid labels ellipsized not clipped.
 
-Guard the ramp itself with a unit test (monotone, clamped, `r(1280×800)=1`).
+Guard the ramp itself with a unit test (monotone, clamped, `r(1920×1080)=1`).
 
 ## Sequencing
 
@@ -164,8 +170,6 @@ Guard the ramp itself with a unit test (monotone, clamped, `r(1280×800)=1`).
 
 ## Open questions (decide at implementation)
 
-- **A. Reference canvas** 1280×800 vs 1366×768 — pick after eyeballing the post-fix internal
-  screen; only changes where the ramp starts biting.
 - **B. Ramp shape**: linear in `min(w-ratio, h-ratio)` is proposed; if mid-ramp canvases look
   mushy, snap `r` to quarter steps so element families move together.
 - **C. Layer B interaction**: when the cssparser cascade (layer-a-theme-node.md B1) lands, the

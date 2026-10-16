@@ -84,9 +84,8 @@ const ENTRY_WIDTH: f64 = 352.;
 ///
 /// Sized as a *button* rather than as a collapsed text field: it reads a touch smaller than a
 /// dash icon ([`crate::ui::dash::ICON_PX`] = 64), the biggest round-ish target on the overview,
-/// so it looks deliberate beside it instead of like a shrunken entry. It does **not** ramp with
-/// the chrome — like the pill's height, this is the size of a hand target, not a share of the
-/// canvas.
+/// so it looks deliberate beside it instead of like a shrunken entry. This is its size at or
+/// above the reference canvas: [`puck_diameter`] ramps it, as the dash beside it ramps.
 ///
 /// **Divergence (approved).** GNOME shows the full 24em pill at rest with a "Type to search"
 /// hint inside it (`overviewControls.js:324-331`). We rest as a puck at the right end of the
@@ -106,6 +105,27 @@ const ENTRY_MARGIN_TOP: f64 = 12.;
 /// `.search-entry` `margin-bottom: $base_padding` (`_search-entry.scss:5`).
 const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 
+/// **Adaptive chrome, rule 2 — ramped.** The puck's diameter on a canvas with this chrome ramp:
+/// [`PUCK_D`] shrunk with the dash, but never below the pill it opens into, whose height is its
+/// text plus padding and does not ramp.
+pub fn puck_diameter(ramp: f64) -> f64 {
+    (PUCK_D * ramp).round().max(Entry::HEIGHT)
+}
+
+/// The find glyph's size in the puck on a canvas with this chrome ramp: ramped with the puck,
+/// never below the pill's glyph. One size per canvas, so the icon cache sees no new key per frame.
+fn puck_icon_px(ramp: f64) -> f64 {
+    (PUCK_ICON_PX * ramp).round().max(Entry::ICON_PX)
+}
+
+/// The entry's theme margins on a canvas with this chrome ramp: fixed logical constants, ramped.
+fn entry_margins(ramp: f64) -> (f64, f64) {
+    (
+        (ENTRY_MARGIN_TOP * ramp).round(),
+        (ENTRY_MARGIN_BOTTOM * ramp).round(),
+    )
+}
+
 /// What the search entry asks [`crate::ui::overview_layout`] for: the control plus its margins,
 /// which is what gnome-shell's `searchEntryBin` reports as its preferred height
 /// (`overviewControls.js:165`).
@@ -114,15 +134,21 @@ const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 /// band sized for the pill would leave the resting button overhanging the thumbnail strip. The
 /// pill then centres inside the puck's footprint rather than sitting on GNOME's literal
 /// `margin-top`, which is the price of [`PUCK_D`]'s divergence.
-pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + PUCK_D + ENTRY_MARGIN_BOTTOM;
+pub fn preferred_entry_height(ramp: f64) -> f64 {
+    let (top, bottom) = entry_margins(ramp);
+    top + puck_diameter(ramp) + bottom
+}
 
 /// How far the *control's* vertical middle sits below the top of the bin
-/// [`PREFERRED_ENTRY_HEIGHT`] reserves — the puck's centre, which is also the expanded
+/// [`preferred_entry_height`] reserves — the puck's centre, which is also the expanded
 /// pill's (the pill centres inside the puck's footprint, see [`PUCK_D`]).
 ///
 /// Published because the overview's workspace row is anchored to it: the row's top sits on
-/// the entry control's midline (`crate::ui::overview_layout::ControlsLayout::workspace_row`).
-pub const ENTRY_CONTROL_MID_Y: f64 = ENTRY_MARGIN_TOP + PUCK_D / 2.;
+/// the entry control's midline (`crate::ui::overview_layout::ControlsLayout::workspace_row`),
+/// so the gap above the row shrinks with the chrome on a small canvas.
+pub fn entry_control_mid_y(ramp: f64) -> f64 {
+    entry_margins(ramp).0 + puck_diameter(ramp) / 2.
+}
 
 /// Full-color app-icon side in a result tile, logical: `GridSearchResult` builds a
 /// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
@@ -524,13 +550,14 @@ impl OverviewSearch {
         // right edge of the box the controls layout allocated, so nothing else has to move
         // as it opens.
         let full_w = entry_width(area.ramp);
+        let puck = puck_diameter(area.ramp);
         let e = self.expand;
-        let pill_w = PUCK_D + (full_w - PUCK_D) * e;
+        let pill_w = puck + (full_w - puck) * e;
         // The puck shrinks to the pill's height about a **fixed centre**, so the control opens
         // symmetrically instead of hinging on one edge. That centre is the puck's own, since the
-        // band is reserved for the puck (see `PREFERRED_ENTRY_HEIGHT`).
-        let pill_h = PUCK_D + (Entry::HEIGHT - PUCK_D) * e;
-        let center_y = area.entry.loc.y + ENTRY_MARGIN_TOP + PUCK_D / 2.;
+        // band is reserved for the puck (see `preferred_entry_height`).
+        let pill_h = puck + (Entry::HEIGHT - puck) * e;
+        let center_y = area.entry.loc.y + entry_control_mid_y(area.ramp);
         let right = area.entry.loc.x + area.entry.size.w;
         let entry = Entry::layout(
             right - pill_w / 2.,
@@ -581,6 +608,7 @@ impl OverviewSearch {
         SearchLayout {
             entry,
             find_icon,
+            puck_icon_px: puck_icon_px(area.ramp),
             pill_w,
             pill_h,
             card,
@@ -739,7 +767,7 @@ impl OverviewSearch {
         for (name, px, color, center, want, glyph_alpha) in [
             (
                 "edit-find-symbolic",
-                PUCK_ICON_PX,
+                layout.puck_icon_px,
                 style::MUTED,
                 layout.find_icon,
                 true,
@@ -1071,6 +1099,8 @@ struct SearchLayout {
     entry: EntryLayout,
     /// The find glyph's centre, lerped between the puck's middle and the pill's gutter.
     find_icon: Point<f64, Logical>,
+    /// The find glyph's size at rest, on this canvas.
+    puck_icon_px: f64,
     /// The pill's current size — what the chrome is baked at.
     pill_w: f64,
     pill_h: f64,
@@ -1448,9 +1478,9 @@ mod tests {
             Size::from((1920., 1080.)),
             35.,
             crate::ui::overview_layout::Measured {
-                search_entry_height: PREFERRED_ENTRY_HEIGHT,
+                search_entry_height: preferred_entry_height(1.),
                 search_entry_width: entry_width(1.),
-                search_entry_mid_y: ENTRY_CONTROL_MID_Y,
+                search_entry_mid_y: entry_control_mid_y(1.),
                 dash_preferred_height: crate::ui::dash::preferred_height(Size::from((
                     1920., 1080.,
                 ))),
