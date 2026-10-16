@@ -66,6 +66,7 @@ use crate::synoik::{PointerRenderElements, RedrawState, State, Synoik};
 use crate::system_compositor::protocol::{
     self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter,
 };
+use crate::system_compositor::Style;
 use crate::utils::{get_monotonic_time, is_laptop_panel};
 
 /// Scanout buffers per output: one on screen, one in flight, one to render the next frame into.
@@ -79,6 +80,8 @@ pub struct Nested {
     libinput: Libinput,
     handle: LoopHandle<'static, State>,
     socket_path: PathBuf,
+    /// How the outer moves switches (`ToInner::Welcome`), until `init` hands it to the session.
+    transition: Style,
     conn: Option<Connection>,
     renderer: VulkanRenderer,
     render_node: Option<DrmNode>,
@@ -186,7 +189,7 @@ impl Nested {
         // The first connection is synchronous: the outputs, and the device to render on, come
         // from the outer, and nothing else can be set up without them.
         let fd = connect(&socket_path)?;
-        let (render_node, connectors) = handshake(fd.as_fd())?;
+        let (render_node, connectors, transition) = handshake(fd.as_fd())?;
         let render_node = render_node.context("the outer named no render node")?;
         let renderer =
             VulkanRenderer::for_drm_render_node(render_node.0 as u32, render_node.1 as u32)
@@ -204,6 +207,7 @@ impl Nested {
             libinput,
             handle: event_loop,
             socket_path,
+            transition,
             conn: None,
             renderer,
             render_node,
@@ -221,6 +225,7 @@ impl Nested {
     }
 
     pub fn init(&mut self, synoik: &mut Synoik) {
+        synoik.end_session_dialog.set_motion(Some(self.transition));
         self.add_dmabuf_global(synoik);
         self.reconfigure(synoik);
     }
@@ -629,7 +634,10 @@ impl Nested {
             }
         };
         let connectors = match handshake(fd.as_fd()) {
-            Ok((_, connectors)) => connectors,
+            Ok((_, connectors, transition)) => {
+                synoik.end_session_dialog.set_motion(Some(transition));
+                connectors
+            }
             Err(err) => {
                 warn!("reattaching to the system compositor: {err:#}");
                 return false;
@@ -1585,7 +1593,7 @@ fn own_session_id() -> Option<String> {
 }
 
 /// What the outer's `Welcome` gives a session: its render node and the connected displays.
-type Welcomed = (Option<(u64, u64)>, Vec<ConnectorInfo>);
+type Welcomed = (Option<(u64, u64)>, Vec<ConnectorInfo>, Style);
 
 /// Say hello and wait for the welcome. Bounded, so a wedged outer fails startup instead of hanging
 /// it.
@@ -1610,6 +1618,7 @@ fn handshake(fd: BorrowedFd<'_>) -> anyhow::Result<Welcomed> {
                 version,
                 render_node,
                 connectors,
+                transition,
             },
             _,
         ) => {
@@ -1619,7 +1628,7 @@ fn handshake(fd: BorrowedFd<'_>) -> anyhow::Result<Welcomed> {
                     protocol::VERSION
                 );
             }
-            Ok((render_node, connectors))
+            Ok((render_node, connectors, transition))
         }
         Received::Message(other, _) => bail!("expected Welcome, got {other:?}"),
         Received::WouldBlock | Received::Closed => {

@@ -2277,6 +2277,7 @@ impl Outer {
                     version: protocol::VERSION,
                     render_node: self.render_node,
                     connectors: self.connector_infos(),
+                    transition: self.style,
                 };
                 protocol::send(fd.as_fd(), &welcome, &[])?;
             }

@@ -10,4 +10,5 @@ mod compose;
 pub mod outer;
 pub mod protocol;
 
+pub use compose::{Style, DEPTH_NEAR};
 pub use synoik_splash::{layout as splash, plymouth};

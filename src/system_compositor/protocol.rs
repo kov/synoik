@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any change to the messages below.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Where the outer listens unless told otherwise. The unit's `RuntimeDirectory=` creates it.
 pub const DEFAULT_SOCKET: &str = "/run/synoik-system/outer.sock";
@@ -124,6 +124,9 @@ pub enum ToInner {
         /// must allocate its scanout buffers there, or the outer cannot import them.
         render_node: Option<(u64, u64)>,
         connectors: Vec<ConnectorInfo>,
+        /// How switches look (`SYNOIK_SYSTEM_TRANSITION`), for what the session brings up for one
+        /// (the end-session dialog) to move the same way.
+        transition: super::Style,
     },
     /// The connected displays changed: one was plugged or unplugged, or its mode list or identity
     /// changed (a resized VM window is a new preferred mode). The whole set, as in `Welcome`.

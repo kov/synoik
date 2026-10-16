@@ -31,12 +31,13 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use synoik_config::Config;
 
-use crate::animation::{Animation, Clock};
+use crate::animation::{Animation, Clock, Curve};
 use crate::end_session::Presentation;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::synoik_render_elements;
+use crate::system_compositor::{Style, DEPTH_NEAR};
 use crate::ui::widget::{
     self, style, BakeCache, Painter, ParagraphSpan, Rgba, ShapedParagraph, ShapedText, TextShaper,
     TextStyle,
@@ -117,6 +118,10 @@ enum State {
     Hidden,
     Showing(Animation),
     Visible,
+    /// Confirmed under the system compositor's motion: it stays on screen, inert, for the greeter
+    /// or the shutdown splash to come in over it, rather than moving away just before they move
+    /// in. The animation is a bound, 1 to 1: past it, a session that did not end hides it.
+    Held(Animation),
     Hiding(Animation),
 }
 
@@ -177,6 +182,10 @@ pub struct EndSessionDialog {
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
+    /// Nested in the system compositor, how it moves switches: the dialog arrives and leaves the
+    /// same way, as the greeter will come in over it once it is confirmed (a curtain down from the
+    /// top, or flying in from near). `None` for gnome-shell's open animation.
+    motion: Option<Style>,
 }
 
 synoik_render_elements! {
@@ -199,10 +208,25 @@ impl EndSessionDialog {
             cache: RefCell::new(BakeCache::new()),
             clock,
             config,
+            motion: None,
         }
     }
 
+    /// How the system compositor moves switches, if nested in one.
+    pub fn set_motion(&mut self, motion: Option<Style>) {
+        self.motion = motion;
+    }
+
+    /// The motion the dialog moves with, `None` for gnome-shell's own.
+    fn moving(&self) -> Option<Style> {
+        self.motion.filter(|s| *s != Style::Fade)
+    }
+
     fn animation(&self, from: f64, to: f64) -> Animation {
+        if self.moving().is_some() {
+            // As the system compositor's curtain slide (`CURTAIN_SLIDE_TIME`).
+            return Animation::ease(self.clock.clone(), from, to, 0., 300, Curve::EaseOutQuad);
+        }
         let c = self.config.borrow();
         // Reuse the exit-confirmation open/close curve; it's the same kind of modal dialog.
         Animation::new(
@@ -218,7 +242,7 @@ impl EndSessionDialog {
         match &self.state {
             State::Hidden => 0.,
             State::Showing(anim) | State::Hiding(anim) => anim.value(),
-            State::Visible => 1.,
+            State::Visible | State::Held(_) => 1.,
         }
     }
 
@@ -259,9 +283,20 @@ impl EndSessionDialog {
     }
 
     pub fn hide(&mut self) {
-        if self.is_open() {
+        if self.is_open() || matches!(self.state, State::Held(_)) {
             self.state = State::Hiding(self.animation(self.value(), 0.));
         }
+    }
+
+    /// Confirmed: hide it, or under the system compositor's motion hold it ([`State::Held`]).
+    pub fn confirmed(&mut self) {
+        if self.moving().is_none() || !self.is_open() {
+            self.hide();
+            return;
+        }
+        // Long enough for the session to end and the switch away to cover it.
+        let bound = Animation::ease(self.clock.clone(), 1., 1., 0., 3000, Curve::Linear);
+        self.state = State::Held(bound);
     }
 
     pub fn is_open(&self) -> bool {
@@ -277,6 +312,11 @@ impl EndSessionDialog {
     pub fn advance_animations(&mut self) {
         match &mut self.state {
             State::Hidden | State::Visible => (),
+            State::Held(bound) => {
+                if bound.is_done() {
+                    self.state = State::Hiding(self.animation(1., 0.));
+                }
+            }
             State::Showing(anim) => {
                 if anim.is_done() {
                     self.state = State::Visible;
@@ -291,7 +331,10 @@ impl EndSessionDialog {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        matches!(self.state, State::Showing(_) | State::Hiding(_))
+        matches!(
+            self.state,
+            State::Showing(_) | State::Held(_) | State::Hiding(_)
+        )
     }
 
     /// Feed a key. Only presses act; Esc cancels, Enter activates the focused button,
@@ -481,7 +524,7 @@ impl EndSessionDialog {
         let (value, clamped_value) = match &self.state {
             State::Hidden => return,
             State::Showing(anim) | State::Hiding(anim) => (anim.value(), anim.clamped_value()),
-            State::Visible => (1., 1.),
+            State::Visible | State::Held(_) => (1., 1.),
         };
         let Some((presentation, seconds_left, checkbox)) = self.content else {
             return;
@@ -526,23 +569,38 @@ impl EndSessionDialog {
             }
         };
 
+        // How far down from the top the curtain is, how big the dialog is drawn about its centre,
+        // and how opaque, for the motion it arrives with.
+        let (drop, rescale, alpha) = match self.moving() {
+            Some(Style::Curtain) => (-(1. - clamped_value) * output_size.h, 1., 1.),
+            Some(Style::Depth) => {
+                let away = 1. - value.max(0.);
+                (
+                    0.,
+                    1. + (DEPTH_NEAR - 1.) * away,
+                    clamped_value * clamped_value,
+                )
+            }
+            _ => (0., value.max(0.) * 0.2 + 0.8, clamped_value),
+        };
+
         if let Some(buffer) = texture {
             let size = buffer.logical_size();
             let location = (output_size.to_point() - size.to_point()).downscale(2.);
             let mut location = location.to_physical_precise_round(scale).to_logical(scale);
             location.x = f64::max(0., location.x);
             location.y = f64::max(0., location.y);
+            location.y += drop;
 
             let elem = TextureRenderElement::from_texture_buffer(
                 buffer,
                 location,
-                clamped_value as f32,
+                alpha as f32,
                 None,
                 None,
                 Kind::Unspecified,
             );
             let centre = (location + size.downscale(2.)).to_physical_precise_round(scale);
-            let rescale = value.max(0.) * 0.2 + 0.8;
             let elem = RescaleRenderElement::from_element(elem, centre, rescale);
             push(EndSessionDialogRenderElement::Texture(elem));
 
@@ -560,7 +618,7 @@ impl EndSessionDialog {
                         style::TEXT,
                         location,
                         check.glyph_centre(),
-                        clamped_value as f32,
+                        alpha as f32,
                     ) {
                         let elem = RescaleRenderElement::from_element(elem, centre, rescale);
                         push(EndSessionDialogRenderElement::Texture(elem));
@@ -580,8 +638,8 @@ impl EndSessionDialog {
 
         let elem = SolidColorRenderElement::from_buffer(
             &data.backdrop,
-            Point::new(0., 0.),
-            clamped_value as f32,
+            Point::new(0., drop),
+            alpha as f32,
             Kind::Unspecified,
         );
         push(EndSessionDialogRenderElement::SolidColor(elem));
@@ -809,6 +867,38 @@ mod tests {
     use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
+
+    /// Under the system compositor's curtain a confirmed dialog stays on screen for the greeter to
+    /// come down over, instead of sliding away first; one whose session does not end goes after
+    /// the bound. Without a motion it closes on confirm, as gnome-shell's.
+    #[test]
+    fn a_confirmed_dialog_waits_under_the_curtain() {
+        let at = |ms: u64| std::time::Duration::from_millis(ms);
+        for (motion, held) in [(Some(Style::Curtain), true), (None, false)] {
+            let mut clock = Clock::with_time(at(0));
+            let mut dialog = EndSessionDialog::new(clock.clone(), Default::default());
+            dialog.set_motion(motion);
+            dialog.show(Presentation::Logout);
+            clock.set_unadjusted(at(1000));
+            dialog.advance_animations();
+            assert!(dialog.is_interactive());
+
+            dialog.confirmed();
+            clock.set_unadjusted(at(2000));
+            dialog.advance_animations();
+            assert!(!dialog.is_interactive(), "{motion:?}: inert once confirmed");
+            assert_eq!(dialog.value() == 1., held, "{motion:?}");
+
+            clock.set_unadjusted(at(4500));
+            dialog.advance_animations();
+            clock.set_unadjusted(at(5000));
+            dialog.advance_animations();
+            assert!(
+                matches!(dialog.state, State::Hidden),
+                "{motion:?}: gone past the bound"
+            );
+        }
+    }
 
     /// The GPU render produces a fixed-size box for every type, countdown state, and focused button
     /// — the paths the live dialog cycles through — and the focused button's accent-blue fill is

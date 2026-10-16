@@ -48,9 +48,10 @@ pub(super) enum Picture {
     Texture(VkTexture),
 }
 
-/// How a switch between sessions looks (`SYNOIK_SYSTEM_TRANSITION`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Style {
+/// How a switch between sessions looks (`SYNOIK_SYSTEM_TRANSITION`). Sessions are told it
+/// (`ToInner::Welcome`), so what they bring up for a switch moves the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Style {
     /// The outgoing picture crossfades into the incoming one.
     Fade,
     /// The greeter is a curtain over the sessions, as gnome-shell's lock screen is over a
@@ -102,7 +103,7 @@ const DEPTH_FAR: f64 = 0.75;
 /// How near the front picture comes as it leaves: it flies past, as if gone through and left
 /// behind. As it fades out of sight (under 5% at 78% of the motion) about a tenth of its width
 /// is still on screen. Ours: gnome-shell has no greeter moving out.
-const DEPTH_NEAR: f64 = 12.;
+pub const DEPTH_NEAR: f64 = 12.;
 
 impl Motion {
     pub const FADE: Self = Self {

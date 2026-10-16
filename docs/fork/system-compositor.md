@@ -440,6 +440,10 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   presents during the transition replaces it, answered `Presented` by the flip that shows it, so
   whatever the session animates meanwhile (an unlock, its startup) plays through. A fronted frame
   that replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+  Sessions are told the style in `Welcome`, and the end-session dialog moves with it (ours):
+  under the curtain the dialog and its dimming slide down from the top, in depth they fly in from
+  near, in 300 ms either way, and a confirmed dialog stays on screen, inert, until the greeter or
+  the shutdown splash comes in over it (bounded at 3 s). Fade keeps gnome-shell's open animation.
   Switch User leaves the desktop on screen and the lock screen held: the session sends its
   shield's frame as a `Hold`, which the outer keeps unshown as the frame that session comes back
   to, and goes to the login screen on `Held`. So the curtain comes down over the desktop, and a

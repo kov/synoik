@@ -5617,7 +5617,7 @@ impl State {
             self.save_session_before_end();
             self.synoik.emit_confirmation(confirmation);
         }
-        self.synoik.end_session_dialog.hide();
+        self.synoik.end_session_dialog.confirmed();
         self.synoik.reschedule_end_session_timer();
         self.synoik.queue_redraw_all();
     }
@@ -5631,7 +5631,7 @@ impl State {
             self.synoik.end_session_timer = None;
             self.save_session_before_end();
             self.synoik.emit_confirmation(confirmation);
-            self.synoik.end_session_dialog.hide();
+            self.synoik.end_session_dialog.confirmed();
             self.synoik.queue_redraw_all();
             return;
         }
