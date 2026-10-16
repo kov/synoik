@@ -116,6 +116,9 @@ struct NestedOutput {
     /// The slot whose `Present` the outer has not answered yet, with what that frame owes when it
     /// lands.
     in_flight: Option<(usize, OutputPresentationFeedback, Duration)>,
+    /// The frame in flight went as a `Hold`: the outer keeps it without showing it (see
+    /// `Synoik::switch_user_on_shield_frame`), and nothing renders here until it is answered.
+    held: bool,
     /// The slot the outer last reported on screen. Never rendered into: it is being scanned out.
     on_screen: Option<usize>,
     /// The buffer that was in flight when the mode changed: the outer still answers it, and that
@@ -389,6 +392,7 @@ impl Nested {
                 slots: Vec::new(),
                 frame: 0,
                 in_flight: None,
+                held: false,
                 on_screen: None,
                 abandoned: None,
                 cursor_image: None,
@@ -585,6 +589,7 @@ impl Nested {
                 refresh_ns,
             } => self.on_presented(synoik, &output, buffer, sequence, time_ns, refresh_ns),
             ToInner::Discarded { output, buffer } => self.on_discarded(synoik, &output, buffer),
+            ToInner::Held { output, buffer } => self.on_held(synoik, &output, buffer),
         }
     }
 
@@ -602,6 +607,7 @@ impl Nested {
             out.cursor_position = None;
             // The frame in flight will never be answered; finish its bookkeeping as a frame that
             // did not present, so the redraw machinery is not left waiting for a vblank.
+            out.held = false;
             if out.in_flight.take().is_some() {
                 if let Some(state) = synoik.output_state.get_mut(&out.output) {
                     state.redraw_state = RedrawState::Idle;
@@ -834,11 +840,27 @@ impl Nested {
                 warn!("waiting for a frame that could not hand over its fence: {err:?}");
             }
         }
-        let msg = ToOuter::Present {
-            output: name.clone(),
-            buffer,
-            fenced: fence.is_some(),
-            cursor,
+        // Switch User's lock screen frame is held, not shown: the desktop stays on screen for the
+        // outer's switch to the login screen to move away, and the lock screen is what the session
+        // comes back to (`Synoik::switch_user_on_shield_frame`).
+        let held = synoik.switch_user_on_shield_frame
+            && synoik
+                .output_state
+                .get(output)
+                .is_some_and(|s| s.shield_frame_queued);
+        let msg = if held {
+            ToOuter::Hold {
+                output: name.clone(),
+                buffer,
+                fenced: fence.is_some(),
+            }
+        } else {
+            ToOuter::Present {
+                output: name.clone(),
+                buffer,
+                fenced: fence.is_some(),
+                cursor,
+            }
         };
         let fds: Vec<BorrowedFd<'_>> = fence.iter().map(|fd| fd.as_fd()).collect();
         if let Err(err) = protocol::send(conn.as_fd(), &msg, &fds) {
@@ -851,7 +873,10 @@ impl Nested {
         let feedback = synoik.take_presentation_feedbacks(output, &res.states);
         let out = self.outputs.get_mut(&name).expect("looked up above");
         out.in_flight = Some((index, feedback, target_presentation_time));
-        out.cursor_position = Some(cursor);
+        out.held = held;
+        if !held {
+            out.cursor_position = Some(cursor);
+        }
         synoik
             .frame_log
             .queued(&name, target_presentation_time, get_monotonic_time());
@@ -904,6 +929,7 @@ impl Nested {
             return;
         };
         let (_, mut feedback, target) = out.in_flight.take().expect("checked above");
+        out.held = false;
         out.on_screen = Some(index);
         let output = out.output.clone();
 
@@ -965,6 +991,67 @@ impl Nested {
         }
     }
 
+    /// The outer keeps the frame in flight as this session's, unshown (`ToOuter::Hold`). It stays
+    /// in flight; what it was held for — Switch User's lock screen — can go ahead.
+    fn on_held(&mut self, synoik: &mut Synoik, name: &str, buffer: u32) {
+        let Some(out) = self.outputs.get(name) else {
+            return;
+        };
+        let in_flight = out
+            .in_flight
+            .as_ref()
+            .is_some_and(|(index, _, _)| out.slots.get(*index).is_some_and(|s| s.id == buffer));
+        if !(out.held && in_flight) {
+            warn!("Held buffer {buffer} on {name}, which is not held in flight");
+            return;
+        }
+        let output = out.output.clone();
+        let Some(state) = synoik.output_state.get_mut(&output) else {
+            return;
+        };
+        if mem::take(&mut state.shield_frame_queued) {
+            synoik.note_shield_frame_presented(&output);
+        }
+    }
+
+    /// Show the frames the outer is holding unshown, now: what they were held for is not going
+    /// to happen (a Switch User that did not switch), and nothing renders here until they are.
+    pub fn show_held_frames(&mut self, synoik: &mut Synoik) {
+        let Some(conn) = self.conn.as_ref() else {
+            return;
+        };
+        let fd = conn.fd.clone();
+        let mut failed = false;
+        for (name, out) in &mut self.outputs {
+            let Some(buffer) = out
+                .in_flight
+                .as_ref()
+                .filter(|_| out.held)
+                .and_then(|(index, _, _)| out.slots.get(*index))
+                .map(|s| s.id)
+            else {
+                continue;
+            };
+            debug!("showing held buffer {buffer} on {name}");
+            out.held = false;
+            // Long done rendering: the bound that got here is far longer than a frame.
+            let msg = ToOuter::Present {
+                output: name.clone(),
+                buffer,
+                fenced: false,
+                cursor: out.cursor_position.flatten(),
+            };
+            if let Err(err) = protocol::send(fd.as_fd(), &msg, &[]) {
+                warn!("showing a held frame: {err}");
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            self.detach(synoik);
+        }
+    }
+
     /// The outer will not show the frame in flight — the flip was refused, or a newer frame
     /// superseded it while this session was in the background. Its slot is free again, and an
     /// active session owes a fresh frame.
@@ -988,6 +1075,7 @@ impl Nested {
             return;
         };
         out.in_flight = None;
+        out.held = false;
         // Its contents never reached the screen, so the damage history it was drawn against is
         // not one anything will be compared with.
         out.slots[index].drawn = 0;

@@ -2326,6 +2326,8 @@ impl Outer {
                 if !session.buffers.contains_key(&buffer) {
                     bail!("present of unknown buffer {buffer}");
                 }
+                // A frame held by `Hold` is shown now, so it is no longer the one held.
+                session.held.retain(|_, (b, _)| *b != buffer);
                 // The frame's own cursor: whichever commit shows this frame shows it too.
                 session.cursors.entry(output.clone()).or_default().position = cursor;
                 let fence = fenced.then(|| Rc::new(fds.remove(0)));
@@ -2387,6 +2389,21 @@ impl Outer {
                     // unanswered; the one it supersedes is given back.
                     _ => self.hold(generation, d, buffer, fence),
                 }
+            }
+            ToOuter::Hold {
+                output,
+                buffer,
+                fenced,
+            } => {
+                if !session.buffers.contains_key(&buffer) {
+                    bail!("hold of unknown buffer {buffer}");
+                }
+                let fence = fenced.then(|| Rc::new(fds.remove(0)));
+                let fd = session.fd.clone();
+                debug!(target: FLIGHT, "session {:?} holds buffer {buffer} on {output}", session.logind_id);
+                self.hold(generation, &output, buffer, fence);
+                let held = ToInner::Held { output, buffer };
+                protocol::send(fd.as_fd(), &held, &[])?;
             }
             ToOuter::CursorImage {
                 output,

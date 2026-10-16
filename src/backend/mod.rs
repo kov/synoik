@@ -193,6 +193,13 @@ impl Backend {
         matches!(self, Backend::Tty(_) | Backend::Nested(_))
     }
 
+    /// Show the frames a nested session had the outer hold unshown (`Nested::show_held_frames`).
+    pub fn show_held_frames(&mut self, synoik: &mut Synoik) {
+        if let Backend::Nested(nested) = self {
+            nested.show_held_frames(synoik);
+        }
+    }
+
     pub fn set_monitors_active(&mut self, active: bool) {
         match self {
             Backend::Tty(tty) => tty.set_monitors_active(active),

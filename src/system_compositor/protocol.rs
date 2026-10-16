@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any change to the messages below.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Where the outer listens unless told otherwise. The unit's `RuntimeDirectory=` creates it.
 pub const DEFAULT_SOCKET: &str = "/run/synoik-system/outer.sock";
@@ -83,6 +83,16 @@ pub enum ToOuter {
         fenced: bool,
         cursor: Option<(i32, i32)>,
     },
+    /// Keep `buffer` as this session's frame for `output` without showing it, answered `Held`: the
+    /// frame the session is to come back to, while the one on screen stays there for the switch
+    /// away to start from (Switch User leaves the desktop on screen and its lock screen held). It
+    /// stays in flight until the outer shows it (`Presented`) or gives it back (`Discarded`); a
+    /// `Present` of the same buffer shows it now. The fd is as `Present`'s.
+    Hold {
+        output: String,
+        buffer: u32,
+        fenced: bool,
+    },
     /// The pointer's image on `output`, for the outer's cursor plane (§3): `width`×`height` — the
     /// connector's `cursor_size` — premultiplied ARGB8888, rows of `width * 4` bytes, in the one
     /// fd (a memfd). `hotspot` is where in it the pointer points. Sent when the image changes, and
@@ -133,6 +143,9 @@ pub enum ToInner {
     /// A `Present` that will never reach the screen (the flip was refused). The inner owes a
     /// fresh frame, and `buffer` is free again.
     Discarded { output: String, buffer: u32 },
+    /// The outer keeps the `Hold`'s `buffer` as the session's frame for `output`. Still in
+    /// flight: `Presented` or `Discarded` comes when it is shown or given back.
+    Held { output: String, buffer: u32 },
 }
 
 /// One connected display, as the inner needs it to name and configure the output the way the tty
@@ -170,11 +183,14 @@ impl ToOuter {
     pub fn fd_count(&self) -> usize {
         match self {
             ToOuter::AddBuffer { .. } => 1,
-            ToOuter::Present { fenced: true, .. } | ToOuter::CursorImage { .. } => 1,
+            ToOuter::Present { fenced: true, .. }
+            | ToOuter::Hold { fenced: true, .. }
+            | ToOuter::CursorImage { .. } => 1,
             ToOuter::Hello { .. }
             | ToOuter::Configure { .. }
             | ToOuter::RemoveBuffer { .. }
             | ToOuter::Present { .. }
+            | ToOuter::Hold { .. }
             | ToOuter::CursorPosition { .. } => 0,
         }
     }

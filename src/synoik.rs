@@ -843,7 +843,10 @@ pub struct Synoik {
     pub shield_frames_owed: HashSet<Output>,
     /// Switch User is waiting for the locked shield to reach the screen before it goes to the
     /// login screen (`activateSwitchUser`'s `POST_PAINT`, `systemActions.js:476-479`), so the
-    /// picture left behind is the lock screen, never the desktop.
+    /// picture left behind is the lock screen, never the desktop. Nested, the shield's frame goes
+    /// to the outer as a `Hold` and the wait ends on `Held` instead: the outer keeps it as the
+    /// frame the session comes back to, while the desktop stays on screen for the switch away to
+    /// move (a divergence: the curtain comes down over the desktop).
     pub switch_user_on_shield_frame: bool,
     /// A switch to the login screen on its way, bounded by [`Self::LEAVING_FOR_LOGIN_DEADLINE`].
     /// gsd-power blanks the screens the moment the shield goes up (`handle_screensaver_active`,
@@ -12256,6 +12259,9 @@ impl Synoik {
             move |state| {
                 if !state.synoik.shield_frames_owed.is_empty() {
                     warn!("the shield never reached the screen; going ahead without it");
+                    // A lock screen frame held unshown for Switch User goes on screen first, so
+                    // the switch at least starts from it.
+                    state.backend.show_held_frames(&mut state.synoik);
                     state.synoik.clear_shield_present_wait();
                 }
                 None
@@ -12312,6 +12318,8 @@ impl Synoik {
             Self::LEAVING_FOR_LOGIN_DEADLINE,
             move |state| {
                 state.synoik.leaving_for_login = None;
+                // Still here: the lock screen held unshown for the switch goes on screen.
+                state.backend.show_held_frames(&mut state.synoik);
                 if std::mem::take(&mut state.synoik.blank_parked) {
                     debug!("the switch to the login screen did not happen; blanking");
                     state.synoik.deactivate_monitors(&mut state.backend);

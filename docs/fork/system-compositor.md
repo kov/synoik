@@ -438,6 +438,12 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   presents during the transition replaces it, answered `Presented` by the flip that shows it, so
   whatever the session animates meanwhile (an unlock, its startup) plays through. A fronted frame
   that replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+  Switch User leaves the desktop on screen and the lock screen held: the session sends its
+  shield's frame as a `Hold`, which the outer keeps unshown as the frame that session comes back
+  to, and goes to the login screen on `Held`. So the curtain comes down over the desktop, and a
+  return shows the lock screen (a divergence from `activateSwitchUser`, which waits for the shield
+  to be painted, `systemActions.js:476-479`). Should the switch not happen, or `Held` not come,
+  the held frame is presented for real.
   A session leaving for the login screen holds gsd-power's blank until it has been paused, or
   for 2 s if the switch fails (`Synoik::leaving_for_login`). gsd-power blanks the moment the
   shield is up, and Switch User raises the shield just before the switch. A blank that won that
