@@ -99,9 +99,10 @@ pub(super) struct Motion {
 /// The depth a session lands from and recedes to: gnome-shell's session start begins at this
 /// scale (`_prepareStartupAnimation`, `layout.js`).
 const DEPTH_FAR: f64 = 0.75;
-/// How near the front picture comes as it leaves: it flies past, three times its size, as if
-/// gone through and left behind. Ours: gnome-shell has no greeter moving out.
-const DEPTH_NEAR: f64 = 3.;
+/// How near the front picture comes as it leaves: it flies past, as if gone through and left
+/// behind. As it fades out of sight (under 5% at 78% of the motion) about a tenth of its width
+/// is still on screen. Ours: gnome-shell has no greeter moving out.
+const DEPTH_NEAR: f64 = 12.;
 
 impl Motion {
     pub const FADE: Self = Self {

@@ -425,8 +425,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
     user slides it down over it; 300 ms ease-out-quad (`CURTAIN_SLIDE_TIME`, `screenShield.js`).
     Between two users' sessions the plate is the curtain, down over the one and up off the other:
     two slides, each 300 ms eased on its own.
-  - `depth`: the greeter flies past, growing to 3× as it fades out (by the square of the
-    motion, so it is mostly gone early), as the session lands from a distance (0.75× and
+  - `depth`: the greeter flies past, growing to 12× as it fades out by the square of the
+    motion: a tenth of it is on screen as it goes out of sight, as the session lands from a distance (0.75× and
     transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
     same backwards for a logout or a switch user; between users the outgoing session leaves as the
     greeter would. 500 ms ease-out-quad (`STARTUP_ANIMATION_TIME`, `layout.js`).
