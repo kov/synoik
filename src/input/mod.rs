@@ -6238,6 +6238,8 @@ impl State {
                 self.synoik.switch_user_hovered = on_button;
                 self.synoik.queue_redraw_all();
             }
+            // The quick-settings menu opens over the shield (the greeter's, the lock screen's).
+            self.update_popover_pointer(pos, grabbed);
             return;
         }
         if self.synoik.switch_user_hovered {
@@ -6478,6 +6480,11 @@ impl State {
             self.set_emoji_picker_owns_cursor(over);
         }
 
+        self.update_popover_pointer(pos, grabbed);
+    }
+
+    /// Hover and slider drags for an open panel popover, which the shield's own panel opens too.
+    fn update_popover_pointer(&mut self, pos: Point<f64, Logical>, grabbed: bool) {
         // A panel popover grabs input modally: no window under it receives pointer focus
         // (see `contents_under`), so the app can't set the cursor image while we're open.
         // Force the default arrow so a stale client cursor (e.g. a terminal's I-beam that was

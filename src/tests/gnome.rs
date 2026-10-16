@@ -42196,6 +42196,45 @@ fn a_menu_over_the_shield_keeps_keys_from_the_desktop() {
     assert!(f.synoik().screen_shield.is_active());
 }
 
+/// The quick-settings menu over the greeter and the lock screen tracks the pointer as it does in
+/// a session: what is under it lights up. Pointer motion under the shield returned before the
+/// menu ever saw it, which also left its sliders undraggable.
+#[test]
+fn a_menu_over_the_shield_follows_the_pointer() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    for greeter in [true, false] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        f.freeze_clock();
+        if greeter {
+            f.synoik().greeter = true;
+            f.synoik_state().show_greeter_dialog();
+        } else {
+            f.synoik_state()
+                .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+            f.synoik_state().synoik.lock_screen.settle();
+        }
+        let x = qs_center_x(&mut f, 1920.);
+        click_panel_at(&mut f, x);
+        assert!(f.synoik().panel_popover.is_open());
+
+        let (_, button) = f
+            .synoik()
+            .panel_popover
+            .quick_settings()
+            .unwrap()
+            .sys_buttons()[0];
+        let at = popover_origin(&mut f) + button.loc + button.size.downscale(2.).to_point();
+        pointer_motion_to(&mut f, at.x, at.y);
+        let output = f.synoik_output(1);
+        assert!(
+            !f.synoik().panel_popover.pointer_hover(&output, at),
+            "greeter {greeter}: the motion already lit what is under the pointer"
+        );
+    }
+}
+
 /// The lock screen's panel stays down over a fullscreen window: the curtain hides the window, and
 /// GNOME's `unlock-dialog` panel does not track it.
 #[test]
