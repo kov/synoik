@@ -47,7 +47,7 @@ use smithay::reexports::calloop::{
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs as rfs;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use smithay::utils::{Physical, Point, Scale, Size, Transform};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 use smithay::wayland::shm;
@@ -129,8 +129,9 @@ struct NestedOutput {
     cursor_position: Option<Option<(i32, i32)>>,
 }
 
-/// What a pointer image was made from: the element's identity, contents and size.
-type CursorKey = (Id, CommitCounter, Size<i32, Physical>);
+/// What a pointer image was made from: the element's identity, contents and size, and the
+/// rotation it was turned by for the plane.
+type CursorKey = (Id, CommitCounter, Size<i32, Physical>, Transform);
 
 struct Slot {
     id: u32,
@@ -1155,12 +1156,12 @@ fn sync_cursor(
     let Some((width, height)) = out.connector.cursor_size else {
         return Pointer::InFrame;
     };
-    // The plane is not rotated with the frame; a rotated display draws its pointer.
-    if synoik.config.borrow().debug.disable_cursor_plane
-        || output.current_transform() != Transform::Normal
-    {
+    if synoik.config.borrow().debug.disable_cursor_plane {
         return Pointer::InFrame;
     }
+    // The plane is in the scanout's orientation: the pointer is turned onto it as the frame is
+    // (`OutputDamageTracker`, which renders with the output transform's inverse).
+    let transform = output.current_transform().invert();
 
     let mut elements = Vec::new();
     synoik.render_pointer(renderer, output, &mut |e| elements.push(e));
@@ -1173,12 +1174,16 @@ fn sync_cursor(
         _ => return Pointer::InFrame,
     };
     let geometry = element.geometry(scale);
-    let display = Size::from((i32::from(out.mode.width), i32::from(out.mode.height)));
-    if !geometry.overlaps(smithay::utils::Rectangle::from_size(display)) {
+    let display = transform.transform_size(Size::from((
+        i32::from(out.mode.width),
+        i32::from(out.mode.height),
+    )));
+    if !geometry.overlaps(Rectangle::from_size(display)) {
         // On another display: this one's plane stays off rather than parked out of sight.
         return Pointer::OnPlane(None);
     }
-    if geometry.size.w > width as i32 || geometry.size.h > height as i32 {
+    let on_plane = transform.transform_rect_in(geometry, &display);
+    if on_plane.size.w > width as i32 || on_plane.size.h > height as i32 {
         return Pointer::InFrame;
     }
 
@@ -1186,15 +1191,18 @@ fn sync_cursor(
         element.id().clone(),
         element.current_commit(),
         geometry.size,
+        transform,
     );
     if out.cursor_image.as_ref() != Some(&key) {
-        let Some(pixels) = cursor_pixels(renderer, element, geometry.size, (width, height)) else {
+        let Some(pixels) =
+            cursor_pixels(renderer, element, geometry.size, transform, (width, height))
+        else {
             return Pointer::InFrame;
         };
         let pointer = synoik
             .pointer_position_on(output)
             .to_physical_precise_round(scale);
-        let hotspot: Point<i32, Physical> = pointer - geometry.loc;
+        let hotspot = transform.transform_point_in(pointer - geometry.loc, &geometry.size);
         let name = &out.connector.connector;
         if let Err(err) = send_cursor_image(conn, name, (width, height), hotspot, &pixels) {
             warn!("sending the pointer image: {err:#}");
@@ -1207,50 +1215,43 @@ fn sync_cursor(
     Pointer::OnPlane(Some(PlaneCursor {
         id: element.id().clone(),
         visible_area: (geometry.size.w * geometry.size.h) as usize,
-        position: (geometry.loc.x, geometry.loc.y),
+        position: (on_plane.loc.x, on_plane.loc.y),
     }))
 }
 
-/// The pointer element's pixels, copied on the CPU into a `width`×`height` ARGB8888 image — as
-/// the tty's cursor plane takes them (smithay's `DrmCompositor`), with no GPU round trip. `None`
-/// for anything but an unscaled, untransformed ARGB8888 image in memory or shm: that one is drawn
-/// into the frame.
+/// The pointer element's pixels, as the display's cursor plane takes them: a `width`×`height`
+/// ARGB8888 image, drawn at `size` and turned by `transform`, on the CPU with no GPU round trip.
+/// Mutter's native cursor renderer scales and turns its sprites for the CRTC the same way
+/// (`meta-cursor-renderer-native.c`). `None` for anything but an ARGB8888 image in memory or shm
+/// with no buffer transform of its own: that one is drawn into the frame.
 fn cursor_pixels(
     renderer: &mut VulkanRenderer,
     element: &PointerRenderElements,
     size: Size<i32, Physical>,
+    transform: Transform,
     (width, height): (u32, u32),
 ) -> Option<Vec<u8>> {
-    let src = element.src();
-    if src.loc != Point::default()
-        || src.size
-            != size
-                .to_f64()
-                .to_logical(1.)
-                .to_buffer(1., Transform::Normal)
-        || element.transform() != Transform::Normal
-    {
+    if element.transform() != Transform::Normal {
         return None;
     }
-    let row = width as usize * 4;
-    let mut image = vec![0u8; row * height as usize];
-    let mut copy = |pixels: &[u8], stride: usize| {
-        let len = size.w as usize * 4;
-        for (y, dst) in image
-            .chunks_exact_mut(row)
-            .take(size.h as usize)
-            .enumerate()
-        {
-            dst[..len].copy_from_slice(pixels.get(y * stride..y * stride + len)?);
-        }
-        Some(())
+    let src = element.src();
+    let draw = |pixels: &[u8], stride: usize, buffer: Size<i32, Buffer>| {
+        draw_cursor(
+            pixels,
+            stride,
+            buffer,
+            src,
+            size,
+            transform,
+            (width, height),
+        )
     };
     match element.underlying_storage(renderer)? {
         UnderlyingStorage::Memory(memory) => {
             if memory.format() != Fourcc::Argb8888 {
                 return None;
             }
-            copy(memory, memory.stride() as usize)?;
+            draw(memory, memory.stride() as usize, memory.size())
         }
         UnderlyingStorage::Wayland(buffer) => {
             shm::with_buffer_contents(buffer, |ptr, len, data| {
@@ -1264,9 +1265,87 @@ fn cursor_pixels(
                 }
                 // SAFETY: smithay maps the pool for the duration of the closure, `len` bytes long.
                 let pixels = unsafe { std::slice::from_raw_parts(ptr.add(start), end - start) };
-                copy(pixels, data.stride as usize)
+                draw(
+                    pixels,
+                    data.stride as usize,
+                    Size::from((data.width, data.height)),
+                )
             })
-            .ok()??
+            .ok()?
+        }
+    }
+}
+
+/// Draw `src` of a premultiplied ARGB8888 buffer at `size`, turned by `transform` as the frame
+/// turns its elements, into the top-left corner of a cleared `width`×`height` image. Bilinear,
+/// so an image drawn at its own size and unturned is copied exactly.
+fn draw_cursor(
+    pixels: &[u8],
+    stride: usize,
+    buffer: Size<i32, Buffer>,
+    src: Rectangle<f64, Buffer>,
+    size: Size<i32, Physical>,
+    transform: Transform,
+    (width, height): (u32, u32),
+) -> Option<Vec<u8>> {
+    let turned = transform.transform_size(size);
+    if size.w <= 0
+        || size.h <= 0
+        || turned.w > width as i32
+        || turned.h > height as i32
+        || buffer.w <= 0
+        || buffer.h <= 0
+        || pixels.len() < (buffer.h as usize - 1) * stride + buffer.w as usize * 4
+    {
+        return None;
+    }
+    // The texels `src` covers, which sampling stays within.
+    let first = |at: f64, max: i32| (at.floor() as i32).clamp(0, max - 1);
+    let last = |at: f64, max: i32| ((at.ceil() as i32) - 1).clamp(0, max - 1);
+    let (x_lo, x_hi) = (
+        first(src.loc.x, buffer.w),
+        last(src.loc.x + src.size.w, buffer.w),
+    );
+    let (y_lo, y_hi) = (
+        first(src.loc.y, buffer.h),
+        last(src.loc.y + src.size.h, buffer.h),
+    );
+    let texel = |x: i32, y: i32| {
+        let at = y.clamp(y_lo, y_hi) as usize * stride + x.clamp(x_lo, x_hi) as usize * 4;
+        &pixels[at..at + 4]
+    };
+    let (scale_x, scale_y) = (
+        src.size.w / f64::from(size.w),
+        src.size.h / f64::from(size.h),
+    );
+    let back = transform.invert();
+    let area = turned.to_f64();
+
+    let row = width as usize * 4;
+    let mut image = vec![0u8; row * height as usize];
+    for y in 0..turned.h {
+        for x in 0..turned.w {
+            // This pixel's centre, back in the frame's orientation, then in the buffer.
+            let at = back.transform_point_in(
+                Point::<f64, Physical>::from((f64::from(x) + 0.5, f64::from(y) + 0.5)),
+                &area,
+            );
+            let u = src.loc.x + at.x * scale_x - 0.5;
+            let v = src.loc.y + at.y * scale_y - 0.5;
+            let (u0, v0) = (u.floor(), v.floor());
+            let (fu, fv) = (u - u0, v - v0);
+            let (u0, v0) = (u0 as i32, v0 as i32);
+            let corners = [
+                (texel(u0, v0), (1. - fu) * (1. - fv)),
+                (texel(u0 + 1, v0), fu * (1. - fv)),
+                (texel(u0, v0 + 1), (1. - fu) * fv),
+                (texel(u0 + 1, v0 + 1), fu * fv),
+            ];
+            let out = y as usize * row + x as usize * 4;
+            for c in 0..4 {
+                let value: f64 = corners.iter().map(|(t, w)| f64::from(t[c]) * w).sum();
+                image[out + c] = value.round().clamp(0., 255.) as u8;
+            }
         }
     }
     Some(image)
@@ -1496,6 +1575,132 @@ mod tests {
                 refresh,
             },
         }
+    }
+
+    /// A `w`×`h` buffer whose every texel is distinct, tightly packed.
+    fn distinct(w: i32, h: i32) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| [i as u8, (i * 7) as u8, (i * 13) as u8, 255])
+            .collect()
+    }
+
+    fn whole(w: i32, h: i32) -> Rectangle<f64, Buffer> {
+        Rectangle::from_size((f64::from(w), f64::from(h)).into())
+    }
+
+    fn pixel(image: &[u8], width: u32, x: i32, y: i32) -> &[u8] {
+        let at = y as usize * width as usize * 4 + x as usize * 4;
+        &image[at..at + 4]
+    }
+
+    #[test]
+    fn a_cursor_at_its_own_size_is_copied_exactly() {
+        let (w, h) = (3, 2);
+        let pixels = distinct(w, h);
+        let image = draw_cursor(
+            &pixels,
+            w as usize * 4,
+            (w, h).into(),
+            whole(w, h),
+            (w, h).into(),
+            Transform::Normal,
+            (4, 4),
+        )
+        .unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let want: &[u8] = if x < w && y < h {
+                    &pixels[(y * w + x) as usize * 4..][..4]
+                } else {
+                    &[0; 4]
+                };
+                assert_eq!(pixel(&image, 4, x, y), want, "pixel {x},{y}");
+            }
+        }
+    }
+
+    /// The case of a fractional scale: the theme's image drawn smaller than it is.
+    #[test]
+    fn a_cursor_drawn_at_half_size_averages_its_texels() {
+        let pixels = [
+            [0, 0, 0, 0],
+            [100, 100, 100, 100],
+            [200, 200, 200, 200],
+            [60, 60, 60, 60],
+        ]
+        .concat();
+        let image = draw_cursor(
+            &pixels,
+            8,
+            (2, 2).into(),
+            whole(2, 2),
+            (1, 1).into(),
+            Transform::Normal,
+            (2, 2),
+        )
+        .unwrap();
+        assert_eq!(pixel(&image, 2, 0, 0), [90; 4]);
+        assert_eq!(pixel(&image, 2, 1, 0), [0; 4]);
+    }
+
+    /// Each texel lands where the frame puts that part of the pointer: the unit rectangle it
+    /// covers, through `transform_rect_in` as the renderer maps every element.
+    #[test]
+    fn a_turned_cursor_lands_where_the_frame_would_draw_it() {
+        let (w, h) = (3, 2);
+        let pixels = distinct(w, h);
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let image = draw_cursor(
+                &pixels,
+                w as usize * 4,
+                (w, h).into(),
+                whole(w, h),
+                (w, h).into(),
+                transform,
+                (4, 4),
+            )
+            .unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let to = transform.transform_rect_in(
+                        Rectangle::<i32, Physical>::new((x, y).into(), (1, 1).into()),
+                        &Size::from((w, h)),
+                    );
+                    assert_eq!(
+                        pixel(&image, 4, to.loc.x, to.loc.y),
+                        &pixels[(y * w + x) as usize * 4..][..4],
+                        "{transform:?}: texel {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_larger_than_the_plane_is_refused() {
+        let pixels = distinct(2, 3);
+        let draw = |transform| {
+            draw_cursor(
+                &pixels,
+                8,
+                (2, 3).into(),
+                whole(2, 3),
+                (2, 3).into(),
+                transform,
+                (3, 2),
+            )
+        };
+        assert!(draw(Transform::Normal).is_none());
+        assert!(draw(Transform::_90).is_some());
     }
 
     /// The tty backend's rules, over the outer's list.
