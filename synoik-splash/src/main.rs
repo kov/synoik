@@ -4,13 +4,14 @@
 
 //! The initramfs splash (`docs/fork/boot-splash.md` §7): plymouthd for the initramfs. It holds the
 //! card from the boot's first DRM frame, draws the splash into dumb buffers, answers plymouth's
-//! clients, and lives on across switch_root (as `synoik-system.service`, its `argv[0]` marked `@`)
-//! until the real root restarts the unit into the outer. At that TERM it leaves the splash in the
-//! fd store, beside the card and the listener, for the outer to carry on.
+//! clients, and lives on across switch_root (as `synoik-splash.service`, its `argv[0]` marked `@`,
+//! or from initramfs-tools' boot script, §7.6) until the outer is ready to draw.
 //!
-//! An initramfs without systemd (initramfs-tools) starts it from a boot script instead, and the
-//! real root's unit fetches the same three descriptors from it over [`handoff::HANDOVER_SOCKET`]
-//! with `synoik-splash --hand-over` (§7.6).
+//! The real root's `synoik-system.service` runs `synoik-splash --hand-over` as root before the
+//! outer: that asks for a channel over [`handoff::HANDOVER_SOCKET`] and leaves it in the unit's fd
+//! store. The outer sets up its GPU while the spinner turns on, then asks for [`handoff::STOP`]
+//! over it; the splash lets its last flip land and answers with the card, plymouth's listener and
+//! the splash, so the outer's first frame follows its last within a turn of the spinner (§7.2).
 
 #[macro_use]
 extern crate tracing;
@@ -45,9 +46,6 @@ impl AsFd for Card {
 impl drm::Device for Card {}
 impl drm::control::Device for Card {}
 
-/// Present while this program is the unit's process: what the real root's handover runs on.
-const MARKER: &str = "/run/synoik-system/initrd-splash";
-
 /// How often to look for the card while it is not there yet.
 const CARD_POLL: Duration = Duration::from_millis(20);
 
@@ -55,11 +53,15 @@ const CARD_POLL: Duration = Duration::from_millis(20);
 /// forced probe reads EDID, so not at the card's rate.
 const CONNECTOR_POLL: Duration = Duration::from_secs(1);
 
-/// How long the TERM handoff waits for systemd to take the splash state.
+/// How long `--hand-over` waits for systemd to take the channel into the fd store.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long `--hand-over` waits for the splash's descriptors.
+/// How long `--hand-over` waits for the splash's channel.
 const HANDOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a stop waits for the flip in flight to land before handing over regardless: the
+/// outer's first frame would otherwise be refused while ours is still queued.
+const STOP_FLIP_WAIT: Duration = Duration::from_millis(200);
 
 struct Buf {
     fb: framebuffer::Handle,
@@ -94,7 +96,6 @@ struct Splash {
     keyboard: Option<Keyboard>,
     entry: Entry,
     card: Option<Card>,
-    recovered: bool,
     displays: Vec<Display>,
     /// The kernel's uevents, read while the card has no display lit: a connector may come up after
     /// the card does (a VM's host window), and plymouthd waits for its hotplug event too.
@@ -107,6 +108,11 @@ struct Splash {
     /// The frame a frozen spinner keeps.
     frozen: Option<usize>,
     revision: u64,
+    /// The outer's channel, while it gets ready to take over.
+    channel: Option<UnixStream>,
+    /// When the outer asked us to stop: no new flip from then, and the hand over once the one in
+    /// flight has landed.
+    stopping: Option<Duration>,
 }
 
 fn monotonic() -> Duration {
@@ -135,8 +141,8 @@ fn main() {
         }
         return;
     }
-    // From the real root's unit, before the outer starts: the splash's descriptors, into the
-    // unit's fd store (§7.6).
+    // From the real root's unit, before the outer starts: a channel to the splash, into the unit's
+    // fd store (§7.2).
     let hand_over = std::env::args().nth(1).as_deref() == Some("--hand-over");
     tracing_subscriber::fmt()
         .with_ansi(false)
@@ -150,8 +156,8 @@ fn main() {
     }
 }
 
-/// Take the running splash's descriptors into this unit's fd store; nothing when no splash is
-/// waiting, as on a boot whose initramfs started the unit itself.
+/// Put a channel to the running splash in this unit's fd store, for the outer to stop it over once
+/// it can draw; nothing when no splash is waiting, as on a restart or a boot without one.
 fn fetch_splash() -> io::Result<()> {
     let addr = SocketAddr::from_abstract_name(handoff::HANDOVER_SOCKET)?;
     let stream = match UnixStream::connect_addr(&addr) {
@@ -168,47 +174,26 @@ fn fetch_splash() -> io::Result<()> {
     }
     stream.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
     let fds = handoff::receive_fds(stream.as_fd())?;
+    if !fds.iter().any(|(n, _)| n == handoff::FD_CHANNEL) {
+        return Err(io::Error::other("the splash sent no channel"));
+    }
     for (name, fd) in &fds {
         handoff::store(name, fd.as_fd())?;
     }
     handoff::barrier(BARRIER_TIMEOUT)?;
-    info!(
-        "took over the splash's {}",
-        fds.iter()
-            .map(|(n, _)| n.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    info!("the outer has a channel to the splash");
     Ok(())
 }
 
 fn run() -> io::Result<()> {
     let signals = block_signals()?;
-    // Without systemd here, the real root asks for the descriptors over this.
-    let handover = if under_systemd() {
-        None
-    } else {
+    // The real root's `--hand-over` asks for the outer's channel over this.
+    let handover = {
         let addr = SocketAddr::from_abstract_name(handoff::HANDOVER_SOCKET)?;
         let listener = UnixListener::bind_addr(&addr)?;
         listener.set_nonblocking(true)?;
-        Some(listener)
+        listener
     };
-
-    let mut drm = None;
-    let mut listener = None;
-    let mut resume = None;
-    if let Ok(fds) = sd_notify::listen_fds_with_names() {
-        for (raw, name) in fds {
-            // SAFETY: systemd passed this descriptor to us; it is ours to own from here on.
-            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            match name.as_str() {
-                handoff::FD_DRM => drm = Some(Card(fd)),
-                handoff::FD_PLYMOUTH => listener = Some(UnixListener::from(fd)),
-                handoff::FD_SPLASH => resume = State::from_fd(fd.as_fd()).ok(),
-                _ => (),
-            }
-        }
-    }
 
     let mut splash = Splash {
         // plymouthd answers root only (`ply-boot-server.c:265-285`).
@@ -217,8 +202,7 @@ fn run() -> io::Result<()> {
         fonts: Fonts::load(&[Path::new(text::FONT_FILE)]),
         keyboard: open_keyboard(),
         entry: Entry::default(),
-        recovered: drm.is_some(),
-        card: drm,
+        card: None,
         displays: Vec::new(),
         uevents: open_uevents()
             .inspect_err(|err| warn!("not listening for hotplug events: {err}"))
@@ -228,28 +212,13 @@ fn run() -> io::Result<()> {
         start: monotonic(),
         frozen: None,
         revision: 0,
+        channel: None,
+        stopping: None,
     };
-    match resume {
-        Some(state) => {
-            splash.start = state.spinner_start;
-            splash.frozen = state.frozen_frame;
-            splash.server.restore(state.splash);
-        }
-        None => splash.server.show(),
-    }
+    splash.server.show();
     splash.server.take_events();
 
-    let bound = match listener {
-        Some(listener) => splash.server.adopt(listener),
-        None => splash.server.try_bind(plymouth::SOCKET_NAME).inspect(|()| {
-            if let (true, Some(fd)) = (under_systemd(), splash.server.listener_fd()) {
-                if let Err(err) = handoff::store(handoff::FD_PLYMOUTH, fd) {
-                    warn!("could not put plymouth's listener in the fd store: {err}");
-                }
-            }
-        }),
-    };
-    match bound {
+    match splash.server.try_bind(plymouth::SOCKET_NAME) {
         Ok(()) => {
             if let Err(err) = fs::create_dir_all("/run/plymouth") {
                 warn!("/run/plymouth: {err}");
@@ -262,16 +231,20 @@ fn run() -> io::Result<()> {
         Err(err) => warn!("not answering plymouth's clients: {err}"),
     }
     if under_systemd() {
-        if let Some(dir) = Path::new(MARKER).parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        if let Err(err) = fs::write(MARKER, b"") {
-            warn!("{MARKER}: {err}");
-        }
         sd_notify::notify(&[sd_notify::NotifyState::Ready])?;
     }
 
     loop {
+        if let Some(since) = splash.stopping {
+            let landed = splash.displays.iter().all(|d| !d.flip_pending);
+            if landed || monotonic().saturating_sub(since) >= STOP_FLIP_WAIT {
+                match splash.hand_over() {
+                    Ok(()) => return Ok(()),
+                    // The outer is gone: carry on, for whoever starts next.
+                    Err(err) => warn!("could not hand the splash over: {err}"),
+                }
+            }
+        }
         if splash.card.is_none() {
             splash.open_card();
         } else if splash.displays.is_empty()
@@ -285,14 +258,21 @@ fn run() -> io::Result<()> {
         }
         splash.redraw();
 
-        let mut fds = vec![libc::pollfd {
-            fd: signals.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        if let Some(listener) = &handover {
+        let mut fds = vec![
+            libc::pollfd {
+                fd: signals.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: handover.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if let Some(channel) = &splash.channel {
             fds.push(libc::pollfd {
-                fd: listener.as_raw_fd(),
+                fd: channel.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -348,21 +328,30 @@ fn run() -> io::Result<()> {
 
         if fds[0].revents != 0 {
             drain(signals.as_fd());
-            splash.hand_off();
+            info!("stopping");
+            splash.let_go();
             return Ok(());
         }
         let ready = |fd: i32| fds.iter().any(|p| p.fd == fd && p.revents != 0);
-        if let Some(listener) = handover.as_ref().filter(|l| ready(l.as_raw_fd())) {
-            if let Ok((stream, _)) = listener.accept() {
+        if ready(handover.as_raw_fd()) {
+            if let Ok((stream, _)) = handover.accept() {
                 match handoff::peer_uid(stream.as_fd()) {
-                    Ok(0) => match splash.hand_over(&stream) {
-                        Ok(()) => return Ok(()),
-                        Err(err) => warn!("could not hand the splash over: {err}"),
-                    },
+                    Ok(0) => {
+                        if let Err(err) = splash.open_channel(&stream) {
+                            warn!("could not open a channel to the outer: {err}");
+                        }
+                    }
                     Ok(uid) => warn!("refusing the splash to uid {uid}"),
                     Err(err) => warn!("handover: {err}"),
                 }
             }
+        }
+        if splash
+            .channel
+            .as_ref()
+            .is_some_and(|c| ready(c.as_raw_fd()))
+        {
+            splash.on_channel();
         }
         if splash
             .server
@@ -423,6 +412,10 @@ impl Splash {
     /// How long poll may sleep, in ms: until the spinner's next frame, or the next look for the
     /// card.
     fn timeout(&self) -> i32 {
+        if self.stopping.is_some() {
+            // The flip in flight wakes us; this bounds a flip that never lands.
+            return 10;
+        }
         if self.card.is_none() {
             return CARD_POLL.as_millis() as i32;
         }
@@ -455,11 +448,6 @@ impl Splash {
         // SAFETY: just opened, and ours.
         let card = Card(unsafe { OwnedFd::from_raw_fd(raw) });
         info!("opened /dev/dri/card0");
-        if under_systemd() {
-            if let Err(err) = handoff::store(handoff::FD_DRM, card.as_fd()) {
-                warn!("could not put the DRM fd in the fd store: {err}");
-            }
-        }
         self.card = Some(card);
         self.setup_displays();
     }
@@ -468,9 +456,6 @@ impl Splash {
     fn setup_displays(&mut self) {
         self.probed = monotonic();
         let Some(card) = &self.card else { return };
-        if self.recovered {
-            close_inherited_framebuffers(card);
-        }
         let res = match card.resource_handles() {
             Ok(res) => res,
             Err(err) => {
@@ -536,8 +521,11 @@ impl Splash {
         }
     }
 
-    /// Flip every idle display whose picture is out of date.
+    /// Flip every idle display whose picture is out of date, unless stopping.
     fn redraw(&mut self) {
+        if self.stopping.is_some() {
+            return;
+        }
         let state = (self.revision, self.spinner_frame());
         let splash = self.server.splash().clone();
         let dialog = self.dialog();
@@ -689,40 +677,82 @@ impl Splash {
         }
     }
 
-    /// The real root is restarting the unit into the outer (§7.2): leave it the splash. The card
-    /// and the listener are in the fd store already; closing them here changes nothing on screen.
-    fn hand_off(&mut self) {
-        info!("handing the splash over");
-        self.let_go();
-        if under_systemd() {
-            let stored = self
-                .state()
-                .to_memfd()
-                .and_then(|fd| handoff::store(handoff::FD_SPLASH, fd.as_fd()))
-                .and_then(|()| handoff::barrier(BARRIER_TIMEOUT));
-            if let Err(err) = stored {
-                warn!("could not leave the splash in the fd store: {err}");
-            }
+    /// The real root's `--hand-over` asks for the outer's channel (§7.2): one end goes back over
+    /// `stream`, for the outer's fd store; we keep the other, and draw on until it says stop.
+    fn open_channel(&mut self, stream: &UnixStream) -> io::Result<()> {
+        let (ours, theirs) = UnixStream::pair()?;
+        ours.set_nonblocking(true)?;
+        // The card too: the same open file, master already, so the outer sets up on it while we
+        // draw. It reads no events and touches no framebuffer of ours until we have stopped.
+        let mut fds = vec![(handoff::FD_CHANNEL, theirs.as_fd())];
+        if let Some(card) = &self.card {
+            fds.push((handoff::FD_DRM, card.as_fd()));
         }
-        let _ = fs::remove_file(MARKER);
+        handoff::send_fds(stream.as_fd(), &fds)?;
+        info!("the outer has a channel");
+        self.channel = Some(ours);
+        Ok(())
     }
 
-    /// The real root's `--hand-over` asks for what the fd store would hold (§7.6): the card,
-    /// the listener and the splash, sent over `stream` once this process has let go of the rest.
-    fn hand_over(&mut self, stream: &UnixStream) -> io::Result<()> {
+    /// The outer's channel: a stop, or its end closing (it died, or will not take over).
+    fn on_channel(&mut self) {
+        let Some(channel) = &self.channel else { return };
+        let mut byte = 0u8;
+        // SAFETY: one byte of ours.
+        let n = unsafe { libc::read(channel.as_raw_fd(), (&raw mut byte).cast(), 1) };
+        match n {
+            1 if byte == handoff::STOP => {
+                if self.stopping.is_none() {
+                    info!("the outer is ready to draw");
+                    self.stopping = Some(monotonic());
+                }
+            }
+            1 => warn!("unknown request {byte:#x} on the outer's channel"),
+            0 => {
+                info!("the outer let go of its channel");
+                self.channel = None;
+                self.stopping = None;
+            }
+            _ => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    warn!("reading the outer's channel: {err}");
+                    self.channel = None;
+                    self.stopping = None;
+                }
+            }
+        }
+    }
+
+    /// The outer is ready and our last flip has landed: send it the card, the listener and the
+    /// splash, once this process has let go of the rest. Closing ours after changes nothing on
+    /// screen: the outer holds the same open card.
+    fn hand_over(&mut self) -> io::Result<()> {
+        let Some(channel) = self.channel.take() else {
+            return Err(io::Error::other("no channel"));
+        };
+        self.stopping = None;
         info!("handing the splash over");
         let state = self.state().to_memfd()?;
-        // First: the outer writes the pid file again once it answers.
-        self.let_go();
-        let listener = self.server.listener_fd();
+        // First: the outer writes the pid file again once it answers. The keyboards after: closing
+        // an input device waits for the kernel's RCU, tens of ms the screen would stand still for.
+        self.server.release_pid_file();
         let mut fds = vec![(handoff::FD_SPLASH, state.as_fd())];
-        if let Some(fd) = listener {
+        if let Some(fd) = self.server.listener_fd() {
             fds.push((handoff::FD_PLYMOUTH, fd));
         }
         if let Some(card) = &self.card {
             fds.push((handoff::FD_DRM, card.as_fd()));
         }
-        handoff::send_fds(stream.as_fd(), &fds)
+        let sent = handoff::send_fds(channel.as_fd(), &fds);
+        if sent.is_ok() {
+            self.let_go();
+        } else if self.server.listener_fd().is_some() {
+            // Drawing on: the pid file back.
+            self.server
+                .set_pid_file(std::path::PathBuf::from(plymouth::PID_FILE));
+        }
+        sent
     }
 
     /// What goes with the splash's process: the VT keyboard back on (a prompt up now dies with
@@ -881,41 +911,6 @@ fn pick_crtc(
             .into_iter()
             .find(|c| !taken.contains(c))
     })
-}
-
-/// Let go of framebuffers a previous splash made on the inherited card without taking them off
-/// the screen (`CLOSEFB`, as the outer does on a restart).
-fn close_inherited_framebuffers(card: &Card) {
-    let Ok(res) = card.resource_handles() else {
-        return;
-    };
-    for &fb in res.framebuffers() {
-        #[repr(C)]
-        struct DrmModeClosefb {
-            fb_id: u32,
-            pad: u32,
-        }
-        // DRM_IOWR(0xD0, struct drm_mode_closefb)
-        const DRM_IOCTL_MODE_CLOSEFB: libc::c_ulong = 0xC008_64D0;
-        let mut arg = DrmModeClosefb {
-            fb_id: u32::from(fb),
-            pad: 0,
-        };
-        // SAFETY: the ioctl's own argument struct, on our card.
-        if unsafe {
-            libc::ioctl(
-                card.as_fd().as_raw_fd(),
-                DRM_IOCTL_MODE_CLOSEFB,
-                &raw mut arg,
-            )
-        } < 0
-        {
-            warn!(
-                "closing inherited framebuffer {fb:?}: {}",
-                io::Error::last_os_error()
-            );
-        }
-    }
 }
 
 /// A socket on the kernel's uevents (`NETLINK_KOBJECT_UEVENT`, its multicast group): no udev

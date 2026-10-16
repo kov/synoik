@@ -54,7 +54,10 @@ dracut_module=/usr/lib/dracut/modules.d/90synoik
 dracut_conf=/etc/dracut.conf.d/90-synoik.conf
 itools_hook=/usr/share/initramfs-tools/hooks/synoik
 itools_script=/etc/initramfs-tools/scripts/init-premount/plymouth
-itools_dropin=/etc/systemd/system/synoik-system.service.d/initramfs-tools.conf
+# The outer waits for the disks while the initramfs splash asks for their passwords (boot-splash.md
+# §7.2), and the splash's own unit after switch_root (dracut's).
+splash_dropin=/etc/systemd/system/synoik-system.service.d/initrd-splash.conf
+splash_unit=/etc/systemd/system/synoik-splash.service
 # Debian's kernel command line: a grub.d snippet, which update-grub reads after /etc/default/grub.
 grub_snippet=/etc/default/grub.d/90-synoik.cfg
 # Debian's choice of display manager. Every display manager's postinst points
@@ -63,8 +66,7 @@ grub_snippet=/etc/default/grub.d/90-synoik.cfg
 default_dm=/etc/X11/default-display-manager
 
 if [ "${1:-}" = "--use-gdm" ]; then
-    systemctl disable synoik-login.service synoik-system.service synoik-splash-handover.service ||
-        true
+    systemctl disable synoik-login.service synoik-system.service || true
     if [ "$distro" = debian ]; then
         if [ -e "$default_dm.pre-synoik" ]; then
             mv "$default_dm.pre-synoik" "$default_dm"
@@ -75,7 +77,7 @@ if [ "${1:-}" = "--use-gdm" ]; then
     # plymouth back in the initramfs.
     if [ "$distro" = debian ]; then
         if [ -e "$itools_hook" ] || [ -e "$itools_script" ]; then
-            rm -f "$itools_hook" "$itools_script" "$itools_dropin"
+            rm -f "$itools_hook" "$itools_script"
             echo "Rebuilding the initramfs images with plymouth..."
             update-initramfs -u -k all
         fi
@@ -84,6 +86,7 @@ if [ "${1:-}" = "--use-gdm" ]; then
         echo "Rebuilding the initramfs images with plymouth..."
         dracut -f --regenerate-all
     fi
+    rm -f "$splash_dropin" "$splash_unit"
     systemctl enable --force gdm.service
     # The text consoles come back with GDM, and plymouth runs after switch_root again.
     if [ "$distro" = debian ]; then
@@ -155,7 +158,13 @@ systemd-sysusers synoik-system.conf synoik-login.conf
 systemd-tmpfiles --create synoik-login.conf synoik-system.conf
 
 # System units. After switch_root the system compositor is plymouth (docs/fork/boot-splash.md §2.2).
-install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-splash-handover.service
+install -Dm644 -t /etc/systemd/system $r/synoik-system.service
+# Earlier installs restarted the splash's unit into the outer from a unit of its own.
+if [ -e /etc/systemd/system/synoik-splash-handover.service ]; then
+    systemctl disable synoik-splash-handover.service || true
+    rm -f /etc/systemd/system/synoik-splash-handover.service \
+        /etc/systemd/system/synoik-system.service.d/initramfs-tools.conf
+fi
 # On Debian the login daemon's unit is where the display-manager postinsts look for it ($default_dm).
 if [ "$distro" = debian ]; then
     rm -f /etc/systemd/system/synoik-login.service
@@ -268,19 +277,22 @@ echo "Rebuilding the initramfs images..."
 if [ "$distro" = debian ]; then
     install -Dm755 $r/initramfs-tools/hook "$itools_hook"
     install -Dm755 $r/initramfs-tools/init-premount "$itools_script"
-    install -Dm644 $r/initramfs-tools/synoik-system-after-cryptsetup.conf "$itools_dropin"
+    install -Dm644 $r/synoik-system-after-cryptsetup.conf "$splash_dropin"
     update-initramfs -u -k all
 else
     rm -rf "$dracut_module"
     install -Dm755 $r/dracut/90synoik/module-setup.sh "$dracut_module/module-setup.sh"
-    install -Dm644 $r/dracut/90synoik/synoik-system.service "$dracut_module/synoik-system.service"
+    install -Dm644 $r/dracut/90synoik/synoik-splash.service "$dracut_module/synoik-splash.service"
     install -Dm644 $r/dracut/90-synoik.conf "$dracut_conf"
+    install -Dm644 $r/synoik-system-after-cryptsetup.conf "$splash_dropin"
+    # The initramfs's unit lives on after switch_root: the real root knows it by its file.
+    install -Dm644 $r/dracut/90synoik/synoik-splash.service "$splash_unit"
     dracut -f --regenerate-all
 fi
 
 systemctl daemon-reload
 systemctl disable gdm.service || true
-systemctl enable synoik-system.service synoik-splash-handover.service
+systemctl enable synoik-system.service
 # The display-manager.service alias is GDM's until now, or an earlier install's: `reenable`, as a
 # plain enable keeps an alias that names this unit at the path it moved from.
 systemctl reenable --force synoik-login.service

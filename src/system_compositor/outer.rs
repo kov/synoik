@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt as _;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -93,13 +93,39 @@ pub fn run(card: Option<PathBuf>, socket: PathBuf) -> anyhow::Result<()> {
     let Inherited {
         drm: fd,
         recovered,
-        plymouth,
-        splash,
+        mut plymouth,
+        mut splash,
+        channel,
     } = acquire_card(card.as_deref())?;
+    // The GPU first, the slow part of a start (~60 ms on a VM): while the initramfs splash still
+    // turns, if one is running.
+    let render_node = DrmNode::from_file(fd.as_fd())
+        .ok()
+        .and_then(|node| node.node_with_type(NodeType::Render).and_then(Result::ok));
+    let compositor = render_node.and_then(|node| {
+        Compositor::new((u64::from(node.major()), u64::from(node.minor())))
+            .map_err(|err| warn!("no transitions, session switches will cut: {err:#}"))
+            .ok()
+    });
+    // Ready to draw: only now does the splash stop, its last frame on screen, and the card is ours
+    // alone from here (boot-splash.md §7.2). Nothing before reads the card's events, which the
+    // splash's flips arrive on, or touches its framebuffers.
+    if let Some(channel) = channel {
+        match take_over_splash(&channel) {
+            Ok(taken) => {
+                plymouth = plymouth.or(taken.plymouth);
+                splash = splash.or(taken.splash);
+            }
+            Err(err) => warn!("the initramfs splash did not hand over: {err}"),
+        }
+        if let Err(err) = handoff::remove(handoff::FD_CHANNEL) {
+            warn!("could not drop the splash's channel from the fd store: {err}");
+        }
+    }
     if recovered {
         close_inherited_framebuffers(fd.as_fd());
     }
-    let mut outer = Outer::new(fd, recovered, splash, handle.clone())?;
+    let mut outer = Outer::new(fd, recovered, splash, compositor, handle.clone())?;
     // The first modeset put plymouth's frame back up; the spinner turns from there, and the socket
     // is plymouthd's once it lets go of it (boot-splash.md §2.1).
     outer.begin_spinner();
@@ -216,6 +242,7 @@ fn acquire_card(card: Option<&Path>) -> anyhow::Result<Inherited> {
     let mut drm = None;
     let mut plymouth = None;
     let mut splash = None;
+    let mut channel = None;
     if let Ok(fds) = sd_notify::listen_fds_with_names() {
         for (raw, name) in fds {
             // SAFETY: systemd passed this descriptor to us; it is ours to own from here on.
@@ -227,8 +254,28 @@ fn acquire_card(card: Option<&Path>) -> anyhow::Result<Inherited> {
                     Ok(state) => splash = Some(state),
                     Err(err) => warn!("not resuming the splash: {err}"),
                 },
+                handoff::FD_CHANNEL => channel = Some(UnixStream::from(fd)),
                 _ => (),
             }
+        }
+    }
+    // A channel with no card: the splash had not opened one yet. Stop it now, for its listener and
+    // splash; the card is then opened as on a boot without one.
+    if let (Some(ch), None) = (&channel, &drm) {
+        match take_over_splash(ch) {
+            Ok(taken) => {
+                plymouth = plymouth.or(taken.plymouth);
+                splash = splash.or(taken.splash);
+                drm = taken.drm;
+            }
+            Err(err) => warn!("the initramfs splash did not hand over: {err}"),
+        }
+        channel = None;
+        if let Err(err) = handoff::remove(handoff::FD_CHANNEL) {
+            warn!("could not drop the splash's channel from the fd store: {err}");
+        }
+        if let Some(fd) = &drm {
+            store_card(fd.as_fd());
         }
     }
     if let Some(drm) = drm {
@@ -238,6 +285,7 @@ fn acquire_card(card: Option<&Path>) -> anyhow::Result<Inherited> {
             recovered: true,
             plymouth,
             splash,
+            channel,
         });
     }
 
@@ -252,23 +300,25 @@ fn acquire_card(card: Option<&Path>) -> anyhow::Result<Inherited> {
 
     // Best effort: outside systemd there is no store, and that is a supported way to run this by
     // hand. Under the unit, failing to store it is worth a warning, not a refusal to start.
-    if std::env::var_os("NOTIFY_SOCKET").is_some() {
-        if let Err(err) = sd_notify::notify_with_fds(
-            &[
-                sd_notify::NotifyState::FdStore,
-                sd_notify::NotifyState::FdName(handoff::FD_DRM),
-            ],
-            &[fd.as_fd()],
-        ) {
-            warn!("could not put the DRM fd in the fd store: {err}");
-        }
-    }
+    store_card(fd.as_fd());
     Ok(Inherited {
         drm: fd,
         recovered: false,
         plymouth,
         splash: None,
+        channel: None,
     })
+}
+
+/// Keep the card in the fd store. Best effort: outside systemd there is no store, and that is a
+/// supported way to run this by hand. Under the unit, failing to store it is worth a warning, not
+/// a refusal to start.
+fn store_card(fd: BorrowedFd<'_>) {
+    if std::env::var_os("NOTIFY_SOCKET").is_some() {
+        if let Err(err) = handoff::store(handoff::FD_DRM, fd) {
+            warn!("could not put the DRM fd in the fd store: {err}");
+        }
+    }
 }
 
 /// What a start begins with: the card, and what the fd store kept besides.
@@ -280,6 +330,58 @@ struct Inherited {
     plymouth: Option<UnixListener>,
     /// The splash a previous drawer had up: the initramfs splash's, at the handover.
     splash: Option<handoff::State>,
+    /// The channel to the initramfs splash, still drawing on the card: it stops once asked.
+    channel: Option<UnixStream>,
+}
+
+/// What the initramfs splash hands over when it stops.
+struct Taken {
+    drm: Option<OwnedFd>,
+    plymouth: Option<UnixListener>,
+    splash: Option<handoff::State>,
+}
+
+/// How long the splash may take to stop: its last flip landing, at most a frame, and its reply.
+const SPLASH_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Ask the initramfs splash to stop, over its `channel`: once its last flip has landed, it answers
+/// with the card, plymouthd's listener and the splash as it stood, and exits.
+fn take_over_splash(channel: &UnixStream) -> std::io::Result<Taken> {
+    use std::io::Write as _;
+
+    info!("ready to draw: stopping the initramfs splash");
+    (&*channel).write_all(&[handoff::STOP])?;
+    channel.set_read_timeout(Some(SPLASH_STOP_TIMEOUT))?;
+    let fds = handoff::receive_fds(channel.as_fd())?;
+    if fds.is_empty() {
+        return Err(std::io::Error::other("the splash is gone"));
+    }
+    let mut taken = Taken {
+        drm: None,
+        plymouth: None,
+        splash: None,
+    };
+    for (name, fd) in fds {
+        match name.as_str() {
+            handoff::FD_DRM => taken.drm = Some(fd),
+            handoff::FD_PLYMOUTH => taken.plymouth = Some(UnixListener::from(fd)),
+            handoff::FD_SPLASH => {
+                // Kept, so an outer restarted before the splash is over resumes it too.
+                if std::env::var_os("NOTIFY_SOCKET").is_some() {
+                    if let Err(err) = handoff::store(handoff::FD_SPLASH, fd.as_fd()) {
+                        warn!("could not put the splash in the fd store: {err}");
+                    }
+                }
+                match handoff::State::from_fd(fd.as_fd()) {
+                    Ok(state) => taken.splash = Some(state),
+                    Err(err) => warn!("not resuming the splash: {err}"),
+                }
+            }
+            _ => (),
+        }
+    }
+    info!("the initramfs splash handed over");
+    Ok(taken)
 }
 
 /// Let go of the framebuffers a previous outer created on the fd we inherited, without taking
@@ -749,9 +851,11 @@ impl Outer {
         fd: OwnedFd,
         recovered: bool,
         splash: Option<handoff::State>,
+        compositor: Option<Compositor>,
         handle: LoopHandle<'static, Outer>,
     ) -> anyhow::Result<Self> {
         let drm_fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        // Again: `run` hands over the compositor built on it, not the node.
         let render_node = DrmNode::from_file(drm_fd.as_fd())
             .ok()
             .and_then(|node| node.node_with_type(NodeType::Render).and_then(Result::ok))
@@ -767,11 +871,6 @@ impl Outer {
             })
             .map_err(|err| anyhow::anyhow!("inserting the DRM notifier: {err}"))?;
 
-        let compositor = render_node.and_then(|node| {
-            Compositor::new(node)
-                .map_err(|err| warn!("no transitions, session switches will cut: {err:#}"))
-                .ok()
-        });
         let mut outer = Self {
             handle,
             drm_fd,

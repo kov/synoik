@@ -353,11 +353,6 @@ harness VM: the handover (§2.1) and surviving shutdown (§2.3). Both hold.
 - Compose sequences: neither drawer feeds keys through an xkb compose table, so a password typed
   with dead keys gets the dead keysyms' text, or none. plymouthd composes with the locale's table
   (`/usr/share/X11/locale`); the image would have to carry it.
-- **The spinner stops at the handover.** The initramfs splash draws its last frame and lets go
-  (at TERM on dracut, at the hand-over on initramfs-tools); the screen holds it until the outer's
-  first frame, 237 ms on the harness (§7.2) and longer while the outer sets up Vulkan on a slower
-  device. The splash should keep turning the spinner on the CPU until the outer is ready to draw,
-  then hand over.
 - **A display plugged in after the first is lit stays dark until the outer.** The initramfs splash
   listens for DRM hotplug only while no display is lit (§7.3); the outer follows udev for all of
   them.
@@ -371,17 +366,15 @@ plymouth leaves the image; `synoik-splash`, a small program built from the outer
 takes its place. It is plymouthd for the initramfs: it answers the protocol (§3), draws the splash
 from the first DRM frame of the boot, and lives on across switch_root until the outer replaces it.
 
-### 7.1 One unit across switch_root
+### 7.1 Across switch_root
 
-The initramfs runs `synoik-system.service` — the same unit name as the real root's, with its own
-unit file. Measured on the harness VM (2026-10-14, systemd 259), with a probe service started from
-the initramfs:
+The initramfs runs `synoik-splash.service`, a unit of its own: the real root's
+`synoik-system.service` starts beside it, while it still draws (§7.2). Measured on the harness VM
+(2026-10-14, systemd 259), with a probe service started from the initramfs:
 
 - A unit started in the initramfs is the same unit after switch_root: it stays `active` with the
-  same main PID, its configuration is now the real root's file, and the real root does not start
-  a second instance.
-- **Its fd store survives the switch.** The DRM fd stored in the initramfs is still master in the
-  real root.
+  same main PID, and its configuration is now the real root's file. The installer puts the
+  splash's unit file in the real root too, with no `[Install]`, so the running unit has one.
 - **systemd TERMs every initramfs process at the switch**, sparing only those whose `argv[0]`
   starts with `@` (plymouthd's mark). The unit runs `@/usr/libexec/synoik-splash @synoik-splash`.
 - A process that survives has its root in the initramfs, which systemd empties. The splash
@@ -390,43 +383,52 @@ the initramfs:
   its policy, `kernel_t` may no longer `map` the card (`device_t`, devtmpfs's label before
   relabelling): the splash maps its buffers once, at setup, and a mapping it holds stays good.
 
-### 7.2 The handover is a restart
+### 7.2 The handover overlaps the outer's start
 
-Once the real root is up as far as the outer needs (§2.2.1), `synoik-splash-handover.service`
-runs `systemctl restart synoik-system.service`. systemd starts the outer from the real root's unit
-file, with all of its settings (user, groups, environment, directories, SELinux domain). Master and
-the frame on screen never move, because the DRM fd is in the fd store; the outer adopts them as it
-does after a crash (`system-compositor.md` §7). What else crosses over, also through the fd store:
+The splash turns the spinner until the outer is ready to draw, so the screen never waits on the
+outer's process start or its GPU setup. The splash listens on an abstract socket,
+`synoik-splash-handover`, and:
 
-- **`plymouth`**: the bound listener. Clients that connect during the restart wait in its backlog,
-  not refused, and the socket keeps the label it got in the initramfs (§6, SELinux). The outer
-  stores the listener it binds itself too, so a crash restart keeps the name.
-- **`splash`**: a memfd with the splash state at TERM: mode, messages, progress, frozen and shown
-  flags, and the spinner's start on the monotonic clock. The outer resumes the splash from it, its
-  spinner phase continuing, and removes it when the splash ends; without it, the outer adopts the
-  screen as before.
+1. The real root's `synoik-system.service` runs `synoik-splash --hand-over` as root before the
+   outer (`ExecStartPre=+`, `NotifyAccess=exec`). The splash answers it with the card (the same
+   open file: master is shared from here) and one end of a socket pair, its **channel**; the
+   helper puts both in the unit's fd store (`drm`, `splash-channel`). Both ends check that the
+   other is root: anyone can bind an abstract name. Where no splash waits, the helper does
+   nothing; a splash that is there but fails to answer fails the start, and the unit restarts: an
+   outer that opened the card itself would not be master, a dark boot.
+2. The outer starts from the real root's unit file, with all of its settings (user, groups,
+   environment, directories, SELinux domain), and sets up Vulkan on the card's render node while
+   the splash flips on. Until step 3 it reads no event from the card, where the splash's flips
+   complete, and touches none of its framebuffers.
+3. Ready to draw, the outer writes a stop over the channel. The splash makes no new flip, lets the
+   one in flight land, and sends over the channel: plymouth's bound listener (`plymouth`), and a
+   memfd with the splash state (`splash`: mode, messages, progress, frozen and shown flags, and
+   the spinner's start on the monotonic clock). It removes its pid file first, closes its
+   keyboards after (each close waits on the kernel's RCU), and exits.
+4. The outer closes the splash's framebuffers (`CLOSEFB`, as after a crash, `system-compositor.md`
+   §7), builds its DRM device, and draws the splash from that state at once, the spinner's phase
+   continuing, without waiting for a session's first frame. It keeps the listener and the state
+   in its fd store, so a crash restart keeps plymouth's name and resumes the splash, and removes
+   the channel. Clients that connect meanwhile wait in the listener's backlog, not refused, and
+   the socket keeps the label it got in the initramfs (§6, SELinux).
 
-The splash removes `/run/plymouth/pid` at TERM; the outer writes it again once it answers, which
-the unit's last `ExecStartPost=` waits for, and the handover's `systemctl restart` returns after
-that (`Type=notify`). The outer adopts each display at the mode it has but, carrying the splash on,
-draws the splash on it at once, without waiting for a session's first frame.
+Measured on the harness VM (2026-10-16, 1280×800, frames captured on the host): the stop is
+answered in 0.6 ms, and the outer's first frame follows the splash's last 79 ms later, one turn
+of the spinner (≈67 ms) plus the outer's DRM setup and first draw; the next comes on the shared
+spinner clock. Restarting the splash's unit into the outer instead held the last frame 314 ms:
+systemd's stop and start, the outer's process start and its Vulkan setup, all with the screen
+still.
 
-Measured on the harness VM (2026-10-14, 1280×800, frames captured on the host): the splash lit at
-1.32 s, turned through switch_root (2.24 s), and at the handover (4.87 s) the outer's first frame
-replaced its last 237 ms later, with the same watermark and the spinner still turning: no empty
-plane and no dark frame between them. Both drawers present at ≈15 fps on that VM. The handover unit runs only while the splash is the
-unit's process: it is conditioned on `/run/synoik-system/initrd-splash`, which the splash creates
-and removes.
-
-**A password prompt is asked again after the restart.** Its client's connection dies with the
+**A password prompt up at the handover is asked again.** Its client's connection dies with the
 splash, and systemd's plymouth agent (v259, `tty-ask-password-agent.c`) takes the EOF as `-EIO`,
 logs it, and waits for the next change under `/run/systemd/ask-password`: alone, the asking unit
 would wait until its own timeout. So once the outer answers, its unit try-restarts
 `systemd-ask-password-plymouth.service` (an `ExecStartPost=`), and the new agent asks every pending
-request of the outer; a crash restart is covered the same way. The handover is still ordered
-`After=cryptsetup.target`, so the crypttab volumes are asked through the splash before it and their
-dialogs do not flash away and back. A request made once logins are allowed goes to the wall agent,
-which stops the plymouth agent for good — systemd's arrangement, as with plymouthd.
+request of the outer; a crash restart is covered the same way. A drop-in the installer adds where
+the initramfs has the splash orders the outer `After=cryptsetup.target`, so the crypttab volumes
+are asked through the splash before it and their dialogs do not flash away and back. A request
+made once logins are allowed goes to the wall agent, which stops the plymouth agent for good —
+systemd's arrangement, as with plymouthd.
 
 The real root's unit keeps its plymouth calls for a boot whose initramfs still has plymouth
 (an image built before the install, or `--use-gdm` half undone). They are guarded on the pid file
@@ -449,8 +451,7 @@ since the image has no fontconfig.
 
 ### 7.4 The image
 
-A dracut module, `90synoik`, installs the program, its unit, the theme's images and the handover
-order; `/etc/dracut.conf.d/synoik.conf` adds it and omits `plymouth` (≈3 MB smaller,
+A dracut module, `90synoik`, installs the program, its unit and the theme's images; `/etc/dracut.conf.d/synoik.conf` adds it and omits `plymouth` (≈3 MB smaller,
 `initrd-size-and-time` measurements). The plymouth package stays installed, so `--use-gdm` brings
 everything back with a `dracut -f`.
 
@@ -469,11 +470,11 @@ the i18n module's copy of `vconsole.conf` already does.
 
 7. **Crate split**: the protocol server and the layout move into `synoik-splash` (lib), with no
    smithay; the outer uses them from there.
-8. **Fd-store handoff** in the outer: the `plymouth` listener and `splash` state adopted at start.
-9. **The program**: dumb buffers, the CPU painter, the TERM handoff; headless tests of the
-   painter against the layout.
-10. **Units, dracut module, installer**, and the boot on the harness: one PID from initramfs to
-    restart, no empty plane at either end, the spinner's phase across the restart.
+8. **Handover** in the outer: the `plymouth` listener and `splash` state adopted at start.
+9. **The program**: dumb buffers, the CPU painter, the handover; headless tests of the painter
+   against the layout.
+10. **Units, dracut module, installer**, and the boot on the harness: one PID from the initramfs
+    to the handover, no empty plane at either end, the spinner's phase across it.
 
 ### 7.6 initramfs-tools (Debian)
 
@@ -493,20 +494,10 @@ is the same program, started and taken over differently.
   drivers by the plymouth hook's rules, which that hook adds only for a graphical theme. Debian's
   spinner has no `watermark.png`; both drawers then use Debian's logo, the file the plymouth
   hook puts in its place (`layout::WATERMARK_FALLBACK`).
-- **The handover.** The splash is no unit's process, so nothing restarts it and it has no fd
-  store. It listens on an abstract socket instead (`synoik-splash-handover`), and the real root's
-  `synoik-system.service` runs `synoik-splash --hand-over` as root before the outer
-  (`ExecStartPre=+`, `NotifyAccess=exec`): it takes the card, plymouth's listener and a `splash`
-  memfd over that socket and puts them in the unit's fd store under the names of §7.2, and the
-  outer adopts them exactly as after the restart. Both ends check that the other is root: anyone
-  can bind an abstract name. The splash lets go of the keyboard before sending and exits once
-  sent. Its pid file it cannot remove: past the switch its root is still the initramfs's, whose
-  `/run` the switch moved into the real root, so the outer replaces the file by rename (tmpfiles
-  has made the directory the outer's). Where no splash
-  waits, as on a dracut boot, the helper finds no socket and does nothing. Measured on Debian's
-  systemd 261: a descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its
-  name.
-- **Ordering.** The handover kills a prompt that is up, asked again of the outer (§7.2); the outer
-  would start as soon as its own dependencies are met, so a drop-in orders it
-  `After=cryptsetup.target` there, as the handover unit is on Fedora. The
+- **The handover** is §7.2's: the splash is no unit's process, but it listens on the same
+  abstract socket either way. Its pid file it cannot remove: past the switch its root is still the
+  initramfs's, whose `/run` the switch moved into the real root, so the outer replaces the file by
+  rename (tmpfiles has made the directory the outer's). Measured on Debian's systemd 261: a
+  descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its name.
+- **Ordering**: the same `After=cryptsetup.target` drop-in as on Fedora (§7.2). The
   real root's plymouth units are conditioned off as on Fedora (§2.2).

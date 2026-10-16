@@ -2,8 +2,9 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! What crosses from the initramfs splash to the outer in `synoik-system.service`'s fd store
-//! (`docs/fork/boot-splash.md` §7.2): the card, plymouthd's listener, and the splash as it stood.
+//! What crosses from the initramfs splash to the outer (`docs/fork/boot-splash.md` §7.2): the
+//! card, plymouthd's listener, and the splash as it stood. The outer keeps the first two in
+//! `synoik-system.service`'s fd store, so a crash restart finds them.
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -20,6 +21,13 @@ pub const FD_DRM: &str = "drm";
 pub const FD_PLYMOUTH: &str = "plymouth";
 /// A memfd holding a [`State`].
 pub const FD_SPLASH: &str = "splash";
+/// The outer's end of its channel to the running splash: it asks the splash to stop over it, once
+/// it is ready to draw, and the splash answers with the three above.
+pub const FD_CHANNEL: &str = "splash-channel";
+
+/// What the outer writes on its channel when it is ready to draw: the splash lets its last flip
+/// land, then answers with [`FD_DRM`], [`FD_PLYMOUTH`] and [`FD_SPLASH`] and exits.
+pub const STOP: u8 = b's';
 
 /// The splash on screen when its drawer stopped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,9 +65,9 @@ impl State {
     }
 }
 
-/// Where a splash with no systemd in its initramfs (initramfs-tools) waits for the real root's
-/// `synoik-splash --hand-over`, an abstract name: it asks for the fd store's contents over it
-/// (`docs/fork/boot-splash.md` §7.6).
+/// Where the splash waits for the real root's `synoik-splash --hand-over`, an abstract name: run as
+/// root before the outer, that asks for a channel to the splash and leaves it in the outer's fd
+/// store ([`FD_CHANNEL`]; `docs/fork/boot-splash.md` §7.2).
 pub const HANDOVER_SOCKET: &str = "synoik-splash-handover";
 
 /// The most descriptors one handover carries: the card, the listener and the splash.

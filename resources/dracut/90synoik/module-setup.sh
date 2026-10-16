@@ -25,8 +25,8 @@ install() {
         strip --strip-debug "$initdir/usr/local/libexec/synoik-splash" ||
             dwarning "synoik: could not strip the splash"
     fi
-    inst_simple "$moddir/synoik-system.service" "$systemdsystemunitdir/synoik-system.service"
-    $SYSTEMCTL -q --root "$initdir" add-wants sysinit.target synoik-system.service
+    inst_simple "$moddir/synoik-splash.service" "$systemdsystemunitdir/synoik-splash.service"
+    $SYSTEMCTL -q --root "$initdir" add-wants sysinit.target synoik-splash.service
     # The splash's images: loaded at start, so nothing is read after switch_root empties the image.
     # Debian's logo is the watermark where its spinner has none (synoik-splash's layout.rs).
     local theme=/usr/share/plymouth/themes/spinner

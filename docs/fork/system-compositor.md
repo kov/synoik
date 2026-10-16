@@ -263,9 +263,9 @@ Plymouth replacement is built in two phases, both in `boot-splash.md`: the outer
 from switch_root to power-off, and a splash of ours holds it in the initramfs. In full it means:
 
 - **Living in the initramfs** (`boot-splash.md` §7): a small CPU-drawing splash program holds the
-  card from the boot's first frame, survives `switch_root` as plymouthd does, and the real root
-  restarts its unit into the outer, master and frame crossing in the fd store. No Mesa or Vulkan in
-  the image.
+  card from the boot's first frame, survives `switch_root` as plymouthd does, and turns the
+  spinner until the outer, started beside it, is ready to draw and takes the card over. No Mesa or
+  Vulkan in the image.
 - **Plymouth's other jobs come with it**: the FDE passphrase prompt (`systemd-ask-password`
   agent), fsck progress, `system-update.target` rendering.
 - **The seamless part is not fbcon** — it is `simpledrm`/`efifb` → real driver. Flicker-free means
@@ -555,7 +555,5 @@ In order:
    handoffs between inner and outer: a login holds the greeter still for the session's first frame
    (about 0.45 s on the harness), and a logout holds the session's last frame until the greeter's
    first.
-2. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
-   CPU splash keeps the spinner turning until the outer can draw.
-3. **Overlay planes through the outer**: a client's buffer scanned out on an overlay plane, which
+2. **Overlay planes through the outer**: a client's buffer scanned out on an overlay plane, which
    needs the buffer forwarded across the wire and §3's atomic test-and-revert first.

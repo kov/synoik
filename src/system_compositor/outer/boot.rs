@@ -205,27 +205,38 @@ impl Outer {
         self.on_plymouth();
     }
 
-    /// Start answering on plymouthd's name: on `inherited`, the listener a previous outer or the
-    /// initramfs splash left in the fd store, or else bound here, retrying while plymouthd still
-    /// holds the name.
+    /// Keep the listener in the fd store across a restart, so the name is never free for anyone
+    /// else to take.
+    fn store_plymouth(&self) {
+        let Some(fd) = self.plymouth.server.listener_fd() else {
+            return;
+        };
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            if let Err(err) = handoff::store(handoff::FD_PLYMOUTH, fd) {
+                warn!("could not put plymouth's listener in the fd store: {err}");
+            }
+        }
+    }
+
+    /// Start answering on plymouthd's name: on `inherited`, the listener a previous outer left in
+    /// the fd store or the initramfs splash handed over, or else bound here, retrying while
+    /// plymouthd still holds the name.
     pub(super) fn bind_plymouth(&mut self, inherited: Option<UnixListener>) {
         if let Some(listener) = inherited {
             match self.plymouth.server.adopt(listener) {
-                Ok(()) => return self.answer_plymouth(),
+                Ok(()) => {
+                    // From the initramfs splash's hand, not the fd store: into it, so a restart
+                    // keeps the name too.
+                    self.store_plymouth();
+                    return self.answer_plymouth();
+                }
                 Err(err) => warn!("not adopting plymouth's listener: {err}"),
             }
         }
         match self.plymouth.server.try_bind(plymouth::SOCKET_NAME) {
             Ok(()) => {
                 self.plymouth.retry = None;
-                // Kept across a restart, so the name is never free for anyone else to take.
-                if let Some(fd) = self.plymouth.server.listener_fd() {
-                    if std::env::var_os("NOTIFY_SOCKET").is_some() {
-                        if let Err(err) = handoff::store(handoff::FD_PLYMOUTH, fd) {
-                            warn!("could not put plymouth's listener in the fd store: {err}");
-                        }
-                    }
-                }
+                self.store_plymouth();
                 self.answer_plymouth();
             }
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
