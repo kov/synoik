@@ -431,8 +431,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
     greeter would. 500 ms ease-out-quad (`STARTUP_ANIMATION_TIME`, `layout.js`).
   - `fade`: a crossfade, 250 ms ease-out.
 
-  Every motion draws over the plate. From the plate or the splash, and at shutdown, a switch
-  crossfades whatever the style. `SYNOIK_SYSTEM_TRANSITION_SLOW` multiplies every duration, to
+  Every motion draws over the plate. From the plate or the splash a switch crossfades whatever
+  the style; at shutdown the splash arrives as the greeter does (Shutdown, below). `SYNOIK_SYSTEM_TRANSITION_SLOW` multiplies every duration, to
   watch one closely. The target is the incoming session's held frame, else its next present,
   gated on its render fence polled readable (§5 step 6), and it is live: each frame the session
   presents during the transition replaces it, answered `Presented` by the flip that shows it, so
@@ -474,17 +474,18 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   window dragged by 120 moves at 16 ms flips 121 frames, cursor in step; a shape change (arrow to
   I-beam and back) lands image and position together.
 - **Shutdown**: on logind's `PrepareForShutdown(true)` the outer stops following the seat and
-  fades what is on screen to the shutdown splash, which turns until the power goes
-  (`boot-splash.md` §2.3); `false` brings back the session logind fronts. From that signal no
+  brings the shutdown splash in over what is on screen, the way the greeter arrives at a logout
+  (a curtain coming down, or in depth; a fade from the plate). The splash then turns until the
+  power goes (`boot-splash.md` §2.3). Every connected display shows it, as plymouth's would: one
+  the session had blanked comes on for it and fades in from black; `false` brings back the session logind fronts. From that signal no
   session is fronted: none of their frames — new, or held for a switch back — reaches the screen
   again, except through the fade itself, whose `from` stays live: each frame the outgoing session
   presents while it ends replaces it (answered by the first blend that shows it, as for `to`), so
   its end-session dialog finishes closing under the fade. A fade from or to the splash takes the
   splash live too, redrawn in place in one picture per display as its spinner turns, so the
   spinner never stands still on screen, at boot or at shutdown. Measured on the harness
-  (2026-10-15, the end-session dialog, `systemctl poweroff` and a reboot): one 250 ms ease-out,
-  then the splash alone until power-off; at boot the splash's spinner turning through the fade to
-  the session.
+  (2026-10-16, `reboot.sh`): the curtain arrives in 300 ms at 8 ms frames, spinner turning, then
+  the splash alone until the reboot; from a blanked display, it is lit and the splash fades in.
 - **Harness** (`scripts/harness/`): drivers that run a scenario on the Limina harness VM while
   Limina records every frame that reaches its screen (`shutdown.sh`, `reboot.sh`, `login.sh`
   through the greeter, `switch.sh` between two running sessions, `logout.sh` through the

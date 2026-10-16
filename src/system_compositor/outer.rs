@@ -907,13 +907,9 @@ impl Outer {
     /// session's `Configure` lands before its first frame, while the greeter is still held up.
     /// A connector nothing lit yet comes on at its preferred mode (§4.1).
     fn wanted_layout(&self) -> Vec<(String, DrmMode)> {
-        if self.shutting_down {
-            return self
-                .displays
-                .iter()
-                .map(|(name, d)| (name.clone(), d.mode))
-                .collect();
-        }
+        // Going down, every connected display shows the shutdown splash, as plymouth's would: one
+        // the session had blanked comes on for it, at the mode it had or its preferred.
+        // (`fronted` is none then.)
         let config = self
             .fronted()
             .and_then(|g| self.sessions.get(&g)?.config.as_ref());
@@ -1369,6 +1365,8 @@ impl Outer {
             self.begin_spinner();
         }
         self.outgoing_greeter = None;
+        // A display off for the session's blank lights showing the plate, to fade from.
+        self.relayout();
         let names: Vec<String> = self.displays.keys().cloned().collect();
         for d in names {
             self.switch_display(&d);
@@ -1516,14 +1514,17 @@ impl Outer {
             Some(Shown::Session { generation, .. }) => (false, Some(*generation)),
             _ => (false, None),
         };
-        // A switch moves between sessions; from the plate or the splash, or at shutdown, it fades.
+        // A switch moves between sessions, and the shutdown splash arrives over the session as the
+        // greeter does at a logout; from the plate or the boot splash it fades.
         let motion = match self.displays.get(d).map(|d| &d.on_screen) {
-            Some(Shown::Session { .. } | Shown::Composite { .. }) if !self.shutting_down => {
-                Motion {
-                    style: self.style,
-                    way: self.switch_way,
-                }
-            }
+            Some(Shown::Session { .. } | Shown::Composite { .. }) if self.shutting_down => Motion {
+                style: self.style,
+                way: Way::Arrives,
+            },
+            Some(Shown::Session { .. } | Shown::Composite { .. }) => Motion {
+                style: self.style,
+                way: self.switch_way,
+            },
             _ => Motion::FADE,
         };
         let from = self.snapshot_screen(d);
