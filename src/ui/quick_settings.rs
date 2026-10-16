@@ -557,6 +557,8 @@ pub struct PowerPolicy {
     /// `_updateSwitchUser`'s inputs but the mode (`systemActions.js:428-438`): switching is not
     /// locked down, there is a seat to switch on, and more than one user.
     pub switch_user: bool,
+    /// `org.gnome.desktop.screensaver user-switch-enabled`: whether a locked screen offers it.
+    pub user_switch_enabled: bool,
 }
 
 /// The power card's machine-power rows, top to bottom.
@@ -1292,7 +1294,8 @@ impl Layout {
     fn row_shape(self, owner: DetailOwner) -> Vec<RowSpec> {
         let mut shape = owner.row_shape(self.owner_device_count(owner), self.mode);
         if owner == DetailOwner::Power && self.power_switch_user {
-            shape.push(RowSpec::item(false));
+            // Past Log Out's separator when Log Out is not there to carry it.
+            shape.push(RowSpec::item(!owner.trailing_row_allowed(self.mode)));
         }
         shape
     }
@@ -2086,6 +2089,10 @@ impl QuickSettings {
     /// with `disable-restart-buttons`, and no Restart or Power Off on a locked screen without
     /// `restart-enabled`. Not ported: hiding one that logind says needs authentication while
     /// locked.
+    ///
+    /// **Divergence:** Switch User stays on a locked screen, where gnome-shell offers it only as
+    /// the unlock dialog's button (`systemActions.js:431`): the menu is where users look for it.
+    /// It follows that button's gate there (`_updateUserSwitchVisibility`, `unlockDialog.js`).
     pub(crate) fn power_actions(&self) -> PowerActions {
         let greeter_off = self.mode.is_greeter && self.power_policy.disable_restart_buttons;
         let locked_off = self.mode.is_locked && !self.power_policy.restart_enabled;
@@ -2094,7 +2101,8 @@ impl QuickSettings {
             restart: !greeter_off && !locked_off,
             power_off: !greeter_off && !locked_off,
             switch_user: self.power_policy.switch_user
-                && !(self.mode.is_locked || self.mode.is_greeter),
+                && !self.mode.is_greeter
+                && (!self.mode.is_locked || self.power_policy.user_switch_enabled),
         }
     }
 
@@ -2156,8 +2164,21 @@ impl QuickSettings {
     /// trailing row the session mode forbids ([`DetailOwner::trailing_row_allowed`]).
     fn detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
         let mut rows = self.unfiltered_detail_rows(owner);
-        if !owner.trailing_row_allowed(self.mode) {
+        if owner.trailing_row_allowed(self.mode) {
+            return rows;
+        }
+        if owner != DetailOwner::Power {
             rows.pop();
+            return rows;
+        }
+        // The power card's trailing row is Log Out, which a locked Switch User follows: that one
+        // then opens the session group, past the separator Log Out had.
+        let log_out = PopoverAction::SessionRequest(SessionRequest::Logout);
+        rows.retain(|r| !matches!(r, DetailRow::Item(row) if row.action == log_out));
+        if let Some(DetailRow::Item(row)) = rows.last_mut() {
+            if row.action == PopoverAction::SwitchUser {
+                row.separator_before = true;
+            }
         }
         rows
     }
@@ -7534,9 +7555,9 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
-    /// "Switch User…" follows Log Out in a user's session when switching is allowed
-    /// (`system.js:199-208`, `systemActions.js:428-438`), never on the lock screen or the greeter;
-    /// the card is sized for it.
+    /// "Switch User…" follows Log Out when switching is allowed (`system.js:199-208`,
+    /// `systemActions.js:428-438`), on a locked screen too when `user-switch-enabled` (our
+    /// divergence), never on the greeter; the card is sized for it.
     #[test]
     fn switch_user_ends_the_power_card() {
         use crate::session_mode::{GDM, UNLOCK_DIALOG, USER};
@@ -7545,18 +7566,31 @@ run it with --features reference-env, as the fedora CI job does"
         q.set_power_policy(PowerPolicy {
             restart_enabled: true,
             switch_user: true,
+            user_switch_enabled: true,
             ..Default::default()
         });
-        q.set_session_mode(&USER);
-        let rows = q.detail_rows(DetailOwner::Power);
-        assert!(matches!(
-            rows.last(),
-            Some(DetailRow::Item(row)) if row.action == PopoverAction::SwitchUser
-        ));
-        assert_eq!(
-            rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
-            q.layout().row_shape(DetailOwner::Power)
-        );
+        for mode in [&USER, &UNLOCK_DIALOG] {
+            q.set_session_mode(mode);
+            let rows = q.detail_rows(DetailOwner::Power);
+            assert!(
+                matches!(
+                    rows.last(),
+                    Some(DetailRow::Item(row)) if row.action == PopoverAction::SwitchUser
+                ),
+                "{}",
+                mode.name
+            );
+            assert_eq!(
+                rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
+                q.layout().row_shape(DetailOwner::Power)
+            );
+        }
+        // A locked screen follows the unlock dialog's button: not without `user-switch-enabled`.
+        q.set_power_policy(PowerPolicy {
+            restart_enabled: true,
+            switch_user: true,
+            ..Default::default()
+        });
         for mode in [&UNLOCK_DIALOG, &GDM] {
             q.set_session_mode(mode);
             let rows = q.detail_rows(DetailOwner::Power);
@@ -7608,6 +7642,7 @@ run it with --features reference-env, as the fedora CI job does"
             disable_restart_buttons: true,
             restart_enabled: false,
             switch_user: false,
+            user_switch_enabled: false,
         };
 
         let mut q = qs(None);

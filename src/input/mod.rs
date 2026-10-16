@@ -2644,6 +2644,8 @@ impl State {
             //
             // Only `Logout` hides the overview first (`activateLogout`, `:483-489`);
             // `activatePowerOff` and `activateRestart` deliberately do not, so neither do we.
+            // Locked, as the unlock dialog's own button: the lock screen is what is left behind.
+            PopoverAction::SwitchUser if self.synoik.is_locked() => self.switch_user(),
             PopoverAction::SwitchUser => self.activate_switch_user(),
             PopoverAction::SessionRequest(request) => {
                 if request == crate::end_session::SessionRequest::Logout {

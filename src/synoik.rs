@@ -10641,6 +10641,7 @@ impl Synoik {
             switch_user: self.can_switch_user
                 && self.multiple_users
                 && !self.screen_shield.settings().disable_user_switching,
+            user_switch_enabled: self.screen_shield.settings().user_switch_enabled,
         };
         if self.panel_popover.set_power_policy(policy) {
             self.queue_redraw_all();
