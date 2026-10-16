@@ -426,10 +426,10 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
     Between two users' sessions the plate is the curtain, down over the one and up off the other:
     two slides, each 300 ms eased on its own.
   - `depth`: the greeter flies past, growing to 12× as it fades out by the square of the
-    motion: a tenth of it is on screen as it goes out of sight, as the session lands from a distance (0.75× and
-    transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
-    same backwards for a logout or a switch user; between users the outgoing session leaves as the
-    greeter would. 500 ms ease-out-quad (`STARTUP_ANIMATION_TIME`, `layout.js`).
+    motion (a tenth of it is on screen as it goes out of sight), as the session lands from a
+    distance (0.75× and transparent, as gnome-shell's session start, `_startupAnimationSession`);
+    the same backwards for a logout or a switch user. Between users the outgoing session leaves
+    as the greeter would. 300 ms ease-out-quad, as one curtain slide.
   - `fade`: a crossfade, 250 ms ease-out.
 
   Every motion draws over the plate. The boot splash leaves as the greeter does at a login, and

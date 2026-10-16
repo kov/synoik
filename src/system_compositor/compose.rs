@@ -111,14 +111,14 @@ impl Motion {
     };
 
     /// How long it runs: the crossfade's 250 ms; the curtain's slide (`CURTAIN_SLIDE_TIME`,
-    /// `screenShield.js`), twice between two users; gnome-shell's session start
-    /// (`STARTUP_ANIMATION_TIME`, `layout.js`).
+    /// `screenShield.js`), twice between two users; the depth as long as one slide (ours: kov's
+    /// pick, where gnome-shell's session start takes 500 ms, `STARTUP_ANIMATION_TIME`).
     pub fn duration(self) -> Duration {
         Duration::from_millis(match (self.style, self.way) {
             (Style::Fade, _) => 250,
             (Style::Curtain, Way::Through) => 600,
             (Style::Curtain, _) => 300,
-            (Style::Depth, _) => 500,
+            (Style::Depth, _) => 300,
         })
     }
 
