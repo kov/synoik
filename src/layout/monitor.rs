@@ -2809,7 +2809,6 @@ impl<W: LayoutElement> Monitor<W> {
             overview_layout::Measured {
                 search_entry_height: overview_search::preferred_entry_height(ramp),
                 search_entry_width: overview_search::entry_width(ramp),
-                search_entry_mid_y: overview_search::entry_control_mid_y(ramp),
                 dash_preferred_height: crate::ui::dash::preferred_height(self.view_size),
             },
             state,

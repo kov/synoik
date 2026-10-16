@@ -10422,28 +10422,28 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     // The small workspace row is always reserved (divergence, see
     // `docs/fork/dynamic-workspaces-divergence.md`), and it is one app-grid workspace
     // tall. Work area 1048 tall ⇒ spacing round(20.96) = 21, row height
-    // round(1048·0.15) = 157 at y = 32 + 40 (the search puck's midline), round(21·1.2) =
+    // round(1048·0.15) = 157 at y = 32 + 21 (one spacing under the panel), round(21·1.2) =
     // 25 below it. The search entry floats (approved divergence), so it costs the picker
     // nothing:
-    //   y = 32 + 40 + 157 + 25               = 254
-    //   h = 1048 − 112(dash) − 21 − 40 − 157 − 25 = 693
+    //   y = 32 + 21 + 157 + 25               = 235
+    //   h = 1048 − 112(dash) − 21 − 21 − 157 − 25 = 712
     let controls = overview_controls(&mut f);
-    assert_eq!(controls.workspaces.loc.y, 254.);
-    assert_eq!(controls.workspaces.size.h, 693.);
+    assert_eq!(controls.workspaces.loc.y, 235.);
+    assert_eq!(controls.workspaces.size.h, 712.);
 
     // The row is fit by height into that box, and centered on what width is left.
-    let zoom: f64 = 693. / 1080.;
+    let zoom: f64 = 712. / 1080.;
     let ws_w = (1920. * zoom).ceil();
     let offset_x = ((1920. - ws_w) / 2.).round();
 
     // Workspace-local slot (see expose::tests): 760 × 570 centered in the picker's area,
     // which is the work area symmetrized about the view — the 32px panel strut is applied
     // at both edges, giving 1920×1016 at y = 32, so the slot sits at
-    // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 227.
+    // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 235.
     let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 254. + 255. * zoom),
+        (offset_x + 580. * zoom, 235. + 255. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(
@@ -10605,8 +10605,8 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
 
 /// **Divergence (approved 2026-07-28/29, revised 2026-08-03).** The search entry floats at
 /// the top right instead of taking a full-width row, and the workspace row is one of
-/// app-grid workspaces rather than gnome-shell's 5% specks — full width, with its top on
-/// the entry puck's midline, so the pill *overlaps* its top-right corner instead of the row
+/// app-grid workspaces rather than gnome-shell's 5% specks — full width, with its top one
+/// spacing under the panel, so the pill *overlaps* its top-right corner instead of the row
 /// dodging the pill's column. Judged on both the reference canvas and the 1024×665 one the
 /// adaptive chrome ramp was written for (`docs/fork/adaptive-overview-chrome.md`), because
 /// that is the canvas the sizes actually have to work on.
@@ -10661,8 +10661,8 @@ fn overview_entry_floats_over_an_app_grid_sized_workspace_row() {
             "{size:?}: a thumbnail must be the app-grid row's workspace height"
         );
 
-        // And the two deliberately *do* overlap: the row is full width and starts at the
-        // puck's midline, so the pill floats over its top-right corner. This is the
+        // And the two deliberately *do* overlap: the row is full width and starts one
+        // spacing under the panel, so the pill floats over its top-right corner. This is the
         // divergence, pinned so it cannot be undone by accident.
         assert_eq!(
             (band.loc.x, band.size.w),
@@ -10914,9 +10914,9 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     f.settle();
 
     let band = overview_controls(&mut f).workspace_row;
-    // 32 + 40, the search puck's midline (the entry floats and takes no row), and one
+    // 32 + 21, one spacing under the panel (the entry floats and takes no row), and one
     // small workspace tall, round((1080 - 32) × SMALL_WORKSPACE_RATIO) = 157.
-    assert_eq!((band.loc.y, band.size.h), (72., 157.));
+    assert_eq!((band.loc.y, band.size.h), (53., 157.));
     // Full width, in both overview states.
     assert_eq!((band.loc.x, band.size.w), (0., 1920.));
 
@@ -10954,7 +10954,7 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
 
     // One populated desktop plus the trailing empty: the band is already there.
     let one = overview_controls(&mut f).workspaces;
-    assert_eq!((one.loc.y, one.size.h), (254., 693.));
+    assert_eq!((one.loc.y, one.size.h), (235., 712.));
 
     // Populate a second desktop. Sample mid-transition too: an eased band would be
     // caught here, and a popped one would show a different box on the next frame.
@@ -10967,17 +10967,17 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
         synoik.advance_animations();
     }
     let mid = overview_controls(&mut f).workspaces;
-    assert_eq!((mid.loc.y, mid.size.h), (254., 693.));
+    assert_eq!((mid.loc.y, mid.size.h), (235., 712.));
 
     f.settle();
     let two = overview_controls(&mut f).workspaces;
-    assert_eq!((two.loc.y, two.size.h), (254., 693.));
+    assert_eq!((two.loc.y, two.size.h), (235., 712.));
 
     // …and back. The emptied desktop is not reaped, so this is now three workspaces.
     f.synoik().layout.move_to_workspace_up(true);
     f.settle();
     let back = overview_controls(&mut f).workspaces;
-    assert_eq!((back.loc.y, back.size.h), (254., 693.));
+    assert_eq!((back.loc.y, back.size.h), (235., 712.));
 
     let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.expect("workspaces must be on a monitor");
@@ -20194,12 +20194,12 @@ fn overview_dropping_a_grid_icon_on_a_folder_joins_it() {
 /// page is allowed — that is how a new page gets made.
 #[test]
 fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
-    let apps: Vec<String> = (0..30).map(|i| format!("app{i:02}.desktop")).collect();
+    let apps: Vec<String> = (0..40).map(|i| format!("app{i:02}.desktop")).collect();
     let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &refs);
 
     let area = overview_controls(&mut f).app_display;
-    assert_eq!(f.synoik().app_grid.page_count(area), 2, "30 apps paginate");
+    assert_eq!(f.synoik().app_grid.page_count(area), 2, "40 apps paginate");
     assert_eq!(f.synoik().app_grid.entry_id(0), Some("app00.desktop"));
 
     let start = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
@@ -20218,7 +20218,7 @@ fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
         "the view must follow the app to its new page"
     );
     assert_eq!(
-        f.synoik().app_grid.entry_id(29),
+        f.synoik().app_grid.entry_id(39),
         Some("app00.desktop"),
         "the app appends to the page it was dropped onto"
     );
@@ -20707,7 +20707,10 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
     let (icon, entry, radius, gap) = measure((1920, 1080));
     assert_eq!(icon, 64., "the dash keeps GNOME's icon on a normal canvas");
     assert_eq!(entry, 352., "…and the entry its 24em");
-    assert_eq!(radius, 30., "…and the preview its 30px corner");
+    assert!(
+        (radius - 30.).abs() < 1e-9,
+        "…and the preview its 30px corner: {radius}"
+    );
     assert!(gap <= 80., "…and the gap stays inside GNOME's clamps");
 
     // 1024x665 (2048x1330 @ 2) — the canvas this divergence was written for. Ramp 0.53.
@@ -21532,7 +21535,7 @@ fn overview_folder_dialog_navigates_with_the_keyboard() {
 /// `Home`/`End` are `AppDisplay._onKeyPressEvent` (`appDisplay.js:1599-1618`).
 #[test]
 fn overview_app_grid_navigates_with_the_keyboard() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, recorder) = app_grid_fixture(&[], &others);
     // The overview must actually hold keyboard focus or none of its key tiers run.
@@ -21542,7 +21545,7 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     assert_eq!(
         f.synoik().app_grid.page_count(area),
         2,
-        "30 apps span two pages"
+        "40 apps span two pages"
     );
     let center = |f: &mut Fixture, i: usize| {
         f.synoik()
@@ -21641,14 +21644,14 @@ fn overview_app_grid_navigates_with_the_keyboard() {
 /// to the first page (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
 #[test]
 fn overview_app_grid_paginates_and_navigates() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&["a.desktop"], &others);
     let area = overview_controls(&mut f).app_display;
     assert_eq!(
         f.synoik().app_grid.page_count(area),
         2,
-        "30 apps span two pages"
+        "40 apps span two pages"
     );
     assert_eq!(f.synoik().app_grid.current_page(), 0);
 
@@ -24072,7 +24075,7 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
 /// the release threshold is 0.6 **pixels** per ms, not pages.
 #[test]
 fn overview_app_grid_swipes_between_pages() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &others);
     let area = overview_controls(&mut f).app_display;
@@ -24509,7 +24512,7 @@ fn a_flick_of_one_update_is_timed_from_the_begin() {
 /// runs its own horizontal `SwipeTracker` (`appDisplay.js:603-614`) at 400 px a page.
 #[test]
 fn touchpad_swipe_sideways_pages_the_app_grid() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &others);
     let area = overview_controls(&mut f).app_display;
@@ -24539,7 +24542,7 @@ fn touchpad_swipe_sideways_pages_the_app_grid() {
 /// (`_getGestureDirFactor` is -1 for LTR, `swipeTracker.js:689-695`).
 #[test]
 fn overview_app_grid_pages_by_dragging_its_background() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, recorder) = app_grid_fixture(&[], &others);
     let area = overview_controls(&mut f).app_display;
@@ -24617,7 +24620,7 @@ fn overview_app_grid_pages_by_dragging_its_background() {
 /// grid at the first icon and Shift+Tab at the last (`overviewControls.js:464-470`).
 #[test]
 fn overview_app_grid_tab_walks_the_icons_in_order() {
-    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let ids: Vec<String> = (0..40).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &others);
     f.synoik_state().update_keyboard_focus();
@@ -24660,7 +24663,7 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
     f.key_release(KEY_LEFTSHIFT);
     assert_eq!(
         f.synoik().app_grid.focused(),
-        Some(29),
+        Some(39),
         "Shift+Tab enters at the grid's last icon"
     );
 
@@ -24675,12 +24678,12 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
     f.key_release(KEY_LEFTSHIFT);
     assert_eq!(
         f.synoik().app_grid.focused(),
-        Some(29),
+        Some(39),
         "Shift+Tab off the front wraps to the last icon"
     );
     assert_eq!(
         f.synoik().app_grid.current_page(),
-        29 / per_page,
+        39 / per_page,
         "…and the page follows the focus there"
     );
 

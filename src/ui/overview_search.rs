@@ -142,11 +142,7 @@ pub fn preferred_entry_height(ramp: f64) -> f64 {
 /// How far the *control's* vertical middle sits below the top of the bin
 /// [`preferred_entry_height`] reserves — the puck's centre, which is also the expanded
 /// pill's (the pill centres inside the puck's footprint, see [`PUCK_D`]).
-///
-/// Published because the overview's workspace row is anchored to it: the row's top sits on
-/// the entry control's midline (`crate::ui::overview_layout::ControlsLayout::workspace_row`),
-/// so the gap above the row shrinks with the chrome on a small canvas.
-pub fn entry_control_mid_y(ramp: f64) -> f64 {
+fn entry_control_mid_y(ramp: f64) -> f64 {
     entry_margins(ramp).0 + puck_diameter(ramp) / 2.
 }
 
@@ -1480,7 +1476,6 @@ mod tests {
             crate::ui::overview_layout::Measured {
                 search_entry_height: preferred_entry_height(1.),
                 search_entry_width: entry_width(1.),
-                search_entry_mid_y: entry_control_mid_y(1.),
                 dash_preferred_height: crate::ui::dash::preferred_height(Size::from((
                     1920., 1080.,
                 ))),

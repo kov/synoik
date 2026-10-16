@@ -52,8 +52,8 @@ picker down into the row's place.
 
 Ours is one row, `ControlsLayout::workspace_row`, drawn identically in both states:
 
-- **One box.** Full width, top on the search puck's midline
-  (`overview_search::ENTRY_CONTROL_MID_Y`), one `small_workspace_height` tall. It does not depend
+- **One box.** Full width, top one vertical spacing under the panel (the gap between the picker
+  and the dash), one `small_workspace_height` tall. It does not depend
   on the overview state, so the show-apps transition never moves it.
 - **One layout.** `thumbnails::strip_geometry` is gnome-shell's fit-all row
   (`_getFirstFitAllWorkspaceBox`) — run centered, `WORKSPACE_MIN_SPACING` between, scrolling to

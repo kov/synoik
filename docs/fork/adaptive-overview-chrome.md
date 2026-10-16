@@ -127,8 +127,7 @@ shrink.
 its text plus padding at the floor. `STATUS_CARD_W = ENTRY_WIDTH` (`overview_search.rs:103`)
 follows automatically; verify the results-strip layout at the floor. The resting search button
 (the puck, a divergence of ours) ramps too, floored at the pill's 40px, and so do the entry's
-margins: the workspace row hangs from the button's midline, so the gap above the row shrinks with
-them.
+margins.
 
 ### Piece 6 — app-grid label ellipsize (small, do regardless)
 

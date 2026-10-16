@@ -30,11 +30,11 @@
 //!   (`workspaceThumbnail.js:1204-1219,1248-1255`, clamped again at `overviewControls.js:190-192`),
 //!   shrinking them further until the row fits. Ours are [`small_workspace_height`] — the app-grid
 //!   row's workspace, whatever the count — and the row scrolls instead.
-//! - the row's top sits at the search puck's vertical midline rather than below the entry's row, so
-//!   it *overlaps* the floating entry (which is itself a divergence — see
-//!   [`ControlsLayout::search_entry`]). GNOME's app-grid row clears the entry because the entry
-//!   takes a full-width row there; ours does not, and tucking the row under the reserved height
-//!   instead left it sitting oddly low on the canvas.
+//! - the row's top sits one vertical spacing below the panel — the gap between the picker and the
+//!   dash — rather than below the entry's row, so it *overlaps* the floating entry (which is itself
+//!   a divergence — see [`ControlsLayout::search_entry`]). GNOME's app-grid row clears the entry
+//!   because the entry takes a full-width row there; ours does not, and tucking the row under the
+//!   reserved height instead left it sitting oddly low on the canvas.
 //! - gnome-shell lays out *secondary* monitors with `SecondaryMonitorDisplay`
 //!   (`workspacesView.js:589-720`) — thumbnails and padding only, no dash or search — so their
 //!   picker box, and now their zoom, differ from the primary's. We draw the full chrome on every
@@ -178,10 +178,6 @@ pub struct Measured {
     /// The pill's own width. Needed because the entry floats right rather than
     /// centering in a full-width bin (see [`ControlsLayout::search_entry`]).
     pub search_entry_width: f64,
-    /// How far the entry *control's* vertical middle sits below the top of its bin — the
-    /// bin is taller than the control by the theme's margins, and the row is anchored to
-    /// the control, not to the bin.
-    pub search_entry_mid_y: f64,
     /// The dash's preferred height, before the work-area cap.
     pub dash_preferred_height: f64,
 }
@@ -200,7 +196,6 @@ pub fn layout(
     let Measured {
         search_entry_height,
         search_entry_width,
-        search_entry_mid_y,
         dash_preferred_height,
     } = measured;
     let width = view_size.w;
@@ -225,11 +220,11 @@ pub fn layout(
     let dash_h = dash_preferred_height.min(max_dash_h);
     let dash = rect(0., start_y + height - dash_h, width, dash_h);
 
-    // The one workspace row, in both states: full width, its top on the entry control's
-    // midline. It deliberately overlaps the floating entry rather than clearing it — see
-    // the module divergence list.
+    // The one workspace row, in both states: full width, one spacing under the panel, as the
+    // picker sits one spacing above the dash. It deliberately overlaps the floating entry
+    // rather than clearing it — see the module divergence list.
     let row_h = small_workspace_height(view_size, start_y);
-    let workspace_row = rect(0., start_y + search_entry_mid_y, width, row_h);
+    let workspace_row = rect(0., start_y + spacing, width, row_h);
     let row_bottom = workspace_row.loc.y + row_h;
     let spacing_bottom = (spacing * ROW_SPACING_ADJUSTMENT_BOTTOM).round();
 
@@ -355,7 +350,6 @@ mod tests {
     /// The heights the fork's own widgets publish, so the expectations below
     /// are hand-derived rather than observed.
     const SEARCH_H: f64 = 74.; // margin-top 12 + puck 56 + margin-bottom 6
-    const SEARCH_MID: f64 = 40.; // margin-top 12 + puck 56 / 2
     const SEARCH_W: f64 = 352.; // `.search-entry` 24em, unramped at the reference and above
     const DASH_H: f64 = 112.; // pill 100 + edge offset 12
 
@@ -363,7 +357,6 @@ mod tests {
         Measured {
             search_entry_height: SEARCH_H,
             search_entry_width: SEARCH_W,
-            search_entry_mid_y: SEARCH_MID,
             dash_preferred_height: DASH_H,
         }
     }
@@ -377,7 +370,7 @@ mod tests {
     }
 
     /// The entry floats at the top right instead of taking a row, and the workspace row
-    /// runs the full width *under* it, its top on the puck's midline.
+    /// runs the full width *under* it, one spacing below the panel.
     #[test]
     fn the_search_entry_floats_right_and_takes_no_row() {
         let l = layout_1080();
@@ -388,9 +381,9 @@ mod tests {
             rect(1920. - 12. - 352., 35., 352., SEARCH_H)
         );
 
-        // Nothing below it is displaced by its height: the row starts at the control's
-        // midline, where GNOME would have put it below a full 74px row.
-        assert_eq!(l.workspace_row.loc.y, 35. + SEARCH_MID);
+        // Nothing below it is displaced by its height: the row starts one spacing (2% of the
+        // 1045px work area) under the panel, where GNOME would have put it below a full 74px row.
+        assert_eq!(l.workspace_row.loc.y, 35. + 21.);
         assert!(l.workspace_row.loc.y < 35. + SEARCH_H);
 
         // Full width, both edges.
@@ -420,13 +413,13 @@ mod tests {
         let l = layout_1080();
 
         assert_eq!(l.search_entry, rect(1556., 35., 352., SEARCH_H));
-        // 35 + 40, full width, round(1045 × 0.15) tall.
-        assert_eq!(l.workspace_row, rect(0., 75., 1920., 157.));
+        // 35 + 21, full width, round(1045 × 0.15) tall.
+        assert_eq!(l.workspace_row, rect(0., 56., 1920., 157.));
         // Bottom-anchored: 35 + 1045 − 112. Unchanged from the pre-allocator
         // hardcoded anchor (1080 − 12 − 100), which is the point.
         assert_eq!(l.dash, rect(0., 968., 1920., 112.));
-        // 75 + 157 + 25, and 968 − 21 − 257.
-        assert_eq!(l.workspaces, rect(0., 257., 1920., 690.));
+        // 56 + 157 + 25, and 968 − 21 − 238.
+        assert_eq!(l.workspaces, rect(0., 238., 1920., 709.));
         // 35 + 74 + 21, and 1045 − 74 − 21 − 112 − 21. Spans the row and the picker
         // both — gnome-shell cross-fades, it does not carve.
         assert_eq!(l.search_results, rect(0., 130., 1920., 817.));
@@ -473,11 +466,11 @@ mod tests {
 
         // work area 1405 ⇒ spacing = round(28.1) = 28, below the row round(33.6) = 34.
         assert_eq!(l.search_entry, rect(2560. - 364., 35., 352., SEARCH_H));
-        // round(1405 × 0.15) = 211 tall, at 35 + 40.
-        assert_eq!(l.workspace_row, rect(0., 75., 2560., 211.));
+        // round(1405 × 0.15) = 211 tall, at 35 + 28.
+        assert_eq!(l.workspace_row, rect(0., 63., 2560., 211.));
         assert_eq!(l.dash, rect(0., 1440. - 112., 2560., 112.));
-        // 75 + 211 + 34, and 1440 − 112 − 28 − 320.
-        assert_eq!(l.workspaces, rect(0., 320., 2560., 980.));
+        // 63 + 211 + 34, and 1440 − 112 − 28 − 308.
+        assert_eq!(l.workspaces, rect(0., 308., 2560., 992.));
         assert_eq!(l.search_results, rect(0., 137., 2560., 1163.));
     }
 
@@ -494,8 +487,8 @@ mod tests {
         assert_eq!(l.search_entry.loc.y, 0.);
         assert_eq!(l.dash.loc.y, 1080. - 112.);
         // spacing = round(1080 × 0.02) = 22, below the row round(26.4) = 26.
-        assert_eq!(l.workspace_row, rect(0., 40., 1920., 162.));
-        assert_eq!(l.workspaces, rect(0., 228., 1920., 718.));
+        assert_eq!(l.workspace_row, rect(0., 22., 1920., 162.));
+        assert_eq!(l.workspaces, rect(0., 210., 1920., 736.));
     }
 
     /// In the app-grid state the app grid fills from under the workspace row down to the
@@ -509,10 +502,10 @@ mod tests {
         assert_eq!(grid.workspace_row, picker.workspace_row);
         assert_eq!(grid.workspaces, picker.workspaces);
 
-        // 232 + 21, and 968 − 21 − 253.
-        assert_eq!(grid.app_display, rect(0., 253., 1920., 694.));
+        // 213 + 21, and 968 − 21 − 234.
+        assert_eq!(grid.app_display, rect(0., 234., 1920., 713.));
         // Parked at box.y2 = start_y + work-area height = 35 + 1045, same height.
-        assert_eq!(picker.app_display, rect(0., 1080., 1920., 694.));
+        assert_eq!(picker.app_display, rect(0., 1080., 1920., 713.));
     }
 
     /// A fractional state slides the app grid up, and moves nothing else: the row and the

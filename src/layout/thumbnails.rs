@@ -398,9 +398,9 @@ mod tests {
     }
 
     /// The band [`crate::ui::overview_layout`] allocates the row at the 1920x1080 /
-    /// 35px-strut reference: full width, top on the search puck's midline (35 + 40), one
+    /// 35px-strut reference: full width, top one spacing under the panel (35 + 21), one
     /// small workspace tall (`round(1045 * SMALL_WORKSPACE_RATIO)`).
-    const BAND_Y: f64 = 75.;
+    const BAND_Y: f64 = 56.;
     const THUMB_H: f64 = 157.;
     /// The output's aspect at that height.
     const THUMB_W: f64 = 279.;
