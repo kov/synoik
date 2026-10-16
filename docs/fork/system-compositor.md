@@ -425,14 +425,16 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
     user slides it down over it; 300 ms ease-out-quad (`CURTAIN_SLIDE_TIME`, `screenShield.js`).
     Between two users' sessions the plate is the curtain, down over the one and up off the other:
     two slides, each 300 ms eased on its own.
-  - `depth`: the greeter comes nearer (to 1.2×) and fades as the session lands from a distance
-    (0.75× and transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
+  - `depth`: the greeter flies past, growing to 3× as it fades out (by the square of the
+    motion, so it is mostly gone early), as the session lands from a distance (0.75× and
+    transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
     same backwards for a logout or a switch user; between users the outgoing session leaves as the
     greeter would. 500 ms ease-out-quad (`STARTUP_ANIMATION_TIME`, `layout.js`).
   - `fade`: a crossfade, 250 ms ease-out.
 
-  Every motion draws over the plate. From the plate or the splash a switch crossfades whatever
-  the style; at shutdown the splash arrives as the greeter does (Shutdown, below). `SYNOIK_SYSTEM_TRANSITION_SLOW` multiplies every duration, to
+  Every motion draws over the plate. The boot splash leaves as the greeter does at a login, and
+  the shutdown splash arrives as it does at a logout (Shutdown, below); from the plate a switch
+  crossfades whatever the style. `SYNOIK_SYSTEM_TRANSITION_SLOW` multiplies every duration, to
   watch one closely. The target is the incoming session's held frame, else its next present,
   gated on its render fence polled readable (§5 step 6), and it is live: each frame the session
   presents during the transition replaces it, answered `Presented` by the flip that shows it, so

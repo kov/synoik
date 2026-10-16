@@ -99,8 +99,9 @@ pub(super) struct Motion {
 /// The depth a session lands from and recedes to: gnome-shell's session start begins at this
 /// scale (`_prepareStartupAnimation`, `layout.js`).
 const DEPTH_FAR: f64 = 0.75;
-/// How much nearer the greeter comes as it fades. Ours: gnome-shell has no greeter moving out.
-const DEPTH_NEAR: f64 = 1.2;
+/// How near the front picture comes as it leaves: it flies past, three times its size, as if
+/// gone through and left behind. Ours: gnome-shell has no greeter moving out.
+const DEPTH_NEAR: f64 = 3.;
 
 impl Motion {
     pub const FADE: Self = Self {
@@ -705,7 +706,8 @@ fn layers(
             let back_scale = DEPTH_FAR + (1. - DEPTH_FAR) * (1. - cover);
             let front_scale = 1. + (DEPTH_NEAR - 1.) * (1. - cover);
             layers.push((back, scaled(size, back_scale), (1. - cover) as f32));
-            layers.push((front, scaled(size, front_scale), cover as f32));
+            // Faster out than it grows, so it is mostly gone before it is much past the screen.
+            layers.push((front, scaled(size, front_scale), (cover * cover) as f32));
         }
     }
     layers
@@ -922,7 +924,8 @@ mod tests {
     }
 
     /// Halfway through a login in depth, the session landing from the distance covers the middle
-    /// but not yet the corners, where only the greeter coming nearer shows, over the plate.
+    /// but not yet the corners, where only the greeter flying past shows, over the plate: at a
+    /// quarter, as it fades out faster than the session fades in.
     #[test]
     fn a_depth_lands_the_session_from_a_distance() {
         let Some(mut c) = compositor() else { return };
@@ -932,18 +935,22 @@ mod tests {
         };
         let at = transition(&mut c, motion, 0.5);
         let [p, ..] = PLATE;
-        let half = |over: u8, c: u8| ((f32::from(c) + f32::from(over)) / 2.).round() as u8;
-        // Corner: the plate, then red at half.
+        let over = |under: u8, c: u8, a: f32| f32::from(under) * (1. - a) + f32::from(c) * a;
+        let blend = |under: u8, c: u8, a: f32| over(under, c, a).round() as u8;
+        // Corner: the plate, then red at a quarter.
         assert!(
-            near(at(0, 0), [half(p, 255), half(p, 0), half(p, 0)]),
+            near(
+                at(0, 0),
+                [blend(p, 255, 0.25), blend(p, 0, 0.25), blend(p, 0, 0.25)]
+            ),
             "{:?}",
             at(0, 0)
         );
-        // Middle: the plate, blue at half, then red at half.
+        // Middle: the plate, blue at half, then red at a quarter.
         let mid = [
-            half(half(p, 0), 255),
-            half(half(p, 0), 0),
-            half(half(p, 255), 0),
+            over(over(p, 0, 0.5).round() as u8, 255, 0.25).round() as u8,
+            over(over(p, 0, 0.5).round() as u8, 0, 0.25).round() as u8,
+            over(over(p, 255, 0.5).round() as u8, 0, 0.25).round() as u8,
         ];
         assert!(near(at(32, 20), mid), "{:?} for {mid:?}", at(32, 20));
     }

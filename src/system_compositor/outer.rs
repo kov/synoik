@@ -1514,9 +1514,14 @@ impl Outer {
             Some(Shown::Session { generation, .. }) => (false, Some(*generation)),
             _ => (false, None),
         };
-        // A switch moves between sessions, and the shutdown splash arrives over the session as the
-        // greeter does at a logout; from the plate or the boot splash it fades.
+        // A switch moves between sessions; the shutdown splash arrives over the session as the
+        // greeter does at a logout, and the boot splash leaves as it does at a login. From the
+        // plate it fades.
         let motion = match self.displays.get(d).map(|d| &d.on_screen) {
+            Some(Shown::Splash { .. }) if self.boot.is_some() && !self.shutting_down => Motion {
+                style: self.style,
+                way: Way::Leaves,
+            },
             Some(Shown::Session { .. } | Shown::Composite { .. }) if self.shutting_down => Motion {
                 style: self.style,
                 way: Way::Arrives,
@@ -2101,7 +2106,7 @@ impl Outer {
     }
 
     /// A frame of the fronted session for `d`, outside a switch. It replaces the plate with a
-    /// fade, and anything else as it is.
+    /// fade, the boot splash with the switches' motion, and anything else as it is.
     fn fronted_frame(
         &mut self,
         d: &str,
@@ -2114,12 +2119,21 @@ impl Outer {
             debug!(target: FLIGHT, "fade on {d} from the plate to session {generation}");
             let from = self.base_picture(d);
             let from_splash = self.boot.is_some();
+            // The boot splash leaves as the greeter does at a login; the plate fades.
+            let motion = if from_splash {
+                Motion {
+                    style: self.style,
+                    way: Way::Leaves,
+                }
+            } else {
+                Motion::FADE
+            };
             let Some(display) = self.displays.get_mut(d) else {
                 return;
             };
             display.transition = Some(Transition {
                 from,
-                motion: Motion::FADE,
+                motion,
                 to: None,
                 pending: None,
                 pending_watch: None,
