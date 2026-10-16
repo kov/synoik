@@ -57,10 +57,21 @@ itools_script=/etc/initramfs-tools/scripts/init-premount/plymouth
 itools_dropin=/etc/systemd/system/synoik-system.service.d/initramfs-tools.conf
 # Debian's kernel command line: a grub.d snippet, which update-grub reads after /etc/default/grub.
 grub_snippet=/etc/default/grub.d/90-synoik.cfg
+# Debian's choice of display manager. Every display manager's postinst points
+# display-manager.service at /lib/systemd/system/<its basename>.service from it on each upgrade,
+# so an alias made only with `systemctl enable` goes back to GDM at gdm3's next upgrade.
+default_dm=/etc/X11/default-display-manager
 
 if [ "${1:-}" = "--use-gdm" ]; then
     systemctl disable synoik-login.service synoik-system.service synoik-splash-handover.service ||
         true
+    if [ "$distro" = debian ]; then
+        if [ -e "$default_dm.pre-synoik" ]; then
+            mv "$default_dm.pre-synoik" "$default_dm"
+        else
+            rm -f "$default_dm"
+        fi
+    fi
     # plymouth back in the initramfs.
     if [ "$distro" = debian ]; then
         if [ -e "$itools_hook" ] || [ -e "$itools_script" ]; then
@@ -144,8 +155,14 @@ systemd-sysusers synoik-system.conf synoik-login.conf
 systemd-tmpfiles --create synoik-login.conf synoik-system.conf
 
 # System units. After switch_root the system compositor is plymouth (docs/fork/boot-splash.md §2.2).
-install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-login.service \
-    $r/synoik-splash-handover.service
+install -Dm644 -t /etc/systemd/system $r/synoik-system.service $r/synoik-splash-handover.service
+# On Debian the login daemon's unit is where the display-manager postinsts look for it ($default_dm).
+if [ "$distro" = debian ]; then
+    rm -f /etc/systemd/system/synoik-login.service
+    install -Dm644 -t /usr/lib/systemd/system $r/synoik-login.service
+else
+    install -Dm644 -t /etc/systemd/system $r/synoik-login.service
+fi
 for unit in plymouth-start plymouth-quit-wait; do
     install -Dm644 $r/plymouth-real-root.conf "/etc/systemd/system/$unit.service.d/synoik.conf"
 done
@@ -264,8 +281,16 @@ fi
 systemctl daemon-reload
 systemctl disable gdm.service || true
 systemctl enable synoik-system.service synoik-splash-handover.service
-# The display-manager.service alias is GDM's until now.
-systemctl enable --force synoik-login.service
+# The display-manager.service alias is GDM's until now, or an earlier install's: `reenable`, as a
+# plain enable keeps an alias that names this unit at the path it moved from.
+systemctl reenable --force synoik-login.service
+if [ "$distro" = debian ]; then
+    if [ -e "$default_dm" ] && [ ! -e "$default_dm.pre-synoik" ] &&
+        [ "$(cat "$default_dm")" != /usr/local/bin/synoik-login ]; then
+        cp -a "$default_dm" "$default_dm.pre-synoik"
+    fi
+    echo /usr/local/bin/synoik-login >"$default_dm"
+fi
 
 cat <<EOF
 synoik is the display manager from the next boot. Reboot to switch.
