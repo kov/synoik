@@ -3,7 +3,7 @@
 #
 # Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-"""Read a harness run (`shutdown.sh`, `reboot.sh`, `login.sh`, `switch.sh`, `logout.sh`) back: what reached the screen, when, and what the outer meant.
+"""Read a harness run (`shutdown.sh`, `reboot.sh`, `login.sh`, `switch.sh`, `logout.sh`, `switch-user.sh`) back: what reached the screen, when, and what the outer meant.
 
     scripts/harness/report.py RUN [--strip N] [--all]
 

@@ -42105,6 +42105,47 @@ fn switch_user_locks_the_session_first() {
     assert!(!f.synoik().switch_user_on_shield_frame);
 }
 
+/// gsd-power blanks the screens as soon as the shield is up (`handle_screensaver_active`,
+/// `gsd-power-manager.c`), which Switch User raises just before asking for the login screen. The
+/// session holds that blank until it has left: dropped when it is paused, as the screen is the
+/// greeter's by then, and applied if the switch never happens. Under the system compositor a blank
+/// that won the race took the display off, and the greeter came in as a fade from black.
+#[test]
+fn switching_users_holds_the_blank_until_the_session_has_left() {
+    use crate::dbus::mutter_display_config::power_save;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().activate_switch_user();
+    f.synoik_state().set_power_save_mode(power_save::OFF);
+    assert!(
+        f.synoik().monitors_active,
+        "held while the switch is on its way"
+    );
+    f.synoik().session_paused();
+    assert!(
+        !f.synoik().blank_parked,
+        "the greeter has the screen; dropped"
+    );
+    f.synoik_state().set_power_save_mode(power_save::OFF);
+    assert!(
+        !f.synoik().monitors_active,
+        "a blank after the switch goes through"
+    );
+
+    // A switch that never happens leaves the blank to go through when the bound passes.
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().activate_switch_user();
+    f.synoik_state().set_power_save_mode(power_save::OFF);
+    assert!(f.synoik().monitors_active);
+    f.run_frames_for(Duration::from_secs(3));
+    assert!(
+        !f.synoik().monitors_active,
+        "blanked once the switch did not happen"
+    );
+}
+
 /// The greeter's Power Off asks its gnome-session, as gnome-shell's does
 /// (`systemActions.js:491-496`): no confirmation comes up until gnome-session's `Open` does.
 #[test]

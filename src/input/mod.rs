@@ -3965,6 +3965,7 @@ impl State {
             Action::Logout => {
                 self.request_session_action(crate::end_session::SessionRequest::Logout)
             }
+            Action::SwitchUser => self.activate_switch_user(),
             Action::PowerOff => {
                 self.request_session_action(crate::end_session::SessionRequest::PowerOff)
             }

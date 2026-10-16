@@ -438,6 +438,11 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   presents during the transition replaces it, answered `Presented` by the flip that shows it, so
   whatever the session animates meanwhile (an unlock, its startup) plays through. A fronted frame
   that replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+  A session leaving for the login screen holds gsd-power's blank until it has been paused, or
+  for 2 s if the switch fails (`Synoik::leaving_for_login`). gsd-power blanks the moment the
+  shield is up, and Switch User raises the shield just before the switch. A blank that won that
+  race would take the display off, and the switch would start from the plate as a crossfade.
+  GNOME has the same race, hidden there by the VT switch.
   Measured on the harness (2026-10-16, `login.sh`, `switch.sh` both ways and `logout.sh` per
   style): each motion runs its full length at the display's 8 ms with no frame back; a login holds
   the greeter's verified prompt about 0.45 s until the session's first frame, then moves it away,
@@ -477,7 +482,8 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
 - **Harness** (`scripts/harness/`): drivers that run a scenario on the Limina harness VM while
   Limina records every frame that reaches its screen (`shutdown.sh`, `reboot.sh`, `login.sh`
   through the greeter, `switch.sh` between two running sessions, `logout.sh` through the
-  end-session dialog; `deploy.sh` installs a build), and `report.py`, which reads a run back against the outer's flight recorder
+  end-session dialog, `switch-user.sh` through the power menu's Switch User; `deploy.sh` installs
+  a build), and `report.py`, which reads a run back against the outer's flight recorder
   (the `synoik::system_compositor::flight` debug target: every flip that is not a session's steady
   frame, every step of a fade, and which virtio-gpu resource backs each framebuffer). Frames are
   named by that resource, not by time; each boot's journal is put on the capture's clock through

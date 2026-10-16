@@ -845,6 +845,16 @@ pub struct Synoik {
     /// login screen (`activateSwitchUser`'s `POST_PAINT`, `systemActions.js:476-479`), so the
     /// picture left behind is the lock screen, never the desktop.
     pub switch_user_on_shield_frame: bool,
+    /// A switch to the login screen on its way, bounded by [`Self::LEAVING_FOR_LOGIN_DEADLINE`].
+    /// gsd-power blanks the screens the moment the shield goes up (`handle_screensaver_active`,
+    /// `gsd-power-manager.c`), and Switch User raises it just before asking for the greeter, so
+    /// the blank races logind's switch. Under the system compositor a blank that wins takes the
+    /// display off and leaves the transition to the greeter nothing to move, so it is parked in
+    /// [`Self::blank_parked`] instead: dropped once the session is paused (the screen is the
+    /// greeter's), applied if the bound passes first (the switch did not happen).
+    pub leaving_for_login: Option<TimerToken>,
+    /// A blank that came in while [`Self::leaving_for_login`].
+    pub blank_parked: bool,
     /// The bound on the above (see [`Self::SHIELD_PRESENT_DEADLINE`]).
     pub shield_present_deadline: Option<TimerToken>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
@@ -6668,6 +6678,8 @@ impl State {
     /// (`activateSwitchUser`, `systemActions.js:467-478`) — the session is locked behind the
     /// greeter, as GNOME leaves it.
     pub fn activate_switch_user(&mut self) {
+        // Before the lock: the shield going up is what has gsd-power blank.
+        self.synoik.hold_blank_until_switched();
         let now = self.synoik.shield_now();
         let passwordless = self.synoik.user_account.password_mode.is_none();
         match self.synoik.screen_shield.lock_instant(now, passwordless) {
@@ -8988,6 +9000,8 @@ impl Synoik {
             sleep_inhibitor: None,
             shield_frames_owed: HashSet::new(),
             switch_user_on_shield_frame: false,
+            leaving_for_login: None,
+            blank_parked: false,
             shield_present_deadline: None,
             shield_snapshot: Default::default(),
             screen_saver_emit: None,
@@ -9932,6 +9946,11 @@ impl Synoik {
         if !self.monitors_active {
             return;
         }
+        if self.leaving_for_login.is_some() {
+            debug!("holding the blank while the session leaves for the login screen");
+            self.blank_parked = true;
+            return;
+        }
 
         self.monitors_active = false;
         backend.set_monitors_active(false);
@@ -9989,6 +10008,7 @@ impl Synoik {
     }
 
     pub fn activate_monitors(&mut self, backend: &mut Backend) {
+        self.blank_parked = false;
         if self.monitors_active {
             return;
         }
@@ -12260,7 +12280,8 @@ impl Synoik {
     }
 
     /// Ask the display manager for the login screen (`Gdm.goto_login_session_sync`).
-    pub fn goto_login_session(&self) {
+    pub fn goto_login_session(&mut self) {
+        self.hold_blank_until_switched();
         let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_accounts.as_ref()) else {
             warn!("cannot switch users: no system bus connection");
             return;
@@ -12275,6 +12296,38 @@ impl Synoik {
                 "goto-login-session",
             )
             .detach();
+    }
+
+    /// How long a switch to the login screen may take before a blank parked for it goes through:
+    /// a few system-bus round trips and logind's activation, which take tens of milliseconds.
+    const LEAVING_FOR_LOGIN_DEADLINE: Duration = Duration::from_secs(2);
+
+    /// Park any blank until this session has left for the login screen (see
+    /// [`Self::leaving_for_login`]).
+    pub(crate) fn hold_blank_until_switched(&mut self) {
+        if let Some(token) = self.leaving_for_login.take() {
+            self.cancel_timer(token);
+        }
+        self.leaving_for_login = Some(self.timer_after(
+            Self::LEAVING_FOR_LOGIN_DEADLINE,
+            move |state| {
+                state.synoik.leaving_for_login = None;
+                if std::mem::take(&mut state.synoik.blank_parked) {
+                    debug!("the switch to the login screen did not happen; blanking");
+                    state.synoik.deactivate_monitors(&mut state.backend);
+                }
+                None
+            },
+        ));
+    }
+
+    /// The session has been paused: whatever was leaving for the login screen has left, and a
+    /// blank held for it is moot — the screen is no longer ours to blank.
+    pub fn session_paused(&mut self) {
+        if let Some(token) = self.leaving_for_login.take() {
+            self.cancel_timer(token);
+        }
+        self.blank_parked = false;
     }
 
     /// A frame carrying the settled curtain has been presented on `output`.

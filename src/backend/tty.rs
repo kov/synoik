@@ -637,6 +637,7 @@ impl Tty {
         match event {
             SessionEvent::PauseSession => {
                 debug!("pausing session");
+                synoik.session_paused();
 
                 self.libinput.suspend();
 

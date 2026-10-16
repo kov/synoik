@@ -516,6 +516,7 @@ impl Nested {
         match event {
             SessionEvent::PauseSession => {
                 debug!("session paused");
+                synoik.session_paused();
                 self.libinput.suspend();
             }
             SessionEvent::ActivateSession => {

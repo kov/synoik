@@ -511,6 +511,8 @@ pub enum Action {
     PowerOnMonitors {},
     /// Log out of the session, via gnome-session's confirmation dialog.
     Logout {},
+    /// Lock the session and go to the login screen, as the power menu's "Switch User…".
+    SwitchUser {},
     /// Power off the system, via gnome-session's confirmation dialog.
     PowerOff {},
     /// Restart the system, via gnome-session's confirmation dialog.
