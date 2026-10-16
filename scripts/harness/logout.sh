@@ -7,10 +7,11 @@
 # Log u2 out on the harness VM (common.sh) through the session's own path, and record every frame
 # on its screen until the greeter is back, for `report.py`.
 #
-#   scripts/harness/logout.sh [--settle SECONDS] [--out DIR]
+#   scripts/harness/logout.sh [--transition STYLE] [--settle SECONDS] [--out DIR]
 #
 #   --settle   how long to keep recording once the outer fronts the greeter (default 3)
 #   --out      where the run lands (default: target/harness/<run> in this checkout)
+#   --transition  how the outer draws switches: fade, curtain or depth (default: as it is)
 #
 # u2 is logged in and fronted first if it is not. The logout is the power menu's: gnome-session's
 # confirmation dialog, confirmed with Enter. A run is laid out as shutdown.sh's.
@@ -19,20 +20,23 @@ set -euo pipefail
 
 settle=3
 out=
+transition=
 while [ $# -gt 0 ]; do
     case $1 in
+    --transition) transition=$2; shift 2 ;;
     --settle) settle=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     *) die "unknown argument $1" ;;
     esac
 done
 
-run=logout-$(date +%Y%m%d-%H%M%S)
+run=logout${transition:+-$transition}-$(date +%Y%m%d-%H%M%S)
 out=${out:-$(dirname "$0")/../../target/harness/$run}
 mkdir -p "$out"
 
 boot
 wait_session 1
+[ -z "$transition" ] || set_transition "$transition"
 pid=$(supervisor)
 if [ -z "$(seat_session u2)" ]; then
     say "logging u2 in"

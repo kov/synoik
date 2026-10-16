@@ -5,14 +5,15 @@
 //! The outer's own drawing: what it composites during a session switch (§5), and the boot splash
 //! (`docs/fork/boot-splash.md` §4).
 //!
-//! A switch is two pictures, crossfaded into one of the outer's own scanout buffers. A picture is
-//! either a flat colour (the plate) or a texture: a snapshot the outer took of what was on screen,
-//! or a session frame imported from its dmabuf. Steady state never comes here — a fronted
-//! session's buffers are flipped as they are.
+//! A switch is two pictures, moved or crossfaded ([`Motion`]) into one of the outer's own scanout
+//! buffers. A picture is either a flat colour (the plate) or a texture: a snapshot the outer took
+//! of what was on screen, or a session frame imported from its dmabuf. Steady state never comes
+//! here — a fronted session's buffers are flipped as they are.
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
@@ -33,6 +34,10 @@ use crate::backend::vulkan_scanout::{
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer, NATIVE_FOURCC};
 use crate::ui::widget::{HAlign, Painter, ShapedText, TextShaper};
 
+/// GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a session's
+/// own background sits on.
+pub(super) const PLATE: [u8; 3] = [0x24, 0x24, 0x24];
+
 /// The outer's scanout buffers: one on screen, one to draw the next frame into. Flips go one at a
 /// time, so a third would never be free when the other two are not.
 const SLOTS: usize = 2;
@@ -41,6 +46,103 @@ const SLOTS: usize = 2;
 pub(super) enum Picture {
     Color([f32; 3]),
     Texture(VkTexture),
+}
+
+/// How a switch between sessions looks (`SYNOIK_SYSTEM_TRANSITION`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Style {
+    /// The outgoing picture crossfades into the incoming one.
+    Fade,
+    /// The greeter is a curtain over the sessions, as gnome-shell's lock screen is over a
+    /// session (`screenShield.js`): it slides up off the session to let it in, and down over it to
+    /// close it.
+    Curtain,
+    /// The greeter comes towards the viewer and fades as the session lands from a distance, as
+    /// gnome-shell's session starts (`_startupAnimationSession`, `layout.js`); backwards, the
+    /// session recedes and the greeter settles in front.
+    Depth,
+}
+
+impl Style {
+    /// `fade`, `curtain` or `depth`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "fade" => Some(Self::Fade),
+            "curtain" => Some(Self::Curtain),
+            "depth" => Some(Self::Depth),
+            _ => None,
+        }
+    }
+}
+
+/// Which way a switch goes: the greeter is the front picture, the one that moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Way {
+    /// The front picture leaves, the back one comes in: a login, an unlock (greeter to session).
+    Leaves,
+    /// The front picture comes in over the back one: a logout, a switch user (session to
+    /// greeter).
+    Arrives,
+    /// From one user's session to another's, with no greeter between: the outgoing session is the
+    /// front picture, leaving as a greeter would; a curtain is the plate, down over the outgoing
+    /// session and up off the incoming one in one motion.
+    Through,
+}
+
+/// How a switch moves its two pictures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Motion {
+    pub style: Style,
+    pub way: Way,
+}
+
+/// The depth a session lands from and recedes to: gnome-shell's session start begins at this
+/// scale (`_prepareStartupAnimation`, `layout.js`).
+const DEPTH_FAR: f64 = 0.75;
+/// How much nearer the greeter comes as it fades. Ours: gnome-shell has no greeter moving out.
+const DEPTH_NEAR: f64 = 1.2;
+
+impl Motion {
+    pub const FADE: Self = Self {
+        style: Style::Fade,
+        way: Way::Leaves,
+    };
+
+    /// How long it runs: the crossfade's 250 ms; the curtain's slide (`CURTAIN_SLIDE_TIME`,
+    /// `screenShield.js`); gnome-shell's session start (`STARTUP_ANIMATION_TIME`, `layout.js`).
+    pub fn duration(self) -> Duration {
+        Duration::from_millis(match self.style {
+            Style::Fade => 250,
+            Style::Curtain => 300,
+            Style::Depth => 500,
+        })
+    }
+
+    /// Progress at `t` of the duration, eased out: the crossfade cubic, the motions quadratic as
+    /// gnome-shell's (`EASE_OUT_QUAD`).
+    pub fn ease(self, t: f32) -> f32 {
+        let t = t.clamp(0., 1.);
+        match self.style {
+            Style::Fade => 1. - (1. - t).powi(3),
+            Style::Curtain | Style::Depth => 1. - (1. - t).powi(2),
+        }
+    }
+}
+
+impl std::fmt::Display for Motion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let style = match self.style {
+            Style::Fade => "fade",
+            Style::Curtain => "curtain",
+            Style::Depth => "depth",
+        };
+        let way = match self.way {
+            Way::Leaves => "leaves",
+            Way::Arrives => "arrives",
+            Way::Through => "through",
+        };
+        write!(f, "{style} {way}")
+    }
 }
 
 /// The outer's drawing device, shared by every display.
@@ -185,17 +287,18 @@ impl Compositor {
     pub fn snapshot(&mut self, dmabuf: &Dmabuf) -> anyhow::Result<VkTexture> {
         let source = Picture::Texture(self.import(dmabuf)?);
         let size = (dmabuf.width() as u16, dmabuf.height() as u16);
-        self.capture(size, &source, &source, 0.)
+        self.capture(size, &source, &source, Motion::FADE, 0.)
     }
 
-    /// `from` crossfaded towards `to` at `alpha`, drawn into a texture the outer owns, `size`
-    /// pixels.
+    /// `from` on its way to `to` by `motion`, `progress` of the way there, drawn into a texture
+    /// the outer owns, `size` pixels: what a transition shows, as [`Self::compose`] draws it.
     pub fn capture(
         &mut self,
         size: (u16, u16),
         from: &Picture,
         to: &Picture,
-        alpha: f32,
+        motion: Motion,
+        progress: f32,
     ) -> anyhow::Result<VkTexture> {
         let size: Size<i32, Physical> = Size::from((i32::from(size.0), i32::from(size.1)));
         let mut target = self
@@ -214,9 +317,7 @@ impl Compositor {
                 .renderer
                 .render(&mut fb, size, Transform::Normal)
                 .map_err(|err| anyhow!("starting a snapshot: {err:?}"))?;
-            let full = Rectangle::from_size(size);
-            draw(&mut frame, from, full, 1.0)?;
-            draw(&mut frame, to, full, alpha)?;
+            paint(&mut frame, size, from, to, motion, progress)?;
             // Ordered before anything that samples it by the queue; nothing waits on it here.
             let _ = frame
                 .finish()
@@ -225,8 +326,10 @@ impl Compositor {
         Ok(target)
     }
 
-    /// Draw `from` crossfaded towards `to` at `t` (0 is all `from`) into a free slot of `canvas`,
-    /// avoiding `busy`. Returns the slot, its framebuffer and the fence that completes the draw.
+    /// Draw `from` on its way to `to` by `motion`, `progress` of the way there (0 is all `from`),
+    /// into a free slot of `canvas`, avoiding `busy`. Returns the slot, its framebuffer and the
+    /// fence that completes the draw.
+    #[allow(clippy::too_many_arguments)]
     pub fn compose(
         &mut self,
         canvas: &mut Canvas,
@@ -234,7 +337,8 @@ impl Compositor {
         busy: Option<usize>,
         from: &Picture,
         to: &Picture,
-        t: f32,
+        motion: Motion,
+        progress: f32,
     ) -> anyhow::Result<(usize, Rc<PrimeFramebuffer>, Option<OwnedFd>)> {
         if canvas.slots.is_empty() {
             self.allocate(canvas, drm_fd)?;
@@ -243,7 +347,6 @@ impl Compositor {
             .find(|&i| Some(i) != busy)
             .context("no free scanout slot")?;
         let size = canvas.size;
-        let full = Rectangle::from_size(size);
 
         // The fence goes to the kernel as `IN_FENCE_FD`, so the submit may stay in flight.
         self.renderer.set_finish_may_defer(true);
@@ -257,8 +360,7 @@ impl Compositor {
                 .renderer
                 .render(&mut fb, size, Transform::Normal)
                 .map_err(|err| anyhow!("starting a frame: {err:?}"))?;
-            draw(&mut frame, from, full, 1.0)?;
-            draw(&mut frame, to, full, t)?;
+            paint(&mut frame, size, from, to, motion, progress)?;
             frame
                 .finish()
                 .map_err(|err| anyhow!("finishing a frame: {err:?}"))
@@ -551,21 +653,109 @@ fn paint_splash(
     Ok(())
 }
 
-/// Draw `picture` over the whole frame at opacity `alpha`, blending over what is there.
+type OuterFrame<'a, 'b> =
+    <VulkanRenderer as smithay::backend::renderer::RendererSuper>::Frame<'a, 'b>;
+
+/// One of a transition's pictures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Layer {
+    From,
+    To,
+    /// The plate: behind every motion, and the curtain of a user-to-user one.
+    Plate,
+}
+
+/// Where each picture of a transition goes and how opaque it is, `progress` of the way from
+/// `from` to `to`, in drawing order. The one place a motion's geometry lives, so a snapshot taken
+/// mid-transition is what was on screen.
+fn layers(
+    size: Size<i32, Physical>,
+    motion: Motion,
+    progress: f32,
+) -> Vec<(Layer, Rectangle<i32, Physical>, f32)> {
+    let full = Rectangle::from_size(size);
+    let p = f64::from(progress.clamp(0., 1.));
+    if motion.style == Style::Fade {
+        return vec![(Layer::From, full, 1.), (Layer::To, full, progress)];
+    }
+    // `front` is the greeter's side, `cover` how much of the way it is in: 1 on screen, 0 gone.
+    let (front, back, cover) = match motion.way {
+        Way::Leaves => (Layer::From, Layer::To, 1. - p),
+        Way::Arrives => (Layer::To, Layer::From, p),
+        Way::Through if motion.style == Style::Depth => (Layer::From, Layer::To, 1. - p),
+        // The plate's curtain, down over `from` for the first half and up off `to` for the second.
+        Way::Through if p < 0.5 => (Layer::Plate, Layer::From, p * 2.),
+        Way::Through => (Layer::Plate, Layer::To, (1. - p) * 2.),
+    };
+    let mut layers = vec![(Layer::Plate, full, 1.)];
+    match motion.style {
+        Style::Fade => unreachable!("handled above"),
+        Style::Curtain => {
+            let y = -((1. - cover) * f64::from(size.h)).round() as i32;
+            layers.push((back, full, 1.));
+            layers.push((front, Rectangle::new((0, y).into(), size), 1.));
+        }
+        Style::Depth => {
+            let back_scale = DEPTH_FAR + (1. - DEPTH_FAR) * (1. - cover);
+            let front_scale = 1. + (DEPTH_NEAR - 1.) * (1. - cover);
+            layers.push((back, scaled(size, back_scale), (1. - cover) as f32));
+            layers.push((front, scaled(size, front_scale), cover as f32));
+        }
+    }
+    layers
+}
+
+/// The frame's rectangle scaled by `scale` about its centre.
+fn scaled(size: Size<i32, Physical>, scale: f64) -> Rectangle<i32, Physical> {
+    let w = (f64::from(size.w) * scale).round() as i32;
+    let h = (f64::from(size.h) * scale).round() as i32;
+    Rectangle::new(((size.w - w) / 2, (size.h - h) / 2).into(), (w, h).into())
+}
+
+/// Draw a transition's frame: its [`layers`].
+fn paint(
+    frame: &mut OuterFrame<'_, '_>,
+    size: Size<i32, Physical>,
+    from: &Picture,
+    to: &Picture,
+    motion: Motion,
+    progress: f32,
+) -> anyhow::Result<()> {
+    let full = Rectangle::from_size(size);
+    let plate = Picture::Color(PLATE.map(|c| f32::from(c) / 255.));
+    for (layer, dst, alpha) in layers(size, motion, progress) {
+        let picture = match layer {
+            Layer::From => from,
+            Layer::To => to,
+            Layer::Plate => &plate,
+        };
+        draw(frame, picture, dst, full, alpha)?;
+    }
+    Ok(())
+}
+
+/// Draw `picture` into `dst` (which may reach past the frame, `full`) at opacity `alpha`, blending
+/// over what is there.
 fn draw(
-    frame: &mut <VulkanRenderer as smithay::backend::renderer::RendererSuper>::Frame<'_, '_>,
+    frame: &mut OuterFrame<'_, '_>,
     picture: &Picture,
+    dst: Rectangle<i32, Physical>,
     full: Rectangle<i32, Physical>,
     alpha: f32,
 ) -> anyhow::Result<()> {
+    // The part of `dst` on the frame, as damage local to `dst`.
+    let Some(visible) = dst.intersection(full) else {
+        return Ok(());
+    };
     if alpha <= 0.0 {
         return Ok(());
     }
+    let damage = [Rectangle::new(visible.loc - dst.loc, visible.size)];
     match picture {
         Picture::Color([r, g, b]) => frame
             .draw_solid(
-                full,
-                &[full],
+                dst,
+                &damage,
                 Color32F::new(r * alpha, g * alpha, b * alpha, alpha),
             )
             .map_err(|err| anyhow!("drawing a colour: {err:?}")),
@@ -574,7 +764,7 @@ fn draw(
                 (f64::from(texture.width()), f64::from(texture.height())).into(),
             );
             frame
-                .render_texture_from_to(texture, src, full, &[full], &[], Transform::Normal, alpha)
+                .render_texture_from_to(texture, src, dst, &damage, &[], Transform::Normal, alpha)
                 .map_err(|err| anyhow!("drawing a texture: {err:?}"))
         }
     }
@@ -627,6 +817,107 @@ mod tests {
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
         Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    const RED: Picture = Picture::Color([1., 0., 0.]);
+    const BLUE: Picture = Picture::Color([0., 0., 1.]);
+
+    fn every_motion() -> Vec<Motion> {
+        let mut motions = Vec::new();
+        for style in [Style::Fade, Style::Curtain, Style::Depth] {
+            for way in [Way::Leaves, Way::Arrives, Way::Through] {
+                motions.push(Motion { style, way });
+            }
+        }
+        motions
+    }
+
+    /// A transition `progress` of the way from red to blue, 64×40, as RGB at `(x, y)`.
+    fn transition(
+        c: &mut Compositor,
+        motion: Motion,
+        progress: f32,
+    ) -> impl Fn(i32, i32) -> [u8; 3] {
+        let mut texture = c.capture((64, 40), &RED, &BLUE, motion, progress).unwrap();
+        let (width, bytes) = pixels(c, &mut texture);
+        move |x, y| {
+            let i = ((y * width + x) * 4) as usize;
+            [bytes[i], bytes[i + 1], bytes[i + 2]]
+        }
+    }
+
+    fn near(got: [u8; 3], want: [u8; 3]) -> bool {
+        got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 3)
+    }
+
+    /// Every motion starts on its `from` picture and ends on its `to`, whole, so neither end of a
+    /// switch jumps.
+    #[test]
+    fn a_transition_starts_on_from_and_ends_on_to() {
+        let Some(mut c) = compositor() else { return };
+        for motion in every_motion() {
+            for (progress, want) in [(0., [255, 0, 0]), (1., [0, 0, 255])] {
+                let at = transition(&mut c, motion, progress);
+                for (x, y) in [(0, 0), (63, 0), (32, 20), (0, 39), (63, 39)] {
+                    assert!(
+                        near(at(x, y), want),
+                        "{motion} at {progress}: {:?} at {x},{y}",
+                        at(x, y)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Halfway, a curtain is half down: the greeter's side above, the session below. Leaving, the
+    /// greeter is `from`; arriving, `to`; between two users the plate is the curtain, over
+    /// `from` and then off `to`.
+    #[test]
+    fn a_curtain_slides_from_the_top() {
+        let Some(mut c) = compositor() else { return };
+        let plate = PLATE;
+        let cases = [
+            (Way::Leaves, 0.5, [255, 0, 0], [0, 0, 255]),
+            (Way::Arrives, 0.5, [0, 0, 255], [255, 0, 0]),
+            (Way::Through, 0.25, plate, [255, 0, 0]),
+            (Way::Through, 0.75, plate, [0, 0, 255]),
+        ];
+        for (way, progress, above, below) in cases {
+            let motion = Motion {
+                style: Style::Curtain,
+                way,
+            };
+            let at = transition(&mut c, motion, progress);
+            assert!(near(at(32, 2), above), "{motion}: {:?} above", at(32, 2));
+            assert!(near(at(32, 37), below), "{motion}: {:?} below", at(32, 37));
+        }
+    }
+
+    /// Halfway through a login in depth, the session landing from the distance covers the middle
+    /// but not yet the corners, where only the greeter coming nearer shows, over the plate.
+    #[test]
+    fn a_depth_lands_the_session_from_a_distance() {
+        let Some(mut c) = compositor() else { return };
+        let motion = Motion {
+            style: Style::Depth,
+            way: Way::Leaves,
+        };
+        let at = transition(&mut c, motion, 0.5);
+        let [p, ..] = PLATE;
+        let half = |over: u8, c: u8| ((f32::from(c) + f32::from(over)) / 2.).round() as u8;
+        // Corner: the plate, then red at half.
+        assert!(
+            near(at(0, 0), [half(p, 255), half(p, 0), half(p, 0)]),
+            "{:?}",
+            at(0, 0)
+        );
+        // Middle: the plate, blue at half, then red at half.
+        let mid = [
+            half(half(p, 0), 255),
+            half(half(p, 0), 0),
+            half(half(p, 255), 0),
+        ];
+        assert!(near(at(32, 20), mid), "{:?} for {mid:?}", at(32, 20));
     }
 
     /// The installed theme, drawn where the layout says: the watermark, the spinner, the

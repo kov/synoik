@@ -509,6 +509,9 @@ pub struct Synoik {
     /// `synoik --greeter`: the login screen's session, in gnome-shell's `gdm` mode
     /// (`docs/fork/greeter.md` §4).
     pub greeter: bool,
+    /// Nested in the system compositor, which animates every switch between sessions itself
+    /// (`docs/fork/system-compositor.md` §5).
+    pub nested: bool,
 
     /// Name of the Wayland socket.
     ///
@@ -7043,10 +7046,20 @@ impl State {
                 let effects = self.synoik.screen_shield.authenticator_lost();
                 self.apply_shield_effects(effects);
             }
+            // Nested, the system compositor carries the greeter away as the session comes in
+            // (system-compositor.md §5), so the verified prompt stays up and the session starts at
+            // once: a dialog faded out first would leave it nothing to move but an empty screen
+            // (greeter.md §4.4, a divergence).
+            VerifierEvent::SessionOpened(service) if self.synoik.greeter && self.synoik.nested => {
+                if let Some(tx) = self.synoik.gdm_requests.as_ref() {
+                    let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::StartSession(
+                        service.clone(),
+                    ));
+                }
+            }
             // `_startSession` (`loginDialog.js:1254-1265`): fade the dialog out, then start the
-            // session. The screen behind stays the greeter's until the session has drawn (the
-            // system compositor holds it, `GREETER_TARGET_WAIT`), so it is the empty greeter that
-            // gives way to the session, not a dialog cut off mid-sentence.
+            // session, so it is the empty greeter that gives way to the session, not a dialog cut
+            // off mid-sentence.
             VerifierEvent::SessionOpened(service) if self.synoik.greeter => {
                 let now = self.synoik.shield_now();
                 self.synoik.lock_screen.fade_dialog(false, now);
@@ -8823,6 +8836,7 @@ impl Synoik {
             display_handle,
             is_session_instance,
             greeter: false,
+            nested: matches!(backend, Backend::Nested(_)),
             login_users: Vec::new(),
             login_users_loaded: false,
             greeter_visit: 0,

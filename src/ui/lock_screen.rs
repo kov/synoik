@@ -919,11 +919,6 @@ impl LockScreen {
         self.dialog_fade = Some((now, from));
     }
 
-    /// Whether the login dialog is faded out, or on its way.
-    pub fn dialog_hidden(&self) -> bool {
-        self.dialog_hidden
-    }
-
     /// The login dialog's opacity now.
     pub fn dialog_alpha(&self, now: Duration) -> f64 {
         let to = if self.dialog_hidden { 0. } else { 1. };

@@ -171,3 +171,18 @@ boot_journal() {
     on_guest "journalctl -b ${1:-} -o json _COMM=synoik + _COMM=synoik-login + \
         _SYSTEMD_UNIT=systemd-logind.service + _COMM=gnome-session-b + _PID=1"
 }
+
+# Make the outer draw switches as $1 (fade, curtain or depth; `SYNOIK_SYSTEM_TRANSITION`) through
+# a drop-in, restarting it only if that changes what it runs with; the sessions reattach.
+set_transition() {
+    local style=$1 dropin=/etc/systemd/system/synoik-system.service.d/90-harness-transition.conf
+    case $style in fade | curtain | depth) ;; *) die "a transition is fade, curtain or depth" ;; esac
+    local want="[Service]
+Environment=SYNOIK_SYSTEM_TRANSITION=$style"
+    if [ "$(on_guest "cat $dropin 2>/dev/null")" != "$want" ]; then
+        say "the outer draws switches as $style from now"
+        on_guest "mkdir -p $(dirname $dropin) && printf '%s\n' '$want' >$dropin &&
+            systemctl daemon-reload && systemctl restart synoik-system"
+        wait_session 3
+    fi
+}

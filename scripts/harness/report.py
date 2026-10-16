@@ -18,9 +18,10 @@ outer's flight recorder says which framebuffer of which session or of its own th
 Sections:
   timeline   frames merged with the driver's steps and the journal; a steady run of one label
              is one line (`--all` prints every frame)
-  fades      per fade, each composite frame's alpha fitted from its pixels as A + a·(B − A),
+  fades      per crossfade, each composite frame's alpha fitted from its pixels as A + a·(B − A),
              against the frames before and after the fade (before the first frame, the still the
-             run began with, `before.png`), beside the alpha the outer logged
+             run began with, `before.png`), beside the alpha the outer logged; per curtain or
+             depth, which move their pictures and have no blend to fit, the progress it logged
   tail       the screen's last change before the power went, the longest still after the shutdown
              began, and how steadily the spinner turned
   filmstrip  RUN/filmstrip.png: up to N frames (default 40), every label change kept
@@ -271,7 +272,7 @@ def attribute(frames, flips, resources, events):
 
 def kind_of(frame):
     """A frame's label without what changes from one frame of a steady run to the next."""
-    return re.sub(r' (alpha|frame)=\S+', '', frame['label'])
+    return re.sub(r' (alpha|progress|frame)=\S+', '', frame['label'])
 
 
 def gray(run, f, cache={}):
@@ -316,6 +317,13 @@ def fades(run, frames, flips, events):
         span = seg[-1]['t'] - seg[0]['t']
         print(f"fade #{seg[0]['seq']}-#{seg[-1]['seq']}: {len(seg)} frames over {span:.0f} ms, "
               f"from #{a['seq']} ({a['label']}) to #{b['seq']} ({b['label']})")
+        if any('alpha=' not in f['label'] for f in seg):
+            # A curtain or a depth moves its pictures: no blend of the two ends to fit.
+            print(f"  {kind_of(seg[0]).removeprefix('composite ')}: progress per frame, as the outer logged it")
+            for f in seg:
+                logged = re.search(r'progress=(\S+)', f['label'])
+                print(f"  #{f['seq']:<5} {f['t']:8.1f}  logged {logged.group(1) if logged else '?':>6}")
+            continue
         if mask.sum() < 100:
             print('  the two ends look the same: nothing to fit')
             continue

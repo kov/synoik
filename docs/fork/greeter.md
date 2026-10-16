@@ -404,11 +404,16 @@ As gnome-shell's: the verified prompt stays up, and once the session opens the l
 out over 250 ms before `StartSessionWhenReady` (`_startSession`, `loginDialog.js:1254-1265`); the
 gdm pump reports `SessionOpened` and the compositor sends `StartSession` when the fade is done.
 
+**Divergence, nested in the system compositor:** the dialog does not fade, and `StartSession` goes
+at once. The outer moves the greeter away as the session comes in (system-compositor.md §10,
+Switch), and a dialog faded out first would leave it an empty screen to move, after a dip to
+black.
+
 On a VT-less seat logind activates a session the moment it attaches (`seat_attach_session`),
-which is PAM's open — before `SessionOpened`, so the greeter is already backgrounded when its fade
-starts. It keeps drawing while its dialog is hidden (`backend::nested`), and the outer flips the
-outgoing greeter's frames while it waits for the incoming session's first one
-(`Transition::from_live`), so the fade plays in front of the user. The outer **holds a
+which is PAM's open — before `SessionOpened`, so the greeter is already backgrounded when it
+starts the session. The outer flips the outgoing greeter's frames while it waits for the incoming
+session's first one (`Transition::from_live`), so whatever the greeter draws meanwhile plays in
+front of the user. The outer **holds a
 greeter-class outgoing picture until the incoming frame** (bounded at 10 s,
 `GREETER_TARGET_WAIT`) rather than fading to the plate after 300 ms: the greeter shows nothing
 private, and a session's first frame takes most of a second. The 300 ms rule stays for user → user
@@ -416,8 +421,8 @@ switches, where it exists to take the previous user's screen away.
 
 The session's first frame waits for its wallpaper (`_loadBackground`, `layout.js:693-707`), and
 the session opens in the overview with GNOME's startup animation (`runStartupAnimation`,
-`overviewControls.js:801-857`), which plays through the outer's crossfade because the fade's
-target follows the incoming session's frames.
+`overviewControls.js:801-857`), which plays through the outer's transition because its target
+follows the incoming session's frames.
 
 ---
 

@@ -7,10 +7,11 @@
 # Log u2 in through the greeter on the harness VM (common.sh) and record every frame on its
 # screen, from the greeter through the new session's startup, for `report.py`.
 #
-#   scripts/harness/login.sh [--settle SECONDS] [--out DIR]
+#   scripts/harness/login.sh [--transition STYLE] [--settle SECONDS] [--out DIR]
 #
 #   --settle   how long to keep recording once the outer fronts the new session (default 5)
 #   --out      where the run lands (default: target/harness/<run> in this checkout)
+#   --transition  how the outer draws switches: fade, curtain or depth (default: as it is)
 #
 # u2 is logged out first if it has a session, and the greeter fronted. A Shift lifts the greeter's
 # shield if it is up, which takes the first key and does nothing else with it (a Shift on the grid
@@ -22,20 +23,23 @@ set -euo pipefail
 
 settle=5
 out=
+transition=
 while [ $# -gt 0 ]; do
     case $1 in
+    --transition) transition=$2; shift 2 ;;
     --settle) settle=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     *) die "unknown argument $1" ;;
     esac
 done
 
-run=login-$(date +%Y%m%d-%H%M%S)
+run=login${transition:+-$transition}-$(date +%Y%m%d-%H%M%S)
 out=${out:-$(dirname "$0")/../../target/harness/$run}
 mkdir -p "$out"
 
 boot
 wait_session 1
+[ -z "$transition" ] || set_transition "$transition"
 pid=$(supervisor)
 if [ -n "$(seat_session u2)" ]; then
     say "logging u2 out first"

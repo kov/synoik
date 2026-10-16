@@ -54,7 +54,7 @@ mod boot;
 
 use self::boot::{BootSplash, Plymouth};
 use super::chord;
-use super::compose::{Canvas, Compositor, Picture};
+use super::compose::{Canvas, Compositor, Motion, Picture, Style, Way, PLATE};
 use super::protocol::{self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter};
 use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
 use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
@@ -65,13 +65,6 @@ use crate::utils::get_monotonic_time;
 /// step of a fade, so a harness capture can be read against what the outer meant to show
 /// (`scripts/harness/`).
 const FLIGHT: &str = "synoik::system_compositor::flight";
-
-/// GNOME's dark plate (`$system_bg_color`, #242424 in libadwaita dark), the colour a session's
-/// own background sits on.
-const PLATE: [u8; 3] = [0x24, 0x24, 0x24];
-
-/// How long a switch crossfades (§5 steps 2 and 7, which with no modeset are one fade).
-const FADE: Duration = Duration::from_millis(250);
 
 /// How long the outgoing session's picture may stay up waiting for the incoming one's first
 /// frame. Past it the switch fades to the incoming session's last frame, or the plate: the
@@ -423,11 +416,12 @@ enum Shown {
         frame: usize,
     },
     /// A frame the outer drew itself, in its own scanout slot: the switch's `from` and `to`
-    /// pictures blended at `alpha`.
+    /// pictures, `progress` of the way by `motion`.
     Composite {
         slot: usize,
         _fb: Rc<PrimeFramebuffer>,
-        alpha: f32,
+        motion: Motion,
+        progress: f32,
         /// The incoming session frame it blends in, while that frame's present is unanswered:
         /// the flip putting the blend on screen answers it.
         samples: Option<(u64, u32)>,
@@ -449,7 +443,8 @@ enum Next {
         slot: usize,
         fb: Rc<PrimeFramebuffer>,
         fence: Option<Rc<OwnedFd>>,
-        alpha: f32,
+        motion: Motion,
+        progress: f32,
         samples: Option<(u64, u32)>,
         samples_from: Option<(u64, u32)>,
     },
@@ -461,6 +456,8 @@ enum Next {
 /// startup) plays through the fade instead of freezing on its first frame and cutting at the end.
 struct Transition {
     from: Picture,
+    /// How `from` gives way to `to`.
+    motion: Motion,
     to: Option<Target>,
     /// Waiting for this session frame's render fence before it can become `to`.
     pending: Option<(u64, u32, Option<Rc<OwnedFd>>)>,
@@ -469,10 +466,11 @@ struct Transition {
     start: Duration,
     /// Armed while there is neither `to` nor `pending` (`TARGET_WAIT`).
     wait: Option<RegistrationToken>,
-    /// The outgoing greeter, still drawing: until the incoming session has a frame, the greeter's
-    /// frames go on screen as they come, so its dialog fades out in front of the user — logind
-    /// activates a new session on a VT-less seat the moment it is created, before the greeter has
-    /// had the chance (`seat_attach_session`). `from` is re-taken when the target arrives.
+    /// The outgoing greeter, which may still draw: until the incoming session has a frame, the
+    /// greeter's frames go on screen as they come, so what it shows as it leaves plays in front of
+    /// the user — logind activates a new session on a VT-less seat the moment it is created,
+    /// before the greeter is done (`seat_attach_session`). `from` is re-taken when the target
+    /// arrives.
     from_live: Option<u64>,
     /// The outgoing session, still drawing while the machine goes down: each frame it presents
     /// during the fade replaces `from`, so what it animates as it ends (its end-session dialog
@@ -690,6 +688,13 @@ struct Outer {
     switch_wait: Duration,
     /// The greeter the switch in progress leaves, for [`Transition::from_live`].
     outgoing_greeter: Option<u64>,
+    /// Which way the switch in progress goes, by the classes of the sessions it is between.
+    switch_way: Way,
+    /// How switches between sessions look (`SYNOIK_SYSTEM_TRANSITION`).
+    style: Style,
+    /// How many times slower than their own durations transitions run
+    /// (`SYNOIK_SYSTEM_TRANSITION_SLOW`, 1 by default): to watch one closely.
+    slow: f32,
     /// logind announced the machine is going down (`PrepareForShutdown(true)`): the screen fades
     /// to black and stays there, whatever logind fronts as the sessions end.
     shutting_down: bool,
@@ -702,6 +707,37 @@ struct Outer {
     next_cursor_serial: u64,
     /// The virtio-gpu resource each framebuffer was last seen backed by, for the flight recorder.
     flight_resources: HashMap<u32, u32>,
+}
+
+/// How switches look: `SYNOIK_SYSTEM_TRANSITION` is `fade`, `curtain` (the default) or `depth`.
+fn transition_style() -> Style {
+    let Ok(name) = std::env::var("SYNOIK_SYSTEM_TRANSITION") else {
+        return Style::Curtain;
+    };
+    Style::parse(&name).unwrap_or_else(|| {
+        warn!("SYNOIK_SYSTEM_TRANSITION={name:?} is not fade, curtain or depth: a curtain");
+        Style::Curtain
+    })
+}
+
+/// `SYNOIK_SYSTEM_TRANSITION_SLOW`: a factor of at least 1 on every transition's duration.
+fn transition_slow() -> f32 {
+    std::env::var("SYNOIK_SYSTEM_TRANSITION_SLOW")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|f| f.is_finite())
+        .map_or(1., |f| f.max(1.))
+}
+
+/// Which way a switch between sessions of these logind classes goes: the greeter is the front
+/// picture, leaving at a login or an unlock and arriving at a logout or a switch user.
+fn switch_way(outgoing: Option<&str>, incoming: Option<&str>) -> Way {
+    match (outgoing, incoming) {
+        (Some("greeter"), _) => Way::Leaves,
+        (_, Some("greeter")) => Way::Arrives,
+        (Some(_), Some(_)) => Way::Through,
+        _ => Way::Leaves,
+    }
 }
 
 fn plate_picture() -> Picture {
@@ -751,6 +787,9 @@ impl Outer {
             compositor,
             switch_wait: TARGET_WAIT,
             outgoing_greeter: None,
+            switch_way: Way::Leaves,
+            style: transition_style(),
+            slow: transition_slow(),
             shutting_down: false,
             plymouth: Plymouth::new(),
             boot: None,
@@ -1381,7 +1420,9 @@ impl Outer {
         }
         info!("seat0 fronts session {front:?} (was {:?})", self.front);
         let outgoing = self.front.as_deref().and_then(read_session_class);
+        let incoming = front.as_deref().and_then(read_session_class);
         self.switch_wait = target_wait(outgoing.as_deref());
+        self.switch_way = switch_way(outgoing.as_deref(), incoming.as_deref());
         self.outgoing_greeter = (outgoing.as_deref() == Some("greeter"))
             .then(|| self.fronted())
             .flatten();
@@ -1475,6 +1516,16 @@ impl Outer {
             Some(Shown::Session { generation, .. }) => (false, Some(*generation)),
             _ => (false, None),
         };
+        // A switch moves between sessions; from the plate or the splash, or at shutdown, it fades.
+        let motion = match self.displays.get(d).map(|d| &d.on_screen) {
+            Some(Shown::Session { .. } | Shown::Composite { .. }) if !self.shutting_down => {
+                Motion {
+                    style: self.style,
+                    way: self.switch_way,
+                }
+            }
+            _ => Motion::FADE,
+        };
         let from = self.snapshot_screen(d);
         self.cancel_transition(d);
         let Some(display) = self.displays.get_mut(d) else {
@@ -1486,6 +1537,7 @@ impl Outer {
         let from_session = outgoing.filter(|_| self.shutting_down);
         display.transition = Some(Transition {
             from,
+            motion,
             to: None,
             pending: None,
             pending_watch: None,
@@ -1548,10 +1600,12 @@ impl Outer {
             Shown::Session { dmabuf, .. } => compositor.snapshot(dmabuf),
             // Mid-fade: the blend on screen, redrawn, so the next fade starts where this one
             // stands instead of jumping to either end.
-            Shown::Composite { alpha, .. } => match &display.transition {
+            Shown::Composite {
+                motion, progress, ..
+            } => match &display.transition {
                 Some(Transition {
                     from, to: Some(to), ..
-                }) => compositor.capture(size, from, &to.picture, *alpha),
+                }) => compositor.capture(size, from, &to.picture, *motion, *progress),
                 Some(Transition { from, .. }) => return from.clone(),
                 None => return display.last_to.clone().unwrap_or_else(plate_picture),
             },
@@ -1804,7 +1858,7 @@ impl Outer {
             return;
         };
         if transition.to.is_none() {
-            debug!(target: FLIGHT, "fade on {d} to {}", target.end);
+            debug!(target: FLIGHT, "fade on {d} to {} ({})", target.end, transition.motion);
         }
         match transition.to.replace(target) {
             None => transition.start = get_monotonic_time(),
@@ -1933,13 +1987,15 @@ impl Outer {
             return;
         };
         let elapsed = get_monotonic_time().saturating_sub(transition.start);
-        let t = (elapsed.as_secs_f32() / FADE.as_secs_f32()).clamp(0., 1.);
+        let motion = transition.motion;
+        let duration = motion.duration().as_secs_f32() * self.slow;
+        let t = (elapsed.as_secs_f32() / duration).clamp(0., 1.);
         if t >= 1. {
             self.finish_transition(d);
             return;
         }
-        // Ease out: most of the change early, settling into the incoming picture.
-        let alpha = 1. - (1. - t).powi(3);
+        // Eased out: most of the change early, settling into the incoming picture.
+        let progress = motion.ease(t);
         // Both share the canvas: drawing into the slot on screen would show the draw.
         let busy = match &display.on_screen {
             Shown::Composite { slot, .. } | Shown::Splash { slot, .. } => Some(*slot),
@@ -1967,7 +2023,8 @@ impl Outer {
             busy,
             &transition.from,
             &to.picture,
-            alpha,
+            motion,
+            progress,
         );
         match composed {
             Ok((slot, fb, fence)) => self.flip(
@@ -1976,7 +2033,8 @@ impl Outer {
                     slot,
                     fb,
                     fence: fence.map(Rc::new),
-                    alpha,
+                    motion,
+                    progress,
                     samples,
                     samples_from,
                 },
@@ -2060,6 +2118,7 @@ impl Outer {
             };
             display.transition = Some(Transition {
                 from,
+                motion: Motion::FADE,
                 to: None,
                 pending: None,
                 pending_watch: None,
@@ -2526,7 +2585,8 @@ impl Outer {
                 slot,
                 fb,
                 fence,
-                alpha,
+                motion,
+                progress,
                 samples,
                 samples_from,
             } => {
@@ -2536,7 +2596,8 @@ impl Outer {
                     Shown::Composite {
                         slot,
                         _fb: fb,
-                        alpha,
+                        motion,
+                        progress,
                         samples,
                         samples_from,
                     },
@@ -2600,8 +2661,15 @@ impl Outer {
                         } => {
                             debug!(target: FLIGHT, "flip {d} fb={fb} session {generation} buffer {buffer}")
                         }
-                        Shown::Composite { alpha, .. } => {
-                            debug!(target: FLIGHT, "flip {d} fb={fb} composite alpha={alpha:.4}")
+                        Shown::Composite {
+                            motion, progress, ..
+                        } if motion.style == Style::Fade => {
+                            debug!(target: FLIGHT, "flip {d} fb={fb} composite alpha={progress:.4}")
+                        }
+                        Shown::Composite {
+                            motion, progress, ..
+                        } => {
+                            debug!(target: FLIGHT, "flip {d} fb={fb} composite {motion} progress={progress:.4}")
                         }
                     }
                 }

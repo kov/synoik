@@ -42748,6 +42748,33 @@ fn the_greeters_accessibility_button_opens_its_toggles() {
     assert!(f.synoik().panel_popover.is_login_a11y_open());
 }
 
+/// Nested in the system compositor, the greeter starts a session as soon as it opens and keeps
+/// the verified prompt up: the system compositor moves it away as the session comes in, which a
+/// dialog faded out first would leave nothing to show (greeter.md §4.4, a divergence from
+/// `_startSession`).
+#[test]
+fn a_nested_greeter_starts_the_session_with_its_prompt_up() {
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.freeze_clock();
+    f.synoik().greeter = true;
+    f.synoik().nested = true;
+    f.synoik_state().show_greeter_dialog();
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::SessionOpened("gdm-password".to_owned()));
+    f.turn();
+    assert!(f
+        .gdm_requests()
+        .iter()
+        .any(|r| matches!(r, VerifierRequest::StartSession(s) if s == "gdm-password")));
+    f.advance_clock(crate::ui::lock_screen::DIALOG_FADE_TIME);
+    let now = f.synoik().shield_now();
+    assert_eq!(f.synoik().lock_screen.dialog_alpha(now), 1.);
+    assert!(f.synoik().shield_is_up(), "the greeter stays");
+}
+
 /// Picking a user on the greeter asks gdm for a login conversation for them; Escape cancels it and
 /// goes back to the list. A verified one stays on its prompt, uncancelled, and once its session
 /// opens the dialog fades out before the session is started (`_startSession`,

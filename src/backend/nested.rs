@@ -700,12 +700,7 @@ impl Nested {
     ) -> RenderResult {
         let _span = tracy_client::span!("Nested::render");
 
-        // A greeter whose dialog is fading out for a new session draws on in the background: logind
-        // fronted that session when it was created, before the fade began (a VT-less seat
-        // activates a session as it attaches), and the outer keeps the greeter's frames on screen
-        // until the session has one of its own. It shows nothing private.
-        let fading_greeter = synoik.greeter && synoik.lock_screen.dialog_hidden();
-        if self.conn.is_none() || !(self.session.is_active() || fading_greeter) {
+        if self.conn.is_none() || !self.session.is_active() {
             // Nowhere to show it. Pace off the clock until the outer is back or the session is
             // fronted again, the same as a tty frame that failed to queue.
             queue_estimated_vblank_timer(synoik, output.clone());

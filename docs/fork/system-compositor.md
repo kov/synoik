@@ -416,13 +416,32 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   a background frame does.
 - **Switch** (`system_compositor::compose`, the outer's own Vulkan device on the render node): on
   a change of active session the outer snapshots what is on screen into its own texture (§5 step
-  1; mid-fade, the blend on screen) and crossfades to the incoming session's frame, 250 ms
-  ease-out, into two outer-owned scanout buffers, then flips the session's frame itself (§5 step
-  8). The target is the incoming session's held frame, else its next present, gated on its render
-  fence polled readable (§5 step 6), and it is live: each frame the session presents during the
-  fade replaces it, answered `Presented` by the flip that shows a blend of it, so whatever the
-  session animates meanwhile (an unlock, its startup) plays through the fade. A fronted frame that
-  replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+  1; mid-transition, the frame on screen) and moves it out for the incoming session's frame, into
+  two outer-owned scanout buffers, then flips the session's frame itself (§5 step 8). How it
+  moves is `SYNOIK_SYSTEM_TRANSITION` on the outer's unit (`compose::Style`), and which way the
+  logind classes of the two sessions decide (`compose::Way`), the greeter being the front picture:
+  - `curtain` (the default): the greeter is a curtain over the sessions, as gnome-shell's lock
+    screen is over one — a login or an unlock slides it up off the session, a logout or a switch
+    user slides it down over it; 300 ms ease-out-quad (`CURTAIN_SLIDE_TIME`, `screenShield.js`).
+    Between two users' sessions the plate is the curtain, down over the one and up off the other
+    in one motion.
+  - `depth`: the greeter comes nearer (to 1.2×) and fades as the session lands from a distance
+    (0.75× and transparent, as gnome-shell's session start, `_startupAnimationSession`), and the
+    same backwards for a logout or a switch user; between users the outgoing session leaves as the
+    greeter would. 500 ms ease-out-quad (`STARTUP_ANIMATION_TIME`, `layout.js`).
+  - `fade`: a crossfade, 250 ms ease-out.
+
+  Every motion draws over the plate. From the plate or the splash, and at shutdown, a switch
+  crossfades whatever the style. `SYNOIK_SYSTEM_TRANSITION_SLOW` multiplies every duration, to
+  watch one closely. The target is the incoming session's held frame, else its next present,
+  gated on its render fence polled readable (§5 step 6), and it is live: each frame the session
+  presents during the transition replaces it, answered `Presented` by the flip that shows it, so
+  whatever the session animates meanwhile (an unlock, its startup) plays through. A fronted frame
+  that replaces the plate fades in the same way. Without a usable GPU a switch is a cut.
+  Measured on the harness (2026-10-16, `login.sh`, `switch.sh` both ways and `logout.sh` per
+  style): each motion runs its full length at the display's 8 ms with no frame back; a login holds
+  the greeter's verified prompt about 0.45 s until the session's first frame, then moves it away,
+  with no black between them.
 - **Cursor plane**: a connector whose CRTC has a cursor plane advertises its buffer size
   (`cursor_size`, the driver's `DRM_CAP_CURSOR_WIDTH`). The inner then leaves its pointer out of
   its frames and puts it on the plane instead. A new image (`CursorImage`, drawn on the CPU from
@@ -474,7 +493,7 @@ the fronting rule of §2.2, the no-modeset transition of §4.1/§5 and the relia
   overrides the detection.
 - **Inner** (`backend::nested`, selected by `SYNOIK_SYSTEM_SOCKET`): input exactly as the tty
   backend takes it; renders like headless into three scanout slots, only while logind has it
-  active (and the greeter while its dialog fades out for a new session, `greeter.md` §4.4), its
+  active, its
   first frame waiting for the wallpaper; paces off `Presented` as the tty does off vblank. On losing the outer it keeps running,
   retries, re-registers its buffers and redraws in full.
 
@@ -512,11 +531,11 @@ and shutdown splash (§6) is built: `boot-splash.md`.
 
 In order:
 
-1. **The outer's animations on the harness** (§10 Harness): every transition has a driver. Next,
-   transitions that move rather than crossfade, and smoothing the handoffs between inner and outer
-   the drivers show: a login dips to black between the greeter's fade-out and the session's
-   first frame (about 0.45 s on the harness, measured 2026-10-16), and a logout holds the
-   session's last frame until the greeter's first.
+1. **The outer's animations on the harness** (§10 Harness): every transition has a driver, and the
+   curtain and the depth are built to be tried side by side. Next, what trying them shows, and the
+   handoffs between inner and outer: a login holds the greeter still for the session's first frame
+   (about 0.45 s on the harness), and a logout holds the session's last frame until the greeter's
+   first.
 2. **No stalled frame between the initramfs splash and the outer** (`boot-splash.md` §6): the
    CPU splash keeps the spinner turning until the outer can draw.
 3. **Overlay planes through the outer**: a client's buffer scanned out on an overlay plane, which

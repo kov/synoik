@@ -7,11 +7,12 @@
 # Switch the harness VM (common.sh) between two running user sessions and record every frame on
 # its screen through the outer's transition, for `report.py`.
 #
-#   scripts/harness/switch.sh [--to USER] [--settle SECONDS] [--out DIR]
+#   scripts/harness/switch.sh [--transition STYLE] [--to USER] [--settle SECONDS] [--out DIR]
 #
 #   --to       the session to switch to: u2 (default) or claude; the other one is fronted first
 #   --settle   how long to keep recording once the outer fronts it (default 3)
 #   --out      where the run lands (default: target/harness/<run> in this checkout)
+#   --transition  how the outer draws switches: fade, curtain or depth (default: as it is)
 #
 # u2 is logged in in the background first if it has no session (`synoik-login open-session`).
 # The switch is logind's `ActivateSession`, as the greeter's unlock of a running session and
@@ -22,8 +23,10 @@ set -euo pipefail
 to=u2
 settle=3
 out=
+transition=
 while [ $# -gt 0 ]; do
     case $1 in
+    --transition) transition=$2; shift 2 ;;
     --to) to=$2; shift 2 ;;
     --settle) settle=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
@@ -32,12 +35,13 @@ while [ $# -gt 0 ]; do
 done
 case $to in u2) from=claude ;; claude) from=u2 ;; *) die "--to is u2 or claude" ;; esac
 
-run=switch-$to-$(date +%Y%m%d-%H%M%S)
+run=switch-$to${transition:+-$transition}-$(date +%Y%m%d-%H%M%S)
 out=${out:-$(dirname "$0")/../../target/harness/$run}
 mkdir -p "$out"
 
 boot
 wait_session 1
+[ -z "$transition" ] || set_transition "$transition"
 pid=$(supervisor)
 if [ -z "$(seat_session u2)" ]; then
     say "logging u2 in"
