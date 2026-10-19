@@ -34201,6 +34201,63 @@ fn a_window_dragged_to_a_smaller_display_is_sized_to_it_where_it_is_dropped() {
     assert_eq!(back.loc.x.round(), 400., "at the place it was dropped");
 }
 
+/// The exception to that: a window dropped across displays with its top-left corner off the
+/// desktop is not somewhere the user chose, so it is pulled wholly onto the work area at its
+/// fitted size.
+#[test]
+fn a_window_dropped_with_its_corner_off_a_smaller_display_is_pulled_onto_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    pointer_motion_to(&mut f, 960., 540.);
+    let surface = map_window_sized(&mut f, id, (1000, 900), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let settle = |f: &mut Fixture| ack_configures(f, id, std::slice::from_ref(&surface));
+    settle(&mut f);
+
+    // Grabbed 100 in from its left edge and let go 50 into display 2: the left edge, and the
+    // corner with it, is 50 columns back on display 1.
+    let (x, y) = focused_window_pos(&mut f);
+    pointer_motion_to(&mut f, x + 100., y + 100.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, 1920. + 50., 300.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    settle(&mut f);
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-2");
+
+    let area = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .unwrap()
+        .2
+        .working_area();
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .tile
+        .live_rect
+        .expect("it floats");
+    assert_eq!(
+        (rect.size.w.round(), rect.size.h.round()),
+        (1000., area.size.h.round()),
+        "it is fitted as any other drop is"
+    );
+    assert!(
+        area.contains_rect(rect),
+        "and pulled wholly onto the area: {rect:?} in {area:?}"
+    );
+}
+
 /// A window dragged so it straddles two displays is drawn on both, each showing the part of it
 /// that falls there — not only on the display the pointer is over.
 #[test]

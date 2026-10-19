@@ -405,8 +405,10 @@ area-to-area move (`FloatingSpace::fit_arrived`). The overview's drop keeps the 
 as a fraction of the area it left, so the window is first put back there, in that area, and moved
 from it exactly as its workspace would have been.
 
-A desktop drag across displays gets the size half only (`FloatingSpace::fit_arrived_size`): the user
+A desktop drag across displays gets the size half (`FloatingSpace::fit_arrived_size`): the user
 put the window where it is, so it stays there, sized to fit the new area or given its own size back.
+The exception is a drop that leaves the window's top-left corner off the desktop, which was not a
+place anyone chose: that window is also pulled wholly onto the area, at its fitted size.
 Such a drop keeps the remembered size that an in-area drop discards, re-based to the drop point, so
 nothing later moves the window back to where it once sat.
 

@@ -709,7 +709,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     /// The size half of [`Self::fit_arrived`], for a window the user dragged here across displays
     /// and put down where they wanted it: sized to fit this area, or given its own size back if
-    /// the area can hold it, and left exactly where it was dropped.
+    /// the area can hold it, and left where it was dropped — unless that left its top-left corner
+    /// off the desktop, when it is pulled wholly onto it.
     pub fn fit_arrived_size(&mut self, id: &W::Id, from: Rectangle<f64, Logical>) {
         let area = self.working_area;
         if from == area {
@@ -729,6 +730,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // and a later move must not try to.
         if fitted.size_restored {
             self.tiles[idx].displaced_rect = None;
+        }
+
+        // Except where the drop left the window's top-left corner off the desktop: then the place
+        // is no more chosen than the size was, and the window is pulled wholly onto the area at the
+        // size the fit asked for, the way a workspace move lands it.
+        let data = &mut self.data[idx];
+        if data.anchor == Anchor::Free && !area.contains(data.logical_pos) {
+            let size = fitted.tile_size.unwrap_or(data.size);
+            let pos = fully_onscreen(data.logical_pos, size, area);
+            data.set_logical_pos(pos);
+            if let Some(desired) = &mut self.tiles[idx].displaced_rect {
+                desired.loc = pos - area.loc;
+            }
         }
     }
 
