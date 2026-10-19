@@ -16,6 +16,8 @@
 #   HARNESS_DMG       the Limina build, mounted at $HARNESS_DIR/mnt when nothing is there yet
 #                     (the newest ~/Projects/LiminaParkingLot/Limina-*.dmg)
 #   HARNESS_SIZE      the display mode                      (1280x800)
+#   HARNESS_LIMINA_ARGS  more launch flags, e.g. `--acpi` for the ACPI machine, whose firmware
+#                     publishes its logo as a BGRT table   (none)
 
 HARNESS_HOST=${HARNESS_HOST:-alface}
 HARNESS_DIR=${HARNESS_DIR:-/Users/kov/Projects/synoik-harness}
@@ -71,7 +73,7 @@ boot() {
     on_host "cd '$HARNESS_DIR' && K=\$(cat ~/.ssh/id_ed25519.pub) && \
         LIMINA_INPUT_INJECT=1 LIMINA_DEBUG_PORT=1 ${HARNESS_LAUNCH_ENV:-} '$LIMINA' --disk '$HARNESS_DISK' --window --net \
         --ssh-port $HARNESS_SSH_PORT --display-resolution $HARNESS_SIZE --no-fingerprint --no-fido \
-        --console '${HARNESS_DISK%.raw}.console' \
+        --console '${HARNESS_DISK%.raw}.console' ${HARNESS_LIMINA_ARGS:-} \
         --smbios-oem-string \"io.systemd.credential:ssh.authorized_keys.root=\$K\" --detach && \
         ~/Projects/limina/scripts/wait-guest-ssh.sh '$HARNESS_DISK.limina.log' 170 >/dev/null 2>&1" \
         || die "the VM did not come up"
