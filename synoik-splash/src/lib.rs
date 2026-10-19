@@ -12,6 +12,7 @@ extern crate tracing;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
+pub mod bgrt;
 pub mod handoff;
 pub mod keyboard;
 pub mod layout;

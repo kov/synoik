@@ -10,7 +10,8 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::layout::{self, Dialog, Font, Images, Item, Point, Rect, Size};
+use crate::bgrt::Logo;
+use crate::layout::{self, Dialog, Firmware, Font, Images, Item, Point, Rect, Size};
 use crate::plymouth::Splash;
 use crate::text::{Fonts, Line};
 
@@ -62,6 +63,8 @@ impl Image {
 /// The theme's images, each one that failed to load left out, as the outer does.
 #[derive(Debug, Clone, Default)]
 pub struct Theme {
+    /// The firmware's logo, which [`Theme::load`] leaves to the caller: it is the machine's.
+    pub firmware: Option<Logo>,
     pub watermark: Option<Image>,
     /// All the frames or none: a spinner with a gap would stutter.
     pub spinner: Vec<Image>,
@@ -94,6 +97,7 @@ impl Theme {
             .map_err(|err| warn!("splash: {}: {err}", watermark.display()))
             .ok();
         Self {
+            firmware: None,
             watermark,
             spinner,
             lock: load("lock.png"),
@@ -104,9 +108,15 @@ impl Theme {
         }
     }
 
-    pub fn images(&self) -> Images {
+    /// The images' sizes, the firmware's logo placed for `panel` ([`layout::panel`]).
+    pub fn images(&self, panel: Size) -> Images {
         let size = |i: &Option<Image>| i.as_ref().map(|i| i.size);
         Images {
+            firmware: self.firmware.as_ref().map(|logo| Firmware {
+                size: logo.image.size,
+                offset: logo.offset,
+                panel,
+            }),
             watermark: size(&self.watermark),
             spinner: self.spinner.first().map(|i| (i.size, self.spinner.len())),
             lock: size(&self.lock),
@@ -161,6 +171,22 @@ impl Canvas<'_> {
     /// `image` over what is there, its top-left `at`.
     pub fn blend(&mut self, image: &Image, at: Point) {
         self.blend_region(image, Rect::new(Point::default(), image.size), at);
+    }
+
+    /// The part of `image` inside `clip` over what is there, the image's top-left `at`.
+    pub fn blend_within(&mut self, image: &Image, at: Point, clip: Rect) {
+        let x0 = at.x.max(clip.loc.x);
+        let y0 = at.y.max(clip.loc.y);
+        let x1 = (at.x + image.size.w).min(clip.loc.x + clip.size.w);
+        let y1 = (at.y + image.size.h).min(clip.loc.y + clip.size.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let src = Rect::new(
+            Point::from((x0 - at.x, y0 - at.y)),
+            Size::from((x1 - x0, y1 - y0)),
+        );
+        self.blend_region(image, src, Point::from((x0, y0)));
     }
 
     /// The part `src` of `image` over what is there, its top-left `at`.
@@ -236,10 +262,12 @@ pub struct Frame {
 }
 
 /// Lay out `splash` on the whole canvas, its spinner at `spinner_frame`, a password being typed
-/// as `dialog` says. Without `fonts`, or text they cannot shape, the text is left out.
+/// as `dialog` says, the firmware's logo placed for `panel` ([`layout::panel`]). Without `fonts`,
+/// or text they cannot shape, the text is left out.
 pub fn items(
     splash: &Splash,
     size: Size,
+    panel: Size,
     theme: &Theme,
     spinner_frame: usize,
     dialog: &Dialog,
@@ -258,7 +286,7 @@ pub fn items(
     let laid = layout::layout(
         splash,
         size,
-        &theme.images(),
+        &theme.images(panel),
         spinner_frame,
         dialog,
         &mut measure,
@@ -302,12 +330,23 @@ pub fn paint(canvas: &mut Canvas<'_>, frame: &Frame, theme: &Theme) {
     }
 }
 
-/// Repaint only the spinner's area: black, then its frame.
+/// Repaint only the spinner's area: the background under it, then its frame.
 pub fn paint_spinner(canvas: &mut Canvas<'_>, items: &[Item], theme: &Theme) {
     let Some(rect) = spinner_rect(items, theme) else {
         return;
     };
     canvas.fill(rect, [0., 0., 0.]);
+    // The images a large logo, or a small screen, may put under the spinner.
+    for item in items {
+        let (image, at) = match item {
+            Item::Firmware(at) => (theme.firmware.as_ref().map(|l| &l.image), at),
+            Item::Watermark(at) => (theme.watermark.as_ref(), at),
+            _ => continue,
+        };
+        if let Some(image) = image {
+            canvas.blend_within(image, *at, rect);
+        }
+    }
     for item in items {
         if matches!(item, Item::Spinner { .. }) {
             paint_item(canvas, item, theme);
@@ -317,6 +356,11 @@ pub fn paint_spinner(canvas: &mut Canvas<'_>, items: &[Item], theme: &Theme) {
 
 fn paint_item(canvas: &mut Canvas<'_>, item: &Item, theme: &Theme) {
     match item {
+        Item::Firmware(at) => {
+            if let Some(logo) = &theme.firmware {
+                canvas.blend(&logo.image, *at);
+            }
+        }
         Item::Watermark(at) => {
             if let Some(image) = &theme.watermark {
                 canvas.blend(image, *at);
@@ -412,7 +456,15 @@ mod tests {
             ..Splash::default()
         };
         let mut buf = Buffer::new(1280, 800);
-        let frame = items(&splash, buf.size, &theme, 7, &Dialog::default(), None);
+        let frame = items(
+            &splash,
+            buf.size,
+            buf.size,
+            &theme,
+            7,
+            &Dialog::default(),
+            None,
+        );
         paint(&mut buf.canvas(), &frame, &theme);
         // The layout's numbers for 1280×800 (`layout::tests`): watermark at 565×726, spinner
         // at 624×544.
@@ -437,13 +489,13 @@ mod tests {
         let size = buf.size;
         paint(
             &mut buf.canvas(),
-            &items(&splash, size, &theme, 7, &Dialog::default(), None),
+            &items(&splash, size, size, &theme, 7, &Dialog::default(), None),
             &theme,
         );
         let before = buf.bytes.clone();
         paint_spinner(
             &mut buf.canvas(),
-            &items(&splash, size, &theme, 8, &Dialog::default(), None).items,
+            &items(&splash, size, size, &theme, 8, &Dialog::default(), None).items,
             &theme,
         );
         assert_eq!(buf.at(624, 544), 0xff08_0000);
@@ -456,6 +508,70 @@ mod tests {
             })
             .count();
         assert_eq!(changed, 32 * 32);
+    }
+
+    /// [`theme`] with a solid blue logo, 300×600, its offsets not the panel's: the golden ratio
+    /// puts it at 490×5 on 1280×800, under the spinner.
+    fn theme_with_logo() -> Theme {
+        Theme {
+            firmware: Some(Logo {
+                image: solid(300, 600, 0xff00_00ff),
+                offset: Point::default(),
+            }),
+            ..theme()
+        }
+    }
+
+    #[test]
+    fn the_logo_is_the_background() {
+        let theme = theme_with_logo();
+        let splash = Splash {
+            shown: true,
+            ..Splash::default()
+        };
+        let mut buf = Buffer::new(1280, 800);
+        let frame = items(
+            &splash,
+            buf.size,
+            buf.size,
+            &theme,
+            7,
+            &Dialog::default(),
+            None,
+        );
+        paint(&mut buf.canvas(), &frame, &theme);
+        assert_eq!(buf.at(490, 5), 0xff00_00ff);
+        assert_eq!(buf.at(789, 604), 0xff00_00ff);
+        assert_eq!(buf.at(489, 5), 0xff00_0000);
+        assert_eq!(buf.at(490, 4), 0xff00_0000);
+        // The spinner over it.
+        assert_eq!(buf.at(624, 544), 0xff07_0000);
+    }
+
+    #[test]
+    fn a_turn_repaints_the_logo_under_the_spinner() {
+        let theme = theme_with_logo();
+        let splash = Splash {
+            shown: true,
+            ..Splash::default()
+        };
+        let mut buf = Buffer::new(1280, 800);
+        let size = buf.size;
+        let mut spinner = theme.clone();
+        // A spinner frame with a transparent corner, where the logo must show through.
+        spinner.spinner[8].pixels[0] = 0;
+        paint(
+            &mut buf.canvas(),
+            &items(&splash, size, size, &spinner, 7, &Dialog::default(), None),
+            &spinner,
+        );
+        paint_spinner(
+            &mut buf.canvas(),
+            &items(&splash, size, size, &spinner, 8, &Dialog::default(), None).items,
+            &spinner,
+        );
+        assert_eq!(buf.at(624, 544), 0xff00_00ff);
+        assert_eq!(buf.at(625, 544), 0xff08_0000);
     }
 
     #[test]
@@ -471,7 +587,7 @@ mod tests {
         let size = buf.size;
         paint(
             &mut buf.canvas(),
-            &items(&splash, size, &theme, 0, &Dialog::default(), None),
+            &items(&splash, size, size, &theme, 0, &Dialog::default(), None),
             &theme,
         );
         // The bar at 440×556, 400×5: half white, half #606060.
@@ -494,7 +610,7 @@ mod tests {
         let size = buf.size;
         paint(
             &mut buf.canvas(),
-            &items(&splash, size, &theme, 0, &Dialog::default(), None),
+            &items(&splash, size, size, &theme, 0, &Dialog::default(), None),
             &theme,
         );
         assert_eq!(buf.at(0, 0), 0xff80_8080);

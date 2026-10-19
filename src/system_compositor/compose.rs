@@ -24,6 +24,7 @@ use smithay::backend::renderer::{
     Texture as _,
 };
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Rectangle, Size, Transform};
+use synoik_splash::bgrt::{self, Logo};
 use synoik_splash::layout as geo;
 
 use super::plymouth::Splash;
@@ -164,6 +165,8 @@ pub(super) struct Compositor {
 
 /// The splash theme's images, as textures. One that failed to load is left out of the splash.
 struct Theme {
+    /// The firmware's logo, and where the firmware drew it (`synoik_splash::bgrt`).
+    firmware: Option<(VkTexture, geo::Point)>,
     watermark: Option<VkTexture>,
     spinner: Vec<VkTexture>,
     /// The password dialog's.
@@ -175,7 +178,27 @@ struct Theme {
 }
 
 impl Theme {
-    fn load(renderer: &mut VulkanRenderer, dir: &Path) -> Self {
+    /// The theme in `dir`, and the firmware's logo from the table in `bgrt`.
+    fn load(renderer: &mut VulkanRenderer, dir: &Path, bgrt: &Path) -> Self {
+        let firmware = Logo::load(bgrt).and_then(|logo| {
+            let bytes: Vec<u8> = logo
+                .image
+                .pixels
+                .iter()
+                .flat_map(|p| {
+                    let [b, g, r, a] = p.to_le_bytes();
+                    [r, g, b, a]
+                })
+                .collect();
+            let size = (logo.image.size.w, logo.image.size.h);
+            match renderer.import_memory(&bytes, Fourcc::Abgr8888, size.into(), false) {
+                Ok(texture) => Some((texture, logo.offset)),
+                Err(err) => {
+                    warn!("splash: firmware logo: uploading: {err:?}");
+                    None
+                }
+            }
+        });
         // All the frames or none: a spinner with a gap would stutter.
         let spinner = (1..)
             .map(|i| dir.join(format!("throbber-{i:04}.png")))
@@ -204,6 +227,7 @@ impl Theme {
             }
         };
         Self {
+            firmware,
             watermark,
             spinner,
             lock: load("lock.png"),
@@ -214,9 +238,20 @@ impl Theme {
         }
     }
 
-    fn images(&self) -> Images {
+    /// The images' sizes, the firmware's logo placed for `panel` ([`splash::panel`]): logical
+    /// pixels at `scale`, the panel's taken as the display's.
+    fn images(&self, panel: geo::Size, scale: f64) -> Images {
         let size = |t: &VkTexture| geo::Size::from((t.width() as i32, t.height() as i32));
+        let logical = |v: i32| (f64::from(v) / scale).round() as i32;
         Images {
+            firmware: self.firmware.as_ref().map(|(t, offset)| {
+                let t = size(t);
+                geo::Firmware {
+                    size: geo::Size::from((logical(t.w), logical(t.h))),
+                    offset: geo::Point::from((logical(offset.x), logical(offset.y))),
+                    panel: geo::Size::from((logical(panel.w), logical(panel.h))),
+                }
+            }),
             watermark: self.watermark.as_ref().map(size),
             spinner: self.spinner.first().map(|t| (size(t), self.spinner.len())),
             lock: self.lock.as_ref().map(size),
@@ -386,8 +421,9 @@ impl Compositor {
     }
 
     /// Draw `splash` into a free slot of `canvas` (avoiding `busy`) at `scale`, its spinner at
-    /// `spinner_frame`, a password being typed as `dialog` says. Returns the slot, its framebuffer
-    /// and the fence that completes the draw.
+    /// `spinner_frame`, a password being typed as `dialog` says, the firmware's logo placed for a
+    /// `panel` of that mode ([`splash::panel`]). Returns the slot, its framebuffer and the fence
+    /// that completes the draw.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_splash(
         &mut self,
@@ -396,6 +432,7 @@ impl Compositor {
         busy: Option<usize>,
         splash: &Splash,
         scale: f64,
+        panel: (u16, u16),
         spinner_frame: usize,
         dialog: &Dialog,
     ) -> anyhow::Result<(usize, Rc<PrimeFramebuffer>, Option<OwnedFd>)> {
@@ -406,7 +443,7 @@ impl Compositor {
             .find(|&i| Some(i) != busy)
             .context("no free scanout slot")?;
         let size = canvas.size;
-        let prepared = self.prepare_splash(splash, size, scale, spinner_frame, dialog);
+        let prepared = self.prepare_splash(splash, size, scale, panel, spinner_frame, dialog);
 
         self.renderer.set_finish_may_defer(true);
         let result = (|| {
@@ -441,26 +478,29 @@ impl Compositor {
     }
 
     fn theme(&mut self) -> &Theme {
-        self.theme
-            .get_or_insert_with(|| Theme::load(&mut self.renderer, Path::new(splash::THEME_DIR)))
+        self.theme.get_or_insert_with(|| {
+            let (dir, bgrt) = (Path::new(splash::THEME_DIR), Path::new(bgrt::DIR));
+            Theme::load(&mut self.renderer, dir, bgrt)
+        })
     }
 
     /// `splash` drawn into a texture the outer owns, `size` pixels: the picture a crossfade
     /// starts or ends on. Drawn into `reuse` when that is a picture of the same size, so a splash
     /// redrawn as its spinner turns allocates nothing. Queue order keeps the redraw after every
-    /// blend already submitted that reads it.
+    /// blend already submitted that reads it. `panel` as for [`Self::draw_splash`].
     #[allow(clippy::too_many_arguments)]
     pub fn splash_picture(
         &mut self,
         size: (u16, u16),
         splash: &Splash,
         scale: f64,
+        panel: (u16, u16),
         spinner_frame: usize,
         dialog: &Dialog,
         reuse: Option<VkTexture>,
     ) -> anyhow::Result<VkTexture> {
         let size: Size<i32, Physical> = Size::from((i32::from(size.0), i32::from(size.1)));
-        let prepared = self.prepare_splash(splash, size, scale, spinner_frame, dialog);
+        let prepared = self.prepare_splash(splash, size, scale, panel, spinner_frame, dialog);
         let reuse = reuse.filter(|t| (t.width() as i32, t.height() as i32) == (size.w, size.h));
         let mut target = match reuse {
             Some(texture) => texture,
@@ -496,10 +536,12 @@ impl Compositor {
         splash: &Splash,
         size: Size<i32, Physical>,
         scale: f64,
+        panel: (u16, u16),
         spinner_frame: usize,
         dialog: &Dialog,
     ) -> PreparedSplash {
-        let images = self.theme().images();
+        let panel = geo::Size::from((i32::from(panel.0), i32::from(panel.1)));
+        let images = self.theme().images(panel, scale);
         let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
         let logical = geo::Size::from((logical.w, logical.h));
 
@@ -600,6 +642,16 @@ fn paint_splash(
     let mut texts = prepared.texts.iter();
     for item in &prepared.items {
         match item {
+            Item::Firmware(at) => {
+                if let Some((t, _)) = theme.and_then(|t| t.firmware.as_ref()) {
+                    // At the scale the layout placed it: its pixels are the firmware's.
+                    let size = geo::Size::from((
+                        (f64::from(t.width() as i32) / prepared.scale).round() as i32,
+                        (f64::from(t.height() as i32) / prepared.scale).round() as i32,
+                    ));
+                    painter.image(t, logical(*at, size), 1.0)?;
+                }
+            }
             Item::Watermark(at) => {
                 if let Some(t) = theme.and_then(|t| t.watermark.as_ref()) {
                     painter.image(t, logical(*at, size_of(t)), 1.0)?;
@@ -975,9 +1027,17 @@ mod tests {
             ..Splash::default()
         };
         let mut texture = c
-            .splash_picture((1280, 800), &boot, 1., 0, &Dialog::default(), None)
+            .splash_picture(
+                (1280, 800),
+                &boot,
+                1.,
+                (1280, 800),
+                0,
+                &Dialog::default(),
+                None,
+            )
             .unwrap();
-        let images = c.theme.as_ref().unwrap().images();
+        let images = c.theme.as_ref().unwrap().images((1280, 800).into(), 1.);
         let (watermark, spinner) = (images.watermark.unwrap(), images.spinner.unwrap().0);
         let items = splash::layout(
             &boot,
@@ -1012,7 +1072,15 @@ mod tests {
         // spinner turns: nothing of the previous splash may show through.
         let reuse = Some(texture.clone());
         let mut texture = c
-            .splash_picture((1280, 800), &update, 1., 0, &Dialog::default(), reuse)
+            .splash_picture(
+                (1280, 800),
+                &update,
+                1.,
+                (1280, 800),
+                0,
+                &Dialog::default(),
+                reuse,
+            )
             .unwrap();
         let px = pixels(&mut c, &mut texture);
         // The bar at 440×556, 400×5: white to half, grey after.
@@ -1040,7 +1108,15 @@ mod tests {
             keymap: Some("English (US)".into()),
         };
         let mut texture = c
-            .splash_picture((1280, 800), &asking, 1., 0, &dialog, Some(texture.clone()))
+            .splash_picture(
+                (1280, 800),
+                &asking,
+                1.,
+                (1280, 800),
+                0,
+                &dialog,
+                Some(texture.clone()),
+            )
             .unwrap();
         let laid = splash::layout(
             &asking,
@@ -1074,6 +1150,7 @@ mod tests {
                 (1280, 800),
                 &update,
                 1.,
+                (1280, 800),
                 0,
                 &Dialog::default(),
                 Some(texture.clone()),
@@ -1082,5 +1159,101 @@ mod tests {
         let px = pixels(&mut c, &mut texture);
         assert!(brightest(&px, wm) > 128);
         assert_eq!(brightest(&px, rect(0, 0, 1280, wm.loc.y)), 0);
+    }
+
+    /// A BGRT table as the kernel exports it, in a fresh directory: a `w`×`h` logo of one
+    /// colour (0xRRGGBB), its top-left at `offset`.
+    fn bgrt_table(
+        name: &str,
+        w: usize,
+        h: usize,
+        rgb: u32,
+        offset: (i32, i32),
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("synoik-bgrt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pitch = (3 * w + 3) & !3;
+        let mut bmp = Vec::new();
+        bmp.extend(b"BM");
+        bmp.extend(((54 + pitch * h) as u32).to_le_bytes());
+        bmp.extend(0u32.to_le_bytes());
+        bmp.extend(54u32.to_le_bytes());
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend((w as i32).to_le_bytes());
+        bmp.extend((h as i32).to_le_bytes());
+        bmp.extend(1u16.to_le_bytes());
+        bmp.extend(24u16.to_le_bytes());
+        bmp.extend([0; 24]);
+        for _ in 0..h {
+            for _ in 0..w {
+                bmp.extend([rgb as u8, (rgb >> 8) as u8, (rgb >> 16) as u8]);
+            }
+            bmp.extend(vec![0; pitch - 3 * w]);
+        }
+        std::fs::write(dir.join("image"), bmp).unwrap();
+        std::fs::write(dir.join("status"), "1\n").unwrap();
+        std::fs::write(dir.join("xoffset"), format!("{}\n", offset.0)).unwrap();
+        std::fs::write(dir.join("yoffset"), format!("{}\n", offset.1)).unwrap();
+        dir
+    }
+
+    /// The firmware's logo where the layout puts it, in its own colours, as Limina's firmware
+    /// gives it at 1280×800; gone under a password prompt.
+    #[test]
+    fn the_splash_draws_the_firmware_logo() {
+        let Some(mut c) = compositor() else { return };
+        let dir = bgrt_table("compose", 256, 256, 0x20_80ff, (512, 272));
+        c.theme = Some(Theme::load(
+            &mut c.renderer,
+            Path::new(splash::THEME_DIR),
+            &dir,
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let boot = Splash {
+            shown: true,
+            ..Splash::default()
+        };
+        let mut texture = c
+            .splash_picture(
+                (1280, 800),
+                &boot,
+                1.,
+                (1280, 800),
+                0,
+                &Dialog::default(),
+                None,
+            )
+            .unwrap();
+        let px = pixels(&mut c, &mut texture);
+        let (width, bytes) = &px;
+        let at = |x: i32, y: i32| {
+            let i = ((y * width + x) * 4) as usize;
+            [bytes[i], bytes[i + 1], bytes[i + 2]]
+        };
+        assert_eq!(at(512, 272), [0x20, 0x80, 0xff]);
+        assert_eq!(at(767, 527), [0x20, 0x80, 0xff]);
+        assert_eq!(at(511, 272), [0, 0, 0]);
+        assert_eq!(at(512, 271), [0, 0, 0]);
+
+        let asking = Splash {
+            shown: true,
+            password_prompt: Some(super::super::plymouth::Prompt { text: None }),
+            ..Splash::default()
+        };
+        let mut texture = c
+            .splash_picture(
+                (1280, 800),
+                &asking,
+                1.,
+                (1280, 800),
+                0,
+                &Dialog::default(),
+                Some(texture),
+            )
+            .unwrap();
+        let px = pixels(&mut c, &mut texture);
+        assert_eq!(brightest(&px, rect(512, 272, 256, 16)), 0);
     }
 }

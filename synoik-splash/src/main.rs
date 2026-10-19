@@ -27,6 +27,7 @@ use std::{fs, io};
 use drm::buffer::DrmFourcc;
 use drm::control::dumbbuffer::DumbBuffer;
 use drm::control::{connector, crtc, framebuffer, Device as _, Mode, ModeTypeFlags, PageFlipFlags};
+use synoik_splash::bgrt::{self, Logo};
 use synoik_splash::handoff::{self, State};
 use synoik_splash::keyboard::{self, Entry, Keyboard};
 use synoik_splash::layout::{self, Dialog, Size};
@@ -79,6 +80,8 @@ struct Display {
     conn: connector::Handle,
     mode: Mode,
     size: Size,
+    /// Its connector is a built-in panel ([`layout::is_built_in`]).
+    built_in: bool,
     bufs: [Buf; 2],
     /// The buffer on screen, once one is.
     front: Option<usize>,
@@ -198,7 +201,10 @@ fn run() -> io::Result<()> {
     let mut splash = Splash {
         // plymouthd answers root only (`ply-boot-server.c:265-285`).
         server: Server::new(0),
-        theme: Theme::load(Path::new(layout::THEME_DIR)),
+        theme: Theme {
+            firmware: Logo::load(Path::new(bgrt::DIR)),
+            ..Theme::load(Path::new(layout::THEME_DIR))
+        },
         fonts: Fonts::load(&[Path::new(text::FONT_FILE)]),
         keyboard: open_keyboard(),
         entry: Entry::default(),
@@ -483,7 +489,8 @@ impl Splash {
             };
             taken.push(crtc);
             match Display::new(card, crtc, handle, mode) {
-                Ok(display) => {
+                Ok(mut display) => {
+                    display.built_in = layout::is_built_in(conn.interface().as_str());
                     let (w, h) = mode.size();
                     info!("lighting {:?} at {w}x{h}", conn.interface());
                     self.displays.push(display);
@@ -493,16 +500,23 @@ impl Splash {
         }
     }
 
+    /// The display that stands for the one the firmware drew its logo on.
+    fn panel(&self) -> Size {
+        layout::panel(self.displays.iter().map(|d| (d.built_in, d.size))).unwrap_or_default()
+    }
+
     /// The first frame on every display: a modeset, as plymouthd's first frame is.
     fn light(&mut self) {
         let state = (self.revision, self.spinner_frame());
         let splash = self.server.splash().clone();
         let dialog = self.dialog();
         let Some(card) = &self.card else { return };
+        let panel = self.panel();
         for display in &mut self.displays {
             let frame = paint::items(
                 &splash,
                 display.size,
+                panel,
                 &self.theme,
                 state.1,
                 &dialog,
@@ -530,6 +544,7 @@ impl Splash {
         let splash = self.server.splash().clone();
         let dialog = self.dialog();
         let Some(card) = &self.card else { return };
+        let panel = self.panel();
         for display in &mut self.displays {
             let Some(front) = display.front else { continue };
             if display.flip_pending || display.shows == Some(state) {
@@ -539,6 +554,7 @@ impl Splash {
             let frame = paint::items(
                 &splash,
                 display.size,
+                panel,
                 &self.theme,
                 state.1,
                 &dialog,
@@ -794,6 +810,7 @@ impl Display {
             conn,
             mode,
             size: Size::from((i32::from(w), i32::from(h))),
+            built_in: false,
             bufs,
             front: None,
             flip_pending: false,

@@ -53,9 +53,9 @@ use synoik_splash::{handoff, peer_cred};
 mod boot;
 
 use self::boot::{BootSplash, Plymouth};
-use super::chord;
 use super::compose::{Canvas, Compositor, Motion, Picture, Style, Way, PLATE};
 use super::protocol::{self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter};
+use super::{chord, splash};
 use crate::backend::tty::{edid_blob, format_connector_name, refresh_interval};
 use crate::backend::vulkan_scanout::{framebuffer_from_dmabuf, PrimeFramebuffer};
 use crate::render_helpers::vulkan::VkTexture;
@@ -1042,6 +1042,7 @@ impl Outer {
     /// Bring the displays to [`Self::wanted_layout`]. Returns the displays it left as they were;
     /// every other lit one shows the plate, or waits for its flip to land first.
     fn relayout(&mut self) -> HashSet<String> {
+        let panel = self.splash_panel();
         let wanted = self.wanted_layout();
         let names: Vec<String> = self.displays.keys().cloned().collect();
         for name in names {
@@ -1059,7 +1060,33 @@ impl Outer {
                 None => self.light(&name, mode),
             }
         }
+        // The firmware's logo is placed for the panel: a new one moves it on every display, so
+        // the splash is out of date on the ones kept too.
+        if self.splash_panel() != panel {
+            if let Some(boot) = &mut self.boot {
+                boot.revision += 1;
+            }
+        }
         kept
+    }
+
+    /// The display that stands for the one the firmware drew its logo on (`splash::panel`),
+    /// from the lit ones in the card's connector order.
+    fn splash_panel(&self) -> (u16, u16) {
+        let mut lit: Vec<_> = self
+            .displays
+            .iter()
+            .filter_map(|(name, d)| Some((u32::from(self.connectors.get(name)?.handle), name, d)))
+            .collect();
+        lit.sort_by_key(|(handle, ..)| *handle);
+        let lit = lit.into_iter().map(|(_, name, d)| {
+            let (w, h) = d.size();
+            (
+                splash::is_built_in(name),
+                splash::Size::from((i32::from(w), i32::from(h))),
+            )
+        });
+        splash::panel(lit).map_or((0, 0), |s| (s.w as u16, s.h as u16))
     }
 
     /// [`Self::relayout`], then put the fronted session's newest frame on every display that was
@@ -1203,6 +1230,7 @@ impl Outer {
         let (revision, frame) = self.splash_state();
         let splash = self.plymouth.server.splash().clone();
         let dialog = self.splash_dialog();
+        let panel = self.splash_panel();
         let display = self.displays.get_mut(d)?;
         let busy = match &display.on_screen {
             Shown::Composite { slot, .. } | Shown::Splash { slot, .. } => Some(*slot),
@@ -1215,6 +1243,7 @@ impl Outer {
             busy,
             &splash,
             1.,
+            panel,
             frame,
             &dialog,
         ) {
@@ -2303,10 +2332,11 @@ impl Outer {
         };
         let splash = self.plymouth.server.splash().clone();
         let dialog = self.splash_dialog();
+        let panel = self.splash_panel();
         let Some(compositor) = self.compositor.as_mut() else {
             return plate_picture();
         };
-        match compositor.splash_picture(size, &splash, 1., state.1, &dialog, reuse) {
+        match compositor.splash_picture(size, &splash, 1., panel, state.1, &dialog, reuse) {
             Ok(texture) => {
                 let picture = Picture::Texture(texture);
                 if let Some(display) = self.displays.get_mut(d) {

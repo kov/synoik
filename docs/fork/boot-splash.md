@@ -224,8 +224,19 @@ What `two-step` draws for `bgrt` (`src/plugins/splash/two-step/plugin.c`,
 `/usr/share/plymouth/themes/bgrt/bgrt.plymouth`, inheriting `spinner`), per display, in logical
 pixels for a display of W×H:
 
-- **Background:** black. With an ACPI BGRT table (absent in Limina VMs), the firmware logo,
-  centred horizontally with its centre at 38.2 % of the height.
+- **Background:** black, and the firmware's logo where the kernel exports an ACPI BGRT table
+  (`/sys/firmware/acpi/bgrt`; `synoik-splash/src/bgrt.rs`, a 24-bit BMP as plymouth reads it).
+  Limina publishes one only on its ACPI machine (`limina --acpi`); a device-tree boot has none.
+  Placement is two-step's `view_set_bgrt_background` (`layout.rs` `place_firmware`): centred
+  horizontally with its centre at 38.2 % of the height, unless the firmware's x offset centres it
+  on the *panel*, in which case its offsets hold there and other displays shift by half the extra
+  width and 38.2 % of the extra height. The panel is the last built-in (LVDS, eDP, DSI) display,
+  else the first in connector order (the drm renderer's rule), so on Limina at 1280×800 the logo
+  stays at the firmware's 512×272. A logo for a rotated panel (status orientation bits) is left
+  out, as two-step leaves it out on an upright one; the splash never rotates a panel. Shown in
+  boot, shutdown and reboot and in the retained frame, not in the update modes, and cleared under a
+  password dialog (`DialogClearsFirmwareBackground`). Both drawers read the table when they load
+  the theme.
 - **Spinner:** the theme's 30 `throbber-*.png` frames (the installed set; Fedora replaced the
   checkout's), 32×32, one turn per 2 s, top-left at (0.5W−16, 0.7H−16).
 - **Watermark:** `watermark.png` (149×43, the same file as `/usr/share/pixmaps/fedora-gdm-logo.png`),

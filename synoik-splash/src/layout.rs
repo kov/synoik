@@ -148,10 +148,44 @@ pub const SPINNER_PERIOD: Duration = Duration::from_secs(2);
 /// The spinner's frame rate (`ply-throbber.c` `FRAMES_PER_SECOND`): how often it needs a redraw.
 pub const SPINNER_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
+/// The firmware's boot logo (`crate::bgrt`): its size, where the firmware put its top-left, and
+/// the mode of the display that stands for the panel the firmware drew it on ([`panel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Firmware {
+    pub size: Size,
+    pub offset: Point,
+    pub panel: Size,
+}
+
+/// The display two-step takes for the one the firmware drew its logo on, from every lit display in
+/// the card's connector order: whether its connector is a built-in panel, and its mode. The last
+/// built-in panel, else the first display (the drm renderer's `ply_renderer_head_new` keeps the
+/// first output's mode unless a built-in one comes along).
+pub fn panel(displays: impl IntoIterator<Item = (bool, Size)>) -> Option<Size> {
+    let mut panel = None;
+    for (built_in, size) in displays {
+        if panel.is_none() || built_in {
+            panel = Some(size);
+        }
+    }
+    panel
+}
+
+/// Whether a connector, by its type's name (`eDP` in `eDP-1`), is a built-in panel: the drm
+/// renderer's LVDS, eDP and DSI.
+pub fn is_built_in(connector: &str) -> bool {
+    let kind = connector
+        .rsplit_once('-')
+        .map_or(connector, |(kind, _)| kind);
+    matches!(kind, "LVDS" | "eDP" | "DSI")
+}
+
 /// The sizes of the images the theme provides; `None` for one that failed to load, which the
 /// splash then leaves out.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Images {
+    /// Not the theme's, but drawn as its background in the modes that use it.
+    pub firmware: Option<Firmware>,
     pub watermark: Option<Size>,
     /// One frame's size, and how many frames there are.
     pub spinner: Option<(Size, usize)>,
@@ -178,6 +212,8 @@ pub struct Dialog {
 /// One thing on screen, over a black background.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
+    /// The firmware's logo, part of the background: always first.
+    Firmware(Point),
     Watermark(Point),
     Spinner {
         frame: usize,
@@ -220,6 +256,33 @@ fn titles(mode: Mode) -> Option<(&'static str, &'static str)> {
     Some((title, "Do not turn off your computer"))
 }
 
+/// Where the firmware's logo goes on a `screen` (two-step's `view_set_bgrt_background`, at
+/// scale 1 and with neither the logo nor the panel rotated): centred horizontally with its centre
+/// at 38.2 % of the height, the Microsoft boot logo rule; but where the firmware's own offset
+/// centres it horizontally on the panel, that offset, the screen's difference from the panel split
+/// as the default splits it. So on the panel itself, the logo stays where the firmware left it.
+/// `None` when it would start off the screen's top or left.
+///
+/// two-step trusts the offsets on both axes alone, without a panel; its drm renderer always has
+/// one, so that rule never applies.
+fn place_firmware(firmware: &Firmware, screen: Size) -> Option<Point> {
+    let Firmware {
+        size,
+        offset,
+        panel,
+    } = *firmware;
+    // C's `int` arithmetic, truncating towards zero, as Rust's does.
+    let (x, y) = if (panel.w - size.w) / 2 == offset.x {
+        (
+            offset.x + (screen.w - panel.w) / 2,
+            offset.y + (screen.h - panel.h) * 382 / 1000,
+        )
+    } else {
+        ((screen.w - size.w) / 2, screen.h * 382 / 1000 - size.h / 2)
+    };
+    (x >= 0 && y >= 0).then(|| Point::from((x, y)))
+}
+
 /// The spinner frame `elapsed` into its animation (`ply-throbber.c` `animate_at_time`).
 pub fn spinner_frame(elapsed: Duration, frames: usize) -> usize {
     let period = SPINNER_PERIOD.as_secs_f64();
@@ -232,8 +295,8 @@ pub fn spinner_frame(elapsed: Duration, frames: usize) -> usize {
 /// `dialog` is what has been typed into a password prompt, if one is up.
 ///
 /// A splash not `shown` is the frame plymouth leaves behind on `quit --retain-splash`: the
-/// background and the watermark. It is what the outer shows from the handover until the greeter's
-/// first frame.
+/// background, the firmware's logo where the mode shows it, and the watermark. It is what the outer
+/// shows from the handover until the greeter's first frame.
 pub fn layout(
     splash: &Splash,
     screen: Size,
@@ -245,6 +308,14 @@ pub fn layout(
     let (w, h) = (f64::from(screen.w), f64::from(screen.h));
     let mut items = Vec::new();
 
+    // bgrt's boot, shutdown and reboot modes draw the logo (`UseFirmwareBackground`); the update
+    // modes do not, and a password dialog clears it (`DialogClearsFirmwareBackground`).
+    let firmware = images
+        .firmware
+        .filter(|_| titles(splash.mode).is_none() && splash.password_prompt.is_none());
+    if let Some(at) = firmware.and_then(|f| place_firmware(&f, screen)) {
+        items.push(Item::Firmware(at));
+    }
     if let Some(size) = images.watermark {
         // `screen * align - image * align`, not `(screen - image) * align`: the same arithmetic,
         // rounded the same way.
@@ -465,6 +536,7 @@ mod tests {
     /// The installed theme's images.
     fn images() -> Images {
         Images {
+            firmware: None,
             watermark: Some(Size::from((149, 43))),
             spinner: Some((Size::from((32, 32)), 30)),
             lock: Some(Size::from((35, 34))),
@@ -783,5 +855,118 @@ mod tests {
         assert_eq!(spinner_frame(ms(2000), 30), 0);
         assert_eq!(spinner_frame(ms(5000), 30), 15);
         assert_eq!(spinner_frame(ms(5000), 0), 0);
+    }
+
+    /// Limina's logo: 256×256, centred on its 1280×800 display.
+    fn with_logo(panel: (i32, i32)) -> Images {
+        Images {
+            firmware: Some(Firmware {
+                size: Size::from((256, 256)),
+                offset: Point::from((512, 272)),
+                panel: Size::from(panel),
+            }),
+            ..images()
+        }
+    }
+
+    fn lay_with(splash: &Splash, images: &Images, w: i32, h: i32) -> Vec<Item> {
+        layout(
+            splash,
+            Size::from((w, h)),
+            images,
+            7,
+            &Dialog::default(),
+            &mut measure,
+        )
+    }
+
+    #[test]
+    fn the_logo_stays_where_the_firmware_left_it() {
+        // Measured on Limina at 1280×800 (`--acpi`): the firmware's offsets centre the logo on
+        // both axes, and the panel is the display.
+        let items = lay_with(&shown(Mode::BootUp), &with_logo((1280, 800)), 1280, 800);
+        assert_eq!(items[0], Item::Firmware(Point::from((512, 272))));
+        assert!(matches!(items[1], Item::Watermark(_)));
+    }
+
+    #[test]
+    fn another_display_splits_the_difference_as_the_default_does() {
+        // 1920×1080 beside the 1280×800 panel: the panel's offset, plus half the extra width
+        // and 38.2 % of the extra height.
+        let items = lay_with(&shown(Mode::BootUp), &with_logo((1280, 800)), 1920, 1080);
+        assert_eq!(
+            items[0],
+            Item::Firmware(Point::from((512 + 320, 272 + 280 * 382 / 1000)))
+        );
+    }
+
+    #[test]
+    fn offsets_for_another_mode_give_the_golden_ratio() {
+        // The firmware drew at 1024×768 (centred: x = 384), the panel came up at 1280×800: the
+        // offsets are not the panel's, so the Microsoft rule places it.
+        let images = Images {
+            firmware: Some(Firmware {
+                size: Size::from((256, 256)),
+                offset: Point::from((384, 256)),
+                panel: Size::from((1280, 800)),
+            }),
+            ..images()
+        };
+        let items = lay_with(&shown(Mode::BootUp), &images, 1280, 800);
+        assert_eq!(
+            items[0],
+            Item::Firmware(Point::from((512, 800 * 382 / 1000 - 128)))
+        );
+    }
+
+    #[test]
+    fn a_logo_starting_off_screen_is_left_out() {
+        let items = lay_with(&shown(Mode::BootUp), &with_logo((1280, 800)), 200, 100);
+        assert!(!items.iter().any(|i| matches!(i, Item::Firmware(_))));
+    }
+
+    #[test]
+    fn the_logo_shows_where_bgrt_uses_the_firmware_background() {
+        let logo = with_logo((1280, 800));
+        let has_logo = |splash: &Splash| {
+            lay_with(splash, &logo, 1280, 800)
+                .iter()
+                .any(|i| matches!(i, Item::Firmware(_)))
+        };
+        for mode in [Mode::BootUp, Mode::Shutdown, Mode::Reboot] {
+            assert!(has_logo(&shown(mode)), "{mode:?}");
+            // And in the frame `quit --retain-splash` leaves.
+            assert!(
+                has_logo(&Splash {
+                    mode,
+                    ..Splash::default()
+                }),
+                "{mode:?}"
+            );
+        }
+        for mode in [
+            Mode::Updates,
+            Mode::SystemUpgrade,
+            Mode::FirmwareUpgrade,
+            Mode::SystemReset,
+        ] {
+            assert!(!has_logo(&shown(mode)), "{mode:?}");
+        }
+        // A password dialog clears it.
+        assert!(!has_logo(&prompting(Mode::BootUp, Some("Passphrase:"))));
+    }
+
+    #[test]
+    fn the_panel_is_the_built_in_display_else_the_first() {
+        let (a, b, c) = (
+            Size::from((1920, 1080)),
+            Size::from((2560, 1600)),
+            Size::from((1280, 800)),
+        );
+        assert_eq!(panel([(false, a), (true, b), (false, c)]), Some(b));
+        assert_eq!(panel([(false, a), (false, c)]), Some(a));
+        assert_eq!(panel([]), None);
+        assert!(is_built_in("eDP-1") && is_built_in("LVDS-2") && is_built_in("DSI-1"));
+        assert!(!is_built_in("Virtual-1") && !is_built_in("DP-1") && !is_built_in("HDMI-A-1"));
     }
 }
