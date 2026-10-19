@@ -10903,6 +10903,181 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
     }
 }
 
+/// A sideways two-finger scroll in the overview moves an overflowing workspace row and
+/// switches nothing (**divergence**: gnome-shell's row always fits, so there is nothing to
+/// scroll). The delta is read in the scroll-view sense — libinput has already applied the
+/// device's natural-scrolling setting — so `-dx` brings in the row's start. The scroll
+/// stops dead at the row's ends, holds after the pointer leaves the band, and lets go when
+/// a workspace is activated.
+#[test]
+fn overview_sideways_scroll_moves_the_strip_without_switching() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 12);
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    let band = overview_controls(&mut f).workspace_row;
+    // Over the picker, well clear of the band: the scroll is the overview's, not the row's.
+    pointer_motion_to(&mut f, 960., 700.);
+
+    let xs = |f: &mut Fixture| -> Vec<f64> {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .thumbnail_strip()
+            .unwrap()
+            .thumbs
+            .iter()
+            .map(|r| r.loc.x)
+            .collect()
+    };
+    let active = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    let scroll = |f: &mut Fixture, dx: f64, n: usize| {
+        for _ in 0..n {
+            f.advance_input_time(10);
+            f.scroll_finger(dx, 0.);
+        }
+        f.advance_input_time(10);
+        f.scroll_finger(0., 0.);
+        f.settle();
+    };
+
+    let was_active = active(&mut f);
+    let rest = xs(&mut f);
+    assert!(
+        rest[0] < band.loc.x,
+        "the last workspace is active, so the row's start must be off screen: {rest:?}"
+    );
+
+    scroll(&mut f, -10., 10);
+    let scrolled = xs(&mut f);
+    assert_eq!(active(&mut f), was_active, "a scroll must not switch");
+    for (now, then) in scrolled.iter().zip(&rest) {
+        assert!(
+            (now - then - 100.).abs() <= 1.,
+            "the row must follow the scroll 1:1: {scrolled:?} from {rest:?}"
+        );
+    }
+
+    // The row was already at its end; pushing it further that way goes nowhere…
+    scroll(&mut f, 10., 100);
+    assert_eq!(xs(&mut f), rest, "the row must stop at its end");
+    // …and the way back is live on the first pixel.
+    scroll(&mut f, -10., 10);
+    assert_eq!(xs(&mut f), scrolled);
+
+    // Unlike a click's hold, a scroll is not let go when the pointer moves off.
+    pointer_motion_to(&mut f, 960., band.loc.y + band.size.h + 300.);
+    f.run_frames_for(Duration::from_millis(1000));
+    f.settle();
+    assert_eq!(xs(&mut f), scrolled, "the scroll must hold");
+
+    // Activating a workspace lets go of the scroll: there and back again, the row is where
+    // the active workspace puts it, not where it was scrolled to.
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle();
+    assert_eq!(active(&mut f), was_active);
+    assert_eq!(xs(&mut f), rest, "an activation must let go of the scroll");
+}
+
+/// A row that fits its band has nothing to scroll.
+#[test]
+fn overview_sideways_scroll_leaves_a_fitting_strip_alone() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    f.settle();
+    pointer_motion_to(&mut f, 960., 700.);
+
+    let xs = |f: &mut Fixture| -> Vec<f64> {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .thumbnail_strip()
+            .unwrap()
+            .thumbs
+            .iter()
+            .map(|r| r.loc.x)
+            .collect()
+    };
+    let rest = xs(&mut f);
+    for _ in 0..10 {
+        f.advance_input_time(10);
+        f.scroll_finger(-10., 0.);
+    }
+    f.scroll_finger(0., 0.);
+    f.settle();
+    assert_eq!(xs(&mut f), rest);
+}
+
+/// A window carried to the end of an overflowing workspace row scrolls it, so it can be
+/// dropped on a workspace that was off screen when the drag began.
+#[test]
+fn overview_window_drag_at_the_strip_edge_scrolls_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 12);
+    // Onto the last populated workspace, so there is a window to carry.
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.settle();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    let band = overview_controls(&mut f).workspace_row;
+    let first = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[0]
+    };
+    assert!(
+        first(&mut f).loc.x < band.loc.x,
+        "the first workspace must start off screen"
+    );
+
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, rect.loc.x + rect.size.w / 2., rect.loc.y + 10.);
+    // Parked against the band's left edge, the row comes towards the pointer on its own.
+    let mid_y = band.loc.y + band.size.h / 2.;
+    pointer_motion_to(&mut f, band.loc.x + 2., mid_y);
+    f.run_frames_for(Duration::from_millis(5000));
+    let reached = first(&mut f);
+    assert!(
+        reached.loc.x >= band.loc.x,
+        "the row must have scrolled its start into view, at {reached:?}"
+    );
+
+    let (tx, ty) = thumbnail_center(&mut f, 0);
+    pointer_motion_to(&mut f, tx, ty);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+
+    let idx = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .map(|(_, idx, _)| idx);
+    assert_eq!(idx, Some(0), "the drop must land on the first workspace");
+}
+
 /// The thumbnails strip fills the band the overview layout allocates it, just
 /// below the search entry — not a band derived from the workspace zoom.
 #[test]

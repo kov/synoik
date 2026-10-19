@@ -728,6 +728,8 @@ bitflags::bitflags! {
         const THUMB_PLACEHOLDER_LINGER = 1 << 31;
         /// App Exposé opening, closing, or following a swipe (`docs/fork/app-expose.md`).
         const APP_EXPOSE = 1 << 32;
+        /// A drag parked at an end of the workspace row, scrolling it.
+        const THUMB_EDGE_SCROLL = 1 << 33;
     }
 }
 
@@ -789,6 +791,7 @@ impl AnimCauses {
                 "thumb-placeholder-linger",
             ),
             (AnimCauses::APP_EXPOSE, "app-expose"),
+            (AnimCauses::THUMB_EDGE_SCROLL, "thumb-edge-scroll"),
         ];
         TABLE
             .iter()

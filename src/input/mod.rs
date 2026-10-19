@@ -10237,8 +10237,23 @@ impl State {
                     .overview_scroll_swipe_gesture
                     .update(horizontal, vertical);
                 let is_vertical = self.synoik.overview_scroll_swipe_gesture.is_vertical();
+                let gnome_mode = self.synoik.layout.is_gnome_mode();
 
-                if action.end() {
+                if !is_vertical && gnome_mode {
+                    // Sideways, the workspace row under the pointer scrolls, switching nothing
+                    // (**divergence**: gnome-shell's row always fits, so it has nothing to
+                    // scroll; `docs/fork/dynamic-workspaces-divergence.md`). libinput has
+                    // already applied the device's natural-scrolling setting to the delta, so
+                    // it is read in the scroll-view sense like any other scroll on the desktop.
+                    if !action.end() {
+                        if let Some(output) = self.synoik.output_under_cursor() {
+                            redraw |= self
+                                .synoik
+                                .layout
+                                .scroll_thumbnail_strip(&output, horizontal);
+                        }
+                    }
+                } else if action.end() {
                     if is_vertical {
                         redraw |= self
                             .synoik

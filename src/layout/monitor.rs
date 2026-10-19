@@ -140,6 +140,14 @@ const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.075;
 /// because it is the same question about the same pointer.
 const STRIP_FREEZE_MS: u32 = 750;
 
+/// How far in from either end of the row's band a drag starts scrolling it, as a fraction of a
+/// thumbnail's width — see [`Monitor::strip_edge_scroll`].
+const STRIP_EDGE_SCROLL_ZONE: f64 = 0.25;
+
+/// How fast a drag pressed right up against the band's edge scrolls the row, in thumbnail
+/// widths a second.
+const STRIP_EDGE_SCROLL_SPEED: f64 = 2.5;
+
 /// How long a drag has to linger in one strip gap before the row parts for it — see
 /// [`PlaceholderLinger`]. The same `WINDOW_REPOSITIONING_DELAY` every other
 /// hold-the-pointer-still answer on this row runs on.
@@ -282,6 +290,9 @@ pub struct Monitor<W: LayoutElement> {
     /// The row's scroll, held past a click on one of its own thumbnails — see
     /// [`StripFreeze`].
     thumb_scroll_freeze: Option<StripFreeze>,
+    /// When a drag parked at the row's edge last scrolled it — see
+    /// [`Self::strip_edge_scroll`]. `None` while nothing is in an edge zone.
+    thumb_edge_scroll: Option<Duration>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -501,6 +512,11 @@ struct StripFreeze {
     /// `Some` releases when it is done, and *does* claim one, which is what guarantees a frame
     /// arrives to notice.
     hold: Option<Animation>,
+    /// The user put the row here — a sideways scroll, or a drag parked at its edge — rather
+    /// than a click leaving it where it was. Such a hold does not run out when the pointer
+    /// leaves the band: the row stays where it was scrolled to until something activates a
+    /// workspace, which recentres it the way any activation does.
+    scrolled: bool,
 }
 
 /// A drag hovering one of the row's interior gaps, waiting to be taken seriously.
@@ -891,6 +907,7 @@ impl<W: LayoutElement> Monitor<W> {
             thumb_hairline: FocusRing::new(thumbnail_hairline_config()),
             thumb_placeholder_linger: None,
             thumb_drag: None,
+            thumb_edge_scroll: None,
             thumb_phantom: None,
             thumb_row_slide: None,
             thumb_close_slide: None,
@@ -1107,8 +1124,19 @@ impl<W: LayoutElement> Monitor<W> {
         let focus = self.workspace_render_idx();
         self.activate_workspace_inner(idx, None);
         match &mut self.thumb_scroll_freeze {
-            Some(freeze) => freeze.hold = None,
-            None => self.thumb_scroll_freeze = Some(StripFreeze { focus, hold: None }),
+            Some(freeze) => {
+                freeze.hold = None;
+                // From here on it is a click's hold: the row stays put under the pointer, and
+                // recentres on the new workspace once the pointer leaves.
+                freeze.scrolled = false;
+            }
+            None => {
+                self.thumb_scroll_freeze = Some(StripFreeze {
+                    focus,
+                    hold: None,
+                    scrolled: false,
+                })
+            }
         }
     }
 
@@ -2060,6 +2088,11 @@ impl<W: LayoutElement> Monitor<W> {
             .is_some_and(|f| f.hold.is_some())
         {
             causes |= AnimCauses::THUMB_SCROLL_FREEZE;
+        }
+        // A window drag keeps its own frames coming; a thumbnail being carried does not, and
+        // a pointer parked at the edge sends no motion to scroll on.
+        if self.thumb_edge_scroll.is_some() {
+            causes |= AnimCauses::THUMB_EDGE_SCROLL;
         }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
@@ -3296,6 +3329,92 @@ impl<W: LayoutElement> Monitor<W> {
     /// was holding is not on screen to ease away from.
     pub(super) fn clear_strip_freeze(&mut self) {
         self.thumb_scroll_freeze = None;
+        self.thumb_edge_scroll = None;
+    }
+
+    /// Scroll the row sideways by `dx` pixels without activating anything — positive reveals
+    /// more of it to the right. Returns whether it moved; a row that fits its band never does.
+    ///
+    /// **Divergence.** gnome-shell's row always fits (see [`StripFreeze`]), so it has nothing
+    /// to scroll; ours scrolls to follow the active workspace, and this lets the rest of an
+    /// overflowing row be looked at, and dropped onto, without switching to get there.
+    pub fn scroll_strip(&mut self, dx: f64) -> bool {
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return false;
+        };
+        let focus = self.strip_focus();
+        let Some(scrolled) = thumbnails::scrolled_focus(&strip, focus, dx) else {
+            return false;
+        };
+        let unchanged = self
+            .thumb_scroll_freeze
+            .as_ref()
+            .is_some_and(|f| f.scrolled && f.focus == scrolled);
+        self.thumb_scroll_freeze = Some(StripFreeze {
+            focus: scrolled,
+            hold: None,
+            scrolled: true,
+        });
+        !unchanged
+    }
+
+    /// Scroll the row while a drag rests near either end of its band, so a window can be
+    /// carried to a workspace that was off screen when the drag began. `pos` is the drag's
+    /// pointer on this monitor, if it is on this one; a thumbnail being carried along the row
+    /// is a drag too, and speaks for itself. Called once a frame; returns whether the row moved.
+    ///
+    /// The speed ramps from nothing at the inner edge of the zone to
+    /// [`STRIP_EDGE_SCROLL_SPEED`] at the band's edge, so drifting in to drop on a thumbnail
+    /// half in view nudges the row rather than flinging it.
+    pub fn strip_edge_scroll(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
+        let pos = pos.or(self.thumb_drag.map(|drag| drag.pos));
+        let strip = pos.and_then(|_| self.thumbnail_strip_at_rest());
+        let (Some(pos), Some(strip)) = (pos, strip) else {
+            self.thumb_edge_scroll = None;
+            return false;
+        };
+        let band = strip.band;
+        let zone = strip
+            .thumbs
+            .first()
+            .map_or(0., |thumb| thumb.size.w * STRIP_EDGE_SCROLL_ZONE);
+        let depth = if !band.contains(pos) || zone <= 0. {
+            0.
+        } else if pos.x < band.loc.x + zone {
+            -(band.loc.x + zone - pos.x) / zone
+        } else if pos.x > band.loc.x + band.size.w - zone {
+            (pos.x - (band.loc.x + band.size.w - zone)) / zone
+        } else {
+            0.
+        };
+        // A row that fits, or one already at the end being pushed against, has nothing to do;
+        // dropping the clock there keeps it from claiming frames for a scroll that cannot move.
+        let focus = self.strip_focus();
+        let can_move = depth != 0.
+            && thumbnails::scrolled_focus(&strip, focus, 0.)
+                != thumbnails::scrolled_focus(&strip, focus, depth.signum());
+        if !can_move {
+            self.thumb_edge_scroll = None;
+            return false;
+        }
+
+        let now = self.clock.now_unadjusted();
+        let Some(last) = self.thumb_edge_scroll.replace(now) else {
+            // The first frame in the zone only starts the clock.
+            return false;
+        };
+        // Capped, so a frame that came late does not jump the row a long way at once.
+        let dt = now.saturating_sub(last).min(Duration::from_millis(50));
+        let speed = STRIP_EDGE_SCROLL_SPEED * strip.thumbs[0].size.w;
+        let moved = self.scroll_strip(depth * speed * dt.as_secs_f64());
+        if moved {
+            if let Some(drag) = self.thumb_drag {
+                // The row moved under a still pointer: the carried thumbnail may have crossed a
+                // neighbour, which motion would otherwise be what notices.
+                self.update_thumb_drag(drag.pos);
+            }
+        }
+        moved
     }
 
     /// The pointer moved; `pos_within_output` is where it is on this monitor, or `None` if it is
@@ -3351,6 +3470,9 @@ impl<W: LayoutElement> Monitor<W> {
         let Some(freeze) = &self.thumb_scroll_freeze else {
             return false;
         };
+        if freeze.scrolled {
+            return false;
+        }
         // Laying the row out to answer this is only worth it once a freeze exists to answer for.
         let over_band = pos_within_output.is_some_and(|pos| self.strip_band_contains(pos));
         if over_band {
@@ -5264,6 +5386,8 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn workspace_switch_gesture_begin(&mut self, is_touchpad: bool) {
+        // The row follows the switch the gesture drags, not a scroll held from before it.
+        self.release_strip_freeze();
         let center_idx = self.active_workspace_idx;
         let current_idx = self.workspace_render_idx();
 
@@ -5901,22 +6025,7 @@ pub(super) fn scroll_to_follow(span: f64, run: f64, focus: f64) -> f64 {
 
 /// The offset that puts `focus` (a distance from the row's start) on the viewport's center,
 /// whatever the row's length: the focused item sticks to the middle, and the ends carry dead
-/// space rather than being pulled flush.
-///
-/// This is what the thumbnail strip does, and it is the picker's own fit-single behaviour
-/// ([`fit_single_row`]). It buys the strip its "there is more this way" affordance for free:
-/// with the active thumbnail pinned to the middle, an overflowing side almost always has a
-/// workspace *poking in* at the band edge rather than ending on a whole one, and dead space
-/// at an end reads, correctly, as "nothing further this way".
-///
-/// **It applies even when the whole row fits.** Centering a short row *as a whole* instead —
-/// which is what gnome-shell does, and what [`scroll_to_follow`] keeps — leaves the active
-/// workspace off center by up to half the row, which is very visible: four workspaces on a
-/// 3072-wide canvas fit their band comfortably and put the active one 714px left of the
-/// middle. The cost is that a two- or three-workspace strip now slides on every switch.
-///
-/// The app-grid row uses [`scroll_to_follow`] instead: it spans the whole screen, so an
-/// unclamped end would leave most of a screen width empty beside the last workspace.
+/// space rather than being pulled flush. The unclamped core of [`scroll_to_follow`].
 pub(super) fn center_on_focus(span: f64, focus: f64) -> f64 {
     span / 2. - focus
 }

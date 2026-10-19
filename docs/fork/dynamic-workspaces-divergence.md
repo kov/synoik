@@ -221,6 +221,23 @@ This is the window picker's close freeze applied to the row, down to the constan
 Only a click *on the strip* arms it — a key, the wheel or a DnD edge scroll is the user asking the
 row to move, and each of those releases a hold instead.
 
+### The row scrolls on its own (2026-10-19)
+
+An overflowing row can be looked along without switching to get there. A sideways two-finger
+scroll anywhere in the overview scrolls the row under the pointer 1:1
+(`Monitor::scroll_strip`); a vertical one still switches workspaces. The delta is libinput's,
+which already carries the device's natural-scrolling setting, so the row moves the way every other
+scroll view on the desktop does. And a drag — a window, an external DnD, or a thumbnail being
+reordered — parked within a quarter thumbnail of either end of the band scrolls it, ramping up to
+2.5 thumbnails a second at the very edge (`Monitor::strip_edge_scroll`), so a window can be dropped
+on a workspace that was off screen when the drag began.
+
+Both are a `StripFreeze` marked `scrolled`: the row stays where it was put when the pointer leaves
+the band, and only a workspace activation (or a switch gesture beginning) lets go. Scrolling stops
+dead at the row's ends rather than banking travel past them, so reversing moves the row on the first
+pixel. gnome-shell has neither — its row always fits — and its overview ignores smooth scrolls
+(`handleWorkspaceScroll`, `windowManager.js:1882-1883`).
+
 ## Accepted losses
 
 **niri's `empty-workspace-above-first` is gone** (config field, ~50 special-case sites, its

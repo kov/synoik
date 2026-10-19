@@ -369,6 +369,45 @@ impl Strip {
     }
 }
 
+/// The focus that scrolls a row laid out at `focus` by `dx` pixels — positive reveals more
+/// of the row to the right, the scroll-view sense — or `None` when the row fits its band
+/// and there is nothing to scroll.
+///
+/// The answer is clamped to the stretch where [`scroll_to_follow`] centers the focus rather
+/// than pinning the row's end to the band's, so no part of the scroll is dead travel: at an
+/// end, scrolling the other way moves the row on the very first pixel. A `focus` already
+/// past that stretch — the first workspace active, say — is read as the scroll on screen,
+/// which is the clamp's.
+///
+/// Measured against the thumbnails' own centres, not a fixed pitch, so a placeholder parting
+/// the row is scrolled across like any other stretch of it.
+pub fn scrolled_focus(strip: &Strip, focus: f64, dx: f64) -> Option<f64> {
+    let bounds = strip.bounds();
+    // The span [`strip_geometry`] scrolls within: the band less a gap at either end.
+    let span = strip.band.size.w - strip.gap * 2.;
+    if bounds.size.w <= span {
+        return None;
+    }
+    let centers: Vec<f64> = strip
+        .thumbs
+        .iter()
+        .map(|rect| rect.loc.x + rect.size.w / 2. - bounds.loc.x)
+        .collect();
+    let n = centers.len();
+    let idx = focus.clamp(0., (n - 1) as f64);
+    let (lo, hi) = (idx.floor() as usize, idx.ceil() as usize);
+    let at = centers[lo] + (centers[hi] - centers[lo]) * idx.fract();
+
+    let (min, max) = (span / 2., bounds.size.w - span / 2.);
+    let at = (at.clamp(min, max) + dx).clamp(min, max);
+
+    // Back from a position along the row to a fractional index. `min` is at least half a
+    // thumbnail in, so it is never short of the first centre, nor `max` past the last.
+    let i = centers.partition_point(|&c| c <= at).clamp(1, n - 1);
+    let (c0, c1) = (centers[i - 1], centers[i]);
+    Some((i - 1) as f64 + ((at - c0) / (c1 - c0)).clamp(0., 1.))
+}
+
 /// Where a drop on the strip lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropTarget {
@@ -761,5 +800,35 @@ mod tests {
             strip.drop_target(Point::from((first.loc.x + 48., 500.))),
             None
         );
+    }
+
+    /// A scroll moves the row by exactly the pixels asked for, in the scroll-view sense,
+    /// and stops dead at either end rather than banking travel past it.
+    #[test]
+    fn a_scrolled_focus_moves_the_row_by_the_delta() {
+        let lay = |focus: f64| strip_geometry(metrics(THUMB_W, GAP), 10, None, focus);
+        let x0 = |focus: f64| lay(focus).thumbs[0].loc.x;
+
+        // From the first workspace the row sits at its left end: scrolling further left
+        // goes nowhere, and scrolling right moves it on the first pixel.
+        let start = lay(0.);
+        let left = scrolled_focus(&start, 0., -100.).unwrap();
+        assert_eq!(x0(left), x0(0.));
+        let right = scrolled_focus(&start, 0., 100.).unwrap();
+        assert!((x0(right) - (x0(0.) - 100.)).abs() <= 1.);
+
+        // A long scroll ends with the last thumbnail one gap in from the band's edge.
+        let far = scrolled_focus(&start, 0., 1e6).unwrap();
+        let last = lay(far).thumbs[9];
+        assert!((last.loc.x + last.size.w - (1920. - GAP)).abs() <= 1.);
+        // …and coming back is just as immediate.
+        let back = scrolled_focus(&lay(far), far, -50.).unwrap();
+        assert!((x0(back) - (x0(far) + 50.)).abs() <= 1.);
+    }
+
+    /// A row that fits has nothing to scroll.
+    #[test]
+    fn a_row_that_fits_does_not_scroll() {
+        assert_eq!(scrolled_focus(&strip(3, None), 0., 100.), None);
     }
 }

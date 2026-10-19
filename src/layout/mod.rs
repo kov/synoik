@@ -3846,10 +3846,25 @@ impl<W: LayoutElement> Layout<W> {
 
         let is_overview_open = self.overview_open;
 
+        // A drag parked at either end of a workspace row scrolls it, so a workspace that was off
+        // screen when the drag began can still be dropped on. Every monitor is asked, so one the
+        // drag has left stops.
+        let drag = dnd_scroll
+            .as_ref()
+            .map(|(output, pos, _)| (output.clone(), *pos));
+        let mut row_scrolled = false;
+        for mon in self.monitors_mut() {
+            let pos = drag
+                .as_ref()
+                .filter(|(output, _)| *output == mon.output)
+                .map(|(_, pos)| *pos);
+            row_scrolled |= mon.strip_edge_scroll(pos) && pos.is_some();
+        }
+
         // Scroll the view if needed.
         if let Some((output, pos_within_output, is_scrolling)) = dnd_scroll {
             if let Some(mon) = self.monitor_for_output_mut(&output) {
-                let mut scrolled = false;
+                let mut scrolled = row_scrolled;
 
                 let zoom = mon.overview_zoom();
                 scrolled |= mon.dnd_scroll_gesture_scroll(pos_within_output, 1. / zoom);
@@ -5044,6 +5059,13 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
         }
+    }
+
+    /// Scroll `output`'s workspace row sideways by `dx` pixels, activating nothing — see
+    /// [`Monitor::scroll_strip`]. Returns whether it moved.
+    pub fn scroll_thumbnail_strip(&mut self, output: &Output, dx: f64) -> bool {
+        self.monitor_for_output_mut(output)
+            .is_some_and(|mon| mon.scroll_strip(dx))
     }
 
     pub fn workspace_switch_gesture_begin(&mut self, output: &Output, is_touchpad: bool) {
