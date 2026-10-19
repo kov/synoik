@@ -34125,6 +34125,144 @@ fn a_window_dropped_on_a_smaller_display_is_fitted_like_a_moved_workspace() {
     );
 }
 
+/// A window dragged across displays on the desktop gets the size half of that fit and none of the
+/// position: it lands where the user put it, sized to the smaller display, and has its own size
+/// back once dragged onto one that can hold it.
+#[test]
+fn a_window_dragged_to_a_smaller_display_is_sized_to_it_where_it_is_dropped() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    pointer_motion_to(&mut f, 960., 540.);
+    let surface = map_window_sized(&mut f, id, (1000, 900), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    let settle = |f: &mut Fixture| ack_configures(f, id, std::slice::from_ref(&surface));
+    settle(&mut f);
+    let live_rect = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .live_rect
+            .expect("it floats")
+    };
+    let area_of_window = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&win))
+            .unwrap()
+            .2
+            .working_area()
+    };
+    let before = live_rect(&mut f);
+
+    // Super+drag, grabbed 100 in from its top-left, from `from` to `to` in global coordinates.
+    let drag = |f: &mut Fixture, from: (f64, f64), to: (f64, f64)| {
+        pointer_motion_to(f, from.0, from.1);
+        f.key_press(KEY_LEFTMETA);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_motion(0., 10.);
+        pointer_motion_to(f, to.0, to.1);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.key_release(KEY_LEFTMETA);
+        f.settle();
+        settle(f);
+    };
+
+    // Dropped with the pointer at (200, 150) on display 2.
+    let (x, y) = focused_window_pos(&mut f);
+    drag(&mut f, (x + 100., y + 100.), (1920. + 200., 150.));
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-2");
+
+    let area = area_of_window(&mut f);
+    let fitted = live_rect(&mut f);
+    assert_eq!(
+        (fitted.size.w.round(), fitted.size.h.round()),
+        (1000., area.size.h.round()),
+        "only the axis that stopped fitting is clamped"
+    );
+    assert_eq!(
+        fitted.loc.x.round(),
+        100.,
+        "and it stays where it was dropped, not moved by the area-to-area rule"
+    );
+
+    // Back onto the big display: its own size again, where it is put down this time.
+    let (x, y) = focused_window_pos(&mut f);
+    drag(&mut f, (1920. + x + 100., y + 100.), (500., 300.));
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+    let back = live_rect(&mut f);
+    assert_eq!(back.size, before.size, "its own size comes back");
+    assert_eq!(back.loc.x.round(), 400., "at the place it was dropped");
+}
+
+/// A window dragged so it straddles two displays is drawn on both, each showing the part of it
+/// that falls there — not only on the display the pointer is over.
+#[test]
+fn a_window_dragged_across_displays_is_drawn_on_both() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+    pointer_motion_to(&mut f, 960., 540.);
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    {
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+        window.commit();
+    }
+    f.double_roundtrip(id);
+    f.settle();
+
+    // Picked up by its centre and carried right until 280 columns of it are past display 1's
+    // edge, with the pointer still on display 1.
+    let (x, y) = focused_window_pos(&mut f);
+    pointer_motion_to(&mut f, x + 400., y + 300.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, 1800., 540.);
+    f.settle();
+
+    let output = f.synoik_output(2);
+    let (pixels, w, _) = super::fixture::capture_pixels(&mut f, &output);
+    let at = |px: i32, py: i32| {
+        let i = ((py * w + px) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    let [r, g, b] = at(100, 540);
+    assert!(
+        g > 200 && r < 60 && b < 60,
+        "display 2 must show the part of the window past display 1's edge, got {:?}",
+        (r, g, b)
+    );
+    let [r, g, b] = at(600, 540);
+    assert!(
+        !(g > 200 && r < 60 && b < 60),
+        "and nothing past the window's own right edge, got {:?}",
+        (r, g, b)
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+}
+
 /// A window that fits again comes back to where it sat, on a fractionally scaled display.
 ///
 /// The remembered rect is only spendable when the window can be given its size back, and that

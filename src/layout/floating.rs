@@ -211,6 +211,9 @@ struct Fitted {
     /// Where to put the window, when it just got its overridden geometry back and the area can
     /// hold it there.
     restore_pos: Option<Point<f64, Logical>>,
+
+    /// The window was given its own size back.
+    size_restored: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -553,6 +556,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return Fitted {
                 tile_size: Some(desired.size),
                 restore_pos: Some(restored.loc),
+                size_restored: true,
             };
         }
 
@@ -639,6 +643,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return Fitted {
                 tile_size: Some(tile_size),
                 restore_pos: restorable.then_some(restored.loc),
+                size_restored: true,
             };
         }
 
@@ -665,6 +670,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         Fitted {
             tile_size: Some(tile_size),
             restore_pos: None,
+            size_restored: false,
         }
     }
 
@@ -698,6 +704,31 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
         if let Some(pos) = fitted.restore_pos {
             self.data[idx].set_logical_pos(pos);
+        }
+    }
+
+    /// The size half of [`Self::fit_arrived`], for a window the user dragged here across displays
+    /// and put down where they wanted it: sized to fit this area, or given its own size back if
+    /// the area can hold it, and left exactly where it was dropped.
+    pub fn fit_arrived_size(&mut self, id: &W::Id, from: Rectangle<f64, Logical>) {
+        let area = self.working_area;
+        if from == area {
+            return;
+        }
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+        // The size it is owed is kept, the place is not: the user just chose one. Re-based to the
+        // drop, so whatever later gives the size back gives it back here.
+        let dropped_at = self.data[idx].logical_pos - area.loc;
+        if let Some(desired) = &mut self.tiles[idx].displaced_rect {
+            desired.loc = dropped_at;
+        }
+        let fitted = self.fit_to_working_area(idx, area, area);
+        // The rect is spent with the size: nothing is going to put the window back where it was,
+        // and a later move must not try to.
+        if fitted.size_restored {
+            self.tiles[idx].displaced_rect = None;
         }
     }
 

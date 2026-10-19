@@ -13321,6 +13321,13 @@ impl Synoik {
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
         let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
+        // Where the dragged window's output sits relative to this one, so the window is drawn
+        // across every display it overlaps.
+        let move_origin = self.layout.interactive_move_output().and_then(|from| {
+            let from = self.global_space.output_geometry(from)?;
+            let here = self.global_space.output_geometry(output)?;
+            Some((from.loc - here.loc).to_f64())
+        });
 
         // The window picker and the workspace row cross-fade out as a search covers
         // them; outside the overview the fade is 0, so this is a plain pass-through.
@@ -13403,8 +13410,14 @@ impl Synoik {
         if mon.render_above_top_layer() {
             self.render_cycler_highlight(output, push);
 
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if let Some(origin) = move_origin {
+                self.layout.render_interactive_move_for_output(
+                    ctx.r(),
+                    output,
+                    origin,
+                    &mut |elem| push(elem.into()),
+                );
+            }
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
@@ -13461,8 +13474,14 @@ impl Synoik {
 
             self.render_cycler_highlight(output, push);
 
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if let Some(origin) = move_origin {
+                self.layout.render_interactive_move_for_output(
+                    ctx.r(),
+                    output,
+                    origin,
+                    &mut |elem| push(elem.into()),
+                );
+            }
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 

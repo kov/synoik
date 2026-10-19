@@ -6170,8 +6170,15 @@ impl<W: LayoutElement> Layout<W> {
                         if !keep_position {
                             tile.floating_pos = None;
                             // Dropping a window is the user placing it, so a displaced geometry
-                            // stops being one to go back to — the same rule a resize follows.
-                            tile.displaced_rect = None;
+                            // stops being one to go back to — the same rule a resize follows. Its
+                            // *size* survives a drop on another work area, though, which is what
+                            // that work area may have to shrink and later give back
+                            // (`FloatingSpace::fit_arrived_size`).
+                            let crossed =
+                                mon.workspaces[ws_idx].working_area() != move_.origin_working_area;
+                            if !crossed {
+                                tile.displaced_rect = None;
+                            }
                             // Only a drop that places the window can carry the exemption; a picker
                             // drop names a workspace and leaves the position alone.
                             tile.unconstrained_top = move_.unconstrained;
@@ -6228,11 +6235,13 @@ impl<W: LayoutElement> Layout<W> {
                         // Arriving from another work area — another display's, usually — the
                         // window gets what its workspace would have got moving there whole: fit,
                         // restored, and moved between the areas. Only a drop that kept its
-                        // position has one in the old area to move from.
-                        if keep_position {
-                            if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.id() == ws_id)
-                            {
+                        // position has one in the old area to move from; one the user placed
+                        // keeps the place, and gets the size half alone.
+                        if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.id() == ws_id) {
+                            if keep_position {
                                 ws.fit_arrived_window(&win_id, move_.origin_working_area);
+                            } else {
+                                ws.fit_arrived_window_size(&win_id, move_.origin_working_area);
                             }
                         }
                     }
@@ -7121,10 +7130,23 @@ impl<W: LayoutElement> Layout<W> {
         Some(move_.tile.tile_size().upscale(scale))
     }
 
+    /// The output the dragged window is on — the one the pointer is over.
+    pub fn interactive_move_output(&self) -> Option<&Output> {
+        match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) => Some(&move_.output),
+            _ => None,
+        }
+    }
+
+    /// Draws the dragged window on `output`. `origin` is where the drag's own output
+    /// ([`Self::interactive_move_output`]) sits relative to `output`, so a window straddling two
+    /// displays is drawn on both, the part on each where it falls — the way mutter's window
+    /// actor, which lives in one stage across every monitor, simply is.
     pub fn render_interactive_move_for_output(
         &self,
         ctx: RenderCtx,
         output: &Output,
+        origin: Point<f64, Logical>,
         push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement>),
     ) {
         if self.update_render_elements_time != self.clock.now() {
@@ -7135,16 +7157,26 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
 
-        if &move_.output != output {
-            return;
-        }
-
-        let scale = Scale::from(move_.output.current_scale().fractional_scale());
-        let zoom = self.overview_zoom_for_output(output);
+        // Measured on the drag's own output, wherever it is drawn: that is the one the pointer is
+        // over, and the footprint the window has there is the footprint it has.
+        let zoom = self.overview_zoom_for_output(&move_.output);
         // In the GNOME overview the drag carries the picker preview: the
         // tile keeps the on-screen footprint it was picked up at.
         let render_scale = zoom * move_.expose_extra_scale(zoom);
-        let pos_in_backdrop = move_.tile_render_location(zoom);
+        let pos_in_backdrop = move_.tile_render_location(zoom) + origin;
+
+        if &move_.output != output {
+            let footprint = Rectangle::new(
+                pos_in_backdrop,
+                move_.tile.tile_size().upscale(render_scale),
+            );
+            let area = Rectangle::from_size(output_size(output));
+            if !footprint.overlaps(area) {
+                return;
+            }
+        }
+
+        let scale = Scale::from(output.current_scale().fractional_scale());
 
         move_.tile.render(ctx, pos_in_backdrop, true, &mut |elem| {
             push(RescaleRenderElement::from_element(

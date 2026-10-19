@@ -403,8 +403,12 @@ A window dropped from the overview onto a workspace whose work area differs from
 picked up in — another display's, usually — goes through the very same fit, restore and
 area-to-area move (`FloatingSpace::fit_arrived`). The overview's drop keeps the window's position
 as a fraction of the area it left, so the window is first put back there, in that area, and moved
-from it exactly as its workspace would have been. A desktop drag across displays is not included:
-it places the window at the pointer, and has no old position to move from.
+from it exactly as its workspace would have been.
+
+A desktop drag across displays gets the size half only (`FloatingSpace::fit_arrived_size`): the user
+put the window where it is, so it stays there, sized to fit the new area or given its own size back.
+Such a drop keeps the remembered size that an in-area drop discards, re-based to the drop point, so
+nothing later moves the window back to where it once sat.
 
 ## 6. Moving a workspace to another display
 
