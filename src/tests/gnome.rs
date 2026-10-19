@@ -11020,6 +11020,44 @@ fn overview_sideways_scroll_leaves_a_fitting_strip_alone() {
     assert_eq!(xs(&mut f), rest);
 }
 
+/// A tilt wheel scrolls the row the way a sideways touchpad scroll does, half a thumbnail a
+/// notch, and switches nothing.
+#[test]
+fn overview_tilt_wheel_moves_the_strip_without_switching() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 12);
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    pointer_motion_to(&mut f, 960., 700.);
+
+    let first = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[0]
+    };
+    let active = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    let was_active = active(&mut f);
+    let rest = first(&mut f);
+
+    f.scroll_wheel_horizontal(false);
+    f.scroll_wheel_horizontal(false);
+    f.settle();
+    let now = first(&mut f);
+    assert_eq!(active(&mut f), was_active, "a tilt must not switch");
+    assert!(
+        (now.loc.x - rest.loc.x - rest.size.w).abs() <= 1.,
+        "two notches left must bring the row in by a thumbnail: {now:?} from {rest:?}"
+    );
+}
+
 /// A window carried to the end of an overflowing workspace row scrolls it, so it can be
 /// dropped on a workspace that was off screen when the drag began.
 #[test]

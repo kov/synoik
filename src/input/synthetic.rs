@@ -105,6 +105,7 @@ pub fn inject(state: &mut State, event: &InjectedEvent) -> Result<(), String> {
                 event: SyntheticPointerAxisEvent {
                     time: now(),
                     v120: notches * 120.0,
+                    h_v120: 0.,
                     finger: None,
                 },
             };
@@ -167,6 +168,7 @@ fn send_finger_scroll(state: &mut State, dx: f64, dy: f64) {
         event: SyntheticPointerAxisEvent {
             time: now(),
             v120: 0.,
+            h_v120: 0.,
             finger: Some((dx, dy)),
         },
     };
@@ -469,6 +471,8 @@ impl PointerMotionAbsoluteEvent<SyntheticInputBackend> for SyntheticPointerMotio
 pub struct SyntheticPointerAxisEvent {
     pub time: u64,
     pub v120: f64,
+    /// A tilt wheel's horizontal notches, in the same units.
+    pub h_v120: f64,
     /// `Some((dx, dy))` makes this a continuous [`AxisSource::Finger`] scroll instead of a
     /// wheel; `(0., 0.)` is the gesture-end event libinput sends when the fingers lift.
     pub finger: Option<(f64, f64)>,
@@ -509,7 +513,7 @@ impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
         }
         Some(match axis {
             Axis::Vertical => self.v120,
-            Axis::Horizontal => 0.0,
+            Axis::Horizontal => self.h_v120,
         })
     }
 

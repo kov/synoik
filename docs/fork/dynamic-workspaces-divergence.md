@@ -225,7 +225,8 @@ row to move, and each of those releases a hold instead.
 
 An overflowing row can be looked along without switching to get there. A sideways two-finger
 scroll anywhere in the overview scrolls the row under the pointer 1:1
-(`Monitor::scroll_strip`); a vertical one still switches workspaces. The delta is libinput's,
+(`Monitor::scroll_strip`), and so does a tilt wheel, half a thumbnail a notch; a vertical
+scroll still switches workspaces. The delta is libinput's,
 which already carries the device's natural-scrolling setting, so the row moves the way every other
 scroll view on the desktop does. And a drag — a window, an external DnD, or a thumbnail being
 reordered — parked within a quarter thumbnail of either end of the band scrolls it, ramping up to

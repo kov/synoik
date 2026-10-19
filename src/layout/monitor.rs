@@ -3358,6 +3358,17 @@ impl<W: LayoutElement> Monitor<W> {
         !unchanged
     }
 
+    /// [`Self::scroll_strip`] by `thumbs` thumbnail widths.
+    pub fn scroll_strip_by_thumbs(&mut self, thumbs: f64) -> bool {
+        let Some(w) = self
+            .thumbnail_strip_at_rest()
+            .and_then(|strip| strip.thumbs.first().map(|thumb| thumb.size.w))
+        else {
+            return false;
+        };
+        self.scroll_strip(thumbs * w)
+    }
+
     /// Scroll the row while a drag rests near either end of its band, so a window can be
     /// carried to a workspace that was off screen when the drag began. `pos` is the drag's
     /// pointer on this monitor, if it is on this one; a thumbnail being carried along the row

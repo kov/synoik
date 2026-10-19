@@ -268,6 +268,9 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 /// rate the cells suggest.
 const EMOJI_SCROLL_PX: f64 = 40.;
 
+/// How far one tilt-wheel notch scrolls the overview's workspace row, in thumbnail widths.
+const STRIP_THUMBS_PER_WHEEL_NOTCH: f64 = 0.5;
+
 fn edit_mods(mods: &ModifiersState) -> crate::ui::text_edit::EditMods {
     crate::ui::text_edit::EditMods {
         ctrl: mods.ctrl,
@@ -10045,29 +10048,35 @@ impl State {
                 || is_switcher_open
                 || self.synoik.mods_with_wheel_binds.contains(&modifiers);
             if should_handle {
-                let horizontal = horizontal_amount_v120.unwrap_or(0.);
+                let mut horizontal = horizontal_amount_v120.unwrap_or(0.);
+                if should_handle_in_overview
+                    && modifiers.is_empty()
+                    && self.synoik.layout.is_gnome_mode()
+                {
+                    // A tilt wheel scrolls the workspace row under the pointer, switching
+                    // nothing — the touchpad's sideways scroll, in notches (**divergence**,
+                    // `docs/fork/dynamic-workspaces-divergence.md`).
+                    if horizontal != 0. {
+                        if let Some(output) = self.synoik.output_under_cursor() {
+                            if self.synoik.layout.scroll_thumbnail_strip_by_thumbs(
+                                &output,
+                                horizontal / 120. * STRIP_THUMBS_PER_WHEEL_NOTCH,
+                            ) {
+                                self.synoik.queue_redraw_all();
+                            }
+                        }
+                    }
+                    horizontal = 0.;
+                }
                 let ticks = self.synoik.horizontal_wheel_tracker.accumulate(horizontal);
                 if ticks != 0 {
                     let (bind_left, bind_right) =
                         if should_handle_in_overview && modifiers.is_empty() {
-                            // In GNOME windowing mode the overview workspaces
-                            // form a horizontal row: horizontal wheel scrolls
-                            // through them (gnome-shell handleWorkspaceScroll).
-                            let gnome_mode = self.synoik.config.borrow().layout.windowing_mode
-                                == synoik_config::WindowingMode::Floating;
-                            let (action_left, action_right, cooldown) = if gnome_mode {
-                                (
-                                    Action::FocusWorkspaceUp,
-                                    Action::FocusWorkspaceDown,
-                                    Some(Duration::from_millis(50)),
-                                )
-                            } else {
-                                (
-                                    Action::FocusColumnLeftUnderMouse,
-                                    Action::FocusColumnRightUnderMouse,
-                                    None,
-                                )
-                            };
+                            let (action_left, action_right, cooldown) = (
+                                Action::FocusColumnLeftUnderMouse,
+                                Action::FocusColumnRightUnderMouse,
+                                None,
+                            );
                             let bind_left = Some(ResolvedBind {
                                 key: Key {
                                     trigger: Trigger::WheelScrollLeft,

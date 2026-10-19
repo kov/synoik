@@ -576,6 +576,7 @@ impl Fixture {
             event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: 120.0,
+                h_v120: 0.,
                 finger: None,
             },
         };
@@ -588,6 +589,20 @@ impl Fixture {
             event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: -120.0,
+                h_v120: 0.,
+                finger: None,
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    /// Inject one tilt-wheel notch: `right` is the scroll-right direction.
+    pub fn scroll_wheel_horizontal(&mut self, right: bool) {
+        let event = InputEvent::<SyntheticInputBackend>::PointerAxis {
+            event: SyntheticPointerAxisEvent {
+                time: self.next_input_micros(),
+                v120: 0.,
+                h_v120: if right { 120. } else { -120. },
                 finger: None,
             },
         };
@@ -602,6 +617,7 @@ impl Fixture {
             event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: 0.,
+                h_v120: 0.,
                 finger: Some((dx, dy)),
             },
         };

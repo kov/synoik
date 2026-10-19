@@ -5068,6 +5068,13 @@ impl<W: LayoutElement> Layout<W> {
             .is_some_and(|mon| mon.scroll_strip(dx))
     }
 
+    /// The same, by `thumbs` thumbnail widths — for a wheel, whose notch has no pixel size of
+    /// its own.
+    pub fn scroll_thumbnail_strip_by_thumbs(&mut self, output: &Output, thumbs: f64) -> bool {
+        self.monitor_for_output_mut(output)
+            .is_some_and(|mon| mon.scroll_strip_by_thumbs(thumbs))
+    }
+
     pub fn workspace_switch_gesture_begin(&mut self, output: &Output, is_touchpad: bool) {
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
