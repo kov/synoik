@@ -6412,14 +6412,15 @@ impl State {
             }
         };
 
-        // Raising the prompt is what arms the fingerprint reader, so that has to be read off the
-        // page actually moving — not carried by whichever branch happened to run. Two of them
-        // raise the prompt inside `entry_key` and then return `None`, discarding the effects that
-        // said so: a key that edits nothing, and a key arriving before gdm has asked its question.
-        // Both left a prompt on screen with a sensor that was never started, and nothing anywhere
-        // said so — the password still worked, so it read as a hardware problem.
+        // Raising the prompt is what arms the fingerprint reader and repaints the shield, so both
+        // have to be read off the page actually moving — not carried by whichever branch happened
+        // to run. Two of them raise the prompt inside `entry_key` and then return `None`,
+        // discarding the effects that said so: a key that edits nothing (a bare Ctrl or Alt), and
+        // a key arriving before gdm has asked its question. The first left the clock on screen
+        // over a prompt that was already up, until something else repainted — the pointer moving.
         if was_clock && self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt {
             effects.start_fingerprint = true;
+            effects.redraw = true;
         }
 
         self.apply_unlock_effects(effects);

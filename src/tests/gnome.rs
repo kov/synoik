@@ -18885,13 +18885,32 @@ fn shift_and_caps_do_not_wake_the_prompt() {
     tap(&mut f, KEY_CAPSLOCK);
     assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock, "so does caps");
 
-    // Ctrl is not in GNOME's list: it raises the prompt like any other key.
+    // Ctrl is not in GNOME's list: it raises the prompt like any other key — and the screen has
+    // to be told, or the clock stays drawn over a prompt that is already up until something else
+    // repaints. The page alone cannot show that, so read the output's redraw state too.
+    f.settle();
+    let output = f.synoik_output(1);
+    // Whether a repaint is owed: a frame merely in flight, or a vblank being waited out, is not.
+    let owed = |f: &mut Fixture| {
+        use crate::synoik::RedrawState;
+        matches!(
+            f.synoik().output_state[&output].redraw_state,
+            RedrawState::Queued
+                | RedrawState::ScheduledDispatch { .. }
+                | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+                | RedrawState::WaitingForVBlank {
+                    redraw_needed: true
+                }
+        )
+    };
+    assert!(!owed(&mut f), "nothing is owed before the key");
     tap(&mut f, KEY_LEFTCTRL);
     assert_eq!(
         f.synoik().unlock_dialog.page(),
         Page::Prompt,
         "ctrl is not one of the four, so it wakes the prompt"
     );
+    assert!(owed(&mut f), "and the raised prompt must be repainted");
 }
 
 /// Return and Escape at the clock raise the prompt like any other key (`unlockDialog.js:671-689`);
