@@ -13632,6 +13632,100 @@ fn strip_now(f: &mut Fixture) -> (Vec<f64>, Option<(f64, f64, f64)>) {
     (xs, phantom)
 }
 
+/// The slot the row opens past the end is the empty workspace that *follows* a drop on the
+/// trailing one, not a workspace of its own. A drag over it is answered as the trailing
+/// workspace — that is what lands the window, and what the strip highlights — and the slot
+/// draws ghosted for as long as the drag is on it, so it does not read as a target.
+#[test]
+fn a_drop_on_the_opened_slot_lands_on_the_trailing_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    assert_eq!(strip_now(&mut f).0.len(), 2);
+
+    let last = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[1]
+    };
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
+
+    // Onto the trailing thumbnail, which opens the slot all the way, then into the slot.
+    let y = last.loc.y + last.size.h / 2.;
+    pointer_motion_to(&mut f, last.loc.x + last.size.w / 2., y);
+    let (_, phantom) = strip_now(&mut f);
+    let (slot_x, slot_w, _) = phantom.expect("the slot must be open");
+    let refused = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .thumbnail_strip()
+            .unwrap()
+            .phantom
+            .map(|(_, ph)| ph.refused)
+    };
+    assert_eq!(
+        refused(&mut f),
+        Some(false),
+        "over the thumbnail, nothing is refused"
+    );
+
+    pointer_motion_to(&mut f, slot_x + slot_w / 2., y);
+    assert_eq!(
+        refused(&mut f),
+        Some(true),
+        "over the slot itself, it must draw as no target"
+    );
+    f.synoik().layout.update_render_elements(None);
+    let trailing = f.synoik().layout.workspaces().nth(1).unwrap().2.id();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    let mon = mon.unwrap();
+    assert_eq!(
+        mon.insert_hint_workspace(),
+        Some(trailing),
+        "the trailing workspace must be the one highlighted"
+    );
+    assert_eq!(
+        mon.insert_hint_rect(),
+        None,
+        "and no between-workspaces bar may promise a new one"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+
+    let idx = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win_a))
+        .map(|(_, idx, _)| idx);
+    assert_eq!(
+        idx,
+        Some(1),
+        "the window must land on the trailing workspace"
+    );
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        3,
+        "with a fresh empty workspace after it"
+    );
+    assert_eq!(strip_now(&mut f).1, None, "and the slot handed over");
+}
+
 /// Dragging a window towards the trailing workspace opens the row for the workspace the
 /// drop would append, in proportion to how close the drag has come.
 ///

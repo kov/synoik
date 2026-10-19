@@ -148,6 +148,10 @@ const STRIP_SCROLL_SMOOTHING: Duration = Duration::from_millis(25);
 /// The speed, in pixels a second, under which a fling has stopped.
 const STRIP_FLING_THRESHOLD: f64 = 20.;
 
+/// How opaque the phantom slot draws while a drag is over it — see
+/// [`thumbnails::Phantom::refused`].
+const PHANTOM_REFUSED_ALPHA: f32 = 0.35;
+
 /// How far in from either end of the row's band a drag starts scrolling it, as a fraction of a
 /// thumbnail's width — see [`Monitor::strip_edge_scroll`].
 const STRIP_EDGE_SCROLL_ZONE: f64 = 0.25;
@@ -594,6 +598,8 @@ struct PhantomSlot {
     reveal: f64,
     /// Set once the drag stops driving it: eases [`Self::reveal`] back to 0.
     closing: Option<Animation>,
+    /// The drag is over the slot itself — see [`thumbnails::Phantom::refused`].
+    refused: bool,
 }
 
 impl PhantomSlot {
@@ -610,6 +616,7 @@ impl PhantomSlot {
             idx: self.idx,
             reveal: (t * 2.).min(1.),
             emerge: (t * 2. - 1.).max(0.),
+            refused: self.refused && self.closing.is_none(),
         }
     }
 }
@@ -3737,17 +3744,23 @@ impl<W: LayoutElement> Monitor<W> {
     /// `None` while no drag is in flight, which is what eases the slot back shut.
     pub fn update_thumb_phantom(&mut self, pos: Option<Point<f64, Logical>>) {
         let target = pos.and_then(|pos| self.phantom_target(pos));
+        let refused = pos.is_some_and(|pos| {
+            self.full_phantom_slot()
+                .is_some_and(|slot| slot.contains(pos))
+        });
 
         match (&mut self.thumb_phantom, target) {
             (Some(slot), Some((idx, reveal))) if slot.idx == idx => {
                 slot.reveal = reveal;
                 slot.closing = None;
+                slot.refused = refused;
             }
             (_, Some((idx, reveal))) => {
                 self.thumb_phantom = Some(PhantomSlot {
                     idx,
                     reveal,
                     closing: None,
+                    refused,
                 });
             }
             (Some(slot), None) => {
@@ -3843,6 +3856,7 @@ impl<W: LayoutElement> Monitor<W> {
             idx: self.workspaces.len(),
             reveal: 1.,
             emerge: 0.,
+            refused: false,
         };
         Some(self.lay_strip(Some(phantom))?.phantom?.0)
     }
@@ -4636,6 +4650,22 @@ impl<W: LayoutElement> Monitor<W> {
                         strip.thumbs[idx],
                     );
                 }
+                // Past the last thumbnail is the slot the row holds open for the empty
+                // workspace that follows a drop on the trailing one. It is not a workspace a
+                // window can go to — the drop would only fill the trailing empty and append
+                // another — so it is answered as the trailing workspace, which is then the one
+                // the drag highlights, and the slot draws ghosted
+                // ([`thumbnails::Phantom::refused`]).
+                Some(thumbnails::DropTarget::NewAt(idx))
+                    if idx == self.workspaces.len()
+                        && self.workspaces.last().is_some_and(|ws| !ws.has_windows()) =>
+                {
+                    let last = self.workspaces.len() - 1;
+                    return (
+                        InsertWorkspace::Existing(self.workspaces[last].id()),
+                        strip.thumbs[last],
+                    );
+                }
                 Some(thumbnails::DropTarget::NewAt(idx)) => {
                     return (InsertWorkspace::NewAt(idx), Rectangle::default());
                 }
@@ -4761,6 +4791,16 @@ impl<W: LayoutElement> Monitor<W> {
         let loc = self.insert_hint_render_loc.as_ref()?;
         matches!(loc.workspace, InsertWorkspace::NewAt(_))
             .then(|| Rectangle::new(loc.location, loc.size))
+    }
+
+    /// The workspace a drag would drop onto, when it is an existing one — for the conformance
+    /// corpus.
+    #[cfg(test)]
+    pub fn insert_hint_workspace(&self) -> Option<WorkspaceId> {
+        match self.insert_hint.as_ref()?.workspace {
+            InsertWorkspace::Existing(id) => Some(id),
+            InsertWorkspace::NewAt(_) => None,
+        }
     }
 
     pub fn render_insert_hint_between_workspaces(
@@ -5141,6 +5181,11 @@ impl<W: LayoutElement> Monitor<W> {
         if alpha <= 0. {
             return;
         }
+        let alpha = if phantom.refused {
+            alpha * PHANTOM_REFUSED_ALPHA
+        } else {
+            alpha
+        };
 
         // `slide_position`: scale from 0.75 up, about the slot's centre so the slot it
         // grows into does not move (`workspaceThumbnail.js:319-333`).

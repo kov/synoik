@@ -197,6 +197,11 @@ Three things this is careful about:
   it went; those keep the pill. The ramp is measured to the trailing thumbnail and the slot
   *together*, because both drops grow the row — which also means a drop can only ever land on a
   slot that is already full width, so the real thumbnail takes it over with no jump.
+- **The slot is not a target.** It stands for the empty workspace that *follows* a drop on the
+  trailing one, so a drag over it is answered as the trailing workspace (`Monitor::insert_position`):
+  that thumbnail is the one highlighted, and the one the window lands on. The slot itself draws at
+  35% opacity while the drag is on it (`thumbnails::Phantom::refused`), so it does not read as the
+  place the window is going.
 
 The workspace is *not* in the model while the slot is open — `Monitor::render_phantom_thumb` draws
 an empty desktop's chrome and nothing else, for the same reason `CloseSlide` keeps a removed

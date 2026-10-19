@@ -66,6 +66,10 @@ pub struct Phantom {
     /// opacity `emerge` (`workspaceThumbnail.js:319-333`). Geometry ignores it; only the
     /// drawing does, which is why the two are separate.
     pub emerge: f64,
+    /// The drag is over the slot itself, which takes no drop — it is the empty workspace
+    /// that *follows* one, and a drop there lands on the trailing workspace instead
+    /// (`Monitor::insert_position`). Drawn ghosted, so the slot does not read as a target.
+    pub refused: bool,
 }
 
 /// What the row is making room for while a drag is in flight. Alternatives, not partners:
@@ -463,6 +467,7 @@ mod tests {
             idx,
             reveal,
             emerge: 0.,
+            refused: false,
         }));
         strip_geometry(metrics(THUMB_W, GAP), n, insert, 0.)
     }
