@@ -10939,12 +10939,13 @@ fn overview_sideways_scroll_moves_the_strip_without_switching() {
             .unwrap()
             .active_workspace_idx()
     };
+    // The fingers rest before they lift, so nothing flings: this pins the drag itself.
     let scroll = |f: &mut Fixture, dx: f64, n: usize| {
         for _ in 0..n {
             f.advance_input_time(10);
             f.scroll_finger(dx, 0.);
         }
-        f.advance_input_time(10);
+        f.advance_input_time(300);
         f.scroll_finger(0., 0.);
         f.settle();
     };
@@ -10988,6 +10989,79 @@ fn overview_sideways_scroll_moves_the_strip_without_switching() {
     f.settle();
     assert_eq!(active(&mut f), was_active);
     assert_eq!(xs(&mut f), rest, "an activation must let go of the scroll");
+}
+
+/// Let go while still moving, the row flings on past where the fingers took it and slows to a
+/// stop, as a scroll view does; fingers back down catch it where it is.
+#[test]
+fn overview_sideways_scroll_flings_on_release() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 16);
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    pointer_motion_to(&mut f, 960., 700.);
+
+    let x0 = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[0].loc.x
+    };
+    let active = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    let was_active = active(&mut f);
+    let rest = x0(&mut f);
+
+    // 100px in 50ms — 2000px/s — and straight off the touchpad.
+    for _ in 0..5 {
+        f.advance_input_time(10);
+        f.scroll_finger(-20., 0.);
+    }
+    f.advance_input_time(10);
+    f.scroll_finger(0., 0.);
+
+    f.run_frames_for(Duration::from_millis(100));
+    let mid = x0(&mut f) - rest;
+    f.run_frames_for(Duration::from_millis(100));
+    let later = x0(&mut f) - rest;
+    assert!(
+        mid > 100. && later > mid,
+        "the row must carry on past the fingers' 100px: {mid} then {later}"
+    );
+
+    f.settle();
+    let end = x0(&mut f) - rest;
+    assert!(
+        end > later && end < 2000.,
+        "and come to rest a fling away, at {end}"
+    );
+    assert_eq!(active(&mut f), was_active, "a fling must not switch");
+
+    // Caught: fingers down on a fresh fling stop it where it is.
+    for _ in 0..5 {
+        f.advance_input_time(10);
+        f.scroll_finger(20., 0.);
+    }
+    f.advance_input_time(10);
+    f.scroll_finger(0., 0.);
+    // Long enough for the drag itself to have eased in, well short of the fling's end.
+    f.run_frames_for(Duration::from_millis(200));
+    let caught = x0(&mut f);
+    f.advance_input_time(10);
+    f.scroll_finger(0.001, 0.);
+    f.advance_input_time(10);
+    f.scroll_finger(0., 0.);
+    f.settle();
+    assert!(
+        (x0(&mut f) - caught).abs() <= 1.,
+        "fingers down must catch the fling: {caught} then {}",
+        x0(&mut f)
+    );
 }
 
 /// A row that fits its band has nothing to scroll.

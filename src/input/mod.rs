@@ -10254,13 +10254,21 @@ impl State {
                     // scroll; `docs/fork/dynamic-workspaces-divergence.md`). libinput has
                     // already applied the device's natural-scrolling setting to the delta, so
                     // it is read in the scroll-view sense like any other scroll on the desktop.
-                    if !action.end() {
-                        if let Some(output) = self.synoik.output_under_cursor() {
-                            redraw |= self
-                                .synoik
-                                .layout
-                                .scroll_thumbnail_strip(&output, horizontal);
+                    if action.end() {
+                        self.synoik.layout.scroll_thumbnail_strip_end(timestamp);
+                        redraw = true;
+                    } else {
+                        if action.begin() {
+                            if let Some(output) = self.synoik.output_under_cursor() {
+                                self.synoik
+                                    .layout
+                                    .scroll_thumbnail_strip_begin(&output, timestamp);
+                            }
                         }
+                        redraw |= self
+                            .synoik
+                            .layout
+                            .scroll_thumbnail_strip_update(horizontal, timestamp);
                     }
                 } else if action.end() {
                     if is_vertical {
@@ -10341,6 +10349,7 @@ impl State {
                             .layout
                             .view_offset_gesture_end(Some(true))
                             .is_some();
+                        self.synoik.layout.scroll_thumbnail_strip_end(timestamp);
                     }
                 }
                 if redraw {

@@ -730,6 +730,8 @@ bitflags::bitflags! {
         const APP_EXPOSE = 1 << 32;
         /// A drag parked at an end of the workspace row, scrolling it.
         const THUMB_EDGE_SCROLL = 1 << 33;
+        /// The workspace row catching up with a sideways scroll, or flinging after one.
+        const THUMB_KINETIC_SCROLL = 1 << 34;
     }
 }
 
@@ -792,6 +794,7 @@ impl AnimCauses {
             ),
             (AnimCauses::APP_EXPOSE, "app-expose"),
             (AnimCauses::THUMB_EDGE_SCROLL, "thumb-edge-scroll"),
+            (AnimCauses::THUMB_KINETIC_SCROLL, "thumb-kinetic-scroll"),
         ];
         TABLE
             .iter()

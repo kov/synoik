@@ -5061,15 +5061,32 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// Scroll `output`'s workspace row sideways by `dx` pixels, activating nothing — see
-    /// [`Monitor::scroll_strip`]. Returns whether it moved.
-    pub fn scroll_thumbnail_strip(&mut self, output: &Output, dx: f64) -> bool {
-        self.monitor_for_output_mut(output)
-            .is_some_and(|mon| mon.scroll_strip(dx))
+    /// Fingers down on a sideways scroll of `output`'s workspace row — see
+    /// [`Monitor::scroll_strip_begin`]. Any other row's scroll is let go.
+    pub fn scroll_thumbnail_strip_begin(&mut self, output: &Output, timestamp: Duration) {
+        self.scroll_thumbnail_strip_end(timestamp);
+        if let Some(mon) = self.monitor_for_output_mut(output) {
+            mon.scroll_strip_begin();
+        }
     }
 
-    /// The same, by `thumbs` thumbnail widths — for a wheel, whose notch has no pixel size of
-    /// its own.
+    /// Scroll the workspace row the fingers are on sideways by `dx` pixels, activating nothing —
+    /// see [`Monitor::scroll_strip_smoothly`]. Returns whether there was a row to scroll.
+    pub fn scroll_thumbnail_strip_update(&mut self, dx: f64, timestamp: Duration) -> bool {
+        self.monitors_mut()
+            .find(|mon| mon.is_strip_scrolling())
+            .is_some_and(|mon| mon.scroll_strip_smoothly(dx, Some(timestamp)))
+    }
+
+    /// Fingers up: the row flings on — see [`Monitor::scroll_strip_end`].
+    pub fn scroll_thumbnail_strip_end(&mut self, timestamp: Duration) {
+        for mon in self.monitors_mut() {
+            mon.scroll_strip_end(timestamp);
+        }
+    }
+
+    /// Scroll `output`'s workspace row by `thumbs` thumbnail widths — for a wheel, whose notch
+    /// has no pixel size of its own.
     pub fn scroll_thumbnail_strip_by_thumbs(&mut self, output: &Output, thumbs: f64) -> bool {
         self.monitor_for_output_mut(output)
             .is_some_and(|mon| mon.scroll_strip_by_thumbs(thumbs))

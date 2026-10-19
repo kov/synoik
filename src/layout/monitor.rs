@@ -140,6 +140,14 @@ const SWIPE_MOTION_BLUR_THRESHOLD: f64 = 0.075;
 /// because it is the same question about the same pointer.
 const STRIP_FREEZE_MS: u32 = 750;
 
+/// How quickly the row catches up with a sideways scroll — see [`StripKinetic::pending`]. One
+/// touchpad report's worth and a half: enough to even out reports that land two to one frame and
+/// none to the next, short enough that the row still reads as under the fingers.
+const STRIP_SCROLL_SMOOTHING: Duration = Duration::from_millis(25);
+
+/// The speed, in pixels a second, under which a fling has stopped.
+const STRIP_FLING_THRESHOLD: f64 = 20.;
+
 /// How far in from either end of the row's band a drag starts scrolling it, as a fraction of a
 /// thumbnail's width — see [`Monitor::strip_edge_scroll`].
 const STRIP_EDGE_SCROLL_ZONE: f64 = 0.25;
@@ -293,6 +301,11 @@ pub struct Monitor<W: LayoutElement> {
     /// When a drag parked at the row's edge last scrolled it — see
     /// [`Self::strip_edge_scroll`]. `None` while nothing is in an edge zone.
     thumb_edge_scroll: Option<Duration>,
+    /// The fingers on a sideways scroll of the row, for the release speed — see
+    /// [`Self::scroll_strip_begin`].
+    thumb_scroll_tracker: Option<SwipeTracker>,
+    /// See [`StripKinetic`].
+    thumb_kinetic: Option<StripKinetic>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -517,6 +530,24 @@ struct StripFreeze {
     /// leaves the band: the row stays where it was scrolled to until something activates a
     /// workspace, which recentres it the way any activation does.
     scrolled: bool,
+}
+
+/// The row's scroll in motion: easing towards where a sideways scroll asked for, and flinging on
+/// after the fingers lift.
+///
+/// Applied a frame at a time, rather than each scroll event moving the row as it arrives: a
+/// touchpad reports at about the display's rate, but not in step with it, so frames would get two
+/// reports and then none, and the row would judder.
+#[derive(Debug)]
+struct StripKinetic {
+    /// Pixels the input has scrolled that the row has not been moved by yet. Each frame takes
+    /// its share, [`STRIP_SCROLL_SMOOTHING`] being the time constant.
+    pending: f64,
+    /// The fling after the fingers lifted — libadwaita's touchpad deceleration on the release
+    /// speed, the same projection the swipe tracker uses — and how much of it has been applied.
+    fling: Option<(Animation, f64)>,
+    /// When the last frame took its share.
+    last: Duration,
 }
 
 /// A drag hovering one of the row's interior gaps, waiting to be taken seriously.
@@ -908,6 +939,8 @@ impl<W: LayoutElement> Monitor<W> {
             thumb_placeholder_linger: None,
             thumb_drag: None,
             thumb_edge_scroll: None,
+            thumb_scroll_tracker: None,
+            thumb_kinetic: None,
             thumb_phantom: None,
             thumb_row_slide: None,
             thumb_close_slide: None,
@@ -1987,6 +2020,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        self.advance_strip_kinetic();
         match &mut self.workspace_switch {
             Some(WorkspaceSwitch::Animation(anim)) => {
                 if anim.is_done() {
@@ -2093,6 +2127,9 @@ impl<W: LayoutElement> Monitor<W> {
         // a pointer parked at the edge sends no motion to scroll on.
         if self.thumb_edge_scroll.is_some() {
             causes |= AnimCauses::THUMB_EDGE_SCROLL;
+        }
+        if self.thumb_kinetic.is_some() {
+            causes |= AnimCauses::THUMB_KINETIC_SCROLL;
         }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
@@ -3322,6 +3359,8 @@ impl<W: LayoutElement> Monitor<W> {
         }
         let from = self.thumb_positions_now();
         self.thumb_scroll_freeze = None;
+        // A fling still running would only scroll the row away again.
+        self.thumb_kinetic = None;
         self.arm_row_slide(from);
     }
 
@@ -3330,6 +3369,106 @@ impl<W: LayoutElement> Monitor<W> {
     pub(super) fn clear_strip_freeze(&mut self) {
         self.thumb_scroll_freeze = None;
         self.thumb_edge_scroll = None;
+        self.thumb_scroll_tracker = None;
+        self.thumb_kinetic = None;
+    }
+
+    /// Fingers down on a sideways scroll of the row: catches a fling that is still running, and
+    /// starts measuring the speed this one will be let go at.
+    pub fn scroll_strip_begin(&mut self) {
+        if let Some(kinetic) = &mut self.thumb_kinetic {
+            kinetic.fling = None;
+        }
+        self.thumb_scroll_tracker = Some(SwipeTracker::new());
+    }
+
+    /// Whether this monitor's row has fingers on it — see [`Self::scroll_strip_begin`].
+    pub fn is_strip_scrolling(&self) -> bool {
+        self.thumb_scroll_tracker.is_some()
+    }
+
+    /// Scroll the row by `dx` pixels, eased in over the next frames (see [`StripKinetic`]).
+    /// `timestamp` is the input event's, when this is a touchpad's. Returns whether there is a
+    /// row to scroll.
+    pub fn scroll_strip_smoothly(&mut self, dx: f64, timestamp: Option<Duration>) -> bool {
+        if let (Some(tracker), Some(timestamp)) = (&mut self.thumb_scroll_tracker, timestamp) {
+            tracker.push(dx, timestamp);
+        }
+        let can_scroll = self.thumbnail_strip_at_rest().is_some_and(|strip| {
+            thumbnails::scrolled_focus(&strip, self.strip_focus(), 0.).is_some()
+        });
+        if !can_scroll {
+            return false;
+        }
+        let now = self.clock.now();
+        self.thumb_kinetic
+            .get_or_insert(StripKinetic {
+                pending: 0.,
+                fling: None,
+                last: now,
+            })
+            .pending += dx;
+        true
+    }
+
+    /// Fingers up: the row flings on at the speed it was let go at.
+    pub fn scroll_strip_end(&mut self, timestamp: Duration) {
+        let Some(mut tracker) = self.thumb_scroll_tracker.take() else {
+            return;
+        };
+        tracker.release(timestamp);
+        let velocity = tracker.velocity();
+        if velocity.abs() < STRIP_FLING_THRESHOLD {
+            return;
+        }
+        let fling = Animation::decelerate(
+            self.clock.clone(),
+            0.,
+            velocity,
+            swipe_tracker::DECELERATION_TOUCHPAD,
+            STRIP_FLING_THRESHOLD,
+        );
+        let now = self.clock.now();
+        self.thumb_kinetic
+            .get_or_insert(StripKinetic {
+                pending: 0.,
+                fling: None,
+                last: now,
+            })
+            .fling = Some((fling, 0.));
+    }
+
+    /// Moves the row by this frame's share of [`StripKinetic`].
+    fn advance_strip_kinetic(&mut self) {
+        let Some(kinetic) = &mut self.thumb_kinetic else {
+            return;
+        };
+        let now = self.clock.now();
+        let dt = now.saturating_sub(kinetic.last);
+        kinetic.last = now;
+
+        let share = 1. - (-dt.as_secs_f64() / STRIP_SCROLL_SMOOTHING.as_secs_f64()).exp();
+        let mut step = kinetic.pending * share;
+        // The last of it in one go, rather than an ever-smaller tail.
+        if (kinetic.pending - step).abs() < 0.5 {
+            step = kinetic.pending;
+        }
+        kinetic.pending -= step;
+
+        if let Some((anim, applied)) = &mut kinetic.fling {
+            let value = anim.value();
+            step += value - *applied;
+            *applied = value;
+            if anim.is_done() {
+                kinetic.fling = None;
+            }
+        }
+        let idle = kinetic.pending == 0. && kinetic.fling.is_none();
+
+        // Stopped dead by an end of the row: what is left of the scroll has nowhere to go.
+        if (!self.scroll_strip(step) && step != 0.) || idle {
+            self.thumb_kinetic = None;
+        }
     }
 
     /// Scroll the row sideways by `dx` pixels without activating anything — positive reveals
@@ -3358,7 +3497,7 @@ impl<W: LayoutElement> Monitor<W> {
         !unchanged
     }
 
-    /// [`Self::scroll_strip`] by `thumbs` thumbnail widths.
+    /// [`Self::scroll_strip_smoothly`] by `thumbs` thumbnail widths.
     pub fn scroll_strip_by_thumbs(&mut self, thumbs: f64) -> bool {
         let Some(w) = self
             .thumbnail_strip_at_rest()
@@ -3366,7 +3505,7 @@ impl<W: LayoutElement> Monitor<W> {
         else {
             return false;
         };
-        self.scroll_strip(thumbs * w)
+        self.scroll_strip_smoothly(thumbs * w, None)
     }
 
     /// Scroll the row while a drag rests near either end of its band, so a window can be

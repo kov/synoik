@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 const HISTORY_LIMIT: Duration = Duration::from_millis(150);
-const DECELERATION_TOUCHPAD: f64 = 0.997;
+pub const DECELERATION_TOUCHPAD: f64 = 0.997;
 
 #[derive(Debug)]
 pub struct SwipeTracker {
