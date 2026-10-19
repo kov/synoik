@@ -644,6 +644,9 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// the band, so it needs no animation of its own — it rides the pointer, and nothing has to
     /// remember to reset it when the drag leaves the strip.
     pub(self) peek_shrink: f64,
+    /// The work area of the workspace the window was picked up from, which its floating position
+    /// is a fraction of — see [`floating::FloatingSpace::fit_arrived`].
+    pub(self) origin_working_area: Rectangle<f64, Logical>,
 }
 
 #[derive(Debug)]
@@ -5730,6 +5733,7 @@ impl<W: LayoutElement> Layout<W> {
                     .workspaces_mut()
                     .find(|ws| ws.has_window(&window_id))
                     .unwrap();
+                let origin_working_area = ws.working_area();
                 if in_expose {
                     // gnome-shell's WindowPreview drag never touches the real window: no
                     // unmaximize/untile until the drop, the tile carrying its state and
@@ -5785,6 +5789,7 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 let mut data = InteractiveMoveData {
+                    origin_working_area,
                     tile,
                     output,
                     pointer_pos_within_output,
@@ -6219,6 +6224,17 @@ impl<W: LayoutElement> Layout<W> {
                             move_.is_full_width,
                             true,
                         );
+
+                        // Arriving from another work area — another display's, usually — the
+                        // window gets what its workspace would have got moving there whole: fit,
+                        // restored, and moved between the areas. Only a drop that kept its
+                        // position has one in the old area to move from.
+                        if keep_position {
+                            if let Some(ws) = mon.workspaces.iter_mut().find(|ws| ws.id() == ws_id)
+                            {
+                                ws.fit_arrived_window(&win_id, move_.origin_working_area);
+                            }
+                        }
                     }
                     InsertPosition::EdgeTile(target) => {
                         // Dropped on a screen edge: commit the tile/maximize.

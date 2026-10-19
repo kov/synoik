@@ -34023,6 +34023,108 @@ fn a_window_shrunk_for_a_smaller_display_lands_wholly_inside_it() {
     );
 }
 
+/// A window dropped from the overview onto a workspace on a smaller display gets what its whole
+/// workspace would have got moving there: fitted per axis, wholly inside the work area, and given
+/// its own geometry back when it is dropped back on a display that can hold it
+/// (`docs/fork/multi-display.md` §5).
+#[test]
+fn a_window_dropped_on_a_smaller_display_is_fitted_like_a_moved_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let id = f.add_client();
+    f.roundtrip(id);
+    pointer_motion_to(&mut f, 960., 540.);
+    let surface = map_window_sized(&mut f, id, (1000, 900), None);
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+
+    // Honour each configure like a real client, or the tile keeps its old size.
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        let w = f.client(id).window(&surface);
+        let (cw, ch) = w.configures_received.last().unwrap().1.size;
+        if cw > 0 && ch > 0 {
+            w.set_size(cw as u16, ch as u16);
+        }
+        w.ack_last_and_commit();
+        f.double_roundtrip(id);
+        f.settle();
+    };
+    settle(&mut f);
+    let rect_of = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .tile
+            .live_rect
+            .expect("it floats")
+    };
+    let before = rect_of(&mut f);
+
+    let drop_on = |f: &mut Fixture, n: u8| {
+        tap(f, KEY_LEFTMETA);
+        f.settle();
+        let from = if window_workspace_output(f, &win) == "headless-1" {
+            1
+        } else {
+            2
+        };
+        let output = f.synoik_output(from);
+        let origin = f
+            .synoik()
+            .global_space
+            .output_geometry(&output)
+            .unwrap()
+            .loc
+            .to_f64();
+        let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
+        let grab = (
+            origin.x + rect.loc.x + rect.size.w / 2.,
+            origin.y + rect.loc.y + rect.size.h / 2.,
+        );
+        pointer_motion_to(f, grab.0, grab.1);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(f, grab.0, grab.1 - 20.);
+        let (tx, ty) = thumbnail_center_on(f, n, 0);
+        pointer_motion_to(f, tx, ty);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.settle();
+        tap(f, KEY_LEFTMETA);
+        f.settle();
+        settle(f);
+    };
+
+    drop_on(&mut f, 2);
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-2");
+    let area = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .unwrap()
+        .2
+        .working_area();
+    let fitted = rect_of(&mut f);
+    assert_eq!(
+        (fitted.size.w.round(), fitted.size.h.round()),
+        (1000., area.size.h.round()),
+        "only the axis that stopped fitting is clamped"
+    );
+    assert!(
+        area.contains_rect(fitted),
+        "and it lands wholly inside the work area: {fitted:?} in {area:?}"
+    );
+
+    drop_on(&mut f, 1);
+    assert_eq!(window_workspace_output(&mut f, &win), "headless-1");
+    assert_eq!(
+        rect_of(&mut f),
+        before,
+        "a display that can hold it again gives back the geometry it had, position included"
+    );
+}
+
 /// A window that fits again comes back to where it sat, on a fractionally scaled display.
 ///
 /// The remembered rect is only spendable when the window can be given its size back, and that

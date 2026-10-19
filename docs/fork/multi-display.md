@@ -397,6 +397,15 @@ policy. Displacement deliberately does **not** re-run it: doing so would maximiz
 large window on every dock cycle. Making arrival on a smaller display maximize instead of shrink is
 a one-line change to this predicate, kept known for later tuning.
 
+### A window dropped across displays gets the same
+
+A window dropped from the overview onto a workspace whose work area differs from the one it was
+picked up in — another display's, usually — goes through the very same fit, restore and
+area-to-area move (`FloatingSpace::fit_arrived`). The overview's drop keeps the window's position
+as a fraction of the area it left, so the window is first put back there, in that area, and moved
+from it exactly as its workspace would have been. A desktop drag across displays is not included:
+it places the window at the pointer, and has no old position to move from.
+
 ## 6. Moving a workspace to another display
 
 **Dragging a workspace from one display's strip to another's** is **implemented**. Most of the

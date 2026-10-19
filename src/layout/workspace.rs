@@ -3946,6 +3946,11 @@ impl<W: LayoutElement> Workspace<W> {
         self.working_area
     }
 
+    /// See [`FloatingSpace::fit_arrived`].
+    pub fn fit_arrived_window(&mut self, id: &W::Id, from: Rectangle<f64, Logical>) {
+        self.floating.fit_arrived(id, from);
+    }
+
     /// Seeds the geometry an un-maximize or un-fullscreen returns `id` to, from an output-local
     /// rect.
     ///

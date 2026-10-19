@@ -472,7 +472,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // hence `Fitted::tile_size`, since the tile itself will not carry it until the client acks.
         let fitted: Vec<Fitted> = if area_changed {
             (0..self.tiles.len())
-                .map(|idx| self.fit_to_working_area(idx, working_area))
+                .map(|idx| self.fit_to_working_area(idx, self.working_area, working_area))
                 .collect()
         } else {
             Vec::new()
@@ -521,8 +521,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
     ///
     /// Returns the size it asked the client for and, when the window just got its rect back and
     /// the area can hold it there, the position to put it back at.
-    fn fit_to_working_area(&mut self, idx: usize, area: Rectangle<f64, Logical>) -> Fitted {
-        let old_area = self.working_area;
+    ///
+    /// `old_area` is the area the window's current position is relative to: this space's own,
+    /// unless the window has just arrived from another ([`Self::fit_arrived`]).
+    fn fit_to_working_area(
+        &mut self,
+        idx: usize,
+        old_area: Rectangle<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> Fitted {
         let tile = &self.tiles[idx];
 
         // A window this maximized because nothing else fit comes back out when something does.
@@ -658,6 +665,39 @@ impl<W: LayoutElement> FloatingSpace<W> {
         Fitted {
             tile_size: Some(tile_size),
             restore_pos: None,
+        }
+    }
+
+    /// Gives a window just dropped here from another work area the treatment a workspace moving
+    /// between those areas gives its windows ([`Self::update_config`]): sized to fit, its own
+    /// geometry given back if this area can hold it, and moved by mutter's area-to-area rule.
+    ///
+    /// The tile was added at its old floating position — a fraction of `from`, the area it was
+    /// picked up in — so that is where it is put back first, and the move made from there is the
+    /// very one a workspace move would have made. A drop that placed the window itself, at the
+    /// pointer, has no old position to move from; this is only for the overview's, which keeps it.
+    pub fn fit_arrived(&mut self, id: &W::Id, from: Rectangle<f64, Logical>) {
+        let area = self.working_area;
+        if from == area {
+            return;
+        }
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+        let tile = &self.tiles[idx];
+        let plain = tile.window().pending_sizing_mode().is_normal()
+            && tile.window().edge_tiled_side().is_none();
+        if plain {
+            let data = &mut self.data[idx];
+            data.working_area = from;
+            data.recompute_logical_pos();
+        }
+        let fitted = self.fit_to_working_area(idx, from, area);
+        if plain {
+            self.data[idx].update_config(area, fitted.tile_size);
+        }
+        if let Some(pos) = fitted.restore_pos {
+            self.data[idx].set_logical_pos(pos);
         }
     }
 
