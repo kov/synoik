@@ -6390,6 +6390,12 @@ impl State {
         let theme = self.synoik.gnome_settings.key_theme;
         let was_clock = self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Clock;
         let mut effects = match raw {
+            // At the clock these are keys like any other: GNOME raises the prompt for everything
+            // but the four above (`unlockDialog.js:671-689`), and Return and Escape only act on
+            // the prompt once it is up. Enter is the key people reach for to wake a lock screen.
+            Some(Keysym::Escape | Keysym::Return | Keysym::KP_Enter) if was_clock => {
+                self.synoik.unlock_dialog.show_prompt(now)
+            }
             Some(Keysym::Escape) => self.synoik.unlock_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter) => self.synoik.unlock_dialog.submit(now),
             _ => {

@@ -18894,6 +18894,50 @@ fn shift_and_caps_do_not_wake_the_prompt() {
     );
 }
 
+/// Return and Escape at the clock raise the prompt like any other key (`unlockDialog.js:671-689`);
+/// they act as submit and back only once the prompt is up. Enter is what people press to wake a
+/// lock screen, and it used to leave the clock showing until the pointer moved.
+#[test]
+fn return_and_escape_wake_the_prompt_from_the_clock() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock);
+
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(
+        f.synoik().unlock_dialog.page(),
+        Page::Prompt,
+        "Enter wakes it"
+    );
+
+    // On the prompt Escape is back, as before.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(
+        f.synoik().unlock_dialog.page(),
+        Page::Clock,
+        "Escape goes back"
+    );
+
+    tap(&mut f, KEY_ESC);
+    assert_eq!(
+        f.synoik().unlock_dialog.page(),
+        Page::Prompt,
+        "and wakes it from the clock"
+    );
+}
+
 /// Keys typed at a **locked** shield must not raise it, and must not reach the desktop.
 ///
 /// The unlocked shield raises on anything (it is a screensaver). The locked one must not — and the
