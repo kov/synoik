@@ -8,21 +8,27 @@
 # through all three boots' worth of it: the shutdown into the update, the update boot's splash,
 # handover and update screen, its reboot, and the boot after — for `report.py`.
 #
-#   scripts/harness/update.sh [--settle SECONDS] [--out DIR]
+#   scripts/harness/update.sh [--fake] [--settle SECONDS] [--out DIR]
 #
+#   --fake     no package manager: a unit drives the splash as dnf5 would, but stops the bar at
+#              40 % before changing to the reboot screen, as a real update may (boot-splash.md
+#              §4.3); the package managers' offline units are masked meanwhile
 #   --settle   how long to keep recording after the session's first frame (default 3)
 #   --out      where the run lands (default: target/harness/<run> in this checkout)
 #
-# Stages `dnf5 reinstall --offline which` unless a transaction is staged already. The harness is
-# SELinux enforcing, where every plymouth client is denied the outer's socket (boot-splash.md §6),
-# so the default entry boots with `enforcing=0` for the run; the argument is removed after.
+# Without `--fake`, stages `dnf5 reinstall --offline which` unless a transaction is staged
+# already. The harness is SELinux enforcing, where every plymouth client is denied the outer's
+# socket (boot-splash.md §6), so the default entry boots with `enforcing=0` for the run; the
+# argument is removed after.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
 settle=3
 out=
+fake=
 while [ $# -gt 0 ]; do
     case $1 in
+    --fake) fake=1; shift ;;
     --settle) settle=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     *) die "unknown argument $1" ;;
@@ -37,16 +43,53 @@ capture="$HARNESS_DIR/captures/$run"
 boot
 wait_session 3
 pid=$(supervisor)
-on_guest 'dnf5 offline status | grep -q "dnf5 offline reboot" || dnf5 reinstall --offline -y which >/dev/null' ||
-    die "cannot stage an offline transaction"
+offline_units="dnf5-offline-transaction.service packagekit-offline-update.service dnf-system-upgrade.service"
+fake_unit=/etc/systemd/system/harness-fake-update.service
+if [ -n "$fake" ]; then
+    on_guest "systemctl mask --quiet $offline_units && cat >$fake_unit && systemctl daemon-reload &&
+        systemctl enable --quiet harness-fake-update.service" <<'UNIT'
+[Unit]
+Description=harness: a fake offline update
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target system-update-pre.target
+Before=shutdown.target system-update.target
+ConditionPathExists=/system-update
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'plymouth display-message --text="Starting offline transaction. This will take a while."; sleep 1; \
+    plymouth system-update --progress=0; plymouth change-mode --updates; sleep 1; \
+    for p in 15 40; do plymouth system-update --progress=$$p; sleep 1; done; \
+    plymouth display-message --text="Transaction complete! Cleaning up and rebooting..."; \
+    plymouth change-mode --reboot; rm -f /system-update; systemctl reboot'
+
+[Install]
+WantedBy=system-update.target
+UNIT
+else
+    on_guest 'dnf5 offline status | grep -q "dnf5 offline reboot" || dnf5 reinstall --offline -y which >/dev/null' ||
+        die "cannot stage an offline transaction"
+fi
 on_guest 'grubby --update-kernel=DEFAULT --args=enforcing=0'
-trap "on_guest 'grubby --update-kernel=DEFAULT --remove-args=enforcing=0' || true" EXIT
+cleanup() {
+    on_guest 'grubby --update-kernel=DEFAULT --remove-args=enforcing=0' || true
+    if [ -n "$fake" ]; then
+        on_guest "systemctl disable --quiet harness-fake-update.service; rm -f $fake_unit /system-update;
+            systemctl unmask --quiet $offline_units; systemctl daemon-reload" || true
+    fi
+}
+trap cleanup EXIT
 went_down=$(on_guest 'cat /proc/sys/kernel/random/boot_id' | tr -d -)
 clock_line >"$out/driver.jsonl"
 on_host "mkdir -p '$HARNESS_DIR/captures' && '$LIMINA' debug $pid capture start '$capture' >/dev/null"
 sleep 1
 mark_on_host reboot true >>"$out/driver.jsonl"
-on_guest 'systemd-run --no-block dnf5 offline reboot -y' >/dev/null || true
+if [ -n "$fake" ]; then
+    on_guest 'ln -sfn /var/empty /system-update && systemctl --no-block reboot' || true
+else
+    on_guest 'systemd-run --no-block dnf5 offline reboot -y' >/dev/null || true
+fi
 
 # The update boot has no sshd (system-update.target pulls in no multi-user units): the first
 # boot that answers is the one after it.
