@@ -1,0 +1,7 @@
+Adwaita's scalable cursors, as gnome-shell 51.1 ships them
+(data/cursor-theme/icons/Adwaita/cursors_scalable, commit 32f76879 and later).
+
+By Jakub Steiner for the GNOME project. Each SVG carries its license in its
+metadata: the MIT License.
+
+`build.rs` embeds this directory into the synoik binary; `src/cursor.rs` reads it.

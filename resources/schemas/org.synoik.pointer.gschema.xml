@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The pointer, past what GNOME offers.
+
+  GNOME has no shake-to-locate: it is the Jiggle extension's, and macOS's
+  "Shake mouse pointer to locate". So this is ours.
+-->
+<schemalist>
+  <schema id="org.synoik.pointer" path="/org/synoik/pointer/">
+
+    <key name="shake-to-locate" type="b">
+      <default>true</default>
+      <summary>Grow the pointer when it is shaken</summary>
+      <description>
+        Shaking the pointer quickly back and forth makes it grow, so it is easy
+        to find on a large or busy screen. It shrinks back once the shaking
+        stops.
+      </description>
+    </key>
+
+  </schema>
+</schemalist>

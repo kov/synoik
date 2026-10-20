@@ -1316,7 +1316,7 @@ fn sync_cursor(
 /// Mutter's native cursor renderer scales and turns its sprites for the CRTC the same way
 /// (`meta-cursor-renderer-native.c`). `None` for anything but an ARGB8888 image in memory or shm
 /// with no buffer transform of its own: that one is drawn into the frame.
-fn cursor_pixels(
+pub(crate) fn cursor_pixels(
     renderer: &mut VulkanRenderer,
     element: &PointerRenderElements,
     size: Size<i32, Physical>,

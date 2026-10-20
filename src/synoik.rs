@@ -133,7 +133,7 @@ use crate::app_system::AppIconRef;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::clipboard::SelectionData;
-use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
+use crate::cursor::{CursorManager, RenderCursor};
 use crate::dbus::freedesktop_locale1::Locale1ToSynoik;
 use crate::dbus::freedesktop_login1::Login1ToSynoik;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntrospect};
@@ -1074,8 +1074,11 @@ pub struct Synoik {
     pub xkb_from_locale1: Option<Xkb>,
 
     pub cursor_manager: CursorManager,
-    pub cursor_texture_cache: CursorTextureCache,
     pub cursor_shape_manager_state: CursorShapeManagerState,
+    /// Shake-to-locate's detector and the zoom it puts on the pointer.
+    pub shake: crate::input::shake::Shake,
+    /// Checks, while the pointer is grown, whether it is still being shaken.
+    pub shake_timer: Option<TimerToken>,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
     ///
@@ -2186,9 +2189,14 @@ impl State {
             }
         }
 
+        if mode == BackendMode::HeadlessTest {
+            // Hermetic: the bundled cursor theme answers, whatever the host has installed.
+            state.synoik.cursor_manager.set_data_dirs(Vec::new());
+        }
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
+            state.synoik.sync_cursor_settings();
             if let Some(sources) = state.synoik.greeter_input_sources() {
                 state.synoik.gnome_settings.input_sources = sources;
             }
@@ -2491,6 +2499,7 @@ impl State {
                             || state.synoik.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.synoik.gnome_settings = settings;
+                        state.synoik.sync_cursor_settings();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -4201,14 +4210,6 @@ impl State {
         // borrow of `self.synoik` — several of the updates below need it mutably.
         let config_cell = self.synoik.config.clone();
         let mut old_config = config_cell.borrow_mut();
-
-        // Reload the cursor.
-        if config.cursor != old_config.cursor {
-            self.synoik
-                .cursor_manager
-                .reload(&config.cursor.xcursor_theme, config.cursor.xcursor_size);
-            self.synoik.cursor_texture_cache.clear();
-        }
 
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
@@ -8725,14 +8726,14 @@ impl Synoik {
         seat.add_pointer();
 
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
-        let cursor_manager =
-            CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
 
         let mod_key = backend.mod_key(&config.borrow());
         // The compiled-in model, which a live session replaces right after
         // construction (and then calls `refresh_keybinding_state`). Headless tests keep
         // exactly this one, so the fast-path sets have to be built from it here.
         let gnome_settings = GnomeSettings::default();
+        let cursor_manager =
+            CursorManager::new(&gnome_settings.cursor_theme, gnome_settings.cursor_size);
         let keybindings = &gnome_settings.keybindings;
         let mods_with_mouse_binds = mods_with_mouse_binds(keybindings);
         let mods_with_wheel_binds = mods_with_wheel_binds(keybindings);
@@ -9058,8 +9059,9 @@ impl Synoik {
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
             cursor_manager,
-            cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
+            shake: Default::default(),
+            shake_timer: None,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
             pointer_visibility: PointerVisibility::Visible,
@@ -11453,6 +11455,25 @@ impl Synoik {
         };
     }
 
+    /// Point the cursor manager at `org.gnome.desktop.interface cursor-theme`/`cursor-size`, and
+    /// put a grown pointer back when shake-to-locate is turned off.
+    pub fn sync_cursor_settings(&mut self) {
+        let settings = &self.gnome_settings;
+        let mut changed = self
+            .cursor_manager
+            .set_theme(&settings.cursor_theme, settings.cursor_size);
+        if !settings.shake_to_locate {
+            changed |= self.shake.zoom() != 1.;
+            self.shake.reset();
+            if let Some(token) = self.shake_timer.take() {
+                self.cancel_timer(token);
+            }
+        }
+        if changed {
+            self.queue_redraw_all();
+        }
+    }
+
     /// Hotspot of the current cursor image for `output`, in physical pixels.
     ///
     /// Matches the offset `render_pointer` bakes into the cursor element position, so it can be
@@ -11465,19 +11486,32 @@ impl Synoik {
     /// cursor plane buffer for the output transform, so this stays transform-agnostic.
     pub fn cursor_plane_hotspot(&self, output: &Output) -> Point<i32, Physical> {
         let output_scale = Scale::from(output.current_scale().fractional_scale());
-        let cursor_scale = output.current_scale().integer_scale();
-        match self.cursor_manager.get_render_cursor(cursor_scale) {
+        match self.render_cursor_on(output) {
             RenderCursor::Hidden => Point::default(),
             RenderCursor::Surface { hotspot, .. } => {
-                hotspot.to_physical_precise_round(output_scale)
+                // `render_pointer`'s arithmetic: the surface at the rounded pointer less the
+                // hotspot, stretched about the rounded pointer by the shake's zoom.
+                let pointer_pos = self.pointer_position_on(output);
+                let origin: Point<i32, Physical> =
+                    pointer_pos.to_physical_precise_round(output_scale);
+                let loc: Point<i32, Physical> =
+                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
+                (origin - loc)
+                    .to_f64()
+                    .upscale(self.shake.zoom())
+                    .to_i32_round()
             }
-            RenderCursor::Named { scale, cursor, .. } => {
-                let (_, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                XCursor::hotspot(frame)
-                    .to_logical(scale)
-                    .to_physical_precise_round(output_scale)
-            }
+            RenderCursor::Named(named) => named.hotspot.to_physical_precise_round(output_scale),
         }
+    }
+
+    /// The cursor as `output` draws it now.
+    fn render_cursor_on(&self, output: &Output) -> RenderCursor {
+        self.cursor_manager.get_render_cursor(
+            output.current_scale().fractional_scale(),
+            self.shake.zoom(),
+            self.start_time.elapsed().as_millis() as u32,
+        )
     }
 
     /// Where the pointer is drawn, relative to `output`: the tablet cursor while there is one,
@@ -11497,21 +11531,21 @@ impl Synoik {
         push: &mut dyn FnMut(PointerRenderElements),
     ) {
         let _span = tracy_client::span!("Synoik::render_pointer");
-        let output_scale = output.current_scale();
         let pointer_pos = self.pointer_position_on(output);
 
-        // Get the render cursor to draw.
-        let cursor_scale = output_scale.integer_scale();
-        let render_cursor = self.cursor_manager.get_render_cursor(cursor_scale);
-
+        let render_cursor = self.render_cursor_on(output);
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
         match render_cursor {
             RenderCursor::Hidden => (),
             RenderCursor::Surface { surface, hotspot } => {
+                let origin = pointer_pos.to_physical_precise_round(output_scale);
                 let pointer_pos =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
+                // A client's own image has no larger version to draw: a shaken one is
+                // stretched about the hotspot, which keeps it on the pointer.
+                let zoom = self.shake.zoom();
                 push_elements_from_surface_tree(
                     renderer,
                     &surface,
@@ -11519,27 +11553,31 @@ impl Synoik {
                     output_scale,
                     1.,
                     Kind::Cursor,
-                    &mut |elem| push(elem.into()),
+                    &mut |elem| {
+                        if zoom == 1. {
+                            push(elem.into());
+                        } else {
+                            push(RescaleRenderElement::from_element(elem, origin, zoom).into());
+                        }
+                    },
                 );
             }
-            RenderCursor::Named {
-                icon,
-                scale,
-                cursor,
-            } => {
-                let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let hotspot = XCursor::hotspot(frame).to_logical(scale);
-                let pointer_pos =
-                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
-
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+            RenderCursor::Named(named) => {
+                // The hotspot is rounded on its own, as `cursor_plane_hotspot` rounds it.
+                let pointer_pos: Point<i32, Physical> = pointer_pos
+                    .to_physical_precise_round(output_scale)
+                    - named.hotspot.to_physical_precise_round(output_scale);
+                let src = Rectangle::from_size(Size::from((
+                    f64::from(named.pixels.w),
+                    f64::from(named.pixels.h),
+                )));
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    pointer_pos,
-                    &texture,
+                    pointer_pos.to_f64(),
+                    &named.buffer,
                     None,
-                    None,
-                    None,
+                    Some(src),
+                    Some(named.size.to_i32_round()),
                     Kind::Cursor,
                 ) {
                     Ok(element) => push(element.into()),
@@ -11734,15 +11772,14 @@ impl Synoik {
 
                     // The default cursor is rendered at the right scale for each output, which
                     // means that it may have a different hotspot for each output.
-                    let output_scale = output.current_scale().integer_scale();
-                    let cursor = self
-                        .cursor_manager
-                        .get_cursor_with_name(icon, output_scale)
-                        .unwrap_or_else(|| self.cursor_manager.get_default_cursor(output_scale));
-
+                    //
                     // For simplicity, we always use frame 0 for this computation. Let's hope the
                     // hotspot doesn't change between frames.
-                    let hotspot = XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale);
+                    let hotspot = self
+                        .cursor_manager
+                        .named(icon, output.current_scale().fractional_scale(), 1., 0)
+                        .hotspot
+                        .to_i32_round();
 
                     let surface_pos = pointer_pos.to_i32_round() - hotspot;
                     let bbox = bbox_from_surface_tree(surface, surface_pos);
@@ -11960,7 +11997,8 @@ impl Synoik {
         causes.set(
             AnimCauses::CURSOR,
             self.cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale()),
+                .is_current_cursor_animated(output.current_scale().fractional_scale())
+                || self.shake.is_animating(),
         );
 
         causes.set(
@@ -18489,6 +18527,7 @@ fn scale_relocate_crop<E: Element>(
 synoik_render_elements! {
     PointerRenderElements => {
         Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
+        ZoomedWayland = RescaleRenderElement<WaylandSurfaceRenderElement<VulkanRenderer>>,
         NamedPointer = MemoryRenderBufferRenderElement<VulkanRenderer>,
     }
 }

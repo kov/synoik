@@ -175,6 +175,13 @@ pub struct GnomeSettings {
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
     pub icon_theme: String,
+    /// `org.gnome.desktop.interface cursor-theme`: the theme pointer images come from, scalable
+    /// (`cursors_scalable`) first and Xcursor after, as mutter looks them up
+    /// (`meta-cursor-theme.c`). GNOME's default is `"Adwaita"`.
+    pub cursor_theme: String,
+    /// `org.gnome.desktop.interface cursor-size`: the pointer's size in logical pixels. GNOME's
+    /// default is 24.
+    pub cursor_size: i32,
 
     /// `org.gnome.desktop.interface enable-animations`. False turns our animations off, via
     /// [`State::apply_animation_clock`] — mutter honors this key, so a session that asked for no
@@ -199,6 +206,9 @@ pub struct GnomeSettings {
     ///
     /// [`State::apply_animation_clock`]: crate::synoik::State::apply_animation_clock
     pub animation_speed: f64,
+    /// `org.synoik.pointer shake-to-locate`: whether shaking the pointer makes it grow. Ours —
+    /// GNOME has it only as the Jiggle extension. See [`crate::input::shake`].
+    pub shake_to_locate: bool,
     /// `org.gnome.desktop.interface enable-hot-corners`: whether the top-left corner toggles the
     /// overview when the pointer pushes into it (`layout.js:436-443`). GNOME has exactly one hot
     /// corner and no way to move it; which corner is a text-direction question, not a preference.
@@ -510,6 +520,7 @@ impl Default for GnomeSettings {
             center_new_windows: true,
             auto_maximize: true,
             enable_animations: true,
+            shake_to_locate: true,
             animation_speed: 1.,
             enable_hot_corners: true,
             background: BackgroundSettings::default(),
@@ -519,6 +530,8 @@ impl Default for GnomeSettings {
             base_font_family: synoik_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
             key_theme: crate::ui::text_edit::KeyTheme::default(),
             icon_theme: "Adwaita".to_string(),
+            cursor_theme: "Adwaita".to_string(),
+            cursor_size: 24,
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
             quick_toggles: QuickToggles::default(),
@@ -834,6 +847,14 @@ impl GnomeSettings {
         }
     }
 
+    /// `org.synoik.pointer` — ours, like `org.synoik.animations`, and absent on a checkout that
+    /// never installed our schemas, which leaves the default in charge.
+    fn load_pointer(&mut self, pointer: Option<&gio::Settings>) {
+        if let Some(pointer) = pointer.filter(|s| settings_has_key(s, "shake-to-locate")) {
+            self.shake_to_locate = pointer.boolean("shake-to-locate");
+        }
+    }
+
     fn load_interface(&mut self, interface: &gio::Settings) {
         if settings_has_key(interface, "enable-animations") {
             self.enable_animations = interface.boolean("enable-animations");
@@ -858,6 +879,17 @@ impl GnomeSettings {
             if !value.is_empty() {
                 self.icon_theme = value.to_string();
             }
+        }
+        if settings_has_key(interface, "cursor-theme") {
+            let value = interface.string("cursor-theme");
+            if !value.is_empty() {
+                self.cursor_theme = value.to_string();
+            }
+        }
+        if settings_has_key(interface, "cursor-size") {
+            // The schema allows 0; mutter would then load the theme's smallest image, which is
+            // no pointer anyone asked for.
+            self.cursor_size = interface.int("cursor-size").max(1);
         }
         if settings_has_key(interface, "font-name") {
             let value = interface.string("font-name");
@@ -2775,6 +2807,8 @@ struct Stores {
     /// `org.synoik.animations` — how fast animations run. Ours because GNOME has no
     /// user-facing key for it; see [`GnomeSettings::animation_speed`].
     synoik_animations: Option<gio::Settings>,
+    /// `org.synoik.pointer` — shake-to-locate; see [`GnomeSettings::shake_to_locate`].
+    synoik_pointer: Option<gio::Settings>,
     /// `org.gtk.gtk4.Settings.EmojiChooser` — GTK's own history, read to seed ours and never
     /// written. Installed by GTK itself, so `None` on a machine without it.
     gtk_emoji_chooser: Option<gio::Settings>,
@@ -2846,6 +2880,7 @@ impl Stores {
             synoik_keybindings: gsettings("org.synoik.keybindings", b),
             synoik_emoji: gsettings("org.synoik.emoji", b),
             synoik_animations: gsettings("org.synoik.animations", b),
+            synoik_pointer: gsettings("org.synoik.pointer", b),
             gtk_emoji_chooser: gsettings("org.gtk.gtk4.Settings.EmojiChooser", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
@@ -2910,6 +2945,7 @@ impl Stores {
             &self.synoik_keybindings,
             &self.synoik_emoji,
             &self.synoik_animations,
+            &self.synoik_pointer,
             &self.gtk_emoji_chooser,
             &self.shell_keybindings,
             &self.wm_keybindings,
@@ -2970,6 +3006,7 @@ impl Stores {
         }
         settings.load_emoji(self.synoik_emoji.as_ref(), self.gtk_emoji_chooser.as_ref());
         settings.load_animations(self.synoik_animations.as_ref());
+        settings.load_pointer(self.synoik_pointer.as_ref());
         settings.load_switchers(self.app_switcher.as_ref(), self.window_switcher.as_ref());
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
@@ -3486,7 +3523,7 @@ fn desktop_app_installed(desktop_id: &str) -> bool {
 
 /// The XDG data search path, **user directory first** — the order every
 /// first-wins lookup below walks (`shell-app-cache.c:112-140`).
-fn xdg_data_dirs() -> Vec<PathBuf> {
+pub(crate) fn xdg_data_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(data_home));
@@ -4940,6 +4977,26 @@ mod tests {
             0.5,
             "a refused write must leave the value alone",
         );
+    }
+
+    /// `org.synoik.pointer shake-to-locate` reaches the model through the real store set, and is
+    /// on unless turned off. Skipped on a checkout that has not installed our schemas.
+    #[test]
+    fn shake_to_locate_comes_from_our_store() {
+        if !schema_available("org.synoik.pointer", Some("shake-to-locate")) {
+            return;
+        }
+
+        let stores = Rc::new(Stores::open(SettingsStore::Memory));
+        assert!(stores.read().shake_to_locate, "on by default");
+
+        stores
+            .synoik_pointer
+            .as_ref()
+            .expect("the schema is installed")
+            .set_boolean("shake-to-locate", false)
+            .unwrap();
+        assert!(!stores.read().shake_to_locate);
     }
 
     /// The change subscription re-reads the model when a key in any watched

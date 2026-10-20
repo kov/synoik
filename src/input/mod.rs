@@ -94,6 +94,7 @@ pub mod pressure;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
+pub mod shake;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod synthetic;
@@ -6514,6 +6515,34 @@ impl State {
         }
     }
 
+    /// Feed shake-to-locate the pointer's new position ([`shake`]), and keep checking whether
+    /// it is still shaken while it is grown.
+    fn shake_pointer(&mut self) {
+        if !self.synoik.gnome_settings.shake_to_locate {
+            return;
+        }
+        let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+        let now = self.synoik.clock.now_unadjusted();
+        if !self.synoik.shake.motion(now, pos, &self.synoik.clock) {
+            return;
+        }
+        self.synoik.queue_redraw_all();
+        if self.synoik.shake_timer.is_some() {
+            return;
+        }
+        let token = self.synoik.timer_after(shake::WINDOW / 5, |state| {
+            let now = state.synoik.clock.now_unadjusted();
+            let clock = state.synoik.clock.clone();
+            if state.synoik.shake.check(now, &clock) {
+                return Some(shake::WINDOW / 5);
+            }
+            state.synoik.shake_timer = None;
+            state.synoik.queue_redraw_all();
+            None
+        });
+        self.synoik.shake_timer = Some(token);
+    }
+
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
         // We need an output to be able to move the pointer.
         if self.synoik.global_space.outputs().next().is_none() {
@@ -6828,6 +6857,8 @@ impl State {
             }
         }
 
+        self.shake_pointer();
+
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.synoik.queue_redraw_all();
@@ -6969,6 +7000,8 @@ impl State {
                 self.synoik.layout.dnd_update(output, pos_within_output);
             }
         }
+
+        self.shake_pointer();
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.

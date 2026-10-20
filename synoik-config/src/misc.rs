@@ -18,36 +18,20 @@ pub struct SpawnShAtStartup {
     pub command: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Cursor {
-    pub xcursor_theme: String,
-    pub xcursor_size: u8,
     pub hide_when_typing: bool,
     pub hide_after_inactive_ms: Option<u32>,
 }
 
-impl Default for Cursor {
-    fn default() -> Self {
-        Self {
-            xcursor_theme: String::from("default"),
-            xcursor_size: 24,
-            hide_when_typing: false,
-            hide_after_inactive_ms: None,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct CursorPart {
-    pub xcursor_theme: Option<String>,
-    pub xcursor_size: Option<u8>,
     pub hide_when_typing: Option<Flag>,
     pub hide_after_inactive_ms: Option<u32>,
 }
 
 impl MergeWith<CursorPart> for Cursor {
     fn merge_with(&mut self, part: &CursorPart) {
-        merge_clone!((self, part), xcursor_theme, xcursor_size);
         merge!((self, part), hide_when_typing);
         merge_clone_opt!((self, part), hide_after_inactive_ms);
     }
