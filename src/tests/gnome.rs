@@ -43918,3 +43918,86 @@ fn the_greeter_shows_a_polkit_prompt_over_the_list() {
         Some(PolkitRequest::Done { dismissed: true })
     ));
 }
+
+/// Shake the pointer: four 100 px strokes along x, an event every 10 ms of compositor time.
+fn shake_pointer(f: &mut Fixture, step_ms: u64) {
+    for stroke in 0..4 {
+        let dx = if stroke % 2 == 0 { 12.5 } else { -12.5 };
+        for _ in 0..8 {
+            f.advance_clock(Duration::from_millis(step_ms));
+            f.pointer_motion(dx, 0.);
+        }
+    }
+}
+
+fn shake_fixture() -> (Fixture, Output) {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    pointer_motion_to(&mut f, 500., 300.);
+    f.freeze_clock();
+    (f, output)
+}
+
+/// Shake-to-locate (ours; GNOME has it as the Jiggle extension): a shaken pointer grows to three
+/// times its size about its hotspot, holds while the shaking goes on, and shrinks back once it
+/// stops. Pinned by the hotspot the cursor plane is handed, which is what moves when the drawn
+/// image grows around the pointer.
+#[test]
+fn a_shaken_pointer_grows_and_shrinks_back() {
+    let (mut f, output) = shake_fixture();
+    let at_rest = f.synoik().cursor_plane_hotspot(&output);
+    assert_eq!(at_rest, Point::from((8, 7)), "the bundled Adwaita default");
+
+    shake_pointer(&mut f, 10);
+    f.run_frames_for(Duration::from_millis(300));
+    assert_eq!(
+        f.synoik().cursor_plane_hotspot(&output),
+        Point::from((24, 21)),
+        "grown threefold"
+    );
+
+    // No more shaking: the hold runs out with the window, then the shrink plays.
+    f.run_frames_for(crate::input::shake::WINDOW + Duration::from_millis(400));
+    assert_eq!(f.synoik().cursor_plane_hotspot(&output), at_rest);
+    assert!(f.synoik().shake_timer.is_none(), "nothing left checking");
+}
+
+/// The same strokes, slowly, are someone moving the pointer about, not shaking it.
+#[test]
+fn a_slowly_moved_pointer_does_not_grow() {
+    let (mut f, output) = shake_fixture();
+    shake_pointer(&mut f, 40);
+    f.run_frames_for(Duration::from_millis(300));
+    assert_eq!(
+        f.synoik().cursor_plane_hotspot(&output),
+        Point::from((8, 7))
+    );
+}
+
+/// `org.synoik.pointer shake-to-locate` off: no growth, and turning it off mid-growth puts the
+/// pointer back at once.
+#[test]
+fn shake_to_locate_can_be_turned_off() {
+    let (mut f, output) = shake_fixture();
+    shake_pointer(&mut f, 10);
+    f.run_frames_for(Duration::from_millis(100));
+    assert_ne!(
+        f.synoik().cursor_plane_hotspot(&output),
+        Point::from((8, 7))
+    );
+
+    f.synoik().gnome_settings.shake_to_locate = false;
+    f.synoik().sync_cursor_settings();
+    assert_eq!(
+        f.synoik().cursor_plane_hotspot(&output),
+        Point::from((8, 7))
+    );
+
+    shake_pointer(&mut f, 10);
+    f.run_frames_for(Duration::from_millis(300));
+    assert_eq!(
+        f.synoik().cursor_plane_hotspot(&output),
+        Point::from((8, 7))
+    );
+}

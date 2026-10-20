@@ -1075,6 +1075,10 @@ pub struct Synoik {
 
     pub cursor_manager: CursorManager,
     pub cursor_shape_manager_state: CursorShapeManagerState,
+    /// Shake-to-locate's detector and the zoom it puts on the pointer.
+    pub shake: crate::input::shake::Shake,
+    /// Checks, while the pointer is grown, whether it is still being shaken.
+    pub shake_timer: Option<TimerToken>,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
     ///
@@ -2188,7 +2192,7 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
-            state.synoik.sync_cursor_theme();
+            state.synoik.sync_cursor_settings();
             if let Some(sources) = state.synoik.greeter_input_sources() {
                 state.synoik.gnome_settings.input_sources = sources;
             }
@@ -2491,7 +2495,7 @@ impl State {
                             || state.synoik.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.synoik.gnome_settings = settings;
-                        state.synoik.sync_cursor_theme();
+                        state.synoik.sync_cursor_settings();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -9052,6 +9056,8 @@ impl Synoik {
             xkb_from_locale1: None,
             cursor_manager,
             cursor_shape_manager_state,
+            shake: Default::default(),
+            shake_timer: None,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
             pointer_visibility: PointerVisibility::Visible,
@@ -11445,13 +11451,21 @@ impl Synoik {
         };
     }
 
-    /// Point the cursor manager at `org.gnome.desktop.interface cursor-theme`/`cursor-size`.
-    pub fn sync_cursor_theme(&mut self) {
+    /// Point the cursor manager at `org.gnome.desktop.interface cursor-theme`/`cursor-size`, and
+    /// put a grown pointer back when shake-to-locate is turned off.
+    pub fn sync_cursor_settings(&mut self) {
         let settings = &self.gnome_settings;
-        if self
+        let mut changed = self
             .cursor_manager
-            .set_theme(&settings.cursor_theme, settings.cursor_size)
-        {
+            .set_theme(&settings.cursor_theme, settings.cursor_size);
+        if !settings.shake_to_locate {
+            changed |= self.shake.zoom() != 1.;
+            self.shake.reset();
+            if let Some(token) = self.shake_timer.take() {
+                self.cancel_timer(token);
+            }
+        }
+        if changed {
             self.queue_redraw_all();
         }
     }
@@ -11481,7 +11495,7 @@ impl Synoik {
     fn render_cursor_on(&self, output: &Output) -> RenderCursor {
         self.cursor_manager.get_render_cursor(
             output.current_scale().fractional_scale(),
-            1.,
+            self.shake.zoom(),
             self.start_time.elapsed().as_millis() as u32,
         )
     }
@@ -11511,9 +11525,13 @@ impl Synoik {
         match render_cursor {
             RenderCursor::Hidden => (),
             RenderCursor::Surface { surface, hotspot } => {
+                let origin = pointer_pos.to_physical_precise_round(output_scale);
                 let pointer_pos =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
+                // A client's own image has no larger version to draw: a shaken one is
+                // stretched about the hotspot, which keeps it on the pointer.
+                let zoom = self.shake.zoom();
                 push_elements_from_surface_tree(
                     renderer,
                     &surface,
@@ -11521,7 +11539,13 @@ impl Synoik {
                     output_scale,
                     1.,
                     Kind::Cursor,
-                    &mut |elem| push(elem.into()),
+                    &mut |elem| {
+                        if zoom == 1. {
+                            push(elem.into());
+                        } else {
+                            push(RescaleRenderElement::from_element(elem, origin, zoom).into());
+                        }
+                    },
                 );
             }
             RenderCursor::Named(named) => {
@@ -11959,7 +11983,8 @@ impl Synoik {
         causes.set(
             AnimCauses::CURSOR,
             self.cursor_manager
-                .is_current_cursor_animated(output.current_scale().fractional_scale()),
+                .is_current_cursor_animated(output.current_scale().fractional_scale())
+                || self.shake.is_animating(),
         );
 
         causes.set(
@@ -18488,6 +18513,7 @@ fn scale_relocate_crop<E: Element>(
 synoik_render_elements! {
     PointerRenderElements => {
         Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
+        ZoomedWayland = RescaleRenderElement<WaylandSurfaceRenderElement<VulkanRenderer>>,
         NamedPointer = MemoryRenderBufferRenderElement<VulkanRenderer>,
     }
 }
