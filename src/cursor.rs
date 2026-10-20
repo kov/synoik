@@ -271,11 +271,17 @@ impl CursorManager {
                 None,
             )
         });
+        // The drawing moved by its snap; the pointer moves with it.
+        let snap = frame.snap(raster_scale);
+        let hotspot = (
+            frame.hotspot.0 + snap.x / raster_scale,
+            frame.hotspot.1 + snap.y / raster_scale,
+        );
         NamedCursor {
             buffer,
             pixels,
             size: Size::from((frame.width * unit * zoom, frame.height * unit * zoom)),
-            hotspot: Point::from((frame.hotspot.0 * unit * zoom, frame.hotspot.1 * unit * zoom)),
+            hotspot: Point::from((hotspot.0 * unit * zoom, hotspot.1 * unit * zoom)),
         }
     }
 
@@ -492,6 +498,9 @@ struct SvgCursor {
     frames: Vec<SvgFrame>,
 }
 
+/// Straight edges along one axis, as `(where, length)` in SVG units.
+type Edges = Vec<(f64, f64)>;
+
 struct SvgFrame {
     tree: usvg::Tree,
     /// How long it shows, in ms; zero for a still cursor.
@@ -503,6 +512,10 @@ struct SvgFrame {
     /// The SVG's intrinsic size.
     width: f64,
     height: f64,
+    /// The outline's vertical edges ([`SvgFrame::snap`]).
+    x_edges: Edges,
+    /// Its horizontal edges.
+    y_edges: Edges,
 }
 
 impl SvgFrame {
@@ -512,13 +525,19 @@ impl SvgFrame {
     /// wider than a pixel as a hairline, a pixel wide along its minor axis, so Adwaita's 1-unit
     /// outline came out thin and grey on the arrow's diagonal at cursor-size 24. Averaged down,
     /// the raster matches librsvg's, which gnome-shell draws with.
+    ///
+    /// The drawing is shifted by [`SvgFrame::snap`] first.
     fn rasterize(&self, scale: f64, pixels: Size<i32, Buffer>) -> tiny_skia::Pixmap {
         let _span = tracy_client::span!("SvgFrame::rasterize");
         let (w, h) = (pixels.w as usize, pixels.h as usize);
         let mut large =
             tiny_skia::Pixmap::new((w * SUPERSAMPLE) as u32, (h * SUPERSAMPLE) as u32).unwrap();
         let large_scale = scale as f32 * SUPERSAMPLE as f32;
-        let transform = tiny_skia::Transform::from_scale(large_scale, large_scale);
+        let snap = self.snap(scale);
+        let transform = tiny_skia::Transform::from_scale(large_scale, large_scale).post_translate(
+            snap.x as f32 * SUPERSAMPLE as f32,
+            snap.y as f32 * SUPERSAMPLE as f32,
+        );
         resvg::render(&self.tree, transform, &mut large.as_mut());
 
         // Premultiplied, so a plain average of each block is the right blend.
@@ -546,6 +565,110 @@ impl SvgFrame {
         }
         pixmap
     }
+
+    /// How far, in pixels and under half of one each way, the drawing moves at `scale` so its
+    /// straight outline edges fall between pixels rather than across them.
+    ///
+    /// Adwaita's shapes sit on the unit grid but the groups holding them do not (`default`'s is
+    /// translated by 1.748 units), so at cursor-size 24 a horizontal edge straddles two rows and
+    /// both come out grey. A cursor is a few pixels of outline, so that is most of what it is:
+    /// this is our own hinting, not GNOME's, which draws the SVG where it lies. Each axis takes
+    /// the shift that leaves the least edge length off the grid, the smallest one of those.
+    fn snap(&self, scale: f64) -> Point<f64, Buffer> {
+        fn axis(edges: &[(f64, f64)], scale: f64) -> f64 {
+            let misfit = |shift: f64| -> f64 {
+                edges
+                    .iter()
+                    .map(|(at, length)| {
+                        let at = at * scale + shift;
+                        (at - at.round()).abs() * length
+                    })
+                    .sum()
+            };
+            std::iter::once(0.)
+                .chain(
+                    edges
+                        .iter()
+                        .map(|(at, _)| (at * scale).round() - at * scale),
+                )
+                .min_by(|a, b| {
+                    // Within a millipixel of edge length the fits are equal.
+                    let key = |shift: f64| ((misfit(shift) * 1000.).round(), shift.abs());
+                    key(*a).partial_cmp(&key(*b)).unwrap()
+                })
+                .unwrap()
+        }
+        Point::from((axis(&self.x_edges, scale), axis(&self.y_edges, scale)))
+    }
+}
+
+/// The vertical and horizontal edges of `tree`'s outline, as [`SvgFrame`] holds them: a
+/// stroke's two sides, or a fill's edge when it has no stroke. Shadows, drawn through filters,
+/// are blurred anyway and stay out of it.
+fn straight_edges(tree: &usvg::Tree) -> (Edges, Edges) {
+    use usvg::tiny_skia_path::PathSegment;
+
+    fn walk(group: &usvg::Group, x: &mut Edges, y: &mut Edges) {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(group) if group.filters().is_empty() => walk(group, x, y),
+                usvg::Node::Path(path) if path.is_visible() => add(path, x, y),
+                _ => (),
+            }
+        }
+    }
+
+    fn add(path: &usvg::Path, x: &mut Edges, y: &mut Edges) {
+        let transform = path.abs_transform();
+        let sides: &[f32] = &match path.stroke() {
+            Some(stroke) => {
+                let scale = (transform.sx * transform.sy - transform.kx * transform.ky)
+                    .abs()
+                    .sqrt();
+                let half = stroke.width().get() * scale / 2.;
+                [-half, half]
+            }
+            None if path.fill().is_some() => [0., 0.],
+            None => return,
+        };
+        let mut line = |mut from: tiny_skia::Point, mut to: tiny_skia::Point| {
+            transform.map_point(&mut from);
+            transform.map_point(&mut to);
+            let (dx, dy) = ((to.x - from.x).abs(), (to.y - from.y).abs());
+            if dx < 1e-3 && dy > 1e-3 {
+                x.extend(
+                    sides
+                        .iter()
+                        .map(|side| (f64::from(from.x + side), f64::from(dy))),
+                );
+            } else if dy < 1e-3 && dx > 1e-3 {
+                y.extend(
+                    sides
+                        .iter()
+                        .map(|side| (f64::from(from.y + side), f64::from(dx))),
+                );
+            }
+        };
+        let (mut start, mut at) = (tiny_skia::Point::zero(), tiny_skia::Point::zero());
+        for segment in path.data().segments() {
+            match segment {
+                PathSegment::MoveTo(to) => (start, at) = (to, to),
+                PathSegment::LineTo(to) => {
+                    line(at, to);
+                    at = to;
+                }
+                PathSegment::QuadTo(_, to) | PathSegment::CubicTo(_, _, to) => at = to,
+                PathSegment::Close => {
+                    line(at, start);
+                    at = start;
+                }
+            }
+        }
+    }
+
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    walk(tree.root(), &mut x, &mut y);
+    (x, y)
 }
 
 #[derive(serde::Deserialize)]
@@ -618,12 +741,15 @@ impl SvgCursor {
                 let tree = usvg::Tree::from_data(&read(&meta.filename)?, &options)
                     .with_context(|| format!("parsing {}", meta.filename))?;
                 let size = tree.size();
+                let (x_edges, y_edges) = straight_edges(&tree);
                 Ok(SvgFrame {
                     delay: meta.delay,
                     hotspot: (meta.hotspot_x, meta.hotspot_y),
                     nominal_size: meta.nominal_size,
                     width: f64::from(size.width()),
                     height: f64::from(size.height()),
+                    x_edges,
+                    y_edges,
                     tree,
                 })
             })
@@ -721,12 +847,18 @@ mod tests {
     }
 
     /// The default pointer at GNOME's defaults: Adwaita's 32-unit SVG, drawn for a 24 px
-    /// cursor, with its hotspot at (8, 7) (`cursors_scalable/default/metadata.json`).
+    /// cursor, with its hotspot at (8, 7) (`cursors_scalable/default/metadata.json`), moved
+    /// with the drawing by the snap that puts the notch's edges, at 17.748 and 18.748, on rows.
     #[test]
     fn the_default_pointer_is_the_bundled_svg() {
         let manager = manager(BUNDLED_THEME_NAME, 24);
         let named = manager.named(CursorIcon::Default, 1., 1., 0);
-        assert_eq!(named.hotspot, Point::from((8., 7.)));
+        assert_eq!(named.hotspot.x, 8.);
+        assert!(
+            (named.hotspot.y - 7.2516).abs() < 1e-3,
+            "{:?}",
+            named.hotspot
+        );
         assert_eq!(named.size, Size::from((32., 32.)));
         assert_eq!(named.pixels, Size::from((32, 32)));
     }
@@ -737,7 +869,14 @@ mod tests {
     fn an_svg_cursor_renders_at_any_size_and_scale() {
         let manager = manager(BUNDLED_THEME_NAME, 48);
         let named = manager.named(CursorIcon::Default, 1.5, 1., 0);
-        assert_eq!(named.hotspot, Point::from((16., 14.)));
+        // (8, 7) at 2 logical pixels a unit, but drawn at 3 pixels a unit, where the notch's
+        // edges fall at 53.245 and 56.245 and the snap is -0.245 px.
+        assert_eq!(named.hotspot.x, 16.);
+        assert!(
+            (named.hotspot.y - (7. - 0.2452 / 3.) * 2.).abs() < 1e-3,
+            "{:?}",
+            named.hotspot
+        );
         assert_eq!(named.size, Size::from((64., 64.)));
         assert_eq!(named.pixels, Size::from((96, 96)));
     }
@@ -785,6 +924,29 @@ mod tests {
                 .unwrap();
             let lightness = edge.red().min(edge.green()).min(edge.blue());
             assert!(lightness > 220, "row {y}: {edge:?}");
+        }
+    }
+
+    /// At cursor-size 24 and scale 1 the bar across the arrow's notch is one white row, not two
+    /// grey ones: the snap put its edges between rows.
+    #[test]
+    fn the_arrow_notch_lands_on_a_pixel_row() {
+        let cursor = SvgCursor::load_bundled("default").unwrap().unwrap();
+        let pixmap = cursor.frames[0].rasterize(1., Size::from((32, 32)));
+        let pixel = |x, y| pixmap.pixel(x, y).unwrap().demultiply();
+        // The bar runs from the tail to the diagonal: white and opaque on row 18, with the
+        // black head above it and only shadow below.
+        for x in 14..19 {
+            let bar = pixel(x, 18);
+            assert!(bar.alpha() > 240 && bar.red() > 240, "({x}, 18): {bar:?}");
+        }
+        for x in 12..16 {
+            let head = pixel(x, 17);
+            assert!(head.alpha() > 240 && head.red() < 30, "({x}, 17): {head:?}");
+        }
+        for x in 15..19 {
+            let below = pixel(x, 19);
+            assert!(below.red() < 30, "({x}, 19): {below:?}");
         }
     }
 
