@@ -182,12 +182,6 @@ Owner doc: `docs/fork/client-blur.md` (gaps 4–7 were open).
 - **[R] hint-text margin changed**: `_entries.scss` `margin-left: $base_margin * 0.5` → `* 2`.
 - **[N] `StScrollView` supports touch scrolling** (`0cfdd9f1a`), gated by a setting
   (`d4af38315`), and ad-hoc touch handling was removed from search (`dc27d75e6`).
-- **[N] SVG cursors**: `St` gained `st-cursor.c` (`ca479a211`) and gnome-shell ships a whole
-  **scalable Adwaita cursor theme** in `data/theme/Adwaita/cursors_scalable/` +
-  `gnome-shell-cursor-theme.gresource.xml` (`32f768792`). mutter gained
-  `meta-cursor-theme.c` and "allow external cursor implementations" (`!5104`), with
-  `meta-cursor-xcursor.c` shrinking by 233 lines. Relevant to `docs/fork/` cursor work and to the
-  software-cursor interim.
 - **[R] `St.ButtonMask` values renamed** (`a2979bb9c`, `c3b936e4d`) — cosmetic for us.
 - **[N] `ShellGLSLEffect` deleted**, effects ported to `ClutterShaderEffect` (`0c86a7b35`,
   `709d0634e`); `st-scroll-view-fade.glsl` is gone, inlined via `Cogl.Snippet` (`89b599cb4`).
