@@ -175,6 +175,13 @@ pub struct GnomeSettings {
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
     pub icon_theme: String,
+    /// `org.gnome.desktop.interface cursor-theme`: the theme pointer images come from, scalable
+    /// (`cursors_scalable`) first and Xcursor after, as mutter looks them up
+    /// (`meta-cursor-theme.c`). GNOME's default is `"Adwaita"`.
+    pub cursor_theme: String,
+    /// `org.gnome.desktop.interface cursor-size`: the pointer's size in logical pixels. GNOME's
+    /// default is 24.
+    pub cursor_size: i32,
 
     /// `org.gnome.desktop.interface enable-animations`. False turns our animations off, via
     /// [`State::apply_animation_clock`] — mutter honors this key, so a session that asked for no
@@ -519,6 +526,8 @@ impl Default for GnomeSettings {
             base_font_family: synoik_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
             key_theme: crate::ui::text_edit::KeyTheme::default(),
             icon_theme: "Adwaita".to_string(),
+            cursor_theme: "Adwaita".to_string(),
+            cursor_size: 24,
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
             quick_toggles: QuickToggles::default(),
@@ -858,6 +867,17 @@ impl GnomeSettings {
             if !value.is_empty() {
                 self.icon_theme = value.to_string();
             }
+        }
+        if settings_has_key(interface, "cursor-theme") {
+            let value = interface.string("cursor-theme");
+            if !value.is_empty() {
+                self.cursor_theme = value.to_string();
+            }
+        }
+        if settings_has_key(interface, "cursor-size") {
+            // The schema allows 0; mutter would then load the theme's smallest image, which is
+            // no pointer anyone asked for.
+            self.cursor_size = interface.int("cursor-size").max(1);
         }
         if settings_has_key(interface, "font-name") {
             let value = interface.string("font-name");

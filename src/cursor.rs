@@ -28,7 +28,8 @@ type XCursorCache = HashMap<(CursorIcon, i32), Option<Rc<XCursor>>>;
 
 pub struct CursorManager {
     theme: CursorTheme,
-    size: u8,
+    theme_name: String,
+    size: i32,
     current_cursor: CursorImageStatus,
     /// A compositor-wide cursor that wins over whatever the pointer is actually
     /// over — mutter's `MetaCompositor:global_cursor`, applied through the backend's
@@ -39,13 +40,12 @@ pub struct CursorManager {
 }
 
 impl CursorManager {
-    pub fn new(theme: &str, size: u8) -> Self {
+    pub fn new(theme: &str, size: i32) -> Self {
         Self::ensure_env(theme, size);
 
-        let theme = CursorTheme::load(theme);
-
         Self {
-            theme,
+            theme: CursorTheme::load(theme),
+            theme_name: theme.to_owned(),
             size,
             current_cursor: CursorImageStatus::default_named(),
             global_override: None,
@@ -53,12 +53,18 @@ impl CursorManager {
         }
     }
 
-    /// Reload the cursor theme.
-    pub fn reload(&mut self, theme: &str, size: u8) {
+    /// Follow `org.gnome.desktop.interface cursor-theme`/`cursor-size`. Returns whether anything
+    /// changed — the caller then owes a texture-cache clear and a redraw.
+    pub fn set_theme(&mut self, theme: &str, size: i32) -> bool {
+        if self.theme_name == theme && self.size == size {
+            return false;
+        }
         Self::ensure_env(theme, size);
         self.theme = CursorTheme::load(theme);
+        self.theme_name = theme.to_owned();
         self.size = size;
         self.named_cursor_cache.get_mut().clear();
+        true
     }
 
     /// Checks if the cursor WlSurface is alive, and if not, cleans it up.
@@ -155,7 +161,7 @@ impl CursorManager {
             .borrow_mut()
             .entry((icon, scale))
             .or_insert_with_key(|(icon, scale)| {
-                let size = self.size as i32 * scale;
+                let size = self.size * scale;
                 let mut cursor = Self::load_xcursor(&self.theme, icon.name(), size);
 
                 // Check alternative names to account for non-compliant themes.
@@ -232,7 +238,7 @@ impl CursorManager {
     }
 
     /// Set the common XCURSOR env variables.
-    fn ensure_env(theme: &str, size: u8) {
+    fn ensure_env(theme: &str, size: i32) {
         env::set_var("XCURSOR_THEME", theme);
         env::set_var("XCURSOR_SIZE", size.to_string());
     }

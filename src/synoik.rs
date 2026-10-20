@@ -2189,6 +2189,7 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
+            state.synoik.sync_cursor_theme();
             if let Some(sources) = state.synoik.greeter_input_sources() {
                 state.synoik.gnome_settings.input_sources = sources;
             }
@@ -2491,6 +2492,7 @@ impl State {
                             || state.synoik.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.synoik.gnome_settings = settings;
+                        state.synoik.sync_cursor_theme();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -4201,14 +4203,6 @@ impl State {
         // borrow of `self.synoik` — several of the updates below need it mutably.
         let config_cell = self.synoik.config.clone();
         let mut old_config = config_cell.borrow_mut();
-
-        // Reload the cursor.
-        if config.cursor != old_config.cursor {
-            self.synoik
-                .cursor_manager
-                .reload(&config.cursor.xcursor_theme, config.cursor.xcursor_size);
-            self.synoik.cursor_texture_cache.clear();
-        }
 
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
@@ -8725,14 +8719,14 @@ impl Synoik {
         seat.add_pointer();
 
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
-        let cursor_manager =
-            CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
 
         let mod_key = backend.mod_key(&config.borrow());
         // The compiled-in model, which a live session replaces right after
         // construction (and then calls `refresh_keybinding_state`). Headless tests keep
         // exactly this one, so the fast-path sets have to be built from it here.
         let gnome_settings = GnomeSettings::default();
+        let cursor_manager =
+            CursorManager::new(&gnome_settings.cursor_theme, gnome_settings.cursor_size);
         let keybindings = &gnome_settings.keybindings;
         let mods_with_mouse_binds = mods_with_mouse_binds(keybindings);
         let mods_with_wheel_binds = mods_with_wheel_binds(keybindings);
@@ -11451,6 +11445,18 @@ impl Synoik {
                 scheduled_at: Some(at),
             },
         };
+    }
+
+    /// Point the cursor manager at `org.gnome.desktop.interface cursor-theme`/`cursor-size`.
+    pub fn sync_cursor_theme(&mut self) {
+        let settings = &self.gnome_settings;
+        if self
+            .cursor_manager
+            .set_theme(&settings.cursor_theme, settings.cursor_size)
+        {
+            self.cursor_texture_cache.clear();
+            self.queue_redraw_all();
+        }
     }
 
     /// Hotspot of the current cursor image for `output`, in physical pixels.
