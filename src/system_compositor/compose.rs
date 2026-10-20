@@ -1047,13 +1047,16 @@ mod tests {
             messages: vec!["Hello".into()],
             ..Splash::default()
         };
+        // Mid-turn: a theme's first frames can be all but blank, as Ubuntu's fade in (its first
+        // peaks at 4/255).
+        let frame = c.spinner_frames() / 2;
         let mut texture = c
             .splash_picture(
                 (1280, 800),
                 &boot,
                 1.,
                 (1280, 800),
-                0,
+                frame,
                 &Dialog::default(),
                 None,
             )
@@ -1064,7 +1067,7 @@ mod tests {
             &boot,
             (1280, 800).into(),
             &images,
-            0,
+            frame,
             &Dialog::default(),
             &mut |_, _| (0, 0).into(),
         );
