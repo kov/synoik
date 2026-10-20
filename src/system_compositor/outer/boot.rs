@@ -18,14 +18,23 @@ use synoik_splash::handoff;
 use synoik_splash::keyboard::{self, Entry, Keyboard};
 use synoik_splash::layout::Dialog;
 
-use super::{Outer, Shown};
-use crate::system_compositor::plymouth::{self, Event, Server};
+use super::{End, Motion, Outer, Picture, Shown, Target, Transition};
+use crate::render_helpers::vulkan::VkTexture;
+use crate::system_compositor::plymouth::{self, Event, Server, Splash};
 use crate::system_compositor::splash;
 use crate::utils::get_monotonic_time;
 
 /// How soon to try plymouthd's name again while plymouthd still holds it: it frees it a moment
 /// after acknowledging `ExecStartPost=`'s quit (§2.1 step 4).
 const BIND_RETRY: Duration = Duration::from_millis(20);
+
+/// How long the update bar takes to fill the rest of the way when an update ends short of
+/// 100 % (§4.3). Ours: plymouth cuts to the next mode wherever the bar stands.
+const FILL: Duration = Duration::from_millis(150);
+
+/// How long a mode change may keep its client waiting for the screen to show it (§4.3): the
+/// fill and the fade, with room to spare. The reboot after an update waits on that client.
+const MODE_CHANGE_CAP: Duration = Duration::from_secs(1);
 
 /// The socket side: always there, so the shutdown's `change-mode` reaches the outer too.
 pub(super) struct Plymouth {
@@ -40,19 +49,27 @@ pub(super) struct Plymouth {
     /// Inside the keyboard's own callback, whose watch goes by returning `Remove`; set once it
     /// should.
     in_keyboard: Option<bool>,
+    /// Armed while a held `C` waits for the screen (`MODE_CHANGE_CAP`); once it fires, the
+    /// change is answered whatever the screen shows.
+    mode_change_cap: Option<RegistrationToken>,
+    mode_change_overdue: bool,
 }
 
 impl Plymouth {
     pub fn new() -> Self {
+        // plymouthd answers root only (`ply-boot-server.c:265-285`).
+        let mut server = Server::new(0);
+        server.hold_mode_changes();
         Self {
-            // plymouthd answers root only (`ply-boot-server.c:265-285`).
-            server: Server::new(0),
+            server,
             retry: None,
             connections: std::collections::HashMap::new(),
             keyboard: None,
             keyboard_failed: false,
             entry: Entry::default(),
             in_keyboard: None,
+            mode_change_cap: None,
+            mode_change_overdue: false,
         }
     }
 }
@@ -68,6 +85,40 @@ pub(super) struct BootSplash {
     /// Bumped with every change to what the splash shows, so a display knows its frame is stale.
     pub revision: u64,
     timer: Option<RegistrationToken>,
+    /// The splash as of the last change, for the screen a mode change leaves.
+    last: Splash,
+}
+
+/// The screen a mode change leaves, as `from` of the crossfade into the new one (§4.3). Drawn
+/// live, so its spinner keeps turning, and leaving an update its bar first fills to 100 %.
+pub(super) struct Leaving {
+    /// The splash as it stood before the change.
+    splash: Splash,
+    /// Where the bar fills from: leaving an update for a mode without a bar.
+    fill_from: Option<u8>,
+    /// Drawn into in place, and the progress and spinner frame it shows.
+    texture: Option<(VkTexture, (u8, usize))>,
+}
+
+impl Leaving {
+    /// How long the old screen stays before the crossfade starts: the bar's fill, if any.
+    pub fn lead(&self) -> Duration {
+        match self.fill_from {
+            Some(from) if from < 100 => FILL,
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+/// The bar's percentage `elapsed` into a fill from `from` lasting `lead`: eased out like the
+/// crossfade that follows, so the bar slows into 100 %.
+fn fill_progress(from: u8, elapsed: Duration, lead: Duration) -> u8 {
+    if lead.is_zero() {
+        return 100;
+    }
+    let t = elapsed.as_secs_f32() / lead.as_secs_f32();
+    let eased = Motion::FADE.ease(t);
+    (f32::from(from) + f32::from(100 - from.min(100)) * eased).round() as u8
 }
 
 /// A connection's fd, for its watch. The stream itself stays with the server, which hands it
@@ -101,6 +152,7 @@ impl Outer {
             resumed,
             revision: 0,
             timer: None,
+            last: Splash::default(),
         });
         match resume {
             Some(state) => {
@@ -108,6 +160,10 @@ impl Outer {
                 self.plymouth.server.restore(state.splash);
             }
             None => self.plymouth.server.show(),
+        }
+        let splash = self.plymouth.server.splash().clone();
+        if let Some(boot) = &mut self.boot {
+            boot.last = splash;
         }
         // Nothing is on screen yet to redraw: the first modeset draws what this says.
         self.plymouth.server.take_events();
@@ -152,12 +208,16 @@ impl Outer {
     }
 
     /// The splash's revision and spinner frame as the screen should show them. A splash not
-    /// shown has no spinner, nor has one asking for a password, so its frame stays put: a
-    /// turning one would redraw the same picture fifteen times a second.
+    /// shown has no spinner, nor has one asking for a password or one in an update mode (its
+    /// bar takes the spinner's place), so its frame stays put: a turning one would redraw the
+    /// same picture fifteen times a second.
     pub(super) fn splash_state(&mut self) -> (u64, usize) {
         let revision = self.boot.as_ref().map_or(0, |b| b.revision);
         let splash = self.plymouth.server.splash();
-        let frame = if splash.shown && splash.password_prompt.is_none() {
+        let frame = if splash.shown
+            && splash.password_prompt.is_none()
+            && splash::titles(splash.mode).is_none()
+        {
             self.spinner_frame()
         } else {
             0
@@ -319,9 +379,14 @@ impl Outer {
     fn on_plymouth_except(&mut self, current: Option<u64>) {
         loop {
             self.follow_prompt();
-            let events = self.plymouth.server.take_events();
+            let mut events = self.plymouth.server.take_events();
             if events.is_empty() {
-                break;
+                // Only now: a change's fade starts as its event is handled.
+                self.release_mode_changes();
+                events = self.plymouth.server.take_events();
+                if events.is_empty() {
+                    break;
+                }
             }
             for event in events {
                 match event {
@@ -423,13 +488,24 @@ impl Outer {
     }
 
     fn on_splash_changed(&mut self) {
-        let frozen = self.plymouth.server.splash().frozen;
+        let splash = self.plymouth.server.splash().clone();
+        let frozen = splash.frozen;
         let Some(was_frozen) = self.boot.as_ref().map(|b| b.frozen.is_some()) else {
             return;
         };
         let frame = self.spinner_frame();
         let Some(boot) = &mut self.boot else { return };
         boot.revision += 1;
+        let old = std::mem::replace(&mut boot.last, splash.clone());
+        // Into an update or out of one the screen changes; between boot, shutdown and reboot, or
+        // between two update modes but for the title, it hardly does.
+        if old.shown && splash.shown && old.mode != splash.mode {
+            let leaving_update = splash::titles(old.mode).is_some();
+            if leaving_update != splash::titles(splash.mode).is_some() {
+                self.change_screen(old, leaving_update);
+            }
+        }
+        let Some(boot) = &mut self.boot else { return };
         match (frozen, was_frozen) {
             (true, false) => boot.frozen = Some(frame),
             // `$` after `H` starts the spinner over (`ply_throbber_start`).
@@ -440,6 +516,158 @@ impl Outer {
             _ => (),
         }
         self.redraw_splash();
+    }
+
+    /// Whether a display is fading from a mode change.
+    fn mode_change_showing(&self) -> bool {
+        self.displays
+            .values()
+            .any(|d| d.transition.as_ref().is_some_and(|t| t.leaving.is_some()))
+    }
+
+    /// Answer a held `C` once no display is still showing a mode change, or once it has waited
+    /// `MODE_CHANGE_CAP`. Answering lets its client go on, and it may be what the reboot waits
+    /// for (`plymouth-reboot.service`, PackageKit).
+    fn release_mode_changes(&mut self) {
+        let waiting = self.plymouth.server.mode_change_waiting();
+        if waiting && !self.plymouth.mode_change_overdue && self.mode_change_showing() {
+            if self.plymouth.mode_change_cap.is_none() {
+                // Not the compositor clock of `Synoik::timer_after`: the outer holds no `Synoik`.
+                #[allow(clippy::disallowed_methods)]
+                let timer = Timer::from_duration(MODE_CHANGE_CAP.mul_f32(self.slow));
+                let token = self
+                    .handle
+                    .insert_source(timer, |_, _, outer: &mut Outer| {
+                        outer.plymouth.mode_change_cap = None;
+                        warn!("a mode change waited too long for the screen; answering it");
+                        outer.plymouth.mode_change_overdue = true;
+                        outer.on_plymouth();
+                        TimeoutAction::Drop
+                    })
+                    .expect("inserting a timer");
+                self.plymouth.mode_change_cap = Some(token);
+            }
+            return;
+        }
+        if waiting {
+            self.plymouth.server.finish_mode_change();
+        }
+        self.plymouth.mode_change_overdue = false;
+        if let Some(token) = self.plymouth.mode_change_cap.take() {
+            self.handle.remove(token);
+        }
+    }
+
+    /// A fade from a mode change on some display ended: answer the change if it was the last,
+    /// from the loop rather than from inside whatever ended it.
+    pub(super) fn mode_change_shown(&mut self) {
+        self.handle.insert_idle(|outer| outer.on_plymouth());
+    }
+
+    /// The splash changed mode from `old`: crossfade every display showing it into the new
+    /// mode, and leaving an update fill its bar to 100 % first (§4.3). A display already fading
+    /// shows the change as it is: its splash end is drawn live.
+    fn change_screen(&mut self, old: Splash, leaving_update: bool) {
+        if self.compositor.is_none() {
+            return;
+        }
+        debug!(
+            target: super::FLIGHT,
+            "the splash changes mode: {:?} to {:?}",
+            old.mode,
+            self.plymouth.server.splash().mode
+        );
+        let fill_from = leaving_update.then(|| old.progress.unwrap_or(0));
+        let names: Vec<String> = self.displays.keys().cloned().collect();
+        for d in names {
+            let idle = self
+                .displays
+                .get(&d)
+                .is_some_and(|d| d.transition.is_none() && !d.switch_pending);
+            if !idle || !self.plate_showing(&d) {
+                continue;
+            }
+            let leaving = Leaving {
+                splash: old.clone(),
+                fill_from,
+                texture: None,
+            };
+            let to = self.base_picture(&d);
+            let Some(display) = self.displays.get_mut(&d) else {
+                continue;
+            };
+            display.transition = Some(Transition {
+                // Drawn before the first frame (`refresh_live_pictures`).
+                from: to.clone(),
+                motion: Motion::FADE,
+                to: None,
+                pending: None,
+                pending_watch: None,
+                start: get_monotonic_time(),
+                wait: None,
+                from_live: None,
+                from_session: None,
+                from_frame: None,
+                from_pending: None,
+                from_splash: false,
+                leaving: Some(leaving),
+            });
+            self.set_target(
+                &d,
+                Target {
+                    picture: to,
+                    end: End::Plate,
+                },
+            );
+        }
+    }
+
+    /// Draw the screen a mode change leaves on `d` as it stands `elapsed` into the change, into
+    /// its fade's `from`.
+    pub(super) fn draw_leaving(&mut self, d: &str, elapsed: Duration) {
+        let frame = self.spinner_frame();
+        let dialog = self.splash_dialog();
+        let panel = self.splash_panel();
+        let slow = self.slow;
+        let Some(display) = self.displays.get_mut(d) else {
+            return;
+        };
+        let size = display.size();
+        let Some(transition) = display.transition.as_mut() else {
+            return;
+        };
+        let Some(leaving) = transition.leaving.as_mut() else {
+            return;
+        };
+        let mut splash = leaving.splash.clone();
+        if let Some(from) = leaving.fill_from {
+            splash.progress = Some(fill_progress(from, elapsed, leaving.lead().mul_f32(slow)));
+        }
+        // An update's bar has the spinner's place.
+        let frame = if splash::titles(splash.mode).is_none() {
+            frame
+        } else {
+            0
+        };
+        let state = (splash.progress.unwrap_or(0), frame);
+        let reuse = match leaving.texture.take() {
+            Some((texture, drawn)) if drawn == state => {
+                leaving.texture = Some((texture, drawn));
+                return;
+            }
+            Some((texture, _)) => Some(texture),
+            None => None,
+        };
+        let Some(compositor) = self.compositor.as_mut() else {
+            return;
+        };
+        match compositor.splash_picture(size, &splash, 1., panel, frame, &dialog, reuse) {
+            Ok(texture) => {
+                transition.from = Picture::Texture(texture.clone());
+                leaving.texture = Some((texture, state));
+            }
+            Err(err) => warn!("drawing the splash a mode change leaves on {d}: {err:#}"),
+        }
     }
 
     fn close_plymouth_connections(&mut self, current: Option<u64>) {
@@ -453,5 +681,29 @@ impl Outer {
             // connection's `Remove` has been applied.
             self.handle.insert_idle(move |_| drop::<UnixStream>(stream));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bar_fills_from_where_it_stood_to_full() {
+        let at = |ms| fill_progress(94, Duration::from_millis(ms), FILL);
+        assert_eq!(at(0), 94);
+        assert_eq!(at(FILL.as_millis() as u64), 100);
+        assert_eq!(at(10_000), 100);
+        let mut last = 94;
+        for ms in (0..=FILL.as_millis() as u64).step_by(10) {
+            let p = at(ms);
+            assert!(p >= last, "{p} after {last}");
+            last = p;
+        }
+        // Eased out: most of the way early.
+        assert!(fill_progress(0, FILL / 4, FILL) > 50);
+        // Nothing to fill.
+        assert_eq!(fill_progress(100, Duration::ZERO, FILL), 100);
+        assert_eq!(fill_progress(42, Duration::ZERO, Duration::ZERO), 100);
     }
 }

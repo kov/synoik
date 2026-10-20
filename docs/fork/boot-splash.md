@@ -140,7 +140,8 @@ the outer's card with `fbcon=map:9` instead, which leaves the client in place
   its update screen through `C`, `u` and `M` (§3.3). The unit's last `ExecStartPost=` waits for the
   pid file, so the update starts only once the outer answers. Measured with a dnf5 offline
   reinstall on the harness (permissive, §6): "Installing Updates…" with the bar at 0, 47 and 100 %,
-  then the reboot screen with dnf5's closing message under the spinner.
+  then the reboot screen with dnf5's closing message under the spinner. `scripts/harness/update.sh`
+  records such an update boot end to end.
 - Open: the outer keeps files on the root filesystem mapped, so dracut's shutdown can only remount
   it read-only. A binary replaced by the update and still mapped may block even that. The harness
   printed no failure at the console's log level; an update replacing the outer's own libraries is
@@ -186,7 +187,7 @@ is reached on the serial console or over ssh — S6's stated cost. Measured on t
 |---|---|---|
 | `P` | ping | ACK at once — util-linux gives up after 1 s, and agetty *quits* plymouth when the ping is late |
 | `$` / `H` | show / hide splash | show; hide freezes the last frame |
-| `C` | change mode: `boot-up`, `shutdown`, `reboot`, `updates`, `system-upgrade`, `firmware-upgrade`, `system-reset` | switch screen (§4.3); unknown modes ACKed and ignored |
+| `C` | change mode: `boot-up`, `shutdown`, `reboot`, `updates`, `system-upgrade`, `firmware-upgrade`, `system-reset` | switch screen (§4.3), ACKed once the screen shows it (at most 1 s); unknown modes ACKed and ignored |
 | `u` | update progress 0-100 | progress bar |
 | `M` / `m` | show / hide message (exact match) | message list; an empty `M` clears it (systemd's FIDO2 code relies on that) |
 | `*` | ask for password, prompt optional | the password dialog (§4.2); ANSWER on Enter. Never NO_ANSWER while a splash is up: systemd's agent takes it as "no UI", leaves the request and waits for the next one, and the console agent stands down for `/run/plymouth/pid`, so the asking unit would wait unseen (crypttab's default timeout is none) |
@@ -234,8 +235,8 @@ pixels for a display of W×H:
   else the first in connector order (the drm renderer's rule), so on Limina at 1280×800 the logo
   stays at the firmware's 512×272. A logo for a rotated panel (status orientation bits) is left
   out, as two-step leaves it out on an upright one; the splash never rotates a panel. Shown in
-  boot, shutdown and reboot and in the retained frame, not in the update modes, and cleared under a
-  password dialog (`DialogClearsFirmwareBackground`). Both drawers read the table when they load
+  every mode and in the retained frame — bgrt leaves it out of the update modes, the splash keeps
+  it (§4.3) — and cleared under a password dialog (`DialogClearsFirmwareBackground`). Both drawers read the table when they load
   the theme.
 - **Spinner:** the theme's 30 `throbber-*.png` frames (the installed set; Fedora replaced the
   checkout's), 32×32, one turn per 2 s, top-left at (0.5W−16, 0.7H−16).
@@ -244,9 +245,10 @@ pixels for a display of W×H:
 - **Messages:** one line, the latest `M`, centred, 10 px under the spinner. two-step has no
   `hide_message`, so `m` does nothing there (systemd clears with an empty `M` for that reason);
   the outer hides the line when `m` names it, which is what the request asks for.
-- **No fades within the splash.** A client's `quit` stops it at background + watermark, plymouth's
-  retained frame. The fades are the outer's: from the splash as it stands, spinner and all, to the
-  first session frame.
+- **No fades within the splash but a mode change's.** A client's `quit` stops it at background +
+  watermark, plymouth's retained frame. The fades are the outer's: from the splash as it stands,
+  spinner and all, to the first session frame, and between the boot and the update screens
+  (§4.3).
 
 ### 4.2 Password dialog
 
@@ -280,12 +282,35 @@ was built (§7.4). Compose sequences (dead keys) are not supported (§6).
 
 ### 4.3 Update modes
 
-`updates`, `system-upgrade`, `firmware-upgrade` and `system-reset`: black background (no firmware
-logo), no spinner; a 400×5 progress bar (white on #606060); a 30 pt title and a 12 pt subtitle
-("Installing Updates…" and its siblings, then "Do not turn off your computer"); "N% complete",
-10 px under the bar, once progress is reported; `M` messages are suppressed. The bar sits at
-(0.5·(W−400), 0.7·(H−5)). The strings are plymouth's; translating them through its gettext domain
+`updates`, `system-upgrade`, `firmware-upgrade` and `system-reset`: no spinner; a 400×5 progress
+bar (white on #606060) in the spinner's place, at (0.5·(W−400), 0.7·(H−5)); a 30 pt title and a
+12 pt subtitle ("Installing Updates…" and its siblings, then "Do not turn off your computer"),
+one subtitle line apart; "N% complete" once progress is reported; `M` messages are suppressed. The strings are plymouth's; translating them through its gettext domain
 is not built (§6).
+
+Two divergences from bgrt, so that an update reads as the same screen as the boot it interrupts
+rather than a different one cut in:
+
+- **The firmware logo stays**, and the title pair sits above it, its subtitle's bottom 40 px over
+  the logo's top (`TITLE_GAP`). Without a logo the pair is bgrt's: centred at 38.2 %. bgrt drops
+  the logo and puts the pair where it was.
+- **"N% complete" sits on the message line**, 10 px under where the spinner's bottom is, rather
+  than 10 px under the bar: it takes the place of the boot's messages.
+- **A mode change into an update mode or out of one crossfades** in the outer, over the switches'
+  250 ms fade, from the old screen drawn live (its spinner turning) to the new one. Leaving an
+  update for a mode without a bar, the bar first fills from where the last `u` left it to 100 %
+  over 150 ms (eased out, "N% complete" counting with it), as an update can end short of 100 %
+  (measured 2026-10-20 on the harness: 94 %). plymouth cuts in both cases.
+- **The `C` waits for the screen.** The outer answers a mode change only once no display is
+  still fading from it, at most 1 s later (`MODE_CHANGE_CAP`). The reboot after an update needs
+  this: dnf5 ends with `u 100` and logind's `Reboot`, and the `C reboot` comes from
+  `plymouth-reboot.service` (`Before=systemd-reboot.service`), so the machine reboots ~200-400 ms
+  after it (measured on the harness), sooner than a fill and a fade; PackageKit sends its own `C`
+  before it reboots, and waits the same way. A logind delay inhibitor cannot do it: logind starts
+  the reboot, and with it the unit sending the `C`, only once the inhibitor is released.
+- The outer's `PrepareForShutdown` fade is skipped on a display already showing the splash, so
+  the update's reboot lets the change play out. The initramfs splash never sees an update mode:
+  `system-update.target` waits for the outer (§2.3), and it answers every `C` at once.
 
 ### 4.4 Text and scale
 

@@ -125,6 +125,10 @@ const ANIMATION_ALIGN: (f64, f64) = (0.5, 0.7);
 const WATERMARK_ALIGN: (f64, f64) = (0.5, 0.96);
 const TITLE_ALIGN: (f64, f64) = (0.5, 0.382);
 
+/// Between the update modes' subtitle and the firmware's logo under it (§4.3). Ours: bgrt shows
+/// no logo there.
+const TITLE_GAP: i32 = 40;
+
 /// Messages sit this far under the spinner or the progress bar (`view_show_message`).
 const MESSAGE_GAP: i32 = 10;
 
@@ -245,7 +249,7 @@ pub enum Item {
 }
 
 /// The update modes' title and subtitle (bgrt's `Title=` and `SubTitle=`).
-fn titles(mode: Mode) -> Option<(&'static str, &'static str)> {
+pub fn titles(mode: Mode) -> Option<(&'static str, &'static str)> {
     let title = match mode {
         Mode::BootUp | Mode::Shutdown | Mode::Reboot => return None,
         Mode::Updates => "Installing Updates...",
@@ -308,12 +312,12 @@ pub fn layout(
     let (w, h) = (f64::from(screen.w), f64::from(screen.h));
     let mut items = Vec::new();
 
-    // bgrt's boot, shutdown and reboot modes draw the logo (`UseFirmwareBackground`); the update
-    // modes do not, and a password dialog clears it (`DialogClearsFirmwareBackground`).
-    let firmware = images
-        .firmware
-        .filter(|_| titles(splash.mode).is_none() && splash.password_prompt.is_none());
-    if let Some(at) = firmware.and_then(|f| place_firmware(&f, screen)) {
+    // bgrt's boot, shutdown and reboot modes draw the logo (`UseFirmwareBackground`); so do the
+    // update modes here, which bgrt draws without it (§4.3). A password dialog clears it
+    // (`DialogClearsFirmwareBackground`).
+    let firmware = images.firmware.filter(|_| splash.password_prompt.is_none());
+    let firmware_at = firmware.and_then(|f| place_firmware(&f, screen));
+    if let Some(at) = firmware_at {
         items.push(Item::Firmware(at));
     }
     if let Some(size) = images.watermark {
@@ -355,7 +359,16 @@ pub fn layout(
         if !prompting {
             items.push(Item::Bar { rect, filled });
         }
-        animation_bottom = Some(rect.loc.y + bh);
+        // The percentage goes on the spinner's message line, not under the bar as bgrt has it:
+        // into an update and out of it, the line crossfades in place (§4.3).
+        let spinner_bottom = images
+            .spinner
+            .map(|(size, _)| (ANIMATION_ALIGN.1 * h - f64::from(size.h) / 2.) as i32 + size.h);
+        animation_bottom = Some(
+            spinner_bottom
+                .unwrap_or(rect.loc.y + bh)
+                .max(rect.loc.y + bh),
+        );
     } else if let Some((size, frames)) = images.spinner {
         let x = ANIMATION_ALIGN.0 * w - f64::from(size.w) / 2.;
         let y = ANIMATION_ALIGN.1 * h - f64::from(size.h) / 2.;
@@ -373,7 +386,14 @@ pub fn layout(
         let title_size = measure(title, Font::Title);
         let subtitle_size = measure(subtitle, Font::Regular);
         // The subtitle's height separates the two (`view_show_title`).
-        let mut y = (h - f64::from(title_size.h) - 2. * f64::from(subtitle_size.h)) * TITLE_ALIGN.1;
+        let height = title_size.h + 2 * subtitle_size.h;
+        // bgrt centres the pair at 38.2 %, where the logo is, and so drops the logo. Here the
+        // logo stays and the pair sits above it, so going into an update and out of it only the
+        // spinner's part of the screen changes (§4.3).
+        let mut y = match &firmware_at {
+            Some(logo) => f64::from(logo.y - TITLE_GAP - height),
+            None => (h - f64::from(height)) * TITLE_ALIGN.1,
+        };
         let x = (w - f64::from(title_size.w)) * TITLE_ALIGN.0;
         items.push(Item::Text {
             text: title.to_owned(),
@@ -621,7 +641,8 @@ mod tests {
         splash.messages = vec!["suppressed".into()];
         splash.progress = Some(42);
         let items = lay(&splash, 1280, 800);
-        // Title 40 px tall, subtitle 20: the pair starts at 0.382 × (800 − 40 − 40).
+        // No logo: title 40 px tall, subtitle 20, the pair starts at 0.382 × (800 − 40 − 40),
+        // bgrt's place.
         assert_eq!(
             items,
             [
@@ -640,13 +661,27 @@ mod tests {
                     font: Font::Regular,
                     at: Point::from((524, 335)),
                 },
+                // On the message line: 10 px under the spinner's bottom at 576.
                 Item::Text {
                     text: "42% complete".into(),
                     font: Font::Regular,
-                    at: Point::from((592, 571)),
+                    at: Point::from((592, 586)),
                 },
             ]
         );
+        // With the logo, at 512×272: the pair ends 40 px above it, 80 px tall.
+        let items = lay_with(&splash, &with_logo((1280, 800)), 1280, 800);
+        assert!(items.contains(&Item::Firmware(Point::from((512, 272)))));
+        assert!(items.contains(&Item::Text {
+            text: "Installing Updates...".into(),
+            font: Font::Title,
+            at: Point::from((472, 152)),
+        }));
+        assert!(items.contains(&Item::Text {
+            text: "Do not turn off your computer".into(),
+            font: Font::Regular,
+            at: Point::from((524, 212)),
+        }));
     }
 
     #[test]
@@ -926,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn the_logo_shows_where_bgrt_uses_the_firmware_background() {
+    fn the_logo_shows_unless_a_dialog_is_up() {
         let logo = with_logo((1280, 800));
         let has_logo = |splash: &Splash| {
             lay_with(splash, &logo, 1280, 800)
@@ -944,13 +979,14 @@ mod tests {
                 "{mode:?}"
             );
         }
+        // The update modes keep it, where bgrt drops it (§4.3).
         for mode in [
             Mode::Updates,
             Mode::SystemUpgrade,
             Mode::FirmwareUpgrade,
             Mode::SystemReset,
         ] {
-            assert!(!has_logo(&shown(mode)), "{mode:?}");
+            assert!(has_logo(&shown(mode)), "{mode:?}");
         }
         // A password dialog clears it.
         assert!(!has_logo(&prompting(Mode::BootUp, Some("Passphrase:"))));

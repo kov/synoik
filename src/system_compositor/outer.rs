@@ -52,7 +52,7 @@ use synoik_splash::{handoff, peer_cred};
 
 mod boot;
 
-use self::boot::{BootSplash, Plymouth};
+use self::boot::{BootSplash, Leaving, Plymouth};
 use super::compose::{Canvas, Compositor, Motion, Picture, Style, Way, PLATE};
 use super::protocol::{self, ConnectorInfo, ModeInfo, OutputConfig, Received, ToInner, ToOuter};
 use super::{chord, splash};
@@ -585,6 +585,9 @@ struct Transition {
     from_pending: Option<(u32, Option<Rc<OwnedFd>>)>,
     /// `from` is the splash, which keeps turning: redrawn as its spinner moves.
     from_splash: bool,
+    /// `from` is the screen a mode change of the splash leaves (boot-splash.md §4.3), drawn
+    /// live; the fade waits for its lead.
+    leaving: Option<Leaving>,
 }
 
 struct Target {
@@ -1497,7 +1500,21 @@ impl Outer {
         self.relayout();
         let names: Vec<String> = self.displays.keys().cloned().collect();
         for d in names {
-            self.switch_display(&d);
+            // Already on the splash, as at the end of an offline update: nothing to fade from,
+            // and a mode change fading on it plays out.
+            let on_splash = self.boot.is_some()
+                && match self
+                    .displays
+                    .get(&d)
+                    .map(|d| (&d.transition, d.switch_pending))
+                {
+                    Some((Some(transition), _)) => transition.leaving.is_some(),
+                    Some((None, false)) => self.plate_showing(&d),
+                    _ => false,
+                };
+            if !on_splash {
+                self.switch_display(&d);
+            }
         }
     }
 
@@ -1682,6 +1699,7 @@ impl Outer {
             from_frame: None,
             from_pending: None,
             from_splash,
+            leaving: None,
         });
         if let Some(Next::Session {
             generation,
@@ -1759,6 +1777,9 @@ impl Outer {
             return;
         };
         debug!(target: FLIGHT, "fade on {d} cancelled");
+        if transition.leaving.is_some() {
+            self.mode_change_shown();
+        }
         self.give_back_from(d, &transition);
         if let Some(token) = transition.wait {
             self.handle.remove(token);
@@ -2082,6 +2103,13 @@ impl Outer {
         let Some(transition) = self.displays.get(d).and_then(|d| d.transition.as_ref()) else {
             return;
         };
+        if transition.leaving.is_some() {
+            let elapsed = get_monotonic_time().saturating_sub(transition.start);
+            self.draw_leaving(d, elapsed);
+        }
+        let Some(transition) = self.displays.get(d).and_then(|d| d.transition.as_ref()) else {
+            return;
+        };
         let from_splash = transition.from_splash;
         let to_splash = matches!(
             transition.to,
@@ -2120,7 +2148,14 @@ impl Outer {
         let Some(to) = &transition.to else {
             return;
         };
-        let elapsed = get_monotonic_time().saturating_sub(transition.start);
+        // A mode change holds the screen it leaves for its lead, then fades.
+        let lead = transition
+            .leaving
+            .as_ref()
+            .map_or(Duration::ZERO, |l| l.lead().mul_f32(self.slow));
+        let elapsed = get_monotonic_time()
+            .saturating_sub(transition.start)
+            .saturating_sub(lead);
         let motion = transition.motion;
         let duration = motion.duration().as_secs_f32() * self.slow;
         let t = (elapsed.as_secs_f32() / duration).clamp(0., 1.);
@@ -2185,6 +2220,9 @@ impl Outer {
         let Some(transition) = self.displays.get_mut(d).and_then(|d| d.transition.take()) else {
             return;
         };
+        if transition.leaving.is_some() {
+            self.mode_change_shown();
+        }
         if let Some(token) = transition.wait {
             self.handle.remove(token);
         }
@@ -2272,6 +2310,7 @@ impl Outer {
                 from_frame: None,
                 from_pending: None,
                 from_splash,
+                leaving: None,
             });
             self.target_frame(d, generation, buffer, fence);
         } else {

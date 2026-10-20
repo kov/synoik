@@ -280,6 +280,8 @@ fn percent(text: &str) -> u8 {
 enum Waiting {
     Password,
     Quit,
+    /// A `C` the outer is still showing (`Server::hold_mode_changes`).
+    ModeChange,
 }
 
 struct Connection {
@@ -311,6 +313,8 @@ pub struct Server {
     /// Connections that are over, for the caller to stop watching before it drops them: a
     /// watch outliving its fd could match the next fd given that number.
     closing: Vec<(u64, UnixStream)>,
+    /// A `C` that changes the mode waits for [`Self::finish_mode_change`].
+    hold_mode_changes: bool,
 }
 
 impl Server {
@@ -326,6 +330,34 @@ impl Server {
             events: Vec::new(),
             pid_file: None,
             closing: Vec::new(),
+            hold_mode_changes: false,
+        }
+    }
+
+    /// Make a `C` that changes the mode wait for [`Self::finish_mode_change`]: its client waits
+    /// for the answer, so whatever follows it — the reboot after `plymouth-reboot.service`, or
+    /// PackageKit's — waits for the screen to show the change (`boot-splash.md` §4.3).
+    pub fn hold_mode_changes(&mut self) {
+        self.hold_mode_changes = true;
+    }
+
+    /// Whether a `C` waits for [`Self::finish_mode_change`].
+    pub fn mode_change_waiting(&self) -> bool {
+        self.connections
+            .values()
+            .any(|c| c.waiting == Some(Waiting::ModeChange))
+    }
+
+    /// Answer every `C` waiting for the screen to show its change.
+    pub fn finish_mode_change(&mut self) {
+        let waiting: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| c.waiting == Some(Waiting::ModeChange))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in waiting {
+            self.resume(id, Waiting::ModeChange, &Reply::Ack);
         }
     }
 
@@ -600,6 +632,10 @@ impl Server {
                     Some(mode) if mode != self.splash.mode => {
                         self.splash.mode = mode;
                         self.changed();
+                        if self.hold_mode_changes {
+                            self.connections.get_mut(&id)?.waiting = Some(Waiting::ModeChange);
+                            return None;
+                        }
                     }
                     Some(_) => (),
                     None => debug!("plymouth: ignoring unknown mode {name:?}"),
@@ -1003,6 +1039,28 @@ mod tests {
         assert_eq!(h.send(&mut client, b"V\0z\0"), [NAK, NAK]);
         // The prompts the splash never shows send the client elsewhere.
         assert_eq!(h.send(&mut client, b"c\0W\x02\x04Go?\0K\0"), [NO_ANSWER; 3]);
+    }
+
+    #[test]
+    fn a_held_mode_change_waits_for_the_screen() {
+        let mut h = Harness::new();
+        h.server.hold_mode_changes();
+        let mut client = h.connect();
+        // A mode change, and a message queued behind it: neither answered yet.
+        assert_eq!(
+            h.send(&mut client, b"C\x02\x08updates\0M\x02\x06first\0"),
+            [0u8; 0]
+        );
+        assert_eq!(h.server.splash().mode, Mode::Updates);
+        assert!(h.server.mode_change_waiting());
+        assert!(h.server.splash().messages.is_empty());
+        h.server.finish_mode_change();
+        assert!(!h.server.mode_change_waiting());
+        assert_eq!(h.server.splash().messages, ["first"]);
+        assert_eq!(read_now(&mut client), [ACK; 2]);
+        // The same mode again changes nothing, and is answered at once.
+        assert_eq!(h.send(&mut client, b"C\x02\x08updates\0"), [ACK]);
+        assert!(!h.server.mode_change_waiting());
     }
 
     #[test]
