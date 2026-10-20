@@ -1491,7 +1491,9 @@ impl Outer {
         if self.compositor.is_none() {
             return;
         }
-        if self.boot.is_none() {
+        // Up already, as through an offline update: no session to fade from.
+        let splash_up = self.boot.is_some();
+        if !splash_up {
             self.start_boot_splash(None);
             self.begin_spinner();
         }
@@ -1502,7 +1504,7 @@ impl Outer {
         for d in names {
             // Already on the splash, as at the end of an offline update: nothing to fade from,
             // and a mode change fading on it plays out.
-            let on_splash = self.boot.is_some()
+            let on_splash = splash_up
                 && match self
                     .displays
                     .get(&d)
