@@ -3506,7 +3506,7 @@ fn desktop_app_installed(desktop_id: &str) -> bool {
 
 /// The XDG data search path, **user directory first** — the order every
 /// first-wins lookup below walks (`shell-app-cache.c:112-140`).
-fn xdg_data_dirs() -> Vec<PathBuf> {
+pub(crate) fn xdg_data_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(data_home));

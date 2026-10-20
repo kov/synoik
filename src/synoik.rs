@@ -133,7 +133,7 @@ use crate::app_system::AppIconRef;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::clipboard::SelectionData;
-use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
+use crate::cursor::{CursorManager, RenderCursor};
 use crate::dbus::freedesktop_locale1::Locale1ToSynoik;
 use crate::dbus::freedesktop_login1::Login1ToSynoik;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntrospect};
@@ -1074,7 +1074,6 @@ pub struct Synoik {
     pub xkb_from_locale1: Option<Xkb>,
 
     pub cursor_manager: CursorManager,
-    pub cursor_texture_cache: CursorTextureCache,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
@@ -9052,7 +9051,6 @@ impl Synoik {
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
             cursor_manager,
-            cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
@@ -11454,7 +11452,6 @@ impl Synoik {
             .cursor_manager
             .set_theme(&settings.cursor_theme, settings.cursor_size)
         {
-            self.cursor_texture_cache.clear();
             self.queue_redraw_all();
         }
     }
@@ -11471,19 +11468,22 @@ impl Synoik {
     /// cursor plane buffer for the output transform, so this stays transform-agnostic.
     pub fn cursor_plane_hotspot(&self, output: &Output) -> Point<i32, Physical> {
         let output_scale = Scale::from(output.current_scale().fractional_scale());
-        let cursor_scale = output.current_scale().integer_scale();
-        match self.cursor_manager.get_render_cursor(cursor_scale) {
+        match self.render_cursor_on(output) {
             RenderCursor::Hidden => Point::default(),
             RenderCursor::Surface { hotspot, .. } => {
                 hotspot.to_physical_precise_round(output_scale)
             }
-            RenderCursor::Named { scale, cursor, .. } => {
-                let (_, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                XCursor::hotspot(frame)
-                    .to_logical(scale)
-                    .to_physical_precise_round(output_scale)
-            }
+            RenderCursor::Named(named) => named.hotspot.to_physical_precise_round(output_scale),
         }
+    }
+
+    /// The cursor as `output` draws it now.
+    fn render_cursor_on(&self, output: &Output) -> RenderCursor {
+        self.cursor_manager.get_render_cursor(
+            output.current_scale().fractional_scale(),
+            1.,
+            self.start_time.elapsed().as_millis() as u32,
+        )
     }
 
     /// Where the pointer is drawn, relative to `output`: the tablet cursor while there is one,
@@ -11503,13 +11503,9 @@ impl Synoik {
         push: &mut dyn FnMut(PointerRenderElements),
     ) {
         let _span = tracy_client::span!("Synoik::render_pointer");
-        let output_scale = output.current_scale();
         let pointer_pos = self.pointer_position_on(output);
 
-        // Get the render cursor to draw.
-        let cursor_scale = output_scale.integer_scale();
-        let render_cursor = self.cursor_manager.get_render_cursor(cursor_scale);
-
+        let render_cursor = self.render_cursor_on(output);
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
         match render_cursor {
@@ -11528,24 +11524,22 @@ impl Synoik {
                     &mut |elem| push(elem.into()),
                 );
             }
-            RenderCursor::Named {
-                icon,
-                scale,
-                cursor,
-            } => {
-                let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let hotspot = XCursor::hotspot(frame).to_logical(scale);
-                let pointer_pos =
-                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
-
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+            RenderCursor::Named(named) => {
+                // The hotspot is rounded on its own, as `cursor_plane_hotspot` rounds it.
+                let pointer_pos: Point<i32, Physical> = pointer_pos
+                    .to_physical_precise_round(output_scale)
+                    - named.hotspot.to_physical_precise_round(output_scale);
+                let src = Rectangle::from_size(Size::from((
+                    f64::from(named.pixels.w),
+                    f64::from(named.pixels.h),
+                )));
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    pointer_pos,
-                    &texture,
+                    pointer_pos.to_f64(),
+                    &named.buffer,
                     None,
-                    None,
-                    None,
+                    Some(src),
+                    Some(named.size.to_i32_round()),
                     Kind::Cursor,
                 ) {
                     Ok(element) => push(element.into()),
@@ -11740,15 +11734,14 @@ impl Synoik {
 
                     // The default cursor is rendered at the right scale for each output, which
                     // means that it may have a different hotspot for each output.
-                    let output_scale = output.current_scale().integer_scale();
-                    let cursor = self
-                        .cursor_manager
-                        .get_cursor_with_name(icon, output_scale)
-                        .unwrap_or_else(|| self.cursor_manager.get_default_cursor(output_scale));
-
+                    //
                     // For simplicity, we always use frame 0 for this computation. Let's hope the
                     // hotspot doesn't change between frames.
-                    let hotspot = XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale);
+                    let hotspot = self
+                        .cursor_manager
+                        .named(icon, output.current_scale().fractional_scale(), 1., 0)
+                        .hotspot
+                        .to_i32_round();
 
                     let surface_pos = pointer_pos.to_i32_round() - hotspot;
                     let bbox = bbox_from_surface_tree(surface, surface_pos);
@@ -11966,7 +11959,7 @@ impl Synoik {
         causes.set(
             AnimCauses::CURSOR,
             self.cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale()),
+                .is_current_cursor_animated(output.current_scale().fractional_scale()),
         );
 
         causes.set(

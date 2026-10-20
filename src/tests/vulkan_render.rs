@@ -16698,3 +16698,47 @@ fn vulkan_draws_dialogs_over_the_greeter() {
         "the end-session dialog is not drawn over the greeter"
     );
 }
+
+/// The default pointer is the bundled scalable Adwaita, rasterized for the output's fractional
+/// scale: at 1.5 the 32-unit image spans 48 px around a hotspot at (8, 7)·1.5, where an Xcursor
+/// would have come from the 2× bitmap and been scaled down.
+#[test]
+fn vulkan_the_pointer_is_drawn_from_svg_at_a_fractional_scale() {
+    let Some(mut f) = scaled_green_fixture(1.5) else {
+        return;
+    };
+    super::gnome::pointer_motion_to(&mut f, 100., 100.);
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    let state = f.synoik_state();
+    let pixels = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let mut elements = Vec::new();
+            state
+                .synoik
+                .render_pointer(vk, &output, &mut |e| elements.push(e));
+            assert_eq!(elements.len(), 1, "one named pointer");
+            let size = Size::from((i32::from(OUT_W) * 3 / 2, i32::from(OUT_H) * 3 / 2));
+            composite_ui(vk, elements, size, Scale::from(1.5))
+        })
+        .unwrap();
+    let w = i32::from(OUT_W) * 3 / 2;
+
+    // Pointer at 150 px, hotspot at (12, 10.5) → the image's corner at (138, 139).
+    let (mut min, mut max) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
+    for y in 100..220 {
+        for x in 100..220 {
+            if px(&pixels, w, x, y)[3] > 0 {
+                min = (min.0.min(x), min.1.min(y));
+                max = (max.0.max(x), max.1.max(y));
+            }
+        }
+    }
+    assert!(min.0 >= 138 && min.1 >= 139, "drawn from {min:?}");
+    assert!(max.0 < 138 + 48 && max.1 < 139 + 48, "drawn to {max:?}");
+    // The arrow's body, just inside the tip: opaque.
+    let body = px(&pixels, w, 152, 155);
+    assert!(body[3] > 200, "{body:?}");
+}
