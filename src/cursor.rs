@@ -42,6 +42,10 @@ const ZOOM_TIERS: [f64; 4] = [1., 1.5, 2., 3.];
 /// frames, and zoom tiers multiply what a cursor can have cached.
 const MAX_TEXTURES: usize = 512;
 
+/// How many times larger an SVG frame is drawn before it is averaged down to its size
+/// ([`SvgFrame::rasterize`]).
+const SUPERSAMPLE: usize = 2;
+
 /// Which raster an upload is: an SVG at a scale (its bits), or an Xcursor at a requested size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RasterKey {
@@ -503,11 +507,43 @@ struct SvgFrame {
 
 impl SvgFrame {
     /// The frame at `scale` pixels per SVG unit, on a `pixels`-sized premultiplied RGBA pixmap.
+    ///
+    /// Drawn at [`SUPERSAMPLE`] times the size and averaged down: tiny-skia draws a stroke no
+    /// wider than a pixel as a hairline, a pixel wide along its minor axis, so Adwaita's 1-unit
+    /// outline came out thin and grey on the arrow's diagonal at cursor-size 24. Averaged down,
+    /// the raster matches librsvg's, which gnome-shell draws with.
     fn rasterize(&self, scale: f64, pixels: Size<i32, Buffer>) -> tiny_skia::Pixmap {
         let _span = tracy_client::span!("SvgFrame::rasterize");
-        let mut pixmap = tiny_skia::Pixmap::new(pixels.w as u32, pixels.h as u32).unwrap();
-        let transform = tiny_skia::Transform::from_scale(scale as f32, scale as f32);
-        resvg::render(&self.tree, transform, &mut pixmap.as_mut());
+        let (w, h) = (pixels.w as usize, pixels.h as usize);
+        let mut large =
+            tiny_skia::Pixmap::new((w * SUPERSAMPLE) as u32, (h * SUPERSAMPLE) as u32).unwrap();
+        let large_scale = scale as f32 * SUPERSAMPLE as f32;
+        let transform = tiny_skia::Transform::from_scale(large_scale, large_scale);
+        resvg::render(&self.tree, transform, &mut large.as_mut());
+
+        // Premultiplied, so a plain average of each block is the right blend.
+        let mut pixmap = tiny_skia::Pixmap::new(w as u32, h as u32).unwrap();
+        let src = large.data();
+        let stride = w * SUPERSAMPLE * 4;
+        for (i, out) in pixmap
+            .data_mut()
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let (x, y) = (i % w * SUPERSAMPLE, i / w * SUPERSAMPLE);
+            for (c, out) in out.iter_mut().enumerate() {
+                let mut sum = 0u32;
+                for dy in 0..SUPERSAMPLE {
+                    for dx in 0..SUPERSAMPLE {
+                        sum += u32::from(src[(y + dy) * stride + (x + dx) * 4 + c]);
+                    }
+                }
+                let n = (SUPERSAMPLE * SUPERSAMPLE) as u32;
+                *out = ((sum + n / 2) / n) as u8;
+            }
+        }
         pixmap
     }
 }
@@ -732,6 +768,24 @@ mod tests {
         assert!(tip.alpha() > 200, "{tip:?}");
         let corner = pixmap.pixel(31, 0).unwrap();
         assert_eq!(corner.alpha(), 0, "{corner:?}");
+    }
+
+    /// At cursor-size 24 and scale 1 the arrow's white outline holds up along its diagonal,
+    /// as librsvg draws it, rather than thinning to grey: the outermost visible pixel of each
+    /// row down the diagonal is near white.
+    #[test]
+    fn the_arrow_keeps_its_white_outline_on_the_diagonal() {
+        let cursor = SvgCursor::load_bundled("default").unwrap().unwrap();
+        let pixmap = cursor.frames[0].rasterize(1., Size::from((32, 32)));
+        for y in 8..17 {
+            let edge = (0..32)
+                .rev()
+                .map(|x| pixmap.pixel(x, y).unwrap().demultiply())
+                .find(|p| p.alpha() > 64)
+                .unwrap();
+            let lightness = edge.red().min(edge.green()).min(edge.blue());
+            assert!(lightness > 220, "row {y}: {edge:?}");
+        }
     }
 
     /// `wait` is animated, frame by frame on its delays, and loops.
