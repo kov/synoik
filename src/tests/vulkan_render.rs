@@ -16720,6 +16720,19 @@ fn vulkan_the_pointer_is_drawn_from_svg_at_a_fractional_scale() {
                 .synoik
                 .render_pointer(vk, &output, &mut |e| elements.push(e));
             assert_eq!(elements.len(), 1, "one named pointer");
+            // And it can go on a 64 px cursor plane under the outer, as the Xcursor image could:
+            // the nested backend takes only Argb8888 images there.
+            let plane = crate::backend::nested::cursor_pixels(
+                vk,
+                &elements[0],
+                Size::from((48, 48)),
+                Transform::Normal,
+                (64, 64),
+            )
+            .expect("the SVG pointer fits the cursor plane");
+            // Its arrow body, as on screen below: opaque.
+            let body = plane[(16 * 64 + 14) * 4 + 3];
+            assert!(body > 200, "alpha {body}");
             let size = Size::from((i32::from(OUT_W) * 3 / 2, i32::from(OUT_H) * 3 / 2));
             composite_ui(vk, elements, size, Scale::from(1.5))
         })

@@ -252,9 +252,15 @@ impl CursorManager {
             (frame.height * raster_scale).ceil().max(1.) as i32,
         ));
         let buffer = self.texture((icon, RasterKey::Svg(raster_scale.to_bits()), idx), || {
+            // Argb8888, as Xcursor images are: the nested backend puts only that on the
+            // outer's cursor plane, and draws anything else into the frame.
+            let mut pixmap = frame.rasterize(raster_scale, pixels);
+            for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
             MemoryRenderBuffer::from_slice(
-                frame.rasterize(raster_scale, pixels).data(),
-                Fourcc::Abgr8888,
+                pixmap.data(),
+                Fourcc::Argb8888,
                 (pixels.w, pixels.h),
                 1,
                 Transform::Normal,
