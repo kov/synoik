@@ -8,11 +8,13 @@
 # through all three boots' worth of it: the shutdown into the update, the update boot's splash,
 # handover and update screen, its reboot, and the boot after — for `report.py`.
 #
-#   scripts/harness/update.sh [--fake] [--settle SECONDS] [--out DIR]
+#   scripts/harness/update.sh [--fake] [--transition STYLE] [--settle SECONDS] [--out DIR]
 #
 #   --fake     no package manager: a unit drives the splash as dnf5 would, but stops the bar at
 #              40 % before changing to the reboot screen, as a real update may (boot-splash.md
 #              §4.3); the package managers' offline units are masked meanwhile
+#   --transition  how the outer draws switches and the splash's mode changes: fade, curtain or
+#              depth (default: as it is)
 #   --settle   how long to keep recording after the session's first frame (default 3)
 #   --out      where the run lands (default: target/harness/<run> in this checkout)
 #
@@ -26,22 +28,25 @@ set -euo pipefail
 settle=3
 out=
 fake=
+transition=
 while [ $# -gt 0 ]; do
     case $1 in
     --fake) fake=1; shift ;;
+    --transition) transition=$2; shift 2 ;;
     --settle) settle=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
     *) die "unknown argument $1" ;;
     esac
 done
 
-run=update-$(date +%Y%m%d-%H%M%S)
+run=update${transition:+-$transition}-$(date +%Y%m%d-%H%M%S)
 out=${out:-$(dirname "$0")/../../target/harness/$run}
 mkdir -p "$out"
 capture="$HARNESS_DIR/captures/$run"
 
 boot
 wait_session 3
+[ -z "$transition" ] || set_transition "$transition"
 pid=$(supervisor)
 offline_units="dnf5-offline-transaction.service packagekit-offline-update.service dnf-system-upgrade.service"
 fake_unit=/etc/systemd/system/harness-fake-update.service
