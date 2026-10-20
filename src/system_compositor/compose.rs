@@ -839,13 +839,22 @@ mod tests {
     use super::*;
     use crate::system_compositor::plymouth::Mode;
 
+    /// A compositor whose theme has no firmware logo, whatever the machine running the tests
+    /// publishes: a test wanting one loads it from a table of its own (`bgrt_table`).
     fn compositor() -> Option<Compositor> {
         match VulkanRenderer::new() {
-            Ok(renderer) => Some(Compositor {
-                renderer,
-                node: None,
-                theme: None,
-            }),
+            Ok(mut renderer) => {
+                let theme = Theme::load(
+                    &mut renderer,
+                    Path::new(splash::THEME_DIR),
+                    Path::new("/nonexistent"),
+                );
+                Some(Compositor {
+                    renderer,
+                    node: None,
+                    theme: Some(theme),
+                })
+            }
             Err(err) => {
                 eprintln!("skipping: no Vulkan device ({err})");
                 None
