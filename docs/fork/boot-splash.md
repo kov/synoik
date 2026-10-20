@@ -245,10 +245,10 @@ pixels for a display of W×H:
 - **Messages:** one line, the latest `M`, centred, 10 px under the spinner. two-step has no
   `hide_message`, so `m` does nothing there (systemd clears with an empty `M` for that reason);
   the outer hides the line when `m` names it, which is what the request asks for.
-- **No fades within the splash but a mode change's.** A client's `quit` stops it at background +
+- **No animation within the splash but a mode change's.** A client's `quit` stops it at background +
   watermark, plymouth's retained frame. The fades are the outer's: from the splash as it stands,
-  spinner and all, to the first session frame, and between the boot and the update screens
-  (§4.3).
+  spinner and all, to the first session frame, and the motion between the boot and the update
+  screens (§4.3).
 
 ### 4.2 Password dialog
 
@@ -296,11 +296,15 @@ rather than a different one cut in:
   the logo and puts the pair where it was.
 - **"N% complete" sits on the message line**, 10 px under where the spinner's bottom is, rather
   than 10 px under the bar: it takes the place of the boot's messages.
-- **A mode change into an update mode or out of one crossfades** in the outer, over the switches'
-  250 ms fade, from the old screen drawn live (its spinner turning) to the new one. Leaving an
-  update for a mode without a bar, the bar first fills from where the last `u` left it to 100 %
-  over 150 ms (eased out, "N% complete" counting with it), as an update can end short of 100 %
-  (measured 2026-10-20 on the harness: 94 %). plymouth cuts in both cases.
+- **A mode change into an update mode or out of one moves as a login does**, with the outer's
+  switch style (`SYNOIK_SYSTEM_TRANSITION`, `system-compositor.md`): the update screen is the
+  front picture, as the greeter is. Going into an update it arrives over the boot screen — the
+  curtain slides down over it, the depth lands it from near — and leaving, it goes the way the
+  greeter goes at a login, off the screen it changes to. Both screens are drawn live (the spinner
+  turning), over black rather than the plate. Leaving an update for a mode without a bar, the bar
+  first fills from where the last `u` left it to 100 % over 150 ms (eased out, "N% complete"
+  counting with it), as an update can end short of 100 % (measured 2026-10-20 on the harness:
+  94 %). plymouth cuts in both cases.
 - **The `C` waits for the screen.** The outer answers a mode change only once no display is
   still fading from it, at most 1 s later (`MODE_CHANGE_CAP`). The reboot after an update needs
   this: dnf5 ends with `u 100` and logind's `Reboot`, and the `C reboot` comes from

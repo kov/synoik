@@ -1665,18 +1665,15 @@ impl Outer {
         // greeter does at a logout, and the boot splash leaves as it does at a login. From the
         // plate it fades.
         let motion = match self.displays.get(d).map(|d| &d.on_screen) {
-            Some(Shown::Splash { .. }) if self.boot.is_some() && !self.shutting_down => Motion {
-                style: self.style,
-                way: Way::Leaves,
-            },
-            Some(Shown::Session { .. } | Shown::Composite { .. }) if self.shutting_down => Motion {
-                style: self.style,
-                way: Way::Arrives,
-            },
-            Some(Shown::Session { .. } | Shown::Composite { .. }) => Motion {
-                style: self.style,
-                way: self.switch_way,
-            },
+            Some(Shown::Splash { .. }) if self.boot.is_some() && !self.shutting_down => {
+                Motion::new(self.style, Way::Leaves)
+            }
+            Some(Shown::Session { .. } | Shown::Composite { .. }) if self.shutting_down => {
+                Motion::new(self.style, Way::Arrives)
+            }
+            Some(Shown::Session { .. } | Shown::Composite { .. }) => {
+                Motion::new(self.style, self.switch_way)
+            }
             _ => Motion::FADE,
         };
         let from = self.snapshot_screen(d);
@@ -2289,10 +2286,7 @@ impl Outer {
             let from_splash = self.boot.is_some();
             // The boot splash leaves as the greeter does at a login; the plate fades.
             let motion = if from_splash {
-                Motion {
-                    style: self.style,
-                    way: Way::Leaves,
-                }
+                Motion::new(self.style, Way::Leaves)
             } else {
                 Motion::FADE
             };

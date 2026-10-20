@@ -96,6 +96,9 @@ pub(super) enum Way {
 pub(super) struct Motion {
     pub style: Style,
     pub way: Way,
+    /// Behind both pictures, and the curtain of a user-to-user switch: the plate between
+    /// sessions, black between two screens of the splash.
+    pub backdrop: [u8; 3],
 }
 
 /// The depth a session lands from and recedes to: gnome-shell's session start begins at this
@@ -107,10 +110,16 @@ const DEPTH_FAR: f64 = 0.75;
 pub const DEPTH_NEAR: f64 = 12.;
 
 impl Motion {
-    pub const FADE: Self = Self {
-        style: Style::Fade,
-        way: Way::Leaves,
-    };
+    pub const FADE: Self = Self::new(Style::Fade, Way::Leaves);
+
+    /// A motion over the plate.
+    pub const fn new(style: Style, way: Way) -> Self {
+        Self {
+            style,
+            way,
+            backdrop: PLATE,
+        }
+    }
 
     /// How long it runs: the crossfade's 250 ms; the curtain's slide (`CURTAIN_SLIDE_TIME`,
     /// `screenShield.js`), twice between two users; the depth as long as one slide (ours: kov's
@@ -784,7 +793,7 @@ fn paint(
     progress: f32,
 ) -> anyhow::Result<()> {
     let full = Rectangle::from_size(size);
-    let plate = Picture::Color(PLATE.map(|c| f32::from(c) / 255.));
+    let plate = Picture::Color(motion.backdrop.map(|c| f32::from(c) / 255.));
     for (layer, dst, alpha) in layers(size, motion, progress) {
         let picture = match layer {
             Layer::From => from,
@@ -897,7 +906,7 @@ mod tests {
         let mut motions = Vec::new();
         for style in [Style::Fade, Style::Curtain, Style::Depth] {
             for way in [Way::Leaves, Way::Arrives, Way::Through] {
-                motions.push(Motion { style, way });
+                motions.push(Motion::new(style, way));
             }
         }
         motions
@@ -943,10 +952,7 @@ mod tests {
     /// A curtain between two users is down at half its duration, each slide eased on its own.
     #[test]
     fn a_curtain_between_users_is_two_slides() {
-        let through = Motion {
-            style: Style::Curtain,
-            way: Way::Through,
-        };
+        let through = Motion::new(Style::Curtain, Way::Through);
         assert_eq!(through.ease(0.5), 0.5);
         assert!(
             through.ease(0.25) > 0.25 && through.ease(0.75) > 0.75,
@@ -976,10 +982,7 @@ mod tests {
             (Way::Through, 0.75, plate, [0, 0, 255]),
         ];
         for (way, progress, above, below) in cases {
-            let motion = Motion {
-                style: Style::Curtain,
-                way,
-            };
+            let motion = Motion::new(Style::Curtain, way);
             let at = transition(&mut c, motion, progress);
             assert!(near(at(32, 2), above), "{motion}: {:?} above", at(32, 2));
             assert!(near(at(32, 37), below), "{motion}: {:?} below", at(32, 37));
@@ -992,10 +995,7 @@ mod tests {
     #[test]
     fn a_depth_lands_the_session_from_a_distance() {
         let Some(mut c) = compositor() else { return };
-        let motion = Motion {
-            style: Style::Depth,
-            way: Way::Leaves,
-        };
+        let motion = Motion::new(Style::Depth, Way::Leaves);
         let at = transition(&mut c, motion, 0.5);
         let [p, ..] = PLATE;
         let over = |under: u8, c: u8, a: f32| f32::from(under) * (1. - a) + f32::from(c) * a;
@@ -1016,6 +1016,18 @@ mod tests {
             over(over(p, 255, 0.5).round() as u8, 0, 0.25).round() as u8,
         ];
         assert!(near(at(32, 20), mid), "{:?} for {mid:?}", at(32, 20));
+
+        // Over a black backdrop, as between two screens of the splash: no plate in the corner.
+        let black = Motion {
+            backdrop: [0; 3],
+            ..motion
+        };
+        let at = transition(&mut c, black, 0.5);
+        assert!(
+            near(at(0, 0), [blend(0, 255, 0.25), 0, 0]),
+            "{:?}",
+            at(0, 0)
+        );
     }
 
     /// The installed theme, drawn where the layout says: the watermark, the spinner, the

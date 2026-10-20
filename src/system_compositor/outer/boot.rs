@@ -18,7 +18,7 @@ use synoik_splash::handoff;
 use synoik_splash::keyboard::{self, Entry, Keyboard};
 use synoik_splash::layout::Dialog;
 
-use super::{End, Motion, Outer, Picture, Shown, Target, Transition};
+use super::{End, Motion, Outer, Picture, Shown, Target, Transition, Way};
 use crate::render_helpers::vulkan::VkTexture;
 use crate::system_compositor::plymouth::{self, Event, Server, Splash};
 use crate::system_compositor::splash;
@@ -578,6 +578,18 @@ impl Outer {
             self.plymouth.server.splash().mode
         );
         let fill_from = leaving_update.then(|| old.progress.unwrap_or(0));
+        // The update screen moves as the greeter does, the front picture over the boot screen:
+        // in, it arrives; out, it leaves. Over black, the splash's own background, not the
+        // plate.
+        let way = if leaving_update {
+            Way::Leaves
+        } else {
+            Way::Arrives
+        };
+        let motion = Motion {
+            backdrop: [0; 3],
+            ..Motion::new(self.style, way)
+        };
         let names: Vec<String> = self.displays.keys().cloned().collect();
         for d in names {
             let idle = self
@@ -599,7 +611,7 @@ impl Outer {
             display.transition = Some(Transition {
                 // Drawn before the first frame (`refresh_live_pictures`).
                 from: to.clone(),
-                motion: Motion::FADE,
+                motion,
                 to: None,
                 pending: None,
                 pending_watch: None,
