@@ -56,6 +56,8 @@ pub struct CursorManager {
     theme: CursorTheme,
     theme_name: String,
     size: i32,
+    /// Where themes' `icons/` directories are looked for: the XDG data directories, user first.
+    data_dirs: Vec<PathBuf>,
     current_cursor: CursorImageStatus,
     /// A compositor-wide cursor that wins over whatever the pointer is actually
     /// over — mutter's `MetaCompositor:global_cursor`, applied through the backend's
@@ -79,6 +81,7 @@ impl CursorManager {
             theme: CursorTheme::load(theme),
             theme_name: theme.to_owned(),
             size,
+            data_dirs: crate::gnome::xdg_data_dirs(),
             current_cursor: CursorImageStatus::default_named(),
             global_override: None,
             svg_cache: Default::default(),
@@ -101,6 +104,14 @@ impl CursorManager {
         self.xcursor_cache.get_mut().clear();
         self.textures.get_mut().clear();
         true
+    }
+
+    /// Look for scalable themes in `dirs` instead of the XDG data directories. Tests hand it
+    /// none, so the bundled theme answers whatever the host has installed.
+    pub fn set_data_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.data_dirs = dirs;
+        self.svg_cache.get_mut().clear();
+        self.textures.get_mut().clear();
     }
 
     /// Checks if the cursor WlSurface is alive, and if not, cleans it up.
@@ -319,7 +330,7 @@ impl CursorManager {
                         if bundled {
                             SvgCursor::load_bundled(name)
                         } else {
-                            SvgCursor::load_from_theme(&self.theme_name, name)
+                            SvgCursor::load_from_theme(&self.data_dirs, &self.theme_name, name)
                         }
                     });
                 match found {
@@ -511,8 +522,12 @@ impl SvgCursor {
     /// `name` from `icons/<theme>/cursors_scalable` in the user's data directory, then each
     /// system one; the bundled copy too when the theme is Adwaita (`find_cursor_metadata`).
     /// `None` when no directory has it.
-    fn load_from_theme(theme: &str, name: &str) -> Option<anyhow::Result<Self>> {
-        let found = crate::gnome::xdg_data_dirs().into_iter().find_map(|dir| {
+    fn load_from_theme(
+        data_dirs: &[PathBuf],
+        theme: &str,
+        name: &str,
+    ) -> Option<anyhow::Result<Self>> {
+        let found = data_dirs.iter().find_map(|dir| {
             let dir = dir
                 .join("icons")
                 .join(theme)
@@ -608,12 +623,19 @@ impl XCursor {
 mod tests {
     use super::*;
 
-    /// Every name a client can ask for (`wp_cursor_shape_v1` maps onto these) has a scalable
-    /// image in the bundled theme, so the default theme never falls back to a bitmap.
+    /// A manager that sees only the bundled theme, whatever the host installed.
+    fn manager(theme: &str, size: i32) -> CursorManager {
+        let mut manager = CursorManager::new(theme, size);
+        manager.set_data_dirs(Vec::new());
+        manager
+    }
+
+    /// Every name a client can ask for (`wp_cursor_shape_v1` maps onto these, all 36) has a
+    /// scalable image in the bundled theme, so the default theme never falls back to a bitmap.
     #[test]
     fn the_bundled_theme_covers_every_cursor_name() {
         use CursorIcon::*;
-        let manager = CursorManager::new(BUNDLED_THEME_NAME, 24);
+        let manager = manager(BUNDLED_THEME_NAME, 24);
         for icon in [
             Default,
             ContextMenu,
@@ -660,7 +682,7 @@ mod tests {
     /// cursor, with its hotspot at (8, 7) (`cursors_scalable/default/metadata.json`).
     #[test]
     fn the_default_pointer_is_the_bundled_svg() {
-        let manager = CursorManager::new(BUNDLED_THEME_NAME, 24);
+        let manager = manager(BUNDLED_THEME_NAME, 24);
         let named = manager.named(CursorIcon::Default, 1., 1., 0);
         assert_eq!(named.hotspot, Point::from((8., 7.)));
         assert_eq!(named.size, Size::from((32., 32.)));
@@ -671,7 +693,7 @@ mod tests {
     /// rounding to a bitmap size.
     #[test]
     fn an_svg_cursor_renders_at_any_size_and_scale() {
-        let manager = CursorManager::new(BUNDLED_THEME_NAME, 48);
+        let manager = manager(BUNDLED_THEME_NAME, 48);
         let named = manager.named(CursorIcon::Default, 1.5, 1., 0);
         assert_eq!(named.hotspot, Point::from((16., 14.)));
         assert_eq!(named.size, Size::from((64., 64.)));
@@ -682,7 +704,7 @@ mod tests {
     /// sharp, and one upload for every zoom up to it.
     #[test]
     fn a_zoomed_cursor_rasterizes_at_the_tier_above() {
-        let manager = CursorManager::new(BUNDLED_THEME_NAME, 24);
+        let manager = manager(BUNDLED_THEME_NAME, 24);
         let named = manager.named(CursorIcon::Default, 1., 1.2, 0);
         assert_eq!(named.hotspot, Point::from((8. * 1.2, 7. * 1.2)));
         assert_eq!(named.size, Size::from((32. * 1.2, 32. * 1.2)));
@@ -723,7 +745,7 @@ mod tests {
     /// the last-resort bitmap.
     #[test]
     fn a_missing_theme_borrows_the_bundled_cursors() {
-        let manager = CursorManager::new("synoik-test-no-such-cursor-theme", 24);
+        let manager = manager("synoik-test-no-such-cursor-theme", 24);
         let named = manager.named(CursorIcon::Pointer, 1., 1., 0);
         // Either the system's `default` Xcursor theme answered (an Xcursor image at 24) or the
         // bundled SVG did; never the 64 px fallback bitmap.

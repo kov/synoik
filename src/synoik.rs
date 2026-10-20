@@ -2189,6 +2189,10 @@ impl State {
             }
         }
 
+        if mode == BackendMode::HeadlessTest {
+            // Hermetic: the bundled cursor theme answers, whatever the host has installed.
+            state.synoik.cursor_manager.set_data_dirs(Vec::new());
+        }
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
@@ -11485,7 +11489,17 @@ impl Synoik {
         match self.render_cursor_on(output) {
             RenderCursor::Hidden => Point::default(),
             RenderCursor::Surface { hotspot, .. } => {
-                hotspot.to_physical_precise_round(output_scale)
+                // `render_pointer`'s arithmetic: the surface at the rounded pointer less the
+                // hotspot, stretched about the rounded pointer by the shake's zoom.
+                let pointer_pos = self.pointer_position_on(output);
+                let origin: Point<i32, Physical> =
+                    pointer_pos.to_physical_precise_round(output_scale);
+                let loc: Point<i32, Physical> =
+                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
+                (origin - loc)
+                    .to_f64()
+                    .upscale(self.shake.zoom())
+                    .to_i32_round()
             }
             RenderCursor::Named(named) => named.hotspot.to_physical_precise_round(output_scale),
         }
