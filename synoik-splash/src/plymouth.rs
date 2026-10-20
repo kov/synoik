@@ -1311,21 +1311,42 @@ mod tests {
             eprintln!("skipping: no {client}");
             return;
         }
+        let unshare = || {
+            let mut unshare = std::process::Command::new("unshare");
+            unshare.args(["--user", "--map-root-user", "--net", "--"]);
+            unshare
+        };
+        // Unprivileged user namespaces can be off, as on Ubuntu's CI runners (AppArmor's
+        // `restrict_unprivileged_userns`): the namespace is the test's precondition, not its
+        // subject.
+        match unshare().arg("true").status() {
+            Ok(status) if status.success() => (),
+            Ok(status) => return eprintln!("skipping: no user namespace: unshare {status}"),
+            Err(err) => return eprintln!("skipping: unshare: {err}"),
+        }
         let exe = std::env::current_exe().unwrap();
-        let status = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--net", "--"])
+        let output = unshare()
             .arg(exe)
             .args([
                 "--exact",
-                "system_compositor::plymouth::tests::plymouths_client_talks_to_us",
+                "plymouth::tests::plymouths_client_talks_to_us",
                 "--nocapture",
             ])
             .env(INSIDE, "1")
-            .status();
-        match status {
-            Ok(status) => assert!(status.success(), "inside the namespace: {status}"),
-            Err(err) => eprintln!("skipping: unshare: {err}"),
-        }
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "inside the namespace: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter naming no test runs nothing, and that passes too.
+        assert!(
+            stdout.contains("1 passed"),
+            "the test did not run inside: {stdout}"
+        );
     }
 
     fn inside_namespace(client: &str) {

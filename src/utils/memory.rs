@@ -317,11 +317,16 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .expect("run the probe in a child process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
+            "{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+        // A filter naming no test runs nothing, and that passes too.
+        assert!(
+            stdout.contains("1 passed"),
+            "the probe did not run: {stdout}"
         );
     }
 
