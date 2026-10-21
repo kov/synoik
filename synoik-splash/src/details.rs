@@ -381,8 +381,13 @@ pub fn kmsg_text(record: &str, console_level: u8, default_level: u8) -> Option<S
     }
     // Continuation lines (" KEY=value") follow the message; its own newlines are escaped.
     let message = message.split('\n').next().unwrap_or("");
-    let message = unescape_kmsg(message);
-    // LOG_EMERG is bold; the urgent ones red, warnings brown, notices green.
+    Some(record_text(priority, &unescape_kmsg(message)))
+}
+
+/// A log record of syslog `priority` as the details view shows it, a line each, coloured as
+/// `ply-kmsg-reader.c` colours the kernel's: LOG_EMERG bold, the urgent ones red, warnings brown,
+/// notices green.
+pub fn record_text(priority: u8, message: &str) -> String {
     let bold = u8::from(priority < 1);
     let color = match priority {
         0..=3 => 31,
@@ -394,7 +399,7 @@ pub fn kmsg_text(record: &str, console_level: u8, default_level: u8) -> Option<S
     for line in message.split('\n') {
         text.push_str(&format!("\x1b[0;{bold};{color}m{line}\x1b[0m\n"));
     }
-    Some(text)
+    text
 }
 
 /// `/dev/kmsg`'s `\xNN` escapes back to bytes (`unhexmangle_to_buffer`).

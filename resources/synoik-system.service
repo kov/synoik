@@ -56,10 +56,11 @@ ExecStartPost=-/bin/sh -c 'for i in $$(seq 200); do [ -e /run/plymouth/pid ] && 
 # logins are allowed. As root (`+`).
 ExecStartPost=+-/usr/bin/systemctl --no-block try-restart systemd-ask-password-plymouth.service
 # Unprivileged: DRM master comes from opening the card first, input from the `input` group, the
-# render node from `render` (Debian keeps it 0660; Fedora opens it to all), and nothing else needs
-# root (docs/fork/system-compositor.md §1).
+# render node from `render` (Debian keeps it 0660; Fedora opens it to all), the system journal
+# from `systemd-journal`, for the splash's details view (boot-splash.md §8.3), and nothing else
+# needs root (docs/fork/system-compositor.md §1).
 User=synoik-system
-SupplementaryGroups=video input render
+SupplementaryGroups=video input render systemd-journal
 RuntimeDirectory=synoik-system
 RuntimeDirectoryPreserve=restart
 # Mesa's shader cache, for the transitions the outer draws (§5); the user has no home. From

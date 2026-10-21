@@ -548,7 +548,7 @@ is the same program, started and taken over differently.
 
 ## 8. Details: the boot's text
 
-> Status: **designed, not built.** Asked for with Limina's quiet boot (limina
+> Status: **built (steps 11-13), not yet validated on the harness (step 14).** Asked for with Limina's quiet boot (limina
 > `docs/design/boot-presentation.md`, "Seeing the boot"): the firmware and loader keep their text
 > off the screen, so the guest shows the boot's own text on request, as plymouth does.
 
@@ -618,10 +618,10 @@ The splash's state memfd (§7.2) carries the details flag and the buffer's lines
 worth plus a bound, not the whole boot), so the outer carries the view on as it carries the
 spinner. From there the outer reads the **journal**, not kmsg: `dmesg_restrict` is 1 on Fedora, and
 past switch_root the journal has the kernel's records, pid 1's unit lines and everything the
-console would have shown, with their priorities. It appends records from the handover on, filtered
-as kmsg is (priority at or under the console level), plus pid 1's start and stop lines, which the
-console carried as status. The outer's user joins `systemd-journal` (sysusers) to read the system
-journal.
+console would have shown, with their priorities. It follows it with a `journalctl --follow` child
+from the splash's start, filtered as kmsg is (priority at or under the console level), plus pid
+1's unit lines, which the console carried as status, coloured as kmsg is. The unit gives the outer
+the `systemd-journal` group (`SupplementaryGroups=`) to read the system journal.
 
 The outer reads the keyboards from the handover until "the splash is over", for the toggle; it
 already opens them itself (`system-compositor.md` §2), so nothing is grabbed and a session that has

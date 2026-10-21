@@ -789,6 +789,35 @@ fn a_click_does_not_cancel_the_peek() {
     );
 }
 
+/// KEY_INFO is the host's key for the boot splash's details view (`boot-splash.md` §8.3): a
+/// Limina host injects it, and the session must never hand it to the focused application, which
+/// may well act on `XF86Info`. Not GNOME's: mutter forwards it.
+#[test]
+fn the_details_key_never_reaches_a_client() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    let info = u32::from(synoik_splash::keyboard::KEY_INFO);
+    f.key_press(info);
+    f.key_release(info);
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.settle();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_A, WlKeyState::Pressed), (KEY_A, WlKeyState::Released)],
+        "KEY_INFO must be swallowed, and only it"
+    );
+}
+
 /// The peek's wire contract, which is **not** the tap's, and the measurement that decided it.
 ///
 /// Both swallow the overlay key's release. The tap gets away with it because firing moves focus to

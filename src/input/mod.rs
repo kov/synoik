@@ -1082,6 +1082,12 @@ impl State {
                     }
                 }
 
+                // The host's key for the splash's details view (boot-splash.md §8.3): KEY_INFO,
+                // which no keyboard has. The splash's alone, never an application's.
+                if key_code.raw() == u32::from(synoik_splash::keyboard::KEY_INFO) + 8 {
+                    return FilterResult::Intercept(None);
+                }
+
                 // The screen shield outranks every other modal surface: while it is down, nothing
                 // behind it may see a key. This lives *inside* the keyboard filter rather than
                 // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
