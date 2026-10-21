@@ -369,12 +369,13 @@ screen in the inner, and moving it means the outer grows real UI — against §1
   framebuffer some console maps to). Measured on the harness VM (2026-10-14, VT kernel, fbdev on):
   without it, fbcon takes over at the first console output and `KD_TEXT` on the foreground VT puts
   fbcon's framebuffer on the plane, where it stays after `KD_GRAPHICS`; with it, only the dummy
-  console binds and the plane keeps the outer's framebuffer. The kernel's fbdev client stays,
-  and with it the first probe of the displays at boot, which plymouth needs to find them
-  (`boot-splash.md` §6) — why this, not `drm_kms_helper.fbdev_emulation=0` (which removes the
-  client) or a root unbind of `/sys/class/vtconsole` at boot (which a deferred takeover outlives).
-  The cost: no kernel text console on the display — boot messages and an emergency shell go
-  unseen there. `--use-gdm` removes the argument.
+  console binds and the plane keeps the outer's framebuffer. A root unbind of
+  `/sys/class/vtconsole` at boot would not do: a deferred takeover outlives it. The install also
+  removes the kernel's fbdev client (`drm_kms_helper.fbdev_emulation=0`), whose first modeset
+  flashes black before the initramfs splash; the splash probes the displays itself
+  (`boot-splash.md` §2.2.2). The cost: no kernel text console on the display — boot messages and
+  an emergency shell go unseen there, but for the splash's details view (`boot-splash.md` §8).
+  `--use-gdm` removes both arguments.
 - **Enhanced-tier Limina guests** — `CONFIG_VT=n`: no VTs, so sessions are VT-less as on the S1
   seat and there is no fbcon (measured, §10: seat0 reports `CanTTY=no`, logind takes VT-less
   sessions there, and the outer's chord is the switch). If VT-less operation turns up too many

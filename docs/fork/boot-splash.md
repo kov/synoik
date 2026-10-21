@@ -107,14 +107,18 @@ initramfs at ≈1.1 s on jabuticaba).
 Real-root volumes are not the outer's to unlock: their prompts are answered by whichever splash
 the initramfs started, still on screen, since the outer takes over only after them (§7.2).
 
-#### 2.2.2 fbcon stays off, the fbdev client stays
+#### 2.2.2 fbcon stays off, and so does the fbdev client
 
-**The initramfs splash needs the kernel's fbdev client.** A connector reads `unknown` until
-something probes it; the fbdev client probes at driver load, and its change uevent is what
-plymouthd waits for. Without it (`drm_kms_helper.fbdev_emulation=0`) nothing probes before the
-outer and plymouthd shows nothing (measured on the harness VM, 2026-10-14). So fbcon is kept off
-the outer's card with `fbcon=map:9` instead, which leaves the client in place
-(`system-compositor.md` S6).
+fbcon is kept off the outer's card with `fbcon=map:9` (`system-compositor.md` S6). The kernel's
+fbdev client goes too (`drm_kms_helper.fbdev_emulation=0`): its initial configuration modesets a
+black framebuffer of its own, which a Limina guest showed for ~515 ms between the firmware's frame
+and the initramfs splash's first (measured 2026-10-21 on the harness, Cardea firmware, frames
+captured on the host; gone without the client). The splash does not need it: it probes the
+connectors itself (§7.3). plymouthd does — a connector reads `unknown` until something probes it,
+and the client's change uevent is what plymouthd waits for — so an initramfs that still carries
+plymouth (one built before the install) shows no splash on such a kernel. The installer writes
+both arguments; `--use-gdm` removes them. Where the firmware owns the kernel command line (Limina),
+it is the firmware's to add.
 
 ### 2.3 Shutdown and offline updates
 

@@ -60,6 +60,8 @@ splash_dropin=/etc/systemd/system/synoik-system.service.d/initrd-splash.conf
 splash_unit=/etc/systemd/system/synoik-splash.service
 # Debian's kernel command line: a grub.d snippet, which update-grub reads after /etc/default/grub.
 grub_snippet=/etc/default/grub.d/90-synoik.cfg
+# What it gets: no fbcon on any display, and no fbdev client either (below).
+kernel_args="fbcon=map:9 drm_kms_helper.fbdev_emulation=0"
 # Debian's choice of display manager. Every display manager's postinst points
 # display-manager.service at /lib/systemd/system/<its basename>.service from it on each upgrade,
 # so an alias made only with `systemctl enable` goes back to GDM at gdm3's next upgrade.
@@ -95,7 +97,7 @@ if [ "${1:-}" = "--use-gdm" ]; then
             update-grub
         fi
     else
-        grubby --update-kernel=ALL --remove-args=fbcon=map:9
+        grubby --update-kernel=ALL --remove-args="$kernel_args"
     fi
     for unit in plymouth-start plymouth-quit-wait plymouth-reboot plymouth-poweroff plymouth-halt \
         plymouth-kexec; do
@@ -254,22 +256,21 @@ fi
 
 # A bound fbcon would take the display back from the system compositor whenever a session lets
 # go of its VT; mapping every console to a framebuffer that does not exist keeps it off them all,
-# deferred takeover included, while the kernel's fbdev client still probes the displays at boot,
-# which is what lets plymouth find them (docs/fork/system-compositor.md §9 S6).
-if [ -e /sys/class/graphics/fbcon ] && ! grep -q 'fbcon=map:' /proc/cmdline; then
-    if [ "$distro" = debian ]; then
-        if [ ! -e "$grub_snippet" ]; then
-            install -d "$(dirname "$grub_snippet")"
-            # shellcheck disable=SC2016
-            printf '%s\n' '# synoik: no text console on the display (scripts/install-display-manager.sh).' \
-                'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX fbcon=map:9"' >"$grub_snippet"
-            update-grub
-        fi
-    else
-        grubby --update-kernel=ALL --args=fbcon=map:9
+# deferred takeover included (docs/fork/system-compositor.md §9 S6). The kernel's fbdev client goes
+# too: its first modeset scans out a black framebuffer for ~0.5 s before the splash, and the
+# splash probes the displays itself (boot-splash.md §2.2.2).
+if [ "$distro" = debian ]; then
+    want="GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX $kernel_args\""
+    if [ "$(tail -1 "$grub_snippet" 2>/dev/null)" != "$want" ]; then
+        install -d "$(dirname "$grub_snippet")"
+        printf '%s\n' '# synoik: no text console or fbdev client on the display (scripts/install-display-manager.sh).' \
+            "$want" >"$grub_snippet"
+        update-grub
     fi
-    echo "Added fbcon=map:9 to every kernel's command line (no text console on the display)."
+else
+    grubby --update-kernel=ALL --args="$kernel_args"
 fi
+echo "Kernel command line: $kernel_args (no text console on the display)."
 
 # The splash replaces plymouth in the initramfs (boot-splash.md §7.4, §7.6); it asks for the
 # passwords that unlock disks there too.
