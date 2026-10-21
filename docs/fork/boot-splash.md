@@ -634,11 +634,10 @@ it), plus pid 1's job lines, which the console carried as status: worded as pid 
 the view reads the same across the handover. A start skipped for an unmet condition, which pid 1
 keeps off the console, is told by its empty `INVOCATION_ID` (71 of 74 such records on the harness;
 the rest show). The unit gives the outer the `systemd-journal` group
-(`SupplementaryGroups=`) to read the system journal. The journal and the keyboards wait for the
-first modeset: compiling the keymap before it held the first frame back (measured on the harness,
-the handover's gap 71 ms with them after it). With the view up across the handover the outer's
-first frame comes ~360 ms after the splash's last, the text shaped in a face the outer has not set
-anything in yet; the screen holds the splash's last view meanwhile.
+(`SupplementaryGroups=`) to read the system journal. The journal and the keyboards start after
+the first modeset. Measured on the harness, the outer's first frame comes 50-100 ms after the
+splash's last with the view off, 280-360 ms with it on; the screen holds the splash's last view
+meanwhile. The extra time with the view on is not attributed yet.
 
 The outer reads the keyboards from the handover until "the splash is over", for the toggle; it
 already opens them itself (`system-compositor.md` §2), so nothing is grabbed and a session that has

@@ -190,8 +190,7 @@ impl Outer {
     }
 
     /// Start the spinner turning, once the first modeset is on screen; and the details view's
-    /// sources and toggle, which wait for it too: compiling the keymap alone would hold the first
-    /// frame back by tens of ms (§8.3).
+    /// sources and toggle, which wait for it too, keeping their setup off the first frame (§8.3).
     pub(super) fn begin_spinner(&mut self) {
         if self.boot.is_none() {
             return;
