@@ -442,6 +442,12 @@ impl Server {
         &self.splash
     }
 
+    /// The details view's side of the splash (§8), which no request changes: whether it is up,
+    /// and the boot's text.
+    pub fn details_mut(&mut self) -> (&mut bool, &mut crate::details::Console) {
+        (&mut self.splash.details, &mut self.splash.console)
+    }
+
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }

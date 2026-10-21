@@ -42,6 +42,12 @@ install() {
         *AdwaitaSans*) inst_simple "$font" /usr/share/synoik-splash/sans.ttf ;;
         *) dwarning "synoik: no Adwaita Sans; the splash draws no text" ;;
     esac
+    # The details view's face (boot-splash.md §8.2).
+    font=$(fc-match -f '%{file}' 'Adwaita Mono')
+    case "$font" in
+        *AdwaitaMono*) inst_simple "$font" /usr/share/synoik-splash/mono.ttf ;;
+        *) dwarning "synoik: no Adwaita Mono; the splash's details draw no text" ;;
+    esac
     mkdir -p "$initdir/usr/share/synoik-splash"
     if ! /usr/local/libexec/synoik-splash --compile-keymap \
         > "$initdir/usr/share/synoik-splash/keymap.xkb"; then

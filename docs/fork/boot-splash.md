@@ -268,8 +268,8 @@ are, where they were.
 Keyboard input (`synoik-splash/src/keyboard.rs`, shared by both drawers) comes from every evdev
 node that reports keys, opened while a prompt is up and closed when none is, through one xkbcommon
 state, as plymouthd's evdev path does: Return answers, BackSpace deletes a character, Ctrl+U and
-Ctrl+W clear the entry, so do Ctrl+C and Ctrl+D (§3.2), Escape does nothing (plymouthd
-shows its details), repeats type again, and the keyboards' LEDs follow the state. The initramfs
+Ctrl+W clear the entry, so do Ctrl+C and Ctrl+D (§3.2), Escape toggles the details (§8; plymouthd
+as plymouthd does), repeats type again, and the keyboards' LEDs follow the state. The initramfs
 splash opens the keyboards when it starts and keeps them, reading them unarmed until a prompt:
 once the real root loads its SELinux policy, its `kernel_t` may not open them (§7.1). Nothing is
 grabbed: at boot no session has the keyboard yet. The foreground VT's keyboard is set to `K_OFF`
@@ -595,7 +595,8 @@ Divergences:
 - **The font** is the shell's monospace, Adwaita Mono (the schema default of
   `org.gnome.desktop.interface monospace-font-name`), at bgrt's 10 pt: the sans follows the
   shell's rather than bgrt's Cantarell (§4.4), and the monospace follows it. The image carries it
-  as `/usr/share/synoik-splash/mono.ttf`, beside the sans (§7.4).
+  as `/usr/share/synoik-splash/mono.ttf`, beside the sans (§7.4): its regular face only (1.4 MB),
+  so what the console prints bold is drawn regular.
 - **The prompt line is drawn, not written:** the view lays the pending prompt under the text
   rather than printing it into the buffer, so an answered prompt leaves no line behind.
 

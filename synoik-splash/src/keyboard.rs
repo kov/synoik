@@ -5,7 +5,8 @@
 //! The password dialog's keyboard (`docs/fork/boot-splash.md` §4.2): every evdev keyboard, read
 //! through one xkb state, as plymouthd reads them (`ply-input-device.c`, `ply-keyboard.c`).
 //!
-//! Armed only while a prompt is up; unarmed, keystrokes only move the xkb state. Nothing is
+//! Armed only while a prompt is up; unarmed, keystrokes only move the xkb state, but for the
+//! details view's toggle (§8.2), which is always read. Nothing is
 //! grabbed — at boot no session holds the keyboard — but the foreground VT's keyboard is turned
 //! off while armed (`KDSKBMODE K_OFF`, as plymouthd's `ply_terminal_set_disabled_input`), so what
 //! is typed never reaches its line discipline: not its input queue, not its echo.
@@ -41,7 +42,13 @@ pub enum Key {
     /// Ctrl+U, Ctrl+W; and Ctrl+C, Ctrl+D, which cannot cancel (§3.2).
     EraseLine,
     Enter,
+    /// Esc, plymouth's key, or KEY_INFO, which a host injects: the details view on or off (§8.2).
+    /// Pressed, not repeated.
+    Details,
 }
+
+/// `KEY_INFO`, matched on its code: no keymap needs to name it.
+pub const KEY_INFO: u16 = 0x166;
 
 /// The password being typed.
 #[derive(Default)]
@@ -64,6 +71,7 @@ impl Entry {
             }
             Key::EraseLine => self.clear(),
             Key::Enter => return Some(std::mem::take(&mut self.text)),
+            Key::Details => (),
         }
         None
     }
@@ -216,11 +224,12 @@ fn key_event(state: &mut xkb::State, code: u16, value: i32) -> (Option<Key>, boo
         2 => (),
         _ => return (None, false),
     }
+    if code == KEY_INFO || sym == xkb::keysyms::KEY_Escape {
+        return ((value == 1).then_some(Key::Details), leds);
+    }
     let key = match sym {
         xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter => Some(Key::Enter),
         xkb::keysyms::KEY_BackSpace => Some(Key::Backspace),
-        // plymouthd shows its details; there are none here.
-        xkb::keysyms::KEY_Escape => None,
         _ => {
             let text = state.key_get_utf8(keycode);
             match text.as_str() {
@@ -356,7 +365,7 @@ impl Keyboard {
             self.write_leds();
         }
         if !self.armed {
-            keys.clear();
+            keys.retain(|k| *k == Key::Details);
         }
         (keys, leds)
     }
@@ -663,7 +672,12 @@ mod tests {
         );
         key_event(&mut state, KEY_A, 0);
         assert_eq!(tap(&mut state, KEY_BACKSPACE), Some(Key::Backspace));
-        assert_eq!(tap(&mut state, KEY_ESC), None);
+        // Esc and KEY_INFO toggle the details, once per press.
+        assert_eq!(tap(&mut state, KEY_ESC), Some(Key::Details));
+        assert_eq!(tap(&mut state, KEY_INFO), Some(Key::Details));
+        assert_eq!(key_event(&mut state, KEY_INFO, 1).0, Some(Key::Details));
+        assert_eq!(key_event(&mut state, KEY_INFO, 2).0, None);
+        key_event(&mut state, KEY_INFO, 0);
         assert_eq!(tap(&mut state, KEY_ENTER), Some(Key::Enter));
 
         let mut entry = Entry::default();

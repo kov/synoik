@@ -53,6 +53,12 @@ case "${font}" in
     *AdwaitaSans*) copy_file font "${font}" /usr/share/synoik-splash/sans.ttf ;;
     *) echo "W: synoik: no Adwaita Sans; the splash draws no text" ;;
 esac
+# The details view's face (boot-splash.md §8.2).
+font=$(fc-match -f '%{file}' 'Adwaita Mono' 2>/dev/null)
+case "${font}" in
+    *AdwaitaMono*) copy_file font "${font}" /usr/share/synoik-splash/mono.ttf ;;
+    *) echo "W: synoik: no Adwaita Mono; the splash's details draw no text" ;;
+esac
 mkdir -p "${DESTDIR}/usr/share/synoik-splash"
 if ! "${splash}" --compile-keymap >"${DESTDIR}/usr/share/synoik-splash/keymap.xkb"; then
     rm -f "${DESTDIR}/usr/share/synoik-splash/keymap.xkb"
