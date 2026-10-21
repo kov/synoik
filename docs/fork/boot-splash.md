@@ -624,9 +624,15 @@ worth plus a bound, not the whole boot), so the outer carries the view on as it 
 spinner. From there the outer reads the **journal**, not kmsg: `dmesg_restrict` is 1 on Fedora, and
 past switch_root the journal has the kernel's records, pid 1's unit lines and everything the
 console would have shown, with their priorities. It follows it with a `journalctl --follow` child
-from the splash's start, filtered as kmsg is (priority at or under the console level), plus pid
-1's unit lines, which the console carried as status, coloured as kmsg is. The unit gives the outer
-the `systemd-journal` group (`SupplementaryGroups=`) to read the system journal.
+from the first modeset, filtered as kmsg is (priority at or under the console level, coloured by
+it), plus pid 1's job lines, which the console carried as status: worded as pid 1 words them there
+(`[  OK  ]`, `[FAILED]`, blanks for a job starting; its `JOB_TYPE` and `JOB_RESULT` fields), so
+the view reads the same across the handover. The unit gives the outer the `systemd-journal` group
+(`SupplementaryGroups=`) to read the system journal. The journal and the keyboards wait for the
+first modeset: compiling the keymap before it held the first frame back (measured on the harness,
+the handover's gap 71 ms with them after it). With the view up across the handover the outer's
+first frame comes ~360 ms after the splash's last, the text shaped in a face the outer has not set
+anything in yet; the screen holds the splash's last view meanwhile.
 
 The outer reads the keyboards from the handover until "the splash is over", for the toggle; it
 already opens them itself (`system-compositor.md` §2), so nothing is grabbed and a session that has

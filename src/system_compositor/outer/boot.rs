@@ -187,13 +187,17 @@ impl Outer {
         }
         // Nothing is on screen yet to redraw: the first modeset draws what this says.
         self.plymouth.server.take_events();
-        self.start_journal();
-        // The keyboard, for the details view's toggle.
-        self.follow_prompt();
     }
 
-    /// Start the spinner turning, once the first modeset is on screen.
+    /// Start the spinner turning, once the first modeset is on screen; and the details view's
+    /// sources and toggle, which wait for it too: compiling the keymap alone would hold the first
+    /// frame back by tens of ms (§8.3).
     pub(super) fn begin_spinner(&mut self) {
+        if self.boot.is_none() {
+            return;
+        }
+        self.start_journal();
+        self.follow_prompt();
         let Some(boot) = &mut self.boot else { return };
         if !boot.resumed {
             boot.start = get_monotonic_time();
@@ -303,7 +307,7 @@ impl Outer {
                 "--lines=0",
                 "--boot",
                 "--output=json",
-                "--output-fields=MESSAGE,PRIORITY,_PID",
+                "--output-fields=MESSAGE,PRIORITY,_PID,JOB_TYPE,JOB_RESULT",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -879,13 +883,37 @@ impl Outer {
 }
 
 /// One `journalctl --output=json` record as the details view shows it, or `None` for one the
-/// console would not have shown: above the console's `level`, but for pid 1's (§8.3).
+/// console would not have shown: above the console's `level`, but for pid 1's job lines, which
+/// the console carries as its status, as systemd prints them there (§8.3).
 fn journal_text(line: &[u8], level: u8) -> Option<String> {
     let record: serde_json::Value = serde_json::from_slice(line).ok()?;
-    let message = record.get("MESSAGE")?.as_str()?;
-    let priority: u8 = record.get("PRIORITY")?.as_str()?.parse().ok()?;
-    let init = record.get("_PID").and_then(|p| p.as_str()) == Some("1");
-    (priority <= level || init).then(|| details::record_text(priority, message))
+    let field = |name: &str| record.get(name).and_then(|v| v.as_str());
+    let message = field("MESSAGE")?;
+    let priority: u8 = field("PRIORITY")?.parse().ok()?;
+    if field("_PID") == Some("1") && field("JOB_TYPE").is_some() {
+        return status_line(field("JOB_RESULT"), message);
+    }
+    (priority <= level).then(|| details::record_text(priority, message))
+}
+
+/// A job's line as pid 1 prints it on the console: its result's word in brackets, or as many
+/// blanks for a job starting (systemd v259 `job.c` `job_done_messages`, `unit_status_printf`).
+/// Results without a word are not printed.
+fn status_line(result: Option<&str>, message: &str) -> Option<String> {
+    let (color, word) = match result {
+        None => return Some(format!("         {message}\n")),
+        Some("done") => ("0;32", "  OK  "),
+        Some("timeout") => ("0;1;31", " TIME "),
+        Some("failed") => ("0;1;31", "FAILED"),
+        Some("dependency") => ("0;1;33", "DEPEND"),
+        Some("assert") => ("0;1;33", "ASSERT"),
+        Some("unsupported") => ("0;1;33", "UNSUPP"),
+        Some("once") => ("0;1;31", " ONCE "),
+        Some("frozen") => ("0;1;31", "FROZEN"),
+        Some("concurrency") => ("0;1;31", "CONCUR"),
+        _ => return None,
+    };
+    Some(format!("[\x1b[{color}m{word}\x1b[0m] {message}\n"))
 }
 
 #[cfg(test)]
@@ -903,7 +931,33 @@ mod tests {
             Some("\x1b[0;0;31moops\x1b[0m\n")
         );
         assert_eq!(journal_text(rec(812, 6, "chatter").as_bytes(), 3), None);
-        assert!(journal_text(rec(1, 6, "Started x.").as_bytes(), 3).is_some());
+        // pid 1's own chatter is not status: a condition check's skip, say.
+        assert_eq!(
+            journal_text(rec(1, 6, "x skipped, unmet condition").as_bytes(), 3),
+            None
+        );
+        // Its jobs are, worded as the console words them.
+        let job = |result: &str, msg: &str| {
+            let result = if result.is_empty() {
+                String::new()
+            } else {
+                format!(r#","JOB_RESULT":"{result}""#)
+            };
+            format!(r#"{{"MESSAGE":"{msg}","PRIORITY":"6","_PID":"1","JOB_TYPE":"start"{result}}}"#)
+        };
+        assert_eq!(
+            journal_text(job("done", "Started x.").as_bytes(), 3).as_deref(),
+            Some("[\x1b[0;32m  OK  \x1b[0m] Started x.\n")
+        );
+        assert_eq!(
+            journal_text(job("", "Starting x...").as_bytes(), 3).as_deref(),
+            Some("         Starting x...\n")
+        );
+        assert_eq!(
+            journal_text(job("failed", "Failed to start x.").as_bytes(), 3).as_deref(),
+            Some("[\x1b[0;1;31mFAILED\x1b[0m] Failed to start x.\n")
+        );
+        assert_eq!(journal_text(job("canceled", "x").as_bytes(), 3), None);
         // A message journald could not store as text is skipped.
         assert_eq!(
             journal_text(br#"{"MESSAGE":[104,105],"PRIORITY":"3"}"#, 3),
