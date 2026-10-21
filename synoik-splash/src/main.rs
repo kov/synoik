@@ -16,6 +16,8 @@
 #[macro_use]
 extern crate tracing;
 
+mod capture;
+
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::os::linux::net::SocketAddrExt as _;
@@ -29,7 +31,7 @@ use drm::control::dumbbuffer::DumbBuffer;
 use drm::control::{connector, crtc, framebuffer, Device as _, Mode, ModeTypeFlags, PageFlipFlags};
 use synoik_splash::bgrt::{self, Logo};
 use synoik_splash::handoff::{self, State};
-use synoik_splash::keyboard::{self, Entry, Keyboard};
+use synoik_splash::keyboard::{self, Entry, Key, Keyboard};
 use synoik_splash::layout::{self, Dialog, Size};
 use synoik_splash::paint::{self, Canvas, Frame, Theme};
 use synoik_splash::plymouth::{self, Event, Server};
@@ -116,6 +118,8 @@ struct Splash {
     /// When the outer asked us to stop: no new flip from then, and the hand over once the one in
     /// flight has landed.
     stopping: Option<Duration>,
+    /// The details view's sources (§8.2), until the splash goes.
+    capture: Option<capture::Capture>,
 }
 
 fn monotonic() -> Duration {
@@ -205,7 +209,7 @@ fn run() -> io::Result<()> {
             firmware: Logo::load(Path::new(bgrt::DIR)),
             ..Theme::load(Path::new(layout::THEME_DIR))
         },
-        fonts: Fonts::load(&[Path::new(text::FONT_FILE)]),
+        fonts: Fonts::load(&[Path::new(text::FONT_FILE), Path::new(text::MONO_FONT_FILE)]),
         keyboard: open_keyboard(),
         entry: Entry::default(),
         card: None,
@@ -220,6 +224,7 @@ fn run() -> io::Result<()> {
         revision: 0,
         channel: None,
         stopping: None,
+        capture: Some(capture::Capture::start()),
     };
     splash.server.show();
     splash.server.take_events();
@@ -311,6 +316,19 @@ fn run() -> io::Result<()> {
                 revents: 0,
             });
         }
+        let captured: Vec<i32> = splash
+            .capture
+            .iter()
+            .flat_map(capture::Capture::fds)
+            .map(|fd| fd.as_raw_fd())
+            .collect();
+        for &fd in &captured {
+            fds.push(libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         let ids: Vec<u64> = splash.connections.keys().copied().collect();
         for &id in &ids {
             if let Some(fd) = splash.server.connection_fd(id) {
@@ -387,6 +405,9 @@ fn run() -> io::Result<()> {
         {
             splash.on_keyboard();
         }
+        if captured.iter().any(|&fd| ready(fd)) {
+            splash.on_capture();
+        }
         for id in ids {
             let readable = splash
                 .server
@@ -403,9 +424,9 @@ fn run() -> io::Result<()> {
 impl Splash {
     /// The spinner frame to draw now.
     fn spinner_frame(&self) -> usize {
-        // Nothing turns: no splash, or a password dialog in the spinner's place.
+        // Nothing turns: no splash, a password dialog in the spinner's place, or the details.
         let splash = self.server.splash();
-        if !splash.shown || splash.password_prompt.is_some() {
+        if !splash.shown || splash.password_prompt.is_some() || splash.details {
             return 0;
         }
         if let Some(frame) = self.frozen {
@@ -429,7 +450,10 @@ impl Splash {
             return CONNECTOR_POLL.as_millis() as i32;
         }
         let splash = self.server.splash();
-        let turning = splash.shown && splash.password_prompt.is_none() && self.frozen.is_none();
+        let turning = splash.shown
+            && splash.password_prompt.is_none()
+            && !splash.details
+            && self.frozen.is_none();
         if !turning || self.displays.is_empty() {
             return -1;
         }
@@ -610,6 +634,8 @@ impl Splash {
                     Event::Changed => self.on_splash_changed(),
                     Event::Quit { retain } => {
                         info!("plymouth quit (retain: {retain})");
+                        // plymouthd gives the console back at quit.
+                        self.stop_capture();
                         self.server.finish_quit();
                     }
                 }
@@ -660,6 +686,16 @@ impl Splash {
         let mut changed = leds && keyboard.is_armed();
         for key in keys {
             changed = true;
+            if key == Key::Details {
+                let (details, _) = self.server.details_mut();
+                *details = !*details;
+                info!("details {}", if *details { "on" } else { "off" });
+                // Off again, the spinner goes on from frame 0 (`start_progress_animation`).
+                if !*details {
+                    self.start = monotonic();
+                }
+                continue;
+            }
             if let Some(password) = self.entry.apply(key) {
                 self.server.answer_password(Some(password));
             }
@@ -681,6 +717,27 @@ impl Splash {
                 self.start = monotonic();
             }
             _ => (),
+        }
+    }
+
+    /// Text for the details view: a redraw only while it shows.
+    fn on_capture(&mut self) {
+        let Some(capture) = &mut self.capture else {
+            return;
+        };
+        let (details, console) = self.server.details_mut();
+        if capture.read(console, monotonic()) && *details {
+            self.revision += 1;
+        }
+    }
+
+    /// The last of the text, then the console back (§8.2).
+    fn stop_capture(&mut self) {
+        if self.capture.is_some() {
+            self.on_capture();
+        }
+        if let Some(mut capture) = self.capture.take() {
+            capture.stop();
         }
     }
 
@@ -749,6 +806,8 @@ impl Splash {
         };
         self.stopping = None;
         info!("handing the splash over");
+        // The console back first: the outer cannot redirect it, nor undo our redirect.
+        self.stop_capture();
         let state = self.state().to_memfd()?;
         // First: the outer writes the pid file again once it answers. The keyboards after: closing
         // an input device waits for the kernel's RCU, tens of ms the screen would stand still for.
@@ -774,6 +833,7 @@ impl Splash {
     /// What goes with the splash's process: the VT keyboard back on (a prompt up now dies with
     /// its connection, §7.2) and the pid file, which the outer writes again once it answers.
     fn let_go(&mut self) {
+        self.stop_capture();
         self.keyboard = None;
         self.entry.clear();
         self.server.release_pid_file();

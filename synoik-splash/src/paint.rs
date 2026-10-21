@@ -124,6 +124,7 @@ impl Theme {
             bullet: size(&self.bullet),
             keyboard: size(&self.keyboard),
             caps_lock: size(&self.caps_lock),
+            cell: None,
         }
     }
 }
@@ -257,8 +258,10 @@ impl Canvas<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct Frame {
     pub items: Vec<Item>,
-    /// One per [`Item::Text`] in `items`, in order.
+    /// One per [`Item::Text`] and [`Item::Console`] in `items`, in order.
     pub lines: Vec<Line>,
+    /// The details view's cell, which its lines are centred in.
+    pub cell: Option<Size>,
 }
 
 /// Lay out `splash` on the whole canvas, its spinner at `spinner_frame`, a password being typed
@@ -273,6 +276,12 @@ pub fn items(
     dialog: &Dialog,
     mut fonts: Option<&mut Fonts>,
 ) -> Frame {
+    let mut images = theme.images(panel);
+    if splash.details {
+        images.cell = fonts
+            .as_deref_mut()
+            .and_then(|f| f.cell(Font::Mono { bold: false }, 1.));
+    }
     let mut shaped: Vec<(String, Font, Line)> = Vec::new();
     let mut measure = |text: &str, font: Font| {
         let Some(fonts) = fonts.as_deref_mut() else {
@@ -283,24 +292,31 @@ pub fn items(
         shaped.push((text.to_owned(), font, line));
         size
     };
-    let laid = layout::layout(
-        splash,
-        size,
-        &theme.images(panel),
-        spinner_frame,
-        dialog,
-        &mut measure,
-    );
+    let laid = layout::layout(splash, size, &images, spinner_frame, dialog, &mut measure);
     let mut frame = Frame::default();
     for item in laid {
-        if let Item::Text { text, font, .. } = &item {
-            let Some(at) = shaped.iter().position(|(t, f, _)| t == text && f == font) else {
-                continue;
-            };
-            frame.lines.push(shaped.swap_remove(at).2);
+        match &item {
+            Item::Text { text, font, .. } => {
+                let Some(at) = shaped.iter().position(|(t, f, _)| t == text && f == font) else {
+                    continue;
+                };
+                frame.lines.push(shaped.swap_remove(at).2);
+            }
+            // Not measured: the cell places it.
+            Item::Console(placed) => {
+                let Some(fonts) = fonts.as_deref_mut() else {
+                    continue;
+                };
+                let font = Font::Mono {
+                    bold: placed.style.bold,
+                };
+                frame.lines.push(fonts.line(&placed.text, font, 1.));
+            }
+            _ => (),
         }
         frame.items.push(item);
     }
+    frame.cell = images.cell;
     frame
 }
 
@@ -319,14 +335,22 @@ pub fn paint(canvas: &mut Canvas<'_>, frame: &Frame, theme: &Theme) {
     canvas.fill(full, [0., 0., 0.]);
     let mut lines = frame.lines.iter();
     for item in &frame.items {
-        if let Item::Text { font, at, .. } = item {
-            if let Some(line) = lines.next() {
-                let origin = line.origin(at.x, at.y, line.line_box_height());
-                canvas.text(line, origin, font.color());
+        match item {
+            Item::Text { font, at, .. } => {
+                if let Some(line) = lines.next() {
+                    let origin = line.origin(at.x, at.y, line.line_box_height());
+                    canvas.text(line, origin, font.color());
+                }
             }
-            continue;
+            Item::Console(placed) => {
+                if let Some(line) = lines.next() {
+                    let band = frame.cell.map_or(line.line_box_height(), |c| c.h);
+                    let origin = line.pen_origin(placed.at.x, placed.at.y, band);
+                    canvas.text(line, origin, placed.style.color.rgb());
+                }
+            }
+            _ => paint_item(canvas, item, theme),
         }
-        paint_item(canvas, item, theme);
     }
 }
 
@@ -387,7 +411,7 @@ fn paint_item(canvas: &mut Canvas<'_>, item: &Item, theme: &Theme) {
                 canvas.blend_region(image, *src, *at);
             }
         }
-        Item::Text { .. } => (),
+        Item::Text { .. } | Item::Console(_) => (),
     }
 }
 

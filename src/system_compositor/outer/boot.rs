@@ -6,17 +6,19 @@
 //! outer's loop, and the splash standing in for the plate — at boot, from the first modeset until a
 //! session's screen replaces it, and at shutdown, from `PrepareForShutdown` until the power goes.
 
+use std::io::Read as _;
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken};
-use synoik_splash::handoff;
-use synoik_splash::keyboard::{self, Entry, Keyboard};
+use synoik_splash::keyboard::{self, Entry, Key, Keyboard};
 use synoik_splash::layout::Dialog;
+use synoik_splash::{details, handoff};
 
 use super::{End, Motion, Outer, Picture, Shown, Target, Transition, Way};
 use crate::render_helpers::vulkan::VkTexture;
@@ -41,7 +43,8 @@ pub(super) struct Plymouth {
     pub server: Server,
     retry: Option<RegistrationToken>,
     connections: std::collections::HashMap<u64, RegistrationToken>,
-    /// Open, armed and watched while a password prompt is up (§4.2).
+    /// Open and watched while the splash is up, for the details view's toggle (§8.3), and while
+    /// a password prompt is; armed only for the prompt (§4.2).
     keyboard: Option<(Keyboard, RegistrationToken)>,
     /// It would not open for this prompt; not tried again until the next.
     keyboard_failed: bool,
@@ -53,6 +56,22 @@ pub(super) struct Plymouth {
     /// change is answered whatever the screen shows.
     mode_change_cap: Option<RegistrationToken>,
     mode_change_overdue: bool,
+    /// The details view's text while the splash is up (§8.3).
+    journal: Option<Journal>,
+}
+
+/// The journal, from the splash's start on, as the details view shows it (§8.3): `journalctl`
+/// following it, since the outer may not read the kernel's log (`dmesg_restrict`) nor redirect
+/// the console.
+struct Journal {
+    child: Child,
+    token: RegistrationToken,
+    /// A line not yet ended.
+    partial: Vec<u8>,
+    /// The console's level and the default one, re-read at most once a second, as the initramfs
+    /// splash reads them.
+    levels: (u8, u8),
+    levels_read: Option<Duration>,
 }
 
 impl Plymouth {
@@ -70,6 +89,7 @@ impl Plymouth {
             in_keyboard: None,
             mode_change_cap: None,
             mode_change_overdue: false,
+            journal: None,
         }
     }
 }
@@ -169,8 +189,14 @@ impl Outer {
         self.plymouth.server.take_events();
     }
 
-    /// Start the spinner turning, once the first modeset is on screen.
+    /// Start the spinner turning, once the first modeset is on screen; and the details view's
+    /// sources and toggle, which wait for it too, keeping their setup off the first frame (§8.3).
     pub(super) fn begin_spinner(&mut self) {
+        if self.boot.is_none() {
+            return;
+        }
+        self.start_journal();
+        self.follow_prompt();
         let Some(boot) = &mut self.boot else { return };
         if !boot.resumed {
             boot.start = get_monotonic_time();
@@ -216,6 +242,7 @@ impl Outer {
         let splash = self.plymouth.server.splash();
         let frame = if splash.shown
             && splash.password_prompt.is_none()
+            && !splash.details
             && splash::titles(splash.mode).is_none()
         {
             self.spinner_frame()
@@ -257,12 +284,148 @@ impl Outer {
             self.handle.remove(token);
         }
         info!("the splash is over");
+        self.stop_journal();
         // A later restart adopts the session's frame, not this splash.
         if let Err(err) = handoff::remove(handoff::FD_SPLASH) {
             debug!("removing the splash from the fd store: {err}");
         }
         self.plymouth.server.end();
         self.on_plymouth();
+    }
+
+    /// Follow the journal for the details view: the kernel's records at the console's level and
+    /// worse, as the console would have shown them, everyone else's at that level too, and pid 1's
+    /// unit lines, which the console carries as its status.
+    fn start_journal(&mut self) {
+        if self.plymouth.journal.is_some() {
+            return;
+        }
+        let spawned = Command::new("journalctl")
+            .args([
+                "--follow",
+                "--lines=0",
+                "--boot",
+                "--output=json",
+                "--output-fields=MESSAGE,PRIORITY,_PID,JOB_TYPE,JOB_RESULT,INVOCATION_ID",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                warn!("details: not following the journal: {err}");
+                return;
+            }
+        };
+        let Some(stdout) = child.stdout.as_ref() else {
+            return;
+        };
+        let raw = std::os::fd::AsRawFd::as_raw_fd(stdout);
+        // SAFETY: fcntl on the pipe we own.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        // The pipe lives in `self.plymouth.journal` until the watch is removed.
+        let token = self
+            .handle
+            .insert_source(
+                Generic::new(ConnectionFd(raw), Interest::READ, Mode::Level),
+                |_, _, outer: &mut Outer| {
+                    if outer.on_journal() {
+                        return Ok(PostAction::Continue);
+                    }
+                    // Its own watch goes by returning `Remove`, not through the handle.
+                    if let Some(mut journal) = outer.plymouth.journal.take() {
+                        warn!("details: the journal ended");
+                        outer.handle.insert_idle(move |_| {
+                            let _ = journal.child.wait();
+                        });
+                    }
+                    Ok(PostAction::Remove)
+                },
+            )
+            .expect("inserting the journal");
+        self.plymouth.journal = Some(Journal {
+            child,
+            token,
+            partial: Vec::new(),
+            levels: (4, 4),
+            levels_read: None,
+        });
+    }
+
+    fn stop_journal(&mut self) {
+        let Some(mut journal) = self.plymouth.journal.take() else {
+            return;
+        };
+        self.handle.remove(journal.token);
+        let _ = journal.child.kill();
+        // Reaped off the loop's turn, after the watch on its pipe is gone.
+        self.handle.insert_idle(move |_| {
+            let _ = journal.child.wait();
+        });
+    }
+
+    /// The journal's new records into the details view; `false` once it is over.
+    fn on_journal(&mut self) -> bool {
+        let Some(journal) = &mut self.plymouth.journal else {
+            return false;
+        };
+        let now = get_monotonic_time();
+        if journal
+            .levels_read
+            .is_none_or(|t| now.saturating_sub(t) >= Duration::from_secs(1))
+        {
+            journal.levels_read = Some(now);
+            if let Some(levels) = std::fs::read_to_string("/proc/sys/kernel/printk")
+                .ok()
+                .and_then(|p| details::printk_levels(&p))
+            {
+                journal.levels = levels;
+            }
+        }
+        let mut alive = true;
+        let mut buf = [0u8; 8192];
+        let Some(stdout) = journal.child.stdout.as_mut() else {
+            return false;
+        };
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => {
+                    alive = false;
+                    break;
+                }
+                Ok(n) => journal.partial.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    warn!("details: reading the journal: {err}");
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        let Some(end) = journal.partial.iter().rposition(|&b| b == b'\n') else {
+            return alive;
+        };
+        let lines: Vec<u8> = journal.partial.drain(..=end).collect();
+        let level = journal.levels.0;
+        let mut text = String::new();
+        for line in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            if let Some(record) = journal_text(line, level) {
+                text.push_str(&record);
+            }
+        }
+        if !text.is_empty() {
+            let (shown, console) = self.plymouth.server.details_mut();
+            console.write_str(&text);
+            if *shown {
+                self.dialog_changed();
+            }
+        }
+        alive
     }
 
     /// Keep the listener in the fd store across a restart, so the name is never free for anyone
@@ -403,20 +566,34 @@ impl Outer {
         self.close_plymouth_connections(current);
     }
 
-    /// Read the keyboard while a password prompt is up, and only then. Without a keyboard the
-    /// dialog still shows: NO_ANSWER would leave the asking unit waiting unseen (§3.2).
+    /// Read the keyboard while the splash is up, for the details view's toggle, and while a
+    /// password prompt is, armed for it. Without a keyboard the dialog still shows: NO_ANSWER would
+    /// leave the asking unit waiting unseen (§3.2).
     fn follow_prompt(&mut self) {
         let prompting = self.plymouth.server.splash().password_prompt.is_some();
-        if prompting && self.plymouth.keyboard.is_none() && !self.plymouth.keyboard_failed {
+        let reading = prompting || self.boot.is_some();
+        if let Some((keyboard, _)) = &mut self.plymouth.keyboard {
+            if prompting && !keyboard.is_armed() {
+                keyboard.arm();
+                self.dialog_changed();
+            } else if !prompting && keyboard.is_armed() {
+                keyboard.disarm();
+                self.plymouth.entry.clear();
+                self.dialog_changed();
+            }
+        }
+        if reading && self.plymouth.keyboard.is_none() && !self.plymouth.keyboard_failed {
             let mut keyboard = match keyboard::open_system() {
                 Ok(keyboard) => keyboard,
                 Err(err) => {
-                    warn!("no keyboard for the password: {err}");
+                    warn!("no keyboard for the splash: {err}");
                     self.plymouth.keyboard_failed = true;
                     return;
                 }
             };
-            keyboard.arm();
+            if prompting {
+                keyboard.arm();
+            }
             // The keyboard lives in `self.plymouth` until the watch is removed.
             let fd = ConnectionFd(std::os::fd::AsRawFd::as_raw_fd(&keyboard.fd()));
             let token = self
@@ -435,7 +612,7 @@ impl Outer {
                 .expect("inserting the keyboard");
             self.plymouth.keyboard = Some((keyboard, token));
             self.dialog_changed();
-        } else if !prompting {
+        } else if !reading {
             self.plymouth.keyboard_failed = false;
             if let Some((mut keyboard, token)) = self.plymouth.keyboard.take() {
                 // Now, not with the drop: a keyboard opened for the next prompt within this
@@ -467,9 +644,17 @@ impl Outer {
         let Some((keyboard, _)) = &mut self.plymouth.keyboard else {
             return;
         };
-        let (keys, mut changed) = keyboard.dispatch();
+        let (keys, leds) = keyboard.dispatch();
+        // Unarmed, caps lock changes nothing on screen.
+        let mut changed = leds && keyboard.is_armed();
         for key in keys {
             changed = true;
+            if key == Key::Details {
+                let (shown, _) = self.plymouth.server.details_mut();
+                *shown = !*shown;
+                info!("details {}", if *shown { "on" } else { "off" });
+                continue;
+            }
             if let Some(password) = self.plymouth.entry.apply(key) {
                 self.plymouth.server.answer_password(Some(password));
             }
@@ -696,9 +881,95 @@ impl Outer {
     }
 }
 
+/// One `journalctl --output=json` record as the details view shows it, or `None` for one the
+/// console would not have shown: above the console's `level`, but for pid 1's job lines, which
+/// the console carries as its status, as systemd prints them there (§8.3).
+fn journal_text(line: &[u8], level: u8) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let field = |name: &str| record.get(name).and_then(|v| v.as_str());
+    let message = field("MESSAGE")?;
+    let priority: u8 = field("PRIORITY")?.parse().ok()?;
+    if field("_PID") == Some("1") && field("JOB_TYPE").is_some() {
+        // A start skipped for an unmet condition is done without ever being invoked; pid 1 keeps
+        // it off the console (`job_emit_done_message`).
+        if field("JOB_RESULT") == Some("done") && field("INVOCATION_ID") == Some("") {
+            return None;
+        }
+        return status_line(field("JOB_RESULT"), message);
+    }
+    (priority <= level).then(|| details::record_text(priority, message))
+}
+
+/// A job's line as pid 1 prints it on the console: its result's word in brackets, or as many
+/// blanks for a job starting (systemd v259 `job.c` `job_done_messages`, `unit_status_printf`).
+/// Results without a word are not printed.
+fn status_line(result: Option<&str>, message: &str) -> Option<String> {
+    let (color, word) = match result {
+        None => return Some(format!("         {message}\n")),
+        Some("done") => ("0;32", "  OK  "),
+        Some("timeout") => ("0;1;31", " TIME "),
+        Some("failed") => ("0;1;31", "FAILED"),
+        Some("dependency") => ("0;1;33", "DEPEND"),
+        Some("assert") => ("0;1;33", "ASSERT"),
+        Some("unsupported") => ("0;1;33", "UNSUPP"),
+        Some("once") => ("0;1;31", " ONCE "),
+        Some("frozen") => ("0;1;31", "FROZEN"),
+        Some("concurrency") => ("0;1;31", "CONCUR"),
+        _ => return None,
+    };
+    Some(format!("[\x1b[{color}m{word}\x1b[0m] {message}\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_journal_shows_what_the_console_would() {
+        let rec = |pid: u32, priority: u8, msg: &str| {
+            format!(r#"{{"MESSAGE":"{msg}","PRIORITY":"{priority}","_PID":"{pid}"}}"#)
+        };
+        // Under `quiet` (level 3): errors, and pid 1's unit lines whatever their priority.
+        assert_eq!(
+            journal_text(rec(812, 3, "oops").as_bytes(), 3).as_deref(),
+            Some("\x1b[0;0;31moops\x1b[0m\n")
+        );
+        assert_eq!(journal_text(rec(812, 6, "chatter").as_bytes(), 3), None);
+        // pid 1's own chatter is not status: a condition check's skip, say.
+        assert_eq!(
+            journal_text(rec(1, 6, "x skipped, unmet condition").as_bytes(), 3),
+            None
+        );
+        // Its jobs are, worded as the console words them.
+        let job = |result: &str, msg: &str| {
+            let result = if result.is_empty() {
+                String::new()
+            } else {
+                format!(r#","JOB_RESULT":"{result}""#)
+            };
+            format!(r#"{{"MESSAGE":"{msg}","PRIORITY":"6","_PID":"1","JOB_TYPE":"start"{result}}}"#)
+        };
+        assert_eq!(
+            journal_text(job("done", "Started x.").as_bytes(), 3).as_deref(),
+            Some("[\x1b[0;32m  OK  \x1b[0m] Started x.\n")
+        );
+        assert_eq!(
+            journal_text(job("", "Starting x...").as_bytes(), 3).as_deref(),
+            Some("         Starting x...\n")
+        );
+        assert_eq!(
+            journal_text(job("failed", "Failed to start x.").as_bytes(), 3).as_deref(),
+            Some("[\x1b[0;1;31mFAILED\x1b[0m] Failed to start x.\n")
+        );
+        assert_eq!(journal_text(job("canceled", "x").as_bytes(), 3), None);
+        let skipped = r#"{"MESSAGE":"x skipped, unmet condition","PRIORITY":"6","_PID":"1","JOB_TYPE":"start","JOB_RESULT":"done","INVOCATION_ID":""}"#;
+        assert_eq!(journal_text(skipped.as_bytes(), 3), None);
+        // A message journald could not store as text is skipped.
+        assert_eq!(
+            journal_text(br#"{"MESSAGE":[104,105],"PRIORITY":"3"}"#, 3),
+            None
+        );
+    }
 
     #[test]
     fn the_bar_fills_from_where_it_stood_to_full() {

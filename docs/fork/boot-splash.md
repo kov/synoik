@@ -107,14 +107,18 @@ initramfs at ≈1.1 s on jabuticaba).
 Real-root volumes are not the outer's to unlock: their prompts are answered by whichever splash
 the initramfs started, still on screen, since the outer takes over only after them (§7.2).
 
-#### 2.2.2 fbcon stays off, the fbdev client stays
+#### 2.2.2 fbcon stays off, and so does the fbdev client
 
-**The initramfs splash needs the kernel's fbdev client.** A connector reads `unknown` until
-something probes it; the fbdev client probes at driver load, and its change uevent is what
-plymouthd waits for. Without it (`drm_kms_helper.fbdev_emulation=0`) nothing probes before the
-outer and plymouthd shows nothing (measured on the harness VM, 2026-10-14). So fbcon is kept off
-the outer's card with `fbcon=map:9` instead, which leaves the client in place
-(`system-compositor.md` S6).
+fbcon is kept off the outer's card with `fbcon=map:9` (`system-compositor.md` S6). The kernel's
+fbdev client goes too (`drm_kms_helper.fbdev_emulation=0`): its initial configuration modesets a
+black framebuffer of its own, which a Limina guest showed for ~515 ms between the firmware's frame
+and the initramfs splash's first (measured 2026-10-21 on the harness, Cardea firmware, frames
+captured on the host; gone without the client). The splash does not need it: it probes the
+connectors itself (§7.3). plymouthd does — a connector reads `unknown` until something probes it,
+and the client's change uevent is what plymouthd waits for — so an initramfs that still carries
+plymouth (one built before the install) shows no splash on such a kernel. The installer writes
+both arguments; `--use-gdm` removes them. Where the firmware owns the kernel command line (Limina),
+it is the firmware's to add.
 
 ### 2.3 Shutdown and offline updates
 
@@ -264,8 +268,8 @@ are, where they were.
 Keyboard input (`synoik-splash/src/keyboard.rs`, shared by both drawers) comes from every evdev
 node that reports keys, opened while a prompt is up and closed when none is, through one xkbcommon
 state, as plymouthd's evdev path does: Return answers, BackSpace deletes a character, Ctrl+U and
-Ctrl+W clear the entry, so do Ctrl+C and Ctrl+D (§3.2), Escape does nothing (plymouthd
-shows its details), repeats type again, and the keyboards' LEDs follow the state. The initramfs
+Ctrl+W clear the entry, so do Ctrl+C and Ctrl+D (§3.2), Escape toggles the details (§8; plymouthd
+as plymouthd does), repeats type again, and the keyboards' LEDs follow the state. The initramfs
 splash opens the keyboards when it starts and keeps them, reading them unarmed until a prompt:
 once the real root loads its SELinux policy, its `kernel_t` may not open them (§7.1). Nothing is
 grabbed: at boot no session has the keyboard yet. The foreground VT's keyboard is set to `K_OFF`
@@ -541,3 +545,113 @@ is the same program, started and taken over differently.
   descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its name.
 - **Ordering**: the same `After=cryptsetup.target` drop-in as on Fedora (§7.2). The
   real root's plymouth units are conditioned off as on Fedora (§2.2).
+
+## 8. Details: the boot's text
+
+> Status: **built and validated on the harness** (2026-10-21, Cardea c712c61, Esc injected on the
+> virtio keyboard): on in the initramfs splash, carried across the handover, off in the outer;
+> `/dev/console` writable and pid 1's `ShowStatus` back to `no` after it. KEY_INFO waits for
+> Limina's keyboard to declare it; a prompt in the view is pinned by the layout's tests only.
+> Asked for with Limina's quiet boot (limina
+> `docs/design/boot-presentation.md`, "Seeing the boot"): the firmware and loader keep their text
+> off the screen, so the guest shows the boot's own text on request, as plymouth does.
+
+### 8.1 What plymouth does
+
+two-step's console viewer (`libply-splash-graphics/ply-console-viewer.c`, chosen by
+`ply_console_viewer_preferred` unless `plymouth.prefer-fbcon`):
+
+- **Toggle:** Esc, in any state, a password prompt included (`validate_input`,
+  `toggle_console_messages`). Shown, the animation stops and the views redraw.
+- **Look:** black — the firmware's logo goes (`draw_background` with
+  `should_show_console_messages`) — the watermark, and over them the newest lines that fit, in
+  the theme's `MonospaceFont` (`monospace 10`, the fallback bgrt uses), one line per font height
+  from the top, half a cell in from the left, wrapped at `width / cell − 1` characters; white
+  (`PLY_CONSOLE_VIEWER_LOG_TEXT_COLOR`) but where the text sets the Linux VT palette's colours
+  (`look_up_rgb_color_from_terminal_color`). The message line is not drawn. A password prompt is
+  drawn as a line of the viewer (`prompt: ****_`) instead of the dialog.
+- **Sources,** appended to one boot buffer from plymouthd's start, so the first toggle shows the
+  boot so far:
+  - `/dev/kmsg`, only records at or above the console's level (`/proc/sys/kernel/printk`'s first
+    field, re-read at most once a second; `ply-kmsg-reader.c`): under `quiet` that is errors and
+    worse — what the kernel would have printed on the console.
+  - `/dev/console`, redirected into a pty with `TIOCCONS` (`ply-terminal-session.c`): every write
+    to it — systemd's status lines, boot scripts, the console password agent — goes to plymouthd
+    instead of the console, until it undoes the redirect at quit.
+  - pid 1 is told to print its status anyway (`SIGRTMIN+20` at show, `SIGRTMIN+21` at quit,
+    `tell_systemd_to_print_details`): under `quiet` systemd's `ShowStatus` is `auto`, which prints
+    nothing until a unit is slow or fails.
+- The text goes through a small terminal emulator (`ply-terminal-emulator.c`): CR, LF, erase in
+  line, the cursor moves systemd's status uses, SGR colours.
+
+### 8.2 The splash's details
+
+synoik-splash takes all of §8.1: the toggle, the look, the three sources, the emulator's subset.
+Divergences:
+
+- **KEY_INFO toggles too** (evdev code 0x166, matched on the code: xkeyboard-config maps it as
+  `<I366>` = `XF86Info`, but the raw code needs no keymap). No keyboard has it; Limina's host injects
+  it for its "boot details" action (its virtual keyboard declares it), where an Esc could land in a
+  session's application. Esc stays, plymouth's key.
+- **The keyboards are read from the start**, not only for a prompt: the splash already keeps them
+  open from start (§4.2), unarmed; a toggle key is now always read, every other key only while a
+  prompt is up.
+- **The font** is the shell's monospace, Adwaita Mono (the schema default of
+  `org.gnome.desktop.interface monospace-font-name`), at bgrt's 10 pt: the sans follows the
+  shell's rather than bgrt's Cantarell (§4.4), and the monospace follows it. The image carries it
+  as `/usr/share/synoik-splash/mono.ttf`, beside the sans (§7.4): its regular face only (1.4 MB),
+  so what the console prints bold is drawn regular.
+- **The prompt line is drawn, not written:** the view lays the pending prompt under the text
+  rather than printing it into the buffer, so an answered prompt leaves no line behind.
+
+`TIOCCONS` costs nothing visible where the splash runs: fbcon is off the card (§2.2.2), so the
+console's text reached no screen. It does take the status lines from a serial console: on a Limina
+guest booted with `console=ttyAMA0`, the host's console view loses systemd's lines while the
+splash is up (the kernel's own still reach it: the redirect moves writes to `/dev/console`, not
+printk). Default images name no serial console (m0's VT kernel: `/proc/consoles` is `tty0` alone).
+
+**Undone before the handover.** The splash gives the console back and sends `SIGRTMIN+21` before it
+answers the outer's stop (§7.2 step 3), at quit, and on TERM, as plymouthd does at quit. The kernel
+would undo the redirect anyway once the splash's pty hangs up (`tty_release_redirect`, also on a
+crash), but pid 1 would keep printing its status. The outer cannot redirect the console itself
+(`TIOCCONS` needs `CAP_SYS_ADMIN`; it runs unprivileged).
+
+**Everything is opened at start**, and the fonts read into memory: past switch_root the splash's
+root is the emptied initramfs, its `/dev` and `/proc` moved to the real root. A face fontdb would
+read by path when text is first set in it is gone by then (measured: the splash's first details
+after switch_root panicked in cosmic-text, "no default font found").
+
+### 8.3 Across the handover
+
+The splash's state memfd (§7.2) carries the details flag and the buffer's lines (the screen's
+worth plus a bound, not the whole boot), so the outer carries the view on as it carries the
+spinner. From there the outer reads the **journal**, not kmsg: `dmesg_restrict` is 1 on Fedora, and
+past switch_root the journal has the kernel's records, pid 1's unit lines and everything the
+console would have shown, with their priorities. It follows it with a `journalctl --follow` child
+from the first modeset, filtered as kmsg is (priority at or under the console level, coloured by
+it), plus pid 1's job lines, which the console carried as status: worded as pid 1 words them there
+(`[  OK  ]`, `[FAILED]`, blanks for a job starting; its `JOB_TYPE` and `JOB_RESULT` fields), so
+the view reads the same across the handover. A start skipped for an unmet condition, which pid 1
+keeps off the console, is told by its empty `INVOCATION_ID` (71 of 74 such records on the harness;
+the rest show). The unit gives the outer the `systemd-journal` group
+(`SupplementaryGroups=`) to read the system journal. The journal and the keyboards start after
+the first modeset. Measured on the harness, the outer's first frame comes 50-100 ms after the
+splash's last with the view off, 280-360 ms with it on; the screen holds the splash's last view
+meanwhile. The extra time with the view on is not attributed yet.
+
+The outer reads the keyboards from the handover until "the splash is over", for the toggle; it
+already opens them itself (`system-compositor.md` §2), so nothing is grabbed and a session that has
+attached meanwhile sees the same keys. Neither key does anything in a session: the session
+compositor binds KEY_INFO to nothing, so no application receives it.
+
+### 8.4 Build order
+
+11. The line buffer and the emulator subset in `synoik-splash` (lib), and the layout of the view as
+    conformance tests: cell size, lines that fit, wrap, the newest at the bottom, the prompt line.
+12. The splash: the sources, the toggle, the redirect undone on every exit; the image carries the
+    font.
+13. The handover of the view, and the outer's journal source and toggle.
+14. On the harness: toggle with Esc and with an injected KEY_INFO in the initramfs, across the
+    handover and in the outer; a prompt in the view; a `systemctl` status line appearing; the
+    console back to normal after the splash (a write to `/dev/console` from the real root reaches
+    `tty0`).

@@ -240,6 +240,13 @@ pub struct Splash {
     /// Its client's connection does not cross a handoff, so neither does the prompt.
     #[serde(skip)]
     pub password_prompt: Option<Prompt>,
+    /// The details view (`docs/fork/boot-splash.md` §8) is up in the splash's place: Esc or
+    /// KEY_INFO toggled it.
+    #[serde(default)]
+    pub details: bool,
+    /// The boot's text, which the details view shows.
+    #[serde(default)]
+    pub console: crate::details::Console,
 }
 
 /// A password request on screen.
@@ -433,6 +440,12 @@ impl Server {
 
     pub fn splash(&self) -> &Splash {
         &self.splash
+    }
+
+    /// The details view's side of the splash (§8), which no request changes: whether it is up,
+    /// and the boot's text.
+    pub fn details_mut(&mut self) -> (&mut bool, &mut crate::details::Console) {
+        (&mut self.splash.details, &mut self.splash.console)
     }
 
     pub fn take_events(&mut self) -> Vec<Event> {

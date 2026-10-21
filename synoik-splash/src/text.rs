@@ -19,12 +19,11 @@ use swash::zeno::{Format, Vector};
 
 use crate::layout::{Font, Size};
 
-/// The family the splash sets its text in: the shell's default sans (§4.4).
-pub const FAMILY: &str = "Adwaita Sans";
-
-/// Where the image carries it. The image builders copy the file fontconfig picks for [`FAMILY`]
-/// here: distributions install it under different paths.
+/// Where the image carries the faces the splash sets text in ([`Font::family`]): the shell's sans
+/// (§4.4) and its monospace (§8.2). The image builders copy the files fontconfig picks for them
+/// here: distributions install them under different paths.
 pub const FONT_FILE: &str = "/usr/share/synoik-splash/sans.ttf";
+pub const MONO_FONT_FILE: &str = "/usr/share/synoik-splash/mono.ttf";
 
 /// One glyph's coverage, placed relative to the line's origin.
 #[derive(Debug, Clone)]
@@ -74,6 +73,13 @@ impl Line {
         Size::from((self.ink_bounds().2, self.line_box_height()))
     }
 
+    /// Where the line's origin goes for its pen to start at `x`, its line box centred in a band
+    /// as [`Self::origin`] centres it: for text set in columns, where the pen, not the ink, has to
+    /// line up.
+    pub fn pen_origin(&self, x: i32, band_top: i32, band_h: i32) -> (i32, i32) {
+        (x, self.origin(x, band_top, band_h).1)
+    }
+
     /// Where the line's origin goes for its ink to start at `x` and its line box to sit centred
     /// in a band of `band_h` at `band_top`: the outer's `Painter::text_band`.
     pub fn origin(&self, x: i32, band_top: i32, band_h: i32) -> (i32, i32) {
@@ -97,11 +103,15 @@ pub struct Fonts {
 
 impl Fonts {
     /// The faces in `files`; those that fail to load are left out, and text in them with them.
+    ///
+    /// Read now, not by path: fontdb reads a file face when text is first set in it, and past
+    /// switch_root the initramfs splash's files are gone (§7.1).
     pub fn load(files: &[&Path]) -> Self {
         let mut db = fontdb::Database::new();
         for file in files {
-            if let Err(err) = db.load_font_file(file) {
-                warn!("splash: font {}: {err}", file.display());
+            match std::fs::read(file) {
+                Ok(data) => db.load_font_data(data),
+                Err(err) => warn!("splash: font {}: {err}", file.display()),
             }
         }
         Self {
@@ -116,8 +126,7 @@ impl Fonts {
         self.system.db().is_empty()
     }
 
-    /// Shape and rasterize `text` in `font` at `scale`.
-    pub fn line(&mut self, text: &str, font: Font, scale: f64) -> Line {
+    fn shape(&mut self, text: &str, font: Font, scale: f64) -> (Buffer, f32) {
         let px = (font.px() * scale) as f32;
         let mut buffer = Buffer::new(&mut self.system, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
@@ -125,11 +134,26 @@ impl Fonts {
             let mut b = buffer.borrow_with(&mut self.system);
             b.set_size(None, None);
             let attrs = Attrs::new()
-                .family(Family::Name(FAMILY))
+                .family(Family::Name(font.family()))
                 .weight(Weight(font.weight()));
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
+        (buffer, px)
+    }
+
+    /// A character cell of `font` at `scale`: a space's advance, and the line box's height
+    /// (`ply_console_viewer_new` measures a label of one space). `None` without the face.
+    pub fn cell(&mut self, font: Font, scale: f64) -> Option<Size> {
+        let (buffer, _) = self.shape(" ", font, scale);
+        let advance = buffer.layout_runs().flat_map(|run| run.glyphs).next()?.w;
+        let height = self.line(" ", font, scale).line_box_height();
+        (advance > 0. && height > 0).then(|| Size::from((advance.round() as i32, height)))
+    }
+
+    /// Shape and rasterize `text` in `font` at `scale`.
+    pub fn line(&mut self, text: &str, font: Font, scale: f64) -> Line {
+        let (buffer, px) = self.shape(text, font, scale);
 
         let mut line = Line::default();
         'metrics: for run in buffer.layout_runs() {
@@ -217,13 +241,13 @@ mod tests {
     /// The installed face, found as the image builders find it.
     fn fonts() -> Option<Fonts> {
         let file = std::process::Command::new("fc-match")
-            .args(["-f", "%{file}", FAMILY])
+            .args(["-f", "%{file}", Font::Regular.family()])
             .output()
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .filter(|file| file.contains("AdwaitaSans"));
         let Some(file) = file else {
-            eprintln!("skipping: no {FAMILY} installed");
+            eprintln!("skipping: no Adwaita Sans installed");
             return None;
         };
         let fonts = Fonts::load(&[Path::new(&file)]);
@@ -255,6 +279,30 @@ mod tests {
         };
         let bold = bold(&mut fonts);
         assert!(bold > f64::from(regular) * 1.03, "{bold} vs {regular}");
+    }
+
+    /// The initramfs splash sets text after switch_root has emptied its root: a face must not be
+    /// read from its file when first used.
+    #[test]
+    fn a_face_outlives_its_file() {
+        let Some(file) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "Adwaita Sans"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .filter(|file| file.contains("AdwaitaSans"))
+        else {
+            eprintln!("skipping: no Adwaita Sans installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("synoik-face-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("sans.ttf");
+        std::fs::copy(&file, &copy).unwrap();
+        let mut fonts = Fonts::load(&[&copy]);
+        std::fs::remove_file(&copy).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(fonts.line("Passphrase", Font::Regular, 1.).size().w > 0);
     }
 
     #[test]
