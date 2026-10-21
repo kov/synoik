@@ -268,6 +268,7 @@ impl Theme {
             bullet: self.bullet.as_ref().map(size),
             keyboard: self.keyboard.as_ref().map(size),
             caps_lock: self.caps_lock.as_ref().map(size),
+            cell: None,
         }
     }
 }
@@ -289,8 +290,27 @@ fn load_image(renderer: &mut VulkanRenderer, path: &Path) -> anyhow::Result<VkTe
 /// A splash laid out and its text shaped, ready to paint.
 struct PreparedSplash {
     items: Vec<Item>,
+    /// One per [`Item::Text`] and [`Item::Console`] in `items`, in order.
     texts: Vec<ShapedText>,
     scale: f64,
+    /// The details view's cell, logical: its lines are centred in it.
+    cell: Option<geo::Size>,
+}
+
+/// The details view's character cell (§8): a monospace face's advance, which two runs of one
+/// character apart differ by, and its line box; logical, at `scale`. `None` without the face.
+fn mono_cell(shaper: &mut TextShaper<'_>, scale: f64) -> Option<geo::Size> {
+    let font = Font::Mono { bold: false };
+    let mut shape = |text: &str| {
+        shaper
+            .shape_named(text, font.px(), font.family(), font.weight())
+            .ok()
+    };
+    let (one, two) = (shape("M")?, shape("MM")?);
+    let advance = two.ink_bounds().2 - one.ink_bounds().2;
+    let height = one.line_box_height();
+    let logical = |px: i32| (f64::from(px) / scale).round() as i32;
+    (advance > 0 && height > 0).then(|| geo::Size::from((logical(advance), logical(height))))
 }
 
 /// One display's scanout buffers for the outer's frames, at that display's mode.
@@ -550,16 +570,19 @@ impl Compositor {
         dialog: &Dialog,
     ) -> PreparedSplash {
         let panel = geo::Size::from((i32::from(panel.0), i32::from(panel.1)));
-        let images = self.theme().images(panel, scale);
+        let mut images = self.theme().images(panel, scale);
         let logical: Size<i32, Logical> = size.to_f64().to_logical(scale).to_i32_round();
         let logical = geo::Size::from((logical.w, logical.h));
 
         let mut shaper = TextShaper::new(&mut self.renderer, scale);
+        if splash.details {
+            images.cell = mono_cell(&mut shaper, scale);
+        }
         let mut shaped = Vec::new();
         let mut measure = |text: &str, font: Font| match shaper.shape_named(
             text,
             font.px(),
-            synoik_vk::text::DEFAULT_SANS_FAMILY,
+            font.family(),
             font.weight(),
         ) {
             Ok(run) => {
@@ -586,17 +609,34 @@ impl Compositor {
             &mut measure,
         );
 
-        // Each text item was measured exactly once, in order; keep the ones that shaped.
+        // Each text item was measured exactly once, in order; keep the ones that shaped. The
+        // details view's runs are not measured (its cell places them): shape them here.
         let mut items = Vec::with_capacity(laid.len());
         let mut texts = Vec::new();
         let mut shaped = shaped.into_iter();
         for item in laid {
-            if let Item::Text { text, font, .. } = &item {
-                let run = shaped
-                    .find(|(t, f, _)| t == text && f == font)
-                    .and_then(|(_, _, run)| run);
-                let Some(run) = run else { continue };
-                texts.push(run);
+            match &item {
+                Item::Text { text, font, .. } => {
+                    let run = shaped
+                        .find(|(t, f, _)| t == text && f == font)
+                        .and_then(|(_, _, run)| run);
+                    let Some(run) = run else { continue };
+                    texts.push(run);
+                }
+                Item::Console(placed) => {
+                    let font = Font::Mono {
+                        bold: placed.style.bold,
+                    };
+                    match shaper.shape_named(&placed.text, font.px(), font.family(), font.weight())
+                    {
+                        Ok(run) => texts.push(run),
+                        Err(err) => {
+                            warn!("splash: shaping {:?}: {err:#}", placed.text);
+                            continue;
+                        }
+                    }
+                }
+                _ => (),
             }
             items.push(item);
         }
@@ -604,6 +644,7 @@ impl Compositor {
             items,
             texts,
             scale,
+            cell: images.cell,
         }
     }
 
@@ -700,6 +741,20 @@ fn paint_splash(
                     let done = logical(rect.loc, geo::Size::from((*filled, rect.size.h)));
                     painter.fill_rounded(done, 0., [r, g, b, 1.])?;
                 }
+            }
+            Item::Console(placed) => {
+                let Some(run) = texts.next() else { continue };
+                // The pen, not the ink, at the column: the runs of a line share one grid.
+                let band = prepared.cell.map_or(run.line_box_height(), |c| {
+                    (f64::from(c.h) * prepared.scale) as i32
+                });
+                let px = |v: i32| (f64::from(v) * prepared.scale).round() as i32;
+                let origin = smithay::utils::Point::<i32, Physical>::from((
+                    px(placed.at.x),
+                    px(placed.at.y) + run.line_box_centered_y(band),
+                ));
+                let [r, g, b] = placed.style.color.rgb();
+                painter.text_px(run, origin, [r, g, b, 1.])?;
             }
             Item::Text { at, font, .. } => {
                 let Some(run) = texts.next() else { continue };
@@ -1034,6 +1089,63 @@ mod tests {
     /// progress bar's two colours and a message's ink, on black everywhere else. The image
     /// positions come from the layout for the images actually installed (CI's distribution ships
     /// its own); `splash::tests` pins the numbers for Fedora's.
+    /// The pixels of `rect` nearest `want` in colour, by the largest channel difference.
+    fn nearest(
+        (width, bytes): &(i32, Vec<u8>),
+        rect: Rectangle<i32, Physical>,
+        want: [u8; 3],
+    ) -> u8 {
+        let mut best = u8::MAX;
+        for y in rect.loc.y..rect.loc.y + rect.size.h {
+            for x in rect.loc.x..rect.loc.x + rect.size.w {
+                let i = ((y * width + x) * 4) as usize;
+                let d = (0..3)
+                    .map(|c| bytes[i + c].abs_diff(want[c]))
+                    .max()
+                    .unwrap();
+                best = best.min(d);
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn the_details_view_draws_the_console_in_its_colours() {
+        let Some(mut c) = compositor() else { return };
+        let mut splash = Splash {
+            shown: true,
+            details: true,
+            messages: vec!["not in the view".into()],
+            ..Splash::default()
+        };
+        splash
+            .console
+            .write(b"[  \x1b[0;32mOK\x1b[0m  ] Started a unit.\n");
+        let mut texture = c
+            .splash_picture(
+                (1280, 800),
+                &splash,
+                1.,
+                (1280, 800),
+                0,
+                &Dialog::default(),
+                None,
+            )
+            .unwrap();
+        let Some(cell) = mono_cell(&mut TextShaper::new(&mut c.renderer, 1.), 1.) else {
+            eprintln!("skipping: no Adwaita Mono");
+            return;
+        };
+        let px = pixels(&mut c, &mut texture);
+        // "OK" in the VT's green, three cells in; the brackets in white around it.
+        let ok = rect(cell.w / 2 + 3 * cell.w, 0, 2 * cell.w, cell.h);
+        assert!(nearest(&px, ok, [0, 0xaa, 0]) < 24);
+        let bracket = rect(cell.w / 2, 0, cell.w, cell.h);
+        assert!(nearest(&px, bracket, [0xff, 0xff, 0xff]) < 24);
+        // Nothing past the first line but the watermark: no spinner, no message.
+        assert_eq!(brightest(&px, rect(0, cell.h, 1280, 600)), 0);
+    }
+
     #[test]
     fn the_splash_draws_the_theme() {
         if !geo::watermark_file(Path::new(splash::THEME_DIR)).exists() {

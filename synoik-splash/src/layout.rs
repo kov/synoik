@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::details::{self, Placed};
 use crate::plymouth::{Mode, Splash};
 
 /// A position in logical pixels.
@@ -83,6 +84,9 @@ pub enum Font {
     /// The keyboard layout's name beside the keyboard icon: `keymap-render.py`'s 30 px bold, in
     /// its grey.
     Keymap,
+    /// The details view's text (§8): bgrt's `monospace 10`, in the shell's monospace; bold for
+    /// what the console prints bold.
+    Mono { bold: bool },
 }
 
 impl Font {
@@ -92,6 +96,16 @@ impl Font {
             Self::Regular => 16.,
             Self::Title => 40.,
             Self::Keymap => 30.,
+            Self::Mono { .. } => details::MONO_PX,
+        }
+    }
+
+    /// The face: the shell's sans and monospace, the schema defaults of
+    /// `org.gnome.desktop.interface` `font-name` and `monospace-font-name`.
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::Mono { .. } => "Adwaita Mono",
+            _ => "Adwaita Sans",
         }
     }
 
@@ -100,14 +114,15 @@ impl Font {
         match self {
             Self::Regular => 400,
             Self::Title => 300,
-            Self::Keymap => 700,
+            Self::Keymap | Self::Mono { bold: true } => 700,
+            Self::Mono { bold: false } => 400,
         }
     }
 
     /// The text's colour.
     pub fn color(self) -> [f32; 3] {
         match self {
-            Self::Regular | Self::Title => [1., 1., 1.],
+            Self::Regular | Self::Title | Self::Mono { .. } => [1., 1., 1.],
             Self::Keymap => [0.75, 0.75, 0.75],
         }
     }
@@ -200,6 +215,9 @@ pub struct Images {
     pub bullet: Option<Size>,
     pub keyboard: Option<Size>,
     pub caps_lock: Option<Size>,
+    /// The details view's character cell in its monospace face: a space's advance and the line
+    /// height. Not an image, but the drawers' to measure, as they measure text.
+    pub cell: Option<Size>,
 }
 
 /// What the keyboard says about a password being typed: the drawers' side of the dialog, which
@@ -246,6 +264,8 @@ pub enum Item {
     },
     Keyboard(Point),
     CapsLock(Point),
+    /// A run of the details view's text, in its monospace face (§8).
+    Console(Placed),
 }
 
 /// The update modes' title and subtitle (bgrt's `Title=` and `SubTitle=`).
@@ -312,6 +332,24 @@ pub fn layout(
     let (w, h) = (f64::from(screen.w), f64::from(screen.h));
     let mut items = Vec::new();
 
+    // The details view: black, without the firmware's logo, the watermark, and the text over it
+    // (two-step's `draw_background` with `should_show_console_messages`).
+    if splash.details && splash.shown {
+        push_watermark(images, w, h, &mut items);
+        if let Some(cell) = images.cell {
+            let prompt = splash.password_prompt.as_ref().map(|p| {
+                let text = p.text.as_deref().unwrap_or("Password");
+                (text.strip_suffix(':').unwrap_or(text), dialog.bullets)
+            });
+            items.extend(
+                details::lay(&splash.console, prompt, screen, cell)
+                    .into_iter()
+                    .map(Item::Console),
+            );
+        }
+        return items;
+    }
+
     // bgrt's boot, shutdown and reboot modes draw the logo (`UseFirmwareBackground`); so do the
     // update modes here, which bgrt draws without it (§4.3). A password dialog clears it
     // (`DialogClearsFirmwareBackground`).
@@ -320,13 +358,7 @@ pub fn layout(
     if let Some(at) = firmware_at {
         items.push(Item::Firmware(at));
     }
-    if let Some(size) = images.watermark {
-        // `screen * align - image * align`, not `(screen - image) * align`: the same arithmetic,
-        // rounded the same way.
-        let x = w * WATERMARK_ALIGN.0 - f64::from(size.w) * WATERMARK_ALIGN.0;
-        let y = h * WATERMARK_ALIGN.1 - f64::from(size.h) * WATERMARK_ALIGN.1;
-        items.push(Item::Watermark(Point::from((x as i32, y as i32))));
-    }
+    push_watermark(images, w, h, &mut items);
     if !splash.shown {
         return items;
     }
@@ -433,6 +465,16 @@ pub fn layout(
     }
 
     items
+}
+
+fn push_watermark(images: &Images, w: f64, h: f64, items: &mut Vec<Item>) {
+    if let Some(size) = images.watermark {
+        // `screen * align - image * align`, not `(screen - image) * align`: the same arithmetic,
+        // rounded the same way.
+        let x = w * WATERMARK_ALIGN.0 - f64::from(size.w) * WATERMARK_ALIGN.0;
+        let y = h * WATERMARK_ALIGN.1 - f64::from(size.h) * WATERMARK_ALIGN.1;
+        items.push(Item::Watermark(Point::from((x as i32, y as i32))));
+    }
 }
 
 /// The password dialog, as two-step's `view_show_prompt` places it: the lock and the entry side by
@@ -564,6 +606,7 @@ mod tests {
             bullet: Some(Size::from((10, 10))),
             keyboard: Some(Size::from((36, 36))),
             caps_lock: Some(Size::from((24, 28))),
+            cell: Some(Size::from((8, 16))),
         }
     }
 
@@ -599,6 +642,76 @@ mod tests {
             lay(&Splash::default(), 1280, 800),
             [Item::Watermark(Point::from((565, 726)))]
         );
+    }
+
+    #[test]
+    fn details_show_the_text_over_black_and_the_watermark() {
+        let mut splash = shown(Mode::BootUp);
+        splash.details = true;
+        splash.messages.push("not in the view".into());
+        splash
+            .console
+            .write(b"[  \x1b[32mOK\x1b[0m  ] Started x.\n");
+        let mut images = images();
+        images.firmware = Some(Firmware {
+            size: Size::from((256, 256)),
+            offset: Point::from((512, 272)),
+            panel: Size::from((1280, 800)),
+        });
+        let items = layout(
+            &splash,
+            Size::from((1280, 800)),
+            &images,
+            7,
+            &Dialog::default(),
+            &mut measure,
+        );
+        let console = |text: &str, color, x| {
+            Item::Console(Placed {
+                text: text.into(),
+                style: details::Style { color, bold: false },
+                at: Point::from((x, 0)),
+            })
+        };
+        use details::Color::*;
+        // No logo, no spinner, no message: two-step's `draw_background` goes black for details.
+        assert_eq!(
+            items,
+            [
+                Item::Watermark(Point::from((565, 726))),
+                console("[  ", Default, 4),
+                console("OK", Green, 4 + 3 * 8),
+                console("  ] Started x.", Default, 4 + 5 * 8),
+            ]
+        );
+
+        // A password asked for meanwhile is a line of the view, not the dialog.
+        splash.password_prompt = Some(crate::plymouth::Prompt {
+            text: Some("Passphrase for data:".into()),
+        });
+        let dialog = Dialog {
+            bullets: 2,
+            ..Dialog::default()
+        };
+        let items = layout(
+            &splash,
+            Size::from((1280, 800)),
+            &images,
+            7,
+            &dialog,
+            &mut measure,
+        );
+        assert_eq!(
+            items.last(),
+            Some(&Item::Console(Placed {
+                text: "Passphrase for data: **_".into(),
+                style: details::Style::default(),
+                at: Point::from((4, 16)),
+            }))
+        );
+        assert!(!items
+            .iter()
+            .any(|i| matches!(i, Item::Lock(_) | Item::Entry(_))));
     }
 
     #[test]

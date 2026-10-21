@@ -559,11 +559,13 @@ two-step's console viewer (`libply-splash-graphics/ply-console-viewer.c`, chosen
 
 - **Toggle:** Esc, in any state, a password prompt included (`validate_input`,
   `toggle_console_messages`). Shown, the animation stops and the views redraw.
-- **Look:** the splash's background (black, the firmware's logo and the watermark, `draw_background`), and over
-  it the newest lines that fit, white (`PLY_CONSOLE_VIEWER_LOG_TEXT_COLOR`), in the theme's
-  `MonospaceFont` (`monospace 10`, the fallback bgrt uses), one line per font height from the top,
-  half a cell in from the left, wrapped at `width / cell − 1` characters. The message line is not
-  drawn. A password prompt is drawn as a line of the viewer (`prompt: ****_`) instead of the dialog.
+- **Look:** black — the firmware's logo goes (`draw_background` with
+  `should_show_console_messages`) — the watermark, and over them the newest lines that fit, in
+  the theme's `MonospaceFont` (`monospace 10`, the fallback bgrt uses), one line per font height
+  from the top, half a cell in from the left, wrapped at `width / cell − 1` characters; white
+  (`PLY_CONSOLE_VIEWER_LOG_TEXT_COLOR`) but where the text sets the Linux VT palette's colours
+  (`look_up_rgb_color_from_terminal_color`). The message line is not drawn. A password prompt is
+  drawn as a line of the viewer (`prompt: ****_`) instead of the dialog.
 - **Sources,** appended to one boot buffer from plymouthd's start, so the first toggle shows the
   boot so far:
   - `/dev/kmsg`, only records at or above the console's level (`/proc/sys/kernel/printk`'s first
@@ -590,9 +592,12 @@ Divergences:
 - **The keyboards are read from the start**, not only for a prompt: the splash already keeps them
   open from start (§4.2), unarmed; a toggle key is now always read, every other key only while a
   prompt is up.
-- **The font** is the system's `monospace` as fontconfig picks it when the image is built
-  (Noto Sans Mono on Fedora 44), copied in as `/usr/share/synoik-splash/mono.ttf` beside the sans
-  (§7.4), at 10 pt.
+- **The font** is the shell's monospace, Adwaita Mono (the schema default of
+  `org.gnome.desktop.interface monospace-font-name`), at bgrt's 10 pt: the sans follows the
+  shell's rather than bgrt's Cantarell (§4.4), and the monospace follows it. The image carries it
+  as `/usr/share/synoik-splash/mono.ttf`, beside the sans (§7.4).
+- **The prompt line is drawn, not written:** the view lays the pending prompt under the text
+  rather than printing it into the buffer, so an answered prompt leaves no line behind.
 
 `TIOCCONS` costs nothing visible where the splash runs: fbcon is off the card (§2.2.2), so the
 console's text reached no screen. It does take the status lines from a serial console: on a Limina

@@ -259,6 +259,8 @@ mod tests {
 
     #[test]
     fn the_state_survives_a_memfd() {
+        let mut console = crate::details::Console::default();
+        console.write(b"[  \x1b[32mOK\x1b[0m  ] Started x.\n");
         let state = State {
             splash: Splash {
                 mode: Mode::Reboot,
@@ -268,6 +270,8 @@ mod tests {
                 progress: Some(42),
                 progress_paused: true,
                 password_prompt: None,
+                details: true,
+                console,
             },
             spinner_start: Duration::from_nanos(1_234_567_891),
             frozen_frame: Some(7),
