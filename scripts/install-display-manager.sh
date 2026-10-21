@@ -24,7 +24,9 @@
 # (docs/fork/greeter.md §2.6).
 #
 # Fedora (dracut, grubby, authselect's PAM stacks) and Debian (initramfs-tools, update-grub, the
-# common-* stacks) are told apart by /etc/os-release.
+# common-* stacks) are told apart by /etc/os-release. A Fedora booting systemd-boot gets its kernel
+# command line from /etc/kernel/cmdline and its images from kernel-install instead of grubby and
+# dracut.
 #
 # Env knobs:
 #   PROFILE=release   which build to install (default: release)
@@ -67,6 +69,47 @@ kernel_args="fbcon=map:9 drm_kms_helper.fbdev_emulation=0"
 # so an alias made only with `systemctl enable` goes back to GDM at gdm3's next upgrade.
 default_dm=/etc/X11/default-display-manager
 
+# systemd-boot, with kernel-install placing the kernels as its entries (the bls layout): the
+# command line is /etc/kernel/cmdline, which kernel-install writes into each entry. GRUB's tools
+# would edit entries nothing boots.
+sdboot=false
+if [ "$distro" = fedora ] && bootctl is-installed --graceful >/dev/null 2>&1 &&
+    kernel-install inspect 2>/dev/null | grep -q 'KERNEL_INSTALL_LAYOUT=bls$'; then
+    sdboot=true
+fi
+
+# Put back `args` into /etc/kernel/cmdline (`add`) or take them out of it (`remove`), each once.
+edit_kernel_cmdline() {
+    local verb=$1 arg out=()
+    local -a have
+    read -r -a have </etc/kernel/cmdline
+    for arg in "${have[@]}"; do
+        case " $kernel_args " in
+            *" $arg "*) ;;
+            *) out+=("$arg") ;;
+        esac
+    done
+    if [ "$verb" = add ]; then
+        # shellcheck disable=SC2206
+        out+=($kernel_args)
+    fi
+    printf '%s\n' "${out[*]}" >/etc/kernel/cmdline
+}
+
+# Install every kernel systemd-boot has an entry for again: its entry takes the command line, and
+# its initramfs is rebuilt.
+reinstall_kernels() {
+    local root token dir kver
+    root=$(kernel-install inspect | sed -n 's/^ *KERNEL_INSTALL_BOOT_ROOT=//p')
+    token=$(kernel-install inspect | sed -n 's/^ *KERNEL_INSTALL_ENTRY_TOKEN=//p')
+    for dir in "$root/$token"/*/; do
+        kver=$(basename "$dir")
+        if [ -e "/lib/modules/$kver/vmlinuz" ]; then
+            kernel-install add "$kver" "/lib/modules/$kver/vmlinuz"
+        fi
+    done
+}
+
 if [ "${1:-}" = "--use-gdm" ]; then
     systemctl disable synoik-login.service synoik-system.service || true
     if [ "$distro" = debian ]; then
@@ -85,8 +128,10 @@ if [ "${1:-}" = "--use-gdm" ]; then
         fi
     elif [ -e "$dracut_conf" ] || [ -e "$dracut_module" ]; then
         rm -rf "$dracut_conf" "$dracut_module"
-        echo "Rebuilding the initramfs images with plymouth..."
-        dracut -f --regenerate-all
+        if [ "$sdboot" = false ]; then
+            echo "Rebuilding the initramfs images with plymouth..."
+            dracut -f --regenerate-all
+        fi
     fi
     rm -f "$splash_dropin" "$splash_unit"
     systemctl enable --force gdm.service
@@ -96,6 +141,10 @@ if [ "${1:-}" = "--use-gdm" ]; then
             rm -f "$grub_snippet"
             update-grub
         fi
+    elif [ "$sdboot" = true ]; then
+        edit_kernel_cmdline remove
+        echo "Reinstalling the kernels with plymouth and the text consoles..."
+        reinstall_kernels
     else
         grubby --update-kernel=ALL --remove-args="$kernel_args"
     fi
@@ -267,6 +316,9 @@ if [ "$distro" = debian ]; then
             "$want" >"$grub_snippet"
         update-grub
     fi
+elif [ "$sdboot" = true ]; then
+    # Into the entries with the initramfs images, below.
+    edit_kernel_cmdline add
 else
     grubby --update-kernel=ALL --args="$kernel_args"
 fi
@@ -288,7 +340,11 @@ else
     install -Dm644 $r/synoik-system-after-cryptsetup.conf "$splash_dropin"
     # The initramfs's unit lives on after switch_root: the real root knows it by its file.
     install -Dm644 $r/dracut/90synoik/synoik-splash.service "$splash_unit"
-    dracut -f --regenerate-all
+    if [ "$sdboot" = true ]; then
+        reinstall_kernels
+    else
+        dracut -f --regenerate-all
+    fi
 fi
 
 systemctl daemon-reload
