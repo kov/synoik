@@ -627,7 +627,9 @@ console would have shown, with their priorities. It follows it with a `journalct
 from the first modeset, filtered as kmsg is (priority at or under the console level, coloured by
 it), plus pid 1's job lines, which the console carried as status: worded as pid 1 words them there
 (`[  OK  ]`, `[FAILED]`, blanks for a job starting; its `JOB_TYPE` and `JOB_RESULT` fields), so
-the view reads the same across the handover. The unit gives the outer the `systemd-journal` group
+the view reads the same across the handover. A start skipped for an unmet condition, which pid 1
+keeps off the console, is told by its empty `INVOCATION_ID` (71 of 74 such records on the harness;
+the rest show). The unit gives the outer the `systemd-journal` group
 (`SupplementaryGroups=`) to read the system journal. The journal and the keyboards wait for the
 first modeset: compiling the keymap before it held the first frame back (measured on the harness,
 the handover's gap 71 ms with them after it). With the view up across the handover the outer's

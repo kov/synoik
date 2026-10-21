@@ -307,7 +307,7 @@ impl Outer {
                 "--lines=0",
                 "--boot",
                 "--output=json",
-                "--output-fields=MESSAGE,PRIORITY,_PID,JOB_TYPE,JOB_RESULT",
+                "--output-fields=MESSAGE,PRIORITY,_PID,JOB_TYPE,JOB_RESULT,INVOCATION_ID",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -891,6 +891,11 @@ fn journal_text(line: &[u8], level: u8) -> Option<String> {
     let message = field("MESSAGE")?;
     let priority: u8 = field("PRIORITY")?.parse().ok()?;
     if field("_PID") == Some("1") && field("JOB_TYPE").is_some() {
+        // A start skipped for an unmet condition is done without ever being invoked; pid 1 keeps
+        // it off the console (`job_emit_done_message`).
+        if field("JOB_RESULT") == Some("done") && field("INVOCATION_ID") == Some("") {
+            return None;
+        }
         return status_line(field("JOB_RESULT"), message);
     }
     (priority <= level).then(|| details::record_text(priority, message))
@@ -958,6 +963,8 @@ mod tests {
             Some("[\x1b[0;1;31mFAILED\x1b[0m] Failed to start x.\n")
         );
         assert_eq!(journal_text(job("canceled", "x").as_bytes(), 3), None);
+        let skipped = r#"{"MESSAGE":"x skipped, unmet condition","PRIORITY":"6","_PID":"1","JOB_TYPE":"start","JOB_RESULT":"done","INVOCATION_ID":""}"#;
+        assert_eq!(journal_text(skipped.as_bytes(), 3), None);
         // A message journald could not store as text is skipped.
         assert_eq!(
             journal_text(br#"{"MESSAGE":[104,105],"PRIORITY":"3"}"#, 3),
