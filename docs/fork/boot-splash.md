@@ -606,11 +606,16 @@ guest booted with `console=ttyAMA0`, the host's console view loses systemd's lin
 splash is up (the kernel's own still reach it: the redirect moves writes to `/dev/console`, not
 printk). Default images name no serial console (m0's VT kernel: `/proc/consoles` is `tty0` alone).
 
-**Undone before the handover.** The redirect points at the splash's pty; left in place past the
-splash's exit, every later write to `/dev/console` would go nowhere. The splash undoes it and sends
-`SIGRTMIN+21` before it answers the outer's stop (§7.2 step 3), and on its other exits (quit
-without retain, §2.4; TERM). The outer cannot redirect the console itself (`TIOCCONS` needs
-`CAP_SYS_ADMIN`; it runs unprivileged), and pid 1's status goes back to `auto`.
+**Undone before the handover.** The splash gives the console back and sends `SIGRTMIN+21` before it
+answers the outer's stop (§7.2 step 3), at quit, and on TERM, as plymouthd does at quit. The kernel
+would undo the redirect anyway once the splash's pty hangs up (`tty_release_redirect`, also on a
+crash), but pid 1 would keep printing its status. The outer cannot redirect the console itself
+(`TIOCCONS` needs `CAP_SYS_ADMIN`; it runs unprivileged).
+
+**Everything is opened at start**, and the fonts read into memory: past switch_root the splash's
+root is the emptied initramfs, its `/dev` and `/proc` moved to the real root. A face fontdb would
+read by path when text is first set in it is gone by then (measured: the splash's first details
+after switch_root panicked in cosmic-text, "no default font found").
 
 ### 8.3 Across the handover
 

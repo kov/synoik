@@ -103,11 +103,15 @@ pub struct Fonts {
 
 impl Fonts {
     /// The faces in `files`; those that fail to load are left out, and text in them with them.
+    ///
+    /// Read now, not by path: fontdb reads a file face when text is first set in it, and past
+    /// switch_root the initramfs splash's files are gone (§7.1).
     pub fn load(files: &[&Path]) -> Self {
         let mut db = fontdb::Database::new();
         for file in files {
-            if let Err(err) = db.load_font_file(file) {
-                warn!("splash: font {}: {err}", file.display());
+            match std::fs::read(file) {
+                Ok(data) => db.load_font_data(data),
+                Err(err) => warn!("splash: font {}: {err}", file.display()),
             }
         }
         Self {
@@ -275,6 +279,30 @@ mod tests {
         };
         let bold = bold(&mut fonts);
         assert!(bold > f64::from(regular) * 1.03, "{bold} vs {regular}");
+    }
+
+    /// The initramfs splash sets text after switch_root has emptied its root: a face must not be
+    /// read from its file when first used.
+    #[test]
+    fn a_face_outlives_its_file() {
+        let Some(file) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "Adwaita Sans"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .filter(|file| file.contains("AdwaitaSans"))
+        else {
+            eprintln!("skipping: no Adwaita Sans installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("synoik-face-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("sans.ttf");
+        std::fs::copy(&file, &copy).unwrap();
+        let mut fonts = Fonts::load(&[&copy]);
+        std::fs::remove_file(&copy).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(fonts.line("Passphrase", Font::Regular, 1.).size().w > 0);
     }
 
     #[test]

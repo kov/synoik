@@ -402,7 +402,7 @@ impl Keyboard {
             warn!("splash: {}: {err}", path.display());
             return;
         }
-        info!("reading {} for a password", path.display());
+        info!("reading {}", path.display());
         self.devices.insert(
             raw,
             Device {

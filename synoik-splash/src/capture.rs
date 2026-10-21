@@ -142,8 +142,8 @@ impl Capture {
         details::printk_levels(std::str::from_utf8(&buf[..n]).ok()?)
     }
 
-    /// Give the console back and tell pid 1 to stop printing its status, before the splash goes:
-    /// a redirect left pointing at a pty nobody reads would swallow every later write.
+    /// Give the console back and tell pid 1 to stop printing its status, before the splash goes.
+    /// The kernel drops the redirect itself once our pty hangs up, but pid 1 would print on.
     pub fn stop(&mut self) {
         if let Some(console) = self.console.take() {
             // `TIOCCONS` on the console itself undoes the redirect (`tioccons`).
