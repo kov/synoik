@@ -548,7 +548,11 @@ is the same program, started and taken over differently.
 
 ## 8. Details: the boot's text
 
-> Status: **built (steps 11-13), not yet validated on the harness (step 14).** Asked for with Limina's quiet boot (limina
+> Status: **built and validated on the harness** (2026-10-21, Cardea c712c61, Esc injected on the
+> virtio keyboard): on in the initramfs splash, carried across the handover, off in the outer;
+> `/dev/console` writable and pid 1's `ShowStatus` back to `no` after it. KEY_INFO waits for
+> Limina's keyboard to declare it; a prompt in the view is pinned by the layout's tests only.
+> Asked for with Limina's quiet boot (limina
 > `docs/design/boot-presentation.md`, "Seeing the boot"): the firmware and loader keep their text
 > off the screen, so the guest shows the boot's own text on request, as plymouth does.
 
