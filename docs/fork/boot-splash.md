@@ -541,3 +541,91 @@ is the same program, started and taken over differently.
   descriptor an `ExecStartPre=` puts in the store reaches `ExecStart=` under its name.
 - **Ordering**: the same `After=cryptsetup.target` drop-in as on Fedora (§7.2). The
   real root's plymouth units are conditioned off as on Fedora (§2.2).
+
+## 8. Details: the boot's text
+
+> Status: **designed, not built.** Asked for with Limina's quiet boot (limina
+> `docs/design/boot-presentation.md`, "Seeing the boot"): the firmware and loader keep their text
+> off the screen, so the guest shows the boot's own text on request, as plymouth does.
+
+### 8.1 What plymouth does
+
+two-step's console viewer (`libply-splash-graphics/ply-console-viewer.c`, chosen by
+`ply_console_viewer_preferred` unless `plymouth.prefer-fbcon`):
+
+- **Toggle:** Esc, in any state, a password prompt included (`validate_input`,
+  `toggle_console_messages`). Shown, the animation stops and the views redraw.
+- **Look:** the splash's background (black, the firmware's logo and the watermark, `draw_background`), and over
+  it the newest lines that fit, white (`PLY_CONSOLE_VIEWER_LOG_TEXT_COLOR`), in the theme's
+  `MonospaceFont` (`monospace 10`, the fallback bgrt uses), one line per font height from the top,
+  half a cell in from the left, wrapped at `width / cell − 1` characters. The message line is not
+  drawn. A password prompt is drawn as a line of the viewer (`prompt: ****_`) instead of the dialog.
+- **Sources,** appended to one boot buffer from plymouthd's start, so the first toggle shows the
+  boot so far:
+  - `/dev/kmsg`, only records at or above the console's level (`/proc/sys/kernel/printk`'s first
+    field, re-read at most once a second; `ply-kmsg-reader.c`): under `quiet` that is errors and
+    worse — what the kernel would have printed on the console.
+  - `/dev/console`, redirected into a pty with `TIOCCONS` (`ply-terminal-session.c`): every write
+    to it — systemd's status lines, boot scripts, the console password agent — goes to plymouthd
+    instead of the console, until it undoes the redirect at quit.
+  - pid 1 is told to print its status anyway (`SIGRTMIN+20` at show, `SIGRTMIN+21` at quit,
+    `tell_systemd_to_print_details`): under `quiet` systemd's `ShowStatus` is `auto`, which prints
+    nothing until a unit is slow or fails.
+- The text goes through a small terminal emulator (`ply-terminal-emulator.c`): CR, LF, erase in
+  line, the cursor moves systemd's status uses, SGR colours.
+
+### 8.2 The splash's details
+
+synoik-splash takes all of §8.1: the toggle, the look, the three sources, the emulator's subset.
+Divergences:
+
+- **KEY_INFO toggles too** (evdev code 0x166, matched on the code: xkeyboard-config maps it as
+  `<I366>` = `XF86Info`, but the raw code needs no keymap). No keyboard has it; Limina's host injects
+  it for its "boot details" action (its virtual keyboard declares it), where an Esc could land in a
+  session's application. Esc stays, plymouth's key.
+- **The keyboards are read from the start**, not only for a prompt: the splash already keeps them
+  open from start (§4.2), unarmed; a toggle key is now always read, every other key only while a
+  prompt is up.
+- **The font** is the system's `monospace` as fontconfig picks it when the image is built
+  (Noto Sans Mono on Fedora 44), copied in as `/usr/share/synoik-splash/mono.ttf` beside the sans
+  (§7.4), at 10 pt.
+
+`TIOCCONS` costs nothing visible where the splash runs: fbcon is off the card (§2.2.2), so the
+console's text reached no screen. It does take the status lines from a serial console: on a Limina
+guest booted with `console=ttyAMA0`, the host's console view loses systemd's lines while the
+splash is up (the kernel's own still reach it: the redirect moves writes to `/dev/console`, not
+printk). Default images name no serial console (m0's VT kernel: `/proc/consoles` is `tty0` alone).
+
+**Undone before the handover.** The redirect points at the splash's pty; left in place past the
+splash's exit, every later write to `/dev/console` would go nowhere. The splash undoes it and sends
+`SIGRTMIN+21` before it answers the outer's stop (§7.2 step 3), and on its other exits (quit
+without retain, §2.4; TERM). The outer cannot redirect the console itself (`TIOCCONS` needs
+`CAP_SYS_ADMIN`; it runs unprivileged), and pid 1's status goes back to `auto`.
+
+### 8.3 Across the handover
+
+The splash's state memfd (§7.2) carries the details flag and the buffer's lines (the screen's
+worth plus a bound, not the whole boot), so the outer carries the view on as it carries the
+spinner. From there the outer reads the **journal**, not kmsg: `dmesg_restrict` is 1 on Fedora, and
+past switch_root the journal has the kernel's records, pid 1's unit lines and everything the
+console would have shown, with their priorities. It appends records from the handover on, filtered
+as kmsg is (priority at or under the console level), plus pid 1's start and stop lines, which the
+console carried as status. The outer's user joins `systemd-journal` (sysusers) to read the system
+journal.
+
+The outer reads the keyboards from the handover until "the splash is over", for the toggle; it
+already opens them itself (`system-compositor.md` §2), so nothing is grabbed and a session that has
+attached meanwhile sees the same keys. Neither key does anything in a session: the session
+compositor binds KEY_INFO to nothing, so no application receives it.
+
+### 8.4 Build order
+
+11. The line buffer and the emulator subset in `synoik-splash` (lib), and the layout of the view as
+    conformance tests: cell size, lines that fit, wrap, the newest at the bottom, the prompt line.
+12. The splash: the sources, the toggle, the redirect undone on every exit; the image carries the
+    font.
+13. The handover of the view, and the outer's journal source and toggle.
+14. On the harness: toggle with Esc and with an injected KEY_INFO in the initramfs, across the
+    handover and in the outer; a prompt in the view; a `systemctl` status line appearing; the
+    console back to normal after the splash (a write to `/dev/console` from the real root reaches
+    `tty0`).
