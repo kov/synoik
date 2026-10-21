@@ -16,8 +16,8 @@
 #   HARNESS_DMG       the Limina build, mounted at $HARNESS_DIR/mnt when nothing is there yet
 #                     (the newest ~/Projects/LiminaParkingLot/Limina-*.dmg)
 #   HARNESS_SIZE      the display mode                      (1280x800)
-#   HARNESS_LIMINA_ARGS  more launch flags, e.g. `--acpi` for the ACPI machine, whose firmware
-#                     publishes its logo as a BGRT table   (none)
+#   HARNESS_LIMINA_ARGS  more launch flags, e.g. `--machine`
+#                     (none; the ACPI machine, whose firmware publishes its logo as BGRT, is the default)
 
 HARNESS_HOST=${HARNESS_HOST:-alface}
 HARNESS_DIR=${HARNESS_DIR:-/Users/kov/Projects/synoik-harness}
