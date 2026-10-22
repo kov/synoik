@@ -2238,6 +2238,9 @@ impl State {
                 .unlock_dialog
                 .set_peek_locked_down(state.synoik.gnome_settings.shield.disable_show_password);
             state.synoik.sync_power_policy();
+            // Pointer accessibility as the session starts with it, and the panel's dwell-click
+            // indicator with it; later changes come through the settings watcher.
+            state.sync_pointer_a11y();
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
