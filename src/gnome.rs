@@ -23,6 +23,7 @@ use smithay::input::keyboard::{xkb, Keysym};
 use synoik_config::{Action, Modifiers};
 use synoik_ipc::SizeChange;
 
+use crate::bell::VisualBellType;
 use crate::input::peripherals::Peripherals;
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
 
@@ -134,6 +135,9 @@ pub struct GnomeSettings {
     /// resizes and Mod+MMB opens the window menu, instead of the other way
     /// round (`meta_prefs_get_mouse_button_resize`, `prefs.c`).
     pub resize_with_right_button: bool,
+    /// `org.gnome.desktop.wm.preferences visual-bell-type`: what a bell flashes when the
+    /// Visual Alerts row (`visual-bell`) is on — see [`crate::bell`].
+    pub visual_bell_type: VisualBellType,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles (sides) or maximizes (top) it.
     pub edge_tiling: bool,
@@ -517,6 +521,7 @@ impl Default for GnomeSettings {
             login_screen: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             resize_with_right_button: false,
+            visual_bell_type: VisualBellType::default(),
             edge_tiling: true,
             center_new_windows: true,
             auto_maximize: true,
@@ -1061,6 +1066,14 @@ impl GnomeSettings {
         }
         if settings_has_key(wm, "resize-with-right-button") {
             self.resize_with_right_button = wm.boolean("resize-with-right-button");
+        }
+        if settings_has_key(wm, "visual-bell-type") {
+            let value = wm.string("visual-bell-type");
+            match value.as_str() {
+                "fullscreen-flash" => self.visual_bell_type = VisualBellType::FullscreenFlash,
+                "frame-flash" => self.visual_bell_type = VisualBellType::FrameFlash,
+                other => warn!("ignoring unrecognized visual-bell-type {other:?}"),
+            }
         }
     }
 

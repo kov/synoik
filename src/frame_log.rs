@@ -732,6 +732,8 @@ bitflags::bitflags! {
         const THUMB_EDGE_SCROLL = 1 << 33;
         /// The workspace row catching up with a sideways scroll, or flinging after one.
         const THUMB_KINETIC_SCROLL = 1 << 34;
+        /// The visual bell's fullscreen flash.
+        const BELL = 1 << 35;
     }
 }
 
@@ -795,6 +797,7 @@ impl AnimCauses {
             (AnimCauses::APP_EXPOSE, "app-expose"),
             (AnimCauses::THUMB_EDGE_SCROLL, "thumb-edge-scroll"),
             (AnimCauses::THUMB_KINETIC_SCROLL, "thumb-kinetic-scroll"),
+            (AnimCauses::BELL, "bell"),
         ];
         TABLE
             .iter()

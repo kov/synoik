@@ -76,23 +76,35 @@ impl FlashSpot {
         let Some((area, alpha)) = self.alpha(now) else {
             return;
         };
-
-        // The area is global; this output draws the part of it that lands on this output.
-        let size = crate::utils::output_size(output);
-        let output_geo = Rectangle::new(output_loc, (size.w as i32, size.h as i32).into());
-        let Some(visible) = area.intersection(output_geo) else {
-            return;
-        };
-        let local = Rectangle::new(visible.loc - output_loc, visible.size);
-
-        let buffer = SolidColorBuffer::new(local.size.to_f64(), COLOR);
-        push(SolidColorRenderElement::from_buffer(
-            &buffer,
-            local.loc.to_f64(),
-            alpha,
-            Kind::Unspecified,
-        ));
+        push_overlay(output, output_loc, Some(area), COLOR, alpha, push);
     }
+}
+
+/// Push a flat `color` overlay at `alpha` over the part of the global `area` that lands on
+/// `output` — or over the whole output when `area` is `None`. The flash primitive both the
+/// screenshot flash and the visual bell draw with.
+pub fn push_overlay(
+    output: &Output,
+    output_loc: Point<i32, Logical>,
+    area: Option<Rectangle<i32, Logical>>,
+    color: [f32; 4],
+    alpha: f32,
+    push: &mut dyn FnMut(SolidColorRenderElement),
+) {
+    let size = crate::utils::output_size(output);
+    let output_geo = Rectangle::new(output_loc, (size.w as i32, size.h as i32).into());
+    let Some(visible) = area.map_or(Some(output_geo), |area| area.intersection(output_geo)) else {
+        return;
+    };
+    let local = Rectangle::new(visible.loc - output_loc, visible.size);
+
+    let buffer = SolidColorBuffer::new(local.size.to_f64(), color);
+    push(SolidColorRenderElement::from_buffer(
+        &buffer,
+        local.loc.to_f64(),
+        alpha,
+        Kind::Unspecified,
+    ));
 }
 
 #[cfg(test)]

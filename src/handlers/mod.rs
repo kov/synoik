@@ -69,6 +69,7 @@ use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
+use smithay::wayland::xdg_system_bell::XdgSystemBellHandler;
 use smithay::{
     delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
     delegate_drm_lease, delegate_drm_syncobj, delegate_ext_data_control, delegate_fractional_scale,
@@ -78,6 +79,7 @@ use smithay::{
     delegate_relative_pointer, delegate_seat, delegate_security_context, delegate_session_lock,
     delegate_single_pixel_buffer, delegate_tablet_manager, delegate_text_input_manager,
     delegate_viewporter, delegate_virtual_keyboard_manager, delegate_xdg_activation,
+    delegate_xdg_system_bell,
 };
 pub use xdg_shell::place_popup;
 
@@ -617,6 +619,13 @@ impl IdleInhibitHandler for State {
     }
 }
 delegate_idle_inhibit!(State);
+
+impl XdgSystemBellHandler for State {
+    fn ring(&mut self, surface: Option<WlSurface>) {
+        self.ring_bell(surface.as_ref());
+    }
+}
+delegate_xdg_system_bell!(State);
 
 impl ForeignToplevelHandler for State {
     fn foreign_toplevel_manager_state(&mut self) -> &mut ForeignToplevelManagerState {

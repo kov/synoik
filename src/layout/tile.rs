@@ -69,6 +69,9 @@ pub struct Tile<W: LayoutElement> {
     /// The black backdrop for fullscreen windows.
     fullscreen_backdrop: SolidColorBuffer,
 
+    /// The visual bell's black overlay, sized to the window geometry (`compositor.c:1407-1438`).
+    bell_flash_overlay: SolidColorBuffer,
+
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
 
@@ -379,6 +382,7 @@ impl<W: LayoutElement> Tile<W> {
             sizing_mode,
             tiled_edges,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
+            bell_flash_overlay: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
@@ -642,7 +646,14 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
+        self.are_transitions_ongoing()
+            || self.window.rules().baba_is_float == Some(true)
+            || self.bell_flash_alpha().is_some()
+    }
+
+    /// The visual bell overlay's alpha now, while a flash runs over this window.
+    fn bell_flash_alpha(&self) -> Option<f32> {
+        self.window.bell_flash()?.alpha(self.clock.now_unadjusted())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -749,6 +760,7 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         self.fullscreen_backdrop.resize(animated_tile_size);
+        self.bell_flash_overlay.resize(self.window_size());
     }
 
     pub fn scale(&self) -> f64 {
@@ -1360,6 +1372,21 @@ impl<W: LayoutElement> Tile<W> {
             .render_popups(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
                 push(elem.into())
             });
+
+        // The bell flash is a child of the window actor, over the window's own content but
+        // under its popups, which are windows of their own in mutter. Square and sized to the
+        // window geometry, not clipped to its corners (`compositor.c:1418-1424`).
+        if let Some(alpha) = self.bell_flash_alpha() {
+            push(
+                SolidColorRenderElement::from_buffer(
+                    &self.bell_flash_overlay,
+                    window_render_loc,
+                    alpha,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
 
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;

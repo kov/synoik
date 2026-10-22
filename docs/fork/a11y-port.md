@@ -1,7 +1,7 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 done (the toggle surface); A2's Large Text half done. Everything else it toggles
-is unbuilt.**
+**Status: A1 done (the toggle surface); A2's Large Text half and A6's visual bell done.
+Everything else it toggles is unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
@@ -77,10 +77,21 @@ This is a self-contained input-path slice against our own seat handling.
 shell-side OSK with layouts, suggestions and input-method integration. Already on the roadmap
 independently (STRATEGY §6 Phase 3, "OSK"); the a11y row is just another way to enable it.
 
-### A6 — Visual bell (the Visual Alerts row)
-`org.gnome.desktop.wm.preferences visual-bell` + `visual-bell-type`, handled in mutter's
-`src/core/bell.c:208-250` (flash the focused frame or the whole screen, with rate limiting).
-Small, and a good candidate to pair with A4.
+### A6 — Visual bell (the Visual Alerts row) ✅ visual half
+`src/bell.rs`, a port of mutter's `src/core/bell.c` and the flashes it asks for
+(`compositor.c:1350-1438`). We serve `xdg_system_bell_v1`. With `visual-bell` on, a bell flashes
+the whole screen, or under `visual-bell-type = frame-flash` the ringing window (the whole screen
+when the bell names no window). Rate limit: 500 ms between flashes, and a double flash after 3 s
+of quiet.
+
+**Divergence:** mutter's double flash ends at peak darkness and snaps off (Clutter's
+`repeat_count = 2` is three passes); ours runs both flashes to the end.
+
+Left out:
+- **The audible bell** (`audible-bell`, the theme's `bell-window-system` sound). It needs a
+  sound-theme player, and we have none.
+- **`gtk_shell1.system_bell`.** GTK3 rings through it; we don't serve `gtk_shell1`.
+- **The keyboard-a11y bell** (`meta-seat-native.c:350`). It arrives with A4.
 
 ### A7 — The a11y D-Bus surface + dwell click
 - mutter exports `org.freedesktop.a11y.KeyboardMonitor` and a `PointerLocator`
@@ -114,7 +125,7 @@ whether we need to do the launching ourselves.
 ## Suggested order
 
 1. **A2** — High Contrast, the half that makes its shipped switch honest.
-2. **A4 + A6** — self-contained compositor/input work, no new protocol surface.
+2. **A4** — self-contained input work, no new protocol surface.
 3. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
 4. **A3**, **A5**, **A7**, **A9** — each independently schedulable.

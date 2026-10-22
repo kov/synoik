@@ -119,6 +119,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_foreign::XdgForeignState;
+use smithay::wayland::xdg_system_bell::XdgSystemBellState;
 use synoik_config::debug::PreviewRender;
 use synoik_config::output::MaxBpc;
 use synoik_config::{
@@ -665,6 +666,7 @@ pub struct Synoik {
     pub security_context_state: SecurityContextState,
     pub gamma_control_manager_state: GammaControlManagerState,
     pub activation_state: XdgActivationState,
+    pub xdg_system_bell_state: XdgSystemBellState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
     pub session_manager_state: SessionManagerState,
     /// Armed by [`State::schedule_session_save`]; `None` means no write is pending.
@@ -1190,6 +1192,10 @@ pub struct Synoik {
 
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
+    /// The visual bell's rate limiter, global across windows (`bell.c:117-143`).
+    pub visual_bell: crate::bell::VisualBell,
+    /// The visual bell's fullscreen flash, while it runs.
+    pub bell_flash: Option<crate::bell::BellFlash>,
     /// The hot corner's ripple.
     pub ripples: crate::ui::ripples::Ripples,
     /// The dash as a bottom-edge dock (a divergence — see [`crate::ui::dock`]).
@@ -6571,6 +6577,39 @@ impl State {
         }
     }
 
+    /// A client rang the bell — `meta_bell_notify` (`bell.c:185-196`), visual half: with Visual
+    /// Alerts on, flash the screen, or under `frame-flash` the window `surface` belongs to. A
+    /// surface that is no window (or none at all) flashes the screen, as mutter's
+    /// `bell_flash_frame` does for a NULL window. The audible half needs a sound-theme player we
+    /// do not have.
+    pub fn ring_bell(&mut self, surface: Option<&WlSurface>) {
+        if !self
+            .synoik
+            .gnome_settings
+            .a11y
+            .get(crate::gnome::A11yToggle::VisualAlerts)
+        {
+            return;
+        }
+        let now = self.synoik.clock.now_unadjusted();
+        let Some(n_flashes) = self.synoik.visual_bell.ring(now) else {
+            return;
+        };
+        let flash = crate::bell::BellFlash::new(now, n_flashes);
+        self.synoik.queue_redraw_all();
+
+        if self.synoik.gnome_settings.visual_bell_type == crate::bell::VisualBellType::FrameFlash {
+            if let Some(surface) = surface {
+                let root = self.synoik.find_root_shell_surface(surface);
+                if let Some((mapped, _)) = self.synoik.layout.find_window_and_output_mut(&root) {
+                    mapped.set_bell_flash(flash);
+                    return;
+                }
+            }
+        }
+        self.synoik.bell_flash = Some(flash);
+    }
+
     /// The login dialog's accessibility button (`A11yMenuButton`, `loginDialog.js:455`): its menu,
     /// above it, on `output`.
     fn toggle_login_a11y_menu(&mut self, output: Output) {
@@ -8675,6 +8714,7 @@ impl Synoik {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
         let activation_state = XdgActivationState::new::<State>(&display_handle);
+        let xdg_system_bell_state = XdgSystemBellState::new::<State>(&display_handle);
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         // Starts empty and in memory; `State::new` loads the real file, except in tests.
@@ -9032,6 +9072,7 @@ impl Synoik {
             security_context_state,
             gamma_control_manager_state,
             activation_state,
+            xdg_system_bell_state,
             mutter_x11_interop_state,
             session_manager_state,
             session_save_timer: None,
@@ -9094,6 +9135,8 @@ impl Synoik {
             select_area_reply: None,
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
+            visual_bell: crate::bell::VisualBell::new(),
+            bell_flash: None,
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
@@ -11921,6 +11964,11 @@ impl Synoik {
             AnimCauses::FLASHSPOT,
             self.flashspot.is_animating(now_unadjusted),
         );
+        causes.set(
+            AnimCauses::BELL,
+            self.bell_flash
+                .is_some_and(|flash| flash.is_animating(now_unadjusted)),
+        );
         // Same for the hot-corner ripple: the overview toggle it accompanies settles well
         // before the last wave has finished expanding.
         causes.set(
@@ -12100,6 +12148,13 @@ impl Synoik {
         self.polkit_ui.advance_animations();
         self.network_secret_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
+        let now_unadjusted = self.clock.now_unadjusted();
+        if self
+            .bell_flash
+            .is_some_and(|flash| !flash.is_animating(now_unadjusted))
+        {
+            self.bell_flash = None;
+        }
         self.ripples.advance(self.clock.now_unadjusted());
         // A drag out of the dock holds it open until the drop, wherever the pointer goes.
         // Derived from the drag itself rather than hooked into each of the five paths that end
@@ -12632,6 +12687,22 @@ impl Synoik {
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+        }
+
+        // Next, the visual bell's fullscreen flash: a stage child added last, over all of the
+        // shell (`meta_compositor_flash_display`, `compositor.c:1361-1395`).
+        if let Some(alpha) = self
+            .bell_flash
+            .and_then(|flash| flash.alpha(self.clock.now_unadjusted()))
+        {
+            crate::ui::flashspot::push_overlay(
+                output,
+                output.current_location(),
+                None,
+                [0., 0., 0., 1.],
+                alpha,
+                &mut |elem| push(elem.into()),
+            );
         }
 
         // Next, the screenshot flash: over everything the capture could have contained.
