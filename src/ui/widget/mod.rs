@@ -3948,6 +3948,26 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// One of a `PageIndicators` row's dots, `size` across when it is the current page, centred
+    /// on `center`. `progress` is how current it is, 0 to 1 — the row interpolates while a page
+    /// is dragged between two (`PageIndicators._updateIndicator`): two thirds the size and half
+    /// the opacity at rest, full at 1.
+    pub fn page_dot(
+        &mut self,
+        center: Point<f64, Logical>,
+        size: f64,
+        progress: f64,
+    ) -> anyhow::Result<()> {
+        const INACTIVE_SCALE: f64 = 2. / 3.;
+        const INACTIVE_OPACITY: f64 = 128. / 255.;
+        let progress = progress.clamp(0., 1.);
+        let r = size / 2. * (INACTIVE_SCALE + (1. - INACTIVE_SCALE) * progress);
+        let alpha = INACTIVE_OPACITY + (1. - INACTIVE_OPACITY) * progress;
+        let color = [style::TEXT[0], style::TEXT[1], style::TEXT[2], alpha as f32];
+        let disc = Rectangle::new(center - Point::from((r, r)), Size::from((2. * r, 2. * r)));
+        self.fill_rounded(disc, r, color)
+    }
+
     /// A `BoxPointer` pointing down (`St.Side.BOTTOM`): a rounded box with a 1px `border`, and an
     /// arrow `base` wide and `rise` tall hanging from its bottom edge, centred on `arrow_x`, its
     /// outline opening into the box's (`boxpointer.js` `_drawBorder`). The bake must reach `rise`
@@ -4500,7 +4520,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             shadow.loc.y += 1.;
             self.fill_rounded(shadow, radius, style::KEY_CAP_SHADOW)?;
         }
-        let bg = if k.latched && k.default_key {
+        // `.default-key:latched` and `.emoji-panel .keyboard-key:latched`: only default keys
+        // latch on the letters, and the emoji page's section keys do.
+        let bg = if k.latched {
             accent
         } else {
             style::key_cap_bg(k.default_key, k.hovered, k.active)

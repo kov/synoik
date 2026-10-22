@@ -25,6 +25,7 @@
 //!
 //! The model lives here; drawing and hit-testing are [`crate::ui::osk`].
 
+pub mod emoji;
 pub mod layout;
 
 use std::collections::BTreeSet;
@@ -119,6 +120,83 @@ pub struct Subkeys {
     captured_press: bool,
 }
 
+/// `EMOJI_PAGE_SEPARATION`: the gap between a page and the one sliding in beside it.
+pub const EMOJI_PAGE_SEPARATION: f64 = 32.;
+
+/// The emoji page while it is up (`_emojiActive`).
+#[derive(Debug)]
+struct EmojiPage {
+    pages: Vec<emoji::Page>,
+    /// The letter level whose ratio the page takes.
+    base: Level,
+    cols: u32,
+    rows: u32,
+    current: usize,
+    level: Level,
+    /// The pager's `delta`, in logical px: negative while the next page comes in from the right.
+    delta: f64,
+    /// Easing `delta` at the end of a swipe, and whether the page then turns to the following one.
+    slide: Option<(Animation, bool)>,
+    swipe: Option<EmojiSwipe>,
+}
+
+/// A press on the pager that may turn into a swipe (`SwipeTracker` with `allowDrag`).
+#[derive(Debug)]
+struct EmojiSwipe {
+    by: Presser,
+    start: Point<f64, Logical>,
+    /// The pager's width, one page of progress.
+    width: f64,
+    /// Past `DRAG_THRESHOLD_DISTANCE`, sideways.
+    begun: bool,
+    last_x: f64,
+    tracker: crate::input::swipe_tracker::SwipeTracker,
+}
+
+/// `DRAG_THRESHOLD_DISTANCE` (`swipeTracker.js:28`).
+const DRAG_THRESHOLD: f64 = 16.;
+
+impl EmojiPage {
+    fn new(base: Level) -> Self {
+        // `setRatio(Math.floor(nCols), Math.floor(nRows) - 1)`.
+        let cols = (base.cols.floor() as u32).max(1);
+        let rows = base.rows.saturating_sub(1).max(1);
+        let pages = emoji::pages((cols * rows) as usize);
+        let level = emoji::page_level(&base, cols, rows, &pages[0]);
+        Self {
+            pages,
+            base,
+            cols,
+            rows,
+            current: 0,
+            level,
+            delta: 0.,
+            slide: None,
+            swipe: None,
+        }
+    }
+
+    /// `setCurrentPage`.
+    fn set_current_page(&mut self, page: usize) {
+        self.current = page % self.pages.len();
+        self.delta = 0.;
+        self.slide = None;
+        self.level = emoji::page_level(&self.base, self.cols, self.rows, &self.pages[self.current]);
+    }
+
+    /// `getFollowingPage`: the page the swipe is bringing in, if it is moving.
+    fn following_page(&self) -> Option<usize> {
+        let n = self.pages.len();
+        if self.delta < 0. {
+            Some((self.current + 1) % n)
+        } else if self.delta > 0. {
+            Some((self.current + n - 1) % n)
+        } else {
+            None
+        }
+    }
+}
+
 /// `_focusWindow`: the window slid out of the keyboard's way, and how far it went — the work-area
 /// clamp can stop it short of the keyboard's height, and it has to come back by exactly as much.
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +239,7 @@ pub struct Osk {
     /// `_deleteEnabled` / `_backspacePressed`.
     delete_held: bool,
     subkeys: Option<Subkeys>,
+    emoji: Option<EmojiPage>,
     focus_window: Option<FocusWindow>,
     /// The `FocusTracker`'s current window and where it sat, to see it move (`window-moved`).
     watched: Option<(Window, Option<Point<f64, Logical>>)>,
@@ -192,6 +271,7 @@ impl Default for Osk {
             long_pressed: false,
             delete_held: false,
             subkeys: None,
+            emoji: None,
             focus_window: None,
             watched: None,
             revision: 0,
@@ -220,7 +300,7 @@ impl Osk {
     }
 
     pub fn is_animating(&self) -> bool {
-        self.progress.as_ref().is_some_and(|a| !a.is_done())
+        self.progress.as_ref().is_some_and(|a| !a.is_done()) || self.emoji_is_animating()
     }
 
     pub fn revision(&self) -> u64 {
@@ -228,6 +308,9 @@ impl Osk {
     }
 
     pub fn level(&self) -> Option<&Level> {
+        if let Some(emoji) = &self.emoji {
+            return Some(&emoji.level);
+        }
         let layout = self.layout.as_ref()?;
         layout.level(&self.page).or_else(|| layout.levels.first())
     }
@@ -252,6 +335,192 @@ impl Osk {
         self.subkeys.as_ref()
     }
 
+    pub fn emoji_active(&self) -> bool {
+        self.emoji.is_some()
+    }
+
+    /// The emoji page's swipe, for drawing: its offset, and the page coming in with the level it
+    /// shows.
+    pub fn emoji_slide(&self) -> Option<(f64, Option<Level>)> {
+        let emoji = self.emoji.as_ref()?;
+        let following = emoji
+            .following_page()
+            .map(|page| emoji::page_level(&emoji.base, emoji.cols, emoji.rows, &emoji.pages[page]));
+        Some((emoji.delta, following))
+    }
+
+    /// The page dots: how many pages the shown section has, and where between them the pager is
+    /// (`_updateIndicatorPosition`), given the pager's width.
+    pub fn emoji_indicators(&self, width: f64) -> Option<(usize, f64)> {
+        let emoji = self.emoji.as_ref()?;
+        let page = &emoji.pages[emoji.current];
+        let width = width.max(1.);
+        Some((page.n_pages, page.page as f64 - emoji.delta / width))
+    }
+
+    /// The section the shown page is in — its key is latched (`_onPageChanged`).
+    pub fn emoji_section(&self) -> Option<usize> {
+        let emoji = self.emoji.as_ref()?;
+        Some(emoji.pages[emoji.current].section)
+    }
+
+    /// `_setEmojiActive`. Showing it starts on the first page (`vfunc_map` → `setCurrentPage(0)`).
+    fn set_emoji_active(&mut self, active: bool) {
+        self.cancel_press();
+        self.hovered = None;
+        self.subkeys = None;
+        self.emoji = if active {
+            let base = self.layout.as_ref().and_then(|layout| {
+                layout
+                    .level(&self.page)
+                    .or_else(|| layout.levels.first())
+                    .cloned()
+            });
+            base.map(EmojiPage::new)
+        } else {
+            None
+        };
+        self.bump();
+    }
+
+    /// `setCurrentSection(section, 0)`.
+    fn set_emoji_section(&mut self, section: usize) {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return;
+        };
+        if let Some(page) = emoji
+            .pages
+            .iter()
+            .position(|p| p.section == section && p.page == 0)
+        {
+            if page != emoji.current {
+                emoji.set_current_page(page);
+                self.subkeys = None;
+            }
+        }
+        self.bump();
+    }
+
+    /// A press on the emoji pager, `width` wide: it may become a swipe.
+    pub fn emoji_swipe_begin(&mut self, by: Presser, pos: Point<f64, Logical>, width: f64) {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return;
+        };
+        if emoji.swipe.is_some() {
+            return;
+        }
+        emoji.swipe = Some(EmojiSwipe {
+            by,
+            start: pos,
+            width: width.max(1.),
+            begun: false,
+            last_x: pos.x,
+            tracker: crate::input::swipe_tracker::SwipeTracker::new(),
+        });
+    }
+
+    /// The presser moved. Returns whether the swipe has it.
+    pub fn emoji_swipe_motion(
+        &mut self,
+        by: Presser,
+        pos: Point<f64, Logical>,
+        time: Duration,
+    ) -> bool {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return false;
+        };
+        let Some(swipe) = emoji.swipe.as_mut().filter(|s| s.by == by) else {
+            return false;
+        };
+        if !swipe.begun {
+            let d = pos - swipe.start;
+            if d.x.hypot(d.y) < DRAG_THRESHOLD {
+                return false;
+            }
+            if d.x.abs() <= d.y.abs() {
+                // A vertical drag is not this tracker's.
+                emoji.swipe = None;
+                return false;
+            }
+            swipe.begun = true;
+            emoji.slide = None;
+        }
+        // Progress runs against the drag: dragging left brings the next page in.
+        swipe.tracker.push(-(pos.x - swipe.last_x), time);
+        swipe.last_x = pos.x;
+        let width = swipe.width;
+        let delta = (pos.x - swipe.start.x).clamp(-width, width);
+        emoji.delta = delta;
+        // `_onSwipeUpdate`: the key under the drag lets go without acting.
+        self.cancel_press();
+        self.bump();
+        true
+    }
+
+    /// The presser let go. Returns whether the swipe had it; then the page settles, eased on
+    /// `clock` (`_onSwipeEnd`).
+    pub fn emoji_swipe_end(&mut self, by: Presser, time: Duration, clock: &Clock) -> bool {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return false;
+        };
+        if !emoji.swipe.as_ref().is_some_and(|s| s.by == by) {
+            return false;
+        }
+        let mut swipe = emoji.swipe.take().unwrap();
+        if !swipe.begun {
+            return false;
+        }
+        swipe.tracker.release(time);
+        let width = swipe.width;
+        let progress = -emoji.delta / width;
+        let velocity = swipe.tracker.velocity() / 1000.;
+        let end =
+            crate::input::swipe_tracker::end_progress(0., progress, (-1., 1.), velocity, false);
+        // `|Δprogress| / velocity * DURATION_MULTIPLIER`, clamped to
+        // `[MIN_ANIMATION_DURATION, MAX_ANIMATION_DURATION * log2(1 + nPoints)]`.
+        let per_ms = (velocity / width).abs();
+        let max = 400. * 4f64.log2();
+        let ms = if per_ms == 0. {
+            max
+        } else {
+            ((progress - end).abs() / per_ms * 3.).clamp(100., max)
+        };
+        let target = if end == 0. {
+            0.
+        } else if end < 0. {
+            width + EMOJI_PAGE_SEPARATION
+        } else {
+            -width - EMOJI_PAGE_SEPARATION
+        };
+        emoji.slide = Some((
+            Animation::ease(
+                clock.clone(),
+                emoji.delta,
+                target,
+                0.,
+                ms.round() as u64,
+                Curve::EaseOutCubic,
+            ),
+            end != 0.,
+        ));
+        self.bump();
+        true
+    }
+
+    /// Who holds the emoji pager, if anyone.
+    pub fn emoji_swipe_presser(&self) -> Option<Presser> {
+        self.emoji.as_ref()?.swipe.as_ref().map(|s| s.by)
+    }
+
+    /// Whether a presser is the keyboard's: on a key, or on the pager.
+    pub fn holds(&self, by: Presser) -> bool {
+        self.pressed.is_some_and(|p| p.by == by) || self.emoji_swipe_presser() == Some(by)
+    }
+
+    pub fn emoji_is_animating(&self) -> bool {
+        self.emoji.as_ref().is_some_and(|e| e.slide.is_some())
+    }
+
     fn key(&self, index: usize) -> Option<&Key> {
         self.level()?.keys.get(index)
     }
@@ -269,6 +538,10 @@ impl Osk {
         self.hovered = None;
         self.subkeys = None;
         self.set_active_level("default");
+        // The page takes the new layout's ratio.
+        if self.emoji.is_some() {
+            self.set_emoji_active(true);
+        }
         self.bump();
     }
 
@@ -355,6 +628,9 @@ impl Osk {
             let index = self.pressed.take().map(|p| p.key);
             // `keyButton.set_hover(false)`.
             self.hovered = None;
+            if let Some(emoji) = self.emoji.as_mut() {
+                emoji.swipe = None;
+            }
             self.subkeys = index.map(|key_index| Subkeys {
                 key: key_index,
                 strings: key.extended.clone(),
@@ -464,12 +740,17 @@ impl Osk {
                     }
                 }
                 Action::LanguageMenu => effects.push(Effect::LanguageMenu(press.key)),
-                // The emoji page is not ported yet.
-                Action::Emoji => {}
+                // The letters' emoji key and the page's ABC key (`_toggleEmoji`).
+                Action::Emoji => self.set_emoji_active(self.emoji.is_none()),
+                Action::EmojiSection(section) => self.set_emoji_section(*section),
             },
             (None, Some(keyval), _) => {
                 effects.push(Effect::Keyval(keyval));
                 self.update_level_from_hints(true);
+            }
+            // An emoji goes in as it is (`emoji-selected` → `commit(emoji)`).
+            (None, None, Some(commit)) if key.flat => {
+                effects.push(Effect::Commit(commit.clone(), Vec::new()));
             }
             (None, None, Some(commit)) => {
                 effects.push(Effect::Commit(
@@ -520,6 +801,21 @@ impl Osk {
     pub fn advance(&mut self) {
         if self.progress.as_ref().is_some_and(Animation::is_done) {
             self.progress = None;
+        }
+        if let Some(emoji) = self.emoji.as_mut() {
+            if let Some((anim, turn)) = &emoji.slide {
+                emoji.delta = anim.value();
+                if anim.is_done() {
+                    let turn = *turn;
+                    emoji.slide = None;
+                    match emoji.following_page() {
+                        Some(page) if turn => emoji.set_current_page(page),
+                        _ => emoji.delta = 0.,
+                    }
+                    self.subkeys = None;
+                }
+                self.bump();
+            }
         }
     }
 }
@@ -770,6 +1066,8 @@ impl State {
         }
         osk.visible = true;
         osk.animate_to(&clock, 1., Curve::EaseOutQuad);
+        // `_open` → `_setEmojiActive(false)`.
+        osk.set_emoji_active(false);
         osk.bump();
         self.osk_animate_window(true);
         self.synoik.queue_redraw_all();
@@ -937,8 +1235,15 @@ impl State {
         self.osk_close(true);
     }
 
-    /// The pointer moved: light the key under it (`track_hover`).
+    /// The pointer moved: light the key under it (`track_hover`), or drag the emoji pager.
     pub fn osk_pointer_motion(&mut self, pos: Point<f64, Logical>) {
+        if let Some(by @ Presser::Button(_)) = self.synoik.osk.emoji_swipe_presser() {
+            let now = self.synoik.clock.now();
+            if self.synoik.osk.emoji_swipe_motion(by, pos, now) {
+                self.synoik.queue_redraw_all();
+                return;
+            }
+        }
         if self.synoik.osk.subkeys.is_some() {
             let hovered = self.synoik.osk_subkey_hit(pos);
             if self.synoik.osk.set_subkey_hovered(hovered) {
@@ -980,10 +1285,20 @@ impl State {
             if let Some(key) = hit {
                 self.osk_press(key, Presser::Button(button));
             }
+            self.osk_emoji_swipe_begin(Presser::Button(button), pos);
             // A press on the keyboard's background is taken all the same.
             self.synoik.suppressed_buttons.insert(button);
             true
         } else {
+            let clock = self.synoik.clock.clone();
+            if self
+                .synoik
+                .osk
+                .emoji_swipe_end(Presser::Button(button), clock.now(), &clock)
+            {
+                self.synoik.queue_redraw_all();
+                return false;
+            }
             let held = self
                 .synoik
                 .osk
@@ -1010,11 +1325,41 @@ impl State {
         if let Some(key) = hit {
             self.osk_press(key, Presser::Touch(slot));
         }
+        self.osk_emoji_swipe_begin(Presser::Touch(slot), pos);
         true
+    }
+
+    /// A touch point moved. Returns whether it is the keyboard's.
+    pub fn osk_touch_motion(&mut self, slot: i32, pos: Point<f64, Logical>) -> bool {
+        let by = Presser::Touch(slot);
+        let now = self.synoik.clock.now();
+        if self.synoik.osk.emoji_swipe_motion(by, pos, now) {
+            self.synoik.queue_redraw_all();
+            return true;
+        }
+        self.synoik.osk.holds(by)
+    }
+
+    /// A press on the emoji pager may be the start of a swipe.
+    fn osk_emoji_swipe_begin(&mut self, by: Presser, pos: Point<f64, Logical>) {
+        if let Some(pager) = self.synoik.osk_emoji_pager() {
+            if pager.contains(pos) {
+                self.synoik.osk.emoji_swipe_begin(by, pos, pager.size.w);
+            }
+        }
     }
 
     /// A touch point went up. Returns whether it was the keyboard's.
     pub fn osk_touch_up(&mut self, slot: i32) -> bool {
+        let clock = self.synoik.clock.clone();
+        if self
+            .synoik
+            .osk
+            .emoji_swipe_end(Presser::Touch(slot), clock.now(), &clock)
+        {
+            self.synoik.queue_redraw_all();
+            return true;
+        }
         if self.synoik.osk.subkeys.is_some() {
             let effects = self.synoik.osk.subkeys_release(Presser::Touch(slot));
             self.osk_apply(effects);
@@ -1216,6 +1561,18 @@ impl Synoik {
     /// at all while a key's popup is up (its stage-wide `captured-event`).
     pub fn osk_contains(&self, pos: Point<f64, Logical>) -> bool {
         self.osk.subkeys.is_some() || self.osk_hit(pos).is_some()
+    }
+
+    /// The emoji pager, global, while the emoji page is up.
+    pub fn osk_emoji_pager(&self) -> Option<Rectangle<f64, Logical>> {
+        let output = self.osk_output()?;
+        let rect = self.osk_rect(&output)?;
+        let level = self.osk.level()?;
+        let geometry = crate::ui::osk::emoji_geometry(rect.size, level)?;
+        Some(Rectangle::new(
+            rect.loc + geometry.pager.loc,
+            geometry.pager.size,
+        ))
     }
 
     /// The popup's geometry, global, if one is up.

@@ -45791,3 +45791,108 @@ fn osk_language_key_lists_the_input_sources() {
     run_for(&mut f, Duration::from_millis(100));
     assert!(!f.synoik().panel_popover.grabs_input());
 }
+
+/// The emoji key turns the keyboard into its emoji page (`_toggleEmoji`): the smileys' first page
+/// with their section key latched, an emoji going in through the input method as it is, a long
+/// press offering the skin tones, a sideways drag turning the page, the section keys jumping, and
+/// ABC going back. The keyboard comes back up on its letters (`_open`).
+#[test]
+fn osk_emoji_page() {
+    use super::client::TextInputEvent as Ti;
+    use crate::osk::layout::{Action, Face};
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let emoji_key = osk_key_center(&mut f, |k| k.action == Some(Action::Emoji));
+    osk_click(&mut f, emoji_key);
+    assert!(f.synoik().osk.emoji_active());
+    assert_eq!(f.synoik().osk.emoji_section(), Some(0));
+    assert_eq!(
+        f.synoik().osk.emoji_indicators(100.).map(|(_, p)| p),
+        Some(0.)
+    );
+
+    // A tap commits the emoji, with no modifiers and no key presses.
+    let _ = f.client(id).text_input_events();
+    let grinning = osk_key_center(&mut f, |k| k.face == Face::Emoji("😀".into()));
+    osk_click(&mut f, grinning);
+    f.double_roundtrip(id);
+    assert!(f
+        .client(id)
+        .text_input_events()
+        .contains(&Ti::CommitString(Some("😀".into()))));
+    assert!(f.synoik().osk.emoji_active(), "the page stays up");
+
+    // The people's section: its first emoji takes skin tones.
+    let people = osk_key_center(&mut f, |k| k.action == Some(Action::EmojiSection(1)));
+    osk_click(&mut f, people);
+    assert_eq!(f.synoik().osk.emoji_section(), Some(1));
+    let selfie = osk_key_center(&mut f, |k| k.face == Face::Emoji("🤳".into()));
+    pointer_motion_to(&mut f, selfie.0, selfie.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    let geometry = f.synoik().osk_subkeys_geometry().expect("the tones are up");
+    assert_eq!(geometry.keys.len(), 6);
+    let dark = geometry.keys[5];
+    osk_click(
+        &mut f,
+        (dark.loc.x + dark.size.w / 2., dark.loc.y + dark.size.h / 2.),
+    );
+    f.double_roundtrip(id);
+    assert!(f
+        .client(id)
+        .text_input_events()
+        .contains(&Ti::CommitString(Some("🤳🏿".into()))));
+
+    // Back to the smileys, and drag the page leftwards: the next one comes in, and the press
+    // the drag started with types nothing.
+    let smileys = osk_key_center(&mut f, |k| k.action == Some(Action::EmojiSection(0)));
+    osk_click(&mut f, smileys);
+    let pager = f.synoik().osk_emoji_pager().unwrap();
+    let y = pager.loc.y + pager.size.h / 2.;
+    let x0 = pager.loc.x + pager.size.w * 0.8;
+    pointer_motion_to(&mut f, x0, y);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    for step in 1..=12 {
+        run_for(&mut f, Duration::from_millis(16));
+        pointer_motion_to(&mut f, x0 - pager.size.w * 0.05 * f64::from(step), y);
+    }
+    run_for(&mut f, Duration::from_millis(200));
+    f.pointer_button(LEFT, ButtonState::Released);
+    run_for(&mut f, Duration::from_millis(900));
+    assert_eq!(
+        f.synoik()
+            .osk
+            .emoji_indicators(pager.size.w)
+            .map(|(_, p)| p),
+        Some(1.)
+    );
+    assert_eq!(f.synoik().osk.emoji_section(), Some(0));
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+
+    // ABC is the letters again.
+    let abc = osk_key_center(&mut f, |k| k.face == Face::Label("ABC".into()));
+    osk_click(&mut f, abc);
+    assert!(!f.synoik().osk.emoji_active());
+
+    // Hidden from the emoji page, it comes back on its letters.
+    osk_click(&mut f, emoji_key);
+    assert!(f.synoik().osk.emoji_active());
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(400));
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert!(!f.synoik().osk.emoji_active());
+}

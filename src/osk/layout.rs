@@ -69,6 +69,8 @@ pub enum Action {
     Delete,
     /// Switch to the named level.
     LevelSwitch(String),
+    /// The emoji page's section key: its first page.
+    EmojiSection(usize),
 }
 
 /// What a key shows: an icon wins over a label, a label over the string it commits
@@ -77,6 +79,8 @@ pub enum Action {
 pub enum Face {
     Icon(String),
     Label(String),
+    /// An emoji, drawn in colour.
+    Emoji(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +100,8 @@ pub struct Key {
     pub row: u32,
     pub width: f64,
     pub height: f64,
+    /// `.emoji-page .keyboard-key`: no cap, only the glyph.
+    pub flat: bool,
 }
 
 impl Key {
@@ -124,6 +130,20 @@ pub struct Level {
     /// `KeyContainer.getRatio()`: the widest row in key units, and the row count.
     pub cols: f64,
     pub rows: u32,
+    /// Laid out as the emoji page rather than one key grid.
+    pub pager: Option<Pager>,
+}
+
+/// The emoji page's shape: a grid of `cols` by `rows` emoji over the page dots, the keys in rows
+/// `0..rows`, then one bottom row of `bottom_units` key widths at the level's own ratio
+/// (`EmojiSelection.setRatio`, `keyboard.js:1030-1043`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pager {
+    pub cols: u32,
+    pub rows: u32,
+    /// Whether the page dots show: the section has more than one page.
+    pub indicators: bool,
+    pub bottom_units: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +267,7 @@ fn build_level(level: ModelLevel, emoji_visible: bool) -> Level {
                 row: rows,
                 width,
                 height: key.height.unwrap_or(1.),
+                flat: false,
             });
             col += left_offset + width;
             cols = cols.max(col);
@@ -263,6 +284,7 @@ fn build_level(level: ModelLevel, emoji_visible: bool) -> Level {
         keys,
         cols,
         rows,
+        pager: None,
     }
 }
 

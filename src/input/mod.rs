@@ -11511,6 +11511,10 @@ impl State {
         };
         let slot = evt.slot();
 
+        if self.osk_touch_motion(crate::osk::touch_id(slot), pos) {
+            return;
+        }
+
         if self.handle_screenshot_ui_motion(pos, Some(slot)) {
             self.synoik.queue_redraw_all();
         }

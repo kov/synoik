@@ -144,9 +144,6 @@ const DOT_PAD_SIDE: f64 = 12.;
 const INDICATORS_MARGIN_BOTTOM: f64 = 24.;
 /// The strip reserved below the grid for the dots row.
 const INDICATORS_STRIP_H: f64 = DOT_PAD_TOP + DOT_SIZE + INDICATORS_MARGIN_BOTTOM;
-/// Inactive dots are scaled to 2/3 and half-opacity (`pageIndicators.js:6-9,88-102`).
-const INACTIVE_DOT_SCALE: f64 = 2. / 3.;
-const INACTIVE_DOT_ALPHA: f32 = 0.5;
 
 // Page navigation arrows (`.page-navigation-arrow`, `_app-grid.scss:172-185`): a flat
 // circular button — transparent at rest, [`style::HOVER_WASH`] on hover — holding a
@@ -3086,20 +3083,11 @@ impl AppGrid {
                     let mut p = Painter::new(frame, scale, phys);
                     p.clear(style::TRANSPARENT)?;
                     for (cx, is_active) in rel {
-                        // The active dot is full 10px; the others scale to 2/3 and
-                        // draw at half opacity (`pageIndicators.js`).
-                        let r = if is_active {
-                            DOT_SIZE / 2.
-                        } else {
-                            DOT_SIZE / 2. * INACTIVE_DOT_SCALE
-                        };
-                        let a = if is_active { 1. } else { INACTIVE_DOT_ALPHA };
-                        let color = [style::TEXT[0], style::TEXT[1], style::TEXT[2], a];
-                        let disc = Rectangle::new(
-                            Point::from((cx - r, DOT_SIZE / 2. - r)),
-                            Size::from((2. * r, 2. * r)),
-                        );
-                        p.fill_rounded(disc, r, color)?;
+                        p.page_dot(
+                            Point::from((cx, DOT_SIZE / 2.)),
+                            DOT_SIZE,
+                            if is_active { 1. } else { 0. },
+                        )?;
                     }
                     Ok(())
                 },
