@@ -26,6 +26,7 @@ pub mod login_a11y_menu;
 pub mod login_dialog;
 pub mod login_grid;
 pub mod media_card;
+pub mod message_dialog;
 /// Draws [`crate::network_secret_dialog`].
 pub mod network_secret_dialog;
 pub mod notification_banner;

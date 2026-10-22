@@ -8801,7 +8801,7 @@ impl Synoik {
         let hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key, keybindings);
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
-        let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
+        let end_session_dialog = EndSessionDialog::new(animation_clock.clone());
         let polkit_ui =
             crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
         let network_secret_ui = crate::ui::network_secret_dialog::NetworkSecretDialogUi::new(
