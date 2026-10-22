@@ -1,7 +1,7 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 (the toggle surface), A2, A4, A6, A7 and A9 done; A3 (Zoom), A5 (Screen Keyboard)
-and A8 (our own UI readable by a screen reader) are unbuilt.**
+**Status: A1 (the toggle surface), A2, A3, A4, A6, A7 and A9 done; A5 (Screen Keyboard) and A8
+(our own UI readable by a screen reader) are unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
@@ -24,7 +24,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 | Layer | GNOME | Us |
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
-| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2; ⬜ A3, A5 |
+| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2, A3; ⬜ A5 |
 | Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
@@ -58,14 +58,30 @@ changes. GNOME routes both through `StSettings`:
   (`st-theme-node.c:1350-1373`) — the same set our base drives through `pt_to_px`, `em` and
   `scaled_px`.
 
-### A3 — Magnifier (the Zoom row)
-`org.gnome.desktop.a11y.magnifier` (`js/ui/magnifier.js:25`), `Magnifier`
-(`magnifier.js:131`). Shell-internal in GNOME: a zoom region composited over the stage, with
-mouse/focus/caret tracking, lens vs full-screen modes, crosshairs, brightness/contrast/
-saturation filters and colour-blindness modes (the schema has ~30 keys — `brightness-*`,
-`contrast-*`, `color-saturation`, `caret-tracking`, …). For us it is a render-path feature on
-the owned Vulkan renderer, which makes it cheaper than GNOME's but not small. `StSettings`
-also exposes `magnifier-active` (`st-settings.c:388-392`), which other chrome reads.
+### A3 — Magnifier (the Zoom row) ✅
+`src/magnifier.rs`, a port of `Magnifier` and `ZoomRegion` (`js/ui/magnifier.js`), on from
+`screen-magnifier-enabled` and configured by `org.gnome.desktop.a11y.magnifier`:
+- **The zoom region**: `mag-factor` (a change eased over 100 ms), the five `screen-position`s
+  with the region's 2px accent border off full screen, `lens-mode`, `scroll-at-edges`, and
+  proportional / push / centred `mouse-tracking`. The frame a display would draw is rendered into
+  an offscreen and drawn rescaled and cropped to the view, over `SystemBackground`'s colour.
+- **The pointer** stays where it is, and so do clicks; it is drawn magnified where the zoom puts
+  it, never on a cursor plane (`render_helpers::off_plane`), and the system pointer hides over the
+  view. Under a nested session the pointer goes in the frame on a magnified display.
+- **Crosshairs** and the **colour effects** (`invert-lightness`, `color-saturation`, per-channel
+  `brightness-*` / `contrast-*`) — the effects in one pass of `mag_effects.frag`, in the order
+  Clutter stacks them, over a second offscreen of the region only while one is on.
+- **Focus and caret tracking** (`src/focus_caret_tracker.rs`): an AT-SPI client over plain zbus
+  that registers the focus and caret events with the registry while the zoom wants them and asks
+  the emitting widget for its extents, as `FocusCaretTracker` and `_convertExtentsToScreenSpace`
+  do. GTK4's text view emits no caret move as you type, only on navigation, so typing alone does
+  not move the view — in GNOME either.
+- The shortcuts (`<Alt><Super>8`, `<Alt><Super>equal`/`minus`) are gsd-media-keys', through our
+  accelerator grabs.
+
+**Divergence: one region per display.** GNOME's region magnifies the whole stage as one surface;
+here each display magnifies its own content, the one under the pointer following it and the others
+keeping their last view.
 
 ### A4 — Keyboard filters (Sticky / Slow / Bounce / Mouse Keys) ✅
 `src/input/keyboard_a11y.rs`, a port of mutter's `src/backends/native/meta-keyboard-a11y.c`, fed
@@ -162,7 +178,7 @@ Orca can *read* is A7 and A8.
 
 1. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-2. **A3**, **A5** — each independently schedulable.
+2. **A5** — independently schedulable.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**
