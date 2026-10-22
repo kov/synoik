@@ -343,6 +343,18 @@ impl State {
         if self.synoik.pointer_a11y.settings == settings {
             return;
         }
+        let a11y = &mut self.synoik.pointer_a11y;
+        if settings.enabled() && !a11y.settings.enabled() {
+            // mutter makes its `ClutterPtrA11yData` afresh when either feature comes on
+            // (`clutter-seat.c:408-416`), so nothing seen while both were off — a release whose
+            // press came before they went off — carries over.
+            *a11y = PointerA11y {
+                settings: a11y.settings,
+                click_type: a11y.click_type,
+                pies: std::mem::take(&mut a11y.pies),
+                ..PointerA11y::default()
+            };
+        }
         let a11y = &self.synoik.pointer_a11y;
         if !settings.dwell_click_enabled && a11y.settings.dwell_click_enabled {
             if a11y.dwell_drag_started {
@@ -595,11 +607,14 @@ impl State {
     }
 
     /// `trigger_dwell_gesture`: back to where it rested, then the click the stroke named.
+    ///
+    /// The click goes out last, as mutter's queued one is seen after the clear timer is armed:
+    /// its press then cancels that timer (`stop_dwell_timeout`), so the next rest can start a
+    /// dwell straight away — a gesture drag's release among them.
     fn trigger_dwell_gesture(&mut self) {
         let direction = self.synoik.pointer_a11y.direction();
         let click = self.synoik.pointer_a11y.settings.click_for(direction);
         self.restore_dwell_position();
-        self.emit_dwell_click(click);
         // Not cleared at once, or the next motion would start another.
         let delay = self.synoik.pointer_a11y.settings.dwell_delay;
         let token = self
@@ -612,6 +627,7 @@ impl State {
             });
         self.synoik.pointer_a11y.dwell_timer = Some(token);
         self.timeout_stopped(TimeoutType::Gesture, true);
+        self.emit_dwell_click(click);
     }
 
     fn restore_dwell_position(&mut self) {

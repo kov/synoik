@@ -3434,10 +3434,16 @@ impl Painter<'_, '_, '_> {
     pub fn icon_button(&mut self, b: &IconButton, accent: Rgba) -> anyhow::Result<()> {
         // `border-radius: $forced_circular_radius` on a square box.
         let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
-        self.fill_rounded(b.rect, radius, b.bg)?;
-        // `.icon-button`'s outline; an accent-filled one is `default`-style and has none.
-        if b.bg != accent {
-            self.hc_inset(b.rect, radius)?;
+        // An accent-filled one is `.icon-button.default`: `hc_color_mix`ed and without the
+        // outline. A flat one — filled with the OSD surface it sits on, as the screenshot UI's
+        // are — is `$style: flat`, which has none either (`_drawing.scss:262-275`).
+        if b.bg == accent {
+            self.fill_rounded(b.rect, radius, style::accent_fill(accent))?;
+        } else {
+            self.fill_rounded(b.rect, radius, b.bg)?;
+            if b.bg != style::osd_bg() {
+                self.hc_inset(b.rect, radius)?;
+            }
         }
         if b.active {
             // `:active` lightens 9% where `:hover` lightens 4% (`_drawing.scss:182-183`).

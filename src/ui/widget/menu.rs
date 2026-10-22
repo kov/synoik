@@ -844,8 +844,15 @@ impl Menu {
     /// `(icon names, centre)` per row that has one.
     ///
     /// Icons are *elements*, not paint verbs, composited over the baked card by [`Self::render`].
+    ///
+    /// Only rows whose glyph lies wholly on the card: a scrolled menu clips its rows at the card's
+    /// edge, and an icon is a separate element nothing would clip.
     pub fn ornaments(&self) -> Vec<(Vec<String>, Point<f64, Logical>)> {
-        let width = self.logical_size().w;
+        let Size {
+            w: width,
+            h: height,
+            ..
+        } = self.logical_size();
         let rows = self.visible_rows();
         let scroll = self.scroll();
         let mut out = Vec::new();
@@ -856,6 +863,9 @@ impl Menu {
             };
             let rect = self.row_rect(&rows, k, width, scroll);
             let mid_y = rect.loc.y + rect.size.h / 2.;
+            if mid_y - ICON / 2. < 0. || mid_y + ICON / 2. > height {
+                continue;
+            }
 
             // The leading column: a checkmark if marked, else the row's own icon. A marked row
             // with an icon shows the mark — the state matters more than the decoration.
@@ -964,7 +974,9 @@ impl Menu {
                         p.fill_rounded(rect, ITEM_RADIUS, style::HOVER_WASH)?;
                     }
                     let mut color = style::TEXT;
-                    if !item.enabled {
+                    // `$insensitive_fg_color` is the plain foreground under High Contrast
+                    // (`_high-contrast-colors.scss:55`).
+                    if !item.enabled && !crate::ui::high_contrast() {
                         color[3] *= DISABLED_ALPHA;
                     }
                     p.text(
@@ -1331,6 +1343,26 @@ mod tests {
             MenuItem::new(2, "Mute").with_ornament(Ornament::Check(false)),
         )]);
         assert_eq!(unmarked.leading_inset(), marked.leading_inset());
+    }
+
+    /// A capped menu scrolled part-way: its icons stay on the card, where its rows are clipped.
+    #[test]
+    fn a_scrolled_menu_keeps_its_icons_on_the_card() {
+        let rows = (0..30)
+            .map(|i| MenuEntry::Item(MenuItem::new(i, format!("Row {i}")).with_icon("x-symbolic")))
+            .collect();
+        let mut menu = Menu::new(rows);
+        assert!(menu.set_max_height(Some(200.)));
+        assert!(menu.scroll_by(57.));
+        let height = menu.logical_size().h;
+        let marks = menu.ornaments();
+        assert!(!marks.is_empty());
+        for (_, c) in marks {
+            assert!(
+                c.y - ICON / 2. >= 0. && c.y + ICON / 2. <= height,
+                "an icon at {c:?} hangs off a {height}px card"
+            );
+        }
     }
 
     #[test]

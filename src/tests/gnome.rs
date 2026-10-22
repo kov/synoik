@@ -45150,6 +45150,36 @@ fn a_dwell_gesture_names_its_click() {
     );
     let at = f.synoik().seat.get_pointer().unwrap().current_location();
     assert_eq!((at.x, at.y), (965., 545.), "made back at the spot");
+
+    // The click's own press clears the gesture, so the next rest starts a dwell at once rather
+    // than a dwell's length later — even one that never left the spot.
+    pointer_motion_to(&mut f, 968., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert!(
+        f.synoik().pointer_a11y.gesture_cursor,
+        "the next dwell has run and a gesture is being drawn"
+    );
+}
+
+/// Pointer accessibility starts afresh when it comes on, as mutter makes its state anew: a
+/// press seen before it went off, released while off, leaves no button held behind.
+#[test]
+fn pointer_accessibility_comes_on_afresh() {
+    let (mut f, id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = false;
+    f.synoik_state().sync_pointer_a11y();
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = true;
+    f.synoik_state().sync_pointer_a11y();
+    let _ = client_buttons(&mut f, id);
+
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
 }
 
 /// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
