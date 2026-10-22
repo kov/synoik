@@ -94,6 +94,9 @@ pub struct Mapped {
     /// Whether this has an urgent indicator.
     is_urgent: bool,
 
+    /// The visual bell flash over this window, while it runs.
+    bell_flash: Option<crate::bell::BellFlash>,
+
     /// Whether this window has the keyboard focus.
     is_focused: bool,
 
@@ -314,6 +317,7 @@ impl Mapped {
             needs_frame_callback: false,
             offscreen_data: RefCell::new(None),
             is_urgent: false,
+            bell_flash: None,
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
@@ -705,6 +709,11 @@ impl Mapped {
 
     pub fn is_windowed_fullscreen(&self) -> bool {
         self.is_windowed_fullscreen
+    }
+
+    /// Flash this window for the visual bell, replacing a flash already running.
+    pub fn set_bell_flash(&mut self, flash: crate::bell::BellFlash) {
+        self.bell_flash = Some(flash);
     }
 
     pub fn set_urgent(&mut self, urgent: bool) {
@@ -1140,6 +1149,10 @@ impl LayoutElement for Mapped {
 
     fn is_urgent(&self) -> bool {
         self.is_urgent
+    }
+
+    fn bell_flash(&self) -> Option<crate::bell::BellFlash> {
+        self.bell_flash
     }
 
     fn set_activated(&mut self, active: bool) {

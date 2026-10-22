@@ -34,7 +34,8 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::{ClientId, KeyboardFocus, SessionEvent, TextInputEvent as ClientEv};
 use super::*;
 use crate::gnome::{
-    Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction, TileSide,
+    A11yToggle, Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
+    TileSide,
 };
 use crate::layout::SizingMode;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::Reason;
@@ -19303,8 +19304,8 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
 /// rungs below the key currently bottom out in GNOME's own "err on the side of yes" default, so
 /// absent and `false` both end at yes. The tri-state is modelled now because the rung that will
 /// make them diverge — a unique GtkApplication with no new-window action, which is what answers
-/// *no* for apps like System Monitor — needs `gtk_shell1.set_dbus_properties`, a protocol we do
-/// not serve. Collapsing the key to a plain boolean today would be invisible and wrong later.
+/// *no* for apps like System Monitor — needs `gtk_shell1.set_dbus_properties`, which we accept
+/// and drop. Collapsing the key to a plain boolean today would be invisible and wrong later.
 #[test]
 fn a_single_window_app_cannot_be_asked_for_a_new_window() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
@@ -44098,5 +44099,292 @@ fn shake_to_locate_can_be_turned_off() {
     assert_eq!(
         f.synoik().cursor_plane_hotspot(&output),
         Point::from((8, 7))
+    );
+}
+
+/// A fixture with a Vulkan renderer, one 1920×1080 output, Visual Alerts on, a frozen clock and
+/// one mapped window — the visual bell's stage. `None` where there is no Vulkan device.
+fn visual_bell_fixture(
+    test: &str,
+    kind: crate::bell::VisualBellType,
+) -> Option<(Fixture, ClientId, WlSurface)> {
+    let mut f = idle_inhibit_fixture(test)?;
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    f.settle();
+    let settings = &mut f.synoik().gnome_settings;
+    settings.a11y.set(A11yToggle::VisualAlerts, true);
+    settings.visual_bell_type = kind;
+    f.freeze_clock();
+    Some((f, id, surface))
+}
+
+/// The bell flash on the fixture's one window.
+fn window_bell_flash(f: &mut Fixture) -> Option<crate::bell::BellFlash> {
+    use crate::layout::LayoutElement as _;
+    let (_, mapped) = f.synoik().layout.windows().next()?;
+    mapped.bell_flash()
+}
+
+/// The bounding box of the pixels that differ between two captures of one output.
+fn diff_bbox(a: &[u8], b: &[u8], width: i32) -> Option<Rectangle<i32, Physical>> {
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (i, (pa, pb)) in a
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
+        .enumerate()
+    {
+        if pa != pb {
+            let (x, y) = (i as i32 % width, i as i32 / width);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+    }
+    (x0 <= x1).then(|| Rectangle::new((x0, y0).into(), (x1 - x0 + 1, y1 - y0 + 1).into()))
+}
+
+/// A bell with Visual Alerts off flashes nothing (`meta_bell_notify`, `bell.c:189`).
+#[test]
+fn a_bell_with_visual_alerts_off_flashes_nothing() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_bell_with_visual_alerts_off_flashes_nothing",
+        crate::bell::VisualBellType::FullscreenFlash,
+    ) else {
+        return;
+    };
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(A11yToggle::VisualAlerts, false);
+
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(f.synoik().bell_flash, None);
+    assert_eq!(window_bell_flash(&mut f), None);
+}
+
+/// `fullscreen-flash` darkens the whole output even when the bell names a window, and the
+/// flash is gone once its passes have run.
+#[test]
+fn a_fullscreen_bell_flashes_the_whole_output() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_fullscreen_bell_flashes_the_whole_output",
+        crate::bell::VisualBellType::FullscreenFlash,
+    ) else {
+        return;
+    };
+    let output = f.synoik().layout.outputs().next().unwrap().clone();
+    let (before, width, height) = super::fixture::capture_pixels(&mut f, &output);
+
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(window_bell_flash(&mut f), None, "not the window's flash");
+    f.advance_clock(crate::bell::FLASH_TIME);
+    let (peak, _, _) = super::fixture::capture_pixels(&mut f, &output);
+    assert_eq!(
+        diff_bbox(&before, &peak, width),
+        Some(Rectangle::from_size((width, height).into())),
+        "at peak the whole output is darkened"
+    );
+
+    // The first bell is a double flash: two passes each way.
+    f.advance_clock(crate::bell::FLASH_TIME * 3);
+    assert_eq!(f.synoik().bell_flash, None, "the flash is over and dropped");
+    let (after, _, _) = super::fixture::capture_pixels(&mut f, &output);
+    assert_eq!(
+        diff_bbox(&before, &after, width),
+        None,
+        "and leaves nothing behind"
+    );
+}
+
+/// `frame-flash` darkens exactly the ringing window's geometry; a bell naming no window falls
+/// back to the whole screen (`bell_flash_frame`, `bell.c:91-99`).
+#[test]
+fn a_frame_bell_flashes_the_ringing_window() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_frame_bell_flashes_the_ringing_window",
+        crate::bell::VisualBellType::FrameFlash,
+    ) else {
+        return;
+    };
+    let output = f.synoik().layout.outputs().next().unwrap().clone();
+    let (before, width, _) = super::fixture::capture_pixels(&mut f, &output);
+
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(f.synoik().bell_flash, None, "not the fullscreen flash");
+    assert!(window_bell_flash(&mut f).is_some());
+    f.advance_clock(crate::bell::FLASH_TIME);
+    let (peak, _, _) = super::fixture::capture_pixels(&mut f, &output);
+    let flashed = diff_bbox(&before, &peak, width).expect("the window darkens");
+    assert_eq!(
+        flashed.size,
+        (100, 100).into(),
+        "exactly the window's geometry"
+    );
+
+    // Past the 500 ms gate, a bell without a surface flashes the screen instead.
+    f.advance_clock(crate::bell::MIN_TIME_BETWEEN_VISUAL_ALERTS);
+    f.client(id).ring_bell(None);
+    f.roundtrip(id);
+    assert!(
+        f.synoik().bell_flash.is_some(),
+        "no window: the whole screen"
+    );
+}
+
+/// [`visual_bell_fixture`] with a recording sound player installed.
+fn audible_bell_fixture(
+    test: &str,
+) -> Option<(
+    Fixture,
+    ClientId,
+    WlSurface,
+    crate::sound_player::StubSoundPlayer,
+)> {
+    let (mut f, id, surface) =
+        visual_bell_fixture(test, crate::bell::VisualBellType::FullscreenFlash)?;
+    let player = crate::sound_player::StubSoundPlayer::default();
+    f.synoik().sound_player = Some(Box::new(player.clone()));
+    Some((f, id, surface, player))
+}
+
+fn bell_sound(theme: &str) -> (String, String) {
+    (theme.to_owned(), "bell-window-system".to_owned())
+}
+
+/// The audible half of a bell plays the theme's `bell-window-system` (`bell.c:229-238`), and
+/// neither the Visual Alerts switch nor the flash's 500 ms limit holds it back: `meta_bell_notify`
+/// runs the two halves independently.
+#[test]
+fn a_bell_plays_the_theme_sound_whatever_the_flash_does() {
+    let Some((mut f, id, surface, player)) =
+        audible_bell_fixture("a_bell_plays_the_theme_sound_whatever_the_flash_does")
+    else {
+        return;
+    };
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert!(f.synoik().bell_flash.is_some());
+    assert_eq!(player.played(), [bell_sound("freedesktop")]);
+
+    f.advance_clock(Duration::from_millis(100));
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(
+        player.played().len(),
+        2,
+        "the flash's gate is not the sound's"
+    );
+
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(A11yToggle::VisualAlerts, false);
+    f.client(id).ring_bell(None);
+    f.roundtrip(id);
+    assert_eq!(player.played().len(), 3, "Visual Alerts off: still audible");
+}
+
+/// `audible-bell` off silences the bell, and so does `event-sounds` off, the switch over every
+/// event sound; the sound comes from the user's `theme-name`.
+#[test]
+fn audible_bell_and_event_sounds_each_silence_the_bell() {
+    let Some((mut f, id, surface, player)) =
+        audible_bell_fixture("audible_bell_and_event_sounds_each_silence_the_bell")
+    else {
+        return;
+    };
+    f.synoik().gnome_settings.audible_bell = false;
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [], "audible-bell off");
+
+    let settings = &mut f.synoik().gnome_settings;
+    settings.audible_bell = true;
+    settings.event_sounds = false;
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [], "event-sounds off");
+
+    let settings = &mut f.synoik().gnome_settings;
+    settings.event_sounds = true;
+    settings.sound_theme_name = "__custom".to_owned();
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [bell_sound("__custom")]);
+}
+
+/// GTK3 rings through `gtk_shell1.system_bell`, naming its window by a `gtk_surface1`; that
+/// window flashes under `frame-flash`, and a bell naming no `gtk_surface1` flashes the screen
+/// (`gtk_shell_system_bell`, `meta-wayland-gtk-shell.c:533-556`).
+#[test]
+fn a_gtk3_bell_flashes_the_ringing_window() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_gtk3_bell_flashes_the_ringing_window",
+        crate::bell::VisualBellType::FrameFlash,
+    ) else {
+        return;
+    };
+    f.client(id).ring_gtk_bell(Some(&surface));
+    f.roundtrip(id);
+    assert!(window_bell_flash(&mut f).is_some(), "the window flashes");
+    assert_eq!(f.synoik().bell_flash, None);
+
+    f.advance_clock(crate::bell::MIN_TIME_BETWEEN_VISUAL_ALERTS);
+    f.client(id).ring_gtk_bell(None);
+    f.roundtrip(id);
+    assert!(
+        f.synoik().bell_flash.is_some(),
+        "no window: the whole screen"
+    );
+}
+
+/// A `gtk_surface1` whose surface is no window rings nothing at all — no flash, no sound
+/// (`meta-wayland-gtk-shell.c:547-549`). `xdg_system_bell_v1` differs: there an unknown surface
+/// still rings, for no window.
+#[test]
+fn a_gtk3_bell_from_a_surface_that_is_no_window_rings_nothing() {
+    let Some((mut f, id, _, player)) =
+        audible_bell_fixture("a_gtk3_bell_from_a_surface_that_is_no_window_rings_nothing")
+    else {
+        return;
+    };
+    let bare = f.client(id).create_bare_surface();
+    f.client(id).ring_gtk_bell(Some(&bare));
+    f.roundtrip(id);
+    assert_eq!(f.synoik().bell_flash, None);
+    assert_eq!(window_bell_flash(&mut f), None);
+    assert_eq!(player.played(), []);
+
+    f.client(id).ring_bell(Some(&bare));
+    f.roundtrip(id);
+    assert!(f.synoik().bell_flash.is_some(), "xdg_system_bell_v1 rings");
+    assert_eq!(player.played().len(), 1);
+}
+
+/// A bell inside 500 ms of the last flash is dropped, and does not restart the flash that is
+/// running (`bell.c:130-131`).
+#[test]
+fn a_bell_inside_the_gate_does_not_restart_the_flash() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_bell_inside_the_gate_does_not_restart_the_flash",
+        crate::bell::VisualBellType::FullscreenFlash,
+    ) else {
+        return;
+    };
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    let first = f.synoik().bell_flash.expect("the first bell flashes");
+
+    f.advance_clock(Duration::from_millis(100));
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(
+        f.synoik().bell_flash,
+        Some(first),
+        "the running flash is untouched"
     );
 }

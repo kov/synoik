@@ -376,6 +376,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pw = synoik::pipewire_audio::start(&event_loop.handle());
         state.synoik.audio_backend = Some(Box::new(pw));
     }
+    #[cfg(feature = "audio")]
+    if !cli.headless || state.synoik.config.borrow().debug.audio_in_headless {
+        state.synoik.sound_player = Some(Box::new(synoik::sound_player::PwSoundPlayer::new()));
+    }
 
     if cli.session {
         state.synoik.a11y.start();

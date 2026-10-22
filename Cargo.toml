@@ -114,6 +114,8 @@ png = "0.18.1"
 profiling = "1.0.17"
 resvg = "0.47.0"
 sd-notify = { version = "0.5.0", features = ["fdstore"] }
+# Decodes the sound theme's event sounds; canberra's suffix list is .oga/.ogg (Vorbis) and .wav.
+symphonia = { version = "0.6.1", optional = true, default-features = false, features = ["ogg", "vorbis", "wav", "pcm"] }
 serde.workspace = true
 serde_json.workspace = true
 smithay-drm-extras.workspace = true
@@ -186,7 +188,7 @@ systemd = []
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["pipewire"]
 # Enables the audio (volume/mute) indicator + quick-settings slider via PipeWire.
-audio = ["pipewire"]
+audio = ["pipewire", "symphonia"]
 # Enables the Tracy profiler instrumentation.
 # No `smithay/tracy_gpu_profiling`: it instruments smithay's *GLES* renderer, which we deleted, and
 # it enables `renderer_gl` → `backend_egl`. That flips smithay's blanket `ImportAll` to the variant

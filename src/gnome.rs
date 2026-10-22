@@ -23,6 +23,7 @@ use smithay::input::keyboard::{xkb, Keysym};
 use synoik_config::{Action, Modifiers};
 use synoik_ipc::SizeChange;
 
+use crate::bell::VisualBellType;
 use crate::input::peripherals::Peripherals;
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
 
@@ -134,6 +135,17 @@ pub struct GnomeSettings {
     /// resizes and Mod+MMB opens the window menu, instead of the other way
     /// round (`meta_prefs_get_mouse_button_resize`, `prefs.c`).
     pub resize_with_right_button: bool,
+    /// `org.gnome.desktop.wm.preferences visual-bell-type`: what a bell flashes when the
+    /// Visual Alerts row (`visual-bell`) is on — see [`crate::bell`].
+    pub visual_bell_type: VisualBellType,
+    /// `org.gnome.desktop.wm.preferences audible-bell`: whether a bell plays the theme's
+    /// `bell-window-system` sound. Independent of Visual Alerts (`meta_bell_notify`).
+    pub audible_bell: bool,
+    /// `org.gnome.desktop.sound event-sounds`: the master switch for every event sound
+    /// (`MetaSoundPlayer`'s `CA_PROP_CANBERRA_ENABLE`).
+    pub event_sounds: bool,
+    /// `org.gnome.desktop.sound theme-name`: the XDG sound theme event sounds come from.
+    pub sound_theme_name: String,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles (sides) or maximizes (top) it.
     pub edge_tiling: bool,
@@ -517,6 +529,10 @@ impl Default for GnomeSettings {
             login_screen: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             resize_with_right_button: false,
+            visual_bell_type: VisualBellType::default(),
+            audible_bell: true,
+            event_sounds: true,
+            sound_theme_name: crate::sound_theme::FALLBACK_THEME.to_owned(),
             edge_tiling: true,
             center_new_windows: true,
             auto_maximize: true,
@@ -1061,6 +1077,26 @@ impl GnomeSettings {
         }
         if settings_has_key(wm, "resize-with-right-button") {
             self.resize_with_right_button = wm.boolean("resize-with-right-button");
+        }
+        if settings_has_key(wm, "visual-bell-type") {
+            let value = wm.string("visual-bell-type");
+            match value.as_str() {
+                "fullscreen-flash" => self.visual_bell_type = VisualBellType::FullscreenFlash,
+                "frame-flash" => self.visual_bell_type = VisualBellType::FrameFlash,
+                other => warn!("ignoring unrecognized visual-bell-type {other:?}"),
+            }
+        }
+        if settings_has_key(wm, "audible-bell") {
+            self.audible_bell = wm.boolean("audible-bell");
+        }
+    }
+
+    fn load_sound(&mut self, sound: &gio::Settings) {
+        if settings_has_key(sound, "event-sounds") {
+            self.event_sounds = sound.boolean("event-sounds");
+        }
+        if settings_has_key(sound, "theme-name") {
+            self.sound_theme_name = sound.string("theme-name").into();
         }
     }
 
@@ -2835,6 +2871,8 @@ struct Stores {
     shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
+    /// `org.gnome.desktop.sound` — the event-sound switch and theme.
+    sound: Option<gio::Settings>,
     shell: Option<gio::Settings>,
     lockdown: Option<gio::Settings>,
     screensaver: Option<gio::Settings>,
@@ -2905,6 +2943,7 @@ impl Stores {
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
+            sound: gsettings("org.gnome.desktop.sound", b),
             shell: gsettings("org.gnome.shell", b),
             lockdown: gsettings("org.gnome.desktop.lockdown", b),
             screensaver: gsettings("org.gnome.desktop.screensaver", b),
@@ -2970,6 +3009,7 @@ impl Stores {
             &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
+            &self.sound,
             &self.shell,
             &self.lockdown,
             &self.screensaver,
@@ -3020,6 +3060,9 @@ impl Stores {
         );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);
+        }
+        if let Some(sound) = &self.sound {
+            settings.load_sound(sound);
         }
         if let Some(shell) = &self.shell {
             settings.load_shell(shell);

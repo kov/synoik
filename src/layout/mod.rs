@@ -286,6 +286,12 @@ pub trait LayoutElement {
 
     fn is_urgent(&self) -> bool;
 
+    /// The visual bell flash running over this window, if any (`visual-bell-type =
+    /// frame-flash`, see [`crate::bell`]).
+    fn bell_flash(&self) -> Option<crate::bell::BellFlash> {
+        None
+    }
+
     fn configure_intent(&self) -> ConfigureIntent;
     fn send_pending_configure(&mut self);
 
