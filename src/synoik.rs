@@ -2713,6 +2713,9 @@ impl State {
         // These should be called periodically, before flushing the clients.
         self.synoik.popups.cleanup();
         self.refresh_popup_grab();
+        // The zoom follows the pointer wherever it was moved from — a warp, a tablet tool —
+        // as GNOME's poll of `global.get_pointer()` does. Unmoved, this does nothing.
+        self.magnifier_pointer_moved();
         // A peek cannot outlive the session being locked: the shield swallows the overlay key's
         // release, so nothing else would ever put the strip away. Level-triggered rather than
         // hooked into each of the paths that can raise the shield, none of which could then

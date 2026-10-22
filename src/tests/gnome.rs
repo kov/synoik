@@ -44969,6 +44969,61 @@ fn zoom_follows_the_caret_once_the_pointer_rests() {
     assert_eq!(f.synoik().magnifier.tracker().listening(), (false, false));
 }
 
+/// A pointer that keeps reporting motion without moving — pinned at an edge, or under a locked
+/// pointer — is resting: `scrollToMousePos` returns early when the position has not changed, so
+/// the caret still gets its turn. A mode of `none` ignores its events even when an application
+/// sends them, and the view follows a pointer however it was moved, a warp included.
+#[test]
+fn zoom_rests_on_a_pointer_that_does_not_move() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::None;
+        synoik.gnome_settings.magnifier.focus_tracking = crate::magnifier::Tracking::None;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let output = f.synoik_output(1);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f
+        .synoik()
+        .layout
+        .window_render_rect(&window, &output)
+        .unwrap();
+    let region = |f: &mut Fixture| f.synoik().magnifier.region(&output).unwrap().center();
+    let before = region(&mut f);
+
+    let at = |x: f64, y: f64| {
+        Rectangle::new(
+            Point::from((x - rect.loc.x, y - rect.loc.y)).to_i32_round(),
+            (20, 20).into(),
+        )
+    };
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Focus(at(300., 300.)));
+    run_for(&mut f, Duration::from_millis(1200));
+    assert_eq!(region(&mut f), before, "focus tracking is off");
+
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(at(700., 400.)));
+    for _ in 0..4 {
+        f.pointer_motion(0., 0.);
+        run_for(&mut f, Duration::from_millis(300));
+    }
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // Mouse tracking centred, and a warp: the view is on the pointer by the next cycle.
+    f.synoik().gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::Centered;
+    f.synoik_state().sync_magnifier();
+    f.synoik_state().move_cursor(Point::from((500., 500.)));
+    run_for(&mut f, Duration::from_millis(16));
+    assert_eq!(region(&mut f), Point::from((500., 500.)));
+}
+
 /// The `(button, pressed)` events the client saw since the last take.
 fn client_buttons(f: &mut Fixture, id: ClientId) -> Vec<(u32, bool)> {
     f.double_roundtrip(id);

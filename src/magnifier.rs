@@ -29,6 +29,8 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::focus_caret_tracker::{FocusCaretTracker, Tracked};
+use crate::layout::LayoutElement as _;
+use crate::render_helpers::borrowed::BorrowedRenderElement;
 use crate::render_helpers::mag_effects::{MagEffects, MagEffectsRenderElement};
 use crate::render_helpers::off_plane::OffPlaneRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
@@ -748,6 +750,18 @@ impl Synoik {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let mut scene = Vec::new();
         self.render_inner(ctx.r(), output, false, &mut |elem| scene.push(elem));
+        // Only what is on this display. The offscreen is sized to cover every element it is
+        // given, and a workspace switch puts the neighbour's windows up to a display away: that
+        // would regrow it mid-animation, and it never shrinks.
+        let bounds = Rectangle::from_size(
+            crate::utils::output_size(output).to_physical_precise_round(scale),
+        );
+        let on_output: Vec<_> = scene
+            .iter()
+            .filter_map(|elem| {
+                CropRenderElement::from_element(BorrowedRenderElement(elem), scale, bounds)
+            })
+            .collect();
 
         let settings = &self.magnifier.settings;
         let content = view.content.to_physical_precise_round(scale);
@@ -805,7 +819,7 @@ impl Synoik {
             }
         }
 
-        let magnified = match surface.offscreen.render(ctx.renderer, scale, &scene) {
+        let magnified = match surface.offscreen.render(ctx.renderer, scale, &on_output) {
             Ok((elem, _sync, _data)) => {
                 let elem = RescaleRenderElement::from_element(elem, (0, 0).into(), mag);
                 let origin = view.transform.origin.to_physical_precise_round(scale);
@@ -917,6 +931,8 @@ pub struct Magnifier {
     regions: HashMap<String, ZoomRegion>,
     rest_timer: Option<TimerToken>,
     tracker: FocusCaretTracker,
+    /// Where the pointer was when the regions last followed it.
+    last_pointer: Option<Point<f64, Logical>>,
 }
 
 impl Magnifier {
@@ -960,6 +976,9 @@ impl Synoik {
             })
             .collect();
         mag.regions
+            .retain(|name, _| outputs.iter().any(|(n, _)| n == name));
+        self.magnifier_surfaces
+            .borrow_mut()
             .retain(|name, _| outputs.iter().any(|(n, _)| n == name));
         for (name, size) in outputs {
             match mag.regions.get_mut(&name) {
@@ -1026,6 +1045,7 @@ impl State {
             self.synoik.magnifier_surfaces.borrow_mut().clear();
         }
         if active && !was_active {
+            self.synoik.magnifier.last_pointer = None;
             // The view starts on the pointer (`scrollContentsTo` at construction, then
             // `startTrackingMouse`).
             self.magnifier_pointer_moved();
@@ -1060,43 +1080,66 @@ impl State {
         let Some(rect) = self.synoik.layout.window_render_rect(&window, &output) else {
             return;
         };
+        // The rect is as drawn, which the overview shrinks; the extents are the window's own.
+        let Some(size) = self.synoik.layout.focus().map(|m| m.size().to_f64()) else {
+            return;
+        };
+        if size.w <= 0. || size.h <= 0. {
+            return;
+        }
+        let (sx, sy) = (rect.size.w / size.w, rect.size.h / size.h);
         let settings = self.synoik.magnifier.settings;
         let clock = self.synoik.clock.clone();
         let Some(region) = self.synoik.magnifier.regions.get_mut(&output.name()) else {
             return;
         };
+        // A mode of `none` never registered for its events, but other assistive technologies
+        // can make an application emit them anyway.
         match tracked {
-            Tracked::Focus(e) => {
+            Tracked::Focus(e) if settings.focus_tracking != Tracking::None => {
                 let p = Point::from((
-                    rect.loc.x + f64::from(e.loc.x) + f64::from(e.size.w) / 2.,
-                    rect.loc.y + f64::from(e.loc.y) + f64::from(e.size.h) / 2.,
+                    rect.loc.x + (f64::from(e.loc.x) + f64::from(e.size.w) / 2.) * sx,
+                    rect.loc.y + (f64::from(e.loc.y) + f64::from(e.size.h) / 2.) * sy,
                 ));
                 region.focus_moved(p, settings.focus_tracking, &clock);
             }
-            Tracked::Caret(e) => {
+            Tracked::Caret(e) if settings.caret_tracking != Tracking::None => {
                 // "Ignore event(s) if the caret size is none (0x0)."
                 if e.size.w == 0 && e.size.h == 0 {
                     return;
                 }
                 let p = Point::from((
-                    rect.loc.x + f64::from(e.loc.x),
-                    rect.loc.y + f64::from(e.loc.y),
+                    rect.loc.x + f64::from(e.loc.x) * sx,
+                    rect.loc.y + f64::from(e.loc.y) * sy,
                 ));
                 region.caret_moved(p, settings.caret_tracking, &clock);
             }
+            _ => return,
         }
         self.synoik.queue_redraw_all();
     }
 
     /// The pointer moved: the region under it follows (`scrollToMousePos`), and the rest timer
     /// starts over.
+    ///
+    /// Polled as well as called from motion — GNOME polls `global.get_pointer()` — so a warp, a
+    /// tablet tool or a touch moves the view too. A pointer that did not move does nothing
+    /// (`scrollToMousePos`'s early return), or a pointer pinned at an edge would keep the rest
+    /// timer from ever firing.
     pub fn magnifier_pointer_moved(&mut self) {
         if !self.synoik.magnifier.active {
             return;
         }
+        let pointer = self
+            .synoik
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.synoik.seat.get_pointer().unwrap().current_location());
+        if self.synoik.magnifier.last_pointer == Some(pointer) {
+            return;
+        }
+        self.synoik.magnifier.last_pointer = Some(pointer);
         self.synoik.sync_magnifier_regions();
         let clock = self.synoik.clock.clone();
-        let pointer = self.synoik.seat.get_pointer().unwrap().current_location();
         let under = self
             .synoik
             .output_under(pointer)

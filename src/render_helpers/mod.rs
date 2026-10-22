@@ -28,6 +28,7 @@ pub use self::vulkan::NATIVE_FOURCC;
 pub mod background_effect;
 pub mod blur;
 pub mod border;
+pub mod borrowed;
 pub mod captured_texture;
 pub mod clipped_surface;
 pub mod custom_anim;

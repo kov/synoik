@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use calloop::LoopHandle;
+use calloop::{LoopHandle, RegistrationToken};
 use smithay::utils::{Logical, Rectangle};
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Structure};
@@ -58,12 +58,16 @@ pub enum Tracked {
 enum Command {
     Register(&'static str),
     Deregister(&'static str),
+    /// Nothing: whether it can be sent says whether the thread is alive.
+    Ping,
 }
 
 /// The tracker, started on first use and kept for the session.
 #[derive(Default)]
 pub struct FocusCaretTracker {
     commands: Option<mpsc::Sender<Command>>,
+    /// The loop's end of the events channel, removed when the tracker restarts.
+    source: Option<RegistrationToken>,
     focus: bool,
     caret: bool,
 }
@@ -95,11 +99,27 @@ impl FocusCaretTracker {
             (self.focus, self.caret) = (focus, caret);
             return;
         }
+        // A thread that could not reach the bus has gone, and the next request starts over.
+        if self
+            .commands
+            .as_ref()
+            .is_some_and(|c| c.send(Command::Ping).is_err())
+        {
+            self.commands = None;
+            (self.focus, self.caret) = (false, false);
+        }
         if self.commands.is_none() {
             if !focus && !caret {
                 return;
             }
-            self.commands = start(event_loop);
+            if let Some(token) = self.source.take() {
+                event_loop.remove(token);
+            }
+            let Some((commands, source)) = start(event_loop) else {
+                return;
+            };
+            self.commands = Some(commands);
+            self.source = Some(source);
         }
         let Some(commands) = &self.commands else {
             return;
@@ -137,17 +157,10 @@ impl FocusCaretTracker {
 
 /// Connect to the accessibility bus on a thread of its own, which then (de)registers events as
 /// told; a second thread reads the events and sends what moved to the loop.
-fn start(event_loop: &LoopHandle<'static, State>) -> Option<mpsc::Sender<Command>> {
+fn start(
+    event_loop: &LoopHandle<'static, State>,
+) -> Option<(mpsc::Sender<Command>, RegistrationToken)> {
     let (to_loop, from_tracker) = calloop::channel::channel::<Tracked>();
-    if let Err(err) = event_loop.insert_source(from_tracker, |event, _, state| {
-        if let calloop::channel::Event::Msg(tracked) = event {
-            state.magnifier_tracked(tracked);
-        }
-    }) {
-        warn!("focus and caret tracking: no event source: {err:?}");
-        return None;
-    }
-
     let (commands, from_main) = mpsc::channel::<Command>();
     let res = thread::Builder::new()
         .name("FocusCaretTracker".to_owned())
@@ -170,15 +183,17 @@ fn start(event_loop: &LoopHandle<'static, State>) -> Option<mpsc::Sender<Command
             while let Ok(command) = from_main.recv() {
                 let res = match command {
                     Command::Register(event) => register(&conn, event),
+                    // `(s event, s app_bus_name)`; libatspi passes an empty name.
                     Command::Deregister(event) => conn
                         .call_method(
                             Some("org.a11y.atspi.Registry"),
                             "/org/a11y/atspi/registry",
                             Some("org.a11y.atspi.Registry"),
                             "DeregisterEvent",
-                            &(event,),
+                            &(event, ""),
                         )
                         .map(drop),
+                    Command::Ping => Ok(()),
                 };
                 if let Err(err) = res {
                     warn!("focus and caret tracking: (de)registering an event: {err:?}");
@@ -189,7 +204,19 @@ fn start(event_loop: &LoopHandle<'static, State>) -> Option<mpsc::Sender<Command
         warn!("focus and caret tracking: no thread: {err:?}");
         return None;
     }
-    Some(commands)
+    // Only now: a source inserted for a thread that never ran would sit in the loop for good.
+    // Should this fail, dropping `commands` ends the thread.
+    match event_loop.insert_source(from_tracker, |event, _, state| {
+        if let calloop::channel::Event::Msg(tracked) = event {
+            state.magnifier_tracked(tracked);
+        }
+    }) {
+        Ok(token) => Some((commands, token)),
+        Err(err) => {
+            warn!("focus and caret tracking: no event source: {err:?}");
+            None
+        }
+    }
 }
 
 fn connect() -> zbus::Result<Connection> {
@@ -346,7 +373,12 @@ impl<'a> Object<'a> {
     fn is_focused_in_active_window(&self) -> bool {
         let mut window: Option<Object<'a>> = None;
         let mut app_name = None;
-        let mut iter = self.parent();
+        // From the accessible itself: a window that reports the focus is its own window.
+        let mut iter = Some(Object {
+            conn: self.conn,
+            bus: self.bus.clone(),
+            path: self.path.clone(),
+        });
         let mut depth = 0;
         while let Some(object) = iter {
             depth += 1;
