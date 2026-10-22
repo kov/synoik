@@ -11625,7 +11625,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     eprintln!("vulkan_folder_dialog: panel={inside:?}");
     assert_eq!(inside[3], 255, "the panel is opaque: {inside:?}");
     for ch in 0..3 {
-        let want = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        let want = (crate::ui::widget::style::overlay_bg()[ch] * 255.).round() as i32;
         assert!(
             (inside[ch] as i32 - want).abs() <= 4,
             "the panel is $system_overlay_bg_color: {inside:?}"
@@ -11690,7 +11690,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     );
     eprintln!("vulkan_folder_dialog: edit disc={disc:?}");
     for ch in 0..3 {
-        let want = (crate::ui::widget::style::OVERLAY_BUTTON_BG[ch] * 255.).round() as i32;
+        let want = (crate::ui::widget::style::overlay_button_bg()[ch] * 255.).round() as i32;
         assert!(
             (disc[ch] as i32 - want).abs() <= 6,
             "the edit button is `st-mix($system_fg_color, $system_overlay_bg_color, 9%)`, \
@@ -12229,7 +12229,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
     let got = px(&pixels, w, vacated.x as i32, vacated.y as i32);
     eprintln!("vulkan_folder_dialog_shrink: vacated={got:?}");
     for ch in 0..3 {
-        let panel_ch = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        let panel_ch = (crate::ui::widget::style::overlay_bg()[ch] * 255.).round() as i32;
         assert!(
             (got[ch] as i32 - panel_ch).abs() > 8,
             "the vacated corner still reads as panel fill — the zoom did not move it: {got:?}"

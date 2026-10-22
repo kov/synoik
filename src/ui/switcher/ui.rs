@@ -31,8 +31,7 @@ use crate::ui::switcher::app_switcher::{self, AppItem};
 use crate::ui::switcher::{
     thumbnails, window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome,
     SwitcherPopup, Visibility, ARROW, ARROW_HIGHLIGHTED, ITEM_HIGHLIGHTED, ITEM_PADDING,
-    ITEM_RADIUS, ITEM_SELECTED, LIST_BG, LIST_BORDER, LIST_BORDER_COLOR, LIST_FG, LIST_RADIUS,
-    POPUP_SPACING,
+    ITEM_RADIUS, ITEM_SELECTED, LIST_FG, LIST_RADIUS, POPUP_SPACING,
 };
 use crate::ui::widget::{
     self, style, AppIconUploads, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
@@ -1134,8 +1133,8 @@ impl SwitcherUi {
             |frame, phys, shaped: &Vec<ShapedText>| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(LIST_RADIUS, LIST_BG)?;
-                p.stroke_rounded_full(LIST_RADIUS, LIST_BORDER, LIST_BORDER_COLOR)?;
+                p.fill_rounded_full(LIST_RADIUS, style::osd_bg())?;
+                p.stroke_rounded_full(LIST_RADIUS, style::osd_border_width(), style::osd_border())?;
 
                 // Nothing is washed while `_currentWindow` is unset: the list can be up purely to
                 // show you what is there.
@@ -1353,8 +1352,8 @@ impl SwitcherUi {
             |frame, phys, labels: &Vec<ShapedText>| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(LIST_RADIUS, LIST_BG)?;
-                p.stroke_rounded_full(LIST_RADIUS, LIST_BORDER, LIST_BORDER_COLOR)?;
+                p.fill_rounded_full(LIST_RADIUS, style::osd_bg())?;
+                p.stroke_rounded_full(LIST_RADIUS, style::osd_border_width(), style::osd_border())?;
 
                 // The selection wash, and nothing for hover — hovering moves the selection
                 // instead, so a second highlight would show two current items at once.

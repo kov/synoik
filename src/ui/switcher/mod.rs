@@ -81,8 +81,6 @@ pub const LIST_PADDING: f64 = 12.;
 /// (`_switcher-popup.scss:5,17`); `$modal_radius` is `$base_border_radius * 2` = 16
 /// (`_common.scss:40`).
 pub const LIST_RADIUS: f64 = 28.;
-/// `%osd_panel`'s hairline, which `.switcher-list` extends (`_switcher-popup.scss:15`).
-pub const LIST_BORDER: f64 = 1.;
 /// `.switcher-list-item-container` `spacing: $base_padding * 2` (`:21-23`).
 pub const ITEM_SPACING: f64 = 12.;
 /// `.item-box` is a `tile_button` at OSD colours (`_switcher-popup.scss:26-27`), and
@@ -95,9 +93,8 @@ pub const ITEM_SPACING: f64 = 12.;
 pub const ITEM_PADDING: f64 = 6.;
 pub const ITEM_RADIUS: f64 = 16.;
 
-/// `.switcher-list` fill and hairline: `%osd_panel`, shared with the OSD pill.
-pub const LIST_BG: Rgba = style::OSD_BG;
-pub const LIST_BORDER_COLOR: Rgba = style::OSD_BORDER;
+/// `.switcher-list` foreground. Its fill and border are `%osd_panel`'s, shared with the OSD pill
+/// ([`style::osd_bg`], [`style::osd_border`]).
 pub const LIST_FG: Rgba = style::OSD_FG;
 
 /// `.item-box:selected` — `transparentize($osd_fg_color, 0.8)` (`_switcher-popup.scss:32-34`),

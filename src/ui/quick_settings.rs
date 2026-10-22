@@ -37,7 +37,6 @@ use std::collections::HashMap;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
@@ -170,11 +169,6 @@ const MENU_RADIUS: f64 = 36.;
 /// i.e. ×0.6 — which over an opaque surface is black at this alpha.
 const DIM_STRENGTH: f32 = 0.4;
 
-/// Inactive quick-toggle / pill / slider-trough fill — GNOME's `.button` normal
-/// `mix($fg_color, $bg_color, 9%)` ≈ `#48484c` (the quick-toggle extends `.button`,
-/// `_quick-settings.scss:5,15`). Shared [`widget::style::BUTTON_BG`], the raised control on the
-/// menu bg. (The popup box bg itself is now drawn by the shared popover chrome.)
-const TILE_OFF: [f32; 4] = widget::style::BUTTON_BG;
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
 /// Text/icon on an active (accent) tile. GNOME's `-st-accent-fg-color` is hardcoded white
@@ -231,9 +225,6 @@ const DETAIL_ROW_INSET: f64 = 12.;
 /// split in the shutdown menu) — the `.popup-separator-menu-item`'s slot, with a 1px
 /// `$borders_color` rule (shared [`widget::style::BORDERS`]) drawn centered in it.
 const DETAIL_SEP_EXTRA: f64 = 8.;
-/// Detail-card surface — gnome-shell's `%card` = `$card_bg_color` = `lighten($bg_color, 7%)`
-/// ≈ `#47474c`, one step lighter than the menu box. Shared [`widget::style::CARD_BG`].
-const CARD_BG: [f32; 4] = widget::style::CARD_BG;
 /// Header-title font size, GNOME points (shaped via [`TextShaper`]). The header title is
 /// `%title_3` (15pt/700); rows are regular-weight `.popup-menu-item` at `DETAIL_ROW_PT`.
 const DETAIL_TITLE_PT: f64 = 15.;
@@ -2007,7 +1998,7 @@ enum QsStop {
 }
 
 struct TextureCache {
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     textures: HashMap<NotNan<f64>, (u64, VkTexture, Option<VkTexture>)>,
 }
 
@@ -3613,7 +3604,7 @@ impl QuickSettings {
     ) -> anyhow::Result<(VkTexture, Option<VkTexture>)> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let mut cache = self.cache.borrow_mut();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.textures.clear();
             cache.context = Some(context);
@@ -3733,7 +3724,8 @@ impl QuickSettings {
             // The `%card` background is opaque and covers the whole texture; the rounded corners
             // fall back to the popover chrome behind it.
             p.clear(style::TRANSPARENT)?;
-            p.fill_rounded(card, DETAIL_RADIUS, CARD_BG)?;
+            p.fill_rounded(card, DETAIL_RADIUS, widget::style::card_bg())?;
+            p.hc_inset(card, DETAIL_RADIUS)?;
 
             // The `.header .icon` highlighted circular pill, behind the (separately
             // composited) header icon glyph.
@@ -3818,7 +3810,7 @@ impl QuickSettings {
                             Point::from((card.loc.x + inset, line_cy)),
                             Size::from((card.size.w - 2. * inset, 1.)),
                         ),
-                        style::over(CARD_BG, style::BORDERS),
+                        style::over(widget::style::card_bg(), style::borders()),
                     )?;
                 }
                 // A hovered picker row: a faint rounded fill (it has no base
@@ -4010,7 +4002,7 @@ impl QuickSettings {
             // The battery pill: a filled slab (its icon composites on top) with the
             // percentage after it.
             if let (Some(pill), Some(run)) = (pill_rect(self.has_pill()), &pill_run) {
-                p.fill_rounded(pill, pill.size.h / 2., TILE_OFF)?;
+                p.fill_rounded(pill, pill.size.h / 2., widget::style::button_bg())?;
                 if self.hovered == Some(QsHover::Pill) {
                     p.fill_rounded(pill, pill.size.h / 2., style::HOVER_WASH)?;
                 }
@@ -4053,7 +4045,7 @@ impl QuickSettings {
                     Point::from((hit.loc.x, hit.loc.y + (hit.size.h - SYS_HIT) / 2.)),
                     Size::from((SYS_HIT, SYS_HIT)),
                 );
-                p.fill_rounded(disc, SYS_HIT / 2., TILE_OFF)?;
+                p.fill_rounded(disc, SYS_HIT / 2., widget::style::button_bg())?;
                 if self.hovered == Some(QsHover::Sys(button)) {
                     p.fill_rounded(disc, SYS_HIT / 2., style::HOVER_WASH)?;
                 }
@@ -4076,7 +4068,7 @@ impl QuickSettings {
                     Slider::Brightness => (self.brightness.global.unwrap_or_default(), false),
                 };
                 let disc = slider_icon_rect(slider, layout);
-                p.fill_rounded(disc, SLIDER_H / 2., TILE_OFF)?;
+                p.fill_rounded(disc, SLIDER_H / 2., widget::style::button_bg())?;
                 if self.hovered == Some(QsHover::SliderIcon(slider)) {
                     p.fill_rounded(disc, SLIDER_H / 2., style::HOVER_WASH)?;
                 }

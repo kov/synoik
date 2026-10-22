@@ -23,7 +23,6 @@ use std::time::Duration;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
@@ -101,19 +100,35 @@ pub const STACK_HEIGHT_REDUCTION: f64 = 1.4;
 pub const GROUP_BOTTOM_MARGIN: f64 = 15.;
 
 /// `.message` bg, dark variant (`lighten($card_bg_color, 5%)` ≈ `#51515a`).
-pub(crate) const CARD_BG: [f32; 4] = [
-    0x51 as f32 / 255.,
-    0x51 as f32 / 255.,
-    0x5a as f32 / 255.,
-    1.,
-];
+///
+/// **High Contrast:** `#262626` (`.message`).
+pub(crate) fn card_bg() -> [f32; 4] {
+    if crate::ui::high_contrast() {
+        widget::style::rgb8(0x26, 0x26, 0x26)
+    } else {
+        [
+            0x51 as f32 / 255.,
+            0x51 as f32 / 255.,
+            0x5a as f32 / 255.,
+            1.,
+        ]
+    }
+}
 /// `.message-header` fg (`$card_insensitive_fg_color` ≈ `#b1b1b3`).
-pub const HEADER_FG: [f32; 4] = [
-    0xb1 as f32 / 255.,
-    0xb1 as f32 / 255.,
-    0xb3 as f32 / 255.,
-    1.,
-];
+///
+/// **High Contrast:** `$card_insensitive_fg_color: $fg_color`.
+pub fn header_fg() -> [f32; 4] {
+    if crate::ui::high_contrast() {
+        widget::style::TEXT
+    } else {
+        [
+            0xb1 as f32 / 255.,
+            0xb1 as f32 / 255.,
+            0xb3 as f32 / 255.,
+            1.,
+        ]
+    }
+}
 pub(crate) const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// Close/action button bg (white@15%, `%notification_button` normal =
 /// `transparentize($fg_color, .85)`).
@@ -129,12 +144,20 @@ pub(crate) const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 /// while `.message` overrides its *normal* bg to `lighten($card_bg, 5%)`
 /// ([`CARD_BG`]) — so on the dark theme hover is ~1% darker than resting
 /// (`_common.scss:154-161`, `_drawing.scss:193`, `_message-list.scss:87`).
-pub(crate) const CARD_HOVER_BG: [f32; 4] = [
-    0x4d as f32 / 255.,
-    0x4d as f32 / 255.,
-    0x56 as f32 / 255.,
-    1.,
-];
+///
+/// **High Contrast:** `hc_color_mix(lighten(#1a1a1a, 4%))` (`.message:hover`).
+pub(crate) fn card_hover_bg() -> [f32; 4] {
+    if crate::ui::high_contrast() {
+        widget::style::rgb8(0x40, 0x40, 0x40)
+    } else {
+        [
+            0x4d as f32 / 255.,
+            0x4d as f32 / 255.,
+            0x56 as f32 / 255.,
+            1.,
+        ]
+    }
+}
 
 /// A hoverable zone within a single card, resolved by the owner's hit-test and
 /// fed back so [`draw_card`] can highlight it.
@@ -496,8 +519,13 @@ pub fn draw_card(
         // Transparent beyond the rounded corners; the card is an SDF fill. A
         // hovered card body darkens (`%card:hover`).
         p.clear(TRANSPARENT)?;
-        let card_bg = if card_hovered { CARD_HOVER_BG } else { CARD_BG };
+        let card_bg = if card_hovered {
+            card_hover_bg()
+        } else {
+            card_bg()
+        };
         p.fill_rounded(Rectangle::from_size(layout.size), radius, card_bg)?;
+        p.hc_inset(Rectangle::from_size(layout.size), radius)?;
 
         // Close-button circle, and the expand caret's when it's live. A hovered
         // button lightens (`%notification_button:hover`), behind its glyph.
@@ -538,14 +566,14 @@ pub fn draw_card(
             &source_run,
             Point::from((title_x, header_cy)),
             Align::LEFT_MIDDLE,
-            HEADER_FG,
+            header_fg(),
             header_clip,
         )?;
         p.text(
             &time_run,
             Point::from((time_anchor - PAD, header_cy)),
             Align::RIGHT_MIDDLE,
-            HEADER_FG,
+            header_fg(),
         )?;
 
         // Body: bold title over the pre-wrapped body lines (a single
@@ -599,7 +627,7 @@ pub fn draw_card(
 /// The owner picks the keys (the banner keys by its content revision, the list
 /// by revision + card index) and evicts stale ones via [`retain`](Self::retain).
 pub struct CardCache {
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     cards: HashMap<(NotNan<f64>, u64), VkTexture>,
     pixels: HashMap<u64, TextureBuffer<VkTexture>>,
     /// Uploads of images loaded *from a file* (album art), keyed by card key **and source path**.
@@ -645,7 +673,7 @@ impl CardCache {
     /// Drop textures if the renderer context changed (callers building their
     /// own textures — e.g. the group header — must call this too).
     pub fn ensure_context(&mut self, renderer: &VulkanRenderer) {
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if self.context.as_ref() != Some(&context) {
             self.cards.clear();
             self.pixels.clear();
@@ -781,7 +809,7 @@ pub fn source_icon_element(
 ) -> Option<TextureRenderElement<VkTexture>> {
     match source_icon(icons, app_icons, gicon, scale) {
         SourceIcon::Symbolic(name) => {
-            let tb = icons.texture(renderer, &name, SMALL_ICON, scale, HEADER_FG)?;
+            let tb = icons.texture(renderer, &name, SMALL_ICON, scale, header_fg())?;
             let logical = tb.logical_size();
             let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
             Some(TextureRenderElement::from_texture_buffer(
@@ -997,7 +1025,7 @@ pub fn card_elements(
 /// (`_message-list.scss:89-98`). Depth 0 (the top card) uses the normal fill.
 pub fn stack_bg(depth: usize) -> [f32; 4] {
     match depth {
-        0 => CARD_BG,
+        0 => card_bg(),
         1 => STACK_SECOND_BG,
         _ => STACK_LOWER_BG,
     }

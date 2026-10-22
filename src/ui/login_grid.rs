@@ -386,7 +386,7 @@ impl LoginGrid {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
                 let r = Rectangle::from_size(pill_size);
-                p.fill_rounded(r, PILL_H / 2., style::SYSTEM_BUTTON_BG)?;
+                p.fill_rounded(r, PILL_H / 2., style::system_button_bg())?;
                 if hovered {
                     p.fill_rounded(r, PILL_H / 2., style::HOVER_WASH)?;
                 }

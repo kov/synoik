@@ -1160,7 +1160,7 @@ impl FolderDialog {
             move |frame, phys, text| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(ENTRY_RADIUS, style::ENTRY_BG)?;
+                p.fill_rounded_full(ENTRY_RADIUS, style::entry_bg())?;
                 p.stroke_rounded_full(ENTRY_RADIUS, FOCUS_RING_W, ring)?;
                 let center = Point::from((size.w / 2., size.h / 2.));
                 // Shared with the pill entry: `Align::CENTER` anchors the run's *ink*, while
@@ -1261,7 +1261,7 @@ impl FolderDialog {
             move |frame, phys, _: &()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(size.h / 2., style::OVERLAY_BUTTON_BG)?;
+                p.fill_rounded_full(size.h / 2., style::overlay_button_bg())?;
                 if washed {
                     p.fill_rounded_full(size.h / 2., style::HOVER_WASH)?;
                 }
@@ -1397,8 +1397,8 @@ impl FolderDialog {
             move |frame, phys, _: &()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(RADIUS, style::OVERLAY_BG)?;
-                p.stroke_rounded_full(RADIUS, BORDER_W, style::BORDERS)?;
+                p.fill_rounded_full(RADIUS, style::overlay_bg())?;
+                p.stroke_rounded_full(RADIUS, BORDER_W, style::borders())?;
                 Ok(())
             },
         ) {

@@ -51,7 +51,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{
-    BODY_ICON, BTN_RADIUS, CARD_BG, CARD_HOVER_BG, CIRCLE_BG, HEADER_FG, HEADER_H, HEADER_PAD_B,
+    card_bg, card_hover_bg, header_fg, BODY_ICON, BTN_RADIUS, CIRCLE_BG, HEADER_H, HEADER_PAD_B,
     ICON_MARGIN, LINE_H, PAD, SMALL_ICON, TEXT, TRANSPARENT,
 };
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
@@ -272,8 +272,13 @@ pub fn draw_media_card(
         let mut p = Painter::new(frame, scale, size);
 
         p.clear(TRANSPARENT)?;
-        let card_bg = if card_hovered { CARD_HOVER_BG } else { CARD_BG };
+        let card_bg = if card_hovered {
+            card_hover_bg()
+        } else {
+            card_bg()
+        };
         p.fill_rounded(Rectangle::from_size(layout.size), radius, card_bg)?;
+        p.hc_inset(Rectangle::from_size(layout.size), radius)?;
 
         // The art slot's backdrop is the `.message-themed-icon` fill, but rounded rather than
         // circular. It shows through wherever the fallback glyph does not cover — and it is gone
@@ -302,7 +307,7 @@ pub fn draw_media_card(
             &source_run,
             Point::from((title_x, header_cy)),
             Align::LEFT_MIDDLE,
-            HEADER_FG,
+            header_fg(),
             header_clip,
         )?;
 

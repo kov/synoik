@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Renderer};
+use smithay::backend::renderer::Color32F;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use synoik_config::Config;
@@ -700,7 +700,7 @@ struct CachedLabel {
 /// Cached bar textures, keyed so a content change misses. Tied to a renderer
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     /// The bar's text labels, one entry per [`LabelSlot`], keyed by (scale, slot) and holding
     /// the text each was baked from. A label misses when *its own* text changes — which is the
     /// whole point of the split: the clock ticks once a minute (once a *second* with seconds
@@ -1677,7 +1677,7 @@ impl Panel {
             .or_insert_with(BarCache::new);
 
         // The cached textures belong to one renderer context; drop them all if it changed.
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.clear();
             cache.context = Some(context);

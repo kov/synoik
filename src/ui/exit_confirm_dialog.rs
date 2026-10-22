@@ -37,8 +37,6 @@ fn font_px() -> f64 {
 /// only needs to exceed the widest line.
 const WRAP_WIDTH: i32 = 1000;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-/// Dialog card background — GNOME modal `$bg_color`; rounded, borderless.
-const BOX_BG: [f32; 4] = widget::style::DIALOG_BG;
 /// The keycap background behind " Enter " (#2C2C2C, matching the old pango `bgcolor`).
 const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
 /// Dialog text color (opaque white); the glyph coverage modulates the alpha.
@@ -328,7 +326,7 @@ fn paint_dialog(
     // Rounded borderless card (GNOME modal): transparent clear, flat rounded fill,
     // then the keycap patch + message.
     p.clear(widget::style::TRANSPARENT)?;
-    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, widget::style::dialog_bg())?;
     if let Some(keycap) = layout.keycap {
         p.fill_rect_px(keycap, KEYCAP_BG)?;
     }

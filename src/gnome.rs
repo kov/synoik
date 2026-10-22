@@ -330,9 +330,9 @@ impl A11yToggle {
 ///
 /// These are the menu rows' state. What acts on them lives elsewhere: the keyboard filters
 /// read [`GnomeSettings::keyboard_a11y`], the bell reads `visual-bell`. The magnifier, the
-/// on-screen keyboard and the screen reader have no consumer in this stack yet, and our own
-/// chrome does not follow `high-contrast` the way St does; writing their keys is still the
-/// right port — GTK apps read them directly.
+/// on-screen keyboard and the screen reader have no consumer in this stack yet; writing their
+/// keys is still the right port — GTK apps read them directly. `high-contrast` recolours our
+/// chrome through [`GnomeSettings::publish_style`].
 /// `text-scaling-factor` is consumed: it scales our chrome through
 /// [`GnomeSettings::realized_base_font_pt`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -703,10 +703,12 @@ impl GnomeSettings {
         self.base_font_pt * self.a11y.text_scaling_factor
     }
 
-    /// Publish this model's base font to the UI ([`crate::ui::publish_base_font`]). Call it
-    /// after anything that may have moved `font-name` or the Large Text factor.
-    pub fn publish_base_font(&self) {
+    /// Publish this model's style to the UI: its base font ([`crate::ui::publish_base_font`])
+    /// and High Contrast ([`crate::ui::publish_high_contrast`]). Call it after anything that may
+    /// have moved `font-name`, Large Text or High Contrast.
+    pub fn publish_style(&self) {
         crate::ui::publish_base_font(self.realized_base_font_pt(), &self.base_font_family);
+        crate::ui::publish_high_contrast(self.a11y.get(A11yToggle::HighContrast));
     }
 
     fn load_mutter(&mut self, mutter: &gio::Settings) {

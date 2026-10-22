@@ -116,7 +116,7 @@ pub fn publish_base_font(pt: f64, family: &str) {
     let size_changed = store_base_font_pt(&BASE_FONT_PT_BITS, pt);
     let family_changed = synoik_vk::text::set_sans_family(family);
     if size_changed || family_changed {
-        STYLE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        style_state::bump_generation();
     }
 }
 
@@ -135,14 +135,79 @@ fn store_base_font_pt(cell: &std::sync::atomic::AtomicU64, pt: f64) -> bool {
     true
 }
 
-/// Bumped whenever something changes what every widget would draw — today only the
-/// base font size. [`crate::ui::widget::bake`] folds it into each cache key, so one
-/// counter re-bakes the whole UI without every widget needing an invalidate hook.
+/// Bumped whenever something changes what every widget would draw: the base font, or High
+/// Contrast. [`crate::ui::widget::bake`] folds it into each cache key, and every other cache of
+/// drawn chrome resets on it ([`crate::ui::widget::style_context`]), so one counter re-draws the
+/// whole UI without every widget needing an invalidate hook.
 pub fn style_generation() -> u64 {
-    STYLE_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+    style_state::generation()
 }
 
-static STYLE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whether our chrome is drawn in GNOME's High Contrast theme
+/// (`org.gnome.desktop.a11y.interface high-contrast`). gnome-shell swaps its whole stylesheet
+/// for `gnome-shell-high-contrast.css` when the key moves (`main.js:461-466`); here it is one
+/// process-wide switch the palette in [`widget::style`] reads, as `StThemeContext` is one
+/// process-wide theme.
+pub fn high_contrast() -> bool {
+    style_state::high_contrast()
+}
+
+/// Publish the High Contrast switch, re-drawing the UI if it moved. Idempotent, like
+/// [`publish_base_font`].
+pub fn publish_high_contrast(on: bool) {
+    if style_state::set_high_contrast(on) {
+        style_state::bump_generation();
+    }
+}
+
+/// The process-wide style state. Under test it is per thread instead: every test runs its
+/// compositor on its own thread, and a test turning High Contrast on (or bumping the generation)
+/// must not recolour or re-bake the tests running beside it.
+#[cfg(not(test))]
+mod style_state {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    static HIGH_CONTRAST: AtomicBool = AtomicBool::new(false);
+
+    pub fn generation() -> u64 {
+        GENERATION.load(Relaxed)
+    }
+    pub fn bump_generation() {
+        GENERATION.fetch_add(1, Relaxed);
+    }
+    pub fn high_contrast() -> bool {
+        HIGH_CONTRAST.load(Relaxed)
+    }
+    /// Whether it changed.
+    pub fn set_high_contrast(on: bool) -> bool {
+        HIGH_CONTRAST.swap(on, Relaxed) != on
+    }
+}
+
+#[cfg(test)]
+mod style_state {
+    use std::cell::Cell;
+
+    thread_local! {
+        static GENERATION: Cell<u64> = const { Cell::new(0) };
+        static HIGH_CONTRAST: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn generation() -> u64 {
+        GENERATION.get()
+    }
+    pub fn bump_generation() {
+        GENERATION.set(GENERATION.get() + 1);
+    }
+    pub fn high_contrast() -> bool {
+        HIGH_CONTRAST.get()
+    }
+    pub fn set_high_contrast(on: bool) -> bool {
+        HIGH_CONTRAST.replace(on) != on
+    }
+}
 
 static BASE_FONT_PT_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(BASE_FONT_PT.to_bits());

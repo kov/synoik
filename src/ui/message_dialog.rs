@@ -786,7 +786,7 @@ fn paint(
 
     // A flat rounded card on a transparent clear, so the corners stay see-through.
     p.clear(style::TRANSPARENT)?;
-    p.fill_rounded(full, style::DIALOG_RADIUS, style::DIALOG_BG)?;
+    p.fill_rounded(full, style::DIALOG_RADIUS, style::dialog_bg())?;
 
     let centre_x = layout.size.w / 2.;
     for (run, (_, top)) in prepared.title.iter().zip(&layout.title) {
@@ -1013,5 +1013,84 @@ mod tests {
                 .count();
             assert!(bright > 40, "expected visible glyph ink, got {bright}");
         }
+    }
+
+    /// High Contrast (`gnome-shell-high-contrast.css`) turns the card `#1a1a1a` and draws the 1px
+    /// `$hc_inset_color` outline inside a button — through the same cache, which has to let go of
+    /// the dark bake rather than serve it on.
+    #[test]
+    fn high_contrast_recolours_the_card() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{Bind, ExportMem, Texture as _};
+        use smithay::utils::Buffer as BufferCoord;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping high_contrast_recolours_the_card: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let c = content(&["Cancel", "Log Out"], false, Some(24.));
+        let l = layout(&c);
+        let mut cache = BakeCache::new();
+        let mut draw = |vk: &mut VulkanRenderer| {
+            let tex = widget::bake(
+                vk,
+                &mut cache,
+                1.,
+                l.size,
+                0,
+                |r| prepare(r, 1., &c, &l, Focus::Button(1)),
+                |frame, phys, prepared| paint(frame, phys, prepared, &l, 1., [0.2, 0.52, 0.89, 1.]),
+            )
+            .expect("dialog texture");
+            let mut tex = tex.texture().clone();
+            let size = tex.size();
+            let fb = vk.bind(&mut tex).expect("bind");
+            let mapping = vk
+                .copy_framebuffer(
+                    &fb,
+                    Rectangle::<i32, BufferCoord>::from_size(size),
+                    Fourcc::Abgr8888,
+                )
+                .expect("copy_framebuffer");
+            let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+            move |x: f64, y: f64| {
+                let i = ((y as i32 * size.w + x as i32) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2]]
+            }
+        };
+        // Left of the buttons, level with them: card. The unfocused Cancel's top edge, mid-way.
+        let cancel = l.buttons[0];
+        let card_at = (12., cancel.loc.y + cancel.size.h / 2.);
+        let edge_at = (cancel.loc.x + cancel.size.w / 2., cancel.loc.y);
+        let inside_at = (edge_at.0, cancel.loc.y + 4.);
+
+        let dark = draw(&mut vk);
+        assert_eq!(
+            dark(card_at.0, card_at.1),
+            [0x36, 0x36, 0x3a],
+            "the dark card"
+        );
+
+        crate::ui::publish_high_contrast(true);
+        let hc = draw(&mut vk);
+        crate::ui::publish_high_contrast(false);
+        assert_eq!(
+            hc(card_at.0, card_at.1),
+            [0x1a, 0x1a, 0x1a],
+            "the High Contrast card"
+        );
+        let (edge, inside) = (hc(edge_at.0, edge_at.1), hc(inside_at.0, inside_at.1));
+        assert!(
+            edge[0] > inside[0] + 40,
+            "an outline inside the button's edge: edge {edge:?}, inside {inside:?}"
+        );
+        let (edge, inside) = (dark(edge_at.0, edge_at.1), dark(inside_at.0, inside_at.1));
+        assert!(
+            edge[0] < inside[0] + 10,
+            "and none without: edge {edge:?}, inside {inside:?}"
+        );
     }
 }

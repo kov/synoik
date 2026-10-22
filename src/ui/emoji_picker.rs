@@ -43,8 +43,6 @@ const ROWS: usize = 6;
 const PAD: f64 = 12.;
 /// Gap between the entry and the grid, and between the panel and its anchor.
 const GAP: f64 = 8.;
-/// Panel background — the same card as the dialogs.
-const BG: widget::Rgba = widget::style::DIALOG_BG;
 /// Height of the category rail along the panel's bottom edge.
 const RAIL_H: f64 = 36.;
 /// A rail tab's width: the rail spans the grid, so ten tabs are narrower than nine cells.
@@ -958,7 +956,7 @@ fn paint_panel(
     let mut p = Painter::new(frame, scale, phys);
     // Rounded borderless card: transparent clear so the corners composite away, then the fill.
     p.clear(widget::style::TRANSPARENT)?;
-    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BG)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, widget::style::dialog_bg())?;
 
     for (slot, selected, hovered) in &prepared.cells {
         if !selected && !hovered {
@@ -967,9 +965,9 @@ fn paint_panel(
         let rect = cell_rect(*slot);
         // Selection reads stronger than hover, and one cell can be both.
         let wash = if *selected {
-            widget::style::over(BG, widget::style::SELECTED_WASH)
+            widget::style::over(widget::style::dialog_bg(), widget::style::SELECTED_WASH)
         } else {
-            widget::style::over(BG, widget::style::HOVER_WASH)
+            widget::style::over(widget::style::dialog_bg(), widget::style::HOVER_WASH)
         };
         p.fill_rounded(rect, 8., wash)?;
     }
@@ -991,7 +989,7 @@ fn paint_panel(
             Point::from((PAD, rail_top)),
             Size::from((CELL * COLS as f64, 1.)),
         ),
-        widget::style::BORDERS,
+        widget::style::borders(),
     )?;
     for (tab, shaped) in &prepared.rail {
         let rect = rail_tab_rect(*tab);
@@ -1005,7 +1003,11 @@ fn paint_panel(
             None
         };
         if let Some(wash) = wash {
-            p.fill_rounded(rect, 8., widget::style::over(BG, wash))?;
+            p.fill_rounded(
+                rect,
+                8.,
+                widget::style::over(widget::style::dialog_bg(), wash),
+            )?;
         }
         p.text(
             shaped,
@@ -1061,7 +1063,7 @@ fn paint_tones(
     p.clear(widget::style::TRANSPARENT)?;
     // A menu rather than a card: it hangs off a cell, so it takes the menu fill and a smaller
     // radius than the panel it sits on.
-    p.fill_rounded_full(12., widget::style::MENU_BG)?;
+    p.fill_rounded_full(12., widget::style::menu_bg())?;
 
     for (at, shaped) in &prepared.glyphs {
         let col = (at % prepared.cols) as f64;
@@ -1074,7 +1076,7 @@ fn paint_tones(
             p.fill_rounded(
                 rect,
                 8.,
-                widget::style::over(widget::style::MENU_BG, widget::style::SELECTED_WASH),
+                widget::style::over(widget::style::menu_bg(), widget::style::SELECTED_WASH),
             )?;
         }
         p.text(

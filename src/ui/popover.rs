@@ -68,7 +68,15 @@ const POPOVER_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
 
 /// `.popup-menu-content` `border: 1px solid $outer_borders_color` (`_popovers.scss:31`);
 /// `$outer_borders_color` (dark) = `lighten($bg_color #36363a, 5%)` = `#424247`.
-const POPOVER_BORDER: widget::Rgba = [0.260, 0.260, 0.279, 1.];
+///
+/// **High Contrast:** `$outer_borders_color: $borders_color`, white at 0.5.
+fn popover_border() -> widget::Rgba {
+    if crate::ui::high_contrast() {
+        [1., 1., 1., 0.5]
+    } else {
+        [0.260, 0.260, 0.279, 1.]
+    }
+}
 
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1969,7 +1977,7 @@ impl PanelPopover {
                 radius as u64,
                 card,
                 radius,
-                widget::style::MENU_BG,
+                widget::style::menu_bg(),
             ) {
                 Ok(tex) => {
                     // The fill is the popover's one opaque surface, so it carries the rounded
@@ -2039,7 +2047,7 @@ impl PanelPopover {
                 radius as u64,
                 card,
                 radius,
-                POPOVER_BORDER,
+                popover_border(),
             ) {
                 Ok(buffer) => {
                     elements.insert(

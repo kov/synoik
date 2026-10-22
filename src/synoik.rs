@@ -2244,7 +2244,7 @@ impl State {
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
-            state.synoik.gnome_settings.publish_base_font();
+            state.synoik.gnome_settings.publish_style();
             state.synoik.last_power_profile =
                 state.synoik.gnome_settings.last_power_profile.clone();
             state.synoik.gnome_settings_writer = Some(writer);
@@ -2548,7 +2548,7 @@ impl State {
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
-                        state.synoik.gnome_settings.publish_base_font();
+                        state.synoik.gnome_settings.publish_style();
                         // Both surfaces are re-derived *after* the assignment: the grid's
                         // order comes out of `app_picker_layout`, so syncing it against
                         // the old settings would show the previous arrangement until some
@@ -11322,9 +11322,15 @@ impl Synoik {
             .and_then(|slot| slot.offscreen_image())
     }
 
+    /// Which way the surfaces that follow the colour scheme lean ([`Appearance`]).
+    ///
+    /// [`Appearance`]: crate::ui::widget::style::Appearance
+    ///
+    /// High Contrast is always dark (`_high-contrast-colors.scss:3`), whatever the colour scheme,
+    /// so a light plate never lands on its black chrome.
     pub fn appearance(&self) -> crate::ui::widget::style::Appearance {
         crate::ui::widget::style::Appearance::from_dark_style(
-            self.gnome_settings.quick_toggles.dark_style,
+            self.gnome_settings.quick_toggles.dark_style || crate::ui::high_contrast(),
         )
     }
 
