@@ -114,6 +114,11 @@ impl EndSessionDialog {
         self.dialog.is_open()
     }
 
+    /// Where it stacks among the message dialogs ([`MessageDialog::raised`]).
+    pub fn raised(&self) -> u64 {
+        self.dialog.raised()
+    }
+
     pub fn advance_animations(&mut self) {
         self.dialog.advance_animations();
     }

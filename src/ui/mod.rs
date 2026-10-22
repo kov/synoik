@@ -21,6 +21,7 @@ pub mod folder_dialog;
 pub mod hotkey_overlay;
 pub mod indicator_menu;
 pub mod input_source_menu;
+pub mod kbd_a11y_dialog;
 pub mod lock_screen;
 pub mod login_a11y_menu;
 pub mod login_dialog;

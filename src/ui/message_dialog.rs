@@ -134,6 +134,13 @@ impl Hash for DialogContent {
     }
 }
 
+/// The shell's message dialogs, for routing input to the one on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDialogKind {
+    EndSession,
+    KbdA11y,
+}
+
 /// What an input event on the dialog asks its owner to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogOutcome {
@@ -289,7 +296,12 @@ pub struct MessageDialog {
     /// Nested in the system compositor, how it moves switches: the dialog arrives and leaves the
     /// same way. `None` for gnome-shell's fade.
     motion: Option<Style>,
+    /// Stacking order among the open dialogs: the last raised is on top and takes the input.
+    raised: u64,
 }
+
+/// Hands out [`MessageDialog::raised`] stamps.
+static RAISES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 synoik_render_elements! {
     MessageDialogRenderElement => {
@@ -312,7 +324,13 @@ impl MessageDialog {
             cache: RefCell::new(BakeCache::new()),
             clock,
             motion: None,
+            raised: 0,
         }
+    }
+
+    /// Where it stacks: of two open dialogs, the greater was raised last and is on top.
+    pub fn raised(&self) -> u64 {
+        self.raised
     }
 
     /// How the system compositor moves switches, if nested in one.
@@ -354,6 +372,7 @@ impl MessageDialog {
         self.set_content(content);
         if !self.is_open() {
             self.state = State::Showing(self.animation(self.value(), 1.));
+            self.raised = RAISES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         }
     }
 

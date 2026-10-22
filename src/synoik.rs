@@ -194,9 +194,10 @@ use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
 use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::emoji_picker::{EmojiPicker, EmojiPickerRenderElement};
-use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
+use crate::ui::end_session_dialog::EndSessionDialog;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
+use crate::ui::message_dialog::MessageDialogRenderElement;
 use crate::ui::overview_search::{OverviewSearch, SearchResultEntry};
 use crate::ui::panel::{Panel, PanelElement};
 use crate::ui::popover::PanelPopover;
@@ -1173,6 +1174,8 @@ pub struct Synoik {
     /// learns the pointer left and would leave our arrow standing over its text field.
     pub client_cursor_image: CursorImageStatus,
     pub end_session_dialog: EndSessionDialog,
+    /// The confirmation a keyboard-accessibility shortcut raises.
+    pub kbd_a11y_dialog: crate::ui::kbd_a11y_dialog::KbdA11yDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
     /// caller wants coordinates, not a file. Answered on confirm *and* on every close, because a
@@ -1810,6 +1813,7 @@ pub enum KeyboardFocus {
     ExitConfirmDialog,
     RunDialog,
     EndSessionDialog,
+    KbdA11yDialog,
     /// The polkit authentication dialog, which is modal like the three above it.
     PolkitDialog,
     /// The NetworkManager secret dialog, modal in the same way.
@@ -1982,6 +1986,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => "ExitConfirmDialog",
             KeyboardFocus::RunDialog => "RunDialog",
             KeyboardFocus::EndSessionDialog => "EndSessionDialog",
+            KeyboardFocus::KbdA11yDialog => "KbdA11yDialog",
             KeyboardFocus::PolkitDialog => "PolkitDialog",
             KeyboardFocus::NetworkSecretDialog => "NetworkSecretDialog",
             KeyboardFocus::Popover => "Popover",
@@ -2013,6 +2018,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::KbdA11yDialog => None,
             KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
@@ -2031,6 +2037,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::KbdA11yDialog => None,
             KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
@@ -3758,8 +3765,15 @@ impl State {
             KeyboardFocus::ExitConfirmDialog
         } else if self.synoik.run_dialog.is_open() {
             KeyboardFocus::RunDialog
-        } else if self.synoik.end_session_dialog.is_open() {
-            KeyboardFocus::EndSessionDialog
+        } else if let Some(kind) = self.synoik.top_message_dialog() {
+            match kind {
+                crate::ui::message_dialog::MessageDialogKind::EndSession => {
+                    KeyboardFocus::EndSessionDialog
+                }
+                crate::ui::message_dialog::MessageDialogKind::KbdA11y => {
+                    KeyboardFocus::KbdA11yDialog
+                }
+            }
         } else if self.synoik.is_locked() {
             KeyboardFocus::LockScreen {
                 surface: self.synoik.lock_surface_focus(),
@@ -8802,6 +8816,8 @@ impl Synoik {
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone());
+        let kbd_a11y_dialog =
+            crate::ui::kbd_a11y_dialog::KbdA11yDialog::new(animation_clock.clone());
         let polkit_ui =
             crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
         let network_secret_ui = crate::ui::network_secret_dialog::NetworkSecretDialogUi::new(
@@ -9146,6 +9162,7 @@ impl Synoik {
             emoji_picker_owns_cursor: false,
             client_cursor_image: CursorImageStatus::default_named(),
             end_session_dialog,
+            kbd_a11y_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),
             cast_area_indicator: Default::default(),
@@ -10552,6 +10569,27 @@ impl Synoik {
     /// Returns the workspace under the position to be activated.
     ///
     /// The return value is an output and a workspace index on it.
+    /// The open message dialog on top, if any: the one raised last.
+    pub fn top_message_dialog(&self) -> Option<crate::ui::message_dialog::MessageDialogKind> {
+        use crate::ui::message_dialog::MessageDialogKind;
+        [
+            (
+                MessageDialogKind::EndSession,
+                self.end_session_dialog.is_open(),
+                self.end_session_dialog.raised(),
+            ),
+            (
+                MessageDialogKind::KbdA11y,
+                self.kbd_a11y_dialog.is_open(),
+                self.kbd_a11y_dialog.raised(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, open, _)| *open)
+        .max_by_key(|(_, _, raised)| *raised)
+        .map(|(kind, _, _)| kind)
+    }
+
     pub fn workspace_under(
         &self,
         extended_bounds: bool,
@@ -10559,7 +10597,7 @@ impl Synoik {
     ) -> Option<(Output, &Workspace<Mapped>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10645,7 +10683,7 @@ impl Synoik {
     ) -> Option<(Output, Point<f64, Logical>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10737,7 +10775,7 @@ impl Synoik {
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10804,7 +10842,7 @@ impl Synoik {
 
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
         {
@@ -11886,6 +11924,7 @@ impl Synoik {
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::RunDialog => true,
             KeyboardFocus::EndSessionDialog => true,
+            KeyboardFocus::KbdA11yDialog => true,
             KeyboardFocus::PolkitDialog => true,
             KeyboardFocus::NetworkSecretDialog => true,
             KeyboardFocus::Popover => true,
@@ -11980,7 +12019,8 @@ impl Synoik {
         causes.set(
             AnimCauses::DIALOG,
             self.exit_confirm_dialog.are_animations_ongoing()
-                || self.end_session_dialog.are_animations_ongoing(),
+                || self.end_session_dialog.are_animations_ongoing()
+                || self.kbd_a11y_dialog.are_animations_ongoing(),
         );
         causes.set(
             AnimCauses::POLKIT,
@@ -12175,6 +12215,7 @@ impl Synoik {
 
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
+        self.kbd_a11y_dialog.advance_animations();
         self.polkit_ui.advance_animations();
         self.network_secret_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
@@ -12783,14 +12824,25 @@ impl Synoik {
             &mut |elem| push(elem.into()),
         );
 
-        // Next, the end-session (logout/shutdown/restart) confirmation dialog.
-        self.end_session_dialog.render(
-            ctx.renderer,
-            &self.icon_cache,
-            output,
-            self.gnome_settings.accent_color,
-            &mut |elem| push(elem.into()),
-        );
+        // Next, the message dialogs (end-session, keyboard accessibility), the one raised last on
+        // top as it takes the input.
+        let accent = self.gnome_settings.accent_color;
+        let kbd_a11y_on_top = self.kbd_a11y_dialog.raised() > self.end_session_dialog.raised();
+        for kbd_a11y in [kbd_a11y_on_top, !kbd_a11y_on_top] {
+            let push = &mut |elem: MessageDialogRenderElement| push(elem.into());
+            if kbd_a11y {
+                self.kbd_a11y_dialog
+                    .render(ctx.renderer, &self.icon_cache, output, accent, push);
+            } else {
+                self.end_session_dialog.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    output,
+                    accent,
+                    push,
+                );
+            }
+        }
 
         // The network secret dialog, under polkit: both defer rather than stacking on a shield,
         // and if the two ever coincide, authenticating is the more urgent of the two.
@@ -18654,7 +18706,7 @@ synoik_render_elements! {
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EmojiPicker = EmojiPickerRenderElement,
-        EndSessionDialog = EndSessionDialogRenderElement,
+        MessageDialog = MessageDialogRenderElement,
         PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
         NetworkSecretDialog = crate::ui::network_secret_dialog::NetworkSecretDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,

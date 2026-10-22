@@ -365,7 +365,7 @@ impl State {
                         state.ring_bell(None);
                     }
                     let on = !state.synoik.keyboard_a11y.applied.slowkeys_enable;
-                    state.toggle_keyboard_a11y_feature(KeyboardA11yFeature::SlowKeys, on);
+                    state.keyboard_a11y_shortcut(KeyboardA11yFeature::SlowKeys, on);
                     None
                 });
                 self.synoik.keyboard_a11y.toggle_slow_keys_timer = Some(token);
@@ -401,14 +401,22 @@ impl State {
             if a11y.applied.feature_state_change_beep {
                 self.ring_bell(None);
             }
-            self.toggle_keyboard_a11y_feature(KeyboardA11yFeature::StickyKeys, on);
+            self.keyboard_a11y_shortcut(KeyboardA11yFeature::StickyKeys, on);
         }
     }
 
-    /// A shortcut switched `feature` (`set_stickykeys_on`, `trigger_toggle_slowkeys`, …): take
-    /// effect now, and write the key so the menu and Settings follow
-    /// (`meta_input_settings_notify_kbd_a11y_change`).
-    fn toggle_keyboard_a11y_feature(&mut self, feature: KeyboardA11yFeature, on: bool) {
+    /// A shortcut switched `feature` (`set_stickykeys_on`, `trigger_toggle_slowkeys`, …): switch
+    /// it, and say so with the dialog that offers to undo it — mutter's `kbd-a11y-flags-changed`,
+    /// which only a shortcut emits, never a settings change (`KbdA11yDialog`).
+    fn keyboard_a11y_shortcut(&mut self, feature: KeyboardA11yFeature, on: bool) {
+        self.set_keyboard_a11y_feature(feature, on);
+        self.synoik.kbd_a11y_dialog.show(feature, on);
+        self.synoik.queue_redraw_all();
+    }
+
+    /// Switch `feature`: take effect now, and write the key so the menu and Settings follow
+    /// (`meta_input_settings_notify_kbd_a11y_change`, and the dialog's buttons).
+    pub fn set_keyboard_a11y_feature(&mut self, feature: KeyboardA11yFeature, on: bool) {
         let toggle = match feature {
             KeyboardA11yFeature::StickyKeys => crate::gnome::A11yToggle::StickyKeys,
             KeyboardA11yFeature::SlowKeys => crate::gnome::A11yToggle::SlowKeys,
@@ -620,7 +628,7 @@ impl State {
                 return;
             }
             if a11y.sticky_depressed != 0 && settings.stickykeys_two_key_off {
-                self.toggle_keyboard_a11y_feature(KeyboardA11yFeature::StickyKeys, false);
+                self.keyboard_a11y_shortcut(KeyboardA11yFeature::StickyKeys, false);
                 return;
             }
             // Lock itself cannot be sticky, though Caps Lock counts as a modifier key: it may be
@@ -692,8 +700,8 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum KeyboardA11yFeature {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardA11yFeature {
     StickyKeys,
     SlowKeys,
 }

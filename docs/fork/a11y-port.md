@@ -84,7 +84,9 @@ swallowed key changes nothing, and an accepted slow key is delivered when accept
 
 gnome-shell shows no latched-modifier indicator (mutter's `kbd-a11y-mods-state-changed` has no
 listener). What it does show is `KbdA11yDialog` (`js/ui/kbdA11yDialog.js`), the "Sticky Keys
-Turned On" confirmation after a shortcut — **not yet built**. `timeout-enable` /
+Turned On" confirmation after a shortcut (Shift ×5, Shift held, two-key-off) and never after a
+settings change: `ui/kbd_a11y_dialog.rs`, on the shared `ui/message_dialog.rs`. It answers over the
+lock screen too, since the shortcuts work there. `timeout-enable` /
 `disable-timeout` are read by mutter and acted on nowhere.
 
 ### A5 — On-screen keyboard (the Screen Keyboard row)

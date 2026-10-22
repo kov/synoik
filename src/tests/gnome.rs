@@ -44688,6 +44688,127 @@ fn the_enable_shortcuts_toggle_sticky_and_slow_keys() {
     f.key_release(KEY_LEFTSHIFT);
 }
 
+/// Every key the client saw pressed it also saw released, and nothing else.
+fn assert_keys_paired(f: &mut Fixture, id: ClientId, keys: &[u32]) {
+    f.double_roundtrip(id);
+    let events = f.client(id).take_key_events();
+    for key in keys {
+        let count = |state| events.iter().filter(|e| **e == (*key, state)).count();
+        let (pressed, released) = (count(WlKeyState::Pressed), count(WlKeyState::Released));
+        assert_eq!(pressed, released, "key {key} unpaired in {events:?}");
+    }
+    assert!(
+        events.iter().all(|(k, _)| keys.contains(k)),
+        "a key the dialog took reached the client: {events:?}"
+    );
+}
+
+/// A shortcut says what it did (`KbdA11yDialog`): five Shifts turn Sticky Keys on, and the dialog
+/// that comes up leaves it on with Enter and turns it off with Escape; five more turn it off, and
+/// now Escape is the one that turns it back on. The keys that answer it never reach the window,
+/// and the Shift that raised it reaches it whole. A settings change raises nothing.
+#[test]
+fn an_enable_shortcut_raises_a_dialog_that_offers_to_undo_it() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    keyboard_a11y_settings(&mut f).slowkeys_enable = true;
+    tap(&mut f, KEY_Z);
+    run_for(&mut f, Duration::from_millis(500));
+    assert!(
+        !f.synoik().kbd_a11y_dialog.is_open(),
+        "a settings change raises nothing"
+    );
+    keyboard_a11y_settings(&mut f).slowkeys_enable = false;
+    let _ = f.client(id).take_key_events();
+
+    let sticky = |f: &mut Fixture| keyboard_a11y_settings(f).stickykeys_enable;
+    for (escape, on_after) in [(false, true), (true, false)] {
+        for _ in 0..5 {
+            tap(&mut f, KEY_LEFTSHIFT);
+        }
+        assert!(sticky(&mut f), "five Shifts turned it on");
+        assert!(f.synoik().kbd_a11y_dialog.is_open());
+        run_for(&mut f, Duration::from_millis(200));
+        tap(&mut f, if escape { KEY_ESC } else { KEY_ENTER });
+        assert_eq!(sticky(&mut f), on_after, "escape: {escape}");
+        assert!(!f.synoik().kbd_a11y_dialog.is_open(), "answered");
+        assert_keys_paired(&mut f, id, &[KEY_LEFTSHIFT]);
+        // Off again for the next round, by the menu: no dialog.
+        f.synoik_state().set_keyboard_a11y_feature(
+            crate::input::keyboard_a11y::KeyboardA11yFeature::StickyKeys,
+            false,
+        );
+        run_for(&mut f, Duration::from_millis(200));
+    }
+
+    // On, then five Shifts turn it off: Escape turns it back on.
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(!sticky(&mut f), "five Shifts turned it off");
+    run_for(&mut f, Duration::from_millis(200));
+    tap(&mut f, KEY_ESC);
+    assert!(sticky(&mut f), "Escape undid it");
+    assert!(!f.synoik().kbd_a11y_dialog.is_open());
+}
+
+/// The shortcuts work behind the lock, so their dialog must answer there too, or it would be a
+/// modal nobody can dismiss.
+#[test]
+fn the_keyboard_a11y_dialog_answers_over_the_lock_screen() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik_state().synoik.lock_screen.settle();
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(f.synoik().kbd_a11y_dialog.is_open());
+    run_for(&mut f, Duration::from_millis(200));
+    tap(&mut f, KEY_ESC);
+    assert!(!f.synoik().kbd_a11y_dialog.is_open());
+    assert!(!keyboard_a11y_settings(&mut f).stickykeys_enable);
+}
+
+/// Two dialogs at once: the one raised last is on top and takes the keys; the other answers once
+/// it is gone.
+#[test]
+fn the_message_dialog_raised_last_takes_the_keys() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    run_for(&mut f, Duration::from_millis(200));
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    run_for(&mut f, Duration::from_millis(200));
+    assert_eq!(
+        f.synoik().top_message_dialog(),
+        Some(crate::ui::message_dialog::MessageDialogKind::KbdA11y)
+    );
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.synoik().kbd_a11y_dialog.is_open(),
+        "Escape went to the top one"
+    );
+    assert!(
+        f.synoik().end_session.is_open(),
+        "and not to the one under it"
+    );
+    tap(&mut f, KEY_ESC);
+    assert!(!f.synoik().end_session.is_open());
+}
+
 /// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
 const SHIFT_MASK: u32 = 1;
 const CONTROL_MASK: u32 = 1 << 2;
