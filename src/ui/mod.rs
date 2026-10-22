@@ -34,6 +34,7 @@ pub mod network_secret_dialog;
 pub mod notification_banner;
 pub mod notification_card;
 pub mod osd;
+pub mod osk;
 pub mod overview_layout;
 pub mod overview_search;
 pub mod panel;

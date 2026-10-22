@@ -456,6 +456,34 @@ pub mod style {
             [0.283, 0.283, 0.297, 1.]
         }
     }
+    /// An on-screen keyboard key's fill (`.keyboard-key`, `_keyboard.scss:31-60`), compiled:
+    /// `st-mix(#fff, #4d4d4d, 9%)` for a character key and `st-mix(#fff, #333, 9%)` for a
+    /// `.default-key`, lightened 4% on `:hover`, 9% on `:active`, 13% on both.
+    ///
+    /// **High Contrast** mixes each with white at 13% (`hc_color_mix`).
+    pub fn key_cap_bg(default_key: bool, hovered: bool, active: bool) -> Rgba {
+        let base = if default_key {
+            rgb8(0x45, 0x45, 0x45)
+        } else {
+            rgb8(0x5d, 0x5d, 0x5d)
+        };
+        let lift = match (hovered, active) {
+            (_, true) if hovered => 0.13,
+            (_, true) => 0.09,
+            (true, false) => 0.04,
+            (false, false) => 0.,
+        };
+        let c = lighten(base, lift);
+        if crate::ui::high_contrast() {
+            let mix = |v: f32| v * 0.87 + 0.13;
+            [mix(c[0]), mix(c[1]), mix(c[2]), 1.]
+        } else {
+            c
+        }
+    }
+    /// `.keyboard-key`'s `box-shadow: 0 1px 0 0 $shadow_color`.
+    pub const KEY_CAP_SHADOW: Rgba = [0., 0., 0., 0.2];
+
     /// `.modal-dialog-button` fill — translucent white `rgba(255,255,255,0.1)`
     /// (`%dialog_button`, `_drawing.scss:218`). Neutral dialog action button.
     ///
@@ -3034,6 +3062,37 @@ impl Button {
     }
 }
 
+/// A key of the on-screen keyboard (`.keyboard-key`, `_keyboard.scss:30-62`): a rounded cap with
+/// a 1px drop shadow, a bold label or a symbolic glyph, and a **latched** state that fills a
+/// `.default-key` with the accent — shift held, Ctrl or Alt latched. The keyboard, its long-press
+/// popup and its emoji page all draw keys through this.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyCap {
+    pub rect: Rectangle<f64, Logical>,
+    pub default_key: bool,
+    pub hovered: bool,
+    /// `:active`: held down.
+    pub active: bool,
+    pub latched: bool,
+}
+
+impl KeyCap {
+    /// `$key_border_radius: to_em($base_border_radius)`.
+    pub fn radius() -> f64 {
+        crate::ui::scaled_px(8.)
+    }
+
+    /// The label's text style: `fontsize($base_font_size + 5pt)`, bold.
+    pub fn text_style() -> TextStyle {
+        TextStyle::new(crate::ui::BASE_FONT_PT + 5.).bold()
+    }
+
+    /// `StIcon { icon-size: $medium_scalable_icon_size }` — 24px against the default font.
+    pub fn icon_size() -> f64 {
+        crate::ui::scaled_px(24.)
+    }
+}
+
 /// GNOME's `.icon-button` (`_buttons.scss:18-38`) — a **circular** button whose whole content is
 /// one symbolic glyph.
 ///
@@ -4385,6 +4444,43 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             b.rect.loc.y + b.rect.size.h / 2.,
         ));
         self.text_clipped(label, center, Align::CENTER, style::TEXT, b.rect)?;
+        Ok(())
+    }
+
+    /// Draw a [`KeyCap`], its label centred. An icon key passes no label and composites its glyph
+    /// over the cap.
+    pub fn key_cap(
+        &mut self,
+        k: &KeyCap,
+        label: Option<&ShapedText>,
+        accent: Rgba,
+    ) -> anyhow::Result<()> {
+        let radius = KeyCap::radius();
+        if style::shadows() {
+            let mut shadow = k.rect;
+            shadow.loc.y += 1.;
+            self.fill_rounded(shadow, radius, style::KEY_CAP_SHADOW)?;
+        }
+        let bg = if k.latched && k.default_key {
+            accent
+        } else {
+            style::key_cap_bg(k.default_key, k.hovered, k.active)
+        };
+        self.fill_rounded(k.rect, radius, bg)?;
+        self.hc_inset(k.rect, radius)?;
+        if let Some(label) = label {
+            // On the line box, not the ink: a row of letters keeps one baseline whether or not
+            // they descend, as St's labels do.
+            self.text_band(
+                label,
+                k.rect.loc.x + k.rect.size.w / 2.,
+                HAlign::Center,
+                k.rect.loc.y,
+                k.rect.size.h,
+                style::TEXT,
+                k.rect,
+            )?;
+        }
         Ok(())
     }
 

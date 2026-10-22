@@ -46,6 +46,7 @@ pub mod network_secret;
 /// The network secret dialog's state machine, answering the NetworkManager agent.
 pub mod network_secret_dialog;
 pub mod notifications;
+pub mod osk;
 pub mod output_identity;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;

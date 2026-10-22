@@ -45418,3 +45418,181 @@ fn sticky_keys_two_key_off() {
         "the latched Shift went with it"
     );
 }
+
+/// A focused window with a text input, its compositor-side events captured for feeding through
+/// `on_text_input_event` as the real sink would, and the on-screen keyboard enabled.
+fn osk_fixture() -> (
+    Fixture,
+    ClientId,
+    std::sync::Arc<std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>>,
+    async_channel::Receiver<crate::input_method::ImRequest>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::TextInputSeat;
+
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let (to_worker, requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(crate::input_method::InputMethod::new(to_worker));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, true);
+    f.synoik_state().sync_osk();
+    (f, id, seen, requests)
+}
+
+/// Hand the client's committed text-input state to the compositor.
+fn osk_feed(
+    f: &mut Fixture,
+    id: ClientId,
+    seen: &std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>,
+) {
+    f.double_roundtrip(id);
+    let events: Vec<_> = seen.lock().unwrap().drain(..).collect();
+    for event in events {
+        f.synoik_state().on_text_input_event(event);
+    }
+    f.synoik_state().refresh();
+}
+
+/// The global centre of the first key on the keyboard's current level that `pred` picks.
+fn osk_key_center(f: &mut Fixture, pred: impl Fn(&crate::osk::layout::Key) -> bool) -> (f64, f64) {
+    let output = f.synoik_output(1);
+    let synoik = f.synoik();
+    let rect = synoik.osk_rect(&output).expect("keyboard drawn");
+    let level = synoik.osk.level().unwrap();
+    let i = level.keys.iter().position(pred).expect("key on this level");
+    let key = crate::ui::osk::key_rects(rect.size, level)[i];
+    (
+        rect.loc.x + key.loc.x + key.size.w / 2.,
+        rect.loc.y + key.loc.y + key.size.h / 2.,
+    )
+}
+
+fn osk_click(f: &mut Fixture, (x, y): (f64, f64)) {
+    pointer_motion_to(f, x, y);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    f.pointer_button(LEFT, ButtonState::Released);
+}
+
+/// Screen Keyboard: a client re-enabling its text input while it already has the input method
+/// is a version-1 client asking for the panel (`enable_panel_v1`); the keyboard comes up after
+/// `KEYBOARD_REST_TIME` and slides in over `KEYBOARD_ANIMATION_TIME`. The first enable, which
+/// only moves the input method's focus there, does not show it. Disabling goes out through
+/// `HIDE_PANEL_TIME` and a `close(true)`: no rest.
+#[test]
+fn osk_opens_when_a_focused_field_asks_and_closes_when_it_goes() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let output = f.synoik_output(1);
+
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(500));
+    assert!(!f.synoik().osk.is_visible(), "focus alone does not show it");
+
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(280));
+    assert!(!f.synoik().osk.is_visible(), "waiting out the rest");
+    run_for(&mut f, Duration::from_millis(40));
+    assert!(f.synoik().osk.is_visible());
+    run_for(&mut f, Duration::from_millis(200));
+    let rect = f.synoik().osk_rect(&output).unwrap();
+    assert_eq!(rect.loc.y, 720.);
+    assert_eq!(rect.size, Size::from((1920., 360.)));
+
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(30));
+    assert!(f.synoik().osk.is_visible(), "HIDE_PANEL_TIME");
+    run_for(&mut f, Duration::from_millis(40));
+    assert!(!f.synoik().osk.is_visible());
+    run_for(&mut f, Duration::from_millis(200));
+    assert!(f.synoik().osk_rect(&output).is_none(), "slid away");
+}
+
+/// A letter goes in through the input method's commit, and the window under the keyboard never
+/// sees the click; Enter is a key press. The keyboard leaves keyboard focus where it was.
+#[test]
+fn osk_keys_type_into_the_focused_field() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+    let _ = client_buttons(&mut f, id);
+
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&Ti::CommitString(Some("q".into()))),
+        "{events:?}"
+    );
+    assert_eq!(
+        client_buttons(&mut f, id),
+        [],
+        "the click was the keyboard's"
+    );
+
+    let _ = f.client(id).take_key_events();
+    let enter = osk_key_center(&mut f, |k| k.keyval == Some(0xff0d));
+    osk_click(&mut f, enter);
+    f.double_roundtrip(id);
+    let keys = f.client(id).take_key_events();
+    assert!(
+        keys.iter()
+            .any(|(k, s)| *k == 28 && *s == WlKeyState::Pressed),
+        "{keys:?}"
+    );
+    assert!(f.synoik().osk.is_visible());
+
+    // Its hide key: gone at once.
+    let hide = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::Hide)
+    });
+    osk_click(&mut f, hide);
+    assert!(!f.synoik().osk.is_visible());
+}
+
+/// One of our own entries taking the key focus opens it (`_onKeyFocusChanged`), and the setting
+/// going off takes it down at once.
+#[test]
+fn osk_opens_for_a_shell_entry() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().refresh();
+    run_for(&mut f, Duration::from_millis(320));
+    assert!(f.synoik().osk.is_visible());
+
+    // A key commits into the entry.
+    run_for(&mut f, Duration::from_millis(200));
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    assert_eq!(f.synoik().run_dialog.entry(), "q");
+
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, false);
+    f.synoik_state().sync_osk();
+    assert!(!f.synoik().osk.is_enabled());
+    let output = f.synoik_output(1);
+    assert!(f.synoik().osk_rect(&output).is_none());
+}

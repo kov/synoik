@@ -1208,6 +1208,9 @@ pub struct Synoik {
     pub magnifier: crate::magnifier::Magnifier,
     /// What the magnifier draws each output's frame with, by output name.
     pub(crate) magnifier_surfaces: RefCell<HashMap<String, crate::magnifier::MagnifierSurface>>,
+    /// The on-screen keyboard. See [`crate::osk`].
+    pub osk: crate::osk::Osk,
+    pub(crate) osk_ui: crate::ui::osk::OskUi,
     /// The visual bell's fullscreen flash, while it runs.
     pub bell_flash: Option<crate::bell::BellFlash>,
     /// The hot corner's ripple.
@@ -2245,6 +2248,7 @@ impl State {
             // indicator with it; later changes come through the settings watcher.
             state.sync_pointer_a11y();
             state.sync_magnifier();
+            state.sync_osk();
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
@@ -2526,6 +2530,7 @@ impl State {
                         state.sync_keyboard_a11y();
                         state.sync_pointer_a11y();
                         state.sync_magnifier();
+                        state.sync_osk();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -2716,6 +2721,7 @@ impl State {
         // The zoom follows the pointer wherever it was moved from — a warp, a tablet tool —
         // as GNOME's poll of `global.get_pointer()` does. Unmoved, this does nothing.
         self.magnifier_pointer_moved();
+        self.synoik.osk.advance();
         // A peek cannot outlive the session being locked: the shield swallows the overlay key's
         // release, so nothing else would ever put the strip away. Level-triggered rather than
         // hooked into each of the paths that can raise the shield, none of which could then
@@ -4049,6 +4055,7 @@ impl State {
         // moving (a modal dialog over the same window keeps `KeyboardFocus::Layout`), and the
         // engine must not keep composing into an entry that has gone away.
         self.sync_im_focus();
+        self.sync_osk_focus();
     }
 
     /// Loads the xkb keymap from a file config setting.
@@ -9187,6 +9194,8 @@ impl Synoik {
             pointer_a11y: Default::default(),
             magnifier: Default::default(),
             magnifier_surfaces: Default::default(),
+            osk: Default::default(),
+            osk_ui: Default::default(),
             bell_flash: None,
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),
@@ -10365,6 +10374,13 @@ impl Synoik {
             self.dock.forget_pressure();
             return;
         }
+        // Nor while the on-screen keyboard is up along that edge: a press on its bottom row is
+        // the pointer against the edge, and the keyboard draws over the dock anyway. Ours to
+        // decide — GNOME has no bottom chrome to share the edge with.
+        if self.osk_rect(&output).is_some() {
+            self.dock.forget_pressure();
+            return;
+        }
 
         let discarded = unclamped - pos;
         if self
@@ -10855,6 +10871,10 @@ impl Synoik {
 
         // The ordering here must be consistent with the ordering in render() so that input is
         // consistent with the visuals.
+
+        if self.osk_contains(pos) {
+            return rv;
+        }
 
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
@@ -12075,6 +12095,7 @@ impl Synoik {
                 .any(|pie| pie.frame(now_unadjusted).is_some()),
         );
         causes.set(AnimCauses::MAGNIFIER, self.magnifier.easing());
+        causes.set(AnimCauses::OSK, self.osk.is_animating());
         causes.set(AnimCauses::DOCK, self.dock.are_animations_ongoing());
         causes.set(
             AnimCauses::SCREENSHOT_UI,
@@ -12831,6 +12852,23 @@ impl Synoik {
             self.clock.now_unadjusted(),
             &mut |elem| push(elem.into()),
         );
+
+        // Next, the on-screen keyboard, over the shell's dialogs and the shield
+        // (`addTopChrome(this.keyboardBox)`, `layout.js:296-301`).
+        if let Some(rect) = self.osk_rect(output) {
+            let geo = self.global_space.output_geometry(output).unwrap();
+            let mut rect = rect;
+            rect.loc -= geo.loc.to_f64();
+            self.osk_ui.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.osk,
+                rect,
+                output_scale.x,
+                self.gnome_settings.accent_color,
+                &mut |elem| push(OutputRenderElements::UiTexture(elem)),
+            );
+        }
 
         // Next, the screen transition texture.
         {

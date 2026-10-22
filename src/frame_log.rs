@@ -737,6 +737,8 @@ bitflags::bitflags! {
         /// A pointer-accessibility pie counting down at the pointer.
         const POINTER_A11Y = 1 << 36;
         const MAGNIFIER = 1 << 37;
+        /// The on-screen keyboard sliding in or out.
+        const OSK = 1 << 38;
     }
 }
 
@@ -803,6 +805,7 @@ impl AnimCauses {
             (AnimCauses::BELL, "bell"),
             (AnimCauses::POINTER_A11Y, "pointer-a11y"),
             (AnimCauses::MAGNIFIER, "magnifier"),
+            (AnimCauses::OSK, "osk"),
         ];
         TABLE
             .iter()

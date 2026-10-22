@@ -34,6 +34,7 @@ use crate::utils::get_monotonic_time;
 const XKB_KEYCODE_OFFSET: u32 = 8;
 
 const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTALT: u32 = 100;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
@@ -199,6 +200,31 @@ fn send_button(state: &mut State, button_code: u32, button_state: ButtonState) {
         },
     };
     state.process_input_event(event);
+}
+
+/// Press or release a keysym as a virtual keyboard does (`notify_keyval_in_impl`,
+/// `meta-virtual-input-device-native.c`): the key that produces it in the active layout, with
+/// Shift and/or AltGr for the level it sits on pressed before the key and released after it.
+/// Returns false if no key produces it.
+pub fn send_keysym(state: &mut State, keysym: Keysym, key_state: KeyState) -> bool {
+    let Some((key_code, level)) = find_keysym(state, keysym) else {
+        return false;
+    };
+    let shift = (level & 1 == 1).then(|| Keycode::new(KEY_LEFTSHIFT + XKB_KEYCODE_OFFSET));
+    let altgr = (level >= 2).then(|| Keycode::new(KEY_RIGHTALT + XKB_KEYCODE_OFFSET));
+    let modifiers = [shift, altgr].into_iter().flatten();
+    if key_state == KeyState::Pressed {
+        for modifier in modifiers {
+            send_key(state, modifier, KeyState::Pressed);
+        }
+        send_key(state, key_code, KeyState::Pressed);
+    } else {
+        send_key(state, key_code, KeyState::Released);
+        for modifier in modifiers {
+            send_key(state, modifier, KeyState::Released);
+        }
+    }
+    true
 }
 
 /// Resolves a key given as an XKB keysym name, or as `code:N` for a raw decimal evdev

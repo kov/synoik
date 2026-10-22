@@ -6506,6 +6506,7 @@ impl State {
         // The emoji picker is not modal — it takes no pointer grab and the window under it keeps
         // its focus — so this only lights the cell or rail tab under the pointer. `pos` is global,
         // which is the space the picker's geometry is in.
+        self.osk_pointer_motion(pos);
         if self.synoik.emoji_picker.pointer_motion(pos) {
             self.synoik.queue_redraw_all();
         }
@@ -9025,6 +9026,12 @@ impl State {
 
         let button_state = event.state();
 
+        // The on-screen keyboard is over everything, the shield included, and takes both edges
+        // of a press on it: the release is claimed by `suppressed_buttons` below.
+        if self.osk_pointer_button(button_code, button_state == ButtonState::Pressed) {
+            return;
+        }
+
         // A click while the shield is down raises it. Both edges are swallowed, not just the
         // press: leaking the release alone would give whatever is underneath a button-up it never
         // saw pressed.
@@ -11336,6 +11343,11 @@ impl State {
         };
         let slot = evt.slot();
 
+        // The on-screen keyboard is over everything, and a touch on it is its own.
+        if self.osk_touch_down(crate::osk::touch_id(slot), pos) {
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
 
         let under = self.synoik.contents_under(pos);
@@ -11471,6 +11483,10 @@ impl State {
             return;
         };
         let slot = evt.slot();
+
+        if self.osk_touch_up(crate::osk::touch_id(slot)) {
+            return;
+        }
 
         if let Some(up) = self.synoik.screenshot_ui.pointer_up(Some(slot)) {
             self.handle_screenshot_ui_pointer_up(up);

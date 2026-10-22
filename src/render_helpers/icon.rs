@@ -527,6 +527,14 @@ fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> Symboli
 /// The names [`embedded_icon`] answers to, so a test can walk the table rather than trusting that
 /// each new arm was spelled the same in both places.
 pub const EMBEDDED_ICON_NAMES: &[&str] = &[
+    "osk-caps-lock-symbolic",
+    "osk-delete-symbolic",
+    "osk-emoji-picker-symbolic",
+    "osk-enter-symbolic",
+    "osk-hide-symbolic",
+    "osk-layout-symbolic",
+    "osk-shift-symbolic",
+    "osk-zwnj-symbolic",
     "no-notifications-symbolic",
     "notification-expand-symbolic",
     "notification-collapse-symbolic",
@@ -563,6 +571,31 @@ pub const EMBEDDED_ICON_NAMES: &[&str] = &[
 
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
     match name {
+        // The on-screen keyboard's (`data/icons/scalable/status/osk-*`).
+        "osk-caps-lock-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-caps-lock-symbolic.svg"
+        )),
+        "osk-delete-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-delete-symbolic.svg"
+        )),
+        "osk-emoji-picker-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-emoji-picker-symbolic.svg"
+        )),
+        "osk-enter-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-enter-symbolic.svg"
+        )),
+        "osk-hide-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-hide-symbolic.svg"
+        )),
+        "osk-layout-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-layout-symbolic.svg"
+        )),
+        "osk-shift-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-shift-symbolic.svg"
+        )),
+        "osk-zwnj-symbolic" => Some(include_bytes!(
+            "../../resources/icons/osk-zwnj-symbolic.svg"
+        )),
         // The dwell-click indicator's (`js/ui/status/dwellClick.js:14-31`).
         "pointer-primary-click-symbolic" => Some(include_bytes!(
             "../../resources/icons/pointer-primary-click-symbolic.svg"
