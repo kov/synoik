@@ -411,6 +411,15 @@ mod pw {
                 done,
                 deadline: Instant::now() + length + DRAIN_GRACE,
             });
+            // Wake the loop at the deadline, so a stream that never drains is reaped even when no
+            // other sound follows it.
+            let reaper = self.reaper.clone();
+            std::thread::Builder::new()
+                .name("synoik-sound-reap".to_owned())
+                .spawn(move || {
+                    std::thread::sleep(length + DRAIN_GRACE);
+                    let _ = reaper.send(Msg::Reap);
+                })?;
             Ok(())
         }
 
