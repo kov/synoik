@@ -9775,6 +9775,17 @@ impl State {
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
 
+        // The on-screen keyboard is over everything and takes the scroll there.
+        if self.osk_axis(
+            pointer.current_location(),
+            source != AxisSource::Wheel,
+            event.amount(Axis::Horizontal).unwrap_or(0.),
+            event.amount(Axis::Vertical).unwrap_or(0.),
+            timestamp,
+        ) {
+            return;
+        }
+
         let is_overview_open = self.synoik.layout.is_overview_open();
 
         // We should only handle scrolling in the overview if the pointer is not over a (top or

@@ -45877,6 +45877,26 @@ fn osk_emoji_page() {
     f.double_roundtrip(id);
     assert_eq!(f.client(id).text_input_events(), []);
 
+    // A touchpad's two-finger scroll turns it too, on the touchpad's own scale: a page per
+    // `TOUCHPAD_BASE_DISTANCE` of travel at `SCROLL_MULTIPLIER`.
+    let mid = (pager.loc.x + pager.size.w / 2., y);
+    pointer_motion_to(&mut f, mid.0, mid.1);
+    for _ in 0..30 {
+        f.scroll_finger(1., 0.);
+        run_for(&mut f, Duration::from_millis(16));
+    }
+    f.scroll_finger(0., 0.);
+    run_for(&mut f, Duration::from_millis(900));
+    assert_eq!(
+        f.synoik()
+            .osk
+            .emoji_indicators(pager.size.w)
+            .map(|(_, p)| p),
+        Some(2.)
+    );
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+
     // ABC is the letters again.
     let abc = osk_key_center(&mut f, |k| k.face == Face::Label("ABC".into()));
     osk_click(&mut f, abc);

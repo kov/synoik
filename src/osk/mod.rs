@@ -140,21 +140,29 @@ struct EmojiPage {
     swipe: Option<EmojiSwipe>,
 }
 
-/// A press on the pager that may turn into a swipe (`SwipeTracker` with `allowDrag`).
+/// A swipe on the pager (`SwipeTracker` with `allowDrag` and `allowScroll`): a press that may turn
+/// into a drag, or a touchpad's two-finger scroll.
 #[derive(Debug)]
 struct EmojiSwipe {
-    by: Presser,
+    /// The press dragging it; `None` for a touchpad scroll.
+    by: Option<Presser>,
     start: Point<f64, Logical>,
-    /// The pager's width, one page of progress.
+    /// The pager's width: how far one page of progress moves it.
     width: f64,
-    /// Past `DRAG_THRESHOLD_DISTANCE`, sideways.
+    /// Past `DRAG_THRESHOLD_DISTANCE`, sideways. A scroll has begun from its first event.
     begun: bool,
     last_x: f64,
+    /// In pages; positive brings the next page in.
+    progress: f64,
     tracker: crate::input::swipe_tracker::SwipeTracker,
 }
 
 /// `DRAG_THRESHOLD_DISTANCE` (`swipeTracker.js:28`).
 const DRAG_THRESHOLD: f64 = 16.;
+/// `TOUCHPAD_BASE_DISTANCE`: a touchpad scroll's travel per page (`swipeTracker.js:26`).
+const TOUCHPAD_PAGE: f64 = 400.;
+/// `SCROLL_MULTIPLIER` (`swipeTracker.js:27`).
+const SCROLL_MULTIPLIER: f64 = 10.;
 
 impl EmojiPage {
     fn new(base: Level) -> Self {
@@ -410,13 +418,55 @@ impl Osk {
             return;
         }
         emoji.swipe = Some(EmojiSwipe {
-            by,
+            by: Some(by),
             start: pos,
             width: width.max(1.),
             begun: false,
             last_x: pos.x,
+            progress: 0.,
             tracker: crate::input::swipe_tracker::SwipeTracker::new(),
         });
+    }
+
+    /// A touchpad scroll over the pager, `width` wide, `dx` sideways; a stop event (`dx` and `dy`
+    /// both 0) ends it. Returns whether anything moved.
+    pub fn emoji_scroll(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        width: f64,
+        time: Duration,
+        clock: &Clock,
+    ) -> bool {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return false;
+        };
+        if dx == 0. && dy == 0. {
+            if emoji.swipe.as_ref().is_some_and(|s| s.by.is_none()) {
+                return self.emoji_swipe_finish(time, clock, true);
+            }
+            return false;
+        }
+        if emoji.swipe.as_ref().is_some_and(|s| s.by.is_some()) {
+            return false;
+        }
+        let swipe = emoji.swipe.get_or_insert_with(|| EmojiSwipe {
+            by: None,
+            start: Point::default(),
+            width: width.max(1.),
+            begun: true,
+            last_x: 0.,
+            progress: 0.,
+            tracker: crate::input::swipe_tracker::SwipeTracker::new(),
+        });
+        emoji.slide = None;
+        let delta = dx * SCROLL_MULTIPLIER;
+        swipe.tracker.push(delta, time);
+        swipe.progress = (swipe.progress + delta / TOUCHPAD_PAGE).clamp(-1., 1.);
+        emoji.delta = -swipe.progress * swipe.width;
+        self.cancel_press();
+        self.bump();
+        true
     }
 
     /// The presser moved. Returns whether the swipe has it.
@@ -429,7 +479,7 @@ impl Osk {
         let Some(emoji) = self.emoji.as_mut() else {
             return false;
         };
-        let Some(swipe) = emoji.swipe.as_mut().filter(|s| s.by == by) else {
+        let Some(swipe) = emoji.swipe.as_mut().filter(|s| s.by == Some(by)) else {
             return false;
         };
         if !swipe.begun {
@@ -449,8 +499,8 @@ impl Osk {
         swipe.tracker.push(-(pos.x - swipe.last_x), time);
         swipe.last_x = pos.x;
         let width = swipe.width;
-        let delta = (pos.x - swipe.start.x).clamp(-width, width);
-        emoji.delta = delta;
+        swipe.progress = (-(pos.x - swipe.start.x) / width).clamp(-1., 1.);
+        emoji.delta = -swipe.progress * width;
         // `_onSwipeUpdate`: the key under the drag lets go without acting.
         self.cancel_press();
         self.bump();
@@ -463,22 +513,33 @@ impl Osk {
         let Some(emoji) = self.emoji.as_mut() else {
             return false;
         };
-        if !emoji.swipe.as_ref().is_some_and(|s| s.by == by) {
+        if !emoji.swipe.as_ref().is_some_and(|s| s.by == Some(by)) {
             return false;
         }
-        let mut swipe = emoji.swipe.take().unwrap();
+        self.emoji_swipe_finish(time, clock, false)
+    }
+
+    /// `_endGesture` → `_onSwipeEnd`: settle on the page the release points at.
+    fn emoji_swipe_finish(&mut self, time: Duration, clock: &Clock, touchpad: bool) -> bool {
+        let Some(emoji) = self.emoji.as_mut() else {
+            return false;
+        };
+        let Some(mut swipe) = emoji.swipe.take() else {
+            return false;
+        };
         if !swipe.begun {
             return false;
         }
         swipe.tracker.release(time);
         let width = swipe.width;
-        let progress = -emoji.delta / width;
+        let progress = swipe.progress;
         let velocity = swipe.tracker.velocity() / 1000.;
         let end =
-            crate::input::swipe_tracker::end_progress(0., progress, (-1., 1.), velocity, false);
-        // `|Δprogress| / velocity * DURATION_MULTIPLIER`, clamped to
-        // `[MIN_ANIMATION_DURATION, MAX_ANIMATION_DURATION * log2(1 + nPoints)]`.
-        let per_ms = (velocity / width).abs();
+            crate::input::swipe_tracker::end_progress(0., progress, (-1., 1.), velocity, touchpad);
+        // `|Δprogress| / velocity * DURATION_MULTIPLIER`, the velocity per page of travel, clamped
+        // to `[MIN_ANIMATION_DURATION, MAX_ANIMATION_DURATION * log2(1 + nPoints)]`.
+        let distance = if touchpad { TOUCHPAD_PAGE } else { width };
+        let per_ms = (velocity / distance).abs();
         let max = 400. * 4f64.log2();
         let ms = if per_ms == 0. {
             max
@@ -509,7 +570,7 @@ impl Osk {
 
     /// Who holds the emoji pager, if anyone.
     pub fn emoji_swipe_presser(&self) -> Option<Presser> {
-        self.emoji.as_ref()?.swipe.as_ref().map(|s| s.by)
+        self.emoji.as_ref()?.swipe.as_ref()?.by
     }
 
     /// Whether a presser is the keyboard's: on a key, or on the pager.
@@ -1338,6 +1399,41 @@ impl State {
             return true;
         }
         self.synoik.osk.holds(by)
+    }
+
+    /// A scroll over the keyboard: a touchpad's turns the emoji pages, and whatever the source, the
+    /// keyboard takes it. Returns whether it was over the keyboard.
+    pub fn osk_axis(
+        &mut self,
+        pos: Point<f64, Logical>,
+        continuous: bool,
+        dx: f64,
+        dy: f64,
+        time: Duration,
+    ) -> bool {
+        let clock = self.synoik.clock.clone();
+        if self.synoik.osk_hit(pos).is_none() {
+            // Leaving the keyboard ends a scroll it had going.
+            if self.synoik.osk.emoji_scroll(0., 0., 0., time, &clock) {
+                self.synoik.queue_redraw_all();
+            }
+            return false;
+        }
+        // `ScrollGesture` takes only smooth scrolling, and only over the pager.
+        if continuous {
+            if let Some(pager) = self.synoik.osk_emoji_pager() {
+                let stop = dx == 0. && dy == 0.;
+                if (pager.contains(pos) || stop)
+                    && self
+                        .synoik
+                        .osk
+                        .emoji_scroll(dx, dy, pager.size.w, time, &clock)
+                {
+                    self.synoik.queue_redraw_all();
+                }
+            }
+        }
+        true
     }
 
     /// A press on the emoji pager may be the start of a swipe.
