@@ -92,6 +92,7 @@ use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
 };
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
+use crate::protocols::gtk_shell::GtkShellHandler;
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
@@ -105,7 +106,7 @@ use crate::protocols::virtual_pointer::{
 use crate::synoik::{DndIcon, NewClient, State};
 use crate::utils::{ipc_transform_to_smithay, output_size, send_scale_transform};
 use crate::{
-    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
+    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control, delegate_gtk_shell,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
     delegate_session_management, delegate_virtual_pointer,
 };
@@ -626,6 +627,22 @@ impl XdgSystemBellHandler for State {
     }
 }
 delegate_xdg_system_bell!(State);
+
+impl GtkShellHandler for State {
+    fn system_bell(&mut self, surface: Option<WlSurface>) {
+        // A `gtk_surface1` that is not a window rings nothing at all
+        // (`gtk_shell_system_bell`, `meta-wayland-gtk-shell.c:547-549`) — unlike
+        // `xdg_system_bell_v1`, where an unknown surface still rings for no window.
+        if let Some(surface) = &surface {
+            let root = self.synoik.find_root_shell_surface(surface);
+            if self.synoik.layout.find_window_and_output(&root).is_none() {
+                return;
+            }
+        }
+        self.ring_bell(surface.as_ref());
+    }
+}
+delegate_gtk_shell!(State);
 
 impl ForeignToplevelHandler for State {
     fn foreign_toplevel_manager_state(&mut self) -> &mut ForeignToplevelManagerState {

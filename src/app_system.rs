@@ -802,7 +802,7 @@ impl AppSystem {
     /// 4. a `new-window` desktop action → yes;
     /// 5. a unique GtkApplication with no new-window → no. **Not implemented**: it reads the
     ///    window's GTK application object path and unique bus name, which reach mutter over
-    ///    `gtk_shell1.set_dbus_properties`, a protocol we do not serve. This is the rung that
+    ///    `gtk_shell1.set_dbus_properties`, a request we accept and drop. This is the rung that
     ///    answers "no" for apps like System Monitor, which declare nothing and simply are
     ///    single-window GtkApplications;
     /// 6. otherwise yes — GNOME's own err-on-the-side-of-compatibility default (`:667-671`).

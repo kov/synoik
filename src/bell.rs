@@ -6,10 +6,11 @@
 //! the compositor for (`meta_compositor_flash_display` / `_flash_window`,
 //! `src/compositor/compositor.c:1350-1438`).
 //!
-//! A bell comes from a client (`xdg_system_bell_v1.ring`). With `visual-bell` on, it flashes the
-//! whole screen or, under `visual-bell-type = frame-flash`, the ringing window — a black overlay
-//! easing in to 75% and back out. The audible half (`audible-bell`, the theme's
-//! `bell-window-system` sound) needs a sound-theme player, which we do not have.
+//! A bell comes from a client (`xdg_system_bell_v1.ring`, or GTK3's `gtk_shell1.system_bell`).
+//! With `visual-bell` on, it flashes the whole screen or, under `visual-bell-type = frame-flash`,
+//! the ringing window — a black overlay easing in to 75% and back out. The audible half
+//! (`audible-bell`) is [`crate::synoik::State::ring_bell`]'s call into
+//! [`crate::sound_player`].
 //!
 //! **Divergence:** a double flash (the first bell, or one after a 3 s quiet) is two complete
 //! flashes here. mutter asks Clutter for `repeat_count = 2` with auto-reverse, which is *three*

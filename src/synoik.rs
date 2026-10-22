@@ -167,6 +167,7 @@ use crate::output_identity::OutputIdentity;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
+use crate::protocols::gtk_shell::GtkShellState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
@@ -668,6 +669,7 @@ pub struct Synoik {
     pub activation_state: XdgActivationState,
     pub xdg_system_bell_state: XdgSystemBellState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
+    pub gtk_shell_state: GtkShellState,
     pub session_manager_state: SessionManagerState,
     /// Armed by [`State::schedule_session_save`]; `None` means no write is pending.
     pub session_save_timer: Option<TimerToken>,
@@ -976,6 +978,9 @@ pub struct Synoik {
     /// tests get `StubAudio`. `None` when the connection failed, is disabled, or the run is
     /// headless — every caller must therefore tolerate an absent backend.
     pub audio_backend: Option<Box<dyn crate::audio::AudioBackend>>,
+    /// Plays event sounds (the audible bell). `None` where nothing may make noise: headless
+    /// runs, and builds without the `audio` feature.
+    pub sound_player: Option<Box<dyn crate::sound_player::SoundPlayer>>,
     /// The decoded `org.gnome.desktop.background` picture, drawn as the
     /// workspace background in GNOME windowing mode.
     pub wallpaper: Wallpaper,
@@ -6583,6 +6588,12 @@ impl State {
     /// `bell_flash_frame` does for a NULL window. The audible half needs a sound-theme player we
     /// do not have.
     pub fn ring_bell(&mut self, surface: Option<&WlSurface>) {
+        // The two halves are independent: neither the Visual Alerts switch nor the flash's rate
+        // limit silences the sound (`meta_bell_notify`, `bell.c:244-254`).
+        if self.synoik.gnome_settings.audible_bell {
+            self.synoik
+                .play_theme_sound("bell-window-system", "Bell event");
+        }
         if !self
             .synoik
             .gnome_settings
@@ -8715,6 +8726,7 @@ impl Synoik {
             });
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         let xdg_system_bell_state = XdgSystemBellState::new::<State>(&display_handle);
+        let gtk_shell_state = GtkShellState::new::<State>(&display_handle);
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         // Starts empty and in memory; `State::new` loads the real file, except in tests.
@@ -8985,6 +8997,7 @@ impl Synoik {
             audio_cards: crate::audio::AudioCards::default(),
             headphones: None,
             audio_backend: None,
+            sound_player: None,
             system_status: SystemStatus::default(),
             battery_override: None,
             network_override: None,
@@ -9074,6 +9087,7 @@ impl Synoik {
             activation_state,
             xdg_system_bell_state,
             mutter_x11_interop_state,
+            gtk_shell_state,
             session_manager_state,
             session_save_timer: None,
             workspace_names: crate::workspace_names::WorkspaceNameStore::in_memory(),
@@ -11375,6 +11389,18 @@ impl Synoik {
         // names the closure, and every request would be charged to this line.
         let caller = Location::caller();
         self.redraw_requester.unwrap_or(Requester::Internal(caller))
+    }
+
+    /// `meta_sound_player_play_from_theme`: play `event_id` from the user's sound theme, unless
+    /// event sounds are off.
+    pub fn play_theme_sound(&self, event_id: &str, description: &str) {
+        let settings = &self.gnome_settings;
+        if !settings.event_sounds {
+            return;
+        }
+        if let Some(player) = &self.sound_player {
+            player.play_from_theme(&settings.sound_theme_name, event_id, description);
+        }
     }
 
     #[track_caller]

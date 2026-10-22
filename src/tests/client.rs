@@ -59,6 +59,8 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_scre
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_backend::client::Backend;
 
+use crate::protocols::raw::gtk_shell::v1::client::gtk_shell1::GtkShell1;
+use crate::protocols::raw::gtk_shell::v1::client::gtk_surface1::GtkSurface1;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::{
     Reason, XdgSessionManagerV1,
 };
@@ -126,6 +128,7 @@ pub struct State {
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     pub idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     pub system_bell: Option<XdgSystemBellV1>,
+    pub gtk_shell: Option<GtkShell1>,
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     /// The in-flight wlr-screencopy capture, if any. One at a time is enough for tests.
     pub screencopy: Option<ScreencopyCapture>,
@@ -458,6 +461,7 @@ impl Client {
             shortcuts_inhibit_manager: None,
             idle_inhibit_manager: None,
             system_bell: None,
+            gtk_shell: None,
             screencopy_manager: None,
             screencopy: None,
             keyboard: None,
@@ -597,6 +601,24 @@ impl Client {
             .as_ref()
             .expect("compositor advertises xdg_system_bell_v1")
             .ring(surface);
+    }
+
+    /// A `wl_surface` with no role: not a window, as far as the compositor can tell.
+    pub fn create_bare_surface(&mut self) -> WlSurface {
+        let compositor = self.state.compositor.as_ref().unwrap();
+        compositor.create_surface(&self.qh, ())
+    }
+
+    /// Ring the bell the way GTK3 does: `gtk_shell1.system_bell`, through a `gtk_surface1` made
+    /// for `surface` (or none).
+    pub fn ring_gtk_bell(&mut self, surface: Option<&WlSurface>) {
+        let shell = self
+            .state
+            .gtk_shell
+            .clone()
+            .expect("compositor advertises gtk_shell1");
+        let gtk_surface = surface.map(|s| shell.get_gtk_surface(s, &self.qh, ()));
+        shell.system_bell(gtk_surface.as_ref());
     }
 
     /// Begin a wlr-screencopy capture of `output`. The compositor answers with `buffer` +
@@ -1438,6 +1460,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwpIdleInhibitManagerV1::interface().name {
                     let version = min(version, ZwpIdleInhibitManagerV1::interface().version);
                     state.idle_inhibit_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == GtkShell1::interface().name {
+                    let version = min(version, GtkShell1::interface().version);
+                    state.gtk_shell = Some(registry.bind(name, version, qh, ()));
                 } else if interface == XdgSystemBellV1::interface().name {
                     let version = min(version, XdgSystemBellV1::interface().version);
                     state.system_bell = Some(registry.bind(name, version, qh, ()));
@@ -2155,6 +2180,30 @@ impl Dispatch<ZwpIdleInhibitManagerV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<GtkShell1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &GtkShell1,
+        _event: <GtkShell1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<GtkSurface1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &GtkSurface1,
+        _event: <GtkSurface1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 

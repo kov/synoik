@@ -90,3 +90,53 @@ pub mod mutter_x11_interop {
         }
     }
 }
+
+/// `gtk_shell1`, GTK's private protocol, vendored from mutter 50.3
+/// (`src/wayland/protocol/gtk-shell.xml`). Served only for GTK3's bell; see
+/// [`crate::protocols::gtk_shell`].
+pub mod gtk_shell {
+    pub mod v1 {
+        #[cfg(test)]
+        pub use self::generated::client;
+        pub use self::generated::server;
+
+        mod generated {
+            pub mod server {
+                #![allow(dead_code, non_camel_case_types, unused_unsafe, unused_variables)]
+                #![allow(non_upper_case_globals, non_snake_case, unused_imports)]
+                #![allow(missing_docs, clippy::all)]
+
+                use smithay::reexports::wayland_server;
+                use wayland_server::protocol::*;
+
+                pub mod __interfaces {
+                    use smithay::reexports::wayland_server;
+                    use wayland_server::protocol::__interfaces::*;
+                    wayland_scanner::generate_interfaces!("resources/gtk-shell.xml");
+                }
+                use self::__interfaces::*;
+
+                wayland_scanner::generate_server_code!("resources/gtk-shell.xml");
+            }
+
+            /// The client half, for the test fixture's Wayland client only.
+            #[cfg(test)]
+            pub mod client {
+                #![allow(dead_code, non_camel_case_types, unused_unsafe, unused_variables)]
+                #![allow(non_upper_case_globals, non_snake_case, unused_imports)]
+                #![allow(missing_docs, clippy::all)]
+
+                use wayland_client;
+                use wayland_client::protocol::*;
+
+                pub mod __interfaces {
+                    use wayland_client::protocol::__interfaces::*;
+                    wayland_scanner::generate_interfaces!("resources/gtk-shell.xml");
+                }
+                use self::__interfaces::*;
+
+                wayland_scanner::generate_client_code!("resources/gtk-shell.xml");
+            }
+        }
+    }
+}

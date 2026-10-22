@@ -19304,8 +19304,8 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
 /// rungs below the key currently bottom out in GNOME's own "err on the side of yes" default, so
 /// absent and `false` both end at yes. The tri-state is modelled now because the rung that will
 /// make them diverge — a unique GtkApplication with no new-window action, which is what answers
-/// *no* for apps like System Monitor — needs `gtk_shell1.set_dbus_properties`, a protocol we do
-/// not serve. Collapsing the key to a plain boolean today would be invisible and wrong later.
+/// *no* for apps like System Monitor — needs `gtk_shell1.set_dbus_properties`, which we accept
+/// and drop. Collapsing the key to a plain boolean today would be invisible and wrong later.
 #[test]
 fn a_single_window_app_cannot_be_asked_for_a_new_window() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
@@ -44233,6 +44233,136 @@ fn a_frame_bell_flashes_the_ringing_window() {
         f.synoik().bell_flash.is_some(),
         "no window: the whole screen"
     );
+}
+
+/// [`visual_bell_fixture`] with a recording sound player installed.
+fn audible_bell_fixture(
+    test: &str,
+) -> Option<(
+    Fixture,
+    ClientId,
+    WlSurface,
+    crate::sound_player::StubSoundPlayer,
+)> {
+    let (mut f, id, surface) =
+        visual_bell_fixture(test, crate::bell::VisualBellType::FullscreenFlash)?;
+    let player = crate::sound_player::StubSoundPlayer::default();
+    f.synoik().sound_player = Some(Box::new(player.clone()));
+    Some((f, id, surface, player))
+}
+
+fn bell_sound(theme: &str) -> (String, String) {
+    (theme.to_owned(), "bell-window-system".to_owned())
+}
+
+/// The audible half of a bell plays the theme's `bell-window-system` (`bell.c:229-238`), and
+/// neither the Visual Alerts switch nor the flash's 500 ms limit holds it back: `meta_bell_notify`
+/// runs the two halves independently.
+#[test]
+fn a_bell_plays_the_theme_sound_whatever_the_flash_does() {
+    let Some((mut f, id, surface, player)) =
+        audible_bell_fixture("a_bell_plays_the_theme_sound_whatever_the_flash_does")
+    else {
+        return;
+    };
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert!(f.synoik().bell_flash.is_some());
+    assert_eq!(player.played(), [bell_sound("freedesktop")]);
+
+    f.advance_clock(Duration::from_millis(100));
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(
+        player.played().len(),
+        2,
+        "the flash's gate is not the sound's"
+    );
+
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(A11yToggle::VisualAlerts, false);
+    f.client(id).ring_bell(None);
+    f.roundtrip(id);
+    assert_eq!(player.played().len(), 3, "Visual Alerts off: still audible");
+}
+
+/// `audible-bell` off silences the bell, and so does `event-sounds` off, the switch over every
+/// event sound; the sound comes from the user's `theme-name`.
+#[test]
+fn audible_bell_and_event_sounds_each_silence_the_bell() {
+    let Some((mut f, id, surface, player)) =
+        audible_bell_fixture("audible_bell_and_event_sounds_each_silence_the_bell")
+    else {
+        return;
+    };
+    f.synoik().gnome_settings.audible_bell = false;
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [], "audible-bell off");
+
+    let settings = &mut f.synoik().gnome_settings;
+    settings.audible_bell = true;
+    settings.event_sounds = false;
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [], "event-sounds off");
+
+    let settings = &mut f.synoik().gnome_settings;
+    settings.event_sounds = true;
+    settings.sound_theme_name = "__custom".to_owned();
+    f.client(id).ring_bell(Some(&surface));
+    f.roundtrip(id);
+    assert_eq!(player.played(), [bell_sound("__custom")]);
+}
+
+/// GTK3 rings through `gtk_shell1.system_bell`, naming its window by a `gtk_surface1`; that
+/// window flashes under `frame-flash`, and a bell naming no `gtk_surface1` flashes the screen
+/// (`gtk_shell_system_bell`, `meta-wayland-gtk-shell.c:533-556`).
+#[test]
+fn a_gtk3_bell_flashes_the_ringing_window() {
+    let Some((mut f, id, surface)) = visual_bell_fixture(
+        "a_gtk3_bell_flashes_the_ringing_window",
+        crate::bell::VisualBellType::FrameFlash,
+    ) else {
+        return;
+    };
+    f.client(id).ring_gtk_bell(Some(&surface));
+    f.roundtrip(id);
+    assert!(window_bell_flash(&mut f).is_some(), "the window flashes");
+    assert_eq!(f.synoik().bell_flash, None);
+
+    f.advance_clock(crate::bell::MIN_TIME_BETWEEN_VISUAL_ALERTS);
+    f.client(id).ring_gtk_bell(None);
+    f.roundtrip(id);
+    assert!(
+        f.synoik().bell_flash.is_some(),
+        "no window: the whole screen"
+    );
+}
+
+/// A `gtk_surface1` whose surface is no window rings nothing at all — no flash, no sound
+/// (`meta-wayland-gtk-shell.c:547-549`). `xdg_system_bell_v1` differs: there an unknown surface
+/// still rings, for no window.
+#[test]
+fn a_gtk3_bell_from_a_surface_that_is_no_window_rings_nothing() {
+    let Some((mut f, id, _, player)) =
+        audible_bell_fixture("a_gtk3_bell_from_a_surface_that_is_no_window_rings_nothing")
+    else {
+        return;
+    };
+    let bare = f.client(id).create_bare_surface();
+    f.client(id).ring_gtk_bell(Some(&bare));
+    f.roundtrip(id);
+    assert_eq!(f.synoik().bell_flash, None);
+    assert_eq!(window_bell_flash(&mut f), None);
+    assert_eq!(player.played(), []);
+
+    f.client(id).ring_bell(Some(&bare));
+    f.roundtrip(id);
+    assert!(f.synoik().bell_flash.is_some(), "xdg_system_bell_v1 rings");
+    assert_eq!(player.played().len(), 1);
 }
 
 /// A bell inside 500 ms of the last flash is dropped, and does not restart the flash that is
