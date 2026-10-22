@@ -246,6 +246,8 @@ pub struct Osk {
     long_pressed: bool,
     /// `_deleteEnabled` / `_backspacePressed`.
     delete_held: bool,
+    /// `_surroundingTextId`: the level waits on the field's next surrounding text.
+    awaiting_surrounding: bool,
     subkeys: Option<Subkeys>,
     emoji: Option<EmojiPage>,
     focus_window: Option<FocusWindow>,
@@ -278,6 +280,7 @@ impl Default for Osk {
             hovered: None,
             long_pressed: false,
             delete_held: false,
+            awaiting_surrounding: false,
             subkeys: None,
             emoji: None,
             focus_window: None,
@@ -645,9 +648,35 @@ impl Osk {
             self.set_active_level("shift");
             return;
         }
+        // `AUTO_CAPITALIZATION` and `TITLECASE`: the level waits on the next surrounding text
+        // the field sends — a Wayland client sends it with its every state — to see what the
+        // caret follows (`surrounding-text-set`, `request_surrounding`).
+        if self.hints & (hints::UPPERCASE_SENTENCES | hints::UPPERCASE_WORDS) != 0 {
+            self.awaiting_surrounding = true;
+            return;
+        }
         if user_input && self.page == "shift" {
             self.set_active_level("default");
         }
+    }
+
+    /// The field's surrounding text arrived. If the level was waiting on it, the caret at the start
+    /// of the text, after a space in title case or after a full stop in a sentence capitalises.
+    pub fn surrounding_text_set(&mut self, text: &str, cursor: usize) {
+        if !std::mem::take(&mut self.awaiting_surrounding) {
+            return;
+        }
+        let before = text.get(..cursor).unwrap_or(text);
+        let shift = if text.is_empty() || cursor == 0 {
+            true
+        } else if self.hints & hints::UPPERCASE_WORDS != 0 {
+            before.ends_with(' ')
+        } else if self.hints & hints::UPPERCASE_SENTENCES != 0 {
+            before.trim_end().ends_with('.')
+        } else {
+            return;
+        };
+        self.set_active_level(if shift { "shift" } else { "default" });
     }
 
     /// A key went down (`Key._press`). Returns whether it started a long-press clock.
@@ -950,8 +979,13 @@ impl State {
         self.synoik.queue_redraw_all();
     }
 
-    /// `getCurrentGroup`: the active input source's xkb layout.
-    fn sync_osk_group(&mut self) {
+    /// `getCurrentGroup`: the active input source's xkb layout, and the focused field's content
+    /// type — its purpose picks the layout (`purpose-changed` → `_updateKeys`), its hints the
+    /// level (`content-hints-changed` → `_updateLevelFromHints(false)`).
+    pub(crate) fn sync_osk_group(&mut self) {
+        if !self.synoik.osk.enabled {
+            return;
+        }
         let sources = &self.synoik.gnome_settings.input_sources;
         let group = sources
             .mru_sources
@@ -962,11 +996,15 @@ impl State {
             .map_or_else(|| "us".to_owned(), |(_, id)| id.clone());
         let (purpose, hints) = self.osk_content_type();
         let osk = &mut self.synoik.osk;
+        let hints_changed = osk.hints != hints;
         osk.hints = hints;
         if osk.group != group || osk.purpose != purpose || osk.layout.is_none() {
             osk.group = group;
             osk.purpose = purpose;
             osk.update_keys();
+            self.synoik.queue_redraw_all();
+        } else if hints_changed {
+            osk.update_level_from_hints(false);
             self.synoik.queue_redraw_all();
         }
     }
@@ -1821,6 +1859,34 @@ mod tests {
         assert!(osk.subkeys().is_some());
         assert!(osk.subkeys_release(Presser::Touch(3)).is_empty());
         assert!(osk.subkeys().is_none());
+    }
+
+    #[test]
+    fn sentences_and_titles_capitalise_from_the_surrounding_text() {
+        let mut osk = osk();
+        osk.hints = hints::UPPERCASE_SENTENCES;
+        osk.update_level_from_hints(false);
+        assert_eq!(osk.page, "default", "waiting on the text");
+        osk.surrounding_text_set("", 0);
+        assert_eq!(osk.page, "shift", "the start of the text");
+
+        osk.update_level_from_hints(true);
+        osk.surrounding_text_set("Hello. ", 7);
+        assert_eq!(osk.page, "shift");
+        osk.update_level_from_hints(true);
+        osk.surrounding_text_set("Hello. W", 8);
+        assert_eq!(osk.page, "default");
+        // Only the one that was asked for: a stray update changes nothing.
+        osk.surrounding_text_set("", 0);
+        assert_eq!(osk.page, "default");
+
+        osk.hints = hints::UPPERCASE_WORDS;
+        osk.update_level_from_hints(true);
+        osk.surrounding_text_set("Grand Hotel ", 12);
+        assert_eq!(osk.page, "shift");
+        osk.update_level_from_hints(true);
+        osk.surrounding_text_set("Grand Hotel", 11);
+        assert_eq!(osk.page, "default");
     }
 
     #[test]

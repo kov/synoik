@@ -516,6 +516,10 @@ impl State {
                         anchor,
                     });
                 }
+                if im.focus == ImFocus::Client {
+                    self.synoik.osk.surrounding_text_set(&text, cursor as usize);
+                    self.synoik.queue_redraw_all();
+                }
                 // Keep it regardless: `delete_surrounding_text` comes back in characters and goes
                 // out in bytes, and only this text can convert between them.
                 self.synoik.im_surrounding = Some((text, cursor));
@@ -527,6 +531,7 @@ impl State {
                 if im.focus == ImFocus::Client {
                     im.content_type = (purpose, hints);
                     im.send(ImRequest::ContentType { purpose, hints });
+                    self.sync_osk_group();
                 }
             }
             // Not forwarded to IBus: the engine only needs this to place a candidate popup, which

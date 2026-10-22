@@ -45916,3 +45916,40 @@ fn osk_emoji_page() {
     assert!(f.synoik().osk.is_visible());
     assert!(!f.synoik().osk.emoji_active());
 }
+
+/// A field that asks for sentence capitalisation gets the shift level at its start and after a
+/// full stop, from the surrounding text it sends (`_updateLevelFromHints`), and the letters back
+/// once a capital is in.
+#[test]
+fn osk_capitalises_sentences() {
+    use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
+        ContentHint, ContentPurpose,
+    };
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    f.client(id)
+        .set_content_type(ContentHint::AutoCapitalization, ContentPurpose::Normal);
+    f.client(id).set_surrounding_text("", 0, 0);
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let page = |f: &mut Fixture| f.synoik().osk.level().unwrap().name.clone();
+    // The surrounding text that answers the hint is the one after it.
+    f.client(id).set_surrounding_text("", 0, 0);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(page(&mut f), "shift");
+
+    let h = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("H"));
+    osk_click(&mut f, h);
+    f.client(id).set_surrounding_text("H", 1, 1);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(page(&mut f), "default");
+
+    let dot = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("."));
+    osk_click(&mut f, dot);
+    f.client(id).set_surrounding_text("Hi. ", 4, 4);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(page(&mut f), "shift");
+}
