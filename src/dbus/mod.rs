@@ -48,6 +48,7 @@ pub mod user_switching;
 pub mod gnome_shell_screencast;
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod mutter_screen_cast;
+pub mod search_provider;
 pub mod smartcard;
 pub mod status_notifier;
 #[cfg(feature = "xdp-gnome-screencast")]
