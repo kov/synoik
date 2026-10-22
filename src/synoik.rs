@@ -3806,7 +3806,7 @@ impl State {
             KeyboardFocus::ScreenshotUi
         } else if self.synoik.switcher.is_open() {
             KeyboardFocus::Switcher
-        } else if self.synoik.panel_popover.grabs_input() {
+        } else if self.synoik.panel_popover.takes_key_focus() {
             KeyboardFocus::Popover
         } else if let Some(output) = self.synoik.layout.active_output() {
             let mon = self.synoik.layout.monitor_for_output(output).unwrap();
@@ -12763,13 +12763,20 @@ impl Synoik {
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
             // bar; the quick-settings menu composites several elements (chrome + icons).
             // It rides the same slide so a menu caught by a switch travels with its button.
-            for element in self.panel_popover.render(
-                ctx.renderer,
-                &self.icon_cache,
-                &self.app_icon_cache,
-                &self.image_cache,
-                output,
-            ) {
+            // The on-screen keyboard's language menu is not the panel's: it goes over the
+            // keyboard, with it.
+            let elements = if self.panel_popover.is_osk_languages() {
+                Vec::new()
+            } else {
+                self.panel_popover.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    &self.image_cache,
+                    output,
+                )
+            };
+            for element in elements {
                 push(
                     RelocateRenderElement::from_element(element, panel_slide, Relocate::Relative)
                         .into(),
@@ -12858,6 +12865,25 @@ impl Synoik {
         // (`addTopChrome(this.keyboardBox)`, `layout.js:296-301`).
         if let Some(rect) = self.osk_rect(output) {
             let geo = self.global_space.output_geometry(output).unwrap();
+            // Its language menu (`addTopChrome(this._languagePopup.actor)`, after the keyboard).
+            if self.panel_popover.is_osk_languages() {
+                for element in self.panel_popover.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    &self.image_cache,
+                    output,
+                ) {
+                    push(
+                        RelocateRenderElement::from_element(
+                            element,
+                            Point::default(),
+                            Relocate::Relative,
+                        )
+                        .into(),
+                    );
+                }
+            }
             if let Some(mut subkeys) = self.osk_subkeys_geometry() {
                 let shift = geo.loc.to_f64();
                 subkeys.rect.loc -= shift;

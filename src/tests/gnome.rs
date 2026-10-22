@@ -45732,3 +45732,62 @@ fn osk_slides_the_focused_window_out_of_its_way() {
     assert!(!f.synoik().osk.is_visible());
     assert_eq!(osk_focused_window_y(&mut f), up);
 }
+
+/// The language key brings up the input sources over itself, with "Keyboard Settings" and none of
+/// the panel menu's extras (`LanguageSelectionPopup`). A click on the keyboard while it is up only
+/// closes it, and the keyboard going takes it along.
+#[test]
+fn osk_language_key_lists_the_input_sources() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let output = f.synoik_output(1);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let globe = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::LanguageMenu)
+    });
+    osk_click(&mut f, globe);
+    run_for(&mut f, Duration::from_millis(300));
+    let popover = &f.synoik().panel_popover;
+    assert!(popover.grabs_input());
+    assert!(
+        !matches!(
+            f.synoik().keyboard_focus,
+            crate::synoik::KeyboardFocus::Popover
+        ),
+        "the field keeps the focus, and with it the keyboard"
+    );
+    let popover = &f.synoik().panel_popover;
+    assert!(popover.contains(&output, Point::from((globe.0, globe.1 - 60.))));
+    assert!(
+        !popover.contains(&output, Point::from(globe)),
+        "above the key"
+    );
+    let rows = popover.input_source_rows();
+    assert_eq!(rows.last().map(String::as_str), Some("Keyboard Settings"));
+    assert!(!rows.iter().any(|r| r == "Show Keyboard Layout"));
+
+    let _ = f.client(id).text_input_events();
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    assert!(!f.synoik().panel_popover.grabs_input());
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id)
+            .text_input_events()
+            .contains(&Ti::CommitString(Some("q".into()))),
+        "the click only closed the menu"
+    );
+
+    osk_click(&mut f, globe);
+    assert!(f.synoik().panel_popover.grabs_input());
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(100));
+    assert!(!f.synoik().panel_popover.grabs_input());
+}

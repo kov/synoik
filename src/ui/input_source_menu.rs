@@ -13,6 +13,10 @@
 //! and "Keyboard Settings" (opens the control-center keyboard panel). Clicking a
 //! layout row switches the active group and records it in `mru-sources`.
 //!
+//! The on-screen keyboard's language key opens the same menu without the short labels and
+//! "Show Keyboard Layout" ([`InputSourceMenu::for_keyboard`]; `LanguageSelectionPopup`,
+//! `js/ui/keyboard.js:158-186`).
+//!
 //! Divergences from gnome-shell: the active row is marked with a check
 //! (`object-select-symbolic`) rather than a radio `Ornament.DOT`; IBus property
 //! sub-menus are absent (no IBus in this fork).
@@ -84,6 +88,8 @@ pub struct InputSourceMenu {
     hovered: Option<usize>,
     /// The keyboard-focused row, same indexing.
     focused: Option<usize>,
+    /// The on-screen keyboard's `LanguageSelectionPopup`.
+    for_keyboard: bool,
     revision: u64,
     bg_cache: RefCell<BakeCache>,
 }
@@ -95,21 +101,35 @@ impl InputSourceMenu {
             active,
             hovered: None,
             focused: None,
+            for_keyboard: false,
             revision: 0,
             bg_cache: RefCell::new(BakeCache::new()),
         }
     }
 
-    /// Total row count: one per layout, then the two fixed trailing items.
+    /// The on-screen keyboard's language menu: the sources by name, then only "Keyboard
+    /// Settings".
+    pub fn for_keyboard(items: Vec<InputSourceItem>, active: usize) -> Self {
+        Self {
+            for_keyboard: true,
+            ..Self::new(items, active)
+        }
+    }
+
+    pub fn is_for_keyboard(&self) -> bool {
+        self.for_keyboard
+    }
+
+    /// Total row count: one per layout, then the fixed trailing items.
     fn row_count(&self) -> usize {
-        self.items.len() + 2
+        self.items.len() + if self.for_keyboard { 1 } else { 2 }
     }
 
     fn row_kind(&self, k: usize) -> RowKind {
         let n = self.items.len();
         if k < n {
             RowKind::Layout(k)
-        } else if k == n {
+        } else if k == n && !self.for_keyboard {
             RowKind::ShowLayout
         } else {
             RowKind::Settings
@@ -139,13 +159,22 @@ impl InputSourceMenu {
             .iter()
             .map(|i| measure(&i.display))
             .fold(0., f64::max);
-        let w_short = self
-            .items
-            .iter()
-            .map(|i| measure(&i.short))
-            .fold(0., f64::max);
-        let w_action = measure("Show Keyboard Layout").max(measure("Keyboard Settings"));
-        let content = (ORN_W + w_display + LABEL_GAP + w_short).max(w_action);
+        let w_short = if self.for_keyboard {
+            0.
+        } else {
+            LABEL_GAP
+                + self
+                    .items
+                    .iter()
+                    .map(|i| measure(&i.short))
+                    .fold(0., f64::max)
+        };
+        let w_action = if self.for_keyboard {
+            measure("Keyboard Settings")
+        } else {
+            measure("Show Keyboard Layout").max(measure("Keyboard Settings"))
+        };
+        let content = (ORN_W + w_display + w_short).max(w_action);
         let width = (TEXT_INSET + content + TEXT_INSET).max(MIN_W);
 
         let total = self.row_count();
@@ -217,6 +246,17 @@ impl InputSourceMenu {
         }
     }
 
+    #[cfg(test)]
+    pub fn row_labels(&self) -> Vec<String> {
+        (0..self.row_count())
+            .map(|k| match self.row_kind(k) {
+                RowKind::Layout(i) => self.items[i].display.clone(),
+                RowKind::ShowLayout => "Show Keyboard Layout".to_owned(),
+                RowKind::Settings => "Keyboard Settings".to_owned(),
+            })
+            .collect()
+    }
+
     /// Activate the keyboard-focused row. Every row here acts and closes, so unlike the a11y
     /// menu's switches there is nothing for Space to keep open.
     pub fn activate_focused(&mut self) -> PopoverAction {
@@ -258,7 +298,7 @@ impl InputSourceMenu {
                 let (label, short) = match self.row_kind(k) {
                     RowKind::Layout(i) => (
                         self.items[i].display.clone(),
-                        Some(self.items[i].short.clone()),
+                        (!self.for_keyboard).then(|| self.items[i].short.clone()),
                     ),
                     RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
                     RowKind::Settings => ("Keyboard Settings".to_owned(), None),

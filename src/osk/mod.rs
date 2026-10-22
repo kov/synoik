@@ -100,6 +100,8 @@ pub enum Effect {
     /// `toggleDelete(true)` / `toggleDelete(false)`.
     Delete(bool),
     Hide,
+    /// `_popupLanguageMenu` over the key at this index.
+    LanguageMenu(usize),
 }
 
 /// The long-press popup of a key's other strings (`Key._showSubkeys`, `keyboard.js:265-370`).
@@ -461,8 +463,9 @@ impl Osk {
                         self.set_latched(false);
                     }
                 }
-                // The language menu and the emoji page are not ported yet.
-                Action::LanguageMenu | Action::Emoji => {}
+                Action::LanguageMenu => effects.push(Effect::LanguageMenu(press.key)),
+                // The emoji page is not ported yet.
+                Action::Emoji => {}
             },
             (None, Some(keyval), _) => {
                 effects.push(Effect::Keyval(keyval));
@@ -812,6 +815,7 @@ impl State {
         if std::mem::take(&mut self.synoik.osk.delete_held) {
             self.osk_delete(false);
         }
+        self.synoik.panel_popover.close_osk_languages();
         self.osk_animate_window(false);
         // `setCursorLocation(null)`.
         self.synoik.osk.focus_window = None;
@@ -1065,8 +1069,34 @@ impl State {
                 }
                 Effect::Delete(enabled) => self.osk_delete(enabled),
                 Effect::Hide => self.osk_close(true),
+                Effect::LanguageMenu(key) => self.osk_language_menu(key),
             }
         }
+    }
+
+    /// `_popupLanguageMenu`: the input sources, over the key.
+    fn osk_language_menu(&mut self, key: usize) {
+        let Some(output) = self.synoik.osk_output() else {
+            return;
+        };
+        let Some(rect) = self.synoik.osk_rect(&output) else {
+            return;
+        };
+        let Some(cap) = self.synoik.osk.level().and_then(|level| {
+            crate::ui::osk::key_rects(rect.size, level)
+                .get(key)
+                .copied()
+        }) else {
+            return;
+        };
+        // The popover anchors output-local.
+        let geo = self.synoik.global_space.output_geometry(&output).unwrap();
+        let anchor = Rectangle::new(rect.loc + cap.loc - geo.loc.to_f64(), cap.size);
+        let (items, active) = self.input_source_menu_snapshot();
+        self.synoik
+            .panel_popover
+            .toggle_osk_languages(output, anchor, items, active);
+        self.synoik.queue_redraw_all();
     }
 
     /// Whether a text field has the input method (`Main.inputMethod.currentFocus`).
@@ -1169,6 +1199,12 @@ impl Synoik {
         let output = self.osk_output()?;
         let rect = self.osk_rect(&output)?;
         if !rect.contains(pos) {
+            return None;
+        }
+        // A menu holding the input grab — its own language menu among them — takes every click,
+        // over the keyboard too: inside it acts, anywhere else it closes (the popup's
+        // stage-wide `captured-event`, a panel menu's modal grab).
+        if self.panel_popover.grabs_input() {
             return None;
         }
         let level = self.osk.level()?;

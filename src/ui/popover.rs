@@ -645,6 +645,14 @@ impl PanelPopover {
         self.open && !self.closing
     }
 
+    /// Whether it takes the keyboard focus with its grab. All do but the on-screen keyboard's
+    /// language menu, which is no modal menu: its items cannot take the focus
+    /// (`item.can_focus = false`) and the text field typed into keeps it, or the keyboard would
+    /// go with the field's input method.
+    pub fn takes_key_focus(&self) -> bool {
+        self.grabs_input() && !self.is_osk_languages()
+    }
+
     /// The panel button role whose menu is up, so the panel can keep that button's
     /// container in its active state. `None` once the popover starts closing, so the
     /// button de-highlights immediately as the menu fades out (like gnome-shell
@@ -926,6 +934,52 @@ impl PanelPopover {
             items, active,
         )));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Toggle the on-screen keyboard's language menu over its key (`LanguageSelectionPopup`,
+    /// `St.Side.BOTTOM`: the box above the key, its arrow pointing down at it).
+    pub fn toggle_osk_languages(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        items: Vec<InputSourceItem>,
+        active: usize,
+    ) {
+        if self.is_showing::<InputSourcesTag>() {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Bottom;
+        self.content = Some(PopoverContent::InputSources(InputSourceMenu::for_keyboard(
+            items, active,
+        )));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Close the keyboard's language menu, if that is what is open: its key went away
+    /// (`notify::mapped`).
+    /// The input-source menu's rows, if that is what is open.
+    #[cfg(test)]
+    pub fn input_source_rows(&self) -> Vec<String> {
+        match &self.content {
+            Some(PopoverContent::InputSources(m)) => m.row_labels(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn close_osk_languages(&mut self) {
+        if self.open && self.is_osk_languages() {
+            self.close();
+        }
+    }
+
+    /// Whether what it holds — open or fading — is the on-screen keyboard's language menu.
+    pub fn is_osk_languages(&self) -> bool {
+        matches!(&self.content, Some(PopoverContent::InputSources(m)) if m.is_for_keyboard())
     }
 
     /// Toggle the accessibility menu, anchored at `anchor` on `output`
