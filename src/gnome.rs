@@ -146,6 +146,7 @@ pub struct GnomeSettings {
     pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11ySettings,
     /// `org.gnome.desktop.a11y.mouse`.
     pub pointer_a11y: crate::input::pointer_a11y::PointerA11ySettings,
+    pub magnifier: crate::magnifier::MagnifierSettings,
     /// `org.gnome.desktop.sound event-sounds`: the master switch for every event sound
     /// (`MetaSoundPlayer`'s `CA_PROP_CANBERRA_ENABLE`).
     pub event_sounds: bool,
@@ -538,6 +539,7 @@ impl Default for GnomeSettings {
             audible_bell: true,
             keyboard_a11y: Default::default(),
             pointer_a11y: Default::default(),
+            magnifier: Default::default(),
             event_sounds: true,
             sound_theme_name: crate::sound_theme::FALLBACK_THEME.to_owned(),
             edge_tiling: true,
@@ -1154,6 +1156,68 @@ impl GnomeSettings {
             if settings_has_key(mouse, key) {
                 *value = DwellDirection::from_nick(&mouse.string(key));
             }
+        }
+    }
+
+    /// `org.gnome.desktop.a11y.magnifier`, as `_settingsInit` reads it (`magnifier.js:576-685`).
+    fn load_magnifier(&mut self, s: &gio::Settings) {
+        use crate::magnifier::{parse_color, ScreenPosition, Tracking};
+        let m = &mut self.magnifier;
+        let has = |key: &str| settings_has_key(s, key);
+        if has("mag-factor") {
+            // "Mag factor is accurate to two decimal places."
+            m.mag_factor = (s.double("mag-factor") * 100.).round() / 100.;
+        }
+        if has("screen-position") {
+            m.screen_position = ScreenPosition::from_nick(&s.string("screen-position"));
+        }
+        let tracking: [(&str, &mut Tracking); 3] = [
+            ("mouse-tracking", &mut m.mouse_tracking),
+            ("focus-tracking", &mut m.focus_tracking),
+            ("caret-tracking", &mut m.caret_tracking),
+        ];
+        for (key, value) in tracking {
+            if settings_has_key(s, key) {
+                *value = Tracking::from_nick(&s.string(key));
+            }
+        }
+        let flags: [(&str, &mut bool); 5] = [
+            ("lens-mode", &mut m.lens_mode),
+            ("scroll-at-edges", &mut m.scroll_at_edges),
+            ("invert-lightness", &mut m.invert_lightness),
+            ("show-cross-hairs", &mut m.show_crosshairs),
+            ("cross-hairs-clip", &mut m.crosshairs_clip),
+        ];
+        for (key, value) in flags {
+            if settings_has_key(s, key) {
+                *value = s.boolean(key);
+            }
+        }
+        let [br, bg, bb] = &mut m.brightness;
+        let [cr, cg, cb] = &mut m.contrast;
+        let doubles: [(&str, &mut f64); 8] = [
+            ("color-saturation", &mut m.color_saturation),
+            ("brightness-red", br),
+            ("brightness-green", bg),
+            ("brightness-blue", bb),
+            ("contrast-red", cr),
+            ("contrast-green", cg),
+            ("contrast-blue", cb),
+            ("cross-hairs-opacity", &mut m.crosshairs_opacity),
+        ];
+        for (key, value) in doubles {
+            if settings_has_key(s, key) {
+                *value = s.double(key);
+            }
+        }
+        if has("cross-hairs-thickness") {
+            m.crosshairs_thickness = f64::from(s.int("cross-hairs-thickness").max(0));
+        }
+        if has("cross-hairs-length") {
+            m.crosshairs_length = f64::from(s.int("cross-hairs-length").max(0));
+        }
+        if has("cross-hairs-color") {
+            m.crosshairs_color = parse_color(&s.string("cross-hairs-color"));
         }
     }
 
@@ -2987,6 +3051,7 @@ struct Stores {
     a11y_applications: Option<gio::Settings>,
     a11y_keyboard: Option<gio::Settings>,
     a11y_mouse: Option<gio::Settings>,
+    a11y_magnifier: Option<gio::Settings>,
     /// `org.gnome.desktop.peripherals.*` — one store per device class, all from
     /// gsettings-desktop-schemas. See [`Peripherals`].
     touchpad: Option<gio::Settings>,
@@ -3055,6 +3120,7 @@ impl Stores {
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
             a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard", b),
             a11y_mouse: gsettings("org.gnome.desktop.a11y.mouse", b),
+            a11y_magnifier: gsettings("org.gnome.desktop.a11y.magnifier", b),
             touchpad: gsettings("org.gnome.desktop.peripherals.touchpad", b),
             mouse: gsettings("org.gnome.desktop.peripherals.mouse", b),
             keyboard: gsettings("org.gnome.desktop.peripherals.keyboard", b),
@@ -3122,6 +3188,7 @@ impl Stores {
             &self.a11y_applications,
             &self.a11y_keyboard,
             &self.a11y_mouse,
+            &self.a11y_magnifier,
             &self.touchpad,
             &self.mouse,
             &self.keyboard,
@@ -3202,6 +3269,9 @@ impl Stores {
         }
         if let Some(mouse) = &self.a11y_mouse {
             settings.load_pointer_a11y(mouse);
+        }
+        if let Some(magnifier) = &self.a11y_magnifier {
+            settings.load_magnifier(magnifier);
         }
         settings.app_folders = self.read_app_folders();
         settings

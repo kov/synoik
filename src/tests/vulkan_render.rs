@@ -4356,6 +4356,74 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     );
 }
 
+/// The green window's bounding box on a capture, if any of it shows.
+fn green_bbox(pixels: &[u8], w: i32, h: i32) -> Option<Rectangle<i32, Physical>> {
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b, _] = px(pixels, w, x, y);
+            if g > 200 && r < 40 && b < 40 {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            }
+        }
+    }
+    (x0 < x1).then(|| Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into()))
+}
+
+/// Zoom draws the screen magnified about the pointer (`ZoomRegion`): with centred tracking, the
+/// window's left edge lands where the transform puts it, and the window is drawn at twice its
+/// size, clipped to the screen.
+#[test]
+fn vulkan_zoom_magnifies_the_screen_about_the_pointer() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let plain = green_bbox(&pixels, w, h).expect("the window shows");
+
+    let at = (f64::from(plain.loc.x) + 20., f64::from(plain.loc.y) + 20.);
+    super::gnome::pointer_motion_to(&mut f, at.0, at.1);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::Centered;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let view = f.synoik().magnifier.view(&output).expect("zoom is on");
+    assert_eq!(view.transform.mag, 2.);
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let zoomed = green_bbox(&pixels, w, h).expect("the window shows, magnified");
+    let left = view.transform.apply(Point::from((
+        f64::from(plain.loc.x),
+        f64::from(plain.loc.y),
+    )));
+    assert_eq!(
+        (zoomed.loc.x, zoomed.loc.y),
+        (left.x.round() as i32, left.y.round() as i32),
+        "the window's corner is drawn where the zoom maps it (plain {plain:?})"
+    );
+    let want_w = (plain.size.w * 2).min(w - zoomed.loc.x);
+    let want_h = (plain.size.h * 2).min(h - zoomed.loc.y);
+    assert!(
+        (zoomed.size.w - want_w).abs() <= 2 && (zoomed.size.h - want_h).abs() <= 2,
+        "drawn at twice its size: {zoomed:?} from {plain:?}"
+    );
+
+    // And off again, the screen is as it was.
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::Zoom, false);
+    f.synoik_state().sync_magnifier();
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(green_bbox(&pixels, w, h), Some(plain));
+}
+
 /// A menu draws its rows' icons over its card (`widget::Menu::render`): the dwell-click menu's
 /// four rows each carry gnome-shell's own icon, so it is five elements, not a bare card.
 #[test]

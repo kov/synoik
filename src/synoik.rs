@@ -1205,6 +1205,9 @@ pub struct Synoik {
     /// Sticky, Slow, Bounce and Mouse Keys (`MetaKeyboardA11y`).
     pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11y,
     pub pointer_a11y: crate::input::pointer_a11y::PointerA11y,
+    pub magnifier: crate::magnifier::Magnifier,
+    /// What the magnifier draws each output's frame with, by output name.
+    pub(crate) magnifier_surfaces: RefCell<HashMap<String, crate::magnifier::MagnifierSurface>>,
     /// The visual bell's fullscreen flash, while it runs.
     pub bell_flash: Option<crate::bell::BellFlash>,
     /// The hot corner's ripple.
@@ -2241,6 +2244,7 @@ impl State {
             // Pointer accessibility as the session starts with it, and the panel's dwell-click
             // indicator with it; later changes come through the settings watcher.
             state.sync_pointer_a11y();
+            state.sync_magnifier();
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
@@ -2521,6 +2525,7 @@ impl State {
                         state.synoik.sync_cursor_settings();
                         state.sync_keyboard_a11y();
                         state.sync_pointer_a11y();
+                        state.sync_magnifier();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -9177,6 +9182,8 @@ impl Synoik {
             visual_bell: crate::bell::VisualBell::new(),
             keyboard_a11y: Default::default(),
             pointer_a11y: Default::default(),
+            magnifier: Default::default(),
+            magnifier_surfaces: Default::default(),
             bell_flash: None,
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),
@@ -12064,6 +12071,7 @@ impl Synoik {
                 .iter()
                 .any(|pie| pie.frame(now_unadjusted).is_some()),
         );
+        causes.set(AnimCauses::MAGNIFIER, self.magnifier.easing());
         causes.set(AnimCauses::DOCK, self.dock.are_animations_ongoing());
         causes.set(
             AnimCauses::SCREENSHOT_UI,
@@ -12686,7 +12694,10 @@ impl Synoik {
             }
         }
 
-        self.render_inner(ctx, output, include_pointer, push);
+        match self.magnifier.view(output) {
+            Some(view) => self.render_magnified(ctx, output, include_pointer, view, push),
+            None => self.render_inner(ctx, output, include_pointer, push),
+        }
     }
 
     /// The top panel and its open popover, as the frame draws them: over the desktop in a user
@@ -12742,7 +12753,7 @@ impl Synoik {
         }
     }
 
-    fn render_inner(
+    pub(crate) fn render_inner(
         &self,
         mut ctx: RenderCtx,
         output: &Output,
@@ -18758,6 +18769,13 @@ synoik_render_elements! {
         RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
         // Pointer accessibility's countdown at the pointer.
         Pie = crate::render_helpers::pie::PieRenderElement,
+        // The magnifier's view of the screen, and the pointer it draws magnified.
+        Magnified = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            OffscreenRenderElement
+        >>>,
+        MagnifiedPointer = crate::render_helpers::off_plane::OffPlaneRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<PointerRenderElements>>>
+        >,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
         // The window picker's per-preview chrome: close button, caption, app icon.

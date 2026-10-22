@@ -37,6 +37,7 @@ pub mod ipc;
 pub mod keyboard_layout;
 pub mod layer;
 pub mod layout;
+pub mod magnifier;
 pub mod monitors_xml;
 pub mod mpris;
 pub mod network_model;

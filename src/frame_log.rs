@@ -736,6 +736,7 @@ bitflags::bitflags! {
         const BELL = 1 << 35;
         /// A pointer-accessibility pie counting down at the pointer.
         const POINTER_A11Y = 1 << 36;
+        const MAGNIFIER = 1 << 37;
     }
 }
 
@@ -801,6 +802,7 @@ impl AnimCauses {
             (AnimCauses::THUMB_KINETIC_SCROLL, "thumb-kinetic-scroll"),
             (AnimCauses::BELL, "bell"),
             (AnimCauses::POINTER_A11Y, "pointer-a11y"),
+            (AnimCauses::MAGNIFIER, "magnifier"),
         ];
         TABLE
             .iter()

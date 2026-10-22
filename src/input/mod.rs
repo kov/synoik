@@ -711,10 +711,12 @@ impl State {
             PointerMotion { event } => {
                 self.on_pointer_motion::<I>(event);
                 self.pointer_a11y_motion();
+                self.magnifier_pointer_moved();
             }
             PointerMotionAbsolute { event } => {
                 self.on_pointer_motion_absolute::<I>(event);
                 self.pointer_a11y_motion();
+                self.magnifier_pointer_moved();
             }
             // After the button: a held primary's release goes out before the secondary click it
             // turns into, as mutter's queued click follows the event that raised it.

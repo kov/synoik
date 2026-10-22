@@ -39,6 +39,7 @@ pub mod gradient_fade_texture;
 pub mod icon;
 pub mod inset_ring;
 pub mod memory;
+pub mod off_plane;
 pub mod offscreen;
 pub mod pie;
 pub mod render_elements;
