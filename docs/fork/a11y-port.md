@@ -144,8 +144,10 @@ panel service is its own slice.
 - It goes on the primary display, always (`keyboardIndex = primaryIndex`), the edge drag
   included; gnome-shell opens a drag's keyboard on the display it came from.
 - An IBus source's keys follow `us`: without the engine's description its xkb layout is unknown.
-- The language menu is no modal menu, as gnome-shell's is not, but it holds the click grab as any
+- The language menu takes no keys, as gnome-shell's does not, but it holds the click grab as any
   of our popovers does: a click elsewhere, the keyboard included, only closes it.
+- Closing the keyboard forgets the caret, so reopening at the same caret moves the window out of
+  the way again; gnome-shell's focus tracker keeps the last caret and does not.
 - The edge drag only claims the edge while there is a keyboard to pull; gnome-shell's gesture
   claims it regardless.
 - The emoji page's long-press variants are the skin tones; gnome-shell groups by name prefix.

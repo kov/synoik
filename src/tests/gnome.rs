@@ -45927,18 +45927,21 @@ fn osk_capitalises_sentences() {
     };
 
     let (mut f, id, seen, _requests) = osk_fixture();
-    f.client(id).enable_text_input();
-    f.client(id)
-        .set_content_type(ContentHint::AutoCapitalization, ContentPurpose::Normal);
-    f.client(id).set_surrounding_text("", 0, 0);
-    osk_feed(&mut f, id, &seen);
-    f.client(id).enable_text_input();
-    osk_feed(&mut f, id, &seen);
-    run_for(&mut f, Duration::from_millis(600));
     let page = |f: &mut Fixture| f.synoik().osk.level().unwrap().name.clone();
-    // The surrounding text that answers the hint is the one after it.
-    f.client(id).set_surrounding_text("", 0, 0);
-    osk_feed(&mut f, id, &seen);
+    // One commit with all of it, as GTK sends it on a click into the field: mutter reads the
+    // content type before the surrounding text, so the surrounding text answers the hint at once.
+    for _ in 0..2 {
+        f.client(id).enable_text_input_with(
+            ContentHint::AutoCapitalization,
+            ContentPurpose::Normal,
+            "",
+            0,
+        );
+        osk_feed(&mut f, id, &seen);
+        assert_eq!(page(&mut f), "shift", "not a commit late");
+    }
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
     assert_eq!(page(&mut f), "shift");
 
     let h = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("H"));
@@ -46042,4 +46045,79 @@ fn osk_bottom_edge_drag() {
     f.touch_up();
     run_for(&mut f, Duration::from_millis(300));
     assert!(!f.synoik().osk.is_visible());
+}
+
+/// Two thumbs type two letters: each touch point holds its own key (`_touchPressSlot`), so a
+/// second press that starts before the first ends is typed too, each on its own release. Nothing
+/// of either touch reaches the window under the keyboard.
+#[test]
+fn osk_two_fingers_type_two_keys() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.synoik().seat.add_touch();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    let p = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("p"));
+    f.touch_down_slot(0, q.0, q.1);
+    f.touch_down_slot(1, p.0, p.1);
+    f.touch_up_slot(0);
+    f.touch_up_slot(1);
+    f.double_roundtrip(id);
+    let commits: Vec<_> = f
+        .client(id)
+        .text_input_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Ti::CommitString(Some(s)) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commits, ["q", "p"]);
+}
+
+/// The keyboard's language menu takes no keys: typing on a hardware keyboard while it is up goes
+/// on into the field (`LanguageSelectionPopup`'s items do not take the key focus).
+#[test]
+fn osk_language_menu_lets_typing_through() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let globe = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::LanguageMenu)
+    });
+    osk_click(&mut f, globe);
+    assert!(f.synoik().panel_popover.is_osk_languages());
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    const KEY_A: u32 = 30;
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+    let keys: Vec<u32> = f
+        .client(id)
+        .take_key_events()
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect();
+    assert_eq!(
+        keys,
+        [KEY_A, KEY_A],
+        "the press and the release reach the field"
+    );
+    assert!(
+        f.synoik().panel_popover.is_osk_languages(),
+        "and the menu stays"
+    );
 }

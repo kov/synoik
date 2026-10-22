@@ -660,23 +660,17 @@ impl Fixture {
         self.synoik_state().process_input_event(event);
     }
 
-    /// Inject a touch-down at `(x, y)` through the real input pipeline.
+    /// Inject a touch-down at `(x, y)` through the real input pipeline, on slot 0.
     pub fn touch_down(&mut self, x: f64, y: f64) {
-        let event = InputEvent::<SyntheticInputBackend>::TouchDown {
-            event: SyntheticTouchDownEvent {
-                time: self.next_input_micros(),
-                x,
-                y,
-            },
-        };
-        self.synoik_state().process_input_event(event);
+        self.touch_down_slot(0, x, y);
     }
 
-    /// Move the single test slot's touch point to `(x, y)`, through the real input pipeline.
+    /// Move slot 0's touch point to `(x, y)`, through the real input pipeline.
     pub fn touch_motion(&mut self, x: f64, y: f64) {
         let event = InputEvent::<SyntheticInputBackend>::TouchMotion {
             event: SyntheticTouchMotionEvent {
                 time: self.next_input_micros(),
+                slot: 0,
                 x,
                 y,
             },
@@ -684,12 +678,29 @@ impl Fixture {
         self.synoik_state().process_input_event(event);
     }
 
-    /// Inject a touch-up (for the single test slot) through the real input
-    /// pipeline.
+    /// Inject a touch-up for slot 0 through the real input pipeline.
     pub fn touch_up(&mut self) {
+        self.touch_up_slot(0);
+    }
+
+    /// A touch-down on `slot`: a second finger is another slot.
+    pub fn touch_down_slot(&mut self, slot: u32, x: f64, y: f64) {
+        let event = InputEvent::<SyntheticInputBackend>::TouchDown {
+            event: SyntheticTouchDownEvent {
+                time: self.next_input_micros(),
+                slot,
+                x,
+                y,
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    pub fn touch_up_slot(&mut self, slot: u32) {
         let event = InputEvent::<SyntheticInputBackend>::TouchUp {
             event: SyntheticTouchUpEvent {
                 time: self.next_input_micros(),
+                slot,
             },
         };
         self.synoik_state().process_input_event(event);

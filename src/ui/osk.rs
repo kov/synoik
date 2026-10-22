@@ -461,7 +461,7 @@ impl OskUi {
                 rect: *rect,
                 default_key: key.default_key,
                 hovered: osk.hovered() == Some(i),
-                active: osk.pressed().is_some_and(|p| p.key == i),
+                active: osk.is_pressed(i),
                 latched: (key.is_shift() && osk.latched())
                     || key.keyval.is_some_and(|k| osk.modifier_latched(k))
                     || matches!(key.action, Some(Action::EmojiSection(s)) if Some(s) == section),
@@ -573,12 +573,17 @@ impl OskUi {
         };
         match baked {
             Ok(texture) => {
+                // The OSD background is cleared over all of it: the keyboard hides what is under
+                // it (the element drops the claim while it fades).
+                let opaque = vec![Rectangle::from_size(
+                    smithay::backend::renderer::Texture::size(&texture),
+                )];
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
                     scale,
                     Transform::Normal,
-                    vec![],
+                    opaque,
                 );
                 push(TextureRenderElement::from_texture_buffer(
                     buffer,

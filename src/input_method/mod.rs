@@ -516,9 +516,10 @@ impl State {
                         anchor,
                     });
                 }
+                // The keyboard reads it once the whole commit is in: mutter applies a commit's
+                // content type and caret before its surrounding text, and either may ask for it.
                 if im.focus == ImFocus::Client {
-                    self.synoik.osk.surrounding_text_set(&text, cursor as usize);
-                    self.synoik.queue_redraw_all();
+                    self.synoik.osk.surrounding_in_commit = true;
                 }
                 // Keep it regardless: `delete_surrounding_text` comes back in characters and goes
                 // out in bytes, and only this text can convert between them.
@@ -548,7 +549,16 @@ impl State {
             }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
             // IBus has no matching "end of batch" call.
-            TextInputEvent::Done | TextInputEvent::TextChangeCause(_) => {}
+            TextInputEvent::Done => {
+                if std::mem::take(&mut self.synoik.osk.surrounding_in_commit) {
+                    if let Some((text, cursor)) = self.synoik.im_surrounding.as_ref() {
+                        if self.synoik.osk.surrounding_text_set(text, *cursor as usize) {
+                            self.synoik.queue_redraw_all();
+                        }
+                    }
+                }
+            }
+            TextInputEvent::TextChangeCause(_) => {}
         }
     }
 

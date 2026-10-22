@@ -558,6 +558,7 @@ impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
 
 pub struct SyntheticTouchDownEvent {
     pub time: u64,
+    pub slot: u32,
     pub x: f64,
     pub y: f64,
 }
@@ -574,7 +575,7 @@ impl Event<SyntheticInputBackend> for SyntheticTouchDownEvent {
 
 impl TouchEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {
     fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
+        TouchSlot::from(Some(self.slot))
     }
 }
 
@@ -598,9 +599,10 @@ impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {
 
 impl TouchDownEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {}
 
-/// The single test slot's touch point moving.
+/// A touch point moving.
 pub struct SyntheticTouchMotionEvent {
     pub time: u64,
+    pub slot: u32,
     pub x: f64,
     pub y: f64,
 }
@@ -617,7 +619,7 @@ impl Event<SyntheticInputBackend> for SyntheticTouchMotionEvent {
 
 impl TouchEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {
     fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
+        TouchSlot::from(Some(self.slot))
     }
 }
 
@@ -643,6 +645,7 @@ impl TouchMotionEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {}
 
 pub struct SyntheticTouchUpEvent {
     pub time: u64,
+    pub slot: u32,
 }
 
 impl Event<SyntheticInputBackend> for SyntheticTouchUpEvent {
@@ -657,7 +660,7 @@ impl Event<SyntheticInputBackend> for SyntheticTouchUpEvent {
 
 impl TouchEvent<SyntheticInputBackend> for SyntheticTouchUpEvent {
     fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
+        TouchSlot::from(Some(self.slot))
     }
 }
 

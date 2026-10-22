@@ -1222,7 +1222,10 @@ impl State {
                         // A menu of the panel over the shield takes the keys the entry would — and
                         // only those: nothing that reaches the desktop's popover branch below (its
                         // binds, the overlay key) may run behind a lock.
-                    } else if pressed && this.synoik.panel_popover.grabs_input() {
+                    } else if pressed
+                        && this.synoik.panel_popover.grabs_input()
+                        && this.synoik.panel_popover.takes_key_focus()
+                    {
                         this.synoik.panel_popover.handle_key(raw, mods, pressed);
                         if key_repeats {
                             this.arm_key_repeat(key_code, RepeatKey::Popover { raw, mods: *mods });
@@ -1509,7 +1512,11 @@ impl State {
                 // is the hardcoded VT-switch chord (Ctrl+Alt+F1..F12): switching to a text console
                 // must never be blocked by an in-compositor overlay, so let it through to the
                 // backend even while the popover holds the grab.
-                if this.synoik.panel_popover.grabs_input() {
+                // The keyboard's language menu is no modal menu: it takes no keys, and typing goes
+                // on into the field (`LanguageSelectionPopup`'s items do not take focus).
+                if this.synoik.panel_popover.grabs_input()
+                    && this.synoik.panel_popover.takes_key_focus()
+                {
                     #[allow(non_upper_case_globals)]
                     if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
                         modified.raw()
@@ -11609,6 +11616,7 @@ impl State {
     }
     fn on_touch_cancel<I: InputBackend>(&mut self, evt: I::TouchCancelEvent) {
         self.osk_edge_drag_up(crate::osk::touch_id(evt.slot()));
+        self.osk_touch_cancel();
         let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };

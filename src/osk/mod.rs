@@ -84,11 +84,32 @@ pub enum Presser {
     Touch(i32),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which keys a key index means: the letter level by name, or the emoji page by page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LevelId {
+    page: String,
+    emoji: Option<usize>,
+}
+
+/// A key held down. Each presser holds its own (`_touchPressSlot`), so two thumbs type two keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Press {
-    /// Index into the current level's keys.
+    /// Index into the keys of the level it was pressed on.
     pub key: usize,
     pub by: Presser,
+    /// The level it was pressed on: if that is gone by the release, so is the key.
+    level: LevelId,
+    /// Names this press to its long-press timer, which may outlive it.
+    serial: u64,
+}
+
+/// Where a press lands while a key's popup is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubkeyHit {
+    Key(usize),
+    /// In the box, between its keys: the popup's own, so not a press elsewhere.
+    Box,
+    Outside,
 }
 
 /// What releasing (or long-pressing) a key asks the compositor to do.
@@ -118,6 +139,8 @@ pub struct Subkeys {
     pub pressed: Option<(usize, Presser)>,
     /// `_capturedPress`.
     captured_press: bool,
+    /// The emoji page's: a string from it is an emoji, committed as it is.
+    emoji: bool,
 }
 
 /// The seat's touch mode (`ClutterSeat:touch-mode`, mutter's `update_touch_mode`): a touchscreen,
@@ -274,7 +297,8 @@ pub struct Osk {
     shown: f64,
     rest_timer: Option<TimerToken>,
     hide_panel_timer: Option<TimerToken>,
-    long_press_timer: Option<TimerToken>,
+    /// Each press's long-press clock, by the press's serial.
+    long_press_timers: Vec<(u64, TimerToken)>,
     /// The text focus as of the last [`State::sync_osk_focus`].
     focus: TextFocus,
     group: String,
@@ -287,7 +311,10 @@ pub struct Osk {
     latched: bool,
     /// `_modifiers`: latched Ctrl/Alt keyvals.
     modifiers: BTreeSet<u32>,
-    pressed: Option<Press>,
+    pressed: Vec<Press>,
+    next_serial: u64,
+    /// Touch points the keyboard took at their start: theirs to the end, whatever they did since.
+    claimed_touches: BTreeSet<i32>,
     hovered: Option<usize>,
     /// `_longPressed`: the shift long-press already latched, so its release must not switch.
     long_pressed: bool,
@@ -295,6 +322,10 @@ pub struct Osk {
     delete_held: bool,
     /// `_surroundingTextId`: the level waits on the field's next surrounding text.
     awaiting_surrounding: bool,
+    /// The caret's rect as last seen (`FocusTracker._rect`).
+    caret: Option<Rectangle<f64, Logical>>,
+    /// The commit being read carried surrounding text.
+    pub(crate) surrounding_in_commit: bool,
     subkeys: Option<Subkeys>,
     emoji: Option<EmojiPage>,
     focus_window: Option<FocusWindow>,
@@ -320,7 +351,7 @@ impl Default for Osk {
             shown: 0.,
             rest_timer: None,
             hide_panel_timer: None,
-            long_press_timer: None,
+            long_press_timers: Vec::new(),
             focus: TextFocus::None,
             group: "us".to_owned(),
             purpose: Purpose::Normal,
@@ -329,11 +360,15 @@ impl Default for Osk {
             page: "default".to_owned(),
             latched: false,
             modifiers: BTreeSet::new(),
-            pressed: None,
+            pressed: Vec::new(),
+            next_serial: 0,
+            claimed_touches: BTreeSet::new(),
             hovered: None,
             long_pressed: false,
             delete_held: false,
             awaiting_surrounding: false,
+            caret: None,
+            surrounding_in_commit: false,
             subkeys: None,
             emoji: None,
             focus_window: None,
@@ -394,8 +429,19 @@ impl Osk {
         self.modifiers.contains(&keyval)
     }
 
-    pub fn pressed(&self) -> Option<Press> {
+    /// Whether the key at `index` on the level shown is held down.
+    pub fn is_pressed(&self, index: usize) -> bool {
+        let level = self.level_id();
         self.pressed
+            .iter()
+            .any(|p| p.key == index && p.level == level)
+    }
+
+    fn level_id(&self) -> LevelId {
+        LevelId {
+            page: self.page.clone(),
+            emoji: self.emoji.as_ref().map(|e| e.current),
+        }
     }
 
     pub fn hovered(&self) -> Option<usize> {
@@ -425,7 +471,9 @@ impl Osk {
     }
 
     /// The page dots: how many pages the shown section has, and where between them the pager is
-    /// (`_updateIndicatorPosition`), given the pager's width.
+    /// (`_updateIndicatorPosition`), given the pager's width. The position is the page within its
+    /// section: gnome-shell passes the ring-wide `_curPage`, which puts the dot past the end in
+    /// every section but the first — a bug, not a behaviour to port.
     pub fn emoji_indicators(&self, width: f64) -> Option<(usize, f64)> {
         let emoji = self.emoji.as_ref()?;
         let page = &emoji.pages[emoji.current];
@@ -642,7 +690,7 @@ impl Osk {
 
     /// Whether a presser is the keyboard's: on a key, or on the pager.
     pub fn holds(&self, by: Presser) -> bool {
-        self.pressed.is_some_and(|p| p.by == by) || self.emoji_swipe_presser() == Some(by)
+        self.pressed.iter().any(|p| p.by == by) || self.emoji_swipe_presser() == Some(by)
     }
 
     pub fn emoji_is_animating(&self) -> bool {
@@ -662,7 +710,7 @@ impl Osk {
         if let Some(layout) = Layout::load(&self.group, self.purpose) {
             self.layout = Some(layout);
         }
-        self.pressed = None;
+        self.pressed.clear();
         self.hovered = None;
         self.subkeys = None;
         self.set_active_level("default");
@@ -675,12 +723,14 @@ impl Osk {
 
     /// `_setActiveLevel` (`keyboard.js:1669-1693`).
     fn set_active_level(&mut self, level: &str) {
-        if self.page != level {
-            self.latched = false;
-            self.page = level.to_owned();
-            // Its key is no longer mapped (`notify::mapped`).
-            self.subkeys = None;
+        // `_setActiveLevel` returns before `_disableAllModifiers` when nothing changes.
+        if self.page == level {
+            return;
         }
+        self.latched = false;
+        self.page = level.to_owned();
+        // Its key is no longer mapped (`notify::mapped`).
+        self.subkeys = None;
         self.modifiers.clear();
         self.bump();
     }
@@ -726,9 +776,10 @@ impl Osk {
 
     /// The field's surrounding text arrived. If the level was waiting on it, the caret at the start
     /// of the text, after a space in title case or after a full stop in a sentence capitalises.
-    pub fn surrounding_text_set(&mut self, text: &str, cursor: usize) {
+    /// Returns whether it was waiting.
+    pub fn surrounding_text_set(&mut self, text: &str, cursor: usize) -> bool {
         if !std::mem::take(&mut self.awaiting_surrounding) {
-            return;
+            return false;
         }
         let before = text.get(..cursor).unwrap_or(text);
         let shift = if text.is_empty() || cursor == 0 {
@@ -738,27 +789,49 @@ impl Osk {
         } else if self.hints & hints::UPPERCASE_SENTENCES != 0 {
             before.trim_end().ends_with('.')
         } else {
-            return;
+            return true;
         };
         self.set_active_level(if shift { "shift" } else { "default" });
-    }
-
-    /// A key went down (`Key._press`). Returns whether it started a long-press clock.
-    pub fn press(&mut self, key: usize, by: Presser) -> bool {
-        if self.pressed.is_some() || self.key(key).is_none() {
-            return false;
-        }
-        self.pressed = Some(Press { key, by });
-        self.bump();
         true
     }
 
-    /// The long-press timer fired (`keyboard.js:285-299,1525-1536`).
-    pub fn long_press(&mut self) -> Vec<Effect> {
-        let Some(Press { key, .. }) = self.pressed else {
+    /// A key went down (`Key._press`). Returns the serial its long-press clock goes by, if it took
+    /// the press: a key already held, or a presser already holding one, takes no other.
+    pub fn press(&mut self, key: usize, by: Presser) -> Option<u64> {
+        let level = self.level_id();
+        if self.key(key).is_none()
+            || self
+                .pressed
+                .iter()
+                .any(|p| p.by == by || (p.key == key && p.level == level))
+        {
+            return None;
+        }
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.pressed.push(Press {
+            key,
+            by,
+            level,
+            serial,
+        });
+        self.bump();
+        Some(serial)
+    }
+
+    /// A press's long-press timer fired (`keyboard.js:285-299,1525-1536`). A press whose level is
+    /// gone, or that ended, has nothing to do.
+    pub fn long_press(&mut self, serial: u64) -> Vec<Effect> {
+        let level = self.level_id();
+        let Some(index) = self
+            .pressed
+            .iter()
+            .find(|p| p.serial == serial && p.level == level)
+            .map(|p| p.key)
+        else {
             return Vec::new();
         };
-        let Some(key) = self.key(key).cloned() else {
+        let Some(key) = self.key(index).cloned() else {
             return Vec::new();
         };
         let mut effects = Vec::new();
@@ -779,18 +852,19 @@ impl Osk {
         if !key.extended.is_empty() {
             // `fake_release`: the key lets go without acting, and the popup stays up after the
             // press ends — a string in it is picked with a press of its own.
-            let index = self.pressed.take().map(|p| p.key);
+            self.pressed.retain(|p| p.serial != serial);
             // `keyButton.set_hover(false)`.
             self.hovered = None;
             if let Some(emoji) = self.emoji.as_mut() {
                 emoji.swipe = None;
             }
-            self.subkeys = index.map(|key_index| Subkeys {
-                key: key_index,
+            self.subkeys = Some(Subkeys {
+                key: index,
                 strings: key.extended.clone(),
                 hovered: None,
                 pressed: None,
                 captured_press: false,
+                emoji: key.flat,
             });
             self.bump();
         }
@@ -798,14 +872,15 @@ impl Osk {
     }
 
     /// A press while the popup is up: on one of its keys, or anywhere else (`_onCapturedEvent`).
-    pub fn subkeys_press(&mut self, inside: Option<usize>, by: Presser) {
+    pub fn subkeys_press(&mut self, hit: SubkeyHit, by: Presser) {
         let Some(subkeys) = self.subkeys.as_mut() else {
             return;
         };
-        match inside {
-            Some(i) if subkeys.pressed.is_none() => subkeys.pressed = Some((i, by)),
-            Some(_) => {}
-            None => subkeys.captured_press = true,
+        match hit {
+            SubkeyHit::Key(i) if subkeys.pressed.is_none() => subkeys.pressed = Some((i, by)),
+            // Inside the box the event is the popup's own (`boxPointer.bin.contains`).
+            SubkeyHit::Key(_) | SubkeyHit::Box => {}
+            SubkeyHit::Outside => subkeys.captured_press = true,
         }
         self.bump();
     }
@@ -820,14 +895,20 @@ impl Osk {
         match subkeys.pressed {
             Some((i, presser)) if presser == by => {
                 let text = subkeys.strings.get(i).cloned();
+                let emoji = subkeys.emoji;
                 self.subkeys = None;
-                if let Some(text) = text {
-                    effects.push(Effect::Commit(
-                        text,
-                        self.modifiers.iter().copied().collect(),
-                    ));
-                    self.modifiers.clear();
-                    self.update_level_from_hints(true);
+                match text {
+                    // `emoji-selected` → `commit(emoji)`: no modifiers, no level change.
+                    Some(text) if emoji => effects.push(Effect::Commit(text, Vec::new())),
+                    Some(text) => {
+                        effects.push(Effect::Commit(
+                            text,
+                            self.modifiers.iter().copied().collect(),
+                        ));
+                        self.modifiers.clear();
+                        self.update_level_from_hints(true);
+                    }
+                    None => {}
                 }
             }
             Some(_) => {}
@@ -853,11 +934,16 @@ impl Osk {
     /// The presser let go (`Key._release` and the handlers `_addRowKeys` connects,
     /// `keyboard.js:306-324,1482-1519`).
     pub fn release(&mut self, by: Presser) -> Vec<Effect> {
-        let Some(press) = self.pressed.filter(|p| p.by == by) else {
+        let Some(at) = self.pressed.iter().position(|p| p.by == by) else {
             return Vec::new();
         };
-        self.pressed = None;
+        let press = self.pressed.remove(at);
         self.bump();
+        // A key whose level went away under it (a hint change, the emoji page turning) went with
+        // it: its release is nothing.
+        if press.level != self.level_id() {
+            return Vec::new();
+        }
         let Some(key) = self.key(press.key).cloned() else {
             return Vec::new();
         };
@@ -917,13 +1003,16 @@ impl Osk {
             }
             (None, None, None) => {}
         }
-        self.long_pressed = false;
+        if self.pressed.is_empty() {
+            self.long_pressed = false;
+        }
         effects
     }
 
-    /// Drop a press without acting on it (`Key.cancel`).
+    /// Drop every press without acting on it (`Key.cancel`). Their timers find nothing to do.
     fn cancel_press(&mut self) {
-        if self.pressed.take().is_some() {
+        if !self.pressed.is_empty() {
+            self.pressed.clear();
             self.bump();
         }
         self.long_pressed = false;
@@ -1021,27 +1110,30 @@ impl State {
             osk.enabled = true;
             osk.group = String::new();
             self.sync_osk_group();
-            // A text field that already has the focus does not ask again; GNOME's keyboard is
-            // likewise only opened by the next request.
-            self.synoik.osk.focus = TextFocus::None;
-            self.sync_osk_focus();
+            // A field that already has the focus, a client's or one of ours, does not open it:
+            // GNOME's keyboard is only opened by the next request (`notify::key-focus` is
+            // connected at construction, never run for the focus already there).
+            self.synoik.osk.focus = self.osk_text_focus();
+            self.sync_osk_group();
         } else {
             // `setCursorLocation(null)`, then `destroy`: the window it moved goes back, and the
             // keyboard is gone at once, no slide.
-            if osk.visible {
+            // A window an edge drag moved has moved with the keyboard still hidden.
+            if osk.focus_window.as_ref().is_some_and(|f| f.shift != 0.) {
                 self.osk_animate_window(false);
             }
             self.synoik.panel_popover.close_osk_languages();
             let osk = &mut self.synoik.osk;
-            for token in [
+            let timers: Vec<TimerToken> = [
                 osk.rest_timer.take(),
                 osk.hide_panel_timer.take(),
-                osk.long_press_timer.take(),
                 osk.edge_drag.take().and_then(|drag| drag.cancel_timer),
             ]
             .into_iter()
             .flatten()
-            {
+            .chain(osk.long_press_timers.drain(..).map(|(_, token)| token))
+            .collect();
+            for token in timers {
                 self.synoik.cancel_timer(token);
             }
             let delete_held = self.synoik.osk.delete_held;
@@ -1480,7 +1572,7 @@ impl State {
         osk.hovered = None;
         osk.subkeys = None;
         osk.bump();
-        if let Some(token) = osk.long_press_timer.take() {
+        for (_, token) in std::mem::take(&mut osk.long_press_timers) {
             self.synoik.cancel_timer(token);
         }
         if std::mem::take(&mut self.synoik.osk.delete_held) {
@@ -1488,8 +1580,10 @@ impl State {
         }
         self.synoik.panel_popover.close_osk_languages();
         self.osk_animate_window(false);
-        // `setCursorLocation(null)`.
+        // `setCursorLocation(null)`. The caret is forgotten with it, so that a reopen at the same
+        // caret moves the window again — gnome-shell's tracker keeps it, and does not.
         self.synoik.osk.focus_window = None;
+        self.synoik.osk.caret = None;
         self.synoik.queue_redraw_all();
     }
 
@@ -1553,6 +1647,18 @@ impl State {
             return;
         }
         let caret = self.text_caret_rect();
+        // `FocusTracker._setCurrentRect`: the same rect again is no move.
+        if caret == self.synoik.osk.caret {
+            return;
+        }
+        self.synoik.osk.caret = caret;
+        self.osk_place_for_caret(caret);
+        // `_onFocusPositionChanged`: a caret moved may mean a new sentence, or a shift to drop.
+        self.synoik.osk.update_level_from_hints(true);
+        self.synoik.queue_redraw_all();
+    }
+
+    fn osk_place_for_caret(&mut self, caret: Option<Rectangle<f64, Logical>>) {
         let window = self.synoik.layout.focus().map(|m| m.window.clone());
         let output = self
             .synoik
@@ -1637,10 +1743,8 @@ impl State {
         if self.synoik.osk.subkeys.is_some() {
             if pressed {
                 let pos = self.synoik.seat.get_pointer().unwrap().current_location();
-                let inside = self.synoik.osk_subkey_hit(pos);
-                self.synoik
-                    .osk
-                    .subkeys_press(inside, Presser::Button(button));
+                let hit = self.synoik.osk_subkey_press_hit(pos);
+                self.synoik.osk.subkeys_press(hit, Presser::Button(button));
                 self.synoik.suppressed_buttons.insert(button);
                 self.synoik.queue_redraw_all();
                 return true;
@@ -1672,12 +1776,7 @@ impl State {
                 self.synoik.queue_redraw_all();
                 return false;
             }
-            let held = self
-                .synoik
-                .osk
-                .pressed
-                .is_some_and(|p| p.by == Presser::Button(button));
-            if held {
+            if self.synoik.osk.holds(Presser::Button(button)) {
                 self.osk_release(Presser::Button(button));
             }
             false
@@ -1687,8 +1786,9 @@ impl State {
     /// A touch point went down. Returns whether the keyboard took it.
     pub fn osk_touch_down(&mut self, slot: i32, pos: Point<f64, Logical>) -> bool {
         if self.synoik.osk.subkeys.is_some() {
-            let inside = self.synoik.osk_subkey_hit(pos);
-            self.synoik.osk.subkeys_press(inside, Presser::Touch(slot));
+            let hit = self.synoik.osk_subkey_press_hit(pos);
+            self.synoik.osk.subkeys_press(hit, Presser::Touch(slot));
+            self.synoik.osk.claimed_touches.insert(slot);
             self.synoik.queue_redraw_all();
             return true;
         }
@@ -1699,6 +1799,7 @@ impl State {
             self.osk_press(key, Presser::Touch(slot));
         }
         self.osk_emoji_swipe_begin(Presser::Touch(slot), pos);
+        self.synoik.osk.claimed_touches.insert(slot);
         true
     }
 
@@ -1710,7 +1811,7 @@ impl State {
             self.synoik.queue_redraw_all();
             return true;
         }
-        self.synoik.osk.holds(by)
+        self.synoik.osk.claimed_touches.contains(&slot)
     }
 
     /// A scroll over the keyboard: a touchpad's turns the emoji pages, and whatever the source, the
@@ -1759,6 +1860,7 @@ impl State {
 
     /// A touch point went up. Returns whether it was the keyboard's.
     pub fn osk_touch_up(&mut self, slot: i32) -> bool {
+        let claimed = self.synoik.osk.claimed_touches.remove(&slot);
         let clock = self.synoik.clock.clone();
         if self
             .synoik
@@ -1772,40 +1874,57 @@ impl State {
             let effects = self.synoik.osk.subkeys_release(Presser::Touch(slot));
             self.osk_apply(effects);
             self.synoik.queue_redraw_all();
-            return true;
+            return claimed;
         }
-        let held = self
-            .synoik
-            .osk
-            .pressed
-            .is_some_and(|p| p.by == Presser::Touch(slot));
-        if held {
+        if self.synoik.osk.holds(Presser::Touch(slot)) {
             self.osk_release(Presser::Touch(slot));
         }
-        held
+        claimed
+    }
+
+    /// The touch sequence was cancelled: the keys touch held let go without acting
+    /// (`Key.cancel`), and a swipe settles where it is.
+    pub fn osk_touch_cancel(&mut self) {
+        let osk = &mut self.synoik.osk;
+        osk.claimed_touches.clear();
+        let before = osk.pressed.len();
+        osk.pressed.retain(|p| !matches!(p.by, Presser::Touch(_)));
+        if osk.pressed.len() != before {
+            osk.bump();
+        }
+        if let Some(by @ Presser::Touch(_)) = osk.emoji_swipe_presser() {
+            let clock = self.synoik.clock.clone();
+            self.synoik.osk.emoji_swipe_end(by, clock.now(), &clock);
+        }
+        self.synoik.queue_redraw_all();
     }
 
     fn osk_press(&mut self, key: usize, by: Presser) {
-        if !self.synoik.osk.press(key, by) {
+        let Some(serial) = self.synoik.osk.press(key, by) else {
             return;
-        }
-        if let Some(token) = self.synoik.osk.long_press_timer.take() {
-            self.synoik.cancel_timer(token);
-        }
-        let token = self.synoik.timer_after(LONG_PRESS_TIME, |state| {
-            state.synoik.osk.long_press_timer = None;
-            let effects = state.synoik.osk.long_press();
+        };
+        let token = self.synoik.timer_after(LONG_PRESS_TIME, move |state| {
+            state
+                .synoik
+                .osk
+                .long_press_timers
+                .retain(|(s, _)| *s != serial);
+            let effects = state.synoik.osk.long_press(serial);
             state.osk_apply(effects);
             state.synoik.queue_redraw_all();
             None
         });
-        self.synoik.osk.long_press_timer = Some(token);
+        self.synoik.osk.long_press_timers.push((serial, token));
         self.synoik.queue_redraw_all();
     }
 
     fn osk_release(&mut self, by: Presser) {
-        if let Some(token) = self.synoik.osk.long_press_timer.take() {
-            self.synoik.cancel_timer(token);
+        let osk = &mut self.synoik.osk;
+        if let Some(serial) = osk.pressed.iter().find(|p| p.by == by).map(|p| p.serial) {
+            if let Some(at) = osk.long_press_timers.iter().position(|(s, _)| *s == serial) {
+                let (_, token) = osk.long_press_timers.remove(at);
+                self.synoik.cancel_timer(token);
+            }
         }
         let effects = self.synoik.osk.release(by);
         self.osk_apply(effects);
@@ -2003,6 +2122,18 @@ impl Synoik {
         let geometry = self.osk_subkeys_geometry()?;
         geometry.keys.iter().position(|k| k.contains(pos))
     }
+
+    /// Where a press lands while the popup is up.
+    fn osk_subkey_press_hit(&self, pos: Point<f64, Logical>) -> SubkeyHit {
+        let Some(geometry) = self.osk_subkeys_geometry() else {
+            return SubkeyHit::Outside;
+        };
+        match geometry.keys.iter().position(|k| k.contains(pos)) {
+            Some(i) => SubkeyHit::Key(i),
+            None if geometry.rect.contains(pos) => SubkeyHit::Box,
+            None => SubkeyHit::Outside,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2047,8 +2178,8 @@ mod tests {
         let shift = index(&osk, |k| {
             k.is_shift() && k.action == Some(Action::LevelSwitch("shift".into()))
         });
-        osk.press(shift, Presser::Touch(0));
-        osk.long_press();
+        let serial = osk.press(shift, Presser::Touch(0)).unwrap();
+        osk.long_press(serial);
         osk.release(Presser::Touch(0));
         assert_eq!(osk.page, "shift");
         assert!(osk.latched());
@@ -2070,6 +2201,67 @@ mod tests {
         );
     }
 
+    /// Each finger holds its own key (`_touchPressSlot`): two thumbs, overlapping, type two
+    /// letters, each on its own release; a finger already on one key takes no other.
+    #[test]
+    fn two_fingers_hold_two_keys() {
+        let mut osk = osk();
+        let q = index(&osk, |k| k.commit.as_deref() == Some("q"));
+        let w = index(&osk, |k| k.commit.as_deref() == Some("w"));
+        let first = osk.press(q, Presser::Touch(0)).unwrap();
+        let second = osk.press(w, Presser::Touch(1)).unwrap();
+        assert_ne!(first, second);
+        assert!(osk.press(w, Presser::Touch(2)).is_none(), "w is held");
+        assert!(osk.is_pressed(q) && osk.is_pressed(w));
+        assert_eq!(
+            osk.release(Presser::Touch(0)),
+            [Effect::Commit("q".into(), vec![])]
+        );
+        // The first press's clock, run late, has nothing left to do.
+        assert!(osk.long_press(first).is_empty());
+        assert_eq!(
+            osk.release(Presser::Touch(1)),
+            [Effect::Commit("w".into(), vec![])]
+        );
+    }
+
+    /// A key held while its level goes away (a hint change between press and release) is gone
+    /// with it: its release types nothing, and its long press opens nothing.
+    #[test]
+    fn a_press_does_not_outlive_its_level() {
+        let mut osk = osk();
+        let e = index(&osk, |k| k.commit.as_deref() == Some("e"));
+        let serial = osk.press(e, Presser::Button(1)).unwrap();
+        osk.set_active_level("shift");
+        assert!(
+            !osk.is_pressed(e),
+            "the shift level's key there is not held"
+        );
+        assert!(osk.long_press(serial).is_empty());
+        assert!(osk.subkeys().is_none());
+        assert!(osk.release(Presser::Button(1)).is_empty());
+    }
+
+    /// `_setActiveLevel` to the level already shown is nothing: a latched modifier stays.
+    #[test]
+    fn the_same_level_again_keeps_the_modifiers() {
+        let mut osk = Osk {
+            enabled: true,
+            purpose: Purpose::Terminal,
+            ..Osk::default()
+        };
+        osk.update_keys();
+        let ctrl = index(&osk, |k| {
+            k.action == Some(Action::Modifier) && k.keyval == Some(0xffe3)
+        });
+        osk.press(ctrl, Presser::Button(1));
+        osk.release(Presser::Button(1));
+        osk.set_active_level("default");
+        assert!(osk.modifier_latched(0xffe3));
+        osk.set_active_level("shift");
+        assert!(!osk.modifier_latched(0xffe3));
+    }
+
     #[test]
     fn delete_taps_and_holds() {
         let mut osk = osk();
@@ -2079,8 +2271,8 @@ mod tests {
             osk.release(Presser::Button(1)),
             [Effect::Delete(true), Effect::Delete(false)]
         );
-        osk.press(delete, Presser::Button(1));
-        assert_eq!(osk.long_press(), [Effect::Delete(true)]);
+        let serial = osk.press(delete, Presser::Button(1)).unwrap();
+        assert_eq!(osk.long_press(serial), [Effect::Delete(true)]);
         assert_eq!(osk.release(Presser::Button(1)), [Effect::Delete(false)]);
     }
 
@@ -2111,15 +2303,19 @@ mod tests {
     fn a_long_press_opens_the_other_strings() {
         let mut osk = osk();
         let e = index(&osk, |k| k.commit.as_deref() == Some("e"));
-        osk.press(e, Presser::Button(1));
-        assert!(osk.long_press().is_empty());
+        let serial = osk.press(e, Presser::Button(1)).unwrap();
+        assert!(osk.long_press(serial).is_empty());
         assert_eq!(osk.subkeys().unwrap().strings, ["è", "é", "ê", "ë", "ē"]);
         // The press that opened it ends without typing anything, and leaves it up.
         assert!(osk.release(Presser::Button(1)).is_empty());
         assert!(osk.subkeys_release(Presser::Button(1)).is_empty());
         assert!(osk.subkeys().is_some());
 
-        osk.subkeys_press(Some(1), Presser::Button(1));
+        // A press on the box between its keys is the popup's: it stays.
+        osk.subkeys_press(SubkeyHit::Box, Presser::Button(1));
+        assert!(osk.subkeys_release(Presser::Button(1)).is_empty());
+        assert!(osk.subkeys().is_some());
+        osk.subkeys_press(SubkeyHit::Key(1), Presser::Button(1));
         assert_eq!(
             osk.subkeys_release(Presser::Button(1)),
             [Effect::Commit("é".into(), vec![])]
@@ -2127,9 +2323,9 @@ mod tests {
         assert!(osk.subkeys().is_none());
 
         // A press anywhere else closes it on its release, typing nothing.
-        osk.press(e, Presser::Touch(2));
-        osk.long_press();
-        osk.subkeys_press(None, Presser::Touch(3));
+        let serial = osk.press(e, Presser::Touch(2)).unwrap();
+        osk.long_press(serial);
+        osk.subkeys_press(SubkeyHit::Outside, Presser::Touch(3));
         assert!(osk.subkeys().is_some());
         assert!(osk.subkeys_release(Presser::Touch(3)).is_empty());
         assert!(osk.subkeys().is_none());

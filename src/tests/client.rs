@@ -405,6 +405,22 @@ impl Client {
         ti.commit();
     }
 
+    /// `enable` with the field's state in the same commit, as GTK sends it: the content type and
+    /// the surrounding text.
+    pub fn enable_text_input_with(
+        &mut self,
+        hint: zwp_text_input_v3::ContentHint,
+        purpose: zwp_text_input_v3::ContentPurpose,
+        text: &str,
+        cursor: i32,
+    ) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.enable();
+        ti.set_surrounding_text(text.to_owned(), cursor, cursor);
+        ti.set_content_type(hint, purpose);
+        ti.commit();
+    }
+
     /// Declare what kind of field the caret is in — a password entry, say.
     pub fn set_content_type(
         &mut self,
