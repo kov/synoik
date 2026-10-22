@@ -100,17 +100,24 @@ fn base_font_pt() -> f64 {
     f64::from_bits(BASE_FONT_PT_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Set the realized base — called from the `org.gnome.desktop.interface` watcher. A
-/// global rather than plumbing: `pt_to_px` is called from inside every widget's bake,
-/// none of which has a settings handle, and it is exactly the process-wide singleton
-/// `StThemeContext` is.
-pub fn set_base_font_pt(pt: f64) {
-    if store_base_font_pt(&BASE_FONT_PT_BITS, pt) {
+/// Publish the realized base font — size and family — re-baking the UI if either moved. A
+/// global rather than plumbing: `pt_to_px` is called from inside every widget's bake, none of
+/// which has a settings handle, and it is exactly the process-wide singleton `StThemeContext`
+/// is.
+///
+/// Idempotent, so callers publish unconditionally instead of deciding whether something
+/// changed: the model they would compare against has more than one writer (the a11y menu
+/// updates it optimistically before the gsettings echo), and a comparison against it swallowed
+/// every menu-driven Large Text flip.
+pub fn publish_base_font(pt: f64, family: &str) {
+    let size_changed = store_base_font_pt(&BASE_FONT_PT_BITS, pt);
+    let family_changed = synoik_vk::text::set_sans_family(family);
+    if size_changed || family_changed {
         STYLE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// The store half of [`set_base_font_pt`], against an explicit cell: returns whether the
+/// The size half of [`publish_base_font`], against an explicit cell: returns whether the
 /// base actually changed, i.e. whether a generation bump is owed.
 ///
 /// Split out so the tests can exercise it without touching the process-wide cell. They

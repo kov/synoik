@@ -680,11 +680,10 @@ impl GnomeSettings {
         self.base_font_pt * self.a11y.text_scaling_factor
     }
 
-    /// Whether `other` realizes a different base font — size or family — so the UI owes a
-    /// re-publish. Compares the *realized* size, so a Large Text flip counts as a change.
-    pub fn base_font_differs(&self, other: &Self) -> bool {
-        self.realized_base_font_pt() != other.realized_base_font_pt()
-            || self.base_font_family != other.base_font_family
+    /// Publish this model's base font to the UI ([`crate::ui::publish_base_font`]). Call it
+    /// after anything that may have moved `font-name` or the Large Text factor.
+    pub fn publish_base_font(&self) {
+        crate::ui::publish_base_font(self.realized_base_font_pt(), &self.base_font_family);
     }
 
     fn load_mutter(&mut self, mutter: &gio::Settings) {
@@ -3987,8 +3986,7 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     /// Large Text scales our chrome the way mutter's font DPI scales St: the factor
-    /// multiplies `font-name`'s size into the realized base, and flipping it alone is a
-    /// change the UI must re-publish.
+    /// multiplies `font-name`'s size into the realized base.
     #[test]
     fn large_text_scales_the_realized_base_font() {
         let settings = GnomeSettings {
@@ -4000,15 +3998,11 @@ mod tests {
         let mut large = settings.clone();
         large.a11y.set(A11yToggle::LargeText, true);
         assert_eq!(large.realized_base_font_pt(), 12. * DPI_FACTOR_LARGE);
-        assert!(
-            settings.base_font_differs(&large),
-            "a Large Text flip re-sizes the UI"
-        );
 
         // An a11y change that is not Large Text leaves the font alone.
         let mut sticky = settings.clone();
         sticky.a11y.set(A11yToggle::StickyKeys, true);
-        assert!(!settings.base_font_differs(&sticky));
+        assert_eq!(sticky.realized_base_font_pt(), 12.);
     }
 
     /// No accelerator in our own schema may take a chord we adopt from GNOME.

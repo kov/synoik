@@ -2569,6 +2569,8 @@ impl State {
                 // gsettings round-trip is the only other path and it's absent headless,
                 // and the indicator's *presence* hangs off this state.
                 self.synoik.gnome_settings.a11y.set(toggle, on);
+                // Large Text re-sizes the UI from this same model, so it moves now too.
+                self.synoik.gnome_settings.publish_base_font();
                 self.synoik.panel.set_a11y(self.synoik.gnome_settings.a11y);
                 // The clicked row also closes the menu, but GNOME's `settings.bind` moves
                 // the switch synchronously — so it flips while the menu fades out rather
