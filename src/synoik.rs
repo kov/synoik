@@ -2220,8 +2220,7 @@ impl State {
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
-            crate::ui::set_base_font_pt(state.synoik.gnome_settings.base_font_pt);
-            synoik_vk::text::set_sans_family(&state.synoik.gnome_settings.base_font_family);
+            state.synoik.gnome_settings.publish_base_font();
             state.synoik.last_power_profile =
                 state.synoik.gnome_settings.last_power_profile.clone();
             state.synoik.gnome_settings_writer = Some(writer);
@@ -2494,10 +2493,6 @@ impl State {
                             new_is.present && old_is.mru_sources != new_is.mru_sources;
                         let icon_theme_changed =
                             state.synoik.gnome_settings.icon_theme != settings.icon_theme;
-                        let base_font_changed = state.synoik.gnome_settings.base_font_pt
-                            != settings.base_font_pt
-                            || state.synoik.gnome_settings.base_font_family
-                                != settings.base_font_family;
                         state.synoik.gnome_settings = settings;
                         state.synoik.sync_cursor_settings();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
@@ -2527,12 +2522,7 @@ impl State {
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
-                        if base_font_changed {
-                            crate::ui::set_base_font_pt(state.synoik.gnome_settings.base_font_pt);
-                            synoik_vk::text::set_sans_family(
-                                &state.synoik.gnome_settings.base_font_family,
-                            );
-                        }
+                        state.synoik.gnome_settings.publish_base_font();
                         // Both surfaces are re-derived *after* the assignment: the grid's
                         // order comes out of `app_picker_layout`, so syncing it against
                         // the old settings would show the previous arrangement until some

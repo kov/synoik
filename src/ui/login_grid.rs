@@ -115,7 +115,7 @@ pub fn tile_rects(monitor: Rectangle<f64, Logical>, count: usize) -> Vec<Rectang
 
 /// The pill's width: padding, label, gap, chevron, padding.
 fn pill_width() -> f64 {
-    let pt = crate::ui::base_font_pt();
+    let pt = crate::ui::BASE_FONT_PT;
     let label = synoik_vk::text::measure_line_width_weighted(
         ENTER_NAME_TEXT,
         crate::ui::pt_to_px(pt) as f32,
@@ -380,7 +380,7 @@ impl LoginGrid {
                 .done(),
             |renderer| {
                 TextShaper::new(renderer, scale)
-                    .shape(ENTER_NAME_TEXT, TextStyle::new(crate::ui::base_font_pt()))
+                    .shape(ENTER_NAME_TEXT, TextStyle::new(crate::ui::BASE_FONT_PT))
             },
             |frame, phys, label| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -508,7 +508,7 @@ impl LoginGrid {
             let has_picture = source.is_some();
             let name = widget::ellipsized_line(
                 user.display_name(),
-                crate::ui::base_font_pt(),
+                crate::ui::BASE_FONT_PT,
                 TILE - 2. * NAME_INSET,
             );
             let tint_key = tint.map(|c| (c * 255.) as u8);
@@ -527,7 +527,7 @@ impl LoginGrid {
                     .done(),
                 |renderer| {
                     TextShaper::new(renderer, scale)
-                        .shape(&name, TextStyle::new(crate::ui::base_font_pt()))
+                        .shape(&name, TextStyle::new(crate::ui::BASE_FONT_PT))
                 },
                 |frame, phys, label| {
                     let mut p = Painter::new(frame, scale, phys);

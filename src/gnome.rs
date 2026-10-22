@@ -314,9 +314,10 @@ impl A11yToggle {
 /// We mirror the keys faithfully, but almost none of them have a consumer in this
 /// stack yet: the magnifier, the on-screen keyboard, the keyboard filters, the visual
 /// bell and the screen reader are separate subsystems, and our own chrome does not
-/// follow `high-contrast`/`text-scaling-factor` the way St does. Writing the canonical
-/// key is still the right port — GTK apps read `high-contrast` and
-/// `text-scaling-factor` directly, and each consumer is its own later slice.
+/// follow `high-contrast` the way St does. Writing the canonical key is still the right
+/// port — GTK apps read it directly, and each consumer is its own later slice.
+/// `text-scaling-factor` is consumed: it scales our chrome through
+/// [`GnomeSettings::realized_base_font_pt`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct A11ySettings {
     /// `org.gnome.desktop.a11y always-show-universal-access-status`: pin the panel
@@ -666,6 +667,25 @@ pub enum FocusNewWindows {
 }
 
 impl GnomeSettings {
+    /// The base every UI point size is a ratio against ([`crate::ui::base_font_pt`]):
+    /// `font-name`'s size times `text-scaling-factor`.
+    ///
+    /// GNOME does not scale the font for Large Text; mutter folds the factor into the font
+    /// DPI (`meta-settings.c:184-199`), and St multiplies every `pt` and `em` length by that
+    /// resolution (`st-theme-node.c:1350-1373`) while leaving `px` alone. Our base already
+    /// drives exactly that set — [`crate::ui::pt_to_px`], [`crate::ui::em`] and
+    /// [`crate::ui::scaled_px`] scale with it, literal px do not — so the factor belongs
+    /// here and nowhere else.
+    pub fn realized_base_font_pt(&self) -> f64 {
+        self.base_font_pt * self.a11y.text_scaling_factor
+    }
+
+    /// Publish this model's base font to the UI ([`crate::ui::publish_base_font`]). Call it
+    /// after anything that may have moved `font-name` or the Large Text factor.
+    pub fn publish_base_font(&self) {
+        crate::ui::publish_base_font(self.realized_base_font_pt(), &self.base_font_family);
+    }
+
     fn load_mutter(&mut self, mutter: &gio::Settings) {
         let overlay_key = mutter.string("overlay-key");
         match parse_overlay_key(overlay_key.as_str()) {
@@ -3965,6 +3985,26 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    /// Large Text scales our chrome the way mutter's font DPI scales St: the factor
+    /// multiplies `font-name`'s size into the realized base.
+    #[test]
+    fn large_text_scales_the_realized_base_font() {
+        let settings = GnomeSettings {
+            base_font_pt: 12.,
+            ..Default::default()
+        };
+        assert_eq!(settings.realized_base_font_pt(), 12.);
+
+        let mut large = settings.clone();
+        large.a11y.set(A11yToggle::LargeText, true);
+        assert_eq!(large.realized_base_font_pt(), 12. * DPI_FACTOR_LARGE);
+
+        // An a11y change that is not Large Text leaves the font alone.
+        let mut sticky = settings.clone();
+        sticky.a11y.set(A11yToggle::StickyKeys, true);
+        assert_eq!(sticky.realized_base_font_pt(), 12.);
+    }
+
     /// No accelerator in our own schema may take a chord we adopt from GNOME.
     ///
     /// This is the fork tenet made mechanical: where the two models want the same
