@@ -7,7 +7,6 @@
 //! The indicator's icon names the one in force, and follows it when a one-shot click falls back
 //! to a single one (`ptr-a11y-dwell-click-type-changed`).
 
-use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Size};
 
 use crate::input::pointer_a11y::DwellClickType;
@@ -121,23 +120,12 @@ impl DwellClickMenu {
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
-        match self.menu.bake(renderer, scale) {
-            Ok(buffer) => vec![TextureRenderElement::from_texture_buffer(
-                buffer,
-                origin,
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            )],
-            Err(err) => {
-                tracing::error!("error baking the dwell-click menu: {err:#}");
-                Vec::new()
-            }
-        }
+        self.menu
+            .render(renderer, icons, scale, origin, "the dwell-click menu")
     }
 }
 

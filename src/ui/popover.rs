@@ -1945,12 +1945,12 @@ impl PanelPopover {
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::LoginA11y(m)) => m.render(renderer, icons, scale, origin),
-            Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
-            Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
-            Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
-            Some(PopoverContent::Workspace(m)) => m.render(renderer, scale, origin),
-            Some(PopoverContent::Background(m)) => m.render(renderer, scale, origin),
-            Some(PopoverContent::DwellClick(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::App(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::Indicator(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::Window(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::Workspace(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::Background(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::DwellClick(m)) => m.render(renderer, icons, scale, origin),
             None => Vec::new(),
         };
 

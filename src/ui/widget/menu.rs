@@ -789,11 +789,61 @@ impl Menu {
         self.scroll_y = 0.;
     }
 
+    /// The menu at `origin`, topmost first: its row icons, check marks and submenu chevrons over
+    /// the baked card. Every menu draws through this, so none can bake the card and forget what
+    /// goes on it. `what` names the menu in a bake error.
+    pub fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
+        scale: f64,
+        origin: Point<f64, Logical>,
+        what: &str,
+    ) -> Vec<
+        crate::render_helpers::texture::TextureRenderElement<
+            crate::render_helpers::vulkan::VkTexture,
+        >,
+    > {
+        let card = match self.bake(renderer, scale) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                tracing::error!("error baking {what}: {err:#}");
+                return Vec::new();
+            }
+        };
+        let mut out: Vec<_> = self
+            .ornaments()
+            .into_iter()
+            .filter_map(|(names, center)| {
+                super::icon_element(
+                    renderer,
+                    icons,
+                    &names,
+                    ICON,
+                    scale,
+                    style::TEXT,
+                    origin,
+                    center,
+                )
+            })
+            .collect();
+        out.push(
+            crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
+                card,
+                origin,
+                1.,
+                None,
+                None,
+                smithay::backend::renderer::element::Kind::Unspecified,
+            ),
+        );
+        out
+    }
+
     /// The ornament/icon centres to composite over the baked card, in menu-local coordinates:
     /// `(icon names, centre)` per row that has one.
     ///
-    /// Icons are *elements*, not paint verbs — the toolkit composites them over a baked card the
-    /// way `input_source_menu` composites its check marks — so the caller draws these itself.
+    /// Icons are *elements*, not paint verbs, composited over the baked card by [`Self::render`].
     pub fn ornaments(&self) -> Vec<(Vec<String>, Point<f64, Logical>)> {
         let width = self.logical_size().w;
         let rows = self.visible_rows();

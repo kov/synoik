@@ -4356,6 +4356,26 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     );
 }
 
+/// A menu draws its rows' icons over its card (`widget::Menu::render`): the dwell-click menu's
+/// four rows each carry gnome-shell's own icon, so it is five elements, not a bare card.
+#[test]
+fn vulkan_a_menu_draws_its_row_icons() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let state = f.synoik_state();
+    let count = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            crate::ui::dwell_click_menu::DwellClickMenu::new()
+                .render(vk, &state.synoik.icon_cache, 1., Point::from((0., 0.)))
+                .len()
+        })
+        .expect("vulkan renderer");
+    assert_eq!(count, 5, "four row icons over the card");
+}
+
 /// A translucent `TextureRenderElement` (alpha < 1, e.g. a fading popover) must NOT report
 /// any opaque regions. If it does, the damage tracker skips clearing and repainting beneath
 /// it, so the fade blends over stale framebuffer content instead of the scene behind — the
