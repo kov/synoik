@@ -136,10 +136,12 @@ name and a bounding box, which is a toolkit-wide change and the reason this is a
 rather than a slice. **The Screen Reader row in A1 is a lie until this exists** — it enables
 Orca, and Orca then finds nothing to read in the shell.
 
-### A9 — Screen reader launch
-`screen-reader-enabled` starts Orca in a GNOME session (gsd/session-side, not shell-side). The
-row currently just writes the key; confirm whether anything on this system acts on it, and
-whether we need to do the launching ourselves.
+### A9 — Screen reader launch ✅ (nothing to build)
+gnome-session launches Orca, not the shell. `/etc/xdg/autostart/orca-autostart.desktop` carries
+`AutostartCondition=GSettings org.gnome.desktop.a11y.applications screen-reader-enabled`, and
+gnome-session watches that key: turning the row on starts `orca.service` in the session, and
+turning it off stops it (checked on the harness VM with orca 50.3 and gnome-session 50.1). What
+Orca can *read* is A7 and A8.
 
 ---
 
@@ -148,7 +150,7 @@ whether we need to do the launching ourselves.
 1. **A2** — High Contrast, the half that makes its shipped switch honest.
 2. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-3. **A3**, **A5**, **A7**, **A9** — each independently schedulable.
+3. **A3**, **A5**, **A7** — each independently schedulable.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**
