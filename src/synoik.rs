@@ -1199,6 +1199,8 @@ pub struct Synoik {
     pub flashspot: crate::ui::flashspot::FlashSpot,
     /// The visual bell's rate limiter, global across windows (`bell.c:117-143`).
     pub visual_bell: crate::bell::VisualBell,
+    /// Sticky, Slow, Bounce and Mouse Keys (`MetaKeyboardA11y`).
+    pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11y,
     /// The visual bell's fullscreen flash, while it runs.
     pub bell_flash: Option<crate::bell::BellFlash>,
     /// The hot corner's ripple.
@@ -2506,6 +2508,7 @@ impl State {
                             state.synoik.gnome_settings.icon_theme != settings.icon_theme;
                         state.synoik.gnome_settings = settings;
                         state.synoik.sync_cursor_settings();
+                        state.sync_keyboard_a11y();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -9150,6 +9153,7 @@ impl Synoik {
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             visual_bell: crate::bell::VisualBell::new(),
+            keyboard_a11y: Default::default(),
             bell_flash: None,
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),

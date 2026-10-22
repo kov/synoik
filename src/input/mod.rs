@@ -85,6 +85,7 @@ use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
+pub mod keyboard_a11y;
 pub mod keyboard_window_grab;
 pub mod move_grab;
 pub mod peripherals;
@@ -697,7 +698,14 @@ impl State {
         match event {
             DeviceAdded { device } => self.on_device_added(device),
             DeviceRemoved { device } => self.on_device_removed(device),
-            Keyboard { event } => self.on_keyboard::<I>(event, &mut consumed_by_a11y),
+            Keyboard { event } => {
+                let time = Event::time_msec(&event);
+                let (keycode, key_state) = (event.key_code(), event.state());
+                if self.keyboard_a11y_admits(keycode, key_state, time) {
+                    self.on_keyboard::<I>(event, &mut consumed_by_a11y);
+                    self.sticky_keys_after(keycode, key_state == KeyState::Pressed);
+                }
+            }
             PointerMotion { event } => self.on_pointer_motion::<I>(event),
             PointerMotionAbsolute { event } => self.on_pointer_motion_absolute::<I>(event),
             PointerButton { event } => self.on_pointer_button::<I>(event),

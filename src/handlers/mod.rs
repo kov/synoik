@@ -155,6 +155,7 @@ impl SeatHandler for State {
     }
 
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: keyboard::LedState) {
+        self.keyboard_a11y_leds_changed();
         let keyboards = self
             .synoik
             .devices

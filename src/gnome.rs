@@ -141,6 +141,9 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.wm.preferences audible-bell`: whether a bell plays the theme's
     /// `bell-window-system` sound. Independent of Visual Alerts (`meta_bell_notify`).
     pub audible_bell: bool,
+    /// `org.gnome.desktop.a11y.keyboard`: what the keyboard filters run with
+    /// ([`crate::input::keyboard_a11y`]).
+    pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11ySettings,
     /// `org.gnome.desktop.sound event-sounds`: the master switch for every event sound
     /// (`MetaSoundPlayer`'s `CA_PROP_CANBERRA_ENABLE`).
     pub event_sounds: bool,
@@ -323,11 +326,11 @@ impl A11yToggle {
 /// The accessibility keys gnome-shell's `ATIndicator` reads and writes
 /// (`js/ui/status/accessibility.js`).
 ///
-/// We mirror the keys faithfully, but almost none of them have a consumer in this
-/// stack yet: the magnifier, the on-screen keyboard, the keyboard filters, the visual
-/// bell and the screen reader are separate subsystems, and our own chrome does not
-/// follow `high-contrast` the way St does. Writing the canonical key is still the right
-/// port — GTK apps read it directly, and each consumer is its own later slice.
+/// These are the menu rows' state. What acts on them lives elsewhere: the keyboard filters
+/// read [`GnomeSettings::keyboard_a11y`], the bell reads `visual-bell`. The magnifier, the
+/// on-screen keyboard and the screen reader have no consumer in this stack yet, and our own
+/// chrome does not follow `high-contrast` the way St does; writing their keys is still the
+/// right port — GTK apps read them directly.
 /// `text-scaling-factor` is consumed: it scales our chrome through
 /// [`GnomeSettings::realized_base_font_pt`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -531,6 +534,7 @@ impl Default for GnomeSettings {
             resize_with_right_button: false,
             visual_bell_type: VisualBellType::default(),
             audible_bell: true,
+            keyboard_a11y: Default::default(),
             event_sounds: true,
             sound_theme_name: crate::sound_theme::FALLBACK_THEME.to_owned(),
             edge_tiling: true,
@@ -1062,6 +1066,47 @@ impl GnomeSettings {
         if let Some(interface) = &stores.interface {
             if settings_has_key(interface, "text-scaling-factor") {
                 self.a11y.text_scaling_factor = interface.double("text-scaling-factor");
+            }
+        }
+    }
+
+    /// `load_keyboard_a11y_settings` (`meta-input-settings.c:1291-1340`).
+    fn load_keyboard_a11y(&mut self, keyboard: &gio::Settings) {
+        let k = &mut self.keyboard_a11y;
+        let flags: [(&str, &mut bool); 13] = [
+            ("enable", &mut k.enable),
+            (
+                "feature-state-change-beep",
+                &mut k.feature_state_change_beep,
+            ),
+            ("bouncekeys-enable", &mut k.bouncekeys_enable),
+            ("bouncekeys-beep-reject", &mut k.bouncekeys_beep_reject),
+            ("mousekeys-enable", &mut k.mousekeys_enable),
+            ("slowkeys-enable", &mut k.slowkeys_enable),
+            ("slowkeys-beep-press", &mut k.slowkeys_beep_press),
+            ("slowkeys-beep-accept", &mut k.slowkeys_beep_accept),
+            ("slowkeys-beep-reject", &mut k.slowkeys_beep_reject),
+            ("stickykeys-enable", &mut k.stickykeys_enable),
+            ("stickykeys-two-key-off", &mut k.stickykeys_two_key_off),
+            ("stickykeys-modifier-beep", &mut k.stickykeys_modifier_beep),
+            ("togglekeys-enable", &mut k.togglekeys_enable),
+        ];
+        for (key, value) in flags {
+            if settings_has_key(keyboard, key) {
+                *value = keyboard.boolean(key);
+            }
+        }
+        // Settings are `int`; a negative delay reads as 0 (`MAX (0, …)`).
+        let delays: [(&str, &mut u32); 5] = [
+            ("bouncekeys-delay", &mut k.bouncekeys_delay),
+            ("slowkeys-delay", &mut k.slowkeys_delay),
+            ("mousekeys-max-speed", &mut k.mousekeys_max_speed),
+            ("mousekeys-accel-time", &mut k.mousekeys_accel_time),
+            ("mousekeys-init-delay", &mut k.mousekeys_init_delay),
+        ];
+        for (key, value) in delays {
+            if settings_has_key(keyboard, key) {
+                *value = keyboard.int(key).max(0) as u32;
             }
         }
     }
@@ -3103,6 +3148,9 @@ impl Stores {
             settings.load_world_clocks(world_clocks, &self.world_clocks_cache);
         }
         settings.load_a11y(self);
+        if let Some(keyboard) = &self.a11y_keyboard {
+            settings.load_keyboard_a11y(keyboard);
+        }
         settings.app_folders = self.read_app_folders();
         settings
     }

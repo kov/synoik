@@ -1,13 +1,12 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 done (the toggle surface); A2's Large Text half and A6's bell done.
-Everything else it toggles is unbuilt.**
+**Status: A1 done (the toggle surface); A2's Large Text half, A4's keyboard filters and A6's
+bell done. Everything else it toggles is unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
-panel for a feature we have not built**. Turning on Zoom, Screen Reader, Screen Keyboard,
-Visual Alerts or the four keyboard filters currently does nothing at all, because every one
-of them is a subsystem the compositor owes and none of them exist here yet. Treating the
+panel for features we had not built**. Zoom, Screen Reader and Screen Keyboard still do
+nothing at all, because each is a subsystem the compositor owes and none exists here yet. Treating the
 rest as "more panel work" would badly misjudge the size: each row below is days-to-weeks,
 several are their own protocol surface, and one (§A8) is the part that actually decides
 whether a blind user can use this desktop.
@@ -26,7 +25,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
 | Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ⬜ §A2, A3, A5 |
-| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ⬜ §A4, A6, A7 |
+| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6; ⬜ A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
 ---
@@ -64,13 +63,29 @@ saturation filters and colour-blindness modes (the schema has ~30 keys — `brig
 the owned Vulkan renderer, which makes it cheaper than GNOME's but not small. `StSettings`
 also exposes `magnifier-active` (`st-settings.c:388-392`), which other chrome reads.
 
-### A4 — Keyboard filters (Sticky / Slow / Bounce / Mouse Keys)
-Compositor-side, and **not** something libinput does for us: mutter implements the state
-machines itself in `src/backends/native/meta-keyboard-a11y.c`, fed from
-`org.gnome.desktop.a11y.keyboard` through `meta-input-settings.c:1297-1305` (which maps each
-key to a `META_A11Y_*` flag, including the beep variants we don't surface). Sticky Keys also
-needs the modifier-latch feedback GNOME shows. Mouse Keys turns the numpad into a pointer.
-This is a self-contained input-path slice against our own seat handling.
+### A4 — Keyboard filters (Sticky / Slow / Bounce / Mouse Keys) ✅
+`src/input/keyboard_a11y.rs`, a port of mutter's `src/backends/native/meta-keyboard-a11y.c`, fed
+from `org.gnome.desktop.a11y.keyboard` as `meta-input-settings.c:1291-1340` reads it. libinput
+reports keys untouched and xkbcommon has no AccessX, so the filters are the compositor's own,
+between the device and the keymap:
+- **Sticky Keys**: a modifier tapped alone latches onto the next key, tapped twice locks, again
+  unlocks; a chord stays a chord; `stickykeys-two-key-off` turns it off on two modifiers at once.
+  The latch lives in the xkb state, so clients and our keybindings see it — which needs
+  `XkbContext::set_latched_and_locked_mods` from our smithay fork.
+- **Slow Keys**, **Bounce Keys**, **Toggle Keys**, and **Mouse Keys** (keypad drives the pointer
+  with Num Lock off, mutter's acceleration curve).
+- **The `enable` shortcuts**: Shift ×5 toggles Sticky Keys, Shift held 8 s toggles Slow Keys,
+  each writing its key back so the menu row follows.
+- Every beep variant, each the system bell (`meta_bell_notify (display, NULL)`, A6).
+
+**Divergence:** mutter filters after the key has updated the xkb state, so a Shift that Slow
+Keys holds back still reaches the modifiers clients see. Ours filters before the keymap: a
+swallowed key changes nothing, and an accepted slow key is delivered when accepted.
+
+gnome-shell shows no latched-modifier indicator (mutter's `kbd-a11y-mods-state-changed` has no
+listener). What it does show is `KbdA11yDialog` (`js/ui/kbdA11yDialog.js`), the "Sticky Keys
+Turned On" confirmation after a shortcut — **not yet built**. `timeout-enable` /
+`disable-timeout` are read by mutter and acted on nowhere.
 
 ### A5 — On-screen keyboard (the Screen Keyboard row)
 `screen-keyboard-enabled` (`js/ui/keyboard.js:25`), `Keyboard` (`keyboard.js:1174`) — a full
@@ -95,8 +110,7 @@ theme's `bell-window-system` (`org.gnome.desktop.sound theme-name`, silenced by 
 PipeWire stream with `media.role = Notification` (canberra's `event` role, so GNOME Settings'
 System Sounds volume applies).
 
-Left out:
-- **The keyboard-a11y bell** (`meta-seat-native.c:350`). It arrives with A4.
+The keyboard filters' beeps (A4) ring this same bell, as `meta_seat_native_bell_notify` does.
 
 ### A7 — The a11y D-Bus surface + dwell click
 - mutter exports `org.freedesktop.a11y.KeyboardMonitor` and a `PointerLocator`
@@ -130,10 +144,9 @@ whether we need to do the launching ourselves.
 ## Suggested order
 
 1. **A2** — High Contrast, the half that makes its shipped switch honest.
-2. **A4** — self-contained input work, no new protocol surface.
-3. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
+2. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-4. **A3**, **A5**, **A7**, **A9** — each independently schedulable.
+3. **A3**, **A5**, **A7**, **A9** — each independently schedulable.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**

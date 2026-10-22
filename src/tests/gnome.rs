@@ -44388,3 +44388,426 @@ fn a_bell_inside_the_gate_does_not_restart_the_flash() {
         "the running flash is untouched"
     );
 }
+
+// ---- The keyboard accessibility filters (`MetaKeyboardA11y`, `meta-keyboard-a11y.c`) ----
+
+const KEY_NUMLOCK: u32 = 69;
+const KEY_KP5: u32 = 76;
+const KEY_KP6: u32 = 77;
+const KEY_KP0: u32 = 82;
+const KEY_KPDOT: u32 = 83;
+const KEY_KPMINUS: u32 = 74;
+
+/// A focused window listening to its keyboard and pointer, a recording sound player standing in
+/// for the bell's audible half, and a frozen clock for the filters' deadlines.
+fn keyboard_a11y_fixture() -> (Fixture, ClientId, crate::sound_player::StubSoundPlayer) {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.client(id).get_pointer();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).take_mods_events();
+    let player = crate::sound_player::StubSoundPlayer::default();
+    f.synoik().sound_player = Some(Box::new(player.clone()));
+    f.freeze_clock();
+    (f, id, player)
+}
+
+fn keyboard_a11y_settings(
+    f: &mut Fixture,
+) -> &mut crate::input::keyboard_a11y::KeyboardA11ySettings {
+    &mut f.synoik().gnome_settings.keyboard_a11y
+}
+
+/// Run the compositor for `d` of its own time, so the filters' timers come due.
+fn run_for(f: &mut Fixture, d: Duration) {
+    f.advance_until(d, |_| false);
+}
+
+/// Bounce Keys: a press of the key released less than `bouncekeys-delay` ago never happened,
+/// release included, and beeps when `bouncekeys-beep-reject` asks (`debounce_key`,
+/// `notify_bounce_keys_reject`). The window opens again on every release, the dropped one's too
+/// (`start_bounce_keys`), and only for the key released last: another key's release ends it.
+#[test]
+fn bounce_keys_drop_a_press_too_soon_after_the_last_release() {
+    let (mut f, id, player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.bouncekeys_enable = true;
+    k.bouncekeys_beep_reject = true;
+    assert_eq!(k.bouncekeys_delay, 300, "the schema default");
+
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(100));
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(250));
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(301));
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_Z);
+    f.double_roundtrip(id);
+
+    use WlKeyState::{Pressed, Released};
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+            (KEY_A, Pressed),
+            (KEY_A, Released),
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+        ],
+        "both bounces dropped whole — the second came 250 ms after the first one's release — \
+         and a Z right after an A is no bounce"
+    );
+    assert_eq!(player.played().len(), 2, "a beep for each bounce");
+}
+
+/// Slow Keys: a key counts only once held for `slowkeys-delay` (`start_slow_keys`,
+/// `trigger_slow_keys`); let go sooner, it never happened (`stop_slow_keys`). A held-back Shift
+/// does not reach the modifiers either — the divergence in the module doc.
+#[test]
+fn slow_keys_deliver_only_a_key_held_past_the_delay() {
+    let (mut f, id, player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.slowkeys_enable = true;
+    k.slowkeys_beep_reject = true;
+    k.slowkeys_beep_accept = true;
+    assert_eq!(k.slowkeys_delay, 300, "the schema default");
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_Z);
+    run_for(&mut f, Duration::from_millis(200));
+    f.key_release(KEY_Z);
+    f.key_release(KEY_LEFTSHIFT);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "keys let go too soon"
+    );
+    assert_eq!(
+        f.client(id).take_mods_events(),
+        Vec::<u32>::new(),
+        "nor did the Shift change the modifiers"
+    );
+    assert_eq!(player.played().len(), 2, "a rejection beep for each");
+
+    f.key_press(KEY_Z);
+    run_for(&mut f, Duration::from_millis(200));
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).take_key_events(), vec![], "not yet");
+    run_for(&mut f, Duration::from_millis(150));
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_Z, WlKeyState::Pressed)],
+        "pressed once it has been held for the delay"
+    );
+    f.key_release(KEY_Z);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_Z, WlKeyState::Released)]
+    );
+    assert_eq!(player.played().len(), 3, "and an acceptance beep");
+}
+
+/// Mouse Keys: with Num Lock off the keypad drives the pointer — 6 moves it right while held,
+/// 0 holds the button and . lets it go, 5 clicks, and − picks the right button
+/// (`handle_mousekeys_press`). None of it reaches the client as a key. With Num Lock on, the
+/// keypad types again.
+#[test]
+fn mouse_keys_drive_the_pointer_from_the_keypad() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).mousekeys_enable = true;
+    pointer_motion_to(&mut f, 960., 540.);
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_pointer_events();
+
+    let pointer = |f: &mut Fixture| f.synoik().seat.get_pointer().unwrap().current_location();
+    let start = pointer(&mut f);
+    f.key_press(KEY_KP6);
+    run_for(&mut f, Duration::from_secs(1));
+    f.key_release(KEY_KP6);
+    let moved = pointer(&mut f);
+    assert!(
+        moved.x >= start.x + 3. && moved.y == start.y,
+        "held, 6 moves the pointer right: {start:?} -> {moved:?}"
+    );
+    run_for(&mut f, Duration::from_millis(500));
+    assert_eq!(pointer(&mut f), moved, "and stops when let go");
+
+    f.key_press(KEY_KP0);
+    f.key_release(KEY_KP0);
+    f.key_press(KEY_KPDOT);
+    f.key_release(KEY_KPDOT);
+    tap(&mut f, KEY_KPMINUS);
+    tap(&mut f, KEY_KP5);
+    f.double_roundtrip(id);
+    let buttons: Vec<_> = f
+        .client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            super::client::PointerEvent::Button { button, pressed } => Some((button, pressed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        buttons,
+        vec![
+            (BTN_LEFT, true),
+            (BTN_LEFT, false),
+            (BTN_RIGHT, true),
+            (BTN_RIGHT, false)
+        ],
+        "0 presses and . releases the left button; − then 5 clicks the right"
+    );
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "no keypad key typed"
+    );
+
+    tap(&mut f, KEY_NUMLOCK);
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    tap(&mut f, KEY_KP6);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_KP6, WlKeyState::Pressed),
+            (KEY_KP6, WlKeyState::Released)
+        ],
+        "with Num Lock on the keypad is a keypad"
+    );
+}
+
+/// Turning Mouse Keys off lets go of a button it holds (`disable_mousekeys`), or the session
+/// would be left mid-drag with no key to end it.
+#[test]
+fn mouse_keys_turned_off_release_the_held_button() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).mousekeys_enable = true;
+    pointer_motion_to(&mut f, 960., 540.);
+    tap(&mut f, KEY_KP0);
+    keyboard_a11y_settings(&mut f).mousekeys_enable = false;
+    f.synoik_state().sync_keyboard_a11y();
+    f.double_roundtrip(id);
+    let buttons: Vec<_> = f
+        .client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter(|e| matches!(e, super::client::PointerEvent::Button { .. }))
+        .collect();
+    assert_eq!(
+        buttons,
+        vec![
+            super::client::PointerEvent::Button {
+                button: BTN_LEFT,
+                pressed: true
+            },
+            super::client::PointerEvent::Button {
+                button: BTN_LEFT,
+                pressed: false
+            },
+        ]
+    );
+}
+
+/// Toggle Keys: a key that changes the lock LEDs beeps
+/// (`meta_keyboard_a11y_maybe_notify_toggle_keys_in_impl`); any other key does not.
+#[test]
+fn toggle_keys_beep_on_caps_lock() {
+    let (mut f, _id, player) = keyboard_a11y_fixture();
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(player.played().is_empty(), "off by default");
+
+    keyboard_a11y_settings(&mut f).togglekeys_enable = true;
+    tap(&mut f, KEY_Z);
+    assert!(player.played().is_empty(), "a plain key changes no LED");
+    tap(&mut f, KEY_CAPSLOCK);
+    assert_eq!(player.played().len(), 1, "Caps Lock off beeps");
+    tap(&mut f, KEY_NUMLOCK);
+    assert_eq!(player.played().len(), 2, "so does Num Lock");
+}
+
+/// The enable shortcuts (`enable`): Shift five times turns Sticky Keys on
+/// (`handle_enablekeys_release`), and holding Shift eight seconds toggles Slow Keys
+/// (`trigger_toggle_slowkeys`). Each writes its key, so the menu row follows. Off, Shift is just
+/// Shift.
+#[test]
+fn the_enable_shortcuts_toggle_sticky_and_slow_keys() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(
+        !keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "the shortcuts are off by default"
+    );
+
+    keyboard_a11y_settings(&mut f).enable = true;
+    for _ in 0..4 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert!(
+        !keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "another key in between starts the count over"
+    );
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(
+        keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "five Shifts"
+    );
+    assert!(
+        f.synoik().gnome_settings.a11y.get(A11yToggle::StickyKeys),
+        "and the menu's row with it"
+    );
+
+    f.key_press(KEY_LEFTSHIFT);
+    run_for(&mut f, Duration::from_secs(7));
+    assert!(!keyboard_a11y_settings(&mut f).slowkeys_enable, "not yet");
+    run_for(&mut f, Duration::from_millis(1100));
+    assert!(
+        keyboard_a11y_settings(&mut f).slowkeys_enable,
+        "Shift held for eight seconds"
+    );
+    f.key_release(KEY_LEFTSHIFT);
+}
+
+/// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
+const SHIFT_MASK: u32 = 1;
+const CONTROL_MASK: u32 = 1 << 2;
+
+/// The `(latched, locked)` masks of the last `wl_keyboard.modifiers` the client saw since the
+/// last take, if any came.
+fn last_sticky_mods(f: &mut Fixture, id: ClientId) -> Option<(u32, u32)> {
+    f.double_roundtrip(id);
+    let events = f.client(id).take_modifier_events();
+    events
+        .last()
+        .map(|(_, latched, locked)| (*latched, *locked))
+}
+
+fn shift_is_on(f: &mut Fixture) -> bool {
+    f.synoik()
+        .seat
+        .get_keyboard()
+        .unwrap()
+        .modifier_state()
+        .shift
+}
+
+/// Sticky Keys: Shift tapped on its own latches onto the next key, which sees it, and that
+/// key's release ends the latch (`handle_stickykeys_release`). The client hears both in
+/// `wl_keyboard.modifiers` — the latch is in the xkb state, not a private flag.
+#[test]
+fn sticky_keys_latch_a_modifier_onto_the_next_key() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((SHIFT_MASK, 0)),
+        "latched"
+    );
+    assert!(shift_is_on(&mut f), "Shift is on with no key held");
+
+    f.key_press(KEY_Z);
+    assert!(shift_is_on(&mut f), "the next key is pressed under it");
+    f.key_release(KEY_Z);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "and its release ends the latch"
+    );
+    assert!(!shift_is_on(&mut f));
+}
+
+/// Tapped twice, a modifier locks; a third tap unlocks it. A locked modifier outlives the keys
+/// pressed under it.
+#[test]
+fn sticky_keys_lock_a_modifier_tapped_twice() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, SHIFT_MASK)),
+        "locked"
+    );
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_A);
+    assert!(shift_is_on(&mut f), "still on after two keys");
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(last_sticky_mods(&mut f, id), Some((0, 0)), "unlocked");
+    assert!(!shift_is_on(&mut f));
+}
+
+/// A modifier held down with a key is an ordinary modifier, not a sticky one (the
+/// `stickykeys_depressed_mask` reset), and two modifiers tapped together latch once, together.
+#[test]
+fn sticky_keys_leave_a_chord_alone() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "Shift+Z latched nothing"
+    );
+    assert!(!shift_is_on(&mut f));
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((SHIFT_MASK | CONTROL_MASK, 0)),
+        "Shift and Control latched as one"
+    );
+}
+
+/// `stickykeys-two-key-off`: two modifiers down at once turn Sticky Keys off, writing the key
+/// and dropping what it had latched (`handle_stickykeys_press`, `notify_stickykeys_change`).
+#[test]
+fn sticky_keys_two_key_off() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.stickykeys_enable = true;
+    k.stickykeys_two_key_off = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(last_sticky_mods(&mut f, id), Some((SHIFT_MASK, 0)));
+    f.key_press(KEY_LEFTCTRL);
+    f.key_press(KEY_LEFTALT);
+    assert!(!keyboard_a11y_settings(&mut f).stickykeys_enable, "off");
+    assert!(!f.synoik().gnome_settings.a11y.get(A11yToggle::StickyKeys));
+    f.key_release(KEY_LEFTALT);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "the latched Shift went with it"
+    );
+}
