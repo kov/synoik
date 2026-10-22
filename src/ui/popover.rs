@@ -962,6 +962,13 @@ impl PanelPopover {
 
     /// Close the keyboard's language menu, if that is what is open: its key went away
     /// (`notify::mapped`).
+    /// The open content's rectangle, output-local.
+    #[cfg(test)]
+    pub fn content_rect(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
+        let size = self.content.as_ref()?.logical_size();
+        Some(Rectangle::new(self.location(output), size))
+    }
+
     /// The input-source menu's rows, if that is what is open.
     #[cfg(test)]
     pub fn input_source_rows(&self) -> Vec<String> {

@@ -16945,3 +16945,78 @@ fn vulkan_the_pointer_is_drawn_from_svg_at_a_fractional_scale() {
     let body = px(&pixels, w, 152, 155);
     assert!(body[3] > 200, "{body:?}");
 }
+
+/// The on-screen keyboard draws over the windows: the OSD background across the display's
+/// bottom, key caps on it; its language menu draws over the keys, not under them; and the emoji
+/// page's emoji have no caps (`.emoji-page .keyboard-key`).
+#[test]
+fn vulkan_renders_the_on_screen_keyboard() {
+    use crate::osk::layout::{Action, Face};
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.freeze_clock();
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, true);
+    f.synoik_state().sync_osk();
+    f.synoik_state().osk_open(true);
+    f.advance_clock(Duration::from_millis(300));
+    let rect = f.synoik().osk_rect(&output).expect("the keyboard is up");
+    assert_eq!(rect.loc.y, f64::from(OUT_H) - rect.size.h);
+
+    let key = |f: &mut Fixture, pred: &dyn Fn(&crate::osk::layout::Key) -> bool| {
+        let synoik = f.synoik();
+        let level = synoik.osk.level().unwrap();
+        let i = level.keys.iter().position(pred).expect("the key");
+        let cap = crate::ui::osk::key_rects(rect.size, level)[i];
+        Rectangle::new(rect.loc + cap.loc, cap.size)
+    };
+    let at = |pixels: &[u8], w: i32, p: Point<f64, Logical>| px(pixels, w, p.x as i32, p.y as i32);
+    let close = |a: [u8; 4], b: [u8; 3]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 3);
+
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    // `osd_bg`, beside the key grid.
+    let background = at(&pixels, w, Point::from((10., f64::from(OUT_H) - 20.)));
+    assert!(close(background, [46, 46, 51]), "{background:?}");
+    // A character key's cap, `#5d5d5d`, just inside its corner.
+    let q = key(&mut f, &|k| k.commit.as_deref() == Some("q"));
+    let cap = at(&pixels, w, q.loc + Point::from((6., q.size.h / 2.)));
+    assert!(close(cap, [0x5d, 0x5d, 0x5d]), "{cap:?}");
+
+    // The language menu, over the keys it covers.
+    let globe = key(&mut f, &|k| k.action == Some(Action::LanguageMenu));
+    let center = globe.loc + globe.size.downscale(2.).to_point();
+    super::gnome::pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.advance_clock(Duration::from_millis(400));
+    let menu = {
+        let popover = &f.synoik().panel_popover;
+        assert!(popover.is_osk_languages());
+        popover.content_rect(&output).unwrap()
+    };
+    let inside = menu.loc + Point::from((menu.size.w / 2., menu.size.h - 12.));
+    assert!(rect.contains(inside), "the probe is over the keyboard");
+    let before = at(&pixels, w, inside);
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    let after = at(&pixels, w, inside);
+    assert_ne!(before, after, "the menu is drawn over the keyboard");
+
+    // Close it, and switch to the emoji page: its emoji have no cap.
+    f.synoik().panel_popover.close_osk_languages();
+    f.advance_clock(Duration::from_millis(400));
+    let emoji = key(&mut f, &|k| k.action == Some(Action::Emoji));
+    let center = emoji.loc + emoji.size.downscale(2.).to_point();
+    super::gnome::pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.synoik().osk.emoji_active());
+    let first = key(&mut f, &|k| matches!(k.face, Face::Emoji(_)) && k.flat);
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    let corner = at(&pixels, w, first.loc + Point::from((3., 3.)));
+    assert!(close(corner, [46, 46, 51]), "no cap: {corner:?}");
+}
