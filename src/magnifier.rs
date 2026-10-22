@@ -28,6 +28,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::{Animation, Clock, Curve};
+use crate::focus_caret_tracker::{FocusCaretTracker, Tracked};
 use crate::render_helpers::mag_effects::{MagEffects, MagEffectsRenderElement};
 use crate::render_helpers::off_plane::OffPlaneRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
@@ -238,6 +239,10 @@ pub struct ZoomRegion {
     mouse: Option<Point<f64, Logical>>,
     /// The pointer image's logical size (`_mouseSourceActor.get_size()`), for push tracking.
     cursor_size: f64,
+    /// The last focus and caret points, to skip a report that did not move (`_xFocus`,
+    /// `_xCaret`).
+    focus: Option<Point<f64, Logical>>,
+    caret: Option<Point<f64, Logical>>,
     target: ZoomTransform,
     ease: Option<Ease>,
 }
@@ -263,6 +268,8 @@ impl ZoomRegion {
             delayed: None,
             mouse: None,
             cursor_size,
+            focus: None,
+            caret: None,
             target: ZoomTransform {
                 origin: Point::from((0., 0.)),
                 mag: 1.,
@@ -461,6 +468,26 @@ impl ZoomRegion {
         } else {
             self.scroll_contents_to(p, clock);
         }
+    }
+
+    /// `_updateFocus` → `_centerFromFocusPosition`: keyboard focus moved to `p`.
+    pub fn focus_moved(&mut self, p: Point<f64, Logical>, mode: Tracking, clock: &Clock) {
+        if self.focus == Some(p) {
+            return;
+        }
+        self.focus = Some(p);
+        let center = self.center_from_point(mode, p);
+        self.scroll_contents_to_delayed(center, clock);
+    }
+
+    /// `_updateCaret` → `_centerFromCaretPosition`: the caret moved to `p`.
+    pub fn caret_moved(&mut self, p: Point<f64, Logical>, mode: Tracking, clock: &Clock) {
+        if self.caret == Some(p) {
+            return;
+        }
+        self.caret = Some(p);
+        let center = self.center_from_point(mode, p);
+        self.scroll_contents_to_delayed(center, clock);
     }
 
     /// `scrollContentsTo`: centre the view on `p`, easing there.
@@ -889,6 +916,7 @@ pub struct Magnifier {
     /// By output name.
     regions: HashMap<String, ZoomRegion>,
     rest_timer: Option<TimerToken>,
+    tracker: FocusCaretTracker,
 }
 
 impl Magnifier {
@@ -906,6 +934,10 @@ impl Magnifier {
 
     pub fn easing(&self) -> bool {
         self.active && self.regions.values().any(ZoomRegion::easing)
+    }
+
+    pub fn tracker(&self) -> &FocusCaretTracker {
+        &self.tracker
     }
 }
 
@@ -1001,6 +1033,59 @@ impl State {
         if active || was_active {
             self.synoik.queue_redraw_all();
         }
+
+        // `_syncFocusTracking` / `_syncCaretTracking`.
+        let focus = active && settings.focus_tracking != Tracking::None;
+        let caret = active && settings.caret_tracking != Tracking::None;
+        let event_loop = self.synoik.event_loop.clone();
+        self.synoik
+            .magnifier
+            .tracker
+            .set_listening(focus, caret, &event_loop);
+    }
+
+    /// Keyboard focus or the caret moved, in the focused window's coordinates: the region showing
+    /// that window scrolls to it, once the pointer rests (`_scrollContentsToDelayed`).
+    pub fn magnifier_tracked(&mut self, tracked: Tracked) {
+        if !self.synoik.magnifier.active {
+            return;
+        }
+        // `_convertExtentsToScreenSpace`: relative to the focused window's frame rect.
+        let Some(window) = self.synoik.layout.focus().map(|m| m.window.clone()) else {
+            return;
+        };
+        let Some(output) = self.synoik.layout.output_of_window(&window) else {
+            return;
+        };
+        let Some(rect) = self.synoik.layout.window_render_rect(&window, &output) else {
+            return;
+        };
+        let settings = self.synoik.magnifier.settings;
+        let clock = self.synoik.clock.clone();
+        let Some(region) = self.synoik.magnifier.regions.get_mut(&output.name()) else {
+            return;
+        };
+        match tracked {
+            Tracked::Focus(e) => {
+                let p = Point::from((
+                    rect.loc.x + f64::from(e.loc.x) + f64::from(e.size.w) / 2.,
+                    rect.loc.y + f64::from(e.loc.y) + f64::from(e.size.h) / 2.,
+                ));
+                region.focus_moved(p, settings.focus_tracking, &clock);
+            }
+            Tracked::Caret(e) => {
+                // "Ignore event(s) if the caret size is none (0x0)."
+                if e.size.w == 0 && e.size.h == 0 {
+                    return;
+                }
+                let p = Point::from((
+                    rect.loc.x + f64::from(e.loc.x),
+                    rect.loc.y + f64::from(e.loc.y),
+                ));
+                region.caret_moved(p, settings.caret_tracking, &clock);
+            }
+        }
+        self.synoik.queue_redraw_all();
     }
 
     /// The pointer moved: the region under it follows (`scrollToMousePos`), and the rest timer

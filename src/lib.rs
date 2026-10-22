@@ -25,6 +25,7 @@ pub mod dbusmenu;
 pub mod draw_ledger;
 pub mod emoji;
 pub mod end_session;
+pub mod focus_caret_tracker;
 pub mod frame_clock;
 pub mod frame_log;
 pub mod gnome;

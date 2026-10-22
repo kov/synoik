@@ -44911,6 +44911,64 @@ fn pointer_a11y_fixture(
     (f, id)
 }
 
+/// Zoom follows the caret (`_updateCaret`): a move, in the focused window's coordinates, scrolls
+/// the view there once the pointer has rested for `POINTER_REST_TIME`, easing over 100 ms.
+#[test]
+fn zoom_follows_the_caret_once_the_pointer_rests() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::None;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    assert_eq!(
+        f.synoik().magnifier.tracker().listening(),
+        (true, true),
+        "focus and caret tracking default on"
+    );
+    let output = f.synoik_output(1);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f
+        .synoik()
+        .layout
+        .window_render_rect(&window, &output)
+        .unwrap();
+    let region = |f: &mut Fixture| f.synoik().magnifier.region(&output).unwrap().center();
+    let before = region(&mut f);
+
+    // Caret tracking is `centered`: the view centres on the caret's top-left.
+    let caret = Point::from((700. - rect.loc.x, 400. - rect.loc.y));
+    let extents = Rectangle::new(caret.to_i32_round(), (2, 16).into());
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(extents));
+    assert_eq!(region(&mut f), before, "the pointer just moved: it waits");
+
+    run_for(&mut f, Duration::from_millis(1200));
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // A zero-sized caret is no caret (`_updateCaret`).
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(Rectangle::new(
+            (0, 0).into(),
+            (0, 0).into(),
+        )));
+    run_for(&mut f, Duration::from_millis(200));
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // Off, it stops listening.
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::Zoom, false);
+    f.synoik_state().sync_magnifier();
+    assert_eq!(f.synoik().magnifier.tracker().listening(), (false, false));
+}
+
 /// The `(button, pressed)` events the client saw since the last take.
 fn client_buttons(f: &mut Fixture, id: ClientId) -> Vec<(u32, bool)> {
     f.double_roundtrip(id);
