@@ -25,7 +25,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
 | Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ⬜ §A2, A3, A5 |
-| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6; ⬜ A7 |
+| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 (D-Bus); ⬜ A7 (dwell) |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
 ---
@@ -114,12 +114,16 @@ System Sounds volume applies).
 
 The keyboard filters' beeps (A4) ring this same bell, as `meta_seat_native_bell_notify` does.
 
-### A7 — The a11y D-Bus surface + dwell click
-- mutter exports `org.freedesktop.a11y.KeyboardMonitor` and a `PointerLocator`
-  (`src/backends/meta-a11y-manager.c:86-89,245-336`: grab/ungrab/watch/unwatch keyboard, key
-  grabs, query pointer). This is what Orca drives. Per STRATEGY §3.9, cosmic-comp already
-  serves the keyboard half — worth reading before writing ours.
-- Dwell click is `panel-status-port.md` R3 plus `org.gnome.desktop.a11y.mouse`
+### A7 — The a11y D-Bus surface ✅ + dwell click ⬜
+- ✅ `org.freedesktop.a11y.KeyboardMonitor` and `PointerLocator` on `org.freedesktop.a11y.Manager`
+  (`src/dbus/freedesktop_a11y.rs`, mutter's `meta-a11y-manager.c`): watch, grab, the key grabs
+  with the lone-tap/double-press rule for a grabbed modifier (`meta-seat-impl.c:520-568`), and
+  QueryPointer with its one-shot PointerPositionChanged. Only the owner of
+  `org.gnome.Orca.KeyboardMonitor` may call either, as in mutter; anyone else gets AccessDenied.
+  **Divergence:** QueryPointer always names a window by pid. mutter names its AT-SPI bus name
+  and path when GTK sent them over gtk-shell v7, and we serve v1 (`src/protocols/gtk_shell.rs`
+  says why).
+- ⬜ Dwell click is `panel-status-port.md` R3 plus `org.gnome.desktop.a11y.mouse`
   (`dwell-click-enabled`, `dwell-mode`, `dwell-time`, `secondary-click-*`) — the indicator is
   panel work but the *behavior* is input work, so it belongs here.
 
