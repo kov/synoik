@@ -45659,3 +45659,76 @@ fn osk_long_press_offers_the_accents() {
     f.double_roundtrip(id);
     assert_eq!(f.client(id).text_input_events(), []);
 }
+
+/// Where the focused window sits, global.
+fn osk_focused_window_y(f: &mut Fixture) -> f64 {
+    let synoik = f.synoik();
+    let window = synoik.layout.focus().unwrap().window.clone();
+    synoik.layout.floating_pos_of(&window).unwrap().y
+}
+
+/// A caret the keyboard would cover takes its window up by the keyboard's height as the keyboard
+/// slides in, and back down as it goes (`setCursorLocation`, `_animateWindow`). A caret clear of
+/// it leaves the window alone, and the window moving under the user closes the keyboard and keeps
+/// the window where the user put it (`_onFocusWindowMoving`).
+#[test]
+fn osk_slides_the_focused_window_out_of_its_way() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let start = osk_focused_window_y(&mut f);
+
+    // Well clear of the keyboard's top at 720: nothing moves.
+    f.client(id).enable_text_input();
+    f.client(id).set_cursor_rectangle(10, 10, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), start);
+
+    // The caret would be under it: up the window goes, by as much as the work area allows.
+    let local = (760. - start) as i32;
+    f.client(id).set_cursor_rectangle(10, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    let up = osk_focused_window_y(&mut f);
+    let output = f.synoik_output(1);
+    let top = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .working_area()
+        .loc
+        .y;
+    assert_eq!(up, (start - 360.).max(top), "start {start}");
+    assert!(up < start);
+
+    // Typing on keeps it there; the keyboard going takes it back down.
+    f.client(id).set_cursor_rectangle(30, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(osk_focused_window_y(&mut f), up);
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(!f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), start);
+
+    // Up again, then the window is moved: the keyboard goes, the window stays.
+    f.client(id).enable_text_input();
+    f.client(id).set_cursor_rectangle(10, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), up);
+    f.synoik().layout.move_floating_window(
+        None,
+        synoik_ipc::PositionChange::AdjustFixed(40.),
+        synoik_ipc::PositionChange::AdjustFixed(0.),
+        false,
+    );
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(!f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), up);
+}

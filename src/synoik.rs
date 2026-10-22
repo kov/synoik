@@ -2722,6 +2722,7 @@ impl State {
         // as GNOME's poll of `global.get_pointer()` does. Unmoved, this does nothing.
         self.magnifier_pointer_moved();
         self.synoik.osk.advance();
+        self.osk_watch_focus_window(false);
         // A peek cannot outlive the session being locked: the shield swallows the overlay key's
         // release, so nothing else would ever put the strip away. Level-triggered rather than
         // hooked into each of the paths that can raise the shield, none of which could then

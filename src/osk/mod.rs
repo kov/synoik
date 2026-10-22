@@ -14,7 +14,9 @@
 //! - one of our own entries taking the key focus (`_onKeyFocusChanged`, `keyboard.js:1364-1386`).
 //!
 //! It goes when the text focus leaves — the input method's `HIDE_PANEL_TIME` after its
-//! `focus_out` (`inputMethod.js:209-226`) — or on its hide key.
+//! `focus_out` (`inputMethod.js:209-226`) — or on its hide key, or when the focused window moves.
+//! When the caret would be under it, the focused window slides up out of its way and back down
+//! after (`setCursorLocation`, `_animateWindow`, `keyboard.js:1885-1965`).
 //!
 //! What a key does follows `KeyboardController` (`keyboard.js:1968-2210`): a string goes in through
 //! the input method's commit when a text field has it, and as key presses otherwise; a keyval is a
@@ -29,6 +31,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use smithay::backend::input::KeyState;
+use smithay::desktop::Window;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
@@ -114,6 +117,14 @@ pub struct Subkeys {
     captured_press: bool,
 }
 
+/// `_focusWindow`: the window slid out of the keyboard's way, and how far it went — the work-area
+/// clamp can stop it short of the keyboard's height, and it has to come back by exactly as much.
+#[derive(Debug, Clone, PartialEq)]
+struct FocusWindow {
+    window: Window,
+    shift: f64,
+}
+
 #[derive(Debug)]
 pub struct Osk {
     /// Whether the keyboard exists (`KeyboardManager._keyboard`).
@@ -148,6 +159,9 @@ pub struct Osk {
     /// `_deleteEnabled` / `_backspacePressed`.
     delete_held: bool,
     subkeys: Option<Subkeys>,
+    focus_window: Option<FocusWindow>,
+    /// The `FocusTracker`'s current window and where it sat, to see it move (`window-moved`).
+    watched: Option<(Window, Option<Point<f64, Logical>>)>,
     /// Bumped on every change the drawn keyboard shows.
     revision: u64,
 }
@@ -176,6 +190,8 @@ impl Default for Osk {
             long_pressed: false,
             delete_held: false,
             subkeys: None,
+            focus_window: None,
+            watched: None,
             revision: 0,
         }
     }
@@ -752,6 +768,7 @@ impl State {
         osk.visible = true;
         osk.animate_to(&clock, 1., Curve::EaseOutQuad);
         osk.bump();
+        self.osk_animate_window(true);
         self.synoik.queue_redraw_all();
     }
 
@@ -795,7 +812,125 @@ impl State {
         if std::mem::take(&mut self.synoik.osk.delete_held) {
             self.osk_delete(false);
         }
+        self.osk_animate_window(false);
+        // `setCursorLocation(null)`.
+        self.synoik.osk.focus_window = None;
         self.synoik.queue_redraw_all();
+    }
+
+    /// `_animateWindow`: slide the focus window up by the keyboard's height, or back to where it
+    /// was, on the keyboard's own time and curve.
+    fn osk_animate_window(&mut self, show: bool) {
+        let Some(height) = self.synoik.osk_full_height() else {
+            return;
+        };
+        let Some(focus) = self.synoik.osk.focus_window.clone() else {
+            return;
+        };
+        let dy = if show { -height } else { 0. } - focus.shift;
+        if dy == 0. {
+            return;
+        }
+        let config = synoik_config::Animation {
+            off: self.synoik.config.borrow().animations.off,
+            kind: synoik_config::animations::Kind::Easing(
+                synoik_config::animations::EasingParams {
+                    duration_ms: ANIMATION_TIME.as_millis() as u32,
+                    curve: synoik_config::animations::Curve::EaseOutQuad,
+                },
+            ),
+        };
+        let moved = self
+            .synoik
+            .layout
+            .slide_floating_window_y(&focus.window, dy, config)
+            .unwrap_or(0.);
+        if let Some(focus) = self.synoik.osk.focus_window.as_mut() {
+            focus.shift += moved;
+        }
+        // Our own move is not the window moving (`_windowSlideAnimationComplete` disconnects
+        // `window-moved` around its `move_frame`).
+        self.synoik.osk.watched = self.osk_focused_window_position();
+        self.synoik.queue_redraw_all();
+    }
+
+    /// `_setFocusWindow`.
+    fn osk_set_focus_window(&mut self, window: Option<Window>) {
+        let current = self.synoik.osk.focus_window.as_ref().map(|f| &f.window);
+        if current == window.as_ref() {
+            return;
+        }
+        let visible = self.synoik.osk.visible;
+        if visible {
+            self.osk_animate_window(false);
+        }
+        self.synoik.osk.focus_window = window.map(|window| FocusWindow { window, shift: 0. });
+        if visible {
+            self.osk_animate_window(true);
+        }
+    }
+
+    /// `_onFocusPositionChanged` → `setCursorLocation`: the caret moved. A caret the keyboard
+    /// would cover takes its window up; once the window is up, it stays until the caret would be
+    /// clear of the keyboard with the window back down.
+    pub fn osk_cursor_location_changed(&mut self) {
+        if !self.synoik.osk.enabled {
+            return;
+        }
+        let caret = self.text_caret_rect();
+        let window = self.synoik.layout.focus().map(|m| m.window.clone());
+        let output = self
+            .synoik
+            .osk_output()
+            .and_then(|o| self.synoik.global_space.output_geometry(&o));
+        let (Some(caret), Some(window), Some(output)) = (caret, window, output) else {
+            self.osk_set_focus_window(None);
+            return;
+        };
+        let height = height(output.size.to_f64());
+        let keyboard_y1 = f64::from(output.loc.y + output.size.h) - height;
+        let bottom = caret.loc.y + caret.size.h;
+        let focus = self.synoik.osk.focus_window.as_ref().map(|f| &f.window);
+        if focus == Some(&window) {
+            if bottom + height < keyboard_y1 {
+                self.osk_set_focus_window(None);
+            }
+            return;
+        }
+        self.osk_set_focus_window((bottom >= keyboard_y1).then_some(window));
+    }
+
+    fn osk_focused_window_position(&self) -> Option<(Window, Option<Point<f64, Logical>>)> {
+        let window = self.synoik.layout.focus()?.window.clone();
+        let pos = self.synoik.layout.floating_pos_of(&window);
+        Some((window, pos))
+    }
+
+    /// The focused window's `position-changed` (`FocusTracker` `window-moved`), and the start of
+    /// a move grab on it (`window-grabbed`): either lets go of the window where it is and closes
+    /// the keyboard (`_onFocusWindowMoving`). `grabbed` says a move grab began on the focused
+    /// window; otherwise this compares its position with the last look. Runs every refresh.
+    pub fn osk_watch_focus_window(&mut self, grabbed: bool) {
+        if !self.synoik.osk.enabled {
+            self.synoik.osk.watched = None;
+            return;
+        }
+        let watched = self.osk_focused_window_position();
+        let moved = grabbed
+            || matches!(
+                (&self.synoik.osk.watched, &watched),
+                (Some((was, was_pos)), Some((now, now_pos))) if was == now && was_pos != now_pos
+            );
+        self.synoik.osk.watched = watched;
+        if !moved {
+            return;
+        }
+        let current = self.synoik.osk.watched.as_ref().map(|(w, _)| w);
+        if self.synoik.osk.focus_window.as_ref().map(|f| &f.window) == current {
+            // Not `_setFocusWindow(null)`: that would move the window under the user's grab.
+            self.synoik.osk.focus_window = None;
+        }
+        self.osk_close(true);
     }
 
     /// The pointer moved: light the key under it (`track_hover`).
@@ -998,6 +1133,13 @@ impl State {
 }
 
 impl Synoik {
+    /// `keyboardBox.height`: the keyboard's whole height on its display, however far up it is.
+    pub fn osk_full_height(&self) -> Option<f64> {
+        let output = self.osk_output()?;
+        let geo = self.global_space.output_geometry(&output)?;
+        Some(height(geo.size.to_f64()))
+    }
+
     /// The keyboard's rectangle in global coordinates, if it is drawn on `output`.
     pub fn osk_rect(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
         let osk = &self.osk;

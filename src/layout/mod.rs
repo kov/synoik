@@ -4671,6 +4671,24 @@ impl<W: LayoutElement> Layout<W> {
         workspace.move_floating_window(id, x, y, animate);
     }
 
+    /// See [`FloatingSpace::slide_y`]. `None` when the window is not a floating one.
+    pub fn slide_floating_window_y(
+        &mut self,
+        id: &W::Id,
+        dy: f64,
+        config: synoik_config::Animation,
+    ) -> Option<f64> {
+        self.workspaces_mut()
+            .find(|ws| ws.has_window(id))?
+            .slide_floating_window_y(id, dy, config)
+    }
+
+    /// Where a floating window sits on its workspace.
+    pub fn floating_pos_of(&self, id: &W::Id) -> Option<Point<f64, Logical>> {
+        self.workspaces()
+            .find_map(|(_, _, ws)| ws.floating_pos_of(id))
+    }
+
     pub fn focus_output(&mut self, output: &Output) {
         if let MonitorSet::Normal {
             monitors,

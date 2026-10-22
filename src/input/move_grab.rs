@@ -141,6 +141,9 @@ impl MoveGrab {
         }
 
         self.gesture = GestureState::Move;
+        if data.synoik.layout.focus().map(|m| &m.window) == Some(&self.window) {
+            data.osk_watch_focus_window(true);
+        }
 
         if self.start_data.is_pointer() {
             data.synoik

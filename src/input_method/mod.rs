@@ -539,6 +539,7 @@ impl State {
                     .keyboard_focus
                     .surface()
                     .map(|surface| (surface.clone(), rect));
+                self.osk_cursor_location_changed();
             }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
             // IBus has no matching "end of batch" call.
