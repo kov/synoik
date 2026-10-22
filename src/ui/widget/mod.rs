@@ -3948,6 +3948,45 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// A `BoxPointer` pointing down (`St.Side.BOTTOM`): a rounded box with a 1px `border`, and an
+    /// arrow `base` wide and `rise` tall hanging from its bottom edge, centred on `arrow_x`, its
+    /// outline opening into the box's (`boxpointer.js` `_drawBorder`). The bake must reach `rise`
+    /// below `rect` to hold the arrow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn box_pointer_down(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        arrow_x: f64,
+        radius: f64,
+        base: f64,
+        rise: f64,
+        bg: Rgba,
+        border: Rgba,
+    ) -> anyhow::Result<()> {
+        self.fill_rounded(rect, radius, bg)?;
+        self.stroke_rounded(rect, radius, 1., border)?;
+        let bottom = rect.loc.y + rect.size.h;
+        // The border's triangle a pixel wider, then the fill's over it — which also covers the
+        // stretch of the box's bottom border the arrow opens through.
+        self.triangle(
+            Rectangle::new(
+                Point::from((arrow_x - base / 2. - 1., bottom - 1.)),
+                Size::from((base + 2., rise + 2.)),
+            ),
+            Side::Bottom,
+            border,
+        )?;
+        self.triangle(
+            Rectangle::new(
+                Point::from((arrow_x - base / 2., bottom - 1.)),
+                Size::from((base, rise)),
+            ),
+            Side::Bottom,
+            bg,
+        )?;
+        Ok(())
+    }
+
     /// Fill the isoceles triangle inscribed in `rect` (logical) with `color`: its base spans one
     /// edge, its apex the midpoint of the opposite one, `side` naming the edge it points at.
     ///

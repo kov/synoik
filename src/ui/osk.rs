@@ -102,10 +102,69 @@ pub fn key_at(size: Size<f64, Logical>, level: &Level, p: Point<f64, Logical>) -
     })
 }
 
+/// `.keyboard-subkeys-boxpointer` (`_keyboard.scss:65-80`).
+mod subkeys_style {
+    pub const RADIUS: f64 = 22.;
+    pub const ARROW_BASE: f64 = 20.;
+    pub const ARROW_RISE: f64 = 10.;
+    /// `-boxpointer-gap`: between the arrow's tip and the key.
+    pub const GAP: f64 = 4.;
+    /// Its `.key-container`: `padding: $base_padding * 2; spacing: $base_margin * 2`.
+    pub const PADDING: f64 = 12.;
+    pub const SPACING: f64 = 8.;
+    /// `-arrow-border-width`.
+    pub const BORDER: f64 = 1.;
+}
+
+/// Where a key's long-press popup goes, global: its box, the tip of its arrow, and each of its
+/// keys — sized as the key it came from (`Key._getExtendedKeys`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubkeysGeometry {
+    pub rect: Rectangle<f64, Logical>,
+    pub arrow_x: f64,
+    pub keys: Vec<Rectangle<f64, Logical>>,
+}
+
+/// `BoxPointer.setPosition(keyButton, 0.5)`: centred over the key, its arrow on the key's top
+/// centre, kept inside the display.
+pub fn subkeys_geometry(
+    cap: Rectangle<f64, Logical>,
+    count: usize,
+    bounds: Rectangle<f64, Logical>,
+) -> SubkeysGeometry {
+    use subkeys_style::*;
+    let n = count as f64;
+    let inset = BORDER + PADDING;
+    let size = Size::from((
+        2. * inset + n * cap.size.w + (n - 1.).max(0.) * SPACING,
+        2. * inset + cap.size.h,
+    ));
+    let arrow_x = cap.loc.x + cap.size.w / 2.;
+    let x = (arrow_x - size.w / 2.)
+        .min(bounds.loc.x + bounds.size.w - size.w)
+        .max(bounds.loc.x);
+    let y = cap.loc.y - GAP - ARROW_RISE - size.h;
+    let rect = Rectangle::new(Point::from((x, y)), size);
+    let keys = (0..count)
+        .map(|i| {
+            Rectangle::new(
+                rect.loc + Point::from((inset + i as f64 * (cap.size.w + SPACING), inset)),
+                cap.size,
+            )
+        })
+        .collect();
+    SubkeysGeometry {
+        rect,
+        arrow_x,
+        keys,
+    }
+}
+
 /// The drawn keyboard's cache.
 #[derive(Default)]
 pub struct OskUi {
     cache: RefCell<ContentCache>,
+    subkeys_cache: RefCell<ContentCache>,
 }
 
 impl std::fmt::Debug for OskUi {
@@ -120,7 +179,126 @@ struct Prepared {
     size: Size<f64, Logical>,
 }
 
+struct PreparedSubkeys {
+    rect: Rectangle<f64, Logical>,
+    arrow_x: f64,
+    caps: Vec<KeyCap>,
+    labels: Vec<Option<ShapedText>>,
+}
+
 impl OskUi {
+    /// Draw a key's long-press popup, `geometry` display-local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_subkeys(
+        &self,
+        renderer: &mut VulkanRenderer,
+        osk: &Osk,
+        geometry: &SubkeysGeometry,
+        scale: f64,
+        accent: [u8; 3],
+        push: &mut dyn FnMut(TextureRenderElement<VkTexture>),
+    ) {
+        let Some(subkeys) = osk.subkeys() else {
+            return;
+        };
+        let accent = style::accent_rgba(accent);
+        let origin = geometry
+            .rect
+            .loc
+            .to_physical_precise_round(scale)
+            .to_logical(scale);
+        let local = |r: Rectangle<f64, Logical>| Rectangle::new(r.loc - geometry.rect.loc, r.size);
+        let caps: Vec<KeyCap> = geometry
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(i, rect)| KeyCap {
+                rect: local(*rect),
+                default_key: false,
+                hovered: subkeys.hovered == Some(i),
+                active: subkeys.pressed.is_some_and(|(p, _)| p == i),
+                latched: false,
+            })
+            .collect();
+        let size = Size::<f64, Logical>::from((
+            geometry.rect.size.w,
+            geometry.rect.size.h + subkeys_style::ARROW_RISE,
+        ));
+        let revision = widget::Revision::new()
+            .of(osk.revision())
+            .px(size.w)
+            .px(geometry.arrow_x - geometry.rect.loc.x)
+            .of(accent.map(f32::to_bits))
+            .done();
+        let baked = {
+            let mut cache = self.subkeys_cache.borrow_mut();
+            widget::bake_content(
+                renderer,
+                &mut cache,
+                scale,
+                revision,
+                |renderer| {
+                    let mut shaper = TextShaper::new(renderer, scale);
+                    let labels = subkeys
+                        .strings
+                        .iter()
+                        .map(|s| shaper.shape(s, KeyCap::text_style()).ok())
+                        .collect();
+                    let px = |v: f64| to_physical_precise_round::<i32>(scale, v).max(1);
+                    let phys = Size::<i32, Physical>::from((px(size.w), px(size.h)));
+                    Ok((
+                        phys,
+                        PreparedSubkeys {
+                            rect: Rectangle::from_size(geometry.rect.size),
+                            arrow_x: geometry.arrow_x - geometry.rect.loc.x,
+                            caps,
+                            labels,
+                        },
+                    ))
+                },
+                |frame, phys, prepared| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    // `-arrow-background-color: $osd_bg_color`,
+                    // `-arrow-border-color: lighten($osd_bg_color, 9%)`.
+                    p.box_pointer_down(
+                        prepared.rect,
+                        prepared.arrow_x,
+                        subkeys_style::RADIUS,
+                        subkeys_style::ARROW_BASE,
+                        subkeys_style::ARROW_RISE,
+                        style::osd_bg(),
+                        style::lighten(style::osd_bg(), 0.09),
+                    )?;
+                    for (cap, label) in prepared.caps.iter().zip(&prepared.labels) {
+                        p.key_cap(cap, label.as_ref(), accent)?;
+                    }
+                    Ok(())
+                },
+            )
+        };
+        match baked {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    vec![],
+                );
+                push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => warn!("error drawing the on-screen keyboard's popup: {err:#}"),
+        }
+    }
+
     /// Draw the keyboard at `rect`, display-local, faded by its slide.
     #[allow(clippy::too_many_arguments)]
     pub fn render(

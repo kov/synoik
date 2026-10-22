@@ -45596,3 +45596,66 @@ fn osk_opens_for_a_shell_entry() {
     let output = f.synoik_output(1);
     assert!(f.synoik().osk_rect(&output).is_none());
 }
+
+/// A key's long press brings up its other strings over it (`Key._showSubkeys`); one is picked with
+/// a press of its own, and goes in through the input method like any key. While the popup is up a
+/// click elsewhere only closes it.
+#[test]
+fn osk_long_press_offers_the_accents() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+
+    let e = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("e"));
+    pointer_motion_to(&mut f, e.0, e.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    let geometry = f.synoik().osk_subkeys_geometry().expect("the popup is up");
+    assert_eq!(geometry.keys.len(), 5);
+    assert!(
+        geometry.rect.loc.y + geometry.rect.size.h < e.1,
+        "above the key"
+    );
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).text_input_events(),
+        [],
+        "the long press typed nothing"
+    );
+
+    let acute = geometry.keys[1];
+    osk_click(
+        &mut f,
+        (
+            acute.loc.x + acute.size.w / 2.,
+            acute.loc.y + acute.size.h / 2.,
+        ),
+    );
+    assert!(f.synoik().osk_subkeys_geometry().is_none());
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&Ti::CommitString(Some("é".into()))),
+        "{events:?}"
+    );
+
+    // Again, and a click on the window above: it closes, and the window sees nothing.
+    let _ = client_buttons(&mut f, id);
+    pointer_motion_to(&mut f, e.0, e.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    assert!(f.synoik().osk_subkeys_geometry().is_some());
+    osk_click(&mut f, (300., 200.));
+    assert!(f.synoik().osk_subkeys_geometry().is_none());
+    assert_eq!(client_buttons(&mut f, id), []);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+}

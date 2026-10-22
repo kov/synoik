@@ -99,6 +99,21 @@ pub enum Effect {
     Hide,
 }
 
+/// The long-press popup of a key's other strings (`Key._showSubkeys`, `keyboard.js:265-370`).
+///
+/// While it is up it captures every event on the stage: a press outside it is swallowed, and the
+/// release that follows closes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subkeys {
+    /// The key they belong to, on the current level.
+    pub key: usize,
+    pub strings: Vec<String>,
+    pub hovered: Option<usize>,
+    pub pressed: Option<(usize, Presser)>,
+    /// `_capturedPress`.
+    captured_press: bool,
+}
+
 #[derive(Debug)]
 pub struct Osk {
     /// Whether the keyboard exists (`KeyboardManager._keyboard`).
@@ -132,6 +147,7 @@ pub struct Osk {
     long_pressed: bool,
     /// `_deleteEnabled` / `_backspacePressed`.
     delete_held: bool,
+    subkeys: Option<Subkeys>,
     /// Bumped on every change the drawn keyboard shows.
     revision: u64,
 }
@@ -159,6 +175,7 @@ impl Default for Osk {
             hovered: None,
             long_pressed: false,
             delete_held: false,
+            subkeys: None,
             revision: 0,
         }
     }
@@ -213,6 +230,10 @@ impl Osk {
         self.hovered
     }
 
+    pub fn subkeys(&self) -> Option<&Subkeys> {
+        self.subkeys.as_ref()
+    }
+
     fn key(&self, index: usize) -> Option<&Key> {
         self.level()?.keys.get(index)
     }
@@ -228,6 +249,7 @@ impl Osk {
         }
         self.pressed = None;
         self.hovered = None;
+        self.subkeys = None;
         self.set_active_level("default");
         self.bump();
     }
@@ -237,6 +259,8 @@ impl Osk {
         if self.page != level {
             self.latched = false;
             self.page = level.to_owned();
+            // Its key is no longer mapped (`notify::mapped`).
+            self.subkeys = None;
         }
         self.modifiers.clear();
         self.bump();
@@ -307,7 +331,75 @@ impl Osk {
             }
             _ => {}
         }
+        if !key.extended.is_empty() {
+            // `fake_release`: the key lets go without acting, and the popup stays up after the
+            // press ends — a string in it is picked with a press of its own.
+            let index = self.pressed.take().map(|p| p.key);
+            // `keyButton.set_hover(false)`.
+            self.hovered = None;
+            self.subkeys = index.map(|key_index| Subkeys {
+                key: key_index,
+                strings: key.extended.clone(),
+                hovered: None,
+                pressed: None,
+                captured_press: false,
+            });
+            self.bump();
+        }
         effects
+    }
+
+    /// A press while the popup is up: on one of its keys, or anywhere else (`_onCapturedEvent`).
+    pub fn subkeys_press(&mut self, inside: Option<usize>, by: Presser) {
+        let Some(subkeys) = self.subkeys.as_mut() else {
+            return;
+        };
+        match inside {
+            Some(i) if subkeys.pressed.is_none() => subkeys.pressed = Some((i, by)),
+            Some(_) => {}
+            None => subkeys.captured_press = true,
+        }
+        self.bump();
+    }
+
+    /// A release while the popup is up: its pressed key commits, and either way a release that
+    /// ends a press closes it (`Key._release` → `_hideSubkeys`).
+    pub fn subkeys_release(&mut self, by: Presser) -> Vec<Effect> {
+        let Some(subkeys) = self.subkeys.as_ref() else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        match subkeys.pressed {
+            Some((i, presser)) if presser == by => {
+                let text = subkeys.strings.get(i).cloned();
+                self.subkeys = None;
+                if let Some(text) = text {
+                    effects.push(Effect::Commit(
+                        text,
+                        self.modifiers.iter().copied().collect(),
+                    ));
+                    self.modifiers.clear();
+                    self.update_level_from_hints(true);
+                }
+            }
+            Some(_) => {}
+            None if subkeys.captured_press => self.subkeys = None,
+            None => {}
+        }
+        self.bump();
+        effects
+    }
+
+    pub fn set_subkey_hovered(&mut self, hovered: Option<usize>) -> bool {
+        let Some(subkeys) = self.subkeys.as_mut() else {
+            return false;
+        };
+        if subkeys.hovered == hovered {
+            return false;
+        }
+        subkeys.hovered = hovered;
+        self.bump();
+        true
     }
 
     /// The presser let go (`Key._release` and the handlers `_addRowKeys` connects,
@@ -695,6 +787,7 @@ impl State {
         osk.modifiers.clear();
         osk.cancel_press();
         osk.hovered = None;
+        osk.subkeys = None;
         osk.bump();
         if let Some(token) = osk.long_press_timer.take() {
             self.synoik.cancel_timer(token);
@@ -707,6 +800,13 @@ impl State {
 
     /// The pointer moved: light the key under it (`track_hover`).
     pub fn osk_pointer_motion(&mut self, pos: Point<f64, Logical>) {
+        if self.synoik.osk.subkeys.is_some() {
+            let hovered = self.synoik.osk_subkey_hit(pos);
+            if self.synoik.osk.set_subkey_hovered(hovered) {
+                self.synoik.queue_redraw_all();
+            }
+            return;
+        }
         let hovered = self.synoik.osk_hit(pos).flatten();
         if self.synoik.osk.set_hovered(hovered) {
             self.synoik.queue_redraw_all();
@@ -717,6 +817,22 @@ impl State {
     /// always does, to be claimed by the caller's `suppressed_buttons`, so the window under the
     /// keyboard never sees a release it was not pressed for.
     pub fn osk_pointer_button(&mut self, button: u32, pressed: bool) -> bool {
+        if self.synoik.osk.subkeys.is_some() {
+            if pressed {
+                let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+                let inside = self.synoik.osk_subkey_hit(pos);
+                self.synoik
+                    .osk
+                    .subkeys_press(inside, Presser::Button(button));
+                self.synoik.suppressed_buttons.insert(button);
+                self.synoik.queue_redraw_all();
+                return true;
+            }
+            let effects = self.synoik.osk.subkeys_release(Presser::Button(button));
+            self.osk_apply(effects);
+            self.synoik.queue_redraw_all();
+            return false;
+        }
         if pressed {
             let pos = self.synoik.seat.get_pointer().unwrap().current_location();
             let Some(hit) = self.synoik.osk_hit(pos) else {
@@ -743,6 +859,12 @@ impl State {
 
     /// A touch point went down. Returns whether the keyboard took it.
     pub fn osk_touch_down(&mut self, slot: i32, pos: Point<f64, Logical>) -> bool {
+        if self.synoik.osk.subkeys.is_some() {
+            let inside = self.synoik.osk_subkey_hit(pos);
+            self.synoik.osk.subkeys_press(inside, Presser::Touch(slot));
+            self.synoik.queue_redraw_all();
+            return true;
+        }
         let Some(hit) = self.synoik.osk_hit(pos) else {
             return false;
         };
@@ -754,6 +876,12 @@ impl State {
 
     /// A touch point went up. Returns whether it was the keyboard's.
     pub fn osk_touch_up(&mut self, slot: i32) -> bool {
+        if self.synoik.osk.subkeys.is_some() {
+            let effects = self.synoik.osk.subkeys_release(Presser::Touch(slot));
+            self.osk_apply(effects);
+            self.synoik.queue_redraw_all();
+            return true;
+        }
         let held = self
             .synoik
             .osk
@@ -906,9 +1034,31 @@ impl Synoik {
         Some(crate::ui::osk::key_at(rect.size, level, local))
     }
 
-    /// Whether the keyboard covers a global point — it takes the pointer there, as chrome.
+    /// Whether the keyboard takes the pointer at a global point: where it is drawn, and anywhere
+    /// at all while a key's popup is up (its stage-wide `captured-event`).
     pub fn osk_contains(&self, pos: Point<f64, Logical>) -> bool {
-        self.osk_hit(pos).is_some()
+        self.osk.subkeys.is_some() || self.osk_hit(pos).is_some()
+    }
+
+    /// The popup's geometry, global, if one is up.
+    pub fn osk_subkeys_geometry(&self) -> Option<crate::ui::osk::SubkeysGeometry> {
+        let subkeys = self.osk.subkeys.as_ref()?;
+        let output = self.osk_output()?;
+        let rect = self.osk_rect(&output)?;
+        let level = self.osk.level()?;
+        let cap = *crate::ui::osk::key_rects(rect.size, level).get(subkeys.key)?;
+        let bounds = self.global_space.output_geometry(&output)?.to_f64();
+        Some(crate::ui::osk::subkeys_geometry(
+            Rectangle::new(rect.loc + cap.loc, cap.size),
+            subkeys.strings.len(),
+            bounds,
+        ))
+    }
+
+    /// The popup key under a global point.
+    pub fn osk_subkey_hit(&self, pos: Point<f64, Logical>) -> Option<usize> {
+        let geometry = self.osk_subkeys_geometry()?;
+        geometry.keys.iter().position(|k| k.contains(pos))
     }
 }
 
@@ -1012,6 +1162,34 @@ mod tests {
             [Effect::Commit("c".into(), vec![0xffe3])]
         );
         assert!(!osk.modifier_latched(0xffe3));
+    }
+
+    #[test]
+    fn a_long_press_opens_the_other_strings() {
+        let mut osk = osk();
+        let e = index(&osk, |k| k.commit.as_deref() == Some("e"));
+        osk.press(e, Presser::Button(1));
+        assert!(osk.long_press().is_empty());
+        assert_eq!(osk.subkeys().unwrap().strings, ["è", "é", "ê", "ë", "ē"]);
+        // The press that opened it ends without typing anything, and leaves it up.
+        assert!(osk.release(Presser::Button(1)).is_empty());
+        assert!(osk.subkeys_release(Presser::Button(1)).is_empty());
+        assert!(osk.subkeys().is_some());
+
+        osk.subkeys_press(Some(1), Presser::Button(1));
+        assert_eq!(
+            osk.subkeys_release(Presser::Button(1)),
+            [Effect::Commit("é".into(), vec![])]
+        );
+        assert!(osk.subkeys().is_none());
+
+        // A press anywhere else closes it on its release, typing nothing.
+        osk.press(e, Presser::Touch(2));
+        osk.long_press();
+        osk.subkeys_press(None, Presser::Touch(3));
+        assert!(osk.subkeys().is_some());
+        assert!(osk.subkeys_release(Presser::Touch(3)).is_empty());
+        assert!(osk.subkeys().is_none());
     }
 
     #[test]

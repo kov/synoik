@@ -12857,6 +12857,22 @@ impl Synoik {
         // (`addTopChrome(this.keyboardBox)`, `layout.js:296-301`).
         if let Some(rect) = self.osk_rect(output) {
             let geo = self.global_space.output_geometry(output).unwrap();
+            if let Some(mut subkeys) = self.osk_subkeys_geometry() {
+                let shift = geo.loc.to_f64();
+                subkeys.rect.loc -= shift;
+                subkeys.arrow_x -= shift.x;
+                for key in &mut subkeys.keys {
+                    key.loc -= shift;
+                }
+                self.osk_ui.render_subkeys(
+                    ctx.renderer,
+                    &self.osk,
+                    &subkeys,
+                    output_scale.x,
+                    self.gnome_settings.accent_color,
+                    &mut |elem| push(OutputRenderElements::UiTexture(elem)),
+                );
+            }
             let mut rect = rect;
             rect.loc -= geo.loc.to_f64();
             self.osk_ui.render(
