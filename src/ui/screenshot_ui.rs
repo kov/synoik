@@ -638,6 +638,23 @@ pub struct ScreenshotNeutral {
     pub pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
 }
 
+/// Which windows the Window selector draws and hit-tests: all of them in the picker, and in a quick
+/// session only the selected one — Space in the crosshair is about the window it armed, and an
+/// exposé of everything else would be a choice the user did not ask to make. Draw and hit test
+/// both ask this, so nothing hidden can be picked.
+struct SelectorFilter(Option<Option<(Output, u64)>>);
+
+impl SelectorFilter {
+    fn shows(&self, output: &Output, id: u64) -> bool {
+        match &self.0 {
+            None => true,
+            Some(selected) => selected
+                .as_ref()
+                .is_some_and(|(o, i)| o == output && *i == id),
+        }
+    }
+}
+
 /// One window, frozen at picker-open time, for the Window-mode selector.
 ///
 /// GNOME's `UIWindowSelectorWindowContent` (`js/ui/screenshot.js:829-975`) holds the same three
@@ -881,8 +898,19 @@ impl ScreenshotUi {
                 // less a 100px margin, and 200px at the bottom on the monitor holding the panel
                 // (`_screenshot.scss:142-151`).
                 let area = window_selector_area(size.to_f64().to_logical(scale));
-                let rects: Vec<_> = windows.iter().map(|w| w.rect).collect();
-                let slots = expose::compute_slots(f64::from(size.h) / scale, area, &rects);
+                let monitor_h = f64::from(size.h) / scale;
+                let slots = if quick.is_some() {
+                    // The crosshair's selector shows the selected window alone
+                    // (`SelectorFilter`), so each window is laid out as if it were the only one:
+                    // centred and as large as the area allows, wherever it ends up selected.
+                    windows
+                        .iter()
+                        .map(|w| expose::compute_slots(monitor_h, area, &[w.rect])[0])
+                        .collect()
+                } else {
+                    let rects: Vec<_> = windows.iter().map(|w| w.rect).collect();
+                    expose::compute_slots(monitor_h, area, &rects)
+                };
 
                 let data = OutputData {
                     size,
@@ -1371,6 +1399,18 @@ impl ScreenshotUi {
 
     pub fn is_open(&self) -> bool {
         matches!(self, ScreenshotUi::Open { .. })
+    }
+
+    /// Which windows the Window selector draws and answers to.
+    fn selector_filter(&self) -> SelectorFilter {
+        match self {
+            Self::Open {
+                quick: Some(_),
+                selected_window,
+                ..
+            } => SelectorFilter(Some(selected_window.clone())),
+            _ => SelectorFilter(None),
+        }
     }
 
     pub fn set_space_down(&mut self, down: bool) {
@@ -1864,6 +1904,13 @@ impl ScreenshotUi {
             .map(|(_, slot)| *slot)
     }
 
+    /// Whether the Window selector draws (and answers to) window `id` on `output`. Test-only, and
+    /// the same filter the render and the hit test read.
+    #[cfg(test)]
+    pub fn selector_shows(&self, output: &Output, id: u64) -> bool {
+        self.selector_filter().shows(output, id)
+    }
+
     /// The panel's control geometry on `output`, panel-local and logical. Test-only, and the same
     /// value the bake and the hit test both read — a test that guessed its own coordinates would
     /// prove nothing about whether those two agree.
@@ -1888,6 +1935,7 @@ impl ScreenshotUi {
         let _span = tracy_client::span!("ScreenshotUi::render_output");
 
         let crosshair_only = self.crosshair_only();
+        let filter = self.selector_filter();
 
         let Self::Open {
             area,
@@ -1988,7 +2036,15 @@ impl ScreenshotUi {
                 .as_ref()
                 .filter(|(o, _)| o == output)
                 .map(|(_, id)| *id);
-            output_data.push_window_selector(renderer, accent, progress, selected, hovered, push);
+            output_data.push_window_selector(
+                renderer,
+                accent,
+                progress,
+                selected,
+                hovered,
+                |id| filter.shows(output, id),
+                push,
+            );
         } else {
             // The four corner handles ride above the border, and only on the output being captured
             // — the others draw the shade alone. Screen mode has no handles: it takes the whole
@@ -2364,6 +2420,7 @@ impl ScreenshotUi {
         let window_enabled = self.window_enabled();
         let crosshair_only = self.crosshair_only();
         let every_display = self.captures_every_display();
+        let filter = self.selector_filter();
         let Self::Open {
             area,
             screen_output,
@@ -2427,7 +2484,10 @@ impl ScreenshotUi {
         // The panel sits above the selector, so a control under the pointer wins the hover — the
         // window behind it must not light up too.
         let new_window = (*capture_type == CaptureType::Window && new.is_none())
-            .then(|| data.and_then(|data| data.window_at(point)))
+            .then(|| {
+                let output = under_output.as_ref()?;
+                data?.window_at(point, |id| filter.shows(output, id))
+            })
             .flatten()
             .zip(under_output.clone())
             .map(|(id, output)| (output, id));
@@ -2502,6 +2562,7 @@ impl ScreenshotUi {
     ) -> Option<PointerDown> {
         let crosshair_only = self.crosshair_only();
         let every_display = self.captures_every_display();
+        let filter = self.selector_filter();
 
         let Self::Open {
             area,
@@ -2574,7 +2635,7 @@ impl ScreenshotUi {
 
         // In Window mode a press outside the panel is a window pick, not a drag.
         if *capture_type == CaptureType::Window {
-            let picked = output_data.window_at(point);
+            let picked = output_data.window_at(point, |id| filter.shows(&output, id));
             *button = Button::Down {
                 touch_slot: slot,
                 on_control: None,
@@ -2997,10 +3058,10 @@ impl OutputData {
     /// Slots do not overlap (the layout packs them into rows), so first-hit is unambiguous. Tested
     /// against the slot rather than the thumbnail: a window with a large shadow margin draws
     /// smaller than its slot, and GNOME's button — which is what is reactive — is the slot.
-    fn window_at(&self, point: Point<i32, Physical>) -> Option<u64> {
+    fn window_at(&self, point: Point<i32, Physical>, shown: impl Fn(u64) -> bool) -> Option<u64> {
         let p = point.to_f64().to_logical(self.scale);
         zip(&self.windows, &self.slots)
-            .find(|(_, slot)| slot.contains(p))
+            .find(|(shot, slot)| shown(shot.id) && slot.contains(p))
             .map(|(shot, _)| shot.id)
     }
 
@@ -3130,6 +3191,7 @@ impl OutputData {
     ///
     /// Elements are pushed front-to-back (the first pushed composites on top), so each window's
     /// border goes before its thumbnail and the backdrop goes last.
+    #[allow(clippy::too_many_arguments)]
     fn push_window_selector(
         &self,
         renderer: &mut VulkanRenderer,
@@ -3137,9 +3199,13 @@ impl OutputData {
         alpha: f32,
         selected: Option<u64>,
         hovered: Option<u64>,
+        shown: impl Fn(u64) -> bool,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
     ) {
         for (shot, slot) in zip(&self.windows, &self.slots) {
+            if !shown(shot.id) {
+                continue;
+            }
             // The thumbnail keeps the window's aspect: `compute_slots` already sized the slot from
             // that rect, so filling the slot is right — but a zero-sized window would divide by
             // zero on the way there.

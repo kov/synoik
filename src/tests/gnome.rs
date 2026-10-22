@@ -30479,8 +30479,9 @@ fn space_in_the_crosshair_arms_the_focused_window() {
         "and Space again comes back to the crosshair"
     );
 
-    // In window mode there is nothing to drag, so the click alone takes it. The selector is an
-    // exposé, so the thumbnail is at the middle of the output rather than where the window is.
+    // In window mode there is nothing to drag, so the click alone takes it. The selector shows the
+    // window alone, centred, so the thumbnail is at the middle of the output rather than where the
+    // window is.
     tap(&mut f, KEY_SPACE);
     let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
@@ -30507,6 +30508,75 @@ fn space_in_the_crosshair_arms_the_focused_window() {
             .action(Keysym::Return, ModifiersState::default()),
         Some(Action::ConfirmScreenshot { .. })
     ));
+}
+
+/// Space in the crosshair shows the armed window alone, centred — not the picker's exposé of every
+/// window, which would turn "this window" into a choice among all of them.
+#[test]
+fn space_in_the_crosshair_shows_only_the_armed_window() {
+    use smithay::utils::Point;
+
+    use crate::ui::screenshot_ui::{CaptureType, PointerDown};
+
+    const KEY_SPACE: u32 = 57;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+    let other = f.synoik().layout.focus().unwrap().id().get();
+    map_focused_window(&mut f, id);
+    let focused = f.synoik().layout.focus().unwrap().id().get();
+    assert_ne!(other, focused);
+    let output = f.synoik_output(1);
+
+    // The picker's selector is the exposé: both windows.
+    open_picker_headless(&mut f);
+    f.synoik_state()
+        .synoik
+        .screenshot_ui
+        .set_capture_type(CaptureType::Window);
+    let ui = &f.synoik().screenshot_ui;
+    assert!(ui.selector_shows(&output, focused) && ui.selector_shows(&output, other));
+    f.synoik_state().cancel_screenshot();
+
+    open_quick_picker_headless(&mut f);
+    f.key_press(KEY_SPACE);
+    f.key_release(KEY_SPACE);
+    let ui = &f.synoik().screenshot_ui;
+    assert!(ui.selector_shows(&output, focused));
+    assert!(
+        !ui.selector_shows(&output, other),
+        "the crosshair's selector shows the armed window and nothing else"
+    );
+
+    // Laid out alone, so centred on the output rather than sharing a row with the other.
+    let slot = ui.window_slot(&output, focused).unwrap();
+    let centre_x = slot.loc.x + slot.size.w / 2.;
+    assert!(
+        (centre_x - 960.).abs() < 1.,
+        "the armed window is centred, at x={centre_x}"
+    );
+
+    // Both windows are the same size, so laid out alone their slots coincide: a press there must
+    // pick the shown one, never the hidden one under it.
+    let hidden = ui.window_slot(&output, other).unwrap();
+    assert_eq!(hidden, slot);
+    let scale = output.current_scale().fractional_scale();
+    let at: Point<i32, smithay::utils::Physical> = (slot.loc
+        + Point::from((slot.size.w / 2., slot.size.h / 2.)))
+    .to_physical_precise_round(scale);
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
+    ui.pointer_motion_here(at);
+    assert_eq!(
+        ui.pointer_down(output, at, None, false),
+        Some(PointerDown::Redraw)
+    );
+    assert_eq!(
+        f.synoik().screenshot_ui.selected_window().map(|(_, id)| id),
+        Some(focused),
+        "a press only picks the shown window"
+    );
 }
 
 /// Single keys drive the type row and the shot/cast pill, so the picker is usable without the
