@@ -1,7 +1,8 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 (the toggle surface), A2, A3, A4, A6, A7 and A9 done; A5 (Screen Keyboard) and A8
-(our own UI readable by a screen reader) are unbuilt.**
+**Status: A1 (the toggle surface), A2, A3, A4, A5, A6, A7 and A9 done — A5 without its word
+suggestions, which wait on the IBus panel; A8 (our own UI readable by a screen reader) is
+unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
@@ -24,7 +25,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 | Layer | GNOME | Us |
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
-| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2, A3; ⬜ A5 |
+| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2, A3, A5 |
 | Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
@@ -109,10 +110,47 @@ settings change: `ui/kbd_a11y_dialog.rs`, on the shared `ui/message_dialog.rs`. 
 lock screen too, since the shortcuts work there. `timeout-enable` /
 `disable-timeout` are read by mutter and acted on nowhere.
 
-### A5 — On-screen keyboard (the Screen Keyboard row)
-`screen-keyboard-enabled` (`js/ui/keyboard.js:25`), `Keyboard` (`keyboard.js:1174`) — a full
-shell-side OSK with layouts, suggestions and input-method integration. Already on the roadmap
-independently (STRATEGY §6 Phase 3, "OSK"); the a11y row is just another way to enable it.
+### A5 — On-screen keyboard (the Screen Keyboard row) ✅
+`src/osk/` (model) and `src/ui/osk.rs` (drawing, hit-testing), a port of `js/ui/keyboard.js`:
+- **When it exists**: `screen-keyboard-enabled`, or touch mode with a touchscreen as the last
+  device (`KeyboardManager._syncEnabled`; mutter's `update_touch_mode`).
+- **When it shows**: a client re-enabling its text input while it already holds the input method
+  (mutter's `enable_panel_v1` — GTK does it on a click), one of our entries taking the key focus,
+  or a touch dragged up from the bottom edge (`ShellEdgeDragGesture`). It goes on the input
+  method's focus-out, its hide key, or the focused window moving. Rest, slide and hide-panel
+  timings are gnome-shell's.
+- **Layouts** are gnome-shell's JSON models (`resources/osk-layouts`), with its purpose layouts,
+  `-extended` for terminals and its group fallbacks. Levels, shift-once, the long-press latch,
+  latching Ctrl/Alt, auto-capitalisation and title case from the surrounding text.
+- **Keys**: a string goes in through the input method's commit when a field has it, otherwise
+  as virtual key presses through the real pipeline (keyboard filters included) with Shift/AltGr
+  held for the level, in mutter's order. A long press opens the key's other strings in a box
+  pointer; the globe key the input sources (`LanguageSelectionPopup`); the emoji key the emoji
+  page (sections, pages, a swipe or touchpad scroll between them, skin tones on long press).
+- **The focused window** slides up out of the keyboard's way when the caret would be under it,
+  and back after (`setCursorLocation`, `_animateWindow`).
+- Drawn over the shell's chrome, the shield and dialogs included (`addTopChrome`), under only
+  the pointer and its own popups; over the dock, whose edge reveal it holds off (decision:
+  keyboard over dock).
+
+**Not built: word suggestions.** gnome-shell fills the row from the IBus panel service's lookup
+table (`ibusCandidatePopup.js:290-335`); we run `ibus-daemon --panel disable` as it does but have
+no panel service, so neither the suggestions nor the desktop candidate popup exist. Porting the
+panel service is its own slice.
+
+**Divergences:**
+- Delete holds BackSpace (a virtual key) rather than asking the input method to delete the
+  surrounding text.
+- It goes on the primary display, always (`keyboardIndex = primaryIndex`), the edge drag
+  included; gnome-shell opens a drag's keyboard on the display it came from.
+- An IBus source's keys follow `us`: without the engine's description its xkb layout is unknown.
+- The language menu is no modal menu, as gnome-shell's is not, but it holds the click grab as any
+  of our popovers does: a click elsewhere, the keyboard included, only closes it.
+- The edge drag only claims the edge while there is a keyboard to pull; gnome-shell's gesture
+  claims it regardless.
+- The emoji page's long-press variants are the skin tones; gnome-shell groups by name prefix.
+  An emoji commits the table's fully-qualified spelling, without gnome-shell's extra U+FE0F.
+- A slide that the work area's titlebar clamp stops short comes back by as much as it went.
 
 ### A6 — The bell (the Visual Alerts row) ✅
 `src/bell.rs`, a port of mutter's `src/core/bell.c` and the flashes it asks for
@@ -178,7 +216,7 @@ Orca can *read* is A7 and A8.
 
 1. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-2. **A5** — independently schedulable.
+2. **The IBus panel service** — the candidate popup, and with it A5's word suggestions.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**
