@@ -4414,6 +4414,34 @@ fn vulkan_zoom_magnifies_the_screen_about_the_pointer() {
         "drawn at twice its size: {zoomed:?} from {plain:?}"
     );
 
+    // The pointer is drawn magnified, and only that once.
+    let state = f.synoik_state();
+    let kinds: Vec<&'static str> = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            synoik
+                .render_to_vec(ctx, &output, true)
+                .iter()
+                .filter_map(|e| match e {
+                    OutputRenderElements::MagnifiedPointer(_) => Some("magnified"),
+                    OutputRenderElements::Pointer(_) => Some("plain"),
+                    _ => None,
+                })
+                .collect()
+        })
+        .expect("vulkan renderer");
+    assert!(
+        !kinds.is_empty() && kinds.iter().all(|k| *k == "magnified"),
+        "{kinds:?}"
+    );
+
     // And off again, the screen is as it was.
     f.synoik()
         .gnome_settings
