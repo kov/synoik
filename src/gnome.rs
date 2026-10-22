@@ -144,6 +144,8 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.a11y.keyboard`: what the keyboard filters run with
     /// ([`crate::input::keyboard_a11y`]).
     pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11ySettings,
+    /// `org.gnome.desktop.a11y.mouse`.
+    pub pointer_a11y: crate::input::pointer_a11y::PointerA11ySettings,
     /// `org.gnome.desktop.sound event-sounds`: the master switch for every event sound
     /// (`MetaSoundPlayer`'s `CA_PROP_CANBERRA_ENABLE`).
     pub event_sounds: bool,
@@ -535,6 +537,7 @@ impl Default for GnomeSettings {
             visual_bell_type: VisualBellType::default(),
             audible_bell: true,
             keyboard_a11y: Default::default(),
+            pointer_a11y: Default::default(),
             event_sounds: true,
             sound_theme_name: crate::sound_theme::FALLBACK_THEME.to_owned(),
             edge_tiling: true,
@@ -1107,6 +1110,47 @@ impl GnomeSettings {
         for (key, value) in delays {
             if settings_has_key(keyboard, key) {
                 *value = keyboard.int(key).max(0) as u32;
+            }
+        }
+    }
+
+    /// `sync_pointer_a11y_settings` (`clutter-settings.c:296-343`): the times are seconds.
+    fn load_pointer_a11y(&mut self, mouse: &gio::Settings) {
+        use crate::input::pointer_a11y::{DwellDirection, DwellMode};
+        let p = &mut self.pointer_a11y;
+        let ms = |key: &str| (1000. * mouse.double(key)).max(0.) as u32;
+        let has = |key: &str| settings_has_key(mouse, key);
+        if has("secondary-click-enabled") {
+            p.secondary_click_enabled = mouse.boolean("secondary-click-enabled");
+        }
+        if has("secondary-click-time") {
+            p.secondary_click_delay = ms("secondary-click-time");
+        }
+        if has("dwell-click-enabled") {
+            p.dwell_click_enabled = mouse.boolean("dwell-click-enabled");
+        }
+        if has("dwell-time") {
+            p.dwell_delay = ms("dwell-time");
+        }
+        if has("dwell-threshold") {
+            p.dwell_threshold = mouse.int("dwell-threshold").max(0) as u32;
+        }
+        if has("dwell-mode") {
+            p.dwell_mode = if mouse.string("dwell-mode") == "window" {
+                DwellMode::Window
+            } else {
+                DwellMode::Gesture
+            };
+        }
+        let gestures: [(&str, &mut DwellDirection); 4] = [
+            ("dwell-gesture-single", &mut p.dwell_gesture_single),
+            ("dwell-gesture-double", &mut p.dwell_gesture_double),
+            ("dwell-gesture-drag", &mut p.dwell_gesture_drag),
+            ("dwell-gesture-secondary", &mut p.dwell_gesture_secondary),
+        ];
+        for (key, value) in gestures {
+            if settings_has_key(mouse, key) {
+                *value = DwellDirection::from_nick(&mouse.string(key));
             }
         }
     }
@@ -2940,6 +2984,7 @@ struct Stores {
     a11y_interface: Option<gio::Settings>,
     a11y_applications: Option<gio::Settings>,
     a11y_keyboard: Option<gio::Settings>,
+    a11y_mouse: Option<gio::Settings>,
     /// `org.gnome.desktop.peripherals.*` — one store per device class, all from
     /// gsettings-desktop-schemas. See [`Peripherals`].
     touchpad: Option<gio::Settings>,
@@ -3007,6 +3052,7 @@ impl Stores {
             a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
             a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard", b),
+            a11y_mouse: gsettings("org.gnome.desktop.a11y.mouse", b),
             touchpad: gsettings("org.gnome.desktop.peripherals.touchpad", b),
             mouse: gsettings("org.gnome.desktop.peripherals.mouse", b),
             keyboard: gsettings("org.gnome.desktop.peripherals.keyboard", b),
@@ -3073,6 +3119,7 @@ impl Stores {
             &self.a11y_interface,
             &self.a11y_applications,
             &self.a11y_keyboard,
+            &self.a11y_mouse,
             &self.touchpad,
             &self.mouse,
             &self.keyboard,
@@ -3150,6 +3197,9 @@ impl Stores {
         settings.load_a11y(self);
         if let Some(keyboard) = &self.a11y_keyboard {
             settings.load_keyboard_a11y(keyboard);
+        }
+        if let Some(mouse) = &self.a11y_mouse {
+            settings.load_pointer_a11y(mouse);
         }
         settings.app_folders = self.read_app_folders();
         settings

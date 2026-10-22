@@ -92,6 +92,7 @@ pub mod move_grab;
 pub mod peripherals;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
+pub mod pointer_a11y;
 pub mod pressure;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
@@ -707,9 +708,22 @@ impl State {
                     self.sticky_keys_after(keycode, key_state == KeyState::Pressed);
                 }
             }
-            PointerMotion { event } => self.on_pointer_motion::<I>(event),
-            PointerMotionAbsolute { event } => self.on_pointer_motion_absolute::<I>(event),
-            PointerButton { event } => self.on_pointer_button::<I>(event),
+            PointerMotion { event } => {
+                self.on_pointer_motion::<I>(event);
+                self.pointer_a11y_motion();
+            }
+            PointerMotionAbsolute { event } => {
+                self.on_pointer_motion_absolute::<I>(event);
+                self.pointer_a11y_motion();
+            }
+            // After the button: a held primary's release goes out before the secondary click it
+            // turns into, as mutter's queued click follows the event that raised it.
+            PointerButton { event } => {
+                let (button, pressed) =
+                    (event.button_code(), event.state() == ButtonState::Pressed);
+                self.on_pointer_button::<I>(event);
+                self.pointer_a11y_button(button, pressed);
+            }
             PointerAxis { event } => self.on_pointer_axis::<I>(event),
             TabletToolAxis { event } => self.on_tablet_tool_axis::<I>(event),
             TabletToolTip { event } => self.on_tablet_tool_tip::<I>(event),

@@ -567,7 +567,11 @@ impl State {
             dx: away(dx),
             dy: away(dy),
         };
+        // A virtual device's move, which pointer accessibility does not count
+        // (`CLUTTER_EVENT_FLAG_SYNTHETIC`).
+        let moving = std::mem::replace(&mut self.synoik.pointer_a11y.moving, true);
         self.process_input_event(InputEvent::<SyntheticInputBackend>::PointerMotion { event });
+        self.synoik.pointer_a11y.moving = moving;
     }
 
     /// `stop_mousekeys_move`.

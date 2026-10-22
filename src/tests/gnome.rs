@@ -44897,6 +44897,130 @@ fn the_pointer_locator_names_the_window_under_the_pointer() {
     );
 }
 
+/// A focused window under the pointer, pointer accessibility set by `set`, every event so far
+/// drained.
+fn pointer_a11y_fixture(
+    set: impl FnOnce(&mut crate::input::pointer_a11y::PointerA11ySettings),
+) -> (Fixture, ClientId) {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    set(&mut f.synoik().gnome_settings.pointer_a11y);
+    f.synoik_state().sync_pointer_a11y();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_pointer_events();
+    (f, id)
+}
+
+/// The `(button, pressed)` events the client saw since the last take.
+fn client_buttons(f: &mut Fixture, id: ClientId) -> Vec<(u32, bool)> {
+    f.double_roundtrip(id);
+    f.client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            super::client::PointerEvent::Button { button, pressed } => Some((button, pressed)),
+            _ => None,
+        })
+        .collect()
+}
+
+const LEFT: u32 = 0x110;
+const RIGHT: u32 = 0x111;
+
+/// Simulated secondary click (`secondary-click-enabled`): the primary held past
+/// `secondary-click-time` is released, then a secondary click follows; let go sooner, it is just
+/// a click.
+#[test]
+fn a_held_primary_becomes_a_secondary_click() {
+    let (mut f, id) = pointer_a11y_fixture(|p| p.secondary_click_enabled = true);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(1300));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false), (RIGHT, true), (RIGHT, false)]
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(500));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+}
+
+/// Dwell click in window mode: the pointer at rest for `dwell-time` clicks, once, and the pie at
+/// the pointer counts it down. A double click is one-shot and falls back to a single one; a drag
+/// presses on one dwell and releases on the next, wherever the pointer went in between.
+#[test]
+fn a_resting_pointer_clicks() {
+    use crate::input::pointer_a11y::DwellClickType;
+
+    let (mut f, id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(f.synoik().pointer_a11y.pie.is_some(), "the pie counts down");
+    run_for(&mut f, Duration::from_millis(1000));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+    run_for(&mut f, Duration::from_secs(3));
+    assert_eq!(client_buttons(&mut f, id), vec![], "once per rest");
+
+    f.synoik_state()
+        .set_dwell_click_type(DwellClickType::Double);
+    pointer_motion_to(&mut f, 980., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false), (LEFT, true), (LEFT, false)]
+    );
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Primary);
+
+    f.synoik_state().set_dwell_click_type(DwellClickType::Drag);
+    pointer_motion_to(&mut f, 960., 540.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true)],
+        "the drag starts"
+    );
+    pointer_motion_to(&mut f, 990., 560.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(client_buttons(&mut f, id), vec![(LEFT, false)], "and ends");
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Primary);
+}
+
+/// Dwell click in gesture mode: after the dwell, a stroke from the spot names the click, and the
+/// pointer goes back to the spot to make it. The stroke's directions are mutter's, so with the
+/// default settings a stroke to the right is `left`, the single click.
+#[test]
+fn a_dwell_gesture_names_its_click() {
+    use crate::input::pointer_a11y::DwellMode;
+
+    let (mut f, id) = pointer_a11y_fixture(|p| {
+        p.dwell_click_enabled = true;
+        p.dwell_mode = DwellMode::Gesture;
+    });
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![],
+        "the dwell only starts the gesture"
+    );
+    pointer_motion_to(&mut f, 1015., 547.);
+    run_for(&mut f, Duration::from_millis(1300));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+    let at = f.synoik().seat.get_pointer().unwrap().current_location();
+    assert_eq!((at.x, at.y), (965., 545.), "made back at the spot");
+}
+
 /// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
 const SHIFT_MASK: u32 = 1;
 const CONTROL_MASK: u32 = 1 << 2;
