@@ -3991,8 +3991,10 @@ mod tests {
     /// change the UI must re-publish.
     #[test]
     fn large_text_scales_the_realized_base_font() {
-        let mut settings = GnomeSettings::default();
-        settings.base_font_pt = 12.;
+        let settings = GnomeSettings {
+            base_font_pt: 12.,
+            ..Default::default()
+        };
         assert_eq!(settings.realized_base_font_pt(), 12.);
 
         let mut large = settings.clone();
