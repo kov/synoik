@@ -28,6 +28,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::{Animation, Clock, Curve};
+use crate::render_helpers::mag_effects::{MagEffects, MagEffectsRenderElement};
 use crate::render_helpers::off_plane::OffPlaneRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -616,14 +617,52 @@ impl ZoomRegion {
     }
 }
 
+/// The colour effects `settings` ask for, or `None` when all of them are off — as
+/// `MagShaderEffects` enables each effect only when it changes something.
+pub fn effects(settings: &MagnifierSettings) -> Option<MagEffects> {
+    let desaturate = settings.color_saturation != 1.;
+    let brightness_contrast =
+        settings.brightness.iter().any(|v| *v != 0.) || settings.contrast.iter().any(|v| *v != 0.);
+    if !settings.invert_lightness && !desaturate && !brightness_contrast {
+        return None;
+    }
+    let mut scale = [1.; 3];
+    let mut bias = [0.; 3];
+    if brightness_contrast {
+        for i in 0..3 {
+            // `get_brightness_values`, then the contrast as `tan((c + 1) * π/4)`, folded into one
+            // affine: ((rgb * m + o * a) - a/2) * k + a/2.
+            let b = settings.brightness[i];
+            let (m, o) = if b < 0. { (1. + b, 0.) } else { (1. - b, b) };
+            let k = ((settings.contrast[i] + 1.) * std::f64::consts::FRAC_PI_4).tan();
+            scale[i] = (m * k) as f32;
+            bias[i] = ((o - 0.5) * k + 0.5) as f32;
+        }
+    }
+    Some(MagEffects {
+        desaturation: if desaturate {
+            (1. - settings.color_saturation) as f32
+        } else {
+            0.
+        },
+        invert: settings.invert_lightness,
+        scale,
+        bias,
+    })
+}
+
 /// What one display's magnified frame is drawn with, kept across frames so the damage tracker
-/// sees the same elements: the frame it magnifies, and the solids around it.
+/// sees the same elements: the frame it magnifies, the view composed again when it has colour
+/// effects, and the solids around it.
 #[derive(Debug)]
 pub struct MagnifierSurface {
     offscreen: OffscreenBuffer,
+    effects_offscreen: OffscreenBuffer,
     background: SolidColorBuffer,
     /// Top, bottom, left, right.
     border: [SolidColorBuffer; 4],
+    /// Left, right, top, bottom.
+    crosshairs: [SolidColorBuffer; 4],
 }
 
 impl Default for MagnifierSurface {
@@ -631,8 +670,10 @@ impl Default for MagnifierSurface {
         let solid = || SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.]);
         Self {
             offscreen: OffscreenBuffer::default(),
+            effects_offscreen: OffscreenBuffer::default(),
             background: solid(),
             border: [solid(), solid(), solid(), solid()],
+            crosshairs: [solid(), solid(), solid(), solid()],
         }
     }
 }
@@ -642,10 +683,33 @@ fn premultiplied(c: Rgba) -> Color32F {
     Color32F::new(c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3])
 }
 
+/// The four hairs of `Crosshairs` around the magnified pointer at `at`, as `reCenter` lays them
+/// out: each `length` long and `thickness` thick, leaving a `clip` square (and the thickness'
+/// own square) free where they cross. Left, right, top, bottom.
+pub fn crosshairs(
+    at: Point<f64, Logical>,
+    thickness: f64,
+    length: f64,
+    clip: f64,
+) -> [Rectangle<f64, Logical>; 4] {
+    let (t, l) = (thickness, length);
+    let near = clip / 2. + t / 2.;
+    [
+        Rectangle::new((at.x - near - l, at.y - t / 2.).into(), (l, t).into()),
+        Rectangle::new((at.x + near, at.y - t / 2.).into(), (l, t).into()),
+        Rectangle::new((at.x - t / 2., at.y - near - l).into(), (t, l).into()),
+        Rectangle::new((at.x - t / 2., at.y + near).into(), (t, l).into()),
+    ]
+}
+
+/// `CROSSHAIRS_CLIP_SIZE`: the square `cross-hairs-clip` leaves free.
+const CROSSHAIRS_CLIP: f64 = 100.;
+
 impl Synoik {
     /// The frame of a display the magnifier is on, in `_createActors` order from the top: the
-    /// magnified pointer, the magnified screen, the `SystemBackground` behind it, the region's
-    /// border; and under all that, unless the view covers the screen, the screen as it is.
+    /// magnified pointer, the crosshairs, the magnified screen, the `SystemBackground` behind it
+    /// — through the colour effects if any is on — then the region's border; and under all
+    /// that, unless the view covers the screen, the screen as it is.
     pub(crate) fn render_magnified(
         &self,
         mut ctx: RenderCtx,
@@ -658,36 +722,69 @@ impl Synoik {
         let mut scene = Vec::new();
         self.render_inner(ctx.r(), output, false, &mut |elem| scene.push(elem));
 
+        let settings = &self.magnifier.settings;
         let content = view.content.to_physical_precise_round(scale);
         let pointer_here = include_pointer
             && self.pointer_visibility.is_visible()
             && self.output_under_cursor().as_ref() == Some(output);
         let mouse = self.pointer_position_on(output);
         let mag = view.transform.mag;
+        // `_getMousePosition` rounds.
+        let at = view.transform.apply(mouse);
+        let at = Point::from((at.x.round(), at.y.round()));
 
-        if pointer_here && view.pointer_over {
+        let mut surfaces = self.magnifier_surfaces.borrow_mut();
+        let surface = surfaces.entry(output.name()).or_default();
+        let mut group: Vec<OutputRenderElements> = Vec::new();
+
+        if pointer_here {
             // `_mouseActor`: the pointer image scaled by the factor about its hotspot, at the
             // spot the zoom draws the pointer's position.
             let origin = mouse.to_physical_precise_round(scale);
-            let shift = view.transform.apply(mouse).to_physical_precise_round(scale) - origin;
+            let shift = at.to_physical_precise_round(scale) - origin;
             self.render_pointer(ctx.renderer, output, &mut |elem| {
                 let elem = RescaleRenderElement::from_element(elem, origin, mag);
                 let elem = RelocateRenderElement::from_element(elem, shift, Relocate::Relative);
                 if let Some(elem) = CropRenderElement::from_element(elem, scale, content) {
-                    push(OffPlaneRenderElement(elem).into());
+                    group.push(OffPlaneRenderElement(elem).into());
                 }
             });
         }
 
-        let mut surfaces = self.magnifier_surfaces.borrow_mut();
-        let surface = surfaces.entry(output.name()).or_default();
+        if pointer_here && settings.show_crosshairs {
+            let clip = if settings.crosshairs_clip {
+                CROSSHAIRS_CLIP
+            } else {
+                0.
+            };
+            let mut color = settings.crosshairs_color;
+            color[3] *= settings.crosshairs_opacity.clamp(0., 1.) as f32;
+            let hairs = crosshairs(
+                at,
+                settings.crosshairs_thickness,
+                settings.crosshairs_length,
+                clip,
+            );
+            for (buffer, hair) in surface.crosshairs.iter_mut().zip(hairs) {
+                // Inside the zoom region's clip.
+                let Some(hair) = hair.intersection(view.content) else {
+                    continue;
+                };
+                buffer.update(hair.size, premultiplied(color));
+                group.push(
+                    SolidColorRenderElement::from_buffer(buffer, hair.loc, 1., Kind::Unspecified)
+                        .into(),
+                );
+            }
+        }
+
         let magnified = match surface.offscreen.render(ctx.renderer, scale, &scene) {
             Ok((elem, _sync, _data)) => {
                 let elem = RescaleRenderElement::from_element(elem, (0, 0).into(), mag);
                 let origin = view.transform.origin.to_physical_precise_round(scale);
                 let elem = RelocateRenderElement::from_element(elem, origin, Relocate::Relative);
                 CropRenderElement::from_element(elem, scale, content).map(|elem| {
-                    push(elem.into());
+                    group.push(elem.into());
                 })
             }
             Err(err) => {
@@ -699,7 +796,7 @@ impl Synoik {
         surface
             .background
             .update(view.content.size, premultiplied(BACKGROUND));
-        push(
+        group.push(
             SolidColorRenderElement::from_buffer(
                 &surface.background,
                 view.content.loc,
@@ -708,6 +805,31 @@ impl Synoik {
             )
             .into(),
         );
+
+        // The effects apply to the whole group (`new MagShaderEffects(mainGroup)`).
+        match effects(settings) {
+            Some(effects) => {
+                match surface
+                    .effects_offscreen
+                    .render(ctx.renderer, scale, &group)
+                {
+                    Ok((elem, _sync, _data)) => {
+                        push(MagEffectsRenderElement::new(elem, effects).into())
+                    }
+                    Err(err) => {
+                        warn!("error applying the zoom's colour effects: {err:?}");
+                        for elem in group {
+                            push(elem);
+                        }
+                    }
+                }
+            }
+            None => {
+                for elem in group {
+                    push(elem);
+                }
+            }
+        }
 
         if !view.full_screen {
             let accent = style::accent_rgba(self.gnome_settings.accent_color);
@@ -739,7 +861,7 @@ impl Synoik {
         drop(surfaces);
 
         // The screen as it is shows around a view that does not cover it — and is all there is if
-        // the magnified frame could not be drawn.
+        // the magnified frame could not be drawn. Off the view the system pointer shows too.
         if !view.full_screen || magnified.is_none() {
             if pointer_here && !view.pointer_over {
                 self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
@@ -932,6 +1054,54 @@ mod tests {
             24.,
             &Clock::with_time(Duration::ZERO),
         )
+    }
+
+    /// Every effect at its default is no effect at all; otherwise the fold matches Clutter's
+    /// two-step brightness then contrast.
+    #[test]
+    fn the_colour_effects_fold_as_clutter_applies_them() {
+        assert_eq!(effects(&MagnifierSettings::default()), None);
+
+        let s = MagnifierSettings {
+            brightness: [0.25, -0.5, 0.],
+            contrast: [0.5, 0., -0.25],
+            ..MagnifierSettings::default()
+        };
+        let e = effects(&s).unwrap();
+        assert!(!e.invert);
+        assert_eq!(e.desaturation, 0.);
+        for (i, rgb) in [0.2f64, 0.7, 1.].into_iter().enumerate() {
+            let b = s.brightness[i];
+            let (m, o) = if b < 0. { (1. + b, 0.) } else { (1. - b, b) };
+            let k = ((s.contrast[i] + 1.) * std::f64::consts::FRAC_PI_4).tan();
+            // `cogl_color_out` opaque: a = 1.
+            let clutter = ((rgb * m + o) - 0.5) * k + 0.5;
+            let ours = rgb * f64::from(e.scale[i]) + f64::from(e.bias[i]);
+            assert!(
+                (clutter - ours).abs() < 1e-5,
+                "channel {i}: {clutter} vs {ours}"
+            );
+        }
+
+        let grey = effects(&MagnifierSettings {
+            color_saturation: 0.25,
+            ..MagnifierSettings::default()
+        })
+        .unwrap();
+        assert_eq!(grey.desaturation, 0.75);
+        assert_eq!((grey.scale, grey.bias), ([1.; 3], [0.; 3]));
+    }
+
+    /// `reCenter`: the hairs stop half a thickness — plus half the clip — short of the pointer.
+    #[test]
+    fn the_crosshairs_leave_the_pointer_free() {
+        let [left, right, top, bottom] = crosshairs(Point::from((100., 50.)), 8., 30., 0.);
+        assert_eq!(left, Rectangle::new((66., 46.).into(), (30., 8.).into()));
+        assert_eq!(right, Rectangle::new((104., 46.).into(), (30., 8.).into()));
+        assert_eq!(top, Rectangle::new((96., 16.).into(), (8., 30.).into()));
+        assert_eq!(bottom, Rectangle::new((96., 54.).into(), (8., 30.).into()));
+        let [left, ..] = crosshairs(Point::from((100., 50.)), 8., 30., 100.);
+        assert_eq!(left.loc.x + left.size.w, 100. - 54.);
     }
 
     #[test]

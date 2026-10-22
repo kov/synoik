@@ -74,6 +74,37 @@ pub struct QuadPush {
     pub cutoff: [f32; 2],
 }
 
+/// `mag_effects.frag`'s push block: [`QuadPush`]'s layout up to the texture transform, then the
+/// colour effects' parameters.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MagEffectsPush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub proj: [f32; 4],
+    pub target: [f32; 2],
+    pub corner_radius: f32,
+    pub stroke_width: f32,
+    pub color: [f32; 4],
+    pub tex_transform: [[f32; 4]; 3],
+    pub desaturation: f32,
+    /// `> 0.5` inverts the lightness.
+    pub invert: f32,
+    pub _pad: [f32; 2],
+    /// Per-channel multiplier (`.xyz`).
+    pub scale: [f32; 4],
+    /// Per-channel offset, applied times alpha (`.xyz`).
+    pub bias: [f32; 4],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<MagEffectsPush>() == 160);
+    assert!(std::mem::offset_of!(MagEffectsPush, tex_transform) == 64);
+    assert!(std::mem::offset_of!(MagEffectsPush, desaturation) == 112);
+    assert!(std::mem::offset_of!(MagEffectsPush, scale) == 128);
+    assert!(std::mem::offset_of!(MagEffectsPush, bias) == 144);
+};
+
 // The Rust layout must match the GLSL std430 `Push` block byte-for-byte; catch drift at compile
 // time (offsets: proj@16, color@48, tex_transform@64/80/96, cutoff@112).
 const _: () = {

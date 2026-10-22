@@ -4452,6 +4452,80 @@ fn vulkan_zoom_magnifies_the_screen_about_the_pointer() {
     assert_eq!(green_bbox(&pixels, w, h), Some(plain));
 }
 
+/// The zoom's colour effects apply to the magnified view: desaturated all the way, the green
+/// window is grey. Its crosshairs cross at the magnified pointer, in their colour.
+#[test]
+fn vulkan_zoom_draws_its_colour_effects_and_crosshairs() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let plain = green_bbox(&pixels, w, h).expect("the window shows");
+    let at = (f64::from(plain.loc.x) + 40., f64::from(plain.loc.y) + 40.);
+    super::gnome::pointer_motion_to(&mut f, at.0, at.1);
+    {
+        let synoik = f.synoik();
+        let m = &mut synoik.gnome_settings.magnifier;
+        m.mouse_tracking = crate::magnifier::Tracking::Centered;
+        m.color_saturation = 0.;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let view = f.synoik().magnifier.view(&output).unwrap();
+    let inside = view.transform.apply(Point::from((at.0 + 30., at.1 + 30.)));
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(green_bbox(&pixels, w, h), None, "no green left");
+    let [r, g, b, _] = px(&pixels, w, inside.x as i32, inside.y as i32);
+    assert!(
+        r.abs_diff(g) < 4 && g.abs_diff(b) < 4 && (130..170).contains(&g),
+        "the window is grey (0.587 of green): {:?}",
+        [r, g, b]
+    );
+
+    // Crosshairs need the pointer drawn, as the screen's frame does.
+    {
+        let m = &mut f.synoik().gnome_settings.magnifier;
+        m.color_saturation = 1.;
+        m.show_crosshairs = true;
+    }
+    f.synoik_state().sync_magnifier();
+    let state = f.synoik_state();
+    let pixels = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, &output, true);
+            render_to_vec(
+                vk,
+                Size::from((w, h)),
+                Scale::from(1.),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+            .unwrap()
+        })
+        .unwrap();
+    let pointer = view.transform.apply(Point::from(at));
+    // Left of the pointer, past half the default 8px thickness: on the horizontal hair.
+    let [r, g, b, _] = px(&pixels, w, pointer.x as i32 - 30, pointer.y as i32);
+    assert!(
+        r > 150 && g < 120 && b < 60,
+        "a red hair at 0.66 over the green window: {:?}",
+        [r, g, b]
+    );
+}
+
 /// A menu draws its rows' icons over its card (`widget::Menu::render`): the dwell-click menu's
 /// four rows each carry gnome-shell's own icon, so it is five elements, not a bare card.
 #[test]

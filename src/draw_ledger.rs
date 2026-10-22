@@ -40,6 +40,7 @@ pub enum Material {
     ClippedTexture(u64),
     RoundedTexture(u64),
     GradientFade(u64),
+    MagEffects(u64),
     /// A backdrop composite, or any other postprocess of a captured texture.
     Postprocess(u64),
     Resize(u64),
@@ -69,6 +70,7 @@ impl Material {
             Material::ClippedTexture(i) => ("clipped-texture", Some(i)),
             Material::RoundedTexture(i) => ("rounded-texture", Some(i)),
             Material::GradientFade(i) => ("gradient-fade", Some(i)),
+            Material::MagEffects(i) => ("mag-effects", Some(i)),
             Material::Postprocess(i) => ("postprocess", Some(i)),
             Material::Resize(i) => ("resize", Some(i)),
             Material::CustomResize(i) => ("custom-resize", Some(i)),

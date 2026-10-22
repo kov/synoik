@@ -38,6 +38,7 @@ pub mod framebuffer_effect;
 pub mod gradient_fade_texture;
 pub mod icon;
 pub mod inset_ring;
+pub mod mag_effects;
 pub mod memory;
 pub mod off_plane;
 pub mod offscreen;

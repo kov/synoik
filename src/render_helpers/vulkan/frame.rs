@@ -11,8 +11,8 @@ use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
 use synoik_vk::render::{
-    as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
-    TextPush, IDENTITY_PROJ,
+    as_bytes, BorderPush, ClippedTexturePush, MagEffectsPush, PostprocessPush, QuadPush,
+    ResizePush, ShadowPush, TextPush, IDENTITY_PROJ,
 };
 use tracing::{debug, warn};
 
@@ -970,6 +970,68 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 self.cbuf,
                 &scissors,
                 Material::GradientFade(raw(texture)),
+            );
+        }
+        Ok(())
+    }
+
+    /// Draw `texture` through the magnifier's colour effects (`mag_effects.frag`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_mag_effects(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        alpha: f32,
+        desaturation: f32,
+        invert: bool,
+        scale: [f32; 3],
+        bias: [f32; 3],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+        let push = MagEffectsPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            color: [alpha, alpha, alpha, alpha],
+            tex_transform: build_tex_transform(src, texture, Transform::Normal),
+            desaturation,
+            invert: if invert { 1. } else { 0. },
+            scale: [scale[0], scale[1], scale[2], 0.],
+            bias: [bias[0], bias[1], bias[2], 0.],
+            ..Default::default()
+        };
+        self.retain(texture);
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.mag_effects_pipeline;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            Self::draw_quad(
+                dev,
+                self.cbuf,
+                &scissors,
+                Material::MagEffects(raw(texture)),
             );
         }
         Ok(())

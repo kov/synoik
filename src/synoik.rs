@@ -18773,6 +18773,7 @@ synoik_render_elements! {
         Magnified = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             OffscreenRenderElement
         >>>,
+        MagnifiedWithEffects = crate::render_helpers::mag_effects::MagEffectsRenderElement,
         MagnifiedPointer = crate::render_helpers::off_plane::OffPlaneRenderElement<
             CropRenderElement<RelocateRenderElement<RescaleRenderElement<PointerRenderElements>>>
         >,

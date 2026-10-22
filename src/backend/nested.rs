@@ -1251,12 +1251,10 @@ fn sync_cursor(
     if synoik.config.borrow().debug.disable_cursor_plane {
         return Pointer::InFrame;
     }
-    // Over the magnifier's view the pointer is drawn magnified, where the zoom puts it, and the
-    // plane stays off (`hideSystemCursor`).
-    if synoik
-        .magnifier
-        .view(output)
-        .is_some_and(|view| view.pointer_over)
+    // On a magnified display the frame draws the pointer magnified where the zoom puts it, and
+    // over the view the system pointer hides (`hideSystemCursor`): the plane stays off.
+    if synoik.magnifier.view(output).is_some()
+        && synoik.output_under_cursor().as_ref() == Some(output)
     {
         return Pointer::InFrame;
     }
