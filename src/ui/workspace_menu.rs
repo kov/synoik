@@ -14,7 +14,6 @@
 //! Built on [`Menu`], the same widget the window menu uses, so the rows, the keyboard
 //! navigation and the card are the shell's one menu.
 
-use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Size};
 
@@ -221,24 +220,11 @@ impl WorkspaceMenu {
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
-        match self.menu.bake(renderer, scale) {
-            Ok(buffer) => {
-                vec![TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    origin,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                )]
-            }
-            Err(err) => {
-                tracing::error!("error baking the workspace menu: {err:#}");
-                Vec::new()
-            }
-        }
+        self.menu
+            .render(renderer, icons, scale, origin, "the workspace menu")
     }
 }

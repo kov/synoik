@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Renderer};
+use smithay::backend::renderer::Color32F;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use synoik_config::Config;
@@ -225,12 +225,13 @@ const BTN_ACTIVE_HOVER_A: f32 = 0.32;
 /// menu — `js/ui/status/keyboard.js:875`). The one place a role opts into the pill:
 /// add it here and give [`Panel::pill_rect`] its geometry. `screenRecording` is
 /// excluded — it carries its own always-on red fill rather than the state layer.
-const PILL_ROLES: [&str; 5] = [
+const PILL_ROLES: [&str; 6] = [
     ROLE_ACTIVITIES,
     ROLE_DATE_MENU,
     ROLE_QUICK_SETTINGS,
     ROLE_KEYBOARD,
     ROLE_A11Y,
+    ROLE_DWELL_CLICK,
 ];
 
 /// A button container's fill-alpha fade (gnome-shell `panel_button`'s 150ms
@@ -289,6 +290,10 @@ pub const ROLE_KEYBOARD: &str = "keyboard";
 /// `js/ui/status/accessibility.js:32`) — an `accessibility-menu-symbolic` button shown only
 /// when a11y is pinned on or some a11y feature is enabled (`accessibility.js:90-97`).
 pub const ROLE_A11Y: &str = "a11y";
+/// Role of the dwell-click indicator (GNOME's `dwellClick`, `sessionMode.js:99`;
+/// `DwellClickIndicator`, `js/ui/status/dwellClick.js`) — the click a window-mode dwell makes,
+/// shown only while dwell click is on in window mode (`_syncMenuVisibility`).
+pub const ROLE_DWELL_CLICK: &str = "dwellClick";
 
 /// Role of the app-indicator cluster — every registered StatusNotifierItem, in one slot.
 ///
@@ -315,7 +320,8 @@ const RIGHT_BOX_ORDER: &[&str] = &[
     // leftward and never displaces the clock or the status cluster.
     ROLE_APP_INDICATORS,
     ROLE_SCREEN_RECORDING,
-    // screenSharing, dwellClick,
+    // screenSharing,
+    ROLE_DWELL_CLICK,
     ROLE_A11Y,
     ROLE_KEYBOARD,
     ROLE_QUICK_SETTINGS,
@@ -694,7 +700,7 @@ struct CachedLabel {
 /// Cached bar textures, keyed so a content change misses. Tied to a renderer
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     /// The bar's text labels, one entry per [`LabelSlot`], keyed by (scale, slot) and holding
     /// the text each was baked from. A label misses when *its own* text changes — which is the
     /// whole point of the split: the clock ticks once a minute (once a *second* with seconds
@@ -844,6 +850,8 @@ pub struct Panel {
     /// The accessibility state driving the `a11y` right-box indicator's presence
     /// (`ATIndicator._syncMenuVisibility`, `js/ui/status/accessibility.js:90-97`).
     a11y: A11ySettings,
+    /// The dwell-click indicator's click type, `None` while it is hidden.
+    dwell_click: Option<crate::input::pointer_a11y::DwellClickType>,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -900,6 +908,7 @@ impl Panel {
             app_indicators: Vec::new(),
             messages_indicator: false,
             a11y: A11ySettings::default(),
+            dwell_click: None,
             clock,
             config,
             fills,
@@ -941,6 +950,30 @@ impl Panel {
         self.a11y = a11y;
         self.clear_caches();
         true
+    }
+
+    /// Show the dwell-click indicator with `click_type`'s icon, or hide it. Returns whether
+    /// anything changed.
+    pub fn set_dwell_click(
+        &mut self,
+        click_type: Option<crate::input::pointer_a11y::DwellClickType>,
+    ) -> bool {
+        if click_type == self.dwell_click {
+            return false;
+        }
+        self.dwell_click = click_type;
+        self.clear_caches();
+        true
+    }
+
+    /// The click type the dwell-click indicator shows, `None` while it is hidden.
+    pub fn dwell_click(&self) -> Option<crate::input::pointer_a11y::DwellClickType> {
+        self.dwell_click
+    }
+
+    /// The dwell-click indicator's rect, or `None` while it is hidden.
+    pub fn dwell_click_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        self.right_box_rect(ROLE_DWELL_CLICK, output_width)
     }
 
     /// The accessibility state the indicator is drawn from.
@@ -1450,6 +1483,9 @@ impl Panel {
         if let Some(rect) = self.a11y_rect(output_width) {
             out.push((ROLE_A11Y, rect));
         }
+        if let Some(rect) = self.dwell_click_rect(output_width) {
+            out.push((ROLE_DWELL_CLICK, rect));
+        }
         if let Some(rect) = self.keyboard_rect(output_width) {
             out.push((ROLE_KEYBOARD, rect));
         }
@@ -1489,6 +1525,8 @@ impl Panel {
             ROLE_SCREEN_RECORDING => self.recording_width(),
             ROLE_KEYBOARD => self.keyboard_width(),
             ROLE_A11Y => self.a11y_width(),
+            // One `.system-status-icon`, as the accessibility indicator.
+            ROLE_DWELL_CLICK if self.dwell_click.is_some() => 2. * INDICATOR_H_PADDING + QS_ICON,
             ROLE_DATE_MENU => self.date_menu_width(),
             _ => 0.,
         }
@@ -1639,7 +1677,7 @@ impl Panel {
             .or_insert_with(BarCache::new);
 
         // The cached textures belong to one renderer context; drop them all if it changed.
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.clear();
             cache.context = Some(context);
@@ -1677,10 +1715,19 @@ impl Panel {
             }
         }
 
-        // The accessibility indicator's icon, centered in its button
-        // (`accessibility.js:37-40`), on top of the shared `PILL_ROLES` container.
-        if let Some(rect) = self.a11y_rect(width) {
-            if let Some(tb) = A11Y_ICONS
+        // The accessibility and dwell-click indicators' icons, centered in their buttons
+        // (`accessibility.js:37-40`, `dwellClick.js:40-44`), on top of the shared `PILL_ROLES`
+        // container.
+        let dwell_icon = self.dwell_click.map(crate::ui::dwell_click_menu::icon);
+        let status_icons = [
+            (self.a11y_rect(width), A11Y_ICONS),
+            (self.dwell_click_rect(width), dwell_icon.as_slice()),
+        ];
+        for (rect, names) in status_icons {
+            let Some(rect) = rect else {
+                continue;
+            };
+            if let Some(tb) = names
                 .iter()
                 .find_map(|n| icons.texture(renderer, n, QS_ICON, scale, TEXT))
             {

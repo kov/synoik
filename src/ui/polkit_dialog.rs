@@ -646,7 +646,7 @@ fn paint_card(
     // GNOME modal card: transparent clear then a flat rounded fill, so the corners stay
     // transparent (the composited element carries no opaque region).
     painter.clear(style::TRANSPARENT)?;
-    painter.fill_rounded(full, style::DIALOG_RADIUS, style::DIALOG_BG)?;
+    painter.fill_rounded(full, style::DIALOG_RADIUS, style::dialog_bg())?;
 
     // Title and the action's description.
     painter.text_band(

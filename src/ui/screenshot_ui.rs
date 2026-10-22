@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::input::pointer::CursorIcon;
 use smithay::output::{Output, WeakOutput};
@@ -569,7 +569,7 @@ struct PanelState {
 #[derive(Default)]
 struct PanelCache {
     scale: f64,
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     /// What [`texture`](Self::texture) was baked for; `None` before the first bake.
     state: Option<PanelState>,
     texture: Option<TextureBuffer<VkTexture>>,
@@ -2990,7 +2990,7 @@ impl OutputData {
     /// the panel just doesn't draw.
     fn ensure_panel(&self, renderer: &mut VulkanRenderer, accent: Rgba, state: PanelState) {
         let scale = self.scale;
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         {
             let cache = self.panel.borrow();
             if cache.texture.is_some()
@@ -3403,7 +3403,7 @@ impl OutputData {
         for mode in [CaptureMode::Shot, CaptureMode::Cast] {
             let seg = widget::Segmented::segment_rect(layout.shot_cast, mode.index());
             let color = if state.mode == mode {
-                style::OSD_BG
+                style::osd_bg()
             } else {
                 style::OSD_FG
             };
@@ -4182,7 +4182,7 @@ fn generate_panel(
         // A rounded `%osd_panel` card: the fill, then its 1px white@2% inset border. The drop
         // shadow is a separate element composited under it (see `OutputData::shadow_element`), so
         // this buffer stays exactly panel-sized.
-        p.fill_rounded_full(PANEL_RADIUS, style::OSD_BG)?;
+        p.fill_rounded_full(PANEL_RADIUS, style::osd_bg())?;
         p.stroke_rounded_full(PANEL_RADIUS, 1., PANEL_BORDER_COLOR)?;
 
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
@@ -4223,7 +4223,7 @@ fn generate_panel(
         } else if state.hover == Some(pointer_control) {
             style::OSD_FLAT_HOVER
         } else {
-            style::OSD_BG
+            style::osd_bg()
         };
         p.icon_button(
             &widget::IconButton::new(layout.show_pointer, widget::IconButton::ICON_PX, pointer_bg),
@@ -4239,7 +4239,7 @@ fn generate_panel(
         } else if state.hover == Some(delay_control) {
             style::OSD_FLAT_HOVER
         } else {
-            style::OSD_BG
+            style::osd_bg()
         };
         p.icon_button(
             &widget::IconButton::new(layout.delay, widget::IconButton::ICON_PX, delay_bg),
@@ -4259,7 +4259,7 @@ fn generate_panel(
             } else if state.hover == Some(control) {
                 style::OSD_FLAT_HOVER
             } else {
-                style::OSD_BG
+                style::osd_bg()
             };
             p.icon_button(
                 &widget::IconButton::new(rect, widget::IconButton::ICON_PX, bg),
@@ -4430,7 +4430,7 @@ pub struct Countdown {
 struct CountdownCache {
     seconds: u64,
     scale: f64,
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     texture: Option<TextureBuffer<VkTexture>>,
 }
 
@@ -4450,7 +4450,7 @@ impl Countdown {
         }
 
         let scale = output.current_scale().fractional_scale();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         {
             let cache = self.cache.borrow();
             if cache.texture.is_none()
@@ -4507,7 +4507,7 @@ fn generate_countdown(
     let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
         p.clear(style::TRANSPARENT)?;
-        p.fill_rounded_full(COUNTDOWN_RADIUS, style::OSD_BG)?;
+        p.fill_rounded_full(COUNTDOWN_RADIUS, style::osd_bg())?;
         p.stroke_rounded_full(COUNTDOWN_RADIUS, 1., PANEL_BORDER_COLOR)?;
         p.text(
             &label,

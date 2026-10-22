@@ -25,6 +25,7 @@ pub mod dbusmenu;
 pub mod draw_ledger;
 pub mod emoji;
 pub mod end_session;
+pub mod focus_caret_tracker;
 pub mod frame_clock;
 pub mod frame_log;
 pub mod gnome;
@@ -37,6 +38,7 @@ pub mod ipc;
 pub mod keyboard_layout;
 pub mod layer;
 pub mod layout;
+pub mod magnifier;
 pub mod monitors_xml;
 pub mod mpris;
 pub mod network_model;
@@ -44,6 +46,7 @@ pub mod network_secret;
 /// The network secret dialog's state machine, answering the NetworkManager agent.
 pub mod network_secret_dialog;
 pub mod notifications;
+pub mod osk;
 pub mod output_identity;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;

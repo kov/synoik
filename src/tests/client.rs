@@ -160,6 +160,8 @@ pub struct State {
     /// swallows still has to leave the client's modifier state correct, and the key events alone
     /// cannot show that.
     pub mods_events: Vec<u32>,
+    /// Every `wl_keyboard.modifiers` as `(depressed, latched, locked)`.
+    pub modifier_events: Vec<(u32, u32, u32)>,
     /// `wl_keyboard.enter` / `.leave` received, in order. A client repaints on these — Firefox's
     /// CSD chrome posts a whole-window `wl_shm` buffer on each — so *when* they arrive relative to
     /// an animation is a cost, not just a notification.
@@ -403,6 +405,22 @@ impl Client {
         ti.commit();
     }
 
+    /// `enable` with the field's state in the same commit, as GTK sends it: the content type and
+    /// the surrounding text.
+    pub fn enable_text_input_with(
+        &mut self,
+        hint: zwp_text_input_v3::ContentHint,
+        purpose: zwp_text_input_v3::ContentPurpose,
+        text: &str,
+        cursor: i32,
+    ) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.enable();
+        ti.set_surrounding_text(text.to_owned(), cursor, cursor);
+        ti.set_content_type(hint, purpose);
+        ti.commit();
+    }
+
     /// Declare what kind of field the caret is in — a password entry, say.
     pub fn set_content_type(
         &mut self,
@@ -471,6 +489,7 @@ impl Client {
             hold_gesture: None,
             pointer_events: Vec::new(),
             mods_events: Vec::new(),
+            modifier_events: Vec::new(),
             focus_events: Vec::new(),
             session_manager: None,
             session_events: Vec::new(),
@@ -705,8 +724,8 @@ impl Client {
         self.state.keyboard = Some(seat.get_keyboard(&self.qh, ()));
     }
 
-    /// Start receiving `wl_pointer` scroll events and `zwp_pointer_gesture_hold_v1` events;
-    /// they accumulate in [`take_pointer_events`].
+    /// Start receiving `wl_pointer` scroll and button events and `zwp_pointer_gesture_hold_v1`
+    /// events; they accumulate in [`take_pointer_events`].
     ///
     /// [`take_pointer_events`]: Self::take_pointer_events
     pub fn get_pointer(&mut self) {
@@ -735,6 +754,11 @@ impl Client {
     /// The `mods_depressed` masks from every `wl_keyboard.modifiers` since the last take.
     pub fn take_mods_events(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.state.mods_events)
+    }
+
+    /// Every `wl_keyboard.modifiers` since the last take, as `(depressed, latched, locked)`.
+    pub fn take_modifier_events(&mut self) -> Vec<(u32, u32, u32)> {
+        std::mem::take(&mut self.state.modifier_events)
     }
 
     /// Drain the `wl_keyboard.enter` / `.leave` events received so far, in order.
@@ -1918,10 +1942,22 @@ impl Dispatch<WlSeat, ()> for State {
 pub enum PointerEvent {
     Enter,
     AxisSource(wl_pointer::AxisSource),
-    Axis { axis: wl_pointer::Axis, value: f64 },
+    Axis {
+        axis: wl_pointer::Axis,
+        value: f64,
+    },
     AxisStop(wl_pointer::Axis),
-    HoldBegin { fingers: u32 },
-    HoldEnd { cancelled: bool },
+    HoldBegin {
+        fingers: u32,
+    },
+    HoldEnd {
+        cancelled: bool,
+    },
+    /// `wl_pointer.button`: the evdev button and whether it went down.
+    Button {
+        button: u32,
+        pressed: bool,
+    },
 }
 
 impl Dispatch<WlPointer, ()> for State {
@@ -1945,6 +1981,10 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::AxisStop { axis, .. } => {
                 PointerEvent::AxisStop(axis.into_result().unwrap())
             }
+            wl_pointer::Event::Button { button, state, .. } => PointerEvent::Button {
+                button,
+                pressed: state.into_result().unwrap() == wl_pointer::ButtonState::Pressed,
+            },
             _ => return,
         };
         state.pointer_events.push(event);
@@ -2148,8 +2188,16 @@ impl Dispatch<WlKeyboard, ()> for State {
                     .key_events
                     .push((key, key_state.into_result().unwrap()));
             }
-            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                ..
+            } => {
                 state.mods_events.push(mods_depressed);
+                state
+                    .modifier_events
+                    .push((mods_depressed, mods_latched, mods_locked));
             }
             wl_keyboard::Event::RepeatInfo { .. } => (),
             _ => unreachable!(),

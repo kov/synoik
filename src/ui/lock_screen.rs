@@ -1418,7 +1418,7 @@ impl LockScreen {
         let button = widget::IconButton::new(
             Rectangle::from_size(Size::from((size, size))),
             icon_px,
-            style::SYSTEM_BUTTON_BG,
+            style::system_button_bg(),
         )
         .hovered(hovered);
         let accent_rgb = accent;

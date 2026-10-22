@@ -1,13 +1,13 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 done (the toggle surface); A2's Large Text half and A6's bell done.
-Everything else it toggles is unbuilt.**
+**Status: A1 (the toggle surface), A2, A3, A4, A5, A6, A7 and A9 done — A5 without its word
+suggestions, which wait on the IBus panel; A8 (our own UI readable by a screen reader) is
+unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
-panel for a feature we have not built**. Turning on Zoom, Screen Reader, Screen Keyboard,
-Visual Alerts or the four keyboard filters currently does nothing at all, because every one
-of them is a subsystem the compositor owes and none of them exist here yet. Treating the
+panel for features we had not built**. Zoom, Screen Reader and Screen Keyboard still do
+nothing at all, because each is a subsystem the compositor owes and none exists here yet. Treating the
 rest as "more panel work" would badly misjudge the size: each row below is days-to-weeks,
 several are their own protocol surface, and one (§A8) is the part that actually decides
 whether a blind user can use this desktop.
@@ -25,8 +25,8 @@ Accessibility in GNOME is split across three layers, and we own all three:
 | Layer | GNOME | Us |
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
-| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ⬜ §A2, A3, A5 |
-| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ⬜ §A4, A6, A7 |
+| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2, A3, A5 |
+| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
 ---
@@ -37,7 +37,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 The `ATIndicator` indicator + menu. Writes the canonical keys; consumes none of them.
 See `panel-status-port.md` R4.
 
-### A2 — High Contrast + Large Text in our own chrome
+### A2 — High Contrast + Large Text in our own chrome ✅
 The two rows that already do *something* today, because GTK apps read the keys directly —
 but our shell chrome ignores both, so the panel and popovers stay identical while every app
 changes. GNOME routes both through `StSettings`:
@@ -45,37 +45,114 @@ changes. GNOME routes both through `StSettings`:
   shell reloads a **separate stylesheet variant** on it — `_getStylesheet(name.replace('.css',
   '-high-contrast.css'))` (`js/ui/main.js:461-463`), re-run from
   `St.Settings.get().connect('notify::high-contrast', _loadDefaultStylesheet)` (`main.js:176`).
-  For us that is a second theme in the widget layer, not a filter — it lands naturally on the
-  cssparser cascade ([[widget-layer]] slice B1) and should probably wait for it.
+  ✅ Ours is one process-wide switch (`crate::ui::high_contrast`, published with the base font
+  by `GnomeSettings::publish_style`) that the palette in `widget::style` reads: the values the
+  high-contrast sheet moves are functions there, and `Painter::hc_inset` draws its 1px
+  `$hc_inset_color` outline inside buttons, entries, cards, quick toggles and icon buttons.
+  Shadows go and the overview plate stays dark. Values come from compiling both sheets with
+  `sassc` and diffing them per selector. A surface that keeps a hand-picked local colour
+  rather than a `widget::style` one does not follow it yet; the cascade
+  ([[widget-layer]] B1) is what makes that impossible to miss.
 - ✅ `text-scaling-factor` multiplies the realized base font
   (`GnomeSettings::realized_base_font_pt`). mutter folds the factor into the font DPI
   (`meta-settings.c:184-199`) and St scales every `pt` and `em` length by it, not `px`
   (`st-theme-node.c:1350-1373`) — the same set our base drives through `pt_to_px`, `em` and
   `scaled_px`.
 
-High Contrast is the remaining half of A2.
+### A3 — Magnifier (the Zoom row) ✅
+`src/magnifier.rs`, a port of `Magnifier` and `ZoomRegion` (`js/ui/magnifier.js`), on from
+`screen-magnifier-enabled` and configured by `org.gnome.desktop.a11y.magnifier`:
+- **The zoom region**: `mag-factor` (a change eased over 100 ms), the five `screen-position`s
+  with the region's 2px accent border off full screen, `lens-mode`, `scroll-at-edges`, and
+  proportional / push / centred `mouse-tracking`. The frame a display would draw is rendered into
+  an offscreen and drawn rescaled and cropped to the view, over `SystemBackground`'s colour.
+- **The pointer** stays where it is, and so do clicks; it is drawn magnified where the zoom puts
+  it, never on a cursor plane (`render_helpers::off_plane`), and the system pointer hides over the
+  view. Under a nested session the pointer goes in the frame on a magnified display.
+- **Crosshairs** and the **colour effects** (`invert-lightness`, `color-saturation`, per-channel
+  `brightness-*` / `contrast-*`) — the effects in one pass of `mag_effects.frag`, in the order
+  Clutter stacks them, over a second offscreen of the region only while one is on.
+- **Focus and caret tracking** (`src/focus_caret_tracker.rs`): an AT-SPI client over plain zbus
+  that registers the focus and caret events with the registry while the zoom wants them and asks
+  the emitting widget for its extents, as `FocusCaretTracker` and `_convertExtentsToScreenSpace`
+  do. GTK4's text view emits no caret move as you type, only on navigation, so typing alone does
+  not move the view — in GNOME either.
+- The shortcuts (`<Alt><Super>8`, `<Alt><Super>equal`/`minus`) are gsd-media-keys', through our
+  accelerator grabs.
 
-### A3 — Magnifier (the Zoom row)
-`org.gnome.desktop.a11y.magnifier` (`js/ui/magnifier.js:25`), `Magnifier`
-(`magnifier.js:131`). Shell-internal in GNOME: a zoom region composited over the stage, with
-mouse/focus/caret tracking, lens vs full-screen modes, crosshairs, brightness/contrast/
-saturation filters and colour-blindness modes (the schema has ~30 keys — `brightness-*`,
-`contrast-*`, `color-saturation`, `caret-tracking`, …). For us it is a render-path feature on
-the owned Vulkan renderer, which makes it cheaper than GNOME's but not small. `StSettings`
-also exposes `magnifier-active` (`st-settings.c:388-392`), which other chrome reads.
+**Divergence: one region per display.** GNOME's region magnifies the whole stage as one surface;
+here each display magnifies its own content, the one under the pointer following it and the others
+keeping their last view.
 
-### A4 — Keyboard filters (Sticky / Slow / Bounce / Mouse Keys)
-Compositor-side, and **not** something libinput does for us: mutter implements the state
-machines itself in `src/backends/native/meta-keyboard-a11y.c`, fed from
-`org.gnome.desktop.a11y.keyboard` through `meta-input-settings.c:1297-1305` (which maps each
-key to a `META_A11Y_*` flag, including the beep variants we don't surface). Sticky Keys also
-needs the modifier-latch feedback GNOME shows. Mouse Keys turns the numpad into a pointer.
-This is a self-contained input-path slice against our own seat handling.
+### A4 — Keyboard filters (Sticky / Slow / Bounce / Mouse Keys) ✅
+`src/input/keyboard_a11y.rs`, a port of mutter's `src/backends/native/meta-keyboard-a11y.c`, fed
+from `org.gnome.desktop.a11y.keyboard` as `meta-input-settings.c:1291-1340` reads it. libinput
+reports keys untouched and xkbcommon has no AccessX, so the filters are the compositor's own,
+between the device and the keymap:
+- **Sticky Keys**: a modifier tapped alone latches onto the next key, tapped twice locks, again
+  unlocks; a chord stays a chord; `stickykeys-two-key-off` turns it off on two modifiers at once.
+  The latch lives in the xkb state, so clients and our keybindings see it — which needs
+  `XkbContext::set_latched_and_locked_mods` from our smithay fork.
+- **Slow Keys**, **Bounce Keys**, **Toggle Keys**, and **Mouse Keys** (keypad drives the pointer
+  with Num Lock off, mutter's acceleration curve).
+- **The `enable` shortcuts**: Shift ×5 toggles Sticky Keys, Shift held 8 s toggles Slow Keys,
+  each writing its key back so the menu row follows.
+- Every beep variant, each the system bell (`meta_bell_notify (display, NULL)`, A6).
 
-### A5 — On-screen keyboard (the Screen Keyboard row)
-`screen-keyboard-enabled` (`js/ui/keyboard.js:25`), `Keyboard` (`keyboard.js:1174`) — a full
-shell-side OSK with layouts, suggestions and input-method integration. Already on the roadmap
-independently (STRATEGY §6 Phase 3, "OSK"); the a11y row is just another way to enable it.
+**Divergence:** mutter filters after the key has updated the xkb state, so a Shift that Slow
+Keys holds back still reaches the modifiers clients see. Ours filters before the keymap: a
+swallowed key changes nothing, and an accepted slow key is delivered when accepted.
+
+gnome-shell shows no latched-modifier indicator (mutter's `kbd-a11y-mods-state-changed` has no
+listener). What it does show is `KbdA11yDialog` (`js/ui/kbdA11yDialog.js`), the "Sticky Keys
+Turned On" confirmation after a shortcut (Shift ×5, Shift held, two-key-off) and never after a
+settings change: `ui/kbd_a11y_dialog.rs`, on the shared `ui/message_dialog.rs`. It answers over the
+lock screen too, since the shortcuts work there. `timeout-enable` /
+`disable-timeout` are read by mutter and acted on nowhere.
+
+### A5 — On-screen keyboard (the Screen Keyboard row) ✅
+`src/osk/` (model) and `src/ui/osk.rs` (drawing, hit-testing), a port of `js/ui/keyboard.js`:
+- **When it exists**: `screen-keyboard-enabled`, or touch mode with a touchscreen as the last
+  device (`KeyboardManager._syncEnabled`; mutter's `update_touch_mode`).
+- **When it shows**: a client re-enabling its text input while it already holds the input method
+  (mutter's `enable_panel_v1` — GTK does it on a click), one of our entries taking the key focus,
+  or a touch dragged up from the bottom edge (`ShellEdgeDragGesture`). It goes on the input
+  method's focus-out, its hide key, or the focused window moving. Rest, slide and hide-panel
+  timings are gnome-shell's.
+- **Layouts** are gnome-shell's JSON models (`resources/osk-layouts`), with its purpose layouts,
+  `-extended` for terminals and its group fallbacks. Levels, shift-once, the long-press latch,
+  latching Ctrl/Alt, auto-capitalisation and title case from the surrounding text.
+- **Keys**: a string goes in through the input method's commit when a field has it, otherwise
+  as virtual key presses through the real pipeline (keyboard filters included) with Shift/AltGr
+  held for the level, in mutter's order. A long press opens the key's other strings in a box
+  pointer; the globe key the input sources (`LanguageSelectionPopup`); the emoji key the emoji
+  page (sections, pages, a swipe or touchpad scroll between them, skin tones on long press).
+- **The focused window** slides up out of the keyboard's way when the caret would be under it,
+  and back after (`setCursorLocation`, `_animateWindow`).
+- Drawn over the shell's chrome, the shield and dialogs included (`addTopChrome`), under only
+  the pointer and its own popups; over the dock, whose edge reveal it holds off (decision:
+  keyboard over dock).
+
+**Not built: word suggestions.** gnome-shell fills the row from the IBus panel service's lookup
+table (`ibusCandidatePopup.js:290-335`); we run `ibus-daemon --panel disable` as it does but have
+no panel service, so neither the suggestions nor the desktop candidate popup exist. Porting the
+panel service is its own slice.
+
+**Divergences:**
+- Delete holds BackSpace (a virtual key) rather than asking the input method to delete the
+  surrounding text.
+- It goes on the primary display, always (`keyboardIndex = primaryIndex`), the edge drag
+  included; gnome-shell opens a drag's keyboard on the display it came from.
+- An IBus source's keys follow `us`: without the engine's description its xkb layout is unknown.
+- The language menu takes no keys, as gnome-shell's does not, but it holds the click grab as any
+  of our popovers does: a click elsewhere, the keyboard included, only closes it.
+- Closing the keyboard forgets the caret, so reopening at the same caret moves the window out of
+  the way again; gnome-shell's focus tracker keeps the last caret and does not.
+- The edge drag only claims the edge while there is a keyboard to pull; gnome-shell's gesture
+  claims it regardless.
+- The emoji page's long-press variants are the skin tones; gnome-shell groups by name prefix.
+  An emoji commits the table's fully-qualified spelling, without gnome-shell's extra U+FE0F.
+- A slide that the work area's titlebar clamp stops short comes back by as much as it went.
 
 ### A6 — The bell (the Visual Alerts row) ✅
 `src/bell.rs`, a port of mutter's `src/core/bell.c` and the flashes it asks for
@@ -95,17 +172,25 @@ theme's `bell-window-system` (`org.gnome.desktop.sound theme-name`, silenced by 
 PipeWire stream with `media.role = Notification` (canberra's `event` role, so GNOME Settings'
 System Sounds volume applies).
 
-Left out:
-- **The keyboard-a11y bell** (`meta-seat-native.c:350`). It arrives with A4.
+The keyboard filters' beeps (A4) ring this same bell, as `meta_seat_native_bell_notify` does.
 
-### A7 — The a11y D-Bus surface + dwell click
-- mutter exports `org.freedesktop.a11y.KeyboardMonitor` and a `PointerLocator`
-  (`src/backends/meta-a11y-manager.c:86-89,245-336`: grab/ungrab/watch/unwatch keyboard, key
-  grabs, query pointer). This is what Orca drives. Per STRATEGY §3.9, cosmic-comp already
-  serves the keyboard half — worth reading before writing ours.
-- Dwell click is `panel-status-port.md` R3 plus `org.gnome.desktop.a11y.mouse`
-  (`dwell-click-enabled`, `dwell-mode`, `dwell-time`, `secondary-click-*`) — the indicator is
-  panel work but the *behavior* is input work, so it belongs here.
+### A7 — The a11y D-Bus surface and pointer accessibility ✅
+- ✅ `org.freedesktop.a11y.KeyboardMonitor` and `PointerLocator` on `org.freedesktop.a11y.Manager`
+  (`src/dbus/freedesktop_a11y.rs`, mutter's `meta-a11y-manager.c`): watch, grab, the key grabs
+  with the lone-tap/double-press rule for a grabbed modifier (`meta-seat-impl.c:520-568`), and
+  QueryPointer with its one-shot PointerPositionChanged. Only the owner of
+  `org.gnome.Orca.KeyboardMonitor` may call either, as in mutter; anyone else gets AccessDenied.
+  **Divergence:** QueryPointer always names a window by pid. mutter names its AT-SPI bus name
+  and path when GTK sent them over gtk-shell v7, and we serve v1 (`src/protocols/gtk_shell.rs`
+  says why).
+- ✅ Simulated secondary click and dwell click (`src/input/pointer_a11y.rs`, clutter's
+  `clutter-input-pointer-a11y.c`), fed from `org.gnome.desktop.a11y.mouse`; the countdown pie
+  at the pointer (`pointerA11yTimeout.js`, drawn by `sdf_pie.frag`) with the crosshair during a
+  gesture; and the panel's `dwellClick` indicator (`src/ui/dwell_click_menu.rs`). mutter's
+  gesture directions are kept as written: a stroke to the right reads as `left`.
+  **Divergence:** the crosshair goes whenever a dwell timeout stops. mutter reports a gesture cut
+  short as a dwell stopping, gnome-shell keeps the crosshair, and it stays until the next
+  gesture runs out.
 
 ### A8 — Our own UI is actually accessible (AT-SPI / AccessKit)
 **The one that matters most, and the one nothing above delivers.** Every slice up to here is
@@ -120,20 +205,20 @@ name and a bounding box, which is a toolkit-wide change and the reason this is a
 rather than a slice. **The Screen Reader row in A1 is a lie until this exists** — it enables
 Orca, and Orca then finds nothing to read in the shell.
 
-### A9 — Screen reader launch
-`screen-reader-enabled` starts Orca in a GNOME session (gsd/session-side, not shell-side). The
-row currently just writes the key; confirm whether anything on this system acts on it, and
-whether we need to do the launching ourselves.
+### A9 — Screen reader launch ✅ (nothing to build)
+gnome-session launches Orca, not the shell. `/etc/xdg/autostart/orca-autostart.desktop` carries
+`AutostartCondition=GSettings org.gnome.desktop.a11y.applications screen-reader-enabled`, and
+gnome-session watches that key: turning the row on starts `orca.service` in the session, and
+turning it off stops it (checked on the harness VM with orca 50.3 and gnome-session 50.1). What
+Orca can *read* is A7 and A8.
 
 ---
 
 ## Suggested order
 
-1. **A2** — High Contrast, the half that makes its shipped switch honest.
-2. **A4** — self-contained input work, no new protocol surface.
-3. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
+1. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-4. **A3**, **A5**, **A7**, **A9** — each independently schedulable.
+2. **The IBus panel service** — the candidate popup, and with it A5's word suggestions.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**

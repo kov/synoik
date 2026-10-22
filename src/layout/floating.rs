@@ -1779,6 +1779,26 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.interactive_resize_end(None);
     }
 
+    /// Move a window vertically by `dy`, eased by `config`, and return how far it actually went
+    /// once the work-area clamp had its say — the on-screen keyboard's slide (`_animateWindow`),
+    /// which has to know it to put the window back. A maximized or fullscreen window is anchored
+    /// and does not move.
+    pub fn slide_y(
+        &mut self,
+        id: &W::Id,
+        dy: f64,
+        config: synoik_config::Animation,
+    ) -> Option<f64> {
+        let idx = self.idx_of(id)?;
+        let prev = self.data[idx].logical_pos;
+        self.data[idx].set_logical_pos(prev + Point::from((0., dy)));
+        let moved = self.data[idx].logical_pos.y - prev.y;
+        if moved != 0. {
+            self.tiles[idx].animate_move_y_from_with_config(-moved, config);
+        }
+        Some(moved)
+    }
+
     fn move_by(&mut self, amount: Point<f64, Logical>) {
         let Some(active_id) = &self.active_window_id else {
             return;

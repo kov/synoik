@@ -1251,6 +1251,13 @@ fn sync_cursor(
     if synoik.config.borrow().debug.disable_cursor_plane {
         return Pointer::InFrame;
     }
+    // On a magnified display the frame draws the pointer magnified where the zoom puts it, and
+    // over the view the system pointer hides (`hideSystemCursor`): the plane stays off.
+    if synoik.magnifier.view(output).is_some()
+        && synoik.output_under_cursor().as_ref() == Some(output)
+    {
+        return Pointer::InFrame;
+    }
     // The plane is in the scanout's orientation: the pointer is turned onto it as the frame is
     // (`OutputDamageTracker`, which renders with the output transform's inverse).
     let transform = output.current_transform().invert();

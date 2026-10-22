@@ -48,8 +48,6 @@ const BASE_PT: f64 = 11.;
 /// Small (description/hint) font size, GNOME `%caption`, GNOME points.
 const SMALL_PT: f64 = 9.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-/// Dialog card background — GNOME modal `$bg_color`; rounded, borderless.
-const BOX_BG: [f32; 4] = widget::style::DIALOG_BG;
 /// Dialog text color (opaque white); the glyph coverage modulates the alpha.
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// gnome-shell's HistoryManager DEFAULT_LIMIT.
@@ -462,7 +460,7 @@ fn paint_dialog(
     // Rounded borderless card: transparent clear so the corners composite away, then the flat
     // fill over the whole content-sized buffer.
     p.clear(widget::style::TRANSPARENT)?;
-    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, widget::style::dialog_bg())?;
     p.paragraph(&prepared.title, prepared.title_origin, TEXT)?;
     p.paragraph(&prepared.description, prepared.description_origin, TEXT)?;
     Ok(())

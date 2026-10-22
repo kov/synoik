@@ -19,7 +19,7 @@ use smithay::backend::input::{
     GestureHoldEndEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent,
     PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
-    TouchSlot, TouchUpEvent, UnusedEvent,
+    TouchMotionEvent, TouchSlot, TouchUpEvent, UnusedEvent,
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
@@ -34,6 +34,7 @@ use crate::utils::get_monotonic_time;
 const XKB_KEYCODE_OFFSET: u32 = 8;
 
 const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTALT: u32 = 100;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
@@ -199,6 +200,31 @@ fn send_button(state: &mut State, button_code: u32, button_state: ButtonState) {
         },
     };
     state.process_input_event(event);
+}
+
+/// Press or release a keysym as a virtual keyboard does (`notify_keyval_in_impl`,
+/// `meta-virtual-input-device-native.c`): the key that produces it in the active layout, with
+/// Shift and/or AltGr for the level it sits on pressed before the key and released after it.
+/// Returns false if no key produces it.
+pub fn send_keysym(state: &mut State, keysym: Keysym, key_state: KeyState) -> bool {
+    let Some((key_code, level)) = find_keysym(state, keysym) else {
+        return false;
+    };
+    let shift = (level & 1 == 1).then(|| Keycode::new(KEY_LEFTSHIFT + XKB_KEYCODE_OFFSET));
+    let altgr = (level >= 2).then(|| Keycode::new(KEY_RIGHTALT + XKB_KEYCODE_OFFSET));
+    let modifiers = [shift, altgr].into_iter().flatten();
+    if key_state == KeyState::Pressed {
+        for modifier in modifiers {
+            send_key(state, modifier, KeyState::Pressed);
+        }
+        send_key(state, key_code, KeyState::Pressed);
+    } else {
+        send_key(state, key_code, KeyState::Released);
+        for modifier in modifiers {
+            send_key(state, modifier, KeyState::Released);
+        }
+    }
+    true
 }
 
 /// Resolves a key given as an XKB keysym name, or as `code:N` for a raw decimal evdev
@@ -532,6 +558,7 @@ impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
 
 pub struct SyntheticTouchDownEvent {
     pub time: u64,
+    pub slot: u32,
     pub x: f64,
     pub y: f64,
 }
@@ -548,7 +575,7 @@ impl Event<SyntheticInputBackend> for SyntheticTouchDownEvent {
 
 impl TouchEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {
     fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
+        TouchSlot::from(Some(self.slot))
     }
 }
 
@@ -572,8 +599,53 @@ impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {
 
 impl TouchDownEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {}
 
+/// A touch point moving.
+pub struct SyntheticTouchMotionEvent {
+    pub time: u64,
+    pub slot: u32,
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl TouchEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn slot(&self) -> TouchSlot {
+        TouchSlot::from(Some(self.slot))
+    }
+}
+
+impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn x(&self) -> f64 {
+        self.x
+    }
+
+    fn y(&self) -> f64 {
+        self.y
+    }
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        self.x
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        self.y
+    }
+}
+
+impl TouchMotionEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {}
+
 pub struct SyntheticTouchUpEvent {
     pub time: u64,
+    pub slot: u32,
 }
 
 impl Event<SyntheticInputBackend> for SyntheticTouchUpEvent {
@@ -588,7 +660,7 @@ impl Event<SyntheticInputBackend> for SyntheticTouchUpEvent {
 
 impl TouchEvent<SyntheticInputBackend> for SyntheticTouchUpEvent {
     fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
+        TouchSlot::from(Some(self.slot))
     }
 }
 
@@ -740,7 +812,7 @@ impl InputBackend for SyntheticInputBackend {
     type TouchDownEvent = SyntheticTouchDownEvent;
     type TouchUpEvent = SyntheticTouchUpEvent;
 
-    type TouchMotionEvent = UnusedEvent;
+    type TouchMotionEvent = SyntheticTouchMotionEvent;
     type TouchCancelEvent = UnusedEvent;
     type TouchFrameEvent = UnusedEvent;
     type TabletToolAxisEvent = UnusedEvent;

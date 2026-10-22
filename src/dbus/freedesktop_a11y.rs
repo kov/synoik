@@ -4,9 +4,21 @@
 // distributed under the GNU General Public License version 3 or later.
 // Modified for synoik in 2026.
 
-// References:
-// - https://invent.kde.org/plasma/kwin/-/blob/397fbbe52a8f2d855ad0c9817b51a9bdf06a68e2/src/a11ykeyboardmonitor.cpp#L41
-// - https://gitlab.gnome.org/GNOME/mutter/-/blob/cbb7295ac1f93a2dfd55a7c0544688e7e5c4d2e2/src/backends/meta-a11y-manager.c
+//! `org.freedesktop.a11y.KeyboardMonitor` — mutter's `meta-a11y-manager.c`, the interface Orca
+//! drives on Wayland to hear keys and to grab its own (the Orca modifier, its commands).
+//!
+//! Only Orca may call it: mutter answers the owner of `org.gnome.Orca.KeyboardMonitor` and denies
+//! everyone else (`meta-a11y-manager.c:409-411`), since a watch is a keylogger and a grab takes
+//! the keyboard. The modifier double-press — a grabbed modifier tapped alone is Orca's, tapped
+//! twice quickly is the key's own — is `is_a11y_modifier_first_click`
+//! (`meta-seat-impl.c:520-568`), which mutter runs before the keymap sees the key.
+//!
+//! `org.freedesktop.a11y.PointerLocator`, on the same object, tells Orca's mouse review what is
+//! under the pointer (`meta_compositor_query_pointer_a11y`, `compositor.c:1690-1772`): the window's
+//! pid and the pointer relative to the surface under it, or the pointer in global coordinates over
+//! our own chrome. **Divergence:** mutter names the window's AT-SPI bus name and object path when
+//! GTK sent them (`gtk_surface1.set_a11y_properties`, gtk-shell v7); we serve gtk-shell v1, so
+//! Orca always gets mutter's fallback, the pid.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,18 +34,32 @@ use zbus::interface;
 use zbus::message::Header;
 use zbus::names::{BusName, OwnedUniqueName, UniqueName};
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::NoneValue;
+use zbus::zvariant::{NoneValue, OwnedValue};
 
 use super::Start;
 use crate::synoik::State;
+
+/// The well-known name whose owner may use the interface (`meta-a11y-manager.c:410-411`).
+const ALLOWED_SENDER: &str = "org.gnome.Orca.KeyboardMonitor";
 
 #[derive(Debug, Default)]
 struct Data {
     clients: HashMap<OwnedUniqueName, Client>,
 
     grabbed_mods: HashSet<Keysym>,
-    grabbed_mod_last_press_time: HashMap<Keysym, Duration>,
+    /// mutter's `grabbed_keypresses`: keys whose press a client grabbed, so their release is too.
     suppressed_keys: HashSet<Keysym>,
+    first_click: FirstClick,
+}
+
+/// `MetaSeatImplPrivate.a11y`: what `is_a11y_modifier_first_click` remembers between keys.
+#[derive(Debug, Default)]
+struct FirstClick {
+    last_keysym: Option<Keysym>,
+    last_time: Duration,
+    saw_first_release: bool,
+    /// Grabbed modifiers whose press was the second of a double press, processed normally.
+    pressed_modifiers: HashSet<Keysym>,
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +74,119 @@ struct Client {
 pub struct KeyboardMonitor {
     data: Arc<Mutex<Data>>,
     iface: Arc<OnceLock<InterfaceRef<Self>>>,
+    /// Served on the same name and object.
+    locator: Option<PointerLocator>,
+}
+
+/// `org.freedesktop.a11y.PointerLocator`.
+#[derive(Clone)]
+pub struct PointerLocator {
+    to_synoik: calloop::channel::Sender<PointerQuery>,
+    /// Who asked since the pointer last moved: each is told once that it moved
+    /// (`query_pointer_requesters`).
+    requesters: Arc<Mutex<HashSet<OwnedUniqueName>>>,
+    iface: Arc<OnceLock<InterfaceRef<Self>>>,
+}
+
+/// A `QueryPointer` on its way to the compositor, with where the answer goes.
+pub struct PointerQuery {
+    pub reply: async_channel::Sender<Option<PointerTarget>>,
+}
+
+/// What is under the pointer, for a `QueryPointer` answer. No target at all is mutter's
+/// `UnknownToplevel`: a window with no pid to name it by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerTarget {
+    /// Our own chrome, or nothing: the pointer in global logical coordinates.
+    Shell { x: f64, y: f64 },
+    /// A window, by its client's pid, and the pointer relative to the surface under it.
+    Window { pid: i32, x: f64, y: f64 },
+}
+
+/// `META_A11Y_ERROR` (`meta-a11y-manager.c:84-99`), and the refusal every method can answer.
+/// Named in full: the derive gives a wrapped `zbus::Error` a name of its own, which would hide
+/// `AccessDenied` from the caller.
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.freedesktop")]
+enum A11yError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    #[zbus(name = "a11y.UnknownToplevel")]
+    UnknownToplevel(String),
+    #[zbus(name = "DBus.Error.AccessDenied")]
+    AccessDenied(String),
+}
+
+#[interface(name = "org.freedesktop.a11y.PointerLocator")]
+impl PointerLocator {
+    // Queries the a11y details about the toplevel beneath the mouse pointer, together with the
+    // relative position of the mouse pointer on the surface. Also schedules one
+    // PointerPositionChanged for the next pointer motion.
+    async fn query_pointer(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(HashMap<String, OwnedValue>, f64, f64), A11yError> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "QueryPointer")
+            .await
+            .map_err(|err| match err {
+                fdo::Error::AccessDenied(message) => A11yError::AccessDenied(message),
+                err => A11yError::ZBus(err.into()),
+            })?;
+        if let Some(sender) = hdr.sender() {
+            self.requesters
+                .lock()
+                .unwrap()
+                .insert(OwnedUniqueName::from(sender.to_owned()));
+        }
+
+        let (reply, answer) = async_channel::bounded(1);
+        let unknown = || A11yError::UnknownToplevel("Cannot get client a11y information".into());
+        if self.to_synoik.send(PointerQuery { reply }).is_err() {
+            return Err(unknown());
+        }
+        match answer.recv().await {
+            Ok(Some(PointerTarget::Shell { x, y })) => Ok((HashMap::new(), x, y)),
+            Ok(Some(PointerTarget::Window { pid, x, y })) => Ok((
+                HashMap::from([("pid".to_owned(), OwnedValue::from(pid))]),
+                x,
+                y,
+            )),
+            _ => Err(unknown()),
+        }
+    }
+
+    // Emitted once to each client that called QueryPointer, at the first pointer motion after.
+    #[zbus(signal)]
+    async fn pointer_position_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+impl PointerLocator {
+    pub fn new(to_synoik: calloop::channel::Sender<PointerQuery>) -> Self {
+        Self {
+            to_synoik,
+            requesters: Arc::default(),
+            iface: Arc::default(),
+        }
+    }
+
+    /// The pointer moved: tell whoever asked since it last did
+    /// (`meta_a11y_manager_maybe_notify_motion`).
+    pub fn pointer_moved(&self) {
+        let requesters = std::mem::take(&mut *self.requesters.lock().unwrap());
+        let Some(iface) = self.iface.get() else {
+            return;
+        };
+        for name in &requesters {
+            let ctxt = iface
+                .signal_emitter()
+                .clone()
+                .set_destination(BusName::Unique(name.as_ref()));
+            if let Err(err) = async_io::block_on(PointerLocator::pointer_position_changed(&ctxt)) {
+                warn!("error emitting PointerPositionChanged: {err:?}");
+            }
+        }
+    }
 }
 
 /// Keyboard monitor key block reason.
@@ -74,7 +213,12 @@ impl KeyboardMonitor {
     //
     // This behavior stays in effect until the same client calls UngrabKeyboard or closes its D-Bus
     // connection.
-    async fn grab_keyboard(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+    async fn grab_keyboard(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "GrabKeyboard").await?;
         let Some(sender) = hdr.sender() else {
             return Err(fdo::Error::Failed("no sender".to_owned()));
         };
@@ -94,7 +238,12 @@ impl KeyboardMonitor {
     // After calling this method, the key grabs specified in the last call to SetKeyGrabs, if any,
     // are still in effect. Also, the client will still receive key events through the KeyEvent
     // signal, if it has called WatchKeyboard.
-    async fn ungrab_keyboard(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+    async fn ungrab_keyboard(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "UngrabKeyboard").await?;
         let Some(sender) = hdr.sender() else {
             return Err(fdo::Error::Failed("no sender".to_owned()));
         };
@@ -115,7 +264,12 @@ impl KeyboardMonitor {
     //
     // This behavior stays in effect until the same client calls UnwatchKeyboard or closes its D-Bus
     // connection.
-    async fn watch_keyboard(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+    async fn watch_keyboard(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "WatchKeyboard").await?;
         let Some(sender) = hdr.sender() else {
             return Err(fdo::Error::Failed("no sender".to_owned()));
         };
@@ -134,7 +288,12 @@ impl KeyboardMonitor {
     //
     // After calling this method, the key grabs specified in the last call to SetKeyGrabs, if any,
     // are still in effect, but other key events are no longer reported to this client.
-    async fn unwatch_keyboard(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+    async fn unwatch_keyboard(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "UnwatchKeyboard").await?;
         let Some(sender) = hdr.sender() else {
             return Err(fdo::Error::Failed("no sender".to_owned()));
         };
@@ -171,9 +330,11 @@ impl KeyboardMonitor {
     async fn set_key_grabs(
         &self,
         #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         modifiers: Vec<u32>,
         keystrokes: Vec<(u32, u32)>,
     ) -> fdo::Result<()> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "SetKeyGrabs").await?;
         let Some(sender) = hdr.sender() else {
             return Err(fdo::Error::Failed("no sender".to_owned()));
         };
@@ -215,7 +376,18 @@ impl KeyboardMonitor {
         Self {
             data: Arc::new(Mutex::new(Data::default())),
             iface: Arc::new(OnceLock::new()),
+            locator: None,
         }
+    }
+
+    /// Serve `locator` beside the monitor.
+    pub fn with_pointer_locator(mut self, locator: PointerLocator) -> Self {
+        self.locator = Some(locator);
+        self
+    }
+
+    pub fn pointer_locator(&self) -> Option<&PointerLocator> {
+        self.locator.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -231,96 +403,143 @@ impl KeyboardMonitor {
     ) -> KbMonBlock {
         let _span = tracy_client::span!("KeyboardMonitor::process_key");
 
-        let mut ctxt = self.iface.get().unwrap().signal_emitter().clone();
+        let (block, notify) =
+            self.data
+                .lock()
+                .unwrap()
+                .process(repeat_delay, time, released, mods, keysym);
 
+        // No interface until the bus connection is up (and never in tests): nobody to tell.
+        let Some(iface) = self.iface.get() else {
+            return block;
+        };
+        for name in &notify {
+            let _span = tracy_client::span!("emitting key event");
+
+            // Emit to that client only.
+            let ctxt = iface
+                .signal_emitter()
+                .clone()
+                .set_destination(BusName::Unique(name.as_ref()));
+            let ctxt = &ctxt;
+            async_io::block_on(async move {
+                if let Err(err) = KeyboardMonitor::key_event(
+                    ctxt,
+                    released,
+                    mods,
+                    keysym.raw(),
+                    unichar,
+                    keycode.raw() as u16,
+                )
+                .await
+                {
+                    warn!("error emitting key_event: {err:?}");
+                }
+            });
+        }
+        block
+    }
+
+    /// Set `client`'s requests as its D-Bus calls would, for tests that drive keys through the
+    /// compositor without a bus.
+    #[cfg(test)]
+    pub fn set_client(&self, client: &str, grab_all: bool, modifiers: &[Keysym]) {
         let mut data = self.data.lock().unwrap();
-
-        // Emit key events as necessary.
-        for (name, client) in &data.clients {
-            if client.should_watch_keypress(&data.suppressed_keys, mods, keysym) {
-                let _span = tracy_client::span!("emitting key event");
-
-                // Emit to that client only.
-                ctxt = ctxt.set_destination(BusName::Unique(name.as_ref()));
-                let ctxt = &ctxt;
-                async_io::block_on(async move {
-                    if let Err(err) = KeyboardMonitor::key_event(
-                        ctxt,
-                        released,
-                        mods,
-                        keysym.raw(),
-                        unichar,
-                        keycode.raw() as u16,
-                    )
-                    .await
-                    {
-                        warn!("error emitting key_event: {err:?}");
-                    }
-                });
-            }
-        }
-
-        // Check for double-pressed grabbed modifier that should not be captured.
-        if data.grabbed_mods.contains(&keysym) {
-            if released {
-                // If missing from suppressed keys, then this is a release corresponding to the
-                // second press that got handled normally.
-                if !data.suppressed_keys.contains(&keysym) {
-                    trace!("handling release for second press of grabbed modifier: {keysym:?}");
-                    return KbMonBlock::Pass;
-                }
-            } else {
-                let last_press_entry = data
-                    .grabbed_mod_last_press_time
-                    .entry(keysym)
-                    .or_insert(Duration::ZERO);
-                let last_press = *last_press_entry;
-                *last_press_entry = time;
-
-                // Modifier pressed twice; handle it as normal.
-                if time <= last_press.saturating_add(repeat_delay) {
-                    trace!("handling second press of grabbed modifier: {keysym:?}");
-                    return KbMonBlock::Pass;
-                }
-            }
-        }
-
-        let mut block = false;
-
-        if released {
-            // This is a release for a key that was grabbed.
-            if data.suppressed_keys.remove(&keysym) {
-                trace!("blocking release for previously suppressed key: {keysym:?}");
-                block = true;
-            }
-        } else if data.suppressed_keys.contains(&keysym) {
-            // Second press for an already-pressed key, e.g. from two keyboards.
-            trace!("blocking press for already-pressed key: {keysym:?}");
-            block = true;
-        } else {
-            // Check if it's grabbed by any client.
-            if data
-                .clients
-                .values()
-                .any(|client| client.should_grab_keypress(&data.suppressed_keys, mods, keysym))
-            {
-                trace!("blocking press for grabbed key: {keysym:?}");
-                data.suppressed_keys.insert(keysym);
-                block = true;
-            }
-        }
-
-        if !block {
-            KbMonBlock::Pass
-        } else if data.grabbed_mods.contains(&keysym) {
-            KbMonBlock::ModifierFirstPress
-        } else {
-            KbMonBlock::Block
-        }
+        let name = OwnedUniqueName::try_from(client).unwrap();
+        let entry = data.clients.entry(name).or_default();
+        entry.grabbed = grab_all;
+        entry.modifiers = modifiers.iter().copied().collect();
+        data.rebuild_grabbed_mods();
     }
 }
 
 impl Data {
+    /// `meta_a11y_manager_notify_clients` (`meta-a11y-manager.c:614-679`), with the first-click
+    /// test mutter runs before it: whether the compositor handles the key, and which clients hear
+    /// of it.
+    fn process(
+        &mut self,
+        repeat_delay: Duration,
+        time: Duration,
+        released: bool,
+        mods: u32,
+        keysym: Keysym,
+    ) -> (KbMonBlock, Vec<OwnedUniqueName>) {
+        let first_click = self.is_modifier_first_click(keysym, time, released, repeat_delay);
+
+        let notify = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.should_watch_keypress(&self.suppressed_keys, mods, keysym))
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // The second press of a double press, and its release, are the key's own.
+        if self.grabbed_mods.contains(&keysym) && !first_click {
+            return (KbMonBlock::Pass, notify);
+        }
+
+        let mut grabbed;
+        if released {
+            grabbed = self.suppressed_keys.remove(&keysym);
+        } else {
+            grabbed = self.suppressed_keys.contains(&keysym);
+            if self
+                .clients
+                .values()
+                .any(|client| client.should_grab_keypress(&self.suppressed_keys, mods, keysym))
+            {
+                self.suppressed_keys.insert(keysym);
+                grabbed = true;
+            }
+        }
+
+        let block = if first_click {
+            // Never seen by the keymap: a lone Orca-modifier tap must not toggle Caps Lock.
+            KbMonBlock::ModifierFirstPress
+        } else if grabbed {
+            KbMonBlock::Block
+        } else {
+            KbMonBlock::Pass
+        };
+        (block, notify)
+    }
+
+    /// `is_a11y_modifier_first_click` (`meta-seat-impl.c:520-568`): whether this event of a
+    /// grabbed modifier is part of a lone tap, which the client takes, rather than the second press
+    /// of a double press inside the repeat delay, which goes through.
+    fn is_modifier_first_click(
+        &mut self,
+        keysym: Keysym,
+        time: Duration,
+        released: bool,
+        repeat_delay: Duration,
+    ) -> bool {
+        let state = &mut self.first_click;
+        let same_keysym = state.last_keysym == Some(keysym);
+        let soon_enough = time.saturating_sub(state.last_time) < repeat_delay;
+        state.last_keysym = Some(keysym);
+        state.last_time = time;
+
+        if !self.grabbed_mods.contains(&keysym) {
+            return false;
+        }
+        if released && state.pressed_modifiers.remove(&keysym) {
+            return false;
+        }
+        if same_keysym && soon_enough {
+            if !released && state.saw_first_release {
+                state.saw_first_release = false;
+                state.pressed_modifiers.insert(keysym);
+                return false;
+            }
+            state.saw_first_release = true;
+            return true;
+        }
+        state.saw_first_release = false;
+        true
+    }
+
     fn rebuild_grabbed_mods(&mut self) {
         self.grabbed_mods.clear();
         for client in self.clients.values() {
@@ -427,6 +646,15 @@ impl Start for KeyboardMonitor {
             .interface("/org/freedesktop/a11y/Manager")?;
         let _ = self.iface.set(iface);
 
+        if let Some(locator) = &self.locator {
+            conn.object_server()
+                .at("/org/freedesktop/a11y/Manager", locator.clone())?;
+            let iface = conn
+                .object_server()
+                .interface("/org/freedesktop/a11y/Manager")?;
+            let _ = locator.iface.set(iface);
+        }
+
         let async_conn = conn.inner().clone();
         let future = async move {
             if let Err(err) = monitor_disappeared_clients(&async_conn, data.clone()).await {
@@ -453,6 +681,39 @@ impl Start for KeyboardMonitor {
 }
 
 impl State {
+    /// A `QueryPointer`: what is under the pointer (`meta_compositor_query_pointer_a11y`).
+    pub fn on_pointer_query(&mut self, query: PointerQuery) {
+        let _ = query.reply.send_blocking(self.pointer_target());
+    }
+
+    pub(crate) fn pointer_target(&mut self) -> Option<PointerTarget> {
+        let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+        let contents = self.synoik.contents_under(pos);
+        let (Some(_), Some((surface, loc))) = (&contents.window, &contents.surface) else {
+            // Our own chrome — the panel, the overview, a layer surface — and nothing at all
+            // are the shell's.
+            return Some(PointerTarget::Shell { x: pos.x, y: pos.y });
+        };
+        let pid = crate::utils::get_credentials_for_surface(surface)?.pid;
+        Some(PointerTarget::Window {
+            pid,
+            x: pos.x - loc.x,
+            y: pos.y - loc.y,
+        })
+    }
+
+    /// The pointer moved: the PointerLocator's callers want to hear it once.
+    pub fn a11y_pointer_moved(&self) {
+        if let Some(locator) = self
+            .synoik
+            .a11y_keyboard_monitor
+            .as_ref()
+            .and_then(KeyboardMonitor::pointer_locator)
+        {
+            locator.pointer_moved();
+        }
+    }
+
     pub fn a11y_process_key(
         &mut self,
         time: Duration,
@@ -485,5 +746,78 @@ impl State {
             return KbMonBlock::Pass;
         };
         monitor.process_key(repeat_delay, time, keycode, released, mods, keysym, unichar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DELAY: Duration = Duration::from_millis(500);
+
+    fn data(grab_all: bool, watch: bool, modifiers: &[Keysym]) -> Data {
+        let mut data = Data::default();
+        let client = data
+            .clients
+            .entry(OwnedUniqueName::try_from(":1.7").unwrap())
+            .or_default();
+        client.grabbed = grab_all;
+        client.watched = watch;
+        client.modifiers = modifiers.iter().copied().collect();
+        data.rebuild_grabbed_mods();
+        data
+    }
+
+    fn key(data: &mut Data, ms: u64, keysym: Keysym, released: bool) -> (KbMonBlock, usize) {
+        let (block, notify) = data.process(DELAY, Duration::from_millis(ms), released, 0, keysym);
+        (block, notify.len())
+    }
+
+    /// A grabbed modifier tapped alone never reaches the keymap; tapped twice inside the repeat
+    /// delay, the second press and its release are the key's own; too slow, both are lone taps.
+    /// The client hears every one of them.
+    #[test]
+    fn a_grabbed_modifier_is_the_clients_unless_double_pressed() {
+        use KbMonBlock::*;
+        let caps = Keysym::Caps_Lock;
+        let mut d = data(false, false, &[caps]);
+        assert_eq!(key(&mut d, 0, caps, false), (ModifierFirstPress, 1));
+        assert_eq!(key(&mut d, 50, caps, true), (ModifierFirstPress, 1));
+        assert_eq!(key(&mut d, 100, caps, false), (Pass, 1));
+        assert_eq!(key(&mut d, 150, caps, true), (Pass, 1));
+
+        assert_eq!(key(&mut d, 2000, caps, false), (ModifierFirstPress, 1));
+        assert_eq!(key(&mut d, 2050, caps, true), (ModifierFirstPress, 1));
+        assert_eq!(
+            key(&mut d, 3000, caps, false),
+            (ModifierFirstPress, 1),
+            "too slow"
+        );
+        assert_eq!(key(&mut d, 3050, caps, true), (ModifierFirstPress, 1));
+
+        assert_eq!(key(&mut d, 5000, caps, false), (ModifierFirstPress, 1));
+        assert_eq!(
+            key(&mut d, 5050, Keysym::a, false),
+            (Block, 1),
+            "a key under the modifier"
+        );
+        assert_eq!(key(&mut d, 5100, Keysym::a, true), (Block, 1));
+        assert_eq!(key(&mut d, 5150, caps, true), (ModifierFirstPress, 1));
+        assert_eq!(
+            key(&mut d, 5200, Keysym::a, false),
+            (Pass, 0),
+            "and alone, not"
+        );
+    }
+
+    /// A grab takes every key; a watch only listens.
+    #[test]
+    fn a_grab_takes_keys_and_a_watch_hears_them() {
+        let mut grab = data(true, false, &[]);
+        assert_eq!(key(&mut grab, 0, Keysym::a, false), (KbMonBlock::Block, 1));
+        assert_eq!(key(&mut grab, 10, Keysym::a, true), (KbMonBlock::Block, 1));
+        let mut watch = data(false, true, &[]);
+        assert_eq!(key(&mut watch, 0, Keysym::a, false), (KbMonBlock::Pass, 1));
+        assert_eq!(key(&mut watch, 10, Keysym::a, true), (KbMonBlock::Pass, 1));
     }
 }

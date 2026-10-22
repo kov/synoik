@@ -342,7 +342,16 @@ impl DBusServers {
                 dbus.conn_screen_cast = try_start(screen_cast);
             }
 
-            let keyboard_monitor = KeyboardMonitor::new();
+            let (to_niri, from_pointer_locator) = calloop::channel::channel();
+            synoik
+                .event_loop
+                .insert_source(from_pointer_locator, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(query) => state.on_pointer_query(query),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let keyboard_monitor = KeyboardMonitor::new()
+                .with_pointer_locator(freedesktop_a11y::PointerLocator::new(to_niri));
             if let Some(x) = try_start(keyboard_monitor.clone()) {
                 dbus.conn_keyboard_monitor = Some(x);
                 synoik.a11y_keyboard_monitor = Some(keyboard_monitor);

@@ -11,8 +11,8 @@
 //! Every field defaults to `restrictive`'s, the mode a mode inherits what it does not say from.
 
 use crate::ui::panel::{
-    ROLE_A11Y, ROLE_ACTIVITIES, ROLE_APP_INDICATORS, ROLE_DATE_MENU, ROLE_KEYBOARD,
-    ROLE_QUICK_SETTINGS, ROLE_SCREEN_RECORDING,
+    ROLE_A11Y, ROLE_ACTIVITIES, ROLE_APP_INDICATORS, ROLE_DATE_MENU, ROLE_DWELL_CLICK,
+    ROLE_KEYBOARD, ROLE_QUICK_SETTINGS, ROLE_SCREEN_RECORDING,
 };
 
 /// The panel's look in a mode (`panelStyle`).
@@ -67,6 +67,7 @@ pub const USER: SessionMode = SessionMode {
         ROLE_DATE_MENU,
         ROLE_APP_INDICATORS,
         ROLE_SCREEN_RECORDING,
+        ROLE_DWELL_CLICK,
         ROLE_A11Y,
         ROLE_KEYBOARD,
         ROLE_QUICK_SETTINGS,
@@ -79,7 +80,12 @@ pub const USER: SessionMode = SessionMode {
 pub const UNLOCK_DIALOG: SessionMode = SessionMode {
     name: "unlock-dialog",
     is_locked: true,
-    panel_roles: &[ROLE_A11Y, ROLE_KEYBOARD, ROLE_QUICK_SETTINGS],
+    panel_roles: &[
+        ROLE_DWELL_CLICK,
+        ROLE_A11Y,
+        ROLE_KEYBOARD,
+        ROLE_QUICK_SETTINGS,
+    ],
     panel_style: PanelStyle::Transparent,
     ..RESTRICTIVE
 };
@@ -90,7 +96,12 @@ pub const GDM: SessionMode = SessionMode {
     name: "gdm",
     has_notifications: true,
     is_greeter: true,
-    panel_roles: &[ROLE_DATE_MENU, ROLE_KEYBOARD, ROLE_QUICK_SETTINGS],
+    panel_roles: &[
+        ROLE_DATE_MENU,
+        ROLE_DWELL_CLICK,
+        ROLE_KEYBOARD,
+        ROLE_QUICK_SETTINGS,
+    ],
     panel_style: PanelStyle::Transparent,
     ..RESTRICTIVE
 };

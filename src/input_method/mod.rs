@@ -388,6 +388,11 @@ impl InputMethod {
         self.focus
     }
 
+    /// The content type in effect, as `(purpose, hints)` in IBus's enums.
+    pub fn content_type(&self) -> (u32, u32) {
+        self.content_type
+    }
+
     /// Whether the focused *client* has text input enabled.
     pub fn is_enabled(&self) -> bool {
         self.client_enabled
@@ -481,8 +486,12 @@ impl State {
             // Enable and disable no longer focus the engine themselves: they feed `sync_im_focus`,
             // which weighs them against a modal entry of ours that may hold the keyboard.
             TextInputEvent::Enabled => {
+                // Enabling again while it already has the input method is a version-1 client
+                // asking for the on-screen keyboard (`enable_panel_v1`).
+                let already_focused = im.client_enabled && im.focus == ImFocus::Client;
                 im.client_enabled = true;
                 self.sync_im_focus();
+                self.osk_text_input_enabled(already_focused);
             }
             TextInputEvent::Disabled => {
                 im.client_enabled = false;
@@ -507,6 +516,11 @@ impl State {
                         anchor,
                     });
                 }
+                // The keyboard reads it once the whole commit is in: mutter applies a commit's
+                // content type and caret before its surrounding text, and either may ask for it.
+                if im.focus == ImFocus::Client {
+                    self.synoik.osk.surrounding_in_commit = true;
+                }
                 // Keep it regardless: `delete_surrounding_text` comes back in characters and goes
                 // out in bytes, and only this text can convert between them.
                 self.synoik.im_surrounding = Some((text, cursor));
@@ -518,6 +532,7 @@ impl State {
                 if im.focus == ImFocus::Client {
                     im.content_type = (purpose, hints);
                     im.send(ImRequest::ContentType { purpose, hints });
+                    self.sync_osk_group();
                 }
             }
             // Not forwarded to IBus: the engine only needs this to place a candidate popup, which
@@ -530,10 +545,20 @@ impl State {
                     .keyboard_focus
                     .surface()
                     .map(|surface| (surface.clone(), rect));
+                self.osk_cursor_location_changed();
             }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
             // IBus has no matching "end of batch" call.
-            TextInputEvent::Done | TextInputEvent::TextChangeCause(_) => {}
+            TextInputEvent::Done => {
+                if std::mem::take(&mut self.synoik.osk.surrounding_in_commit) {
+                    if let Some((text, cursor)) = self.synoik.im_surrounding.as_ref() {
+                        if self.synoik.osk.surrounding_text_set(text, *cursor as usize) {
+                            self.synoik.queue_redraw_all();
+                        }
+                    }
+                }
+            }
+            TextInputEvent::TextChangeCause(_) => {}
         }
     }
 
@@ -597,7 +622,7 @@ impl State {
     /// The order mirrors the key filter's, because that is what actually decides where a
     /// keystroke lands — deriving it from anything else would let the engine be focused on one
     /// entry while the keys went to another.
-    fn shell_im_entry(&self) -> Option<ShellEntry> {
+    pub(crate) fn shell_im_entry(&self) -> Option<ShellEntry> {
         if self.synoik.shield_is_up() {
             return Some(ShellEntry::Shield);
         }
@@ -1189,25 +1214,7 @@ impl State {
     /// Shell entries come first because they hold the key focus while they are up, which is what
     /// took it from the client in the first place.
     pub fn insert_text(&mut self, text: &str) -> TextInsertion {
-        if text.is_empty() {
-            return TextInsertion::Committed;
-        }
-
-        if let Some(entry) = self.shell_im_entry() {
-            self.commit_into_shell_entry(entry, text);
-            return TextInsertion::Committed;
-        }
-
-        // Asking the same handle the commit goes through, rather than our own view of the
-        // client's state: `client_enabled` is only as fresh as the last `sync_im_focus`, and it
-        // is `None` altogether on a seat with no input method running.
-        let mut active = false;
-        self.synoik
-            .seat
-            .text_input()
-            .with_active_text_input(|_, _| active = true);
-        if active {
-            self.commit_text(text);
+        if text.is_empty() || self.commit_to_text_focus(text) {
             return TextInsertion::Committed;
         }
 
@@ -1222,6 +1229,28 @@ impl State {
         );
         self.synoik.queue_redraw_all();
         TextInsertion::Copied
+    }
+
+    /// Commit `text` into the focused shell entry, else the focused client's text input
+    /// (`Main.inputMethod.commit`). Returns whether either took it.
+    pub fn commit_to_text_focus(&mut self, text: &str) -> bool {
+        if let Some(entry) = self.shell_im_entry() {
+            self.commit_into_shell_entry(entry, text);
+            return true;
+        }
+
+        // Asking the same handle the commit goes through, rather than our own view of the
+        // client's state: `client_enabled` is only as fresh as the last `sync_im_focus`, and it
+        // is `None` altogether on a seat with no input method running.
+        let mut active = false;
+        self.synoik
+            .seat
+            .text_input()
+            .with_active_text_input(|_, _| active = true);
+        if active {
+            self.commit_text(text);
+        }
+        active
     }
 
     /// Send finished text to the focused client.

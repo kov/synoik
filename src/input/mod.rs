@@ -72,6 +72,7 @@ use crate::ui::dash::DashHit;
 use crate::ui::emoji_picker::KeyOutcome as PickerKey;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::folder_dialog::{DialogHit, POPDOWN_DIALOG_MS};
+use crate::ui::message_dialog::MessageDialogKind;
 use crate::ui::overview_search::SearchHit;
 use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
@@ -85,11 +86,13 @@ use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
+pub mod keyboard_a11y;
 pub mod keyboard_window_grab;
 pub mod move_grab;
 pub mod peripherals;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
+pub mod pointer_a11y;
 pub mod pressure;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
@@ -692,15 +695,56 @@ impl State {
             self.synoik.overlay_key_armed = None;
         }
 
+        // `last-device-changed`, for anything but a keyboard.
+        match &event {
+            InputEvent::TouchDown { .. }
+            | InputEvent::TouchMotion { .. }
+            | InputEvent::TouchUp { .. } => self.osk_last_device(true),
+            InputEvent::PointerMotion { .. }
+            | InputEvent::PointerMotionAbsolute { .. }
+            | InputEvent::PointerButton { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TabletToolAxis { .. }
+            | InputEvent::TabletToolTip { .. }
+            | InputEvent::TabletToolProximity { .. }
+            | InputEvent::TabletToolButton { .. }
+            | InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GesturePinchBegin { .. }
+            | InputEvent::GestureHoldBegin { .. } => self.osk_last_device(false),
+            _ => {}
+        }
+
         let mut consumed_by_a11y = false;
         use InputEvent::*;
         match event {
             DeviceAdded { device } => self.on_device_added(device),
             DeviceRemoved { device } => self.on_device_removed(device),
-            Keyboard { event } => self.on_keyboard::<I>(event, &mut consumed_by_a11y),
-            PointerMotion { event } => self.on_pointer_motion::<I>(event),
-            PointerMotionAbsolute { event } => self.on_pointer_motion_absolute::<I>(event),
-            PointerButton { event } => self.on_pointer_button::<I>(event),
+            Keyboard { event } => {
+                let time = Event::time_msec(&event);
+                let (keycode, key_state) = (event.key_code(), event.state());
+                if self.keyboard_a11y_admits(keycode, key_state, time) {
+                    self.on_keyboard::<I>(event, &mut consumed_by_a11y);
+                    self.sticky_keys_after(keycode, key_state == KeyState::Pressed);
+                }
+            }
+            PointerMotion { event } => {
+                self.on_pointer_motion::<I>(event);
+                self.pointer_a11y_motion();
+                self.magnifier_pointer_moved();
+            }
+            PointerMotionAbsolute { event } => {
+                self.on_pointer_motion_absolute::<I>(event);
+                self.pointer_a11y_motion();
+                self.magnifier_pointer_moved();
+            }
+            // After the button: a held primary's release goes out before the secondary click it
+            // turns into, as mutter's queued click follows the event that raised it.
+            PointerButton { event } => {
+                let (button, pressed) =
+                    (event.button_code(), event.state() == ButtonState::Pressed);
+                self.on_pointer_button::<I>(event);
+                self.pointer_a11y_button(button, pressed);
+            }
             PointerAxis { event } => self.on_pointer_axis::<I>(event),
             TabletToolAxis { event } => self.on_tablet_tool_axis::<I>(event),
             TabletToolTip { event } => self.on_tablet_tool_tip::<I>(event),
@@ -775,11 +819,13 @@ impl State {
                 }
 
                 apply_libinput_settings(&self.synoik.config.borrow().input, device);
+                self.sync_touch_mode();
             }
             InputEvent::DeviceRemoved { device } => {
                 self.synoik.touch.remove(device);
                 self.synoik.tablets.remove(device);
                 self.synoik.devices.remove(device);
+                self.sync_touch_mode();
 
                 // Unplugging the last mouse hands workspace actions back to the focused display
                 // rather than leaving them aimed at wherever the cursor was abandoned
@@ -793,6 +839,26 @@ impl State {
             }
             _ => (),
         }
+    }
+
+    /// The seat's devices as mutter's touch mode reads them: a touchscreen, a pointer (a mouse or
+    /// a touchpad), a tablet-mode switch (`meta_seat_impl_add_device`).
+    fn sync_touch_mode(&mut self) {
+        let devices = &self.synoik.devices;
+        let touch_mode = crate::osk::TouchMode {
+            has_touchscreen: devices
+                .iter()
+                .any(|d| d.has_capability(input::DeviceCapability::Touch)),
+            has_pointer: devices
+                .iter()
+                .any(|d| d.has_capability(input::DeviceCapability::Pointer)),
+            has_tablet_switch: devices.iter().any(|d| {
+                d.has_capability(input::DeviceCapability::Switch)
+                    && d.switch_has_switch(input::event::switch::Switch::TabletMode) == Ok(true)
+            }),
+            ..self.synoik.osk.touch_mode()
+        };
+        self.osk_set_touch_mode(touch_mode);
     }
 
     fn on_device_added(&mut self, device: impl Device) {
@@ -1149,19 +1215,17 @@ impl State {
                             pressed,
                             key_repeats,
                         );
-                    // The end-session confirmation counts down: without its keys here nothing
-                    // could cancel it.
-                    } else if this.synoik.end_session_dialog.is_open() {
-                        match this.synoik.end_session_dialog.handle_key(raw, pressed) {
-                            DialogOutcome::Handled => this.synoik.queue_redraw_all(),
-                            DialogOutcome::Confirm => this.confirm_end_session(),
-                            DialogOutcome::Cancel => this.synoik.cancel_end_session(),
-                            DialogOutcome::ToggleUpdates => this.synoik.toggle_install_updates(),
-                        }
-                    // A menu of the panel over the shield takes the keys the entry would — and
-                    // only those: nothing that reaches the desktop's popover branch below (its
-                    // binds, the overlay key) may run behind a lock.
-                    } else if pressed && this.synoik.panel_popover.grabs_input() {
+                    // The end-session confirmation counts down, and the keyboard-accessibility
+                    // one opens from a shortcut that works here too: without their keys here
+                    // nothing could answer them.
+                    } else if this.message_dialog_key(raw, pressed) {
+                        // A menu of the panel over the shield takes the keys the entry would — and
+                        // only those: nothing that reaches the desktop's popover branch below (its
+                        // binds, the overlay key) may run behind a lock.
+                    } else if pressed
+                        && this.synoik.panel_popover.grabs_input()
+                        && this.synoik.panel_popover.takes_key_focus()
+                    {
                         this.synoik.panel_popover.handle_key(raw, mods, pressed);
                         if key_repeats {
                             this.arm_key_repeat(key_code, RepeatKey::Popover { raw, mods: *mods });
@@ -1337,16 +1401,9 @@ impl State {
                     }
                 }
 
-                // The end-session (logout/shutdown/restart) confirmation is modal like the run
-                // dialog: while open, every key goes to it and none reach the clients.
-                if this.synoik.end_session_dialog.is_open() {
-                    match this.synoik.end_session_dialog.handle_key(raw, pressed) {
-                        DialogOutcome::Handled => this.synoik.queue_redraw_all(),
-                        DialogOutcome::Confirm => this.confirm_end_session(),
-                        DialogOutcome::Cancel => this.synoik.cancel_end_session(),
-                        DialogOutcome::ToggleUpdates => this.synoik.toggle_install_updates(),
-                    }
-
+                // The message dialogs (end-session, keyboard accessibility) are modal like the run
+                // dialog: while one is open, every key goes to it and none reach the clients.
+                if this.message_dialog_key(raw, pressed) {
                     if pressed {
                         this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
@@ -1455,7 +1512,11 @@ impl State {
                 // is the hardcoded VT-switch chord (Ctrl+Alt+F1..F12): switching to a text console
                 // must never be blocked by an in-compositor overlay, so let it through to the
                 // backend even while the popover holds the grab.
-                if this.synoik.panel_popover.grabs_input() {
+                // The keyboard's language menu is no modal menu: it takes no keys, and typing goes
+                // on into the field (`LanguageSelectionPopup`'s items do not take focus).
+                if this.synoik.panel_popover.grabs_input()
+                    && this.synoik.panel_popover.takes_key_focus()
+                {
                     #[allow(non_upper_case_globals)]
                     if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
                         modified.raw()
@@ -2494,6 +2555,11 @@ impl State {
                     active,
                 );
             }
+            crate::ui::panel::ROLE_DWELL_CLICK => {
+                self.synoik
+                    .panel_popover
+                    .toggle_dwell_click(output.clone(), anchor);
+            }
             crate::ui::panel::ROLE_A11Y => {
                 let a11y = self.synoik.gnome_settings.a11y;
                 let accent = self.synoik.gnome_settings.accent_color;
@@ -2535,6 +2601,7 @@ impl State {
 
         match action {
             PopoverAction::Consumed => {}
+            PopoverAction::SetDwellClickType(click_type) => self.set_dwell_click_type(click_type),
             PopoverAction::SetDarkStyle(v) => {
                 if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_dark_style(v);
@@ -2570,7 +2637,7 @@ impl State {
                 // and the indicator's *presence* hangs off this state.
                 self.synoik.gnome_settings.a11y.set(toggle, on);
                 // Large Text re-sizes the UI from this same model, so it moves now too.
-                self.synoik.gnome_settings.publish_base_font();
+                self.synoik.gnome_settings.publish_style();
                 self.synoik.panel.set_a11y(self.synoik.gnome_settings.a11y);
                 // The clicked row also closes the menu, but GNOME's `settings.bind` moves
                 // the switch synchronously — so it flips while the menu fades out rather
@@ -6181,6 +6248,14 @@ impl State {
                 self.synoik.queue_redraw_all();
                 true
             }
+            Some(role @ crate::ui::panel::ROLE_DWELL_CLICK) => {
+                if let Some(anchor) = self.synoik.panel.dwell_click_rect(output_w) {
+                    self.open_panel_menu(&output, role, anchor);
+                }
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.synoik.queue_redraw_all();
+                true
+            }
             Some(role @ crate::ui::panel::ROLE_A11Y) => {
                 // Open the accessibility menu, anchored on the indicator
                 // (gnome-shell's `ATIndicator`).
@@ -6479,6 +6554,7 @@ impl State {
         // The emoji picker is not modal — it takes no pointer grab and the window under it keeps
         // its focus — so this only lights the cell or rail tab under the pointer. `pos` is global,
         // which is the space the picker's geometry is in.
+        self.osk_pointer_motion(pos);
         if self.synoik.emoji_picker.pointer_motion(pos) {
             self.synoik.queue_redraw_all();
         }
@@ -6552,6 +6628,9 @@ impl State {
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
+        // Before anything else here, as mutter's `meta_display_handle_event`.
+        self.a11y_pointer_moved();
+
         // We need an output to be able to move the pointer.
         if self.synoik.global_space.outputs().next().is_none() {
             return;
@@ -6740,18 +6819,7 @@ impl State {
             }
         }
 
-        if self.synoik.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
-                let output_size = output_size(output);
-                if self
-                    .synoik
-                    .end_session_dialog
-                    .pointer_motion(output_size, pos_within_output)
-                {
-                    self.synoik.queue_redraw_all();
-                }
-            }
-        }
+        self.message_dialog_motion(new_pos);
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
@@ -6876,6 +6944,8 @@ impl State {
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
+        self.a11y_pointer_moved();
+
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
@@ -6927,18 +6997,7 @@ impl State {
             }
         }
 
-        if self.synoik.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
-                let output_size = output_size(output);
-                if self
-                    .synoik
-                    .end_session_dialog
-                    .pointer_motion(output_size, pos_within_output)
-                {
-                    self.synoik.queue_redraw_all();
-                }
-            }
-        }
+        self.message_dialog_motion(pos);
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
@@ -9015,6 +9074,12 @@ impl State {
 
         let button_state = event.state();
 
+        // The on-screen keyboard is over everything, the shield included, and takes both edges
+        // of a press on it: the release is claimed by `suppressed_buttons` below.
+        if self.osk_pointer_button(button_code, button_state == ButtonState::Pressed) {
+            return;
+        }
+
         // A click while the shield is down raises it. Both edges are swallowed, not just the
         // press: leaking the release alone would give whatever is underneath a button-up it never
         // saw pressed.
@@ -9036,21 +9101,10 @@ impl State {
                     self.synoik.queue_redraw_all();
                     return;
                 }
-                if self.synoik.end_session_dialog.is_open() {
+                if self.synoik.top_message_dialog().is_some() {
                     if button == Some(MouseButton::Left) {
                         if let Some((output, local)) = &under {
-                            match self
-                                .synoik
-                                .end_session_dialog
-                                .pointer_click(output_size(output), *local)
-                            {
-                                DialogOutcome::Handled => {}
-                                DialogOutcome::Confirm => self.confirm_end_session(),
-                                DialogOutcome::Cancel => self.synoik.cancel_end_session(),
-                                DialogOutcome::ToggleUpdates => {
-                                    self.synoik.toggle_install_updates()
-                                }
-                            }
+                            self.message_dialog_click(output_size(output), *local);
                         }
                     }
                     self.synoik.queue_redraw_all();
@@ -9200,23 +9254,14 @@ impl State {
                 }
             }
 
-            // The end-session dialog is modal: a left-click activates the button under the cursor,
+            // The message dialogs are modal: a left-click activates the button under the cursor,
             // and every button is swallowed so nothing reaches the windows behind it.
-            if self.synoik.end_session_dialog.is_open() {
+            if self.synoik.top_message_dialog().is_some() {
                 if button == Some(MouseButton::Left) {
                     let location = pointer.current_location();
                     if let Some((output, pos_within_output)) = self.synoik.output_under(location) {
                         let output_size = output_size(output);
-                        match self
-                            .synoik
-                            .end_session_dialog
-                            .pointer_click(output_size, pos_within_output)
-                        {
-                            DialogOutcome::Handled => {}
-                            DialogOutcome::Confirm => self.confirm_end_session(),
-                            DialogOutcome::Cancel => self.synoik.cancel_end_session(),
-                            DialogOutcome::ToggleUpdates => self.synoik.toggle_install_updates(),
-                        }
+                        self.message_dialog_click(output_size, pos_within_output);
                     }
                 }
 
@@ -9777,6 +9822,17 @@ impl State {
 
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
+
+        // The on-screen keyboard is over everything and takes the scroll there.
+        if self.osk_axis(
+            pointer.current_location(),
+            source != AxisSource::Wheel,
+            event.amount(Axis::Horizontal).unwrap_or(0.),
+            event.amount(Axis::Vertical).unwrap_or(0.),
+            timestamp,
+        ) {
+            return;
+        }
 
         let is_overview_open = self.synoik.layout.is_overview_open();
 
@@ -10580,18 +10636,7 @@ impl State {
             }
         }
 
-        if self.synoik.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
-                let output_size = output_size(output);
-                if self
-                    .synoik
-                    .end_session_dialog
-                    .pointer_motion(output_size, pos_within_output)
-                {
-                    self.synoik.queue_redraw_all();
-                }
-            }
-        }
+        self.message_dialog_motion(pos);
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
@@ -11357,6 +11402,12 @@ impl State {
         };
         let slot = evt.slot();
 
+        // The on-screen keyboard is over everything, and a touch on it is its own.
+        if self.osk_touch_down(crate::osk::touch_id(slot), pos) {
+            return;
+        }
+        self.osk_edge_drag_down(crate::osk::touch_id(slot), pos);
+
         let serial = SERIAL_COUNTER.next_serial();
 
         let under = self.synoik.contents_under(pos);
@@ -11493,6 +11544,14 @@ impl State {
         };
         let slot = evt.slot();
 
+        if self.osk_touch_up(crate::osk::touch_id(slot)) {
+            return;
+        }
+        // A drag the keyboard claimed was already cancelled for the client.
+        if self.osk_edge_drag_up(crate::osk::touch_id(slot)) {
+            return;
+        }
+
         if let Some(up) = self.synoik.screenshot_ui.pointer_up(Some(slot)) {
             self.handle_screenshot_ui_pointer_up(up);
         }
@@ -11515,6 +11574,13 @@ impl State {
             return;
         };
         let slot = evt.slot();
+
+        if self.osk_touch_motion(crate::osk::touch_id(slot), pos) {
+            return;
+        }
+        if self.osk_edge_drag_motion(crate::osk::touch_id(slot), pos) {
+            return;
+        }
 
         if self.handle_screenshot_ui_motion(pos, Some(slot)) {
             self.synoik.queue_redraw_all();
@@ -11548,7 +11614,9 @@ impl State {
         };
         handle.frame(self);
     }
-    fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
+    fn on_touch_cancel<I: InputBackend>(&mut self, evt: I::TouchCancelEvent) {
+        self.osk_edge_drag_up(crate::osk::touch_id(evt.slot()));
+        self.osk_touch_cancel();
         let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
@@ -11559,6 +11627,10 @@ impl State {
         let Some(switch) = evt.switch() else {
             return;
         };
+
+        if switch == Switch::TabletMode {
+            self.osk_set_tablet_mode(evt.state() == SwitchState::On);
+        }
 
         if switch == Switch::Lid {
             let is_closed = evt.state() == SwitchState::On;
@@ -12804,6 +12876,82 @@ pub fn mods_with_binds(
     }
 
     rv
+}
+
+impl State {
+    /// Feed a key to the message dialog on top; whether one was open to take it.
+    fn message_dialog_key(&mut self, raw: Option<Keysym>, pressed: bool) -> bool {
+        match self.synoik.top_message_dialog() {
+            None => return false,
+            Some(MessageDialogKind::EndSession) => {
+                let outcome = self.synoik.end_session_dialog.handle_key(raw, pressed);
+                self.end_session_dialog_outcome(outcome);
+            }
+            Some(MessageDialogKind::KbdA11y) => {
+                if let Some((feature, on)) = self.synoik.kbd_a11y_dialog.handle_key(raw, pressed) {
+                    self.answer_kbd_a11y_dialog(feature, on);
+                }
+            }
+        }
+        self.synoik.queue_redraw_all();
+        true
+    }
+
+    /// The pointer moved to `pos` (global): hovering a message dialog's button focuses it.
+    fn message_dialog_motion(&mut self, pos: Point<f64, Logical>) {
+        let Some(top) = self.synoik.top_message_dialog() else {
+            return;
+        };
+        let Some((output, local)) = self.synoik.output_under(pos) else {
+            return;
+        };
+        let size = output_size(output);
+        let changed = match top {
+            MessageDialogKind::EndSession => {
+                self.synoik.end_session_dialog.pointer_motion(size, local)
+            }
+            MessageDialogKind::KbdA11y => self.synoik.kbd_a11y_dialog.pointer_motion(size, local),
+        };
+        if changed {
+            self.synoik.queue_redraw_all();
+        }
+    }
+
+    /// A left click at `local` on an output of `size`, on the message dialog on top.
+    fn message_dialog_click(&mut self, size: Size<f64, Logical>, local: Point<f64, Logical>) {
+        match self.synoik.top_message_dialog() {
+            None => (),
+            Some(MessageDialogKind::EndSession) => {
+                let outcome = self.synoik.end_session_dialog.pointer_click(size, local);
+                self.end_session_dialog_outcome(outcome);
+            }
+            Some(MessageDialogKind::KbdA11y) => {
+                if let Some((feature, on)) = self.synoik.kbd_a11y_dialog.pointer_click(size, local)
+                {
+                    self.answer_kbd_a11y_dialog(feature, on);
+                }
+            }
+        }
+    }
+
+    fn end_session_dialog_outcome(&mut self, outcome: DialogOutcome) {
+        match outcome {
+            DialogOutcome::Handled => (),
+            DialogOutcome::Confirm => self.confirm_end_session(),
+            DialogOutcome::Cancel => self.synoik.cancel_end_session(),
+            DialogOutcome::ToggleUpdates => self.synoik.toggle_install_updates(),
+        }
+    }
+
+    /// A keyboard-accessibility dialog button: write the key and close (`kbdA11yDialog.js:57-75`).
+    fn answer_kbd_a11y_dialog(
+        &mut self,
+        feature: crate::input::keyboard_a11y::KeyboardA11yFeature,
+        on: bool,
+    ) {
+        self.set_keyboard_a11y_feature(feature, on);
+        self.synoik.kbd_a11y_dialog.hide();
+    }
 }
 
 pub fn mods_with_mouse_binds(keybindings: &[GnomeKeybinding]) -> HashSet<Modifiers> {

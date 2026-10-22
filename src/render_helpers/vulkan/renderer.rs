@@ -26,9 +26,9 @@ use synoik_vk::render::{
 };
 use synoik_vk::shaders::{
     BORDER_FRAG, BORDER_VERT, CLIPPED_SOLID_FRAG, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG,
-    POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG,
-    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_COLOR_FRAG, TEXT_FRAG,
-    TEXT_VERT, TEX_FRAG,
+    MAG_EFFECTS_FRAG, POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT,
+    ROUNDED_TEX_FRAG, SDF_FRAG, SDF_PIE_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT,
+    SOLID_FRAG, TEXT_COLOR_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
 use synoik_vk::texture::Texture as SynoikTexture;
 use tracing::warn;
@@ -80,11 +80,13 @@ pub struct VulkanRenderer {
     pub(super) solid_pipeline: Pipeline,
     pub(super) sdf_rect_pipeline: Pipeline,
     pub(super) sdf_triangle_pipeline: Pipeline,
+    pub(super) sdf_pie_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) clipped_texture_pipeline: Pipeline,
     pub(super) clipped_solid_pipeline: Pipeline,
     pub(super) gradient_fade_pipeline: Pipeline,
+    pub(super) mag_effects_pipeline: Pipeline,
     pub(super) border_pipeline: Pipeline,
     pub(super) shadow_pipeline: Pipeline,
     pub(super) postprocess_pipeline: Pipeline,
@@ -532,6 +534,10 @@ impl VulkanRenderer {
             &[],
             quad_push,
         )?;
+        // Pie slice: the `sdf_pie.frag` material, samples nothing and shares `QuadPush` — the
+        // pointer-accessibility pie timer.
+        let sdf_pie_pipeline =
+            build_pipeline(&gpu, render_pass, QUAD_VERT, SDF_PIE_FRAG, &[], quad_push)?;
         let texture_pipeline =
             build_pipeline(&gpu, render_pass, QUAD_VERT, TEX_FRAG, sampler, quad_push)?;
         let rounded_texture_pipeline = build_pipeline(
@@ -568,6 +574,15 @@ impl VulkanRenderer {
             GRADIENT_FADE_FRAG,
             sampler,
             quad_push,
+        )?;
+        // The magnifier's colour effects: samples a texture, its own push block.
+        let mag_effects_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            MAG_EFFECTS_FRAG,
+            sampler,
+            std::mem::size_of::<synoik_vk::render::MagEffectsPush>() as u32,
         )?;
         // The border/shadow materials sample nothing (no set).
         let border_pipeline = build_pipeline(
@@ -640,11 +655,13 @@ impl VulkanRenderer {
             solid_pipeline,
             sdf_rect_pipeline,
             sdf_triangle_pipeline,
+            sdf_pie_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
             clipped_texture_pipeline,
             clipped_solid_pipeline,
             gradient_fade_pipeline,
+            mag_effects_pipeline,
             border_pipeline,
             shadow_pipeline,
             postprocess_pipeline,
@@ -2939,11 +2956,13 @@ impl Drop for VulkanRenderer {
             self.solid_pipeline.destroy(dev);
             self.sdf_rect_pipeline.destroy(dev);
             self.sdf_triangle_pipeline.destroy(dev);
+            self.sdf_pie_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
             self.clipped_texture_pipeline.destroy(dev);
             self.clipped_solid_pipeline.destroy(dev);
             self.gradient_fade_pipeline.destroy(dev);
+            self.mag_effects_pipeline.destroy(dev);
             self.border_pipeline.destroy(dev);
             self.shadow_pipeline.destroy(dev);
             self.postprocess_pipeline.destroy(dev);

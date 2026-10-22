@@ -4356,6 +4356,196 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     );
 }
 
+/// The green window's bounding box on a capture, if any of it shows.
+fn green_bbox(pixels: &[u8], w: i32, h: i32) -> Option<Rectangle<i32, Physical>> {
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b, _] = px(pixels, w, x, y);
+            if g > 200 && r < 40 && b < 40 {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            }
+        }
+    }
+    (x0 < x1).then(|| Rectangle::new((x0, y0).into(), (x1 - x0, y1 - y0).into()))
+}
+
+/// Zoom draws the screen magnified about the pointer (`ZoomRegion`): with centred tracking, the
+/// window's left edge lands where the transform puts it, and the window is drawn at twice its
+/// size, clipped to the screen.
+#[test]
+fn vulkan_zoom_magnifies_the_screen_about_the_pointer() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let plain = green_bbox(&pixels, w, h).expect("the window shows");
+
+    let at = (f64::from(plain.loc.x) + 20., f64::from(plain.loc.y) + 20.);
+    super::gnome::pointer_motion_to(&mut f, at.0, at.1);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::Centered;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let view = f.synoik().magnifier.view(&output).expect("zoom is on");
+    assert_eq!(view.transform.mag, 2.);
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let zoomed = green_bbox(&pixels, w, h).expect("the window shows, magnified");
+    let left = view.transform.apply(Point::from((
+        f64::from(plain.loc.x),
+        f64::from(plain.loc.y),
+    )));
+    assert_eq!(
+        (zoomed.loc.x, zoomed.loc.y),
+        (left.x.round() as i32, left.y.round() as i32),
+        "the window's corner is drawn where the zoom maps it (plain {plain:?})"
+    );
+    let want_w = (plain.size.w * 2).min(w - zoomed.loc.x);
+    let want_h = (plain.size.h * 2).min(h - zoomed.loc.y);
+    assert!(
+        (zoomed.size.w - want_w).abs() <= 2 && (zoomed.size.h - want_h).abs() <= 2,
+        "drawn at twice its size: {zoomed:?} from {plain:?}"
+    );
+
+    // The pointer is drawn magnified, and only that once.
+    let state = f.synoik_state();
+    let kinds: Vec<&'static str> = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            synoik
+                .render_to_vec(ctx, &output, true)
+                .iter()
+                .filter_map(|e| match e {
+                    OutputRenderElements::MagnifiedPointer(_) => Some("magnified"),
+                    OutputRenderElements::Pointer(_) => Some("plain"),
+                    _ => None,
+                })
+                .collect()
+        })
+        .expect("vulkan renderer");
+    assert!(
+        !kinds.is_empty() && kinds.iter().all(|k| *k == "magnified"),
+        "{kinds:?}"
+    );
+
+    // And off again, the screen is as it was.
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::Zoom, false);
+    f.synoik_state().sync_magnifier();
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(green_bbox(&pixels, w, h), Some(plain));
+}
+
+/// The zoom's colour effects apply to the magnified view: desaturated all the way, the green
+/// window is grey. Its crosshairs cross at the magnified pointer, in their colour.
+#[test]
+fn vulkan_zoom_draws_its_colour_effects_and_crosshairs() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let plain = green_bbox(&pixels, w, h).expect("the window shows");
+    let at = (f64::from(plain.loc.x) + 40., f64::from(plain.loc.y) + 40.);
+    super::gnome::pointer_motion_to(&mut f, at.0, at.1);
+    {
+        let synoik = f.synoik();
+        let m = &mut synoik.gnome_settings.magnifier;
+        m.mouse_tracking = crate::magnifier::Tracking::Centered;
+        m.color_saturation = 0.;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let view = f.synoik().magnifier.view(&output).unwrap();
+    let inside = view.transform.apply(Point::from((at.0 + 30., at.1 + 30.)));
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    assert_eq!(green_bbox(&pixels, w, h), None, "no green left");
+    let [r, g, b, _] = px(&pixels, w, inside.x as i32, inside.y as i32);
+    assert!(
+        r.abs_diff(g) < 4 && g.abs_diff(b) < 4 && (130..170).contains(&g),
+        "the window is grey (0.587 of green): {:?}",
+        [r, g, b]
+    );
+
+    // Crosshairs need the pointer drawn, as the screen's frame does.
+    {
+        let m = &mut f.synoik().gnome_settings.magnifier;
+        m.color_saturation = 1.;
+        m.show_crosshairs = true;
+    }
+    f.synoik_state().sync_magnifier();
+    let state = f.synoik_state();
+    let pixels = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                appearance: Some(synoik.appearance()),
+            };
+            let elements = synoik.render_to_vec(ctx, &output, true);
+            render_to_vec(
+                vk,
+                Size::from((w, h)),
+                Scale::from(1.),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )
+            .unwrap()
+        })
+        .unwrap();
+    let pointer = view.transform.apply(Point::from(at));
+    // Left of the pointer, past half the default 8px thickness: on the horizontal hair.
+    let [r, g, b, _] = px(&pixels, w, pointer.x as i32 - 30, pointer.y as i32);
+    assert!(
+        r > 150 && g < 120 && b < 60,
+        "a red hair at 0.66 over the green window: {:?}",
+        [r, g, b]
+    );
+}
+
+/// A menu draws its rows' icons over its card (`widget::Menu::render`): the dwell-click menu's
+/// four rows each carry gnome-shell's own icon, so it is five elements, not a bare card.
+#[test]
+fn vulkan_a_menu_draws_its_row_icons() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let state = f.synoik_state();
+    let count = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            crate::ui::dwell_click_menu::DwellClickMenu::new()
+                .render(vk, &state.synoik.icon_cache, 1., Point::from((0., 0.)))
+                .len()
+        })
+        .expect("vulkan renderer");
+    assert_eq!(count, 5, "four row icons over the card");
+}
+
 /// A translucent `TextureRenderElement` (alpha < 1, e.g. a fading popover) must NOT report
 /// any opaque regions. If it does, the damage tracker skips clearing and repainting beneath
 /// it, so the fade blends over stale framebuffer content instead of the scene behind — the
@@ -11605,7 +11795,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     eprintln!("vulkan_folder_dialog: panel={inside:?}");
     assert_eq!(inside[3], 255, "the panel is opaque: {inside:?}");
     for ch in 0..3 {
-        let want = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        let want = (crate::ui::widget::style::overlay_bg()[ch] * 255.).round() as i32;
         assert!(
             (inside[ch] as i32 - want).abs() <= 4,
             "the panel is $system_overlay_bg_color: {inside:?}"
@@ -11670,7 +11860,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     );
     eprintln!("vulkan_folder_dialog: edit disc={disc:?}");
     for ch in 0..3 {
-        let want = (crate::ui::widget::style::OVERLAY_BUTTON_BG[ch] * 255.).round() as i32;
+        let want = (crate::ui::widget::style::overlay_button_bg()[ch] * 255.).round() as i32;
         assert!(
             (disc[ch] as i32 - want).abs() <= 6,
             "the edit button is `st-mix($system_fg_color, $system_overlay_bg_color, 9%)`, \
@@ -12209,7 +12399,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
     let got = px(&pixels, w, vacated.x as i32, vacated.y as i32);
     eprintln!("vulkan_folder_dialog_shrink: vacated={got:?}");
     for ch in 0..3 {
-        let panel_ch = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        let panel_ch = (crate::ui::widget::style::overlay_bg()[ch] * 255.).round() as i32;
         assert!(
             (got[ch] as i32 - panel_ch).abs() > 8,
             "the vacated corner still reads as panel fill — the zoom did not move it: {got:?}"
@@ -16754,4 +16944,79 @@ fn vulkan_the_pointer_is_drawn_from_svg_at_a_fractional_scale() {
     // The arrow's body, just inside the tip: opaque.
     let body = px(&pixels, w, 152, 155);
     assert!(body[3] > 200, "{body:?}");
+}
+
+/// The on-screen keyboard draws over the windows: the OSD background across the display's
+/// bottom, key caps on it; its language menu draws over the keys, not under them; and the emoji
+/// page's emoji have no caps (`.emoji-page .keyboard-key`).
+#[test]
+fn vulkan_renders_the_on_screen_keyboard() {
+    use crate::osk::layout::{Action, Face};
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    f.freeze_clock();
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, true);
+    f.synoik_state().sync_osk();
+    f.synoik_state().osk_open(true);
+    f.advance_clock(Duration::from_millis(300));
+    let rect = f.synoik().osk_rect(&output).expect("the keyboard is up");
+    assert_eq!(rect.loc.y, f64::from(OUT_H) - rect.size.h);
+
+    let key = |f: &mut Fixture, pred: &dyn Fn(&crate::osk::layout::Key) -> bool| {
+        let synoik = f.synoik();
+        let level = synoik.osk.level().unwrap();
+        let i = level.keys.iter().position(pred).expect("the key");
+        let cap = crate::ui::osk::key_rects(rect.size, level)[i];
+        Rectangle::new(rect.loc + cap.loc, cap.size)
+    };
+    let at = |pixels: &[u8], w: i32, p: Point<f64, Logical>| px(pixels, w, p.x as i32, p.y as i32);
+    let close = |a: [u8; 4], b: [u8; 3]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 3);
+
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    // `osd_bg`, beside the key grid.
+    let background = at(&pixels, w, Point::from((10., f64::from(OUT_H) - 20.)));
+    assert!(close(background, [46, 46, 51]), "{background:?}");
+    // A character key's cap, `#5d5d5d`, just inside its corner.
+    let q = key(&mut f, &|k| k.commit.as_deref() == Some("q"));
+    let cap = at(&pixels, w, q.loc + Point::from((6., q.size.h / 2.)));
+    assert!(close(cap, [0x5d, 0x5d, 0x5d]), "{cap:?}");
+
+    // The language menu, over the keys it covers.
+    let globe = key(&mut f, &|k| k.action == Some(Action::LanguageMenu));
+    let center = globe.loc + globe.size.downscale(2.).to_point();
+    super::gnome::pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.advance_clock(Duration::from_millis(400));
+    let menu = {
+        let popover = &f.synoik().panel_popover;
+        assert!(popover.is_osk_languages());
+        popover.content_rect(&output).unwrap()
+    };
+    let inside = menu.loc + Point::from((menu.size.w / 2., menu.size.h - 12.));
+    assert!(rect.contains(inside), "the probe is over the keyboard");
+    let before = at(&pixels, w, inside);
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    let after = at(&pixels, w, inside);
+    assert_ne!(before, after, "the menu is drawn over the keyboard");
+
+    // Close it, and switch to the emoji page: its emoji have no cap.
+    f.synoik().panel_popover.close_osk_languages();
+    f.advance_clock(Duration::from_millis(400));
+    let emoji = key(&mut f, &|k| k.action == Some(Action::Emoji));
+    let center = emoji.loc + emoji.size.downscale(2.).to_point();
+    super::gnome::pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.synoik().osk.emoji_active());
+    let first = key(&mut f, &|k| matches!(k.face, Face::Emoji(_)) && k.flat);
+    let (pixels, w, _h) = render_output_vulkan(&mut f, &output);
+    let corner = at(&pixels, w, first.loc + Point::from((3., 3.)));
+    assert!(close(corner, [46, 46, 51]), "no cap: {corner:?}");
 }

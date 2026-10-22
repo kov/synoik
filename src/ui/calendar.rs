@@ -58,7 +58,6 @@ use std::ptr::null_mut;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::calendar_events::CalendarEventStore;
@@ -269,7 +268,7 @@ pub struct Ymd {
 }
 
 struct TextureCache {
-    context: Option<ContextId<VkTexture>>,
+    context: Option<crate::ui::widget::StyleContext>,
     textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
 }
 
@@ -646,7 +645,7 @@ impl Calendar {
     pub fn texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let mut cache = self.cache.borrow_mut();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.textures.clear();
             cache.context = Some(context);
@@ -1228,7 +1227,7 @@ struct ContentTex {
     /// The scroll offset (rounded px) the window was baked at — the bake is
     /// viewport-sized, so it re-bakes when the scroll moves.
     scroll: i64,
-    context: ContextId<VkTexture>,
+    context: crate::ui::widget::StyleContext,
     tex: VkTexture,
 }
 
@@ -2183,7 +2182,7 @@ impl CalendarMessageList {
     ) -> anyhow::Result<VkTexture> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let scroll_key = p.scroll.round() as i64;
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         {
             let cache = self.content_cache.borrow();
             if let Some(c) = cache.as_ref() {
@@ -3479,7 +3478,7 @@ impl DateMenu {
             .of(height_key)
             .done();
         let mut cache = self.bg_cache.borrow_mut();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.textures.clear();
             cache.context = Some(context);
@@ -3538,7 +3537,7 @@ impl DateMenu {
                     Point::from((LIST_PAD + list_box_w() - LIST_BORDER_R, 0.)),
                     Size::from((LIST_BORDER_R, size.h)),
                 ),
-                widget::style::BORDERS,
+                widget::style::borders(),
             )?;
 
             if let Some(run) = &placeholder_run {
@@ -3588,7 +3587,7 @@ impl DateMenu {
             .events_button
             .revision(self.events_rev, height_key as u64);
         let mut cache = self.events_cache.borrow_mut();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.textures.clear();
             cache.context = Some(context);
@@ -3642,7 +3641,8 @@ impl DateMenu {
                 Point::<f64, Logical>::from((EVENTS_MARGIN, EVENTS_MARGIN)),
                 Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
             );
-            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::card_bg())?;
+            p.hc_inset(card, EVENTS_CARD_RADIUS)?;
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
             widget::CardButton::paint_focus(&mut p, focused, card, EVENTS_CARD_RADIUS, accent)?;
@@ -3711,7 +3711,7 @@ impl DateMenu {
             .world_clocks_button
             .revision(self.world_clocks_rev, height_key as u64);
         let mut cache = self.world_clocks_cache.borrow_mut();
-        let context = renderer.context_id();
+        let context = crate::ui::widget::style_context(renderer);
         if cache.context.as_ref() != Some(&context) {
             cache.textures.clear();
             cache.context = Some(context);
@@ -3783,7 +3783,8 @@ impl DateMenu {
                 Point::<f64, Logical>::from((EVENTS_MARGIN, EVENTS_MARGIN)),
                 Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
             );
-            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::card_bg())?;
+            p.hc_inset(card, EVENTS_CARD_RADIUS)?;
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
             widget::CardButton::paint_focus(&mut p, focused, card, EVENTS_CARD_RADIUS, accent)?;

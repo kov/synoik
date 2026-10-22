@@ -23,7 +23,6 @@
 //! touch (`backgroundMenu.js:40-50`). We have no long-press gesture anywhere yet (touch is
 //! deferred), so the right-click is the only way in.
 
-use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Size};
 
 use crate::render_helpers::texture::TextureRenderElement;
@@ -156,25 +155,12 @@ impl BackgroundMenu {
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
-        match self.menu.bake(renderer, scale) {
-            Ok(buffer) => {
-                vec![TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    origin,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                )]
-            }
-            Err(err) => {
-                tracing::error!("error baking the background menu: {err:#}");
-                Vec::new()
-            }
-        }
+        self.menu
+            .render(renderer, icons, scale, origin, "the background menu")
     }
 }
 

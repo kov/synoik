@@ -44388,3 +44388,1736 @@ fn a_bell_inside_the_gate_does_not_restart_the_flash() {
         "the running flash is untouched"
     );
 }
+
+// ---- The keyboard accessibility filters (`MetaKeyboardA11y`, `meta-keyboard-a11y.c`) ----
+
+const KEY_NUMLOCK: u32 = 69;
+const KEY_KP5: u32 = 76;
+const KEY_KP6: u32 = 77;
+const KEY_KP0: u32 = 82;
+const KEY_KPDOT: u32 = 83;
+const KEY_KPMINUS: u32 = 74;
+
+/// A focused window listening to its keyboard and pointer, a recording sound player standing in
+/// for the bell's audible half, and a frozen clock for the filters' deadlines.
+fn keyboard_a11y_fixture() -> (Fixture, ClientId, crate::sound_player::StubSoundPlayer) {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.client(id).get_pointer();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).take_mods_events();
+    let player = crate::sound_player::StubSoundPlayer::default();
+    f.synoik().sound_player = Some(Box::new(player.clone()));
+    f.freeze_clock();
+    (f, id, player)
+}
+
+fn keyboard_a11y_settings(
+    f: &mut Fixture,
+) -> &mut crate::input::keyboard_a11y::KeyboardA11ySettings {
+    &mut f.synoik().gnome_settings.keyboard_a11y
+}
+
+/// Run the compositor for `d` of its own time, so the filters' timers come due.
+fn run_for(f: &mut Fixture, d: Duration) {
+    f.advance_until(d, |_| false);
+}
+
+/// Bounce Keys: a press of the key released less than `bouncekeys-delay` ago never happened,
+/// release included, and beeps when `bouncekeys-beep-reject` asks (`debounce_key`,
+/// `notify_bounce_keys_reject`). The window opens again on every release, the dropped one's too
+/// (`start_bounce_keys`), and only for the key released last: another key's release ends it.
+#[test]
+fn bounce_keys_drop_a_press_too_soon_after_the_last_release() {
+    let (mut f, id, player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.bouncekeys_enable = true;
+    k.bouncekeys_beep_reject = true;
+    assert_eq!(k.bouncekeys_delay, 300, "the schema default");
+
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(100));
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(250));
+    tap(&mut f, KEY_Z);
+    f.advance_clock(Duration::from_millis(301));
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_Z);
+    f.double_roundtrip(id);
+
+    use WlKeyState::{Pressed, Released};
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+            (KEY_A, Pressed),
+            (KEY_A, Released),
+            (KEY_Z, Pressed),
+            (KEY_Z, Released),
+        ],
+        "both bounces dropped whole — the second came 250 ms after the first one's release — \
+         and a Z right after an A is no bounce"
+    );
+    assert_eq!(player.played().len(), 2, "a beep for each bounce");
+}
+
+/// Slow Keys: a key counts only once held for `slowkeys-delay` (`start_slow_keys`,
+/// `trigger_slow_keys`); let go sooner, it never happened (`stop_slow_keys`). A held-back Shift
+/// does not reach the modifiers either — the divergence in the module doc.
+#[test]
+fn slow_keys_deliver_only_a_key_held_past_the_delay() {
+    let (mut f, id, player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.slowkeys_enable = true;
+    k.slowkeys_beep_reject = true;
+    k.slowkeys_beep_accept = true;
+    assert_eq!(k.slowkeys_delay, 300, "the schema default");
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_Z);
+    run_for(&mut f, Duration::from_millis(200));
+    f.key_release(KEY_Z);
+    f.key_release(KEY_LEFTSHIFT);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "keys let go too soon"
+    );
+    assert_eq!(
+        f.client(id).take_mods_events(),
+        Vec::<u32>::new(),
+        "nor did the Shift change the modifiers"
+    );
+    assert_eq!(player.played().len(), 2, "a rejection beep for each");
+
+    f.key_press(KEY_Z);
+    run_for(&mut f, Duration::from_millis(200));
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).take_key_events(), vec![], "not yet");
+    run_for(&mut f, Duration::from_millis(150));
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_Z, WlKeyState::Pressed)],
+        "pressed once it has been held for the delay"
+    );
+    f.key_release(KEY_Z);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_Z, WlKeyState::Released)]
+    );
+    assert_eq!(player.played().len(), 3, "and an acceptance beep");
+}
+
+/// Mouse Keys: with Num Lock off the keypad drives the pointer — 6 moves it right while held,
+/// 0 holds the button and . lets it go, 5 clicks, and − picks the right button
+/// (`handle_mousekeys_press`). None of it reaches the client as a key. With Num Lock on, the
+/// keypad types again.
+#[test]
+fn mouse_keys_drive_the_pointer_from_the_keypad() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).mousekeys_enable = true;
+    pointer_motion_to(&mut f, 960., 540.);
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_pointer_events();
+
+    let pointer = |f: &mut Fixture| f.synoik().seat.get_pointer().unwrap().current_location();
+    let start = pointer(&mut f);
+    f.key_press(KEY_KP6);
+    run_for(&mut f, Duration::from_secs(1));
+    f.key_release(KEY_KP6);
+    let moved = pointer(&mut f);
+    assert!(
+        moved.x >= start.x + 3. && moved.y == start.y,
+        "held, 6 moves the pointer right: {start:?} -> {moved:?}"
+    );
+    run_for(&mut f, Duration::from_millis(500));
+    assert_eq!(pointer(&mut f), moved, "and stops when let go");
+
+    f.key_press(KEY_KP0);
+    f.key_release(KEY_KP0);
+    f.key_press(KEY_KPDOT);
+    f.key_release(KEY_KPDOT);
+    tap(&mut f, KEY_KPMINUS);
+    tap(&mut f, KEY_KP5);
+    f.double_roundtrip(id);
+    let buttons: Vec<_> = f
+        .client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            super::client::PointerEvent::Button { button, pressed } => Some((button, pressed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        buttons,
+        vec![
+            (BTN_LEFT, true),
+            (BTN_LEFT, false),
+            (BTN_RIGHT, true),
+            (BTN_RIGHT, false)
+        ],
+        "0 presses and . releases the left button; − then 5 clicks the right"
+    );
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "no keypad key typed"
+    );
+
+    tap(&mut f, KEY_NUMLOCK);
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    tap(&mut f, KEY_KP6);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_KP6, WlKeyState::Pressed),
+            (KEY_KP6, WlKeyState::Released)
+        ],
+        "with Num Lock on the keypad is a keypad"
+    );
+}
+
+/// Turning Mouse Keys off lets go of a button it holds (`disable_mousekeys`), or the session
+/// would be left mid-drag with no key to end it.
+#[test]
+fn mouse_keys_turned_off_release_the_held_button() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).mousekeys_enable = true;
+    pointer_motion_to(&mut f, 960., 540.);
+    tap(&mut f, KEY_KP0);
+    keyboard_a11y_settings(&mut f).mousekeys_enable = false;
+    f.synoik_state().sync_keyboard_a11y();
+    f.double_roundtrip(id);
+    let buttons: Vec<_> = f
+        .client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter(|e| matches!(e, super::client::PointerEvent::Button { .. }))
+        .collect();
+    assert_eq!(
+        buttons,
+        vec![
+            super::client::PointerEvent::Button {
+                button: BTN_LEFT,
+                pressed: true
+            },
+            super::client::PointerEvent::Button {
+                button: BTN_LEFT,
+                pressed: false
+            },
+        ]
+    );
+}
+
+/// Toggle Keys: a key that changes the lock LEDs beeps
+/// (`meta_keyboard_a11y_maybe_notify_toggle_keys_in_impl`); any other key does not.
+#[test]
+fn toggle_keys_beep_on_caps_lock() {
+    let (mut f, _id, player) = keyboard_a11y_fixture();
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(player.played().is_empty(), "off by default");
+
+    keyboard_a11y_settings(&mut f).togglekeys_enable = true;
+    tap(&mut f, KEY_Z);
+    assert!(player.played().is_empty(), "a plain key changes no LED");
+    tap(&mut f, KEY_CAPSLOCK);
+    assert_eq!(player.played().len(), 1, "Caps Lock off beeps");
+    tap(&mut f, KEY_NUMLOCK);
+    assert_eq!(player.played().len(), 2, "so does Num Lock");
+}
+
+/// The enable shortcuts (`enable`): Shift five times turns Sticky Keys on
+/// (`handle_enablekeys_release`), and holding Shift eight seconds toggles Slow Keys
+/// (`trigger_toggle_slowkeys`). Each writes its key, so the menu row follows. Off, Shift is just
+/// Shift.
+#[test]
+fn the_enable_shortcuts_toggle_sticky_and_slow_keys() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(
+        !keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "the shortcuts are off by default"
+    );
+
+    keyboard_a11y_settings(&mut f).enable = true;
+    for _ in 0..4 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert!(
+        !keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "another key in between starts the count over"
+    );
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(
+        keyboard_a11y_settings(&mut f).stickykeys_enable,
+        "five Shifts"
+    );
+    assert!(
+        f.synoik().gnome_settings.a11y.get(A11yToggle::StickyKeys),
+        "and the menu's row with it"
+    );
+
+    f.key_press(KEY_LEFTSHIFT);
+    run_for(&mut f, Duration::from_secs(7));
+    assert!(!keyboard_a11y_settings(&mut f).slowkeys_enable, "not yet");
+    run_for(&mut f, Duration::from_millis(1100));
+    assert!(
+        keyboard_a11y_settings(&mut f).slowkeys_enable,
+        "Shift held for eight seconds"
+    );
+    f.key_release(KEY_LEFTSHIFT);
+}
+
+/// Every key the client saw pressed it also saw released, and nothing else.
+fn assert_keys_paired(f: &mut Fixture, id: ClientId, keys: &[u32]) {
+    f.double_roundtrip(id);
+    let events = f.client(id).take_key_events();
+    for key in keys {
+        let count = |state| events.iter().filter(|e| **e == (*key, state)).count();
+        let (pressed, released) = (count(WlKeyState::Pressed), count(WlKeyState::Released));
+        assert_eq!(pressed, released, "key {key} unpaired in {events:?}");
+    }
+    assert!(
+        events.iter().all(|(k, _)| keys.contains(k)),
+        "a key the dialog took reached the client: {events:?}"
+    );
+}
+
+/// A shortcut says what it did (`KbdA11yDialog`): five Shifts turn Sticky Keys on, and the dialog
+/// that comes up leaves it on with Enter and turns it off with Escape; five more turn it off, and
+/// now Escape is the one that turns it back on. The keys that answer it never reach the window,
+/// and the Shift that raised it reaches it whole. A settings change raises nothing.
+#[test]
+fn an_enable_shortcut_raises_a_dialog_that_offers_to_undo_it() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    keyboard_a11y_settings(&mut f).slowkeys_enable = true;
+    tap(&mut f, KEY_Z);
+    run_for(&mut f, Duration::from_millis(500));
+    assert!(
+        !f.synoik().kbd_a11y_dialog.is_open(),
+        "a settings change raises nothing"
+    );
+    keyboard_a11y_settings(&mut f).slowkeys_enable = false;
+    let _ = f.client(id).take_key_events();
+
+    let sticky = |f: &mut Fixture| keyboard_a11y_settings(f).stickykeys_enable;
+    for (escape, on_after) in [(false, true), (true, false)] {
+        for _ in 0..5 {
+            tap(&mut f, KEY_LEFTSHIFT);
+        }
+        assert!(sticky(&mut f), "five Shifts turned it on");
+        assert!(f.synoik().kbd_a11y_dialog.is_open());
+        run_for(&mut f, Duration::from_millis(200));
+        tap(&mut f, if escape { KEY_ESC } else { KEY_ENTER });
+        assert_eq!(sticky(&mut f), on_after, "escape: {escape}");
+        assert!(!f.synoik().kbd_a11y_dialog.is_open(), "answered");
+        assert_keys_paired(&mut f, id, &[KEY_LEFTSHIFT]);
+        // Off again for the next round, by the menu: no dialog.
+        f.synoik_state().set_keyboard_a11y_feature(
+            crate::input::keyboard_a11y::KeyboardA11yFeature::StickyKeys,
+            false,
+        );
+        run_for(&mut f, Duration::from_millis(200));
+    }
+
+    // On, then five Shifts turn it off: Escape turns it back on.
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(!sticky(&mut f), "five Shifts turned it off");
+    run_for(&mut f, Duration::from_millis(200));
+    tap(&mut f, KEY_ESC);
+    assert!(sticky(&mut f), "Escape undid it");
+    assert!(!f.synoik().kbd_a11y_dialog.is_open());
+}
+
+/// The shortcuts work behind the lock, so their dialog must answer there too, or it would be a
+/// modal nobody can dismiss.
+#[test]
+fn the_keyboard_a11y_dialog_answers_over_the_lock_screen() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik_state().synoik.lock_screen.settle();
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    assert!(f.synoik().kbd_a11y_dialog.is_open());
+    run_for(&mut f, Duration::from_millis(200));
+    tap(&mut f, KEY_ESC);
+    assert!(!f.synoik().kbd_a11y_dialog.is_open());
+    assert!(!keyboard_a11y_settings(&mut f).stickykeys_enable);
+}
+
+/// Two dialogs at once: the one raised last is on top and takes the keys; the other answers once
+/// it is gone.
+#[test]
+fn the_message_dialog_raised_last_takes_the_keys() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).enable = true;
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    run_for(&mut f, Duration::from_millis(200));
+    for _ in 0..5 {
+        tap(&mut f, KEY_LEFTSHIFT);
+    }
+    run_for(&mut f, Duration::from_millis(200));
+    assert_eq!(
+        f.synoik().top_message_dialog(),
+        Some(crate::ui::message_dialog::MessageDialogKind::KbdA11y)
+    );
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.synoik().kbd_a11y_dialog.is_open(),
+        "Escape went to the top one"
+    );
+    assert!(
+        f.synoik().end_session.is_open(),
+        "and not to the one under it"
+    );
+    tap(&mut f, KEY_ESC);
+    assert!(!f.synoik().end_session.is_open());
+}
+
+/// Orca's modifier through the KeyboardMonitor (A7): a grabbed Caps Lock tapped alone is Orca's,
+/// so the window hears nothing and Caps Lock stays off, and so is a key pressed under it; a quick
+/// double tap is the key's own, so Caps Lock toggles, and the window sees that second tap only.
+#[test]
+fn a_grabbed_modifier_tapped_alone_is_the_monitors() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let monitor = crate::dbus::freedesktop_a11y::KeyboardMonitor::new();
+    monitor.set_client(":1.42", false, &[Keysym::Caps_Lock]);
+    f.synoik().a11y_keyboard_monitor = Some(monitor);
+    let caps_lock = |f: &mut Fixture| {
+        f.synoik()
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .modifier_state()
+            .caps_lock
+    };
+
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(!caps_lock(&mut f), "a lone tap is Orca's");
+    // The double press is timed on the events' own clock, as mutter's.
+    f.advance_input_time(1000);
+    f.key_press(KEY_CAPSLOCK);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_CAPSLOCK);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).take_key_events(), vec![], "nor a key under it");
+
+    f.advance_input_time(1000);
+    tap(&mut f, KEY_CAPSLOCK);
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(caps_lock(&mut f), "a double tap is the key's");
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_CAPSLOCK, WlKeyState::Pressed),
+            (KEY_CAPSLOCK, WlKeyState::Released)
+        ]
+    );
+}
+
+/// What the PointerLocator tells Orca (A7, `meta_compositor_query_pointer_a11y`): over a window,
+/// its client's pid and the pointer relative to the surface under it, moving with the pointer;
+/// over the shell's own chrome, the pointer in global coordinates.
+#[test]
+fn the_pointer_locator_names_the_window_under_the_pointer() {
+    use crate::dbus::freedesktop_a11y::PointerTarget;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // A new window is placed centred on the output.
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_pointer();
+    f.roundtrip(id);
+    let centre = (960., 540.);
+
+    let at = |f: &mut Fixture, x: f64, y: f64| {
+        pointer_motion_to(f, x, y);
+        f.synoik_state().pointer_target()
+    };
+    let Some(PointerTarget::Window { pid, x, y }) = at(&mut f, centre.0, centre.1) else {
+        panic!("not a window under the pointer");
+    };
+    assert_eq!(pid, std::process::id() as i32, "the client's pid");
+    let Some(PointerTarget::Window { x: x2, y: y2, .. }) =
+        at(&mut f, centre.0 + 10., centre.1 + 5.)
+    else {
+        panic!("not a window under the pointer");
+    };
+    assert_eq!(
+        (x2 - x, y2 - y),
+        (10., 5.),
+        "relative to the window, moving with the pointer"
+    );
+    assert!(
+        (0. ..100.).contains(&x) && (0. ..100.).contains(&y),
+        "inside it: {x},{y}"
+    );
+
+    assert_eq!(
+        at(&mut f, 1900., 1060.),
+        Some(PointerTarget::Shell { x: 1900., y: 1060. }),
+        "and the shell's own, globally"
+    );
+}
+
+/// A focused window under the pointer, pointer accessibility set by `set`, every event so far
+/// drained.
+fn pointer_a11y_fixture(
+    set: impl FnOnce(&mut crate::input::pointer_a11y::PointerA11ySettings),
+) -> (Fixture, ClientId) {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    set(&mut f.synoik().gnome_settings.pointer_a11y);
+    f.synoik_state().sync_pointer_a11y();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_pointer_events();
+    (f, id)
+}
+
+/// Zoom follows the caret (`_updateCaret`): a move, in the focused window's coordinates, scrolls
+/// the view there once the pointer has rested for `POINTER_REST_TIME`, easing over 100 ms.
+#[test]
+fn zoom_follows_the_caret_once_the_pointer_rests() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::None;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    assert_eq!(
+        f.synoik().magnifier.tracker().listening(),
+        (true, true),
+        "focus and caret tracking default on"
+    );
+    let output = f.synoik_output(1);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f
+        .synoik()
+        .layout
+        .window_render_rect(&window, &output)
+        .unwrap();
+    let region = |f: &mut Fixture| f.synoik().magnifier.region(&output).unwrap().center();
+    let before = region(&mut f);
+
+    // Caret tracking is `centered`: the view centres on the caret's top-left.
+    let caret = Point::from((700. - rect.loc.x, 400. - rect.loc.y));
+    let extents = Rectangle::new(caret.to_i32_round(), (2, 16).into());
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(extents));
+    assert_eq!(region(&mut f), before, "the pointer just moved: it waits");
+
+    run_for(&mut f, Duration::from_millis(1200));
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // A zero-sized caret is no caret (`_updateCaret`).
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(Rectangle::new(
+            (0, 0).into(),
+            (0, 0).into(),
+        )));
+    run_for(&mut f, Duration::from_millis(200));
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // Off, it stops listening.
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::Zoom, false);
+    f.synoik_state().sync_magnifier();
+    assert_eq!(f.synoik().magnifier.tracker().listening(), (false, false));
+}
+
+/// A pointer that keeps reporting motion without moving — pinned at an edge, or under a locked
+/// pointer — is resting: `scrollToMousePos` returns early when the position has not changed, so
+/// the caret still gets its turn. A mode of `none` ignores its events even when an application
+/// sends them, and the view follows a pointer however it was moved, a warp included.
+#[test]
+fn zoom_rests_on_a_pointer_that_does_not_move() {
+    let (mut f, _id, _player) = keyboard_a11y_fixture();
+    pointer_motion_to(&mut f, 960., 540.);
+    {
+        let synoik = f.synoik();
+        synoik.gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::None;
+        synoik.gnome_settings.magnifier.focus_tracking = crate::magnifier::Tracking::None;
+        synoik
+            .gnome_settings
+            .a11y
+            .set(crate::gnome::A11yToggle::Zoom, true);
+    }
+    f.synoik_state().sync_magnifier();
+    let output = f.synoik_output(1);
+    let window = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f
+        .synoik()
+        .layout
+        .window_render_rect(&window, &output)
+        .unwrap();
+    let region = |f: &mut Fixture| f.synoik().magnifier.region(&output).unwrap().center();
+    let before = region(&mut f);
+
+    let at = |x: f64, y: f64| {
+        Rectangle::new(
+            Point::from((x - rect.loc.x, y - rect.loc.y)).to_i32_round(),
+            (20, 20).into(),
+        )
+    };
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Focus(at(300., 300.)));
+    run_for(&mut f, Duration::from_millis(1200));
+    assert_eq!(region(&mut f), before, "focus tracking is off");
+
+    f.synoik_state()
+        .magnifier_tracked(crate::focus_caret_tracker::Tracked::Caret(at(700., 400.)));
+    for _ in 0..4 {
+        f.pointer_motion(0., 0.);
+        run_for(&mut f, Duration::from_millis(300));
+    }
+    assert_eq!(region(&mut f), Point::from((700., 400.)));
+
+    // Mouse tracking centred, and a warp: the view is on the pointer by the next cycle.
+    f.synoik().gnome_settings.magnifier.mouse_tracking = crate::magnifier::Tracking::Centered;
+    f.synoik_state().sync_magnifier();
+    f.synoik_state().move_cursor(Point::from((500., 500.)));
+    run_for(&mut f, Duration::from_millis(16));
+    assert_eq!(region(&mut f), Point::from((500., 500.)));
+}
+
+/// The `(button, pressed)` events the client saw since the last take.
+fn client_buttons(f: &mut Fixture, id: ClientId) -> Vec<(u32, bool)> {
+    f.double_roundtrip(id);
+    f.client(id)
+        .take_pointer_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            super::client::PointerEvent::Button { button, pressed } => Some((button, pressed)),
+            _ => None,
+        })
+        .collect()
+}
+
+const LEFT: u32 = 0x110;
+const RIGHT: u32 = 0x111;
+
+/// Simulated secondary click (`secondary-click-enabled`): the primary held past
+/// `secondary-click-time` is released, then a secondary click follows; let go sooner, it is just
+/// a click.
+#[test]
+fn a_held_primary_becomes_a_secondary_click() {
+    let (mut f, id) = pointer_a11y_fixture(|p| p.secondary_click_enabled = true);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(1300));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false), (RIGHT, true), (RIGHT, false)]
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(500));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+}
+
+/// Dwell click in window mode: the pointer at rest for `dwell-time` clicks, once, and the pie at
+/// the pointer counts it down. A double click is one-shot and falls back to a single one; a drag
+/// presses on one dwell and releases on the next, wherever the pointer went in between.
+#[test]
+fn a_resting_pointer_clicks() {
+    use crate::input::pointer_a11y::DwellClickType;
+
+    let (mut f, id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(
+        !f.synoik().pointer_a11y.pies.is_empty(),
+        "the pie counts down"
+    );
+    run_for(&mut f, Duration::from_millis(1000));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+    run_for(&mut f, Duration::from_secs(3));
+    assert_eq!(client_buttons(&mut f, id), vec![], "once per rest");
+
+    f.synoik_state()
+        .set_dwell_click_type(DwellClickType::Double);
+    pointer_motion_to(&mut f, 980., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false), (LEFT, true), (LEFT, false)]
+    );
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Primary);
+
+    f.synoik_state().set_dwell_click_type(DwellClickType::Drag);
+    pointer_motion_to(&mut f, 960., 540.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true)],
+        "the drag starts"
+    );
+    pointer_motion_to(&mut f, 990., 560.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(client_buttons(&mut f, id), vec![(LEFT, false)], "and ends");
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Primary);
+}
+
+/// The pie at the pointer (`pointerA11yTimeout.js`): it sweeps round with the dwell and zooms
+/// out once the click is made; a dwell cut short takes it at once. A gesture shows a crosshair
+/// for as long as it is being drawn.
+#[test]
+fn the_dwell_pie_counts_down_at_the_pointer() {
+    use smithay::input::pointer::CursorIcon;
+
+    use crate::input::pointer_a11y::DwellMode;
+
+    let (mut f, _id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(700));
+    let now = f.synoik().clock.now_unadjusted();
+    let pie = f.synoik().pointer_a11y.pies.last().cloned().expect("a pie");
+    assert_eq!((pie.at.x, pie.at.y), (965., 545.), "at the pointer");
+    let frame = pie.frame(now).unwrap();
+    assert!(
+        frame.angle > 1. && frame.angle < 6. && frame.opacity == 1. && frame.scale == 1.,
+        "part way round, faded in: {frame:?}"
+    );
+
+    pointer_motion_to(&mut f, 1000., 545.);
+    assert!(
+        f.synoik().pointer_a11y.pies.is_empty(),
+        "moving off cuts it short"
+    );
+
+    run_for(&mut f, Duration::from_millis(1350));
+    let pie = f
+        .synoik()
+        .pointer_a11y
+        .pies
+        .last()
+        .cloned()
+        .expect("still zooming out");
+    let frame = pie.frame(f.synoik().clock.now_unadjusted()).unwrap();
+    assert!(
+        frame.scale > 1. && frame.opacity < 1.,
+        "zooming out: {frame:?}"
+    );
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(f.synoik().pointer_a11y.pies.is_empty(), "and gone");
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_mode = DwellMode::Gesture;
+    f.synoik_state().sync_pointer_a11y();
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        f.synoik().cursor_manager.global_override(),
+        Some(CursorIcon::Crosshair),
+        "drawing a gesture"
+    );
+    run_for(&mut f, Duration::from_millis(1300));
+    assert_eq!(f.synoik().cursor_manager.global_override(), None, "made");
+}
+
+/// The dwell-click indicator (`js/ui/status/dwellClick.js`): in the panel while dwell click is on
+/// in window mode, its menu picks the next click, and its icon follows the click in force — back
+/// to a single click once a double one is made.
+#[test]
+fn the_dwell_click_indicator_picks_the_click() {
+    use crate::input::pointer_a11y::{DwellClickType, DwellMode};
+    use crate::ui::panel::ROLE_DWELL_CLICK;
+
+    let (mut f, id) = pointer_a11y_fixture(|_| ());
+    let ow = 1920.;
+    assert_eq!(
+        f.synoik().panel.dwell_click_rect(ow),
+        None,
+        "hidden while dwell is off"
+    );
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = true;
+    f.synoik_state().sync_pointer_a11y();
+    assert_eq!(
+        f.synoik().panel.dwell_click(),
+        Some(DwellClickType::Primary)
+    );
+    let anchor = f.synoik().panel.dwell_click_rect(ow).expect("shown");
+
+    // Clicking the indicator rests the pointer on the panel; that dwell's single click lands
+    // there, harmlessly, as it would in GNOME.
+    pointer_motion_to(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_DWELL_CLICK));
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&out);
+    let row = f
+        .synoik()
+        .panel_popover
+        .dwell_click_row_center("Double Click")
+        .unwrap();
+    pointer_motion_to(&mut f, origin.x + row.x, origin.y + row.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Double);
+    assert_eq!(f.synoik().panel.dwell_click(), Some(DwellClickType::Double));
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(
+        !f.synoik().panel_popover.is_open(),
+        "the row closes the menu"
+    );
+
+    pointer_motion_to(&mut f, 960., 540.);
+    let _ = client_buttons(&mut f, id);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(client_buttons(&mut f, id).len(), 4, "a double click");
+    assert_eq!(
+        f.synoik().panel.dwell_click(),
+        Some(DwellClickType::Primary),
+        "the icon follows the fall back"
+    );
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_mode = DwellMode::Gesture;
+    f.synoik_state().sync_pointer_a11y();
+    assert_eq!(
+        f.synoik().panel.dwell_click_rect(ow),
+        None,
+        "hidden in gesture mode"
+    );
+}
+
+/// Dwell click in gesture mode: after the dwell, a stroke from the spot names the click, and the
+/// pointer goes back to the spot to make it. The stroke's directions are mutter's, so with the
+/// default settings a stroke to the right is `left`, the single click.
+#[test]
+fn a_dwell_gesture_names_its_click() {
+    use crate::input::pointer_a11y::DwellMode;
+
+    let (mut f, id) = pointer_a11y_fixture(|p| {
+        p.dwell_click_enabled = true;
+        p.dwell_mode = DwellMode::Gesture;
+    });
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![],
+        "the dwell only starts the gesture"
+    );
+    pointer_motion_to(&mut f, 1015., 547.);
+    run_for(&mut f, Duration::from_millis(1300));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+    let at = f.synoik().seat.get_pointer().unwrap().current_location();
+    assert_eq!((at.x, at.y), (965., 545.), "made back at the spot");
+
+    // The click's own press clears the gesture, so the next rest starts a dwell at once rather
+    // than a dwell's length later — even one that never left the spot.
+    pointer_motion_to(&mut f, 968., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert!(
+        f.synoik().pointer_a11y.gesture_cursor,
+        "the next dwell has run and a gesture is being drawn"
+    );
+}
+
+/// Pointer accessibility starts afresh when it comes on, as mutter makes its state anew: a
+/// press seen before it went off, released while off, leaves no button held behind.
+#[test]
+fn pointer_accessibility_comes_on_afresh() {
+    let (mut f, id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = false;
+    f.synoik_state().sync_pointer_a11y();
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = true;
+    f.synoik_state().sync_pointer_a11y();
+    let _ = client_buttons(&mut f, id);
+
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        client_buttons(&mut f, id),
+        vec![(LEFT, true), (LEFT, false)]
+    );
+}
+
+/// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
+const SHIFT_MASK: u32 = 1;
+const CONTROL_MASK: u32 = 1 << 2;
+
+/// The `(latched, locked)` masks of the last `wl_keyboard.modifiers` the client saw since the
+/// last take, if any came.
+fn last_sticky_mods(f: &mut Fixture, id: ClientId) -> Option<(u32, u32)> {
+    f.double_roundtrip(id);
+    let events = f.client(id).take_modifier_events();
+    events
+        .last()
+        .map(|(_, latched, locked)| (*latched, *locked))
+}
+
+fn shift_is_on(f: &mut Fixture) -> bool {
+    f.synoik()
+        .seat
+        .get_keyboard()
+        .unwrap()
+        .modifier_state()
+        .shift
+}
+
+/// Sticky Keys: Shift tapped on its own latches onto the next key, which sees it, and that
+/// key's release ends the latch (`handle_stickykeys_release`). The client hears both in
+/// `wl_keyboard.modifiers` — the latch is in the xkb state, not a private flag.
+#[test]
+fn sticky_keys_latch_a_modifier_onto_the_next_key() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((SHIFT_MASK, 0)),
+        "latched"
+    );
+    assert!(shift_is_on(&mut f), "Shift is on with no key held");
+
+    f.key_press(KEY_Z);
+    assert!(shift_is_on(&mut f), "the next key is pressed under it");
+    f.key_release(KEY_Z);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "and its release ends the latch"
+    );
+    assert!(!shift_is_on(&mut f));
+}
+
+/// Tapped twice, a modifier locks; a third tap unlocks it. A locked modifier outlives the keys
+/// pressed under it.
+#[test]
+fn sticky_keys_lock_a_modifier_tapped_twice() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, SHIFT_MASK)),
+        "locked"
+    );
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_A);
+    assert!(shift_is_on(&mut f), "still on after two keys");
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(last_sticky_mods(&mut f, id), Some((0, 0)), "unlocked");
+    assert!(!shift_is_on(&mut f));
+}
+
+/// A modifier held down with a key is an ordinary modifier, not a sticky one (the
+/// `stickykeys_depressed_mask` reset), and two modifiers tapped together latch once, together.
+#[test]
+fn sticky_keys_leave_a_chord_alone() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    keyboard_a11y_settings(&mut f).stickykeys_enable = true;
+
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "Shift+Z latched nothing"
+    );
+    assert!(!shift_is_on(&mut f));
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((SHIFT_MASK | CONTROL_MASK, 0)),
+        "Shift and Control latched as one"
+    );
+}
+
+/// `stickykeys-two-key-off`: two modifiers down at once turn Sticky Keys off, writing the key
+/// and dropping what it had latched (`handle_stickykeys_press`, `notify_stickykeys_change`).
+#[test]
+fn sticky_keys_two_key_off() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let k = keyboard_a11y_settings(&mut f);
+    k.stickykeys_enable = true;
+    k.stickykeys_two_key_off = true;
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(last_sticky_mods(&mut f, id), Some((SHIFT_MASK, 0)));
+    f.key_press(KEY_LEFTCTRL);
+    f.key_press(KEY_LEFTALT);
+    assert!(!keyboard_a11y_settings(&mut f).stickykeys_enable, "off");
+    assert!(!f.synoik().gnome_settings.a11y.get(A11yToggle::StickyKeys));
+    f.key_release(KEY_LEFTALT);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        last_sticky_mods(&mut f, id),
+        Some((0, 0)),
+        "the latched Shift went with it"
+    );
+}
+
+/// A focused window with a text input, its compositor-side events captured for feeding through
+/// `on_text_input_event` as the real sink would, and the on-screen keyboard enabled.
+fn osk_fixture() -> (
+    Fixture,
+    ClientId,
+    std::sync::Arc<std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>>,
+    async_channel::Receiver<crate::input_method::ImRequest>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::TextInputSeat;
+
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let (to_worker, requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(crate::input_method::InputMethod::new(to_worker));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, true);
+    f.synoik_state().sync_osk();
+    (f, id, seen, requests)
+}
+
+/// Hand the client's committed text-input state to the compositor.
+fn osk_feed(
+    f: &mut Fixture,
+    id: ClientId,
+    seen: &std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>,
+) {
+    f.double_roundtrip(id);
+    let events: Vec<_> = seen.lock().unwrap().drain(..).collect();
+    for event in events {
+        f.synoik_state().on_text_input_event(event);
+    }
+    f.synoik_state().refresh();
+}
+
+/// The global centre of the first key on the keyboard's current level that `pred` picks.
+fn osk_key_center(f: &mut Fixture, pred: impl Fn(&crate::osk::layout::Key) -> bool) -> (f64, f64) {
+    let output = f.synoik_output(1);
+    let synoik = f.synoik();
+    let rect = synoik.osk_rect(&output).expect("keyboard drawn");
+    let level = synoik.osk.level().unwrap();
+    let i = level.keys.iter().position(pred).expect("key on this level");
+    let key = crate::ui::osk::key_rects(rect.size, level)[i];
+    (
+        rect.loc.x + key.loc.x + key.size.w / 2.,
+        rect.loc.y + key.loc.y + key.size.h / 2.,
+    )
+}
+
+fn osk_click(f: &mut Fixture, (x, y): (f64, f64)) {
+    pointer_motion_to(f, x, y);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    f.pointer_button(LEFT, ButtonState::Released);
+}
+
+/// Screen Keyboard: a client re-enabling its text input while it already has the input method
+/// is a version-1 client asking for the panel (`enable_panel_v1`); the keyboard comes up after
+/// `KEYBOARD_REST_TIME` and slides in over `KEYBOARD_ANIMATION_TIME`. The first enable, which
+/// only moves the input method's focus there, does not show it. Disabling goes out through
+/// `HIDE_PANEL_TIME` and a `close(true)`: no rest.
+#[test]
+fn osk_opens_when_a_focused_field_asks_and_closes_when_it_goes() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let output = f.synoik_output(1);
+
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(500));
+    assert!(!f.synoik().osk.is_visible(), "focus alone does not show it");
+
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(280));
+    assert!(!f.synoik().osk.is_visible(), "waiting out the rest");
+    run_for(&mut f, Duration::from_millis(40));
+    assert!(f.synoik().osk.is_visible());
+    run_for(&mut f, Duration::from_millis(200));
+    let rect = f.synoik().osk_rect(&output).unwrap();
+    assert_eq!(rect.loc.y, 720.);
+    assert_eq!(rect.size, Size::from((1920., 360.)));
+
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(30));
+    assert!(f.synoik().osk.is_visible(), "HIDE_PANEL_TIME");
+    run_for(&mut f, Duration::from_millis(40));
+    assert!(!f.synoik().osk.is_visible());
+    run_for(&mut f, Duration::from_millis(200));
+    assert!(f.synoik().osk_rect(&output).is_none(), "slid away");
+}
+
+/// A letter goes in through the input method's commit, and the window under the keyboard never
+/// sees the click; Enter is a key press. The keyboard leaves keyboard focus where it was.
+#[test]
+fn osk_keys_type_into_the_focused_field() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+    let _ = client_buttons(&mut f, id);
+
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&Ti::CommitString(Some("q".into()))),
+        "{events:?}"
+    );
+    assert_eq!(
+        client_buttons(&mut f, id),
+        [],
+        "the click was the keyboard's"
+    );
+
+    let _ = f.client(id).take_key_events();
+    let enter = osk_key_center(&mut f, |k| k.keyval == Some(0xff0d));
+    osk_click(&mut f, enter);
+    f.double_roundtrip(id);
+    let keys = f.client(id).take_key_events();
+    assert!(
+        keys.iter()
+            .any(|(k, s)| *k == 28 && *s == WlKeyState::Pressed),
+        "{keys:?}"
+    );
+    assert!(f.synoik().osk.is_visible());
+
+    // Its hide key: gone at once.
+    let hide = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::Hide)
+    });
+    osk_click(&mut f, hide);
+    assert!(!f.synoik().osk.is_visible());
+}
+
+/// One of our own entries taking the key focus opens it (`_onKeyFocusChanged`), and the setting
+/// going off takes it down at once.
+#[test]
+fn osk_opens_for_a_shell_entry() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().refresh();
+    run_for(&mut f, Duration::from_millis(320));
+    assert!(f.synoik().osk.is_visible());
+
+    // A key commits into the entry.
+    run_for(&mut f, Duration::from_millis(200));
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    assert_eq!(f.synoik().run_dialog.entry(), "q");
+
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, false);
+    f.synoik_state().sync_osk();
+    assert!(!f.synoik().osk.is_enabled());
+    let output = f.synoik_output(1);
+    assert!(f.synoik().osk_rect(&output).is_none());
+}
+
+/// A key's long press brings up its other strings over it (`Key._showSubkeys`); one is picked with
+/// a press of its own, and goes in through the input method like any key. While the popup is up a
+/// click elsewhere only closes it.
+#[test]
+fn osk_long_press_offers_the_accents() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+
+    let e = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("e"));
+    pointer_motion_to(&mut f, e.0, e.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    let geometry = f.synoik().osk_subkeys_geometry().expect("the popup is up");
+    assert_eq!(geometry.keys.len(), 5);
+    assert!(
+        geometry.rect.loc.y + geometry.rect.size.h < e.1,
+        "above the key"
+    );
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).text_input_events(),
+        [],
+        "the long press typed nothing"
+    );
+
+    let acute = geometry.keys[1];
+    osk_click(
+        &mut f,
+        (
+            acute.loc.x + acute.size.w / 2.,
+            acute.loc.y + acute.size.h / 2.,
+        ),
+    );
+    assert!(f.synoik().osk_subkeys_geometry().is_none());
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&Ti::CommitString(Some("é".into()))),
+        "{events:?}"
+    );
+
+    // Again, and a click on the window above: it closes, and the window sees nothing.
+    let _ = client_buttons(&mut f, id);
+    pointer_motion_to(&mut f, e.0, e.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    assert!(f.synoik().osk_subkeys_geometry().is_some());
+    osk_click(&mut f, (300., 200.));
+    assert!(f.synoik().osk_subkeys_geometry().is_none());
+    assert_eq!(client_buttons(&mut f, id), []);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+}
+
+/// Where the focused window sits, global.
+fn osk_focused_window_y(f: &mut Fixture) -> f64 {
+    let synoik = f.synoik();
+    let window = synoik.layout.focus().unwrap().window.clone();
+    synoik.layout.floating_pos_of(&window).unwrap().y
+}
+
+/// A caret the keyboard would cover takes its window up by the keyboard's height as the keyboard
+/// slides in, and back down as it goes (`setCursorLocation`, `_animateWindow`). A caret clear of
+/// it leaves the window alone, and the window moving under the user closes the keyboard and keeps
+/// the window where the user put it (`_onFocusWindowMoving`).
+#[test]
+fn osk_slides_the_focused_window_out_of_its_way() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let start = osk_focused_window_y(&mut f);
+
+    // Well clear of the keyboard's top at 720: nothing moves.
+    f.client(id).enable_text_input();
+    f.client(id).set_cursor_rectangle(10, 10, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), start);
+
+    // The caret would be under it: up the window goes, by as much as the work area allows.
+    let local = (760. - start) as i32;
+    f.client(id).set_cursor_rectangle(10, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    let up = osk_focused_window_y(&mut f);
+    let output = f.synoik_output(1);
+    let top = f
+        .synoik()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .working_area()
+        .loc
+        .y;
+    assert_eq!(up, (start - 360.).max(top), "start {start}");
+    assert!(up < start);
+
+    // Typing on keeps it there; the keyboard going takes it back down.
+    f.client(id).set_cursor_rectangle(30, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(osk_focused_window_y(&mut f), up);
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(!f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), start);
+
+    // Up again, then the window is moved: the keyboard goes, the window stays.
+    f.client(id).enable_text_input();
+    f.client(id).set_cursor_rectangle(10, local, 2, 20);
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), up);
+    f.synoik().layout.move_floating_window(
+        None,
+        synoik_ipc::PositionChange::AdjustFixed(40.),
+        synoik_ipc::PositionChange::AdjustFixed(0.),
+        false,
+    );
+    run_for(&mut f, Duration::from_millis(400));
+    assert!(!f.synoik().osk.is_visible());
+    assert_eq!(osk_focused_window_y(&mut f), up);
+}
+
+/// The language key brings up the input sources over itself, with "Keyboard Settings" and none of
+/// the panel menu's extras (`LanguageSelectionPopup`). A click on the keyboard while it is up only
+/// closes it, and the keyboard going takes it along.
+#[test]
+fn osk_language_key_lists_the_input_sources() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let output = f.synoik_output(1);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let globe = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::LanguageMenu)
+    });
+    osk_click(&mut f, globe);
+    run_for(&mut f, Duration::from_millis(300));
+    let popover = &f.synoik().panel_popover;
+    assert!(popover.grabs_input());
+    assert!(
+        !matches!(
+            f.synoik().keyboard_focus,
+            crate::synoik::KeyboardFocus::Popover
+        ),
+        "the field keeps the focus, and with it the keyboard"
+    );
+    let popover = &f.synoik().panel_popover;
+    assert!(popover.contains(&output, Point::from((globe.0, globe.1 - 60.))));
+    assert!(
+        !popover.contains(&output, Point::from(globe)),
+        "above the key"
+    );
+    let rows = popover.input_source_rows();
+    assert_eq!(rows.last().map(String::as_str), Some("Keyboard Settings"));
+    assert!(!rows.iter().any(|r| r == "Show Keyboard Layout"));
+
+    let _ = f.client(id).text_input_events();
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    osk_click(&mut f, q);
+    assert!(!f.synoik().panel_popover.grabs_input());
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id)
+            .text_input_events()
+            .contains(&Ti::CommitString(Some("q".into()))),
+        "the click only closed the menu"
+    );
+
+    osk_click(&mut f, globe);
+    assert!(f.synoik().panel_popover.grabs_input());
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(100));
+    assert!(!f.synoik().panel_popover.grabs_input());
+}
+
+/// The emoji key turns the keyboard into its emoji page (`_toggleEmoji`): the smileys' first page
+/// with their section key latched, an emoji going in through the input method as it is, a long
+/// press offering the skin tones, a sideways drag turning the page, the section keys jumping, and
+/// ABC going back. The keyboard comes back up on its letters (`_open`).
+#[test]
+fn osk_emoji_page() {
+    use super::client::TextInputEvent as Ti;
+    use crate::osk::layout::{Action, Face};
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let emoji_key = osk_key_center(&mut f, |k| k.action == Some(Action::Emoji));
+    osk_click(&mut f, emoji_key);
+    assert!(f.synoik().osk.emoji_active());
+    assert_eq!(f.synoik().osk.emoji_section(), Some(0));
+    assert_eq!(
+        f.synoik().osk.emoji_indicators(100.).map(|(_, p)| p),
+        Some(0.)
+    );
+
+    // A tap commits the emoji, with no modifiers and no key presses.
+    let _ = f.client(id).text_input_events();
+    let grinning = osk_key_center(&mut f, |k| k.face == Face::Emoji("😀".into()));
+    osk_click(&mut f, grinning);
+    f.double_roundtrip(id);
+    assert!(f
+        .client(id)
+        .text_input_events()
+        .contains(&Ti::CommitString(Some("😀".into()))));
+    assert!(f.synoik().osk.emoji_active(), "the page stays up");
+
+    // The people's section: its first emoji takes skin tones.
+    let people = osk_key_center(&mut f, |k| k.action == Some(Action::EmojiSection(1)));
+    osk_click(&mut f, people);
+    assert_eq!(f.synoik().osk.emoji_section(), Some(1));
+    let selfie = osk_key_center(&mut f, |k| k.face == Face::Emoji("🤳".into()));
+    pointer_motion_to(&mut f, selfie.0, selfie.1);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    run_for(&mut f, Duration::from_millis(300));
+    f.pointer_button(LEFT, ButtonState::Released);
+    let geometry = f.synoik().osk_subkeys_geometry().expect("the tones are up");
+    assert_eq!(geometry.keys.len(), 6);
+    let dark = geometry.keys[5];
+    osk_click(
+        &mut f,
+        (dark.loc.x + dark.size.w / 2., dark.loc.y + dark.size.h / 2.),
+    );
+    f.double_roundtrip(id);
+    assert!(f
+        .client(id)
+        .text_input_events()
+        .contains(&Ti::CommitString(Some("🤳🏿".into()))));
+
+    // Back to the smileys, and drag the page leftwards: the next one comes in, and the press
+    // the drag started with types nothing.
+    let smileys = osk_key_center(&mut f, |k| k.action == Some(Action::EmojiSection(0)));
+    osk_click(&mut f, smileys);
+    let pager = f.synoik().osk_emoji_pager().unwrap();
+    let y = pager.loc.y + pager.size.h / 2.;
+    let x0 = pager.loc.x + pager.size.w * 0.8;
+    pointer_motion_to(&mut f, x0, y);
+    f.pointer_button(LEFT, ButtonState::Pressed);
+    for step in 1..=12 {
+        run_for(&mut f, Duration::from_millis(16));
+        pointer_motion_to(&mut f, x0 - pager.size.w * 0.05 * f64::from(step), y);
+    }
+    run_for(&mut f, Duration::from_millis(200));
+    f.pointer_button(LEFT, ButtonState::Released);
+    run_for(&mut f, Duration::from_millis(900));
+    assert_eq!(
+        f.synoik()
+            .osk
+            .emoji_indicators(pager.size.w)
+            .map(|(_, p)| p),
+        Some(1.)
+    );
+    assert_eq!(f.synoik().osk.emoji_section(), Some(0));
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+
+    // A touchpad's two-finger scroll turns it too, on the touchpad's own scale: a page per
+    // `TOUCHPAD_BASE_DISTANCE` of travel at `SCROLL_MULTIPLIER`.
+    let mid = (pager.loc.x + pager.size.w / 2., y);
+    pointer_motion_to(&mut f, mid.0, mid.1);
+    for _ in 0..30 {
+        f.scroll_finger(1., 0.);
+        run_for(&mut f, Duration::from_millis(16));
+    }
+    f.scroll_finger(0., 0.);
+    run_for(&mut f, Duration::from_millis(900));
+    assert_eq!(
+        f.synoik()
+            .osk
+            .emoji_indicators(pager.size.w)
+            .map(|(_, p)| p),
+        Some(2.)
+    );
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).text_input_events(), []);
+
+    // ABC is the letters again.
+    let abc = osk_key_center(&mut f, |k| k.face == Face::Label("ABC".into()));
+    osk_click(&mut f, abc);
+    assert!(!f.synoik().osk.emoji_active());
+
+    // Hidden from the emoji page, it comes back on its letters.
+    osk_click(&mut f, emoji_key);
+    assert!(f.synoik().osk.emoji_active());
+    f.client(id).disable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(400));
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert!(!f.synoik().osk.emoji_active());
+}
+
+/// A field that asks for sentence capitalisation gets the shift level at its start and after a
+/// full stop, from the surrounding text it sends (`_updateLevelFromHints`), and the letters back
+/// once a capital is in.
+#[test]
+fn osk_capitalises_sentences() {
+    use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
+        ContentHint, ContentPurpose,
+    };
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    let page = |f: &mut Fixture| f.synoik().osk.level().unwrap().name.clone();
+    // One commit with all of it, as GTK sends it on a click into the field: mutter reads the
+    // content type before the surrounding text, so the surrounding text answers the hint at once.
+    for _ in 0..2 {
+        f.client(id).enable_text_input_with(
+            ContentHint::AutoCapitalization,
+            ContentPurpose::Normal,
+            "",
+            0,
+        );
+        osk_feed(&mut f, id, &seen);
+        assert_eq!(page(&mut f), "shift", "not a commit late");
+    }
+    run_for(&mut f, Duration::from_millis(600));
+    assert!(f.synoik().osk.is_visible());
+    assert_eq!(page(&mut f), "shift");
+
+    let h = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("H"));
+    osk_click(&mut f, h);
+    f.client(id).set_surrounding_text("H", 1, 1);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(page(&mut f), "default");
+
+    let dot = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("."));
+    osk_click(&mut f, dot);
+    f.client(id).set_surrounding_text("Hi. ", 4, 4);
+    osk_feed(&mut f, id, &seen);
+    assert_eq!(page(&mut f), "shift");
+}
+
+/// With the setting off, the keyboard exists while the seat is in touch mode and a touchscreen is
+/// what was used last (`KeyboardManager._syncEnabled`'s `autoEnabled`); a mouse takes it away.
+#[test]
+fn osk_comes_with_touch_mode() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, false);
+    f.synoik_state().sync_osk();
+    assert!(!f.synoik().osk.is_enabled());
+
+    // A touchscreen alone, with a mouse plugged in: no touch mode.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        has_pointer: true,
+        ..Default::default()
+    });
+    f.touch_down(300., 300.);
+    f.touch_up();
+    assert!(!f.synoik().osk.is_enabled());
+
+    // Unplug the mouse.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        ..Default::default()
+    });
+    assert!(f.synoik().osk.is_enabled(), "the touchscreen was the last");
+    pointer_motion_to(&mut f, 400., 400.);
+    assert!(!f.synoik().osk.is_enabled(), "a pointer was the last");
+    f.touch_down(300., 300.);
+    f.touch_up();
+    assert!(f.synoik().osk.is_enabled());
+
+    // A tablet-mode switch decides when there is one.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        has_tablet_switch: true,
+        ..Default::default()
+    });
+    assert!(!f.synoik().osk.is_enabled());
+    f.synoik_state().osk_set_tablet_mode(true);
+    assert!(f.synoik().osk.is_enabled());
+}
+
+/// A touch dragged up from the bottom edge pulls the keyboard up after it, and past
+/// `DRAG_DISTANCE` it opens the rest of the way; let go short of that and it drops back
+/// (`ShellEdgeDragGesture`, `gestureProgress`/`gestureActivate`/`gestureCancel`). A touch resting
+/// on the edge is not a drag.
+#[test]
+fn osk_bottom_edge_drag() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik().seat.add_touch();
+    let output = f.synoik_output(1);
+    assert!(f.synoik().osk.is_enabled());
+    assert!(!f.synoik().osk.is_visible());
+
+    f.touch_down(960., 1075.);
+    f.touch_motion(960., 1050.);
+    assert!(!f.synoik().osk.is_visible());
+    let rect = f.synoik().osk_rect(&output).expect("following the finger");
+    assert_eq!(rect.loc.y, 1080. - 25.);
+    f.touch_motion(960., 1010.);
+    assert_eq!(f.synoik().osk_rect(&output).unwrap().loc.y, 1080. - 65.);
+    // Let go short of the distance: back down.
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(f.synoik().osk_rect(&output).is_none());
+    assert!(!f.synoik().osk.is_visible());
+
+    // All the way: it opens, at once.
+    f.touch_down(960., 1075.);
+    f.touch_motion(960., 1040.);
+    f.touch_motion(960., 990.);
+    assert!(f.synoik().osk.is_visible());
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert_eq!(f.synoik().osk_rect(&output).unwrap().loc.y, 720.);
+
+    // Down again; a touch that rests at the edge first is no drag.
+    f.synoik_state().osk_close(true);
+    run_for(&mut f, Duration::from_millis(300));
+    f.touch_down(960., 1075.);
+    run_for(&mut f, Duration::from_millis(250));
+    f.touch_motion(960., 990.);
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(!f.synoik().osk.is_visible());
+}
+
+/// Two thumbs type two letters: each touch point holds its own key (`_touchPressSlot`), so a
+/// second press that starts before the first ends is typed too, each on its own release. Nothing
+/// of either touch reaches the window under the keyboard.
+#[test]
+fn osk_two_fingers_type_two_keys() {
+    use super::client::TextInputEvent as Ti;
+
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.synoik().seat.add_touch();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+    let _ = f.client(id).text_input_events();
+
+    let q = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("q"));
+    let p = osk_key_center(&mut f, |k| k.commit.as_deref() == Some("p"));
+    f.touch_down_slot(0, q.0, q.1);
+    f.touch_down_slot(1, p.0, p.1);
+    f.touch_up_slot(0);
+    f.touch_up_slot(1);
+    f.double_roundtrip(id);
+    let commits: Vec<_> = f
+        .client(id)
+        .text_input_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Ti::CommitString(Some(s)) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commits, ["q", "p"]);
+}
+
+/// The keyboard's language menu takes no keys: typing on a hardware keyboard while it is up goes
+/// on into the field (`LanguageSelectionPopup`'s items do not take the key focus).
+#[test]
+fn osk_language_menu_lets_typing_through() {
+    let (mut f, id, seen, _requests) = osk_fixture();
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    f.client(id).enable_text_input();
+    osk_feed(&mut f, id, &seen);
+    run_for(&mut f, Duration::from_millis(600));
+
+    let globe = osk_key_center(&mut f, |k| {
+        k.action == Some(crate::osk::layout::Action::LanguageMenu)
+    });
+    osk_click(&mut f, globe);
+    assert!(f.synoik().panel_popover.is_osk_languages());
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    const KEY_A: u32 = 30;
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+    let keys: Vec<u32> = f
+        .client(id)
+        .take_key_events()
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect();
+    assert_eq!(
+        keys,
+        [KEY_A, KEY_A],
+        "the press and the release reach the field"
+    );
+    assert!(
+        f.synoik().panel_popover.is_osk_languages(),
+        "and the menu stays"
+    );
+}

@@ -19,6 +19,9 @@ pub const SDF_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdf_rect.f
 /// block's `cutoff` offset.
 pub const SDF_TRIANGLE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sdf_triangle.frag.spv"));
+/// SDF pie-timer fragment stage (GNOME's `PieTimer`): a filled, stroked pie slice. Reads the swept
+/// angle at the shared push block's `cutoff` offset and the border colour in `tex_transform[0]`.
+pub const SDF_PIE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdf_pie.frag.spv"));
 /// Textured fragment stage (sample a bound `sampler2D`, tinted by the push-constant color).
 pub const TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.spv"));
 /// Rounded-texture fragment stage (sample a `sampler2D`, then cut the corners with the SDF
@@ -29,6 +32,10 @@ pub const ROUNDED_TEX_FRAG: &[u8] =
 /// a cutoff band — niri's `GradientFadeTextureRenderElement`).
 pub const GRADIENT_FADE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gradient_fade.frag.spv"));
+/// The magnifier's colour effects (desaturate, brightness/contrast, invert lightness) over a
+/// sampled texture. Declares [`crate::render::MagEffectsPush`].
+pub const MAG_EFFECTS_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mag_effects.frag.spv"));
 /// Clipped-surface fragment stage (sample a `sampler2D` via the folded `tex_transform`, then clip
 /// to a rounded rectangle in a general `input_to_geo` geometry space — niri's
 /// `ClippedSurfaceRenderElement`, the window rounded-corner / clip-to-geometry path). Declares the

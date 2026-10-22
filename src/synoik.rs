@@ -194,9 +194,10 @@ use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
 use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::emoji_picker::{EmojiPicker, EmojiPickerRenderElement};
-use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
+use crate::ui::end_session_dialog::EndSessionDialog;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
+use crate::ui::message_dialog::MessageDialogRenderElement;
 use crate::ui::overview_search::{OverviewSearch, SearchResultEntry};
 use crate::ui::panel::{Panel, PanelElement};
 use crate::ui::popover::PanelPopover;
@@ -1173,6 +1174,8 @@ pub struct Synoik {
     /// learns the pointer left and would leave our arrow standing over its text field.
     pub client_cursor_image: CursorImageStatus,
     pub end_session_dialog: EndSessionDialog,
+    /// The confirmation a keyboard-accessibility shortcut raises.
+    pub kbd_a11y_dialog: crate::ui::kbd_a11y_dialog::KbdA11yDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
     /// caller wants coordinates, not a file. Answered on confirm *and* on every close, because a
@@ -1199,6 +1202,15 @@ pub struct Synoik {
     pub flashspot: crate::ui::flashspot::FlashSpot,
     /// The visual bell's rate limiter, global across windows (`bell.c:117-143`).
     pub visual_bell: crate::bell::VisualBell,
+    /// Sticky, Slow, Bounce and Mouse Keys (`MetaKeyboardA11y`).
+    pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11y,
+    pub pointer_a11y: crate::input::pointer_a11y::PointerA11y,
+    pub magnifier: crate::magnifier::Magnifier,
+    /// What the magnifier draws each output's frame with, by output name.
+    pub(crate) magnifier_surfaces: RefCell<HashMap<String, crate::magnifier::MagnifierSurface>>,
+    /// The on-screen keyboard. See [`crate::osk`].
+    pub osk: crate::osk::Osk,
+    pub(crate) osk_ui: crate::ui::osk::OskUi,
     /// The visual bell's fullscreen flash, while it runs.
     pub bell_flash: Option<crate::bell::BellFlash>,
     /// The hot corner's ripple.
@@ -1808,6 +1820,7 @@ pub enum KeyboardFocus {
     ExitConfirmDialog,
     RunDialog,
     EndSessionDialog,
+    KbdA11yDialog,
     /// The polkit authentication dialog, which is modal like the three above it.
     PolkitDialog,
     /// The NetworkManager secret dialog, modal in the same way.
@@ -1980,6 +1993,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => "ExitConfirmDialog",
             KeyboardFocus::RunDialog => "RunDialog",
             KeyboardFocus::EndSessionDialog => "EndSessionDialog",
+            KeyboardFocus::KbdA11yDialog => "KbdA11yDialog",
             KeyboardFocus::PolkitDialog => "PolkitDialog",
             KeyboardFocus::NetworkSecretDialog => "NetworkSecretDialog",
             KeyboardFocus::Popover => "Popover",
@@ -2011,6 +2025,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::KbdA11yDialog => None,
             KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
@@ -2029,6 +2044,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::KbdA11yDialog => None,
             KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::NetworkSecretDialog => None,
             KeyboardFocus::Popover => None,
@@ -2228,10 +2244,15 @@ impl State {
                 .unlock_dialog
                 .set_peek_locked_down(state.synoik.gnome_settings.shield.disable_show_password);
             state.synoik.sync_power_policy();
+            // Pointer accessibility as the session starts with it, and the panel's dwell-click
+            // indicator with it; later changes come through the settings watcher.
+            state.sync_pointer_a11y();
+            state.sync_magnifier();
+            state.sync_osk();
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
-            state.synoik.gnome_settings.publish_base_font();
+            state.synoik.gnome_settings.publish_style();
             state.synoik.last_power_profile =
                 state.synoik.gnome_settings.last_power_profile.clone();
             state.synoik.gnome_settings_writer = Some(writer);
@@ -2506,6 +2527,10 @@ impl State {
                             state.synoik.gnome_settings.icon_theme != settings.icon_theme;
                         state.synoik.gnome_settings = settings;
                         state.synoik.sync_cursor_settings();
+                        state.sync_keyboard_a11y();
+                        state.sync_pointer_a11y();
+                        state.sync_magnifier();
+                        state.sync_osk();
                         // `enable-animations` can flip mid-session (a11y, a user toggle), and an
                         // animation already running is left to finish on the old clock rather than
                         // snapping — same as flipping it in GNOME.
@@ -2533,7 +2558,7 @@ impl State {
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
-                        state.synoik.gnome_settings.publish_base_font();
+                        state.synoik.gnome_settings.publish_style();
                         // Both surfaces are re-derived *after* the assignment: the grid's
                         // order comes out of `app_picker_layout`, so syncing it against
                         // the old settings would show the previous arrangement until some
@@ -2693,6 +2718,11 @@ impl State {
         // These should be called periodically, before flushing the clients.
         self.synoik.popups.cleanup();
         self.refresh_popup_grab();
+        // The zoom follows the pointer wherever it was moved from — a warp, a tablet tool —
+        // as GNOME's poll of `global.get_pointer()` does. Unmoved, this does nothing.
+        self.magnifier_pointer_moved();
+        self.synoik.osk.advance();
+        self.osk_watch_focus_window(false);
         // A peek cannot outlive the session being locked: the shield swallows the overlay key's
         // release, so nothing else would ever put the strip away. Level-triggered rather than
         // hooked into each of the paths that can raise the shield, none of which could then
@@ -3755,8 +3785,15 @@ impl State {
             KeyboardFocus::ExitConfirmDialog
         } else if self.synoik.run_dialog.is_open() {
             KeyboardFocus::RunDialog
-        } else if self.synoik.end_session_dialog.is_open() {
-            KeyboardFocus::EndSessionDialog
+        } else if let Some(kind) = self.synoik.top_message_dialog() {
+            match kind {
+                crate::ui::message_dialog::MessageDialogKind::EndSession => {
+                    KeyboardFocus::EndSessionDialog
+                }
+                crate::ui::message_dialog::MessageDialogKind::KbdA11y => {
+                    KeyboardFocus::KbdA11yDialog
+                }
+            }
         } else if self.synoik.is_locked() {
             KeyboardFocus::LockScreen {
                 surface: self.synoik.lock_surface_focus(),
@@ -3769,7 +3806,7 @@ impl State {
             KeyboardFocus::ScreenshotUi
         } else if self.synoik.switcher.is_open() {
             KeyboardFocus::Switcher
-        } else if self.synoik.panel_popover.grabs_input() {
+        } else if self.synoik.panel_popover.takes_key_focus() {
             KeyboardFocus::Popover
         } else if let Some(output) = self.synoik.layout.active_output() {
             let mon = self.synoik.layout.monitor_for_output(output).unwrap();
@@ -4019,6 +4056,7 @@ impl State {
         // moving (a modal dialog over the same window keeps `KeyboardFocus::Layout`), and the
         // engine must not keep composing into an entry that has gone away.
         self.sync_im_focus();
+        self.sync_osk_focus();
     }
 
     /// Loads the xkb keymap from a file config setting.
@@ -8798,7 +8836,9 @@ impl Synoik {
         let hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key, keybindings);
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
-        let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
+        let end_session_dialog = EndSessionDialog::new(animation_clock.clone());
+        let kbd_a11y_dialog =
+            crate::ui::kbd_a11y_dialog::KbdA11yDialog::new(animation_clock.clone());
         let polkit_ui =
             crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
         let network_secret_ui = crate::ui::network_secret_dialog::NetworkSecretDialogUi::new(
@@ -9143,6 +9183,7 @@ impl Synoik {
             emoji_picker_owns_cursor: false,
             client_cursor_image: CursorImageStatus::default_named(),
             end_session_dialog,
+            kbd_a11y_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),
             cast_area_indicator: Default::default(),
@@ -9150,6 +9191,12 @@ impl Synoik {
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             visual_bell: crate::bell::VisualBell::new(),
+            keyboard_a11y: Default::default(),
+            pointer_a11y: Default::default(),
+            magnifier: Default::default(),
+            magnifier_surfaces: Default::default(),
+            osk: Default::default(),
+            osk_ui: Default::default(),
             bell_flash: None,
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),
@@ -10328,6 +10375,13 @@ impl Synoik {
             self.dock.forget_pressure();
             return;
         }
+        // Nor while the on-screen keyboard is up along that edge: a press on its bottom row is
+        // the pointer against the edge, and the keyboard draws over the dock anyway. Ours to
+        // decide — GNOME has no bottom chrome to share the edge with.
+        if self.osk_rect(&output).is_some() {
+            self.dock.forget_pressure();
+            return;
+        }
 
         let discarded = unclamped - pos;
         if self
@@ -10548,6 +10602,27 @@ impl Synoik {
     /// Returns the workspace under the position to be activated.
     ///
     /// The return value is an output and a workspace index on it.
+    /// The open message dialog on top, if any: the one raised last.
+    pub fn top_message_dialog(&self) -> Option<crate::ui::message_dialog::MessageDialogKind> {
+        use crate::ui::message_dialog::MessageDialogKind;
+        [
+            (
+                MessageDialogKind::EndSession,
+                self.end_session_dialog.is_open(),
+                self.end_session_dialog.raised(),
+            ),
+            (
+                MessageDialogKind::KbdA11y,
+                self.kbd_a11y_dialog.is_open(),
+                self.kbd_a11y_dialog.raised(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, open, _)| *open)
+        .max_by_key(|(_, _, raised)| *raised)
+        .map(|(kind, _, _)| kind)
+    }
+
     pub fn workspace_under(
         &self,
         extended_bounds: bool,
@@ -10555,7 +10630,7 @@ impl Synoik {
     ) -> Option<(Output, &Workspace<Mapped>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10641,7 +10716,7 @@ impl Synoik {
     ) -> Option<(Output, Point<f64, Logical>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10733,7 +10808,7 @@ impl Synoik {
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
             || self.is_locked()
@@ -10798,9 +10873,13 @@ impl Synoik {
         // The ordering here must be consistent with the ordering in render() so that input is
         // consistent with the visuals.
 
+        if self.osk_contains(pos) {
+            return rv;
+        }
+
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
-            || self.end_session_dialog.is_open()
+            || self.top_message_dialog().is_some()
             || self.polkit_is_open()
             || self.network_secret_is_open()
         {
@@ -11274,9 +11353,15 @@ impl Synoik {
             .and_then(|slot| slot.offscreen_image())
     }
 
+    /// Which way the surfaces that follow the colour scheme lean ([`Appearance`]).
+    ///
+    /// [`Appearance`]: crate::ui::widget::style::Appearance
+    ///
+    /// High Contrast is always dark (`_high-contrast-colors.scss:3`), whatever the colour scheme,
+    /// so a light plate never lands on its black chrome.
     pub fn appearance(&self) -> crate::ui::widget::style::Appearance {
         crate::ui::widget::style::Appearance::from_dark_style(
-            self.gnome_settings.quick_toggles.dark_style,
+            self.gnome_settings.quick_toggles.dark_style || crate::ui::high_contrast(),
         )
     }
 
@@ -11882,6 +11967,7 @@ impl Synoik {
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::RunDialog => true,
             KeyboardFocus::EndSessionDialog => true,
+            KeyboardFocus::KbdA11yDialog => true,
             KeyboardFocus::PolkitDialog => true,
             KeyboardFocus::NetworkSecretDialog => true,
             KeyboardFocus::Popover => true,
@@ -11976,7 +12062,8 @@ impl Synoik {
         causes.set(
             AnimCauses::DIALOG,
             self.exit_confirm_dialog.are_animations_ongoing()
-                || self.end_session_dialog.are_animations_ongoing(),
+                || self.end_session_dialog.are_animations_ongoing()
+                || self.kbd_a11y_dialog.are_animations_ongoing(),
         );
         causes.set(
             AnimCauses::POLKIT,
@@ -12001,6 +12088,15 @@ impl Synoik {
             AnimCauses::RIPPLE,
             self.ripples.is_animating(now_unadjusted),
         );
+        causes.set(
+            AnimCauses::POINTER_A11Y,
+            self.pointer_a11y
+                .pies
+                .iter()
+                .any(|pie| pie.frame(now_unadjusted).is_some()),
+        );
+        causes.set(AnimCauses::MAGNIFIER, self.magnifier.easing());
+        causes.set(AnimCauses::OSK, self.osk.is_animating());
         causes.set(AnimCauses::DOCK, self.dock.are_animations_ongoing());
         causes.set(
             AnimCauses::SCREENSHOT_UI,
@@ -12171,6 +12267,7 @@ impl Synoik {
 
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
+        self.kbd_a11y_dialog.advance_animations();
         self.polkit_ui.advance_animations();
         self.network_secret_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
@@ -12182,6 +12279,7 @@ impl Synoik {
             self.bell_flash = None;
         }
         self.ripples.advance(self.clock.now_unadjusted());
+        self.pointer_a11y.prune_pies(self.clock.now_unadjusted());
         // A drag out of the dock holds it open until the drop, wherever the pointer goes.
         // Derived from the drag itself rather than hooked into each of the five paths that end
         // one, none of which could then forget.
@@ -12621,7 +12719,10 @@ impl Synoik {
             }
         }
 
-        self.render_inner(ctx, output, include_pointer, push);
+        match self.magnifier.view(output) {
+            Some(view) => self.render_magnified(ctx, output, include_pointer, view, push),
+            None => self.render_inner(ctx, output, include_pointer, push),
+        }
     }
 
     /// The top panel and its open popover, as the frame draws them: over the desktop in a user
@@ -12662,13 +12763,20 @@ impl Synoik {
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
             // bar; the quick-settings menu composites several elements (chrome + icons).
             // It rides the same slide so a menu caught by a switch travels with its button.
-            for element in self.panel_popover.render(
-                ctx.renderer,
-                &self.icon_cache,
-                &self.app_icon_cache,
-                &self.image_cache,
-                output,
-            ) {
+            // The on-screen keyboard's language menu is not the panel's: it goes over the
+            // keyboard, with it.
+            let elements = if self.panel_popover.is_osk_languages() {
+                Vec::new()
+            } else {
+                self.panel_popover.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    &self.image_cache,
+                    output,
+                )
+            };
+            for element in elements {
                 push(
                     RelocateRenderElement::from_element(element, panel_slide, Relocate::Relative)
                         .into(),
@@ -12677,7 +12785,7 @@ impl Synoik {
         }
     }
 
-    fn render_inner(
+    pub(crate) fn render_inner(
         &self,
         mut ctx: RenderCtx,
         output: &Output,
@@ -12739,6 +12847,10 @@ impl Synoik {
             &mut |elem| push(elem.into()),
         );
 
+        // Next, pointer accessibility's pies, each raised to the top of the shell UI as it starts
+        // (`pointerA11yTimeout.js:113-114`).
+        self.render_pointer_a11y_pies(output, output_scale, &mut |elem| push(elem.into()));
+
         // Next, the hot-corner ripple, which gnome-shell raises above the rest of the shell UI
         // (`Ripples.playAnimation`, `ripples.js:99-101`).
         self.ripples.render(
@@ -12748,6 +12860,58 @@ impl Synoik {
             self.clock.now_unadjusted(),
             &mut |elem| push(elem.into()),
         );
+
+        // Next, the on-screen keyboard, over the shell's dialogs and the shield
+        // (`addTopChrome(this.keyboardBox)`, `layout.js:296-301`).
+        if let Some(rect) = self.osk_rect(output) {
+            let geo = self.global_space.output_geometry(output).unwrap();
+            // Its language menu (`addTopChrome(this._languagePopup.actor)`, after the keyboard).
+            if self.panel_popover.is_osk_languages() {
+                for element in self.panel_popover.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    &self.image_cache,
+                    output,
+                ) {
+                    push(
+                        RelocateRenderElement::from_element(
+                            element,
+                            Point::default(),
+                            Relocate::Relative,
+                        )
+                        .into(),
+                    );
+                }
+            }
+            if let Some(mut subkeys) = self.osk_subkeys_geometry() {
+                let shift = geo.loc.to_f64();
+                subkeys.rect.loc -= shift;
+                subkeys.arrow_x -= shift.x;
+                for key in &mut subkeys.keys {
+                    key.loc -= shift;
+                }
+                self.osk_ui.render_subkeys(
+                    ctx.renderer,
+                    &self.osk,
+                    &subkeys,
+                    output_scale.x,
+                    self.gnome_settings.accent_color,
+                    &mut |elem| push(OutputRenderElements::UiTexture(elem)),
+                );
+            }
+            let mut rect = rect;
+            rect.loc -= geo.loc.to_f64();
+            self.osk_ui.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.osk,
+                rect,
+                output_scale.x,
+                self.gnome_settings.accent_color,
+                &mut |elem| push(OutputRenderElements::UiTexture(elem)),
+            );
+        }
 
         // Next, the screen transition texture.
         {
@@ -12779,14 +12943,25 @@ impl Synoik {
             &mut |elem| push(elem.into()),
         );
 
-        // Next, the end-session (logout/shutdown/restart) confirmation dialog.
-        self.end_session_dialog.render(
-            ctx.renderer,
-            &self.icon_cache,
-            output,
-            self.gnome_settings.accent_color,
-            &mut |elem| push(elem.into()),
-        );
+        // Next, the message dialogs (end-session, keyboard accessibility), the one raised last on
+        // top as it takes the input.
+        let accent = self.gnome_settings.accent_color;
+        let kbd_a11y_on_top = self.kbd_a11y_dialog.raised() > self.end_session_dialog.raised();
+        for kbd_a11y in [kbd_a11y_on_top, !kbd_a11y_on_top] {
+            let push = &mut |elem: MessageDialogRenderElement| push(elem.into());
+            if kbd_a11y {
+                self.kbd_a11y_dialog
+                    .render(ctx.renderer, &self.icon_cache, output, accent, push);
+            } else {
+                self.end_session_dialog.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    output,
+                    accent,
+                    push,
+                );
+            }
+        }
 
         // The network secret dialog, under polkit: both defer rather than stacking on a shield,
         // and if the two ever coincide, authenticating is the more urgent of the two.
@@ -17098,7 +17273,13 @@ impl Synoik {
         // left stuck on by a path that forgets to clear it — the same reason this
         // whole function re-snapshots instead of taking invalidation hooks.
         let starting = self.app_system.starting_apps().next().is_some();
-        let icon = starting.then_some(CursorIcon::Wait);
+        // A dwell gesture's crosshair is the stage cursor, set over whatever the launch asked for
+        // (`pointerA11yTimeout.js:121`).
+        let icon = if self.pointer_a11y.gesture_cursor {
+            Some(CursorIcon::Crosshair)
+        } else {
+            starting.then_some(CursorIcon::Wait)
+        };
         if self.cursor_manager.set_global_override(icon) {
             // The `&&` below this call can swallow a `true`, and the cursor is drawn
             // per frame, so it queues its own redraw.
@@ -18650,7 +18831,7 @@ synoik_render_elements! {
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EmojiPicker = EmojiPickerRenderElement,
-        EndSessionDialog = EndSessionDialogRenderElement,
+        MessageDialog = MessageDialogRenderElement,
         PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
         NetworkSecretDialog = crate::ui::network_secret_dialog::NetworkSecretDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,
@@ -18670,6 +18851,16 @@ synoik_render_elements! {
         RoundedTexture = RoundedTextureRenderElement<crate::render_helpers::vulkan::VkTexture>,
         // The raised background under a dragged folder's composed icon.
         RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
+        // Pointer accessibility's countdown at the pointer.
+        Pie = crate::render_helpers::pie::PieRenderElement,
+        // The magnifier's view of the screen, and the pointer it draws magnified.
+        Magnified = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            OffscreenRenderElement
+        >>>,
+        MagnifiedWithEffects = crate::render_helpers::mag_effects::MagEffectsRenderElement,
+        MagnifiedPointer = crate::render_helpers::off_plane::OffPlaneRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<PointerRenderElements>>>
+        >,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
         // The window picker's per-preview chrome: close button, caption, app icon.

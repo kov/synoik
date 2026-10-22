@@ -734,6 +734,11 @@ bitflags::bitflags! {
         const THUMB_KINETIC_SCROLL = 1 << 34;
         /// The visual bell's fullscreen flash.
         const BELL = 1 << 35;
+        /// A pointer-accessibility pie counting down at the pointer.
+        const POINTER_A11Y = 1 << 36;
+        const MAGNIFIER = 1 << 37;
+        /// The on-screen keyboard sliding in or out.
+        const OSK = 1 << 38;
     }
 }
 
@@ -798,6 +803,9 @@ impl AnimCauses {
             (AnimCauses::THUMB_EDGE_SCROLL, "thumb-edge-scroll"),
             (AnimCauses::THUMB_KINETIC_SCROLL, "thumb-kinetic-scroll"),
             (AnimCauses::BELL, "bell"),
+            (AnimCauses::POINTER_A11Y, "pointer-a11y"),
+            (AnimCauses::MAGNIFIER, "magnifier"),
+            (AnimCauses::OSK, "osk"),
         ];
         TABLE
             .iter()

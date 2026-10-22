@@ -2572,6 +2572,21 @@ impl<W: LayoutElement> Workspace<W> {
     /// Where an operation aimed at `id` should go: the window's own home, or the active half
     /// when no window is named — `None` means "whatever is active", which is the convention the
     /// callers taking `Option<&W::Id>` use.
+    /// See [`FloatingSpace::slide_y`].
+    pub fn slide_floating_window_y(
+        &mut self,
+        id: &W::Id,
+        dy: f64,
+        config: synoik_config::Animation,
+    ) -> Option<f64> {
+        self.floating.slide_y(id, dy, config)
+    }
+
+    /// Where a floating window sits on this workspace, if it is one.
+    pub fn floating_pos_of(&self, id: &W::Id) -> Option<Point<f64, Logical>> {
+        self.floating.logical_pos_of(id)
+    }
+
     fn target_home(&self, id: Option<&W::Id>) -> Option<Home> {
         match id {
             Some(id) => self.home_of(id),

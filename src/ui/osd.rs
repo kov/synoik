@@ -67,8 +67,6 @@ const SPACING: f64 = 12.;
 const INNER_SPACING: f64 = 8.;
 /// `.osd-window StIcon { icon-size: $large_icon_size }` (`_osd.scss:15`).
 const ICON_PX: f64 = 32.;
-/// `border: 1px solid $osd_outer_borders_color` (`%osd_panel`, `_common.scss:294`).
-const BORDER: f64 = 1.;
 /// `StLabel:ltr { margin-right: $base_padding }` (`_osd.scss:18`) and the same on
 /// `.level` (`_osd.scss:32`) — both trailing margins, so the column is that much
 /// wider than its content.
@@ -79,10 +77,7 @@ const LEVEL_MARGIN_BOTTOM: f64 = 4.;
 /// `margin-bottom: 4em` (`_osd.scss:14`) — em against the element's own 11pt font.
 const MARGIN_BOTTOM_EM: f64 = 4.;
 
-/// `%osd_panel`'s colours, shared with the Alt-Tab `.switcher-list` — see [`style::OSD_BG`].
-const OSD_BG: widget::Rgba = style::OSD_BG;
 const OSD_FG: widget::Rgba = style::OSD_FG;
-const OSD_BORDER: widget::Rgba = style::OSD_BORDER;
 /// The level bar's theme colors (`_osd.scss:27-30`); the dark variant's track is
 /// `transparentize($osd_fg_color, 0.9)`, and the overdrive is `$destructive_color`.
 const LEVEL_STYLE: BarLevelStyle = BarLevelStyle {
@@ -202,12 +197,12 @@ fn layout(content: &OsdContent) -> OsdLayout {
         };
     let content_h = ICON_PX.max(column_h);
     let size = Size::from((
-        content_w + 2. * (PADDING_H + BORDER),
-        content_h + 2. * (PADDING_V + BORDER),
+        content_w + 2. * (PADDING_H + style::osd_border_width()),
+        content_h + 2. * (PADDING_V + style::osd_border_width()),
     ));
 
-    let left = BORDER + PADDING_H;
-    let top = BORDER + PADDING_V;
+    let left = style::osd_border_width() + PADDING_H;
+    let top = style::osd_border_width() + PADDING_V;
     // The icon is `y_expand`, so it drives the row height and centers in it.
     let icon_center = Point::from((left + ICON_PX / 2., top + content_h / 2.));
     // The column is `y_align: CENTER` (`osdWindow.js:36-38`).
@@ -450,8 +445,8 @@ impl OsdWindow {
         p.clear(style::TRANSPARENT)?;
         // `border-radius: $forced_circular_radius` — a pill, so half the height.
         let radius = layout.size.h / 2.;
-        p.fill_rounded_full(radius, OSD_BG)?;
-        p.stroke_rounded_full(radius, BORDER, OSD_BORDER)?;
+        p.fill_rounded_full(radius, style::osd_bg())?;
+        p.stroke_rounded_full(radius, style::osd_border_width(), style::osd_border())?;
         if let (Some(rect), Some(run)) = (layout.label, label) {
             p.text(
                 run,

@@ -261,7 +261,15 @@ pub mod style {
     /// `_message-list.scss:8`) and the QS group separators
     /// (`.popup-separator-menu-item-separator`, `_popovers.scss:117`). The single source of truth
     /// so the two can't drift; draw both via [`Painter::hairline`](super::Painter::hairline).
-    pub const BORDERS: Rgba = [1., 1., 1., 0.1];
+    ///
+    /// **High Contrast:** `$border_opacity: .5` (`_default-colors.scss:46`).
+    pub fn borders() -> Rgba {
+        if crate::ui::high_contrast() {
+            [1., 1., 1., 0.5]
+        } else {
+            [1., 1., 1., 0.1]
+        }
+    }
 
     /// Source-over composite of `fg` (possibly translucent) onto `bg` — the color a translucent
     /// overlay *would* produce over `bg`. Use it to lay a translucent [`BORDERS`] hairline onto a
@@ -340,10 +348,46 @@ pub mod style {
     /// `%osd_panel` background — `$osd_bg_color` = `lighten(#222226, 5%)` ≈ `#2e2e33`
     /// (`_colors.scss:17`). Shared: the OSD pill and the Alt-Tab `.switcher-list` both extend
     /// `%osd_panel` (`_common.scss:294`, `_switcher-popup.scss:11`), so they are one value.
-    pub const OSD_BG: Rgba = [0.180, 0.180, 0.200, 1.];
+    ///
+    /// **High Contrast:** `$osd_bg_color: $base_color` = `#000` (`_high-contrast-colors.scss:20`).
+    pub fn osd_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0, 0, 0)
+        } else {
+            [0.180, 0.180, 0.200, 1.]
+        }
+    }
     /// `%osd_panel` hairline — `$osd_outer_borders_color` =
     /// `transparentize($osd_fg_color, 0.98)` (`_colors.scss:44`).
-    pub const OSD_BORDER: Rgba = [1., 1., 1., 0.02];
+    ///
+    /// **High Contrast:** `$hc_inset_color`, drawn 2px wide ([`osd_border_width`]) by
+    /// `draw_hc_inset($width: 2px, $border: true)` (`_common.scss:297-299`).
+    pub fn osd_border() -> Rgba {
+        if crate::ui::high_contrast() {
+            [1., 1., 1., 0.4]
+        } else {
+            [1., 1., 1., 0.02]
+        }
+    }
+    /// The `%osd_panel` border's width: 1px, or High Contrast's 2px inset (`_common.scss:297-299`).
+    pub fn osd_border_width() -> f64 {
+        if crate::ui::high_contrast() {
+            2.
+        } else {
+            1.
+        }
+    }
+
+    /// `$hc_inset_color` = `transparentize($fg_color, 0.6)` (`_high-contrast-colors.scss:83`): the
+    /// 1px outline High Contrast draws inside buttons, entries and cards (`draw_hc_inset`,
+    /// `_drawing.scss:32-50`). Drawn by [`Painter::hc_inset`](super::Painter::hc_inset).
+    pub const HC_INSET: Rgba = [1., 1., 1., 0.4];
+
+    /// `$shadow_color`: High Contrast removes every shadow (`_default-colors.scss:49-50`).
+    pub fn shadows() -> bool {
+        !crate::ui::high_contrast()
+    }
+
     /// `$osd_fg_color` = `$light_1` (`_colors.scss:16`) — the foreground on an OSD panel.
     pub const OSD_FG: Rgba = TEXT;
 
@@ -364,35 +408,122 @@ pub mod style {
 
     /// Modal-dialog card background — GNOME `$bg_color` `#36363a` (`_dialogs.scss:4`,
     /// `_colors.scss:12`). Flat, borderless; corners rounded to `$alert_radius` (18px).
-    pub const DIALOG_BG: Rgba = [0.212, 0.212, 0.227, 1.];
+    ///
+    /// **High Contrast:** `$bg_color: lighten(#000, 10%)` = `#1a1a1a`
+    /// (`_high-contrast-colors.scss:12`).
+    pub fn dialog_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x1a, 0x1a, 0x1a)
+        } else {
+            [0.212, 0.212, 0.227, 1.]
+        }
+    }
     /// `.popup-menu-content` background — GNOME `$bg_color` `#36363a` (`_popovers.scss:31`,
     /// `_colors.scss:12`). The single home for the panel-popover box fill (QS / date /
     /// input-source), drawn once by the shared popover chrome so the three surfaces can't drift
     /// (they each hand-rolled a *different, too-dark* value before). Same value as [`DIALOG_BG`]
     /// today — both are `$bg_color` — but cited to the menu surface so they may diverge.
-    pub const MENU_BG: Rgba = [0.212, 0.212, 0.227, 1.];
+    ///
+    /// **High Contrast:** `$bg_color` = `#1a1a1a`.
+    pub fn menu_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x1a, 0x1a, 0x1a)
+        } else {
+            [0.212, 0.212, 0.227, 1.]
+        }
+    }
     /// `%card` / `.message` base surface — GNOME `$card_bg_color` = `lighten($bg_color, 7%)` ≈
     /// `#47474c` (`_colors.scss:29`). The "one step lighter than the menu" fill used by the
     /// date popover's today card and the QS detail card.
-    pub const CARD_BG: Rgba = [0.278, 0.278, 0.298, 1.];
+    ///
+    /// **High Contrast:** `hc_color_mix($card_bg_color)` = `st-mix(#1a1a1a, #fff, 87%)`
+    /// (`%card`, `_drawing.scss:243`).
+    pub fn card_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x38, 0x38, 0x38)
+        } else {
+            [0.278, 0.278, 0.298, 1.]
+        }
+    }
     /// `.button` normal fill — the subtle raised gray `mix($fg, $bg, 9%)` over the
     /// dialog card (`_drawing.scss:171`, `$background_mix_factor` 9%).
-    pub const BUTTON_BG: Rgba = [0.283, 0.283, 0.297, 1.];
+    ///
+    /// **High Contrast:** `hc_color_mix(st-mix(#fff, #1a1a1a, 9%))` (`_drawing.scss:243`).
+    pub fn button_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x4a, 0x4a, 0x4a)
+        } else {
+            [0.283, 0.283, 0.297, 1.]
+        }
+    }
+    /// An on-screen keyboard key's fill (`.keyboard-key`, `_keyboard.scss:31-60`), compiled:
+    /// `st-mix(#fff, #4d4d4d, 9%)` for a character key and `st-mix(#fff, #333, 9%)` for a
+    /// `.default-key`, lightened 4% on `:hover`, 9% on `:active`, 13% on both.
+    ///
+    /// **High Contrast** mixes each with white at 13% (`hc_color_mix`).
+    pub fn key_cap_bg(default_key: bool, hovered: bool, active: bool) -> Rgba {
+        let base = if default_key {
+            rgb8(0x45, 0x45, 0x45)
+        } else {
+            rgb8(0x5d, 0x5d, 0x5d)
+        };
+        let lift = match (hovered, active) {
+            (_, true) if hovered => 0.13,
+            (_, true) => 0.09,
+            (true, false) => 0.04,
+            (false, false) => 0.,
+        };
+        let c = lighten(base, lift);
+        if crate::ui::high_contrast() {
+            let mix = |v: f32| v * 0.87 + 0.13;
+            [mix(c[0]), mix(c[1]), mix(c[2]), 1.]
+        } else {
+            c
+        }
+    }
+    /// `.keyboard-key`'s `box-shadow: 0 1px 0 0 $shadow_color`.
+    pub const KEY_CAP_SHADOW: Rgba = [0., 0., 0., 0.2];
+
     /// `.modal-dialog-button` fill — translucent white `rgba(255,255,255,0.1)`
     /// (`%dialog_button`, `_drawing.scss:218`). Neutral dialog action button.
-    pub const DIALOG_BUTTON_BG: Rgba = [1., 1., 1., 0.1];
+    ///
+    /// **High Contrast:** `st-mix(rgba(255,255,255,.1), #fff, 87%)` — the mix runs on
+    /// premultiplied colour, so it is white at 0.217.
+    pub fn dialog_button_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            [1., 1., 1., 0.217]
+        } else {
+            [1., 1., 1., 0.1]
+        }
+    }
     /// `.destructive-action` fill — `$red_4 #c01c28` (`_default-colors.scss:11`).
     pub const DESTRUCTIVE_BG: Rgba = [0.753, 0.110, 0.157, 1.];
     /// `%system_entry` normal background — `mix($system_fg_color, $system_bg_color, 9%)`
     /// (`_drawing.scss` `entry()` mixin, `$background_mix_factor` 9%), with
     /// `$system_fg_color`=#fafafb and `$system_bg_color`=lighten(#222226, 5%). The
     /// overview `search-entry` pill fill; always-dark. (`_colors.scss:20-21,47`.)
-    pub const ENTRY_BG: Rgba = [0.252, 0.252, 0.267, 1.];
+    ///
+    /// **High Contrast:** `st-mix(#fff, #0d0d0d, 9%)`, the system bg being `lighten(#000, 5%)`.
+    pub fn entry_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x23, 0x23, 0x23)
+        } else {
+            [0.252, 0.252, 0.267, 1.]
+        }
+    }
     /// `$system_overlay_bg_color` = `mix($system_base_color, $system_fg_color, 90%)`
     /// ≈ `#38383b` (`_colors.scss:50`) — the non-transparent overlay surface used by
     /// the dash and the `.search-section-content` results card. Same value the dash
     /// bakes as its pill (kept in sync via this one constant).
-    pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
+    ///
+    /// **High Contrast:** `st-mix(#0d0d0d, #fff, 90%)`.
+    pub fn overlay_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x25, 0x25, 0x25)
+        } else {
+            [0.218, 0.218, 0.233, 1.]
+        }
+    }
     /// The overview chrome's **plate** fill — every opaque surface the overview lays over its
     /// backdrop: the dash pill, the search entry, the search-results card and the app-grid's folder
     /// tiles. One constant so the four cannot drift, which is the whole point: they read as one
@@ -483,6 +614,17 @@ pub mod style {
         }
     }
 
+    /// An accent-filled control's fill: the accent, or under High Contrast `hc_color_mix` of it —
+    /// `st-mix(-st-accent-color, #fff, 87%)` (`.button.default`, `.quick-toggle:checked`).
+    pub fn accent_fill(accent: Rgba) -> Rgba {
+        if crate::ui::high_contrast() {
+            let mix = |c: f32| 0.87 * c + 0.13;
+            [mix(accent[0]), mix(accent[1]), mix(accent[2]), accent[3]]
+        } else {
+            accent
+        }
+    }
+
     /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
     /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
     pub fn accent_rgba(accent: [u8; 3]) -> Rgba {
@@ -506,7 +648,15 @@ pub mod style {
     /// `$background_mix_factor` 9%), i.e. 9% of #fafafb over the overlay surface ≈ `#49494d`.
     /// NOT the surface itself: `$c` is the background the button sits on, not its fill, and
     /// using it directly makes the button invisible against its own container.
-    pub const OVERLAY_BUTTON_BG: Rgba = [0.287, 0.287, 0.301, 1.];
+    ///
+    /// **High Contrast:** `hc_color_mix(st-mix(#fff, #252525, 9%))`.
+    pub fn overlay_button_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x53, 0x53, 0x53)
+        } else {
+            [0.287, 0.287, 0.301, 1.]
+        }
+    }
 
     /// `.app-folder` fill — the one tile in the grid that is **raised** rather than flat:
     /// `tile_button($bg:$system_base_color, $raised:true)` (`_app-grid.scss:41`) resolves to
@@ -529,7 +679,15 @@ pub mod style {
     /// resting fill the same way from the same pair — but a separate constant because they are
     /// separate rules: an entry and a button on a system surface are free to diverge, and one of
     /// them changing must not silently move the other.
-    pub const SYSTEM_BUTTON_BG: Rgba = [0.252, 0.252, 0.267, 1.];
+    ///
+    /// **High Contrast:** `hc_color_mix(st-mix(#fff, #0d0d0d, 9%))`.
+    pub fn system_button_bg() -> Rgba {
+        if crate::ui::high_contrast() {
+            rgb8(0x3f, 0x3f, 0x3f)
+        } else {
+            [0.252, 0.252, 0.267, 1.]
+        }
+    }
 
     /// Modal-dialog corner radius, logical px — GNOME `$alert_radius` (`_common.scss:43`,
     /// applied at `_dialogs.scss:6`). Note this is 18px, not `$modal_radius` (16px).
@@ -813,11 +971,11 @@ pub fn image_element(
 pub struct Avatar;
 
 impl Avatar {
-    /// The inset ring's colour — `$fg_color` at 10%, i.e. [`style::BORDERS`]. Note it is **not**
-    /// re-tinted to `$_gdm_fg` under the lock screen: `_login-lock.scss:358` overrides the
-    /// background and colour only, so the shadow keeps `_misc.scss`'s value. Its width is the 1px
-    /// [`bake_card_border`] already strokes.
-    pub const RING_COLOR: Rgba = style::BORDERS;
+    /// The inset ring's colour — `$fg_color` at 10%, the dark theme's [`style::borders`]. Note it
+    /// is **not** re-tinted to `$_gdm_fg` under the lock screen: `_login-lock.scss:358`
+    /// overrides the background and colour only, so the shadow keeps `_misc.scss`'s value. Its
+    /// width is the 1px [`bake_card_border`] already strokes.
+    pub const RING_COLOR: Rgba = [1., 1., 1., 0.1];
 
     /// The picture, clipped to a circle, centred at `center` (relative to `origin`) in a
     /// `logical_px` square. `None` when there is no picture, the load has not landed yet, or it
@@ -980,7 +1138,7 @@ impl Tooltip {
     /// `background-color: transparentize(black, 0.1)` (`:226`).
     pub const BG: Rgba = [0., 0., 0., 0.9];
     /// The 1px border — white at 10%.
-    pub const BORDER_COLOR: Rgba = style::BORDERS;
+    pub const BORDER_COLOR: Rgba = [1., 1., 1., 0.1];
     /// The label inherits the stage's 11pt body size; `%tooltip` sets no font.
     pub const TEXT_PT: f64 = 11.;
 
@@ -1438,7 +1596,7 @@ impl EntryStyle {
             EntryStyle::Search(appearance) => appearance.plate(),
             // `transparentize(white, .9)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.1],
-            EntryStyle::Dialog => style::ENTRY_BG,
+            EntryStyle::Dialog => style::entry_bg(),
         }
     }
 
@@ -1702,6 +1860,11 @@ impl Entry {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
                 p.fill_rounded_full(entry_style.radius(height), entry_style.bg())?;
+                // The `entry()` mixin's High Contrast outline (`_drawing.scss:122-124`).
+                p.hc_inset(
+                    Rectangle::from_size(Size::from((width, height))),
+                    entry_style.radius(height),
+                )?;
                 if let Some(ring) = ring {
                     p.stroke_rounded(
                         Rectangle::from_size(Size::from((width, height))),
@@ -1833,6 +1996,24 @@ impl CaretMetrics {
 /// What a cached bake is keyed by: `(scale, physical_w, physical_h)`. The revision rides beside
 /// the value rather than in here, since a stale entry is replaced, never looked up.
 type BakeKey = (NotNan<f64>, i32, i32);
+
+/// What a cached texture of our chrome was drawn under beyond its own inputs: the renderer
+/// context it lives in, and the style generation (base font, High Contrast). A cache that
+/// resets when this changes — not only the context — cannot go on serving chrome drawn in the
+/// old style until its own content next moves. [`bake`] and [`bake_content`] get the same by
+/// folding the generation into the revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleContext {
+    context: ContextId<VkTexture>,
+    generation: u64,
+}
+
+pub fn style_context(renderer: &VulkanRenderer) -> StyleContext {
+    StyleContext {
+        context: renderer.context_id(),
+        generation: crate::ui::style_generation(),
+    }
+}
 
 /// A per-widget offscreen-texture cache for [`bake`], keyed by `(scale,
 /// physical_size, revision)`. One lives (behind a `RefCell`) on each baking
@@ -2080,13 +2261,15 @@ pub fn bake_card_shadow(
         |frame, phys, ()| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(style::TRANSPARENT)?;
-            p.drop_shadow(
-                box_rect,
-                radius + spec.spread,
-                spec.blur,
-                spec.offset,
-                spec.color,
-            )?;
+            if style::shadows() {
+                p.drop_shadow(
+                    box_rect,
+                    radius + spec.spread,
+                    spec.blur,
+                    spec.offset,
+                    spec.color,
+                )?;
+            }
             Ok(())
         },
     )?;
@@ -2251,6 +2434,8 @@ pub fn bake_content<P>(
     paint: impl FnOnce(&mut VulkanFrame, Size<i32, Physical>, &P) -> anyhow::Result<()>,
 ) -> anyhow::Result<VkTexture> {
     let scale_key = NotNan::new(scale).context("non-finite scale")?;
+    // As in `bake`: a style change re-draws every widget.
+    let revision = revision ^ crate::ui::style_generation();
 
     // Same two invalidations as `bake`: a new renderer context, and a rebuilt glyph residency
     // (which means anything cached here was baked with blank text).
@@ -2633,9 +2818,9 @@ impl ButtonStyle {
     /// Base (non-hovered) fill; `accent` is the system accent, used by [`Suggested`].
     fn bg(self, accent: Rgba) -> Rgba {
         match self {
-            ButtonStyle::Normal => style::BUTTON_BG,
-            ButtonStyle::Dialog => style::DIALOG_BUTTON_BG,
-            ButtonStyle::Suggested => accent,
+            ButtonStyle::Normal => style::button_bg(),
+            ButtonStyle::Dialog => style::dialog_button_bg(),
+            ButtonStyle::Suggested => style::accent_fill(accent),
             ButtonStyle::Destructive => style::DESTRUCTIVE_BG,
         }
     }
@@ -2874,6 +3059,37 @@ impl Button {
     /// Hit-test a point in the button's own logical coordinate space.
     pub fn contains(&self, p: Point<f64, Logical>) -> bool {
         self.rect.contains(p)
+    }
+}
+
+/// A key of the on-screen keyboard (`.keyboard-key`, `_keyboard.scss:30-62`): a rounded cap with
+/// a 1px drop shadow, a bold label or a symbolic glyph, and a **latched** state that fills a
+/// `.default-key` with the accent — shift held, Ctrl or Alt latched. The keyboard, its long-press
+/// popup and its emoji page all draw keys through this.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyCap {
+    pub rect: Rectangle<f64, Logical>,
+    pub default_key: bool,
+    pub hovered: bool,
+    /// `:active`: held down.
+    pub active: bool,
+    pub latched: bool,
+}
+
+impl KeyCap {
+    /// `$key_border_radius: to_em($base_border_radius)`.
+    pub fn radius() -> f64 {
+        crate::ui::scaled_px(8.)
+    }
+
+    /// The label's text style: `fontsize($base_font_size + 5pt)`, bold.
+    pub fn text_style() -> TextStyle {
+        TextStyle::new(crate::ui::BASE_FONT_PT + 5.).bold()
+    }
+
+    /// `StIcon { icon-size: $medium_scalable_icon_size }` — 24px against the default font.
+    pub fn icon_size() -> f64 {
+        crate::ui::scaled_px(24.)
     }
 }
 
@@ -3206,7 +3422,7 @@ impl Painter<'_, '_, '_> {
             (true, _, _) => style::OSD_FLAT_ACTIVE,
             (false, true, _) => style::OSD_FLAT_CHECKED,
             (false, false, true) => style::OSD_FLAT_HOVER,
-            (false, false, false) => style::OSD_BG,
+            (false, false, false) => style::osd_bg(),
         };
         self.fill_rounded(b.rect, IconLabelButton::RADIUS, bg)?;
         if b.focused {
@@ -3250,10 +3466,18 @@ impl Painter<'_, '_, '_> {
     /// radius is `$forced_circular_radius`: half the height, a pill.
     pub fn quick_toggle(&mut self, t: &QuickToggle, accent: Rgba) -> anyhow::Result<()> {
         let radius = t.rect.size.h / 2.;
-        let bg = if t.checked { accent } else { style::BUTTON_BG };
+        let bg = if t.checked {
+            style::accent_fill(accent)
+        } else {
+            style::button_bg()
+        };
         self.fill_rounded(t.rect, radius, bg)?;
         if t.hovered {
             self.fill_rounded(t.rect, radius, style::HOVER_WASH)?;
+        }
+        // `.quick-toggle:checked` takes the `.button` outline off again.
+        if !t.checked {
+            self.hc_inset(t.rect, radius)?;
         }
         if t.focused {
             let ring = if t.checked {
@@ -3269,7 +3493,17 @@ impl Painter<'_, '_, '_> {
     pub fn icon_button(&mut self, b: &IconButton, accent: Rgba) -> anyhow::Result<()> {
         // `border-radius: $forced_circular_radius` on a square box.
         let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
-        self.fill_rounded(b.rect, radius, b.bg)?;
+        // An accent-filled one is `.icon-button.default`: `hc_color_mix`ed and without the
+        // outline. A flat one — filled with the OSD surface it sits on, as the screenshot UI's
+        // are — is `$style: flat`, which has none either (`_drawing.scss:262-275`).
+        if b.bg == accent {
+            self.fill_rounded(b.rect, radius, style::accent_fill(accent))?;
+        } else {
+            self.fill_rounded(b.rect, radius, b.bg)?;
+            if b.bg != style::osd_bg() {
+                self.hc_inset(b.rect, radius)?;
+            }
+        }
         if b.active {
             // `:active` lightens 9% where `:hover` lightens 4% (`_drawing.scss:182-183`).
             self.fill_rounded(b.rect, radius, style::SELECTED_WASH)?;
@@ -3711,6 +3945,65 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         let dst = self.rect_px(rect);
         self.frame
             .stroke_rounded_rect(color, r, w, dst, &Self::damage_of(dst))?;
+        Ok(())
+    }
+
+    /// One of a `PageIndicators` row's dots, `size` across when it is the current page, centred
+    /// on `center`. `progress` is how current it is, 0 to 1 — the row interpolates while a page
+    /// is dragged between two (`PageIndicators._updateIndicator`): two thirds the size and half
+    /// the opacity at rest, full at 1.
+    pub fn page_dot(
+        &mut self,
+        center: Point<f64, Logical>,
+        size: f64,
+        progress: f64,
+    ) -> anyhow::Result<()> {
+        const INACTIVE_SCALE: f64 = 2. / 3.;
+        const INACTIVE_OPACITY: f64 = 128. / 255.;
+        let progress = progress.clamp(0., 1.);
+        let r = size / 2. * (INACTIVE_SCALE + (1. - INACTIVE_SCALE) * progress);
+        let alpha = INACTIVE_OPACITY + (1. - INACTIVE_OPACITY) * progress;
+        let color = [style::TEXT[0], style::TEXT[1], style::TEXT[2], alpha as f32];
+        let disc = Rectangle::new(center - Point::from((r, r)), Size::from((2. * r, 2. * r)));
+        self.fill_rounded(disc, r, color)
+    }
+
+    /// A `BoxPointer` pointing down (`St.Side.BOTTOM`): a rounded box with a 1px `border`, and an
+    /// arrow `base` wide and `rise` tall hanging from its bottom edge, centred on `arrow_x`, its
+    /// outline opening into the box's (`boxpointer.js` `_drawBorder`). The bake must reach `rise`
+    /// below `rect` to hold the arrow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn box_pointer_down(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        arrow_x: f64,
+        radius: f64,
+        base: f64,
+        rise: f64,
+        bg: Rgba,
+        border: Rgba,
+    ) -> anyhow::Result<()> {
+        self.fill_rounded(rect, radius, bg)?;
+        self.stroke_rounded(rect, radius, 1., border)?;
+        let bottom = rect.loc.y + rect.size.h;
+        // The border's triangle a pixel wider, then the fill's over it — which also covers the
+        // stretch of the box's bottom border the arrow opens through.
+        self.triangle(
+            Rectangle::new(
+                Point::from((arrow_x - base / 2. - 1., bottom - 1.)),
+                Size::from((base + 2., rise + 2.)),
+            ),
+            Side::Bottom,
+            border,
+        )?;
+        self.triangle(
+            Rectangle::new(
+                Point::from((arrow_x - base / 2., bottom - 1.)),
+                Size::from((base, rise)),
+            ),
+            Side::Bottom,
+            bg,
+        )?;
         Ok(())
     }
 
@@ -4197,6 +4490,11 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         if b.hovered {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
         }
+        // A `default`-style button — the accent and destructive ones — has its inset taken off
+        // again (`draw_hc_inset($no_inset: true)`, `_drawing.scss:262-264`).
+        if matches!(b.style, ButtonStyle::Normal | ButtonStyle::Dialog) {
+            self.hc_inset(b.rect, radius)?;
+        }
         if b.focused {
             self.focus_ring(b.rect, radius, b.style.focus_ring_base(accent))?;
         }
@@ -4205,6 +4503,55 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             b.rect.loc.y + b.rect.size.h / 2.,
         ));
         self.text_clipped(label, center, Align::CENTER, style::TEXT, b.rect)?;
+        Ok(())
+    }
+
+    /// Draw a [`KeyCap`], its label centred. An icon key passes no label and composites its glyph
+    /// over the cap.
+    pub fn key_cap(
+        &mut self,
+        k: &KeyCap,
+        label: Option<&ShapedText>,
+        accent: Rgba,
+    ) -> anyhow::Result<()> {
+        let radius = KeyCap::radius();
+        if style::shadows() {
+            let mut shadow = k.rect;
+            shadow.loc.y += 1.;
+            self.fill_rounded(shadow, radius, style::KEY_CAP_SHADOW)?;
+        }
+        // `.default-key:latched` and `.emoji-panel .keyboard-key:latched`: only default keys
+        // latch on the letters, and the emoji page's section keys do.
+        let bg = if k.latched {
+            accent
+        } else {
+            style::key_cap_bg(k.default_key, k.hovered, k.active)
+        };
+        self.fill_rounded(k.rect, radius, bg)?;
+        self.hc_inset(k.rect, radius)?;
+        if let Some(label) = label {
+            // On the line box, not the ink: a row of letters keeps one baseline whether or not
+            // they descend, as St's labels do.
+            self.text_band(
+                label,
+                k.rect.loc.x + k.rect.size.w / 2.,
+                HAlign::Center,
+                k.rect.loc.y,
+                k.rect.size.h,
+                style::TEXT,
+                k.rect,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// High Contrast's outline inside a button, entry or card: `box-shadow: inset 0 0 0 1px
+    /// $hc_inset_color` (`draw_hc_inset`, `_drawing.scss:32-50`). Nothing without High Contrast,
+    /// so every surface that has one in GNOME calls this unconditionally.
+    pub fn hc_inset(&mut self, rect: Rectangle<f64, Logical>, radius: f64) -> anyhow::Result<()> {
+        if crate::ui::high_contrast() {
+            self.stroke_rounded(rect, radius, 1., style::HC_INSET)?;
+        }
         Ok(())
     }
 

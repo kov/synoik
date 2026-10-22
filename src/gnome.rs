@@ -141,6 +141,12 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.wm.preferences audible-bell`: whether a bell plays the theme's
     /// `bell-window-system` sound. Independent of Visual Alerts (`meta_bell_notify`).
     pub audible_bell: bool,
+    /// `org.gnome.desktop.a11y.keyboard`: what the keyboard filters run with
+    /// ([`crate::input::keyboard_a11y`]).
+    pub keyboard_a11y: crate::input::keyboard_a11y::KeyboardA11ySettings,
+    /// `org.gnome.desktop.a11y.mouse`.
+    pub pointer_a11y: crate::input::pointer_a11y::PointerA11ySettings,
+    pub magnifier: crate::magnifier::MagnifierSettings,
     /// `org.gnome.desktop.sound event-sounds`: the master switch for every event sound
     /// (`MetaSoundPlayer`'s `CA_PROP_CANBERRA_ENABLE`).
     pub event_sounds: bool,
@@ -323,11 +329,11 @@ impl A11yToggle {
 /// The accessibility keys gnome-shell's `ATIndicator` reads and writes
 /// (`js/ui/status/accessibility.js`).
 ///
-/// We mirror the keys faithfully, but almost none of them have a consumer in this
-/// stack yet: the magnifier, the on-screen keyboard, the keyboard filters, the visual
-/// bell and the screen reader are separate subsystems, and our own chrome does not
-/// follow `high-contrast` the way St does. Writing the canonical key is still the right
-/// port — GTK apps read it directly, and each consumer is its own later slice.
+/// These are the menu rows' state. What acts on them lives elsewhere: the keyboard filters
+/// read [`GnomeSettings::keyboard_a11y`], the bell reads `visual-bell`. The magnifier, the
+/// on-screen keyboard and the screen reader have no consumer in this stack yet; writing their
+/// keys is still the right port — GTK apps read them directly. `high-contrast` recolours our
+/// chrome through [`GnomeSettings::publish_style`].
 /// `text-scaling-factor` is consumed: it scales our chrome through
 /// [`GnomeSettings::realized_base_font_pt`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -531,6 +537,9 @@ impl Default for GnomeSettings {
             resize_with_right_button: false,
             visual_bell_type: VisualBellType::default(),
             audible_bell: true,
+            keyboard_a11y: Default::default(),
+            pointer_a11y: Default::default(),
+            magnifier: Default::default(),
             event_sounds: true,
             sound_theme_name: crate::sound_theme::FALLBACK_THEME.to_owned(),
             edge_tiling: true,
@@ -696,10 +705,12 @@ impl GnomeSettings {
         self.base_font_pt * self.a11y.text_scaling_factor
     }
 
-    /// Publish this model's base font to the UI ([`crate::ui::publish_base_font`]). Call it
-    /// after anything that may have moved `font-name` or the Large Text factor.
-    pub fn publish_base_font(&self) {
+    /// Publish this model's style to the UI: its base font ([`crate::ui::publish_base_font`])
+    /// and High Contrast ([`crate::ui::publish_high_contrast`]). Call it after anything that may
+    /// have moved `font-name`, Large Text or High Contrast.
+    pub fn publish_style(&self) {
         crate::ui::publish_base_font(self.realized_base_font_pt(), &self.base_font_family);
+        crate::ui::publish_high_contrast(self.a11y.get(A11yToggle::HighContrast));
     }
 
     fn load_mutter(&mut self, mutter: &gio::Settings) {
@@ -1063,6 +1074,150 @@ impl GnomeSettings {
             if settings_has_key(interface, "text-scaling-factor") {
                 self.a11y.text_scaling_factor = interface.double("text-scaling-factor");
             }
+        }
+    }
+
+    /// `load_keyboard_a11y_settings` (`meta-input-settings.c:1291-1340`).
+    fn load_keyboard_a11y(&mut self, keyboard: &gio::Settings) {
+        let k = &mut self.keyboard_a11y;
+        let flags: [(&str, &mut bool); 13] = [
+            ("enable", &mut k.enable),
+            (
+                "feature-state-change-beep",
+                &mut k.feature_state_change_beep,
+            ),
+            ("bouncekeys-enable", &mut k.bouncekeys_enable),
+            ("bouncekeys-beep-reject", &mut k.bouncekeys_beep_reject),
+            ("mousekeys-enable", &mut k.mousekeys_enable),
+            ("slowkeys-enable", &mut k.slowkeys_enable),
+            ("slowkeys-beep-press", &mut k.slowkeys_beep_press),
+            ("slowkeys-beep-accept", &mut k.slowkeys_beep_accept),
+            ("slowkeys-beep-reject", &mut k.slowkeys_beep_reject),
+            ("stickykeys-enable", &mut k.stickykeys_enable),
+            ("stickykeys-two-key-off", &mut k.stickykeys_two_key_off),
+            ("stickykeys-modifier-beep", &mut k.stickykeys_modifier_beep),
+            ("togglekeys-enable", &mut k.togglekeys_enable),
+        ];
+        for (key, value) in flags {
+            if settings_has_key(keyboard, key) {
+                *value = keyboard.boolean(key);
+            }
+        }
+        // Settings are `int`; a negative delay reads as 0 (`MAX (0, …)`).
+        let delays: [(&str, &mut u32); 5] = [
+            ("bouncekeys-delay", &mut k.bouncekeys_delay),
+            ("slowkeys-delay", &mut k.slowkeys_delay),
+            ("mousekeys-max-speed", &mut k.mousekeys_max_speed),
+            ("mousekeys-accel-time", &mut k.mousekeys_accel_time),
+            ("mousekeys-init-delay", &mut k.mousekeys_init_delay),
+        ];
+        for (key, value) in delays {
+            if settings_has_key(keyboard, key) {
+                *value = keyboard.int(key).max(0) as u32;
+            }
+        }
+    }
+
+    /// `sync_pointer_a11y_settings` (`clutter-settings.c:296-343`): the times are seconds.
+    fn load_pointer_a11y(&mut self, mouse: &gio::Settings) {
+        use crate::input::pointer_a11y::{DwellDirection, DwellMode};
+        let p = &mut self.pointer_a11y;
+        let ms = |key: &str| (1000. * mouse.double(key)).max(0.) as u32;
+        let has = |key: &str| settings_has_key(mouse, key);
+        if has("secondary-click-enabled") {
+            p.secondary_click_enabled = mouse.boolean("secondary-click-enabled");
+        }
+        if has("secondary-click-time") {
+            p.secondary_click_delay = ms("secondary-click-time");
+        }
+        if has("dwell-click-enabled") {
+            p.dwell_click_enabled = mouse.boolean("dwell-click-enabled");
+        }
+        if has("dwell-time") {
+            p.dwell_delay = ms("dwell-time");
+        }
+        if has("dwell-threshold") {
+            p.dwell_threshold = mouse.int("dwell-threshold").max(0) as u32;
+        }
+        if has("dwell-mode") {
+            p.dwell_mode = if mouse.string("dwell-mode") == "window" {
+                DwellMode::Window
+            } else {
+                DwellMode::Gesture
+            };
+        }
+        let gestures: [(&str, &mut DwellDirection); 4] = [
+            ("dwell-gesture-single", &mut p.dwell_gesture_single),
+            ("dwell-gesture-double", &mut p.dwell_gesture_double),
+            ("dwell-gesture-drag", &mut p.dwell_gesture_drag),
+            ("dwell-gesture-secondary", &mut p.dwell_gesture_secondary),
+        ];
+        for (key, value) in gestures {
+            if settings_has_key(mouse, key) {
+                *value = DwellDirection::from_nick(&mouse.string(key));
+            }
+        }
+    }
+
+    /// `org.gnome.desktop.a11y.magnifier`, as `_settingsInit` reads it (`magnifier.js:576-685`).
+    fn load_magnifier(&mut self, s: &gio::Settings) {
+        use crate::magnifier::{parse_color, ScreenPosition, Tracking};
+        let m = &mut self.magnifier;
+        let has = |key: &str| settings_has_key(s, key);
+        if has("mag-factor") {
+            // "Mag factor is accurate to two decimal places."
+            m.mag_factor = (s.double("mag-factor") * 100.).round() / 100.;
+        }
+        if has("screen-position") {
+            m.screen_position = ScreenPosition::from_nick(&s.string("screen-position"));
+        }
+        let tracking: [(&str, &mut Tracking); 3] = [
+            ("mouse-tracking", &mut m.mouse_tracking),
+            ("focus-tracking", &mut m.focus_tracking),
+            ("caret-tracking", &mut m.caret_tracking),
+        ];
+        for (key, value) in tracking {
+            if settings_has_key(s, key) {
+                *value = Tracking::from_nick(&s.string(key));
+            }
+        }
+        let flags: [(&str, &mut bool); 5] = [
+            ("lens-mode", &mut m.lens_mode),
+            ("scroll-at-edges", &mut m.scroll_at_edges),
+            ("invert-lightness", &mut m.invert_lightness),
+            ("show-cross-hairs", &mut m.show_crosshairs),
+            ("cross-hairs-clip", &mut m.crosshairs_clip),
+        ];
+        for (key, value) in flags {
+            if settings_has_key(s, key) {
+                *value = s.boolean(key);
+            }
+        }
+        let [br, bg, bb] = &mut m.brightness;
+        let [cr, cg, cb] = &mut m.contrast;
+        let doubles: [(&str, &mut f64); 8] = [
+            ("color-saturation", &mut m.color_saturation),
+            ("brightness-red", br),
+            ("brightness-green", bg),
+            ("brightness-blue", bb),
+            ("contrast-red", cr),
+            ("contrast-green", cg),
+            ("contrast-blue", cb),
+            ("cross-hairs-opacity", &mut m.crosshairs_opacity),
+        ];
+        for (key, value) in doubles {
+            if settings_has_key(s, key) {
+                *value = s.double(key);
+            }
+        }
+        if has("cross-hairs-thickness") {
+            m.crosshairs_thickness = f64::from(s.int("cross-hairs-thickness").max(0));
+        }
+        if has("cross-hairs-length") {
+            m.crosshairs_length = f64::from(s.int("cross-hairs-length").max(0));
+        }
+        if has("cross-hairs-color") {
+            m.crosshairs_color = parse_color(&s.string("cross-hairs-color"));
         }
     }
 
@@ -2895,6 +3050,8 @@ struct Stores {
     a11y_interface: Option<gio::Settings>,
     a11y_applications: Option<gio::Settings>,
     a11y_keyboard: Option<gio::Settings>,
+    a11y_mouse: Option<gio::Settings>,
+    a11y_magnifier: Option<gio::Settings>,
     /// `org.gnome.desktop.peripherals.*` — one store per device class, all from
     /// gsettings-desktop-schemas. See [`Peripherals`].
     touchpad: Option<gio::Settings>,
@@ -2962,6 +3119,8 @@ impl Stores {
             a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
             a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard", b),
+            a11y_mouse: gsettings("org.gnome.desktop.a11y.mouse", b),
+            a11y_magnifier: gsettings("org.gnome.desktop.a11y.magnifier", b),
             touchpad: gsettings("org.gnome.desktop.peripherals.touchpad", b),
             mouse: gsettings("org.gnome.desktop.peripherals.mouse", b),
             keyboard: gsettings("org.gnome.desktop.peripherals.keyboard", b),
@@ -3028,6 +3187,8 @@ impl Stores {
             &self.a11y_interface,
             &self.a11y_applications,
             &self.a11y_keyboard,
+            &self.a11y_mouse,
+            &self.a11y_magnifier,
             &self.touchpad,
             &self.mouse,
             &self.keyboard,
@@ -3103,6 +3264,15 @@ impl Stores {
             settings.load_world_clocks(world_clocks, &self.world_clocks_cache);
         }
         settings.load_a11y(self);
+        if let Some(keyboard) = &self.a11y_keyboard {
+            settings.load_keyboard_a11y(keyboard);
+        }
+        if let Some(mouse) = &self.a11y_mouse {
+            settings.load_pointer_a11y(mouse);
+        }
+        if let Some(magnifier) = &self.a11y_magnifier {
+            settings.load_magnifier(magnifier);
+        }
         settings.app_folders = self.read_app_folders();
         settings
     }

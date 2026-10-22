@@ -34,6 +34,10 @@ zstd -q -c "$stripped" | on_guest 'mkdir -p /root/stage && zstd -q -d -f -o /roo
     install -m 755 /root/stage/synoik.new /usr/local/bin/synoik && rm /root/stage/synoik.new &&
     restorecon /usr/local/bin/synoik /usr/local/bin/synoik.prev'
 if [ -n "$reboot" ]; then
+    boot=$(on_guest 'cat /proc/sys/kernel/random/boot_id')
+    # The connection drops as the guest goes down, so the call's status says nothing; the boot id
+    # afterwards does. An inhibitor (an unsaved document blocking the session's shutdown) refuses
+    # the reboot outright, and the old binary would go on running.
     on_guest 'systemctl reboot' || true
     pid=$(supervisor)
     sleep 5
@@ -44,6 +48,8 @@ if [ -n "$reboot" ]; then
         sleep 2
     done
     [ "$(supervisor)" = "$pid" ] || die "the VM restarted instead of rebooting"
+    [ "$(on_guest 'cat /proc/sys/kernel/random/boot_id')" != "$boot" ] ||
+        die "the guest did not reboot: $(on_guest 'systemd-inhibit --list --no-pager' | grep block)"
 else
     on_guest 'systemctl restart synoik-system'
 fi
