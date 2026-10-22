@@ -648,6 +648,91 @@ fn vulkan_rounded_rect_fills_and_cuts_corners() {
     );
 }
 
+/// The pie-timer primitive (`render_pie` → `sdf_pie.frag`): a quarter turn fills the slice from
+/// twelve to three o'clock and nothing else, strokes its two radii and its arc in the border
+/// colour, and a full turn is a disc with no radius drawn across it.
+#[test]
+fn vulkan_pie_sweeps_clockwise_from_twelve() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_pie_sweeps_clockwise_from_twelve: no Vulkan device ({e})");
+            return;
+        }
+    };
+    const FILL: [f32; 4] = [1.0, 0.5, 0.1, 1.0];
+    const FILL_U8: [u8; 4] = [255, 128, 26, 255];
+    const BORDER: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    const BORDER_U8: [u8; 4] = [0, 0, 255, 255];
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let full = Rectangle::from_size(size);
+    let draw = |vk: &mut VulkanRenderer, angle: f32| {
+        let mut target = vk
+            .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
+            .expect("vulkan offscreen");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame.clear(Color32F::from(CLEAR), &[full]).expect("clear");
+            frame
+                .render_pie(FILL, BORDER, 4., angle, full, &[full])
+                .expect("render_pie");
+            let _sync = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind for readback");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        vk.map_texture(&mapping).expect("map_texture").to_vec()
+    };
+    let clear = clear_u8();
+    let (cx, cy) = (W / 2, H / 2);
+
+    let quarter = draw(&mut vk, std::f32::consts::FRAC_PI_2);
+    let at = |pixels: &[u8], x: i32, y: i32| px(pixels, x, y);
+    assert!(
+        close_px(at(&quarter, cx + 10, cy - 10), FILL_U8, 6),
+        "the slice is filled"
+    );
+    for (x, y, what) in [
+        (cx - 10, cy - 10, "before twelve"),
+        (cx + 10, cy + 10, "past three"),
+        (cx - 10, cy + 10, "the far side"),
+        (0, 0, "the corner"),
+    ] {
+        assert!(
+            close_px(at(&quarter, x, y), clear, 4),
+            "{what} is left alone"
+        );
+    }
+    assert!(
+        close_px(at(&quarter, cx, cy - 12), BORDER_U8, 8),
+        "the twelve o'clock radius is stroked"
+    );
+    assert!(
+        close_px(at(&quarter, cx + 12, cy), BORDER_U8, 8),
+        "the three o'clock radius is stroked"
+    );
+    // The arc's centre line is `radius - border` from the centre, at 45° here.
+    let r = (W.min(H) / 2 - 4) as f32 * std::f32::consts::FRAC_1_SQRT_2;
+    assert!(
+        close_px(at(&quarter, cx + r as i32, cy - r as i32), BORDER_U8, 40),
+        "the arc is stroked"
+    );
+
+    let whole = draw(&mut vk, std::f32::consts::TAU);
+    assert!(
+        close_px(at(&whole, cx - 10, cy + 10), FILL_U8, 6),
+        "a full turn is a disc"
+    );
+    assert!(
+        close_px(at(&whole, cx, cy - 12), FILL_U8, 6),
+        "with no radius across it"
+    );
+}
+
 // --- M3 step 1c: GradientFadeTextureRenderElement through the owned Vulkan renderer ------------
 
 /// A horizontally-clipped texture (src narrower than the buffer) fades its alpha out toward the

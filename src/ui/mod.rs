@@ -13,6 +13,7 @@ pub mod background_menu;
 pub mod calendar;
 pub mod dash;
 pub mod dock;
+pub mod dwell_click_menu;
 pub mod emoji_picker;
 pub mod end_session_dialog;
 pub mod exit_confirm_dialog;

@@ -98,6 +98,8 @@ pub enum PopoverAction {
     /// The click was consumed but has no side effect (e.g. a calendar day, or a
     /// hit on empty menu space). The popover stays open.
     Consumed,
+    /// The dwell-click indicator picked what a window-mode dwell clicks next.
+    SetDwellClickType(crate::input::pointer_a11y::DwellClickType),
     /// Move to the panel menu `delta` places along and open it: the Left/Right an open panel
     /// menu did not consume. `-1` is left, `+1` right; it does not wrap, because
     /// `StFocusManager` navigates arrows without wrap-around.
@@ -380,6 +382,8 @@ impl PopoverAction {
                 // A switch row toggles and then falls through to `super.activate`,
                 // which closes the menu — only Space keeps it open.
                 | PopoverAction::SetA11yToggle { .. }
+                // A plain `PopupMenuItem` (`addAction`, `dwellClick.js:72`).
+                | PopoverAction::SetDwellClickType(_)
                 // `vfunc_clicked` raises the player and calls `Main.panel.closeCalendar()`.
                 | PopoverAction::RaiseMediaPlayer(_)
                 // Activating a remote row closes the menu too — but *expanding* one does not,
@@ -412,6 +416,8 @@ pub enum PopoverContent {
     QuickSettings(Box<QuickSettings>),
     InputSources(InputSourceMenu),
     A11y(Box<A11yMenu>),
+    /// The dwell-click indicator's menu.
+    DwellClick(Box<crate::ui::dwell_click_menu::DwellClickMenu>),
     /// The login screen's accessibility button's menu.
     LoginA11y(Box<crate::ui::login_a11y_menu::LoginA11yMenu>),
     App(Box<AppMenu>),
@@ -454,6 +460,7 @@ impl PopoverContent {
             PopoverContent::Window(m) => m.logical_size(),
             PopoverContent::Workspace(m) => m.logical_size(),
             PopoverContent::Background(m) => m.logical_size(),
+            PopoverContent::DwellClick(m) => m.logical_size(),
         }
     }
 
@@ -473,6 +480,7 @@ impl PopoverContent {
             PopoverContent::Window(m) => (m.nav(dir), None),
             PopoverContent::Workspace(m) => (m.nav(dir), None),
             PopoverContent::Background(m) => (m.nav(dir), None),
+            PopoverContent::DwellClick(m) => (m.nav(dir), None),
             PopoverContent::InputSources(m) => (m.nav(dir), None),
             PopoverContent::A11y(m) => (m.nav(dir), None),
             PopoverContent::LoginA11y(m) => (m.nav(dir), None),
@@ -492,6 +500,7 @@ impl PopoverContent {
             PopoverContent::Window(m) => Activation::new(m.activate_focused()),
             PopoverContent::Workspace(m) => Activation::new(m.activate_focused()),
             PopoverContent::Background(m) => Activation::new(m.activate_focused()),
+            PopoverContent::DwellClick(m) => Activation::new(m.activate_focused()),
             PopoverContent::InputSources(m) => Activation::new(m.activate_focused()),
             PopoverContent::A11y(m) => {
                 let (action, close) = m.activate_focused(via_space);
@@ -516,6 +525,7 @@ impl PopoverContent {
             PopoverContent::Window(m) => m.corner_radius(),
             PopoverContent::Workspace(m) => m.corner_radius(),
             PopoverContent::Background(m) => m.corner_radius(),
+            PopoverContent::DwellClick(m) => m.corner_radius(),
         }
     }
 }
@@ -640,6 +650,7 @@ impl PanelPopover {
             PopoverContent::QuickSettings(_) => Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
             PopoverContent::InputSources(_) => Some(crate::ui::panel::ROLE_KEYBOARD),
             PopoverContent::A11y(_) => Some(crate::ui::panel::ROLE_A11Y),
+            PopoverContent::DwellClick(_) => Some(crate::ui::panel::ROLE_DWELL_CLICK),
             // Not a panel menu: nothing in the panel should light up for it.
             PopoverContent::App(_) => None,
             // Not a panel menu either: it hangs off a window, not off the bar.
@@ -934,6 +945,21 @@ impl PanelPopover {
         self.anim = Some(self.make_anim(0., 1.));
     }
 
+    /// The dwell-click indicator was clicked (`PanelMenu.Button`'s menu toggle).
+    pub fn toggle_dwell_click(&mut self, output: Output, anchor: Rectangle<f64, Logical>) {
+        if self.is_showing::<DwellClickTag>() {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Top;
+        self.content = Some(PopoverContent::DwellClick(Box::default()));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
     /// The popover's content origin on `output` (its resting top-left),
     /// output-local logical — for tests that click inside the content.
     pub fn content_location(&self, output: &Output) -> Point<f64, Logical> {
@@ -1031,6 +1057,17 @@ impl PanelPopover {
         menu.set_max_height(Some(self.available_menu_height()));
         self.content = Some(PopoverContent::Background(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// The menu-local centre of the open dwell-click menu's row labelled `label` — for the corpus.
+    #[cfg(test)]
+    pub fn dwell_click_row_center(&self, label: &str) -> Option<Point<f64, Logical>> {
+        match &self.content {
+            Some(PopoverContent::DwellClick(m)) if self.open && !self.closing => {
+                m.row_center(label)
+            }
+            _ => None,
+        }
     }
 
     /// The open desktop context menu, if that is what is up — for the corpus.
@@ -1350,6 +1387,7 @@ impl PanelPopover {
             PopoverContent::Window(m) => m.focused_label(),
             PopoverContent::Workspace(m) => m.focused_label(),
             PopoverContent::Background(m) => m.focused_label(),
+            PopoverContent::DwellClick(m) => m.focused_label(),
             PopoverContent::QuickSettings(qs) => qs.focused_for_test(),
             PopoverContent::Calendar(_) => None,
         }
@@ -1521,6 +1559,7 @@ impl PanelPopover {
             Some(PopoverContent::Window(m)) => m.pointer_hover(local),
             Some(PopoverContent::Workspace(m)) => m.pointer_hover(local),
             Some(PopoverContent::Background(m)) => m.pointer_hover(local),
+            Some(PopoverContent::DwellClick(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -1685,6 +1724,9 @@ impl PanelPopover {
             Some(PopoverContent::Background(m)) => {
                 m.nav(widget::Dir::Down);
             }
+            Some(PopoverContent::DwellClick(m)) => {
+                m.nav(widget::Dir::Down);
+            }
             Some(PopoverContent::InputSources(m)) => {
                 m.nav(widget::Dir::Down);
             }
@@ -1749,6 +1791,7 @@ impl PanelPopover {
                 Some(PopoverContent::Window(m)) => m.pointer_click(local),
                 Some(PopoverContent::Workspace(m)) => m.pointer_click(local),
                 Some(PopoverContent::Background(m)) => m.pointer_click(local),
+                Some(PopoverContent::DwellClick(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -1907,6 +1950,7 @@ impl PanelPopover {
             Some(PopoverContent::Window(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Workspace(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::Background(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::DwellClick(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 
@@ -2068,6 +2112,12 @@ impl ContentTag for InputSourcesTag {
     }
 }
 struct A11yTag;
+struct DwellClickTag;
+impl ContentTag for DwellClickTag {
+    fn matches(content: &PopoverContent) -> bool {
+        matches!(content, PopoverContent::DwellClick(_))
+    }
+}
 struct LoginA11yTag;
 impl ContentTag for LoginA11yTag {
     fn matches(content: &PopoverContent) -> bool {

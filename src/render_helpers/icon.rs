@@ -555,10 +555,28 @@ pub const EMBEDDED_ICON_NAMES: &[&str] = &[
     "accessibility-slow-keys-symbolic",
     "accessibility-bounce-keys-symbolic",
     "accessibility-mouse-keys-symbolic",
+    "pointer-primary-click-symbolic",
+    "pointer-double-click-symbolic",
+    "pointer-drag-symbolic",
+    "pointer-secondary-click-symbolic",
 ];
 
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
     match name {
+        // The dwell-click indicator's (`js/ui/status/dwellClick.js:14-31`).
+        "pointer-primary-click-symbolic" => Some(include_bytes!(
+            "../../resources/icons/pointer-primary-click-symbolic.svg"
+        )),
+        "pointer-double-click-symbolic" => Some(include_bytes!(
+            "../../resources/icons/pointer-double-click-symbolic.svg"
+        )),
+        "pointer-drag-symbolic" => Some(include_bytes!(
+            "../../resources/icons/pointer-drag-symbolic.svg"
+        )),
+        "pointer-secondary-click-symbolic" => Some(include_bytes!(
+            "../../resources/icons/pointer-secondary-click-symbolic.svg"
+        )),
+
         "no-notifications-symbolic" => Some(include_bytes!(
             "../../resources/icons/no-notifications-symbolic.svg"
         )),

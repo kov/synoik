@@ -44960,7 +44960,10 @@ fn a_resting_pointer_clicks() {
     let (mut f, id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
     pointer_motion_to(&mut f, 965., 545.);
     run_for(&mut f, Duration::from_millis(400));
-    assert!(f.synoik().pointer_a11y.pie.is_some(), "the pie counts down");
+    assert!(
+        !f.synoik().pointer_a11y.pies.is_empty(),
+        "the pie counts down"
+    );
     run_for(&mut f, Duration::from_millis(1000));
     assert_eq!(
         client_buttons(&mut f, id),
@@ -44991,6 +44994,134 @@ fn a_resting_pointer_clicks() {
     run_for(&mut f, Duration::from_millis(1400));
     assert_eq!(client_buttons(&mut f, id), vec![(LEFT, false)], "and ends");
     assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Primary);
+}
+
+/// The pie at the pointer (`pointerA11yTimeout.js`): it sweeps round with the dwell and zooms
+/// out once the click is made; a dwell cut short takes it at once. A gesture shows a crosshair
+/// for as long as it is being drawn.
+#[test]
+fn the_dwell_pie_counts_down_at_the_pointer() {
+    use smithay::input::pointer::CursorIcon;
+
+    use crate::input::pointer_a11y::DwellMode;
+
+    let (mut f, _id) = pointer_a11y_fixture(|p| p.dwell_click_enabled = true);
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(700));
+    let now = f.synoik().clock.now_unadjusted();
+    let pie = f.synoik().pointer_a11y.pies.last().cloned().expect("a pie");
+    assert_eq!((pie.at.x, pie.at.y), (965., 545.), "at the pointer");
+    let frame = pie.frame(now).unwrap();
+    assert!(
+        frame.angle > 1. && frame.angle < 6. && frame.opacity == 1. && frame.scale == 1.,
+        "part way round, faded in: {frame:?}"
+    );
+
+    pointer_motion_to(&mut f, 1000., 545.);
+    assert!(
+        f.synoik().pointer_a11y.pies.is_empty(),
+        "moving off cuts it short"
+    );
+
+    run_for(&mut f, Duration::from_millis(1350));
+    let pie = f
+        .synoik()
+        .pointer_a11y
+        .pies
+        .last()
+        .cloned()
+        .expect("still zooming out");
+    let frame = pie.frame(f.synoik().clock.now_unadjusted()).unwrap();
+    assert!(
+        frame.scale > 1. && frame.opacity < 1.,
+        "zooming out: {frame:?}"
+    );
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(f.synoik().pointer_a11y.pies.is_empty(), "and gone");
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_mode = DwellMode::Gesture;
+    f.synoik_state().sync_pointer_a11y();
+    pointer_motion_to(&mut f, 965., 545.);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(
+        f.synoik().cursor_manager.global_override(),
+        Some(CursorIcon::Crosshair),
+        "drawing a gesture"
+    );
+    run_for(&mut f, Duration::from_millis(1300));
+    assert_eq!(f.synoik().cursor_manager.global_override(), None, "made");
+}
+
+/// The dwell-click indicator (`js/ui/status/dwellClick.js`): in the panel while dwell click is on
+/// in window mode, its menu picks the next click, and its icon follows the click in force — back
+/// to a single click once a double one is made.
+#[test]
+fn the_dwell_click_indicator_picks_the_click() {
+    use crate::input::pointer_a11y::{DwellClickType, DwellMode};
+    use crate::ui::panel::ROLE_DWELL_CLICK;
+
+    let (mut f, id) = pointer_a11y_fixture(|_| ());
+    let ow = 1920.;
+    assert_eq!(
+        f.synoik().panel.dwell_click_rect(ow),
+        None,
+        "hidden while dwell is off"
+    );
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_click_enabled = true;
+    f.synoik_state().sync_pointer_a11y();
+    assert_eq!(
+        f.synoik().panel.dwell_click(),
+        Some(DwellClickType::Primary)
+    );
+    let anchor = f.synoik().panel.dwell_click_rect(ow).expect("shown");
+
+    // Clicking the indicator rests the pointer on the panel; that dwell's single click lands
+    // there, harmlessly, as it would in GNOME.
+    pointer_motion_to(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_DWELL_CLICK));
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&out);
+    let row = f
+        .synoik()
+        .panel_popover
+        .dwell_click_row_center("Double Click")
+        .unwrap();
+    pointer_motion_to(&mut f, origin.x + row.x, origin.y + row.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.synoik().pointer_a11y.click_type, DwellClickType::Double);
+    assert_eq!(f.synoik().panel.dwell_click(), Some(DwellClickType::Double));
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(
+        !f.synoik().panel_popover.is_open(),
+        "the row closes the menu"
+    );
+
+    pointer_motion_to(&mut f, 960., 540.);
+    let _ = client_buttons(&mut f, id);
+    run_for(&mut f, Duration::from_millis(1400));
+    assert_eq!(client_buttons(&mut f, id).len(), 4, "a double click");
+    assert_eq!(
+        f.synoik().panel.dwell_click(),
+        Some(DwellClickType::Primary),
+        "the icon follows the fall back"
+    );
+
+    f.synoik().gnome_settings.pointer_a11y.dwell_mode = DwellMode::Gesture;
+    f.synoik_state().sync_pointer_a11y();
+    assert_eq!(
+        f.synoik().panel.dwell_click_rect(ow),
+        None,
+        "hidden in gesture mode"
+    );
 }
 
 /// Dwell click in gesture mode: after the dwell, a stroke from the spot names the click, and the

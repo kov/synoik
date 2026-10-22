@@ -12048,6 +12048,13 @@ impl Synoik {
             AnimCauses::RIPPLE,
             self.ripples.is_animating(now_unadjusted),
         );
+        causes.set(
+            AnimCauses::POINTER_A11Y,
+            self.pointer_a11y
+                .pies
+                .iter()
+                .any(|pie| pie.frame(now_unadjusted).is_some()),
+        );
         causes.set(AnimCauses::DOCK, self.dock.are_animations_ongoing());
         causes.set(
             AnimCauses::SCREENSHOT_UI,
@@ -12230,6 +12237,7 @@ impl Synoik {
             self.bell_flash = None;
         }
         self.ripples.advance(self.clock.now_unadjusted());
+        self.pointer_a11y.prune_pies(self.clock.now_unadjusted());
         // A drag out of the dock holds it open until the drop, wherever the pointer goes.
         // Derived from the drag itself rather than hooked into each of the five paths that end
         // one, none of which could then forget.
@@ -12786,6 +12794,10 @@ impl Synoik {
             self.clock.now_unadjusted(),
             &mut |elem| push(elem.into()),
         );
+
+        // Next, pointer accessibility's pies, each raised to the top of the shell UI as it starts
+        // (`pointerA11yTimeout.js:113-114`).
+        self.render_pointer_a11y_pies(output, output_scale, &mut |elem| push(elem.into()));
 
         // Next, the hot-corner ripple, which gnome-shell raises above the rest of the shell UI
         // (`Ripples.playAnimation`, `ripples.js:99-101`).
@@ -17157,7 +17169,13 @@ impl Synoik {
         // left stuck on by a path that forgets to clear it — the same reason this
         // whole function re-snapshots instead of taking invalidation hooks.
         let starting = self.app_system.starting_apps().next().is_some();
-        let icon = starting.then_some(CursorIcon::Wait);
+        // A dwell gesture's crosshair is the stage cursor, set over whatever the launch asked for
+        // (`pointerA11yTimeout.js:121`).
+        let icon = if self.pointer_a11y.gesture_cursor {
+            Some(CursorIcon::Crosshair)
+        } else {
+            starting.then_some(CursorIcon::Wait)
+        };
         if self.cursor_manager.set_global_override(icon) {
             // The `&&` below this call can swallow a `true`, and the cursor is drawn
             // per frame, so it queues its own redraw.
@@ -18729,6 +18747,8 @@ synoik_render_elements! {
         RoundedTexture = RoundedTextureRenderElement<crate::render_helpers::vulkan::VkTexture>,
         // The raised background under a dragged folder's composed icon.
         RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
+        // Pointer accessibility's countdown at the pointer.
+        Pie = crate::render_helpers::pie::PieRenderElement,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
         // The window picker's per-preview chrome: close button, caption, app icon.

@@ -2505,6 +2505,11 @@ impl State {
                     active,
                 );
             }
+            crate::ui::panel::ROLE_DWELL_CLICK => {
+                self.synoik
+                    .panel_popover
+                    .toggle_dwell_click(output.clone(), anchor);
+            }
             crate::ui::panel::ROLE_A11Y => {
                 let a11y = self.synoik.gnome_settings.a11y;
                 let accent = self.synoik.gnome_settings.accent_color;
@@ -2546,6 +2551,7 @@ impl State {
 
         match action {
             PopoverAction::Consumed => {}
+            PopoverAction::SetDwellClickType(click_type) => self.set_dwell_click_type(click_type),
             PopoverAction::SetDarkStyle(v) => {
                 if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_dark_style(v);
@@ -6186,6 +6192,14 @@ impl State {
                 // Open the input-source (keyboard-layout) menu, anchored on the
                 // indicator (gnome-shell's `InputSourceIndicator` popup).
                 if let Some(anchor) = self.synoik.panel.keyboard_rect(output_w) {
+                    self.open_panel_menu(&output, role, anchor);
+                }
+                self.synoik.suppressed_buttons.insert(button_code);
+                self.synoik.queue_redraw_all();
+                true
+            }
+            Some(role @ crate::ui::panel::ROLE_DWELL_CLICK) => {
+                if let Some(anchor) = self.synoik.panel.dwell_click_rect(output_w) {
                     self.open_panel_menu(&output, role, anchor);
                 }
                 self.synoik.suppressed_buttons.insert(button_code);

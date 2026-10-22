@@ -823,6 +823,52 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         Ok(())
     }
 
+    /// Fill a pie slice inscribed in `dst` — from twelve o'clock, clockwise through `angle`
+    /// radians — in `fill`, then stroke its outline `border_width` physical px wide in `border`.
+    /// GNOME's `PieTimer` (`js/ui/pointerA11yTimeout.js`), the countdown at the pointer. Colours
+    /// are straight-alpha.
+    pub(crate) fn render_pie(
+        &mut self,
+        fill: [f32; 4],
+        border: [f32; 4],
+        border_width: f32,
+        angle: f32,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+        let push = QuadPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            stroke_width: border_width.max(0.),
+            color: premultiply(fill),
+            // `sdf_pie.frag` reads the border colour from the first column and the angle at
+            // `cutoff`; it samples nothing.
+            tex_transform: [premultiply(border), [0.; 4], [0.; 4]],
+            cutoff: [angle, 0.],
+            ..Default::default()
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.sdf_pie_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            Self::draw_quad(dev, self.cbuf, &scissors, Material::Pie);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_rounded_rect_impl(
         &mut self,

@@ -27,12 +27,16 @@
 use std::time::Duration;
 
 use smithay::backend::input::{ButtonState, InputEvent};
-use smithay::utils::{Logical, Point};
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::output::Output;
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::input::synthetic::{
     SyntheticInputBackend, SyntheticPointerButtonEvent, SyntheticPointerMotionAbsoluteEvent,
 };
-use crate::synoik::State;
+use crate::render_helpers::pie::PieRenderElement;
+use crate::synoik::{State, Synoik};
+use crate::ui::widget::{style, Rgba};
 use crate::utils::timers::TimerToken;
 
 const BTN_LEFT: u32 = 0x110;
@@ -149,14 +153,59 @@ impl PointerA11ySettings {
     }
 }
 
-/// The running timeout the pie at the pointer draws (`PointerA11yTimeout`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How long a finished pie takes to zoom out (`SUCCESS_ZOOM_OUT_DURATION`).
+const PIE_ZOOM_OUT: Duration = Duration::from_millis(150);
+
+/// A timeout's pie at the pointer (`PieTimer`, `pointerA11yTimeout.js`): it fades in over the
+/// first quarter, sweeps round over the whole, then doubles and fades out. A timeout cut short
+/// takes its pie with it; one that runs out leaves it to finish, so pies can overlap — a dwell's
+/// zooming out as the gesture's starts.
+#[derive(Debug, Clone)]
 pub struct PieTimeout {
-    pub kind: TimeoutType,
+    pub id: smithay::backend::renderer::element::Id,
     /// Where the pointer was when it started: the pie stays there.
     pub at: Point<f64, Logical>,
     pub started: Duration,
     pub delay: Duration,
+}
+
+/// A pie as one frame draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PieFrame {
+    /// Radians swept from twelve o'clock.
+    pub angle: f64,
+    pub opacity: f64,
+    /// Of the pie's 60px.
+    pub scale: f64,
+}
+
+impl PieTimeout {
+    /// The pie at `now`, or `None` once it is over.
+    pub fn frame(&self, now: Duration) -> Option<PieFrame> {
+        use keyframe::functions::{EaseInQuad, EaseOutQuad};
+        use keyframe::EasingFunction;
+
+        let elapsed = now.saturating_sub(self.started);
+        if elapsed < self.delay {
+            let t = elapsed.as_secs_f64() / self.delay.as_secs_f64();
+            return Some(PieFrame {
+                angle: std::f64::consts::TAU * t,
+                // `ease({opacity: 255, duration: duration / 4, mode: EASE_IN_QUAD})`.
+                opacity: EaseInQuad.y((t * 4.).min(1.)),
+                scale: 1.,
+            });
+        }
+        let out = (elapsed - self.delay).as_secs_f64() / PIE_ZOOM_OUT.as_secs_f64();
+        if out >= 1. {
+            return None;
+        }
+        let k = EaseOutQuad.y(out);
+        Some(PieFrame {
+            angle: std::f64::consts::TAU,
+            opacity: 1. - k,
+            scale: 1. + k,
+        })
+    }
 }
 
 /// `ClutterPtrA11yData`.
@@ -178,7 +227,10 @@ pub struct PointerA11y {
     secondary_click_triggered: bool,
     /// Set while this injects a pointer move, which it must not see come back.
     pub(crate) moving: bool,
-    pub pie: Option<PieTimeout>,
+    /// The pies on screen, the newest last.
+    pub pies: Vec<PieTimeout>,
+    /// A gesture is being drawn: the pointer is a crosshair (`pointerA11yTimeout.js:121`).
+    pub gesture_cursor: bool,
 }
 
 impl Default for PointerA11y {
@@ -196,12 +248,18 @@ impl Default for PointerA11y {
             secondary_click_timer: None,
             secondary_click_triggered: false,
             moving: false,
-            pie: None,
+            pies: Vec::new(),
+            gesture_cursor: false,
         }
     }
 }
 
 impl PointerA11y {
+    /// Drop the pies that have finished.
+    pub fn prune_pies(&mut self, now: Duration) {
+        self.pies.retain(|pie| pie.frame(now).is_some());
+    }
+
     /// `pointer_has_moved`: further than the threshold from where it rested.
     fn has_moved(&self) -> bool {
         let d = self.dwell - self.current;
@@ -231,6 +289,52 @@ impl PointerA11y {
     }
 }
 
+/// `.pie-timer` (`_a11y.scss:11-17`).
+const PIE_SIZE: f64 = 60.;
+const PIE_BORDER_WIDTH: f64 = 3.;
+
+impl Synoik {
+    /// The pies on `output`, newest on top.
+    pub fn render_pointer_a11y_pies(
+        &self,
+        output: &Output,
+        scale: Scale<f64>,
+        push: &mut dyn FnMut(PieRenderElement),
+    ) {
+        let now = self.clock.now_unadjusted();
+        let origin = output.current_location().to_f64();
+        let accent = style::accent_rgba(self.gnome_settings.accent_color);
+        // `-pie-border-color: -st-accent-color`; `-pie-background-color:
+        // st-lighten(st-transparentize(-st-accent-color, 0.7), 40%)`.
+        let fill = style::lighten([accent[0], accent[1], accent[2], 0.3], 0.4);
+        for pie in self.pointer_a11y.pies.iter().rev() {
+            let Some(frame) = pie.frame(now) else {
+                continue;
+            };
+            let size = PIE_SIZE * frame.scale;
+            // Scaled about its centre (`set_pivot_point(0.5, 0.5)`), which is the pointer.
+            let geometry = Rectangle::new(
+                pie.at - origin - Point::from((size / 2., size / 2.)),
+                Size::from((size, size)),
+            );
+            let alpha = frame.opacity as f32;
+            let with = |c: Rgba| [c[0], c[1], c[2], c[3] * alpha];
+            // Every frame of a pie differs, so the frame is the commit.
+            let commit = CommitCounter::from(now.as_micros() as usize);
+            push(PieRenderElement::new(
+                pie.id.clone(),
+                commit,
+                geometry,
+                with(fill),
+                with(accent),
+                PIE_BORDER_WIDTH * frame.scale,
+                frame.angle,
+                scale,
+            ));
+        }
+    }
+}
+
 impl State {
     /// Take new settings (`sync_pointer_a11y_settings`). Turning a feature off ends what it had
     /// running, a held dwell drag included (`_clutter_seat_shutdown_a11y`).
@@ -251,13 +355,26 @@ impl State {
             self.stop_secondary_click_timeout();
         }
         self.synoik.pointer_a11y.settings = settings;
+        self.sync_dwell_click_indicator();
     }
 
     /// The panel indicator picked what a window-mode dwell clicks
     /// (`clutter_seat_set_pointer_a11y_dwell_click_type`).
     pub fn set_dwell_click_type(&mut self, click_type: DwellClickType) {
         self.synoik.pointer_a11y.click_type = click_type;
-        self.synoik.queue_redraw_all();
+        self.sync_dwell_click_indicator();
+    }
+
+    /// The panel's dwell-click indicator: shown while dwell click is on in window mode
+    /// (`_syncMenuVisibility`), its icon the click in force (`_updateClickType`).
+    fn sync_dwell_click_indicator(&mut self) {
+        let a11y = &self.synoik.pointer_a11y;
+        let shown =
+            a11y.settings.dwell_click_enabled && a11y.settings.dwell_mode == DwellMode::Window;
+        let click_type = shown.then_some(a11y.click_type);
+        if self.synoik.panel.set_dwell_click(click_type) {
+            self.synoik.queue_redraw_all();
+        }
     }
 
     /// `_clutter_seat_a11y_on_motion_event`, with the pointer where it now is.
@@ -334,22 +451,38 @@ impl State {
         }
     }
 
+    /// `ptr-a11y-timeout-started`, as `PointerA11yTimeout` answers it. With animations off
+    /// gnome-shell's eases take no time, so the pie is over as it starts and none is drawn.
     fn timeout_started(&mut self, kind: TimeoutType, delay: u32) {
-        let at = self.synoik.seat.get_pointer().unwrap().current_location();
-        self.synoik.pointer_a11y.pie = Some(PieTimeout {
-            kind,
-            at,
-            started: self.synoik.clock.now_unadjusted(),
-            delay: Duration::from_millis(u64::from(delay)),
-        });
+        if self.synoik.gnome_settings.enable_animations {
+            let at = self.synoik.seat.get_pointer().unwrap().current_location();
+            self.synoik.pointer_a11y.pies.push(PieTimeout {
+                id: smithay::backend::renderer::element::Id::new(),
+                at,
+                started: self.synoik.clock.now_unadjusted(),
+                delay: Duration::from_millis(u64::from(delay)),
+            });
+        }
+        if kind == TimeoutType::Gesture {
+            self.synoik.pointer_a11y.gesture_cursor = true;
+        }
         self.synoik.queue_redraw_all();
     }
 
-    /// A timeout ended: a pie whose click went through plays out (it is at its end anyway), one
-    /// cut short goes at once (`pointerA11yTimeout.js:124-131`).
-    fn timeout_stopped(&mut self, clicked: bool) {
+    /// `ptr-a11y-timeout-stopped`: a timeout cut short takes the newest pie with it; one whose
+    /// click went through leaves it to finish (`pointerA11yTimeout.js:124-131`).
+    ///
+    /// **Divergence:** the crosshair goes when any dwell timeout stops. mutter reports a gesture
+    /// cut short — by a button press, or turning dwell off — as a *dwell* stopping
+    /// (`stop_dwell_timeout`), which gnome-shell does not take as the end of the gesture, and
+    /// the crosshair stays until the next gesture runs out.
+    fn timeout_stopped(&mut self, kind: TimeoutType, clicked: bool) {
+        let a11y = &mut self.synoik.pointer_a11y;
         if !clicked {
-            self.synoik.pointer_a11y.pie = None;
+            a11y.pies.pop();
+        }
+        if kind != TimeoutType::SecondaryClick {
+            a11y.gesture_cursor = false;
         }
         self.synoik.queue_redraw_all();
     }
@@ -363,7 +496,7 @@ impl State {
                 let a11y = &mut state.synoik.pointer_a11y;
                 a11y.secondary_click_triggered = true;
                 a11y.secondary_click_timer = None;
-                state.timeout_stopped(true);
+                state.timeout_stopped(TimeoutType::SecondaryClick, true);
                 None
             });
         self.synoik.pointer_a11y.secondary_click_timer = Some(token);
@@ -373,7 +506,7 @@ impl State {
     fn stop_secondary_click_timeout(&mut self) {
         if let Some(token) = self.synoik.pointer_a11y.secondary_click_timer.take() {
             self.synoik.cancel_timer(token);
-            self.timeout_stopped(false);
+            self.timeout_stopped(TimeoutType::SecondaryClick, false);
         }
         self.synoik.pointer_a11y.secondary_click_triggered = false;
     }
@@ -413,14 +546,14 @@ impl State {
         if let Some(token) = self.synoik.pointer_a11y.dwell_timer.take() {
             self.synoik.cancel_timer(token);
             self.synoik.pointer_a11y.dwell_gesture_started = false;
-            self.timeout_stopped(false);
+            self.timeout_stopped(TimeoutType::Dwell, false);
         }
     }
 
     /// `trigger_dwell_click`.
     fn trigger_dwell_click(&mut self) {
         self.synoik.pointer_a11y.dwell_timer = None;
-        self.timeout_stopped(true);
+        self.timeout_stopped(TimeoutType::Dwell, true);
         let a11y = &self.synoik.pointer_a11y;
         if a11y.settings.dwell_mode == DwellMode::Gesture {
             if a11y.dwell_drag_started {
@@ -443,9 +576,7 @@ impl State {
                 // The drag's release: a drag is one-shot too.
                 self.synoik.pointer_a11y.click_type = DwellClickType::Primary;
             }
-            if self.synoik.pointer_a11y.click_type != click_type {
-                self.synoik.queue_redraw_all();
-            }
+            self.sync_dwell_click_indicator();
         }
     }
 
@@ -480,7 +611,7 @@ impl State {
                 None
             });
         self.synoik.pointer_a11y.dwell_timer = Some(token);
-        self.timeout_stopped(true);
+        self.timeout_stopped(TimeoutType::Gesture, true);
     }
 
     fn restore_dwell_position(&mut self) {

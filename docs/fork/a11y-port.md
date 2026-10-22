@@ -25,7 +25,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
 | Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ⬜ §A2, A3, A5 |
-| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 (D-Bus); ⬜ A7 (dwell) |
+| Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
 ---
@@ -114,7 +114,7 @@ System Sounds volume applies).
 
 The keyboard filters' beeps (A4) ring this same bell, as `meta_seat_native_bell_notify` does.
 
-### A7 — The a11y D-Bus surface ✅ + dwell click ⬜
+### A7 — The a11y D-Bus surface and pointer accessibility ✅
 - ✅ `org.freedesktop.a11y.KeyboardMonitor` and `PointerLocator` on `org.freedesktop.a11y.Manager`
   (`src/dbus/freedesktop_a11y.rs`, mutter's `meta-a11y-manager.c`): watch, grab, the key grabs
   with the lone-tap/double-press rule for a grabbed modifier (`meta-seat-impl.c:520-568`), and
@@ -123,9 +123,14 @@ The keyboard filters' beeps (A4) ring this same bell, as `meta_seat_native_bell_
   **Divergence:** QueryPointer always names a window by pid. mutter names its AT-SPI bus name
   and path when GTK sent them over gtk-shell v7, and we serve v1 (`src/protocols/gtk_shell.rs`
   says why).
-- ⬜ Dwell click is `panel-status-port.md` R3 plus `org.gnome.desktop.a11y.mouse`
-  (`dwell-click-enabled`, `dwell-mode`, `dwell-time`, `secondary-click-*`) — the indicator is
-  panel work but the *behavior* is input work, so it belongs here.
+- ✅ Simulated secondary click and dwell click (`src/input/pointer_a11y.rs`, clutter's
+  `clutter-input-pointer-a11y.c`), fed from `org.gnome.desktop.a11y.mouse`; the countdown pie
+  at the pointer (`pointerA11yTimeout.js`, drawn by `sdf_pie.frag`) with the crosshair during a
+  gesture; and the panel's `dwellClick` indicator (`src/ui/dwell_click_menu.rs`). mutter's
+  gesture directions are kept as written: a stroke to the right reads as `left`.
+  **Divergence:** the crosshair goes whenever a dwell timeout stops. mutter reports a gesture cut
+  short as a dwell stopping, gnome-shell keeps the crosshair, and it stays until the next
+  gesture runs out.
 
 ### A8 — Our own UI is actually accessible (AT-SPI / AccessKit)
 **The one that matters most, and the one nothing above delivers.** Every slice up to here is
@@ -154,7 +159,7 @@ Orca can *read* is A7 and A8.
 1. **A2** — High Contrast, the half that makes its shipped switch honest.
 2. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-3. **A3**, **A5**, **A7** — each independently schedulable.
+3. **A3**, **A5** — each independently schedulable.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**

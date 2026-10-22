@@ -40,6 +40,7 @@ pub mod icon;
 pub mod inset_ring;
 pub mod memory;
 pub mod offscreen;
+pub mod pie;
 pub mod render_elements;
 pub mod renderer;
 pub mod resize;
