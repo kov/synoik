@@ -44809,6 +44809,48 @@ fn the_message_dialog_raised_last_takes_the_keys() {
     assert!(!f.synoik().end_session.is_open());
 }
 
+/// Orca's modifier through the KeyboardMonitor (A7): a grabbed Caps Lock tapped alone is Orca's,
+/// so the window hears nothing and Caps Lock stays off, and so is a key pressed under it; a quick
+/// double tap is the key's own, so Caps Lock toggles, and the window sees that second tap only.
+#[test]
+fn a_grabbed_modifier_tapped_alone_is_the_monitors() {
+    let (mut f, id, _player) = keyboard_a11y_fixture();
+    let monitor = crate::dbus::freedesktop_a11y::KeyboardMonitor::new();
+    monitor.set_client(":1.42", false, &[Keysym::Caps_Lock]);
+    f.synoik().a11y_keyboard_monitor = Some(monitor);
+    let caps_lock = |f: &mut Fixture| {
+        f.synoik()
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .modifier_state()
+            .caps_lock
+    };
+
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(!caps_lock(&mut f), "a lone tap is Orca's");
+    // The double press is timed on the events' own clock, as mutter's.
+    f.advance_input_time(1000);
+    f.key_press(KEY_CAPSLOCK);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_CAPSLOCK);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).take_key_events(), vec![], "nor a key under it");
+
+    f.advance_input_time(1000);
+    tap(&mut f, KEY_CAPSLOCK);
+    tap(&mut f, KEY_CAPSLOCK);
+    assert!(caps_lock(&mut f), "a double tap is the key's");
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_CAPSLOCK, WlKeyState::Pressed),
+            (KEY_CAPSLOCK, WlKeyState::Released)
+        ]
+    );
+}
+
 /// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
 const SHIFT_MASK: u32 = 1;
 const CONTROL_MASK: u32 = 1 << 2;
