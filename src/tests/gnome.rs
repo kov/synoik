@@ -44851,6 +44851,52 @@ fn a_grabbed_modifier_tapped_alone_is_the_monitors() {
     );
 }
 
+/// What the PointerLocator tells Orca (A7, `meta_compositor_query_pointer_a11y`): over a window,
+/// its client's pid and the pointer relative to the surface under it, moving with the pointer;
+/// over the shell's own chrome, the pointer in global coordinates.
+#[test]
+fn the_pointer_locator_names_the_window_under_the_pointer() {
+    use crate::dbus::freedesktop_a11y::PointerTarget;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // A new window is placed centred on the output.
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_pointer();
+    f.roundtrip(id);
+    let centre = (960., 540.);
+
+    let at = |f: &mut Fixture, x: f64, y: f64| {
+        pointer_motion_to(f, x, y);
+        f.synoik_state().pointer_target()
+    };
+    let Some(PointerTarget::Window { pid, x, y }) = at(&mut f, centre.0, centre.1) else {
+        panic!("not a window under the pointer");
+    };
+    assert_eq!(pid, std::process::id() as i32, "the client's pid");
+    let Some(PointerTarget::Window { x: x2, y: y2, .. }) =
+        at(&mut f, centre.0 + 10., centre.1 + 5.)
+    else {
+        panic!("not a window under the pointer");
+    };
+    assert_eq!(
+        (x2 - x, y2 - y),
+        (10., 5.),
+        "relative to the window, moving with the pointer"
+    );
+    assert!(
+        (0. ..100.).contains(&x) && (0. ..100.).contains(&y),
+        "inside it: {x},{y}"
+    );
+
+    assert_eq!(
+        at(&mut f, 1900., 1060.),
+        Some(PointerTarget::Shell { x: 1900., y: 1060. }),
+        "and the shell's own, globally"
+    );
+}
+
 /// Shift in the xkb masks of the keymap every test runs with (`Shift` is modifier 0).
 const SHIFT_MASK: u32 = 1;
 const CONTROL_MASK: u32 = 1 << 2;

@@ -6549,6 +6549,9 @@ impl State {
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
+        // Before anything else here, as mutter's `meta_display_handle_event`.
+        self.a11y_pointer_moved();
+
         // We need an output to be able to move the pointer.
         if self.synoik.global_space.outputs().next().is_none() {
             return;
@@ -6862,6 +6865,8 @@ impl State {
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
+        self.a11y_pointer_moved();
+
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()

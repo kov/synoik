@@ -12,6 +12,13 @@
 //! the keyboard. The modifier double-press — a grabbed modifier tapped alone is Orca's, tapped
 //! twice quickly is the key's own — is `is_a11y_modifier_first_click`
 //! (`meta-seat-impl.c:520-568`), which mutter runs before the keymap sees the key.
+//!
+//! `org.freedesktop.a11y.PointerLocator`, on the same object, tells Orca's mouse review what is
+//! under the pointer (`meta_compositor_query_pointer_a11y`, `compositor.c:1690-1772`): the window's
+//! pid and the pointer relative to the surface under it, or the pointer in global coordinates over
+//! our own chrome. **Divergence:** mutter names the window's AT-SPI bus name and object path when
+//! GTK sent them (`gtk_surface1.set_a11y_properties`, gtk-shell v7); we serve gtk-shell v1, so
+//! Orca always gets mutter's fallback, the pid.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,7 +34,7 @@ use zbus::interface;
 use zbus::message::Header;
 use zbus::names::{BusName, OwnedUniqueName, UniqueName};
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::NoneValue;
+use zbus::zvariant::{NoneValue, OwnedValue};
 
 use super::Start;
 use crate::synoik::State;
@@ -67,6 +74,119 @@ struct Client {
 pub struct KeyboardMonitor {
     data: Arc<Mutex<Data>>,
     iface: Arc<OnceLock<InterfaceRef<Self>>>,
+    /// Served on the same name and object.
+    locator: Option<PointerLocator>,
+}
+
+/// `org.freedesktop.a11y.PointerLocator`.
+#[derive(Clone)]
+pub struct PointerLocator {
+    to_synoik: calloop::channel::Sender<PointerQuery>,
+    /// Who asked since the pointer last moved: each is told once that it moved
+    /// (`query_pointer_requesters`).
+    requesters: Arc<Mutex<HashSet<OwnedUniqueName>>>,
+    iface: Arc<OnceLock<InterfaceRef<Self>>>,
+}
+
+/// A `QueryPointer` on its way to the compositor, with where the answer goes.
+pub struct PointerQuery {
+    pub reply: async_channel::Sender<Option<PointerTarget>>,
+}
+
+/// What is under the pointer, for a `QueryPointer` answer. No target at all is mutter's
+/// `UnknownToplevel`: a window with no pid to name it by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerTarget {
+    /// Our own chrome, or nothing: the pointer in global logical coordinates.
+    Shell { x: f64, y: f64 },
+    /// A window, by its client's pid, and the pointer relative to the surface under it.
+    Window { pid: i32, x: f64, y: f64 },
+}
+
+/// `META_A11Y_ERROR` (`meta-a11y-manager.c:84-99`), and the refusal every method can answer.
+/// Named in full: the derive gives a wrapped `zbus::Error` a name of its own, which would hide
+/// `AccessDenied` from the caller.
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.freedesktop")]
+enum A11yError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    #[zbus(name = "a11y.UnknownToplevel")]
+    UnknownToplevel(String),
+    #[zbus(name = "DBus.Error.AccessDenied")]
+    AccessDenied(String),
+}
+
+#[interface(name = "org.freedesktop.a11y.PointerLocator")]
+impl PointerLocator {
+    // Queries the a11y details about the toplevel beneath the mouse pointer, together with the
+    // relative position of the mouse pointer on the surface. Also schedules one
+    // PointerPositionChanged for the next pointer motion.
+    async fn query_pointer(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(HashMap<String, OwnedValue>, f64, f64), A11yError> {
+        super::check_sender(conn, hdr.sender(), &[ALLOWED_SENDER], "QueryPointer")
+            .await
+            .map_err(|err| match err {
+                fdo::Error::AccessDenied(message) => A11yError::AccessDenied(message),
+                err => A11yError::ZBus(err.into()),
+            })?;
+        if let Some(sender) = hdr.sender() {
+            self.requesters
+                .lock()
+                .unwrap()
+                .insert(OwnedUniqueName::from(sender.to_owned()));
+        }
+
+        let (reply, answer) = async_channel::bounded(1);
+        let unknown = || A11yError::UnknownToplevel("Cannot get client a11y information".into());
+        if self.to_synoik.send(PointerQuery { reply }).is_err() {
+            return Err(unknown());
+        }
+        match answer.recv().await {
+            Ok(Some(PointerTarget::Shell { x, y })) => Ok((HashMap::new(), x, y)),
+            Ok(Some(PointerTarget::Window { pid, x, y })) => Ok((
+                HashMap::from([("pid".to_owned(), OwnedValue::from(pid))]),
+                x,
+                y,
+            )),
+            _ => Err(unknown()),
+        }
+    }
+
+    // Emitted once to each client that called QueryPointer, at the first pointer motion after.
+    #[zbus(signal)]
+    async fn pointer_position_changed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+impl PointerLocator {
+    pub fn new(to_synoik: calloop::channel::Sender<PointerQuery>) -> Self {
+        Self {
+            to_synoik,
+            requesters: Arc::default(),
+            iface: Arc::default(),
+        }
+    }
+
+    /// The pointer moved: tell whoever asked since it last did
+    /// (`meta_a11y_manager_maybe_notify_motion`).
+    pub fn pointer_moved(&self) {
+        let requesters = std::mem::take(&mut *self.requesters.lock().unwrap());
+        let Some(iface) = self.iface.get() else {
+            return;
+        };
+        for name in &requesters {
+            let ctxt = iface
+                .signal_emitter()
+                .clone()
+                .set_destination(BusName::Unique(name.as_ref()));
+            if let Err(err) = async_io::block_on(PointerLocator::pointer_position_changed(&ctxt)) {
+                warn!("error emitting PointerPositionChanged: {err:?}");
+            }
+        }
+    }
 }
 
 /// Keyboard monitor key block reason.
@@ -256,7 +376,18 @@ impl KeyboardMonitor {
         Self {
             data: Arc::new(Mutex::new(Data::default())),
             iface: Arc::new(OnceLock::new()),
+            locator: None,
         }
+    }
+
+    /// Serve `locator` beside the monitor.
+    pub fn with_pointer_locator(mut self, locator: PointerLocator) -> Self {
+        self.locator = Some(locator);
+        self
+    }
+
+    pub fn pointer_locator(&self) -> Option<&PointerLocator> {
+        self.locator.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -515,6 +646,15 @@ impl Start for KeyboardMonitor {
             .interface("/org/freedesktop/a11y/Manager")?;
         let _ = self.iface.set(iface);
 
+        if let Some(locator) = &self.locator {
+            conn.object_server()
+                .at("/org/freedesktop/a11y/Manager", locator.clone())?;
+            let iface = conn
+                .object_server()
+                .interface("/org/freedesktop/a11y/Manager")?;
+            let _ = locator.iface.set(iface);
+        }
+
         let async_conn = conn.inner().clone();
         let future = async move {
             if let Err(err) = monitor_disappeared_clients(&async_conn, data.clone()).await {
@@ -541,6 +681,39 @@ impl Start for KeyboardMonitor {
 }
 
 impl State {
+    /// A `QueryPointer`: what is under the pointer (`meta_compositor_query_pointer_a11y`).
+    pub fn on_pointer_query(&mut self, query: PointerQuery) {
+        let _ = query.reply.send_blocking(self.pointer_target());
+    }
+
+    pub(crate) fn pointer_target(&mut self) -> Option<PointerTarget> {
+        let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+        let contents = self.synoik.contents_under(pos);
+        let (Some(_), Some((surface, loc))) = (&contents.window, &contents.surface) else {
+            // Our own chrome — the panel, the overview, a layer surface — and nothing at all
+            // are the shell's.
+            return Some(PointerTarget::Shell { x: pos.x, y: pos.y });
+        };
+        let pid = crate::utils::get_credentials_for_surface(surface)?.pid;
+        Some(PointerTarget::Window {
+            pid,
+            x: pos.x - loc.x,
+            y: pos.y - loc.y,
+        })
+    }
+
+    /// The pointer moved: the PointerLocator's callers want to hear it once.
+    pub fn a11y_pointer_moved(&self) {
+        if let Some(locator) = self
+            .synoik
+            .a11y_keyboard_monitor
+            .as_ref()
+            .and_then(KeyboardMonitor::pointer_locator)
+        {
+            locator.pointer_moved();
+        }
+    }
+
     pub fn a11y_process_key(
         &mut self,
         time: Duration,
