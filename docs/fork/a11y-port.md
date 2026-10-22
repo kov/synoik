@@ -1,7 +1,7 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 done (the toggle surface); A2's Large Text half, A4's keyboard filters and A6's
-bell done. Everything else it toggles is unbuilt.**
+**Status: A1 (the toggle surface), A2, A4, A6, A7 and A9 done; A3 (Zoom), A5 (Screen Keyboard)
+and A8 (our own UI readable by a screen reader) are unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
@@ -24,7 +24,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 | Layer | GNOME | Us |
 |---|---|---|
 | Settings surface | `js/ui/status/accessibility.js` | ✅ `src/ui/a11y_menu.rs` (R4) |
-| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ⬜ §A2, A3, A5 |
+| Shell-internal features | `js/ui/magnifier.js`, `js/ui/keyboard.js`, St | ✅ §A2; ⬜ A3, A5 |
 | Compositor/input features | mutter `meta-keyboard-a11y.c`, `bell.c`, `meta-a11y-manager.c` | ✅ §A4, A6, A7 |
 | Our own UI's a11y tree | AT-SPI via St's ATK bridge | ⬜ §A8 — **the real one** |
 
@@ -36,7 +36,7 @@ Accessibility in GNOME is split across three layers, and we own all three:
 The `ATIndicator` indicator + menu. Writes the canonical keys; consumes none of them.
 See `panel-status-port.md` R4.
 
-### A2 — High Contrast + Large Text in our own chrome
+### A2 — High Contrast + Large Text in our own chrome ✅
 The two rows that already do *something* today, because GTK apps read the keys directly —
 but our shell chrome ignores both, so the panel and popovers stay identical while every app
 changes. GNOME routes both through `StSettings`:
@@ -44,15 +44,19 @@ changes. GNOME routes both through `StSettings`:
   shell reloads a **separate stylesheet variant** on it — `_getStylesheet(name.replace('.css',
   '-high-contrast.css'))` (`js/ui/main.js:461-463`), re-run from
   `St.Settings.get().connect('notify::high-contrast', _loadDefaultStylesheet)` (`main.js:176`).
-  For us that is a second theme in the widget layer, not a filter — it lands naturally on the
-  cssparser cascade ([[widget-layer]] slice B1) and should probably wait for it.
+  ✅ Ours is one process-wide switch (`crate::ui::high_contrast`, published with the base font
+  by `GnomeSettings::publish_style`) that the palette in `widget::style` reads: the values the
+  high-contrast sheet moves are functions there, and `Painter::hc_inset` draws its 1px
+  `$hc_inset_color` outline inside buttons, entries, cards, quick toggles and icon buttons.
+  Shadows go and the overview plate stays dark. Values come from compiling both sheets with
+  `sassc` and diffing them per selector. A surface that keeps a hand-picked local colour
+  rather than a `widget::style` one does not follow it yet; the cascade
+  ([[widget-layer]] B1) is what makes that impossible to miss.
 - ✅ `text-scaling-factor` multiplies the realized base font
   (`GnomeSettings::realized_base_font_pt`). mutter folds the factor into the font DPI
   (`meta-settings.c:184-199`) and St scales every `pt` and `em` length by it, not `px`
   (`st-theme-node.c:1350-1373`) — the same set our base drives through `pt_to_px`, `em` and
   `scaled_px`.
-
-High Contrast is the remaining half of A2.
 
 ### A3 — Magnifier (the Zoom row)
 `org.gnome.desktop.a11y.magnifier` (`js/ui/magnifier.js:25`), `Magnifier`
@@ -156,10 +160,9 @@ Orca can *read* is A7 and A8.
 
 ## Suggested order
 
-1. **A2** — High Contrast, the half that makes its shipped switch honest.
-2. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
+1. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.
-3. **A3**, **A5** — each independently schedulable.
+2. **A3**, **A5** — each independently schedulable.
 
 ## Deliberately not here
 - The `QuickToggle` a11y classes at `accessibility.js:149-327` are **GDM-only**

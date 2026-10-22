@@ -586,6 +586,17 @@ pub mod style {
         }
     }
 
+    /// An accent-filled control's fill: the accent, or under High Contrast `hc_color_mix` of it —
+    /// `st-mix(-st-accent-color, #fff, 87%)` (`.button.default`, `.quick-toggle:checked`).
+    pub fn accent_fill(accent: Rgba) -> Rgba {
+        if crate::ui::high_contrast() {
+            let mix = |c: f32| 0.87 * c + 0.13;
+            [mix(accent[0]), mix(accent[1]), mix(accent[2]), accent[3]]
+        } else {
+            accent
+        }
+    }
+
     /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
     /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
     pub fn accent_rgba(accent: [u8; 3]) -> Rgba {
@@ -2781,7 +2792,7 @@ impl ButtonStyle {
         match self {
             ButtonStyle::Normal => style::button_bg(),
             ButtonStyle::Dialog => style::dialog_button_bg(),
-            ButtonStyle::Suggested => accent,
+            ButtonStyle::Suggested => style::accent_fill(accent),
             ButtonStyle::Destructive => style::DESTRUCTIVE_BG,
         }
     }
@@ -3397,13 +3408,17 @@ impl Painter<'_, '_, '_> {
     pub fn quick_toggle(&mut self, t: &QuickToggle, accent: Rgba) -> anyhow::Result<()> {
         let radius = t.rect.size.h / 2.;
         let bg = if t.checked {
-            accent
+            style::accent_fill(accent)
         } else {
             style::button_bg()
         };
         self.fill_rounded(t.rect, radius, bg)?;
         if t.hovered {
             self.fill_rounded(t.rect, radius, style::HOVER_WASH)?;
+        }
+        // `.quick-toggle:checked` takes the `.button` outline off again.
+        if !t.checked {
+            self.hc_inset(t.rect, radius)?;
         }
         if t.focused {
             let ring = if t.checked {
@@ -3420,6 +3435,10 @@ impl Painter<'_, '_, '_> {
         // `border-radius: $forced_circular_radius` on a square box.
         let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
         self.fill_rounded(b.rect, radius, b.bg)?;
+        // `.icon-button`'s outline; an accent-filled one is `default`-style and has none.
+        if b.bg != accent {
+            self.hc_inset(b.rect, radius)?;
+        }
         if b.active {
             // `:active` lightens 9% where `:hover` lightens 4% (`_drawing.scss:182-183`).
             self.fill_rounded(b.rect, radius, style::SELECTED_WASH)?;

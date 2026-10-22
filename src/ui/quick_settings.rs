@@ -4003,6 +4003,7 @@ impl QuickSettings {
             // percentage after it.
             if let (Some(pill), Some(run)) = (pill_rect(self.has_pill()), &pill_run) {
                 p.fill_rounded(pill, pill.size.h / 2., widget::style::button_bg())?;
+                p.hc_inset(pill, pill.size.h / 2.)?;
                 if self.hovered == Some(QsHover::Pill) {
                     p.fill_rounded(pill, pill.size.h / 2., style::HOVER_WASH)?;
                 }
@@ -4046,6 +4047,7 @@ impl QuickSettings {
                     Size::from((SYS_HIT, SYS_HIT)),
                 );
                 p.fill_rounded(disc, SYS_HIT / 2., widget::style::button_bg())?;
+                p.hc_inset(disc, SYS_HIT / 2.)?;
                 if self.hovered == Some(QsHover::Sys(button)) {
                     p.fill_rounded(disc, SYS_HIT / 2., style::HOVER_WASH)?;
                 }
@@ -4069,6 +4071,7 @@ impl QuickSettings {
                 };
                 let disc = slider_icon_rect(slider, layout);
                 p.fill_rounded(disc, SLIDER_H / 2., widget::style::button_bg())?;
+                p.hc_inset(disc, SLIDER_H / 2.)?;
                 if self.hovered == Some(QsHover::SliderIcon(slider)) {
                     p.fill_rounded(disc, SLIDER_H / 2., style::HOVER_WASH)?;
                 }
