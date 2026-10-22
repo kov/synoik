@@ -67,7 +67,7 @@ impl Logo {
 }
 
 fn base_px() -> f64 {
-    crate::ui::pt_to_px(crate::ui::base_font_pt())
+    crate::ui::pt_to_px(crate::ui::BASE_FONT_PT)
 }
 
 /// The banner's lines: each paragraph wrapped at the view's `max-width`
@@ -100,7 +100,7 @@ pub fn banner_lines(text: &str) -> Vec<String> {
 /// a measured one.
 fn banner_natural(lines: &[String], monitor_w: f64) -> Size<f64, Logical> {
     let w = (BANNER_MAX_W_EM * base_px()).min(monitor_w);
-    let h = lines.len() as f64 * crate::ui::line_height_px(crate::ui::base_font_pt());
+    let h = lines.len() as f64 * crate::ui::line_height_px(crate::ui::BASE_FONT_PT);
     Size::from((w, h))
 }
 
@@ -203,7 +203,7 @@ impl LoginDialogChrome {
         if rect.size.w <= 0. || rect.size.h <= 0. {
             return None;
         }
-        let line_h = crate::ui::line_height_px(crate::ui::base_font_pt());
+        let line_h = crate::ui::line_height_px(crate::ui::BASE_FONT_PT);
         let size = rect.size;
         let baked = widget::bake(
             renderer,
@@ -219,7 +219,7 @@ impl LoginDialogChrome {
                 let mut shaper = TextShaper::new(renderer, scale);
                 lines
                     .iter()
-                    .map(|l| shaper.shape(l, TextStyle::new(crate::ui::base_font_pt())))
+                    .map(|l| shaper.shape(l, TextStyle::new(crate::ui::BASE_FONT_PT)))
                     .collect::<anyhow::Result<Vec<_>>>()
             },
             |frame, phys, runs| {

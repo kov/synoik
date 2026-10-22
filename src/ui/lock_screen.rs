@@ -342,7 +342,7 @@ pub fn stack_top(monitor: Rectangle<f64, Logical>, block_h: f64) -> f64 {
 /// is, and over-reporting costs a slightly darker wallpaper, while under-reporting costs a clock
 /// you cannot read. It also keeps the answer stable as the time and the date change width.
 pub fn text_band(monitor: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
-    let h = block_height(crate::ui::pt_to_px(crate::ui::base_font_pt()));
+    let h = block_height(crate::ui::pt_to_px(crate::ui::BASE_FONT_PT));
     Rectangle::new(
         Point::from((monitor.loc.x, stack_top(monitor, h))),
         Size::from((monitor.size.w, h)),
@@ -523,7 +523,7 @@ pub fn peek_hit(
     monitor: Rectangle<f64, Logical>,
     pos: Point<f64, Logical>,
 ) -> Option<widget::EntryHit> {
-    let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+    let base_px = crate::ui::pt_to_px(crate::ui::BASE_FONT_PT);
     let width = prompt_width(base_px);
     let block_h = prompt_block_height(base_px);
     let l = prompt_layout(
@@ -581,7 +581,7 @@ pub fn switch_user_hit(monitor: Rectangle<f64, Logical>, pos: Point<f64, Logical
 pub fn prompt_top(monitor: Rectangle<f64, Logical>) -> f64 {
     stack_top(
         monitor,
-        prompt_block_height(crate::ui::pt_to_px(crate::ui::base_font_pt())),
+        prompt_block_height(crate::ui::pt_to_px(crate::ui::BASE_FONT_PT)),
     )
 }
 
@@ -1043,7 +1043,7 @@ impl LockScreen {
             monitor,
             now,
         } = ctx;
-        let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+        let base_px = crate::ui::pt_to_px(crate::ui::BASE_FONT_PT);
         let width = prompt_width(base_px);
         let block_h = prompt_block_height(base_px);
         // Placement inside the block needs real font metrics, so it happens in `paint` where the
@@ -1489,7 +1489,7 @@ impl LockScreen {
             monitor,
             now,
         } = ctx;
-        let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+        let base_px = crate::ui::pt_to_px(crate::ui::BASE_FONT_PT);
         let size = Size::from((monitor.size.w, block_height(base_px)));
         let hint_alpha = self.hint_alpha(now);
 

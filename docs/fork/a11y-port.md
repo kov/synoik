@@ -1,6 +1,7 @@
 # Accessibility — a milestone of its own
 
-**Status: A1 done (the toggle surface), everything it toggles unbuilt.**
+**Status: A1 done (the toggle surface); A2's Large Text half done. Everything else it toggles
+is unbuilt.**
 
 This is a *milestone*, not a chrome slice. R4 in `panel-status-port.md` delivered the
 `ATIndicator` menu — ten switches that write ten gsettings keys — and that is the **control
@@ -46,11 +47,13 @@ changes. GNOME routes both through `StSettings`:
   `St.Settings.get().connect('notify::high-contrast', _loadDefaultStylesheet)` (`main.js:176`).
   For us that is a second theme in the widget layer, not a filter — it lands naturally on the
   cssparser cascade ([[widget-layer]] slice B1) and should probably wait for it.
-- `text-scaling-factor` multiplies the realized base font. We already have exactly the right
-  seam: `crate::ui::base_font_pt` / `set_base_font_pt`, which every point size is a ratio
-  against ([[gnome-visual-style-reference]]). This slice is small and worth doing early.
+- ✅ `text-scaling-factor` multiplies the realized base font
+  (`GnomeSettings::realized_base_font_pt`). mutter folds the factor into the font DPI
+  (`meta-settings.c:184-199`) and St scales every `pt` and `em` length by it, not `px`
+  (`st-theme-node.c:1350-1373`) — the same set our base drives through `pt_to_px`, `em` and
+  `scaled_px`.
 
-**Do A2 first** — it is the one slice that makes two existing switches honest.
+High Contrast is the remaining half of A2.
 
 ### A3 — Magnifier (the Zoom row)
 `org.gnome.desktop.a11y.magnifier` (`js/ui/magnifier.js:25`), `Magnifier`
@@ -110,7 +113,7 @@ whether we need to do the launching ourselves.
 
 ## Suggested order
 
-1. **A2** — makes two shipped switches honest, and the text-scaling half is nearly free.
+1. **A2** — High Contrast, the half that makes its shipped switch honest.
 2. **A4 + A6** — self-contained compositor/input work, no new protocol surface.
 3. **A8** — the big one; start it as soon as the widget layer's cascade work (B1) settles,
    because roles/names want to live next to the theme node.

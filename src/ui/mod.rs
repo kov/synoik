@@ -90,7 +90,13 @@ pub const BASE_FONT_PT: f64 = 11.;
 /// its icon) is `1em`, i.e. exactly this.
 ///
 /// Structural `em` multiples ride the same base, which is why [`em`] reads it too.
-pub fn base_font_pt() -> f64 {
+///
+/// `text-scaling-factor` (Large Text) is folded in as well — see
+/// [`crate::gnome::GnomeSettings::realized_base_font_pt`].
+///
+/// Private on purpose: callers wanting 1em text pass [`BASE_FONT_PT`] to [`pt_to_px`], which
+/// applies this base. Passing *this* there applied the user's size twice.
+fn base_font_pt() -> f64 {
     f64::from_bits(BASE_FONT_PT_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
