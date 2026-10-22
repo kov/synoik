@@ -120,6 +120,53 @@ pub struct Subkeys {
     captured_press: bool,
 }
 
+/// The seat's touch mode (`ClutterSeat:touch-mode`, mutter's `update_touch_mode`): a touchscreen,
+/// and either a tablet-mode switch that is on or, with no such switch, no pointer at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TouchMode {
+    pub has_touchscreen: bool,
+    pub has_pointer: bool,
+    pub has_tablet_switch: bool,
+    pub tablet_mode: bool,
+}
+
+impl TouchMode {
+    pub fn active(&self) -> bool {
+        if !self.has_touchscreen {
+            false
+        } else if self.has_tablet_switch {
+            self.tablet_mode
+        } else {
+            !self.has_pointer
+        }
+    }
+}
+
+/// `ShellEdgeDragGesture` on the bottom edge (`shell-edge-drag-gesture.c`): a touch that starts
+/// within `EDGE_THRESHOLD` of a display's bottom and is dragged `DRAG_DISTANCE` up it.
+const EDGE_THRESHOLD: f64 = 20.;
+const EDGE_DRAG_DISTANCE: f64 = 80.;
+const EDGE_CANCEL_THRESHOLD: f64 = 100.;
+const EDGE_CANCEL_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[derive(Debug)]
+struct EdgeDrag {
+    slot: i32,
+    begin: Point<f64, Logical>,
+    last: Point<f64, Logical>,
+    /// The display it began on.
+    monitor: Rectangle<f64, Logical>,
+    /// Past the edge: the gesture has the touch.
+    recognizing: bool,
+    cancel_timer: Option<TimerToken>,
+}
+
+impl EdgeDrag {
+    fn near_edge(&self, p: Point<f64, Logical>) -> bool {
+        p.y > self.monitor.loc.y + self.monitor.size.h - EDGE_THRESHOLD
+    }
+}
+
 /// `EMOJI_PAGE_SEPARATION`: the gap between a page and the one sliding in beside it.
 pub const EMOJI_PAGE_SEPARATION: f64 = 32.;
 
@@ -251,6 +298,12 @@ pub struct Osk {
     subkeys: Option<Subkeys>,
     emoji: Option<EmojiPage>,
     focus_window: Option<FocusWindow>,
+    touch_mode: TouchMode,
+    /// `_lastDeviceIsTouchscreen`: the last non-keyboard device used was a touchscreen.
+    last_device_touchscreen: bool,
+    edge_drag: Option<EdgeDrag>,
+    /// The keyboard's progress while the edge drag pulls it up (`gestureProgress`).
+    gesture: Option<f64>,
     /// The `FocusTracker`'s current window and where it sat, to see it move (`window-moved`).
     watched: Option<(Window, Option<Point<f64, Logical>>)>,
     /// Bumped on every change the drawn keyboard shows.
@@ -284,6 +337,10 @@ impl Default for Osk {
             subkeys: None,
             emoji: None,
             focus_window: None,
+            touch_mode: TouchMode::default(),
+            last_device_touchscreen: false,
+            edge_drag: None,
+            gesture: None,
             watched: None,
             revision: 0,
         }
@@ -302,6 +359,9 @@ impl Osk {
 
     /// How far up it is, 0..=1.
     pub fn progress(&self) -> f64 {
+        if let Some(gesture) = self.gesture {
+            return gesture;
+        }
         self.progress.as_ref().map_or(self.shown, Animation::value)
     }
 
@@ -344,6 +404,10 @@ impl Osk {
 
     pub fn subkeys(&self) -> Option<&Subkeys> {
         self.subkeys.as_ref()
+    }
+
+    pub fn touch_mode(&self) -> TouchMode {
+        self.touch_mode
     }
 
     pub fn emoji_active(&self) -> bool {
@@ -938,12 +1002,15 @@ pub fn height(output_size: Size<f64, Logical>) -> f64 {
 impl State {
     /// `KeyboardManager._syncEnabled`: the keyboard exists while the setting is on.
     pub fn sync_osk(&mut self) {
-        let enabled = self
+        let setting = self
             .synoik
             .gnome_settings
             .a11y
             .get(crate::gnome::A11yToggle::ScreenKeyboard);
+        // Or on its own, while a touchscreen is the seat's way in and the last one used
+        // (`autoEnabled`).
         let osk = &mut self.synoik.osk;
+        let enabled = setting || (osk.touch_mode.active() && osk.last_device_touchscreen);
         if enabled == osk.enabled {
             if enabled {
                 self.sync_osk_group();
@@ -959,11 +1026,18 @@ impl State {
             self.synoik.osk.focus = TextFocus::None;
             self.sync_osk_focus();
         } else {
-            // `destroy`: gone at once, no slide.
+            // `setCursorLocation(null)`, then `destroy`: the window it moved goes back, and the
+            // keyboard is gone at once, no slide.
+            if osk.visible {
+                self.osk_animate_window(false);
+            }
+            self.synoik.panel_popover.close_osk_languages();
+            let osk = &mut self.synoik.osk;
             for token in [
                 osk.rest_timer.take(),
                 osk.hide_panel_timer.take(),
                 osk.long_press_timer.take(),
+                osk.edge_drag.take().and_then(|drag| drag.cancel_timer),
             ]
             .into_iter()
             .flatten()
@@ -971,11 +1045,211 @@ impl State {
                 self.synoik.cancel_timer(token);
             }
             let delete_held = self.synoik.osk.delete_held;
-            self.synoik.osk = Osk::default();
+            let (touch_mode, last_device_touchscreen) = (
+                self.synoik.osk.touch_mode,
+                self.synoik.osk.last_device_touchscreen,
+            );
+            self.synoik.osk = Osk {
+                touch_mode,
+                last_device_touchscreen,
+                ..Osk::default()
+            };
             if delete_held {
                 self.osk_delete(false);
             }
         }
+        self.synoik.queue_redraw_all();
+    }
+
+    /// The seat's devices changed: the touch mode follows (`notify::touch-mode`).
+    pub fn osk_set_touch_mode(&mut self, touch_mode: TouchMode) {
+        if self.synoik.osk.touch_mode != touch_mode {
+            self.synoik.osk.touch_mode = touch_mode;
+            self.sync_osk();
+        }
+    }
+
+    /// A tablet-mode switch toggled.
+    pub fn osk_set_tablet_mode(&mut self, on: bool) {
+        let touch_mode = TouchMode {
+            tablet_mode: on,
+            ..self.synoik.osk.touch_mode
+        };
+        self.osk_set_touch_mode(touch_mode);
+    }
+
+    /// `last-device-changed`, for anything but a keyboard: whether it was a touchscreen.
+    pub fn osk_last_device(&mut self, touchscreen: bool) {
+        if self.synoik.osk.last_device_touchscreen != touchscreen {
+            self.synoik.osk.last_device_touchscreen = touchscreen;
+            self.sync_osk();
+        }
+    }
+
+    /// A touch went down: it may be the bottom edge drag that pulls the keyboard up. The touch
+    /// goes on to whatever is under it all the same until the drag is recognised.
+    pub fn osk_edge_drag_down(&mut self, slot: i32, pos: Point<f64, Logical>) {
+        // A second point cancels it (`n_points > 1`).
+        if self.synoik.osk.edge_drag.is_some() {
+            self.osk_edge_drag_cancel();
+            return;
+        }
+        // `may-recognize`: anywhere but the lock screen; and only while there is a keyboard to
+        // pull, and it is not up (`_bottomDragGesture.enabled = !visible`).
+        let osk = &self.synoik.osk;
+        if !osk.enabled || osk.visible || self.synoik.is_locked() {
+            return;
+        }
+        let Some(monitor) = self
+            .synoik
+            .global_space
+            .outputs()
+            .filter_map(|o| self.synoik.global_space.output_geometry(o))
+            .map(|g| g.to_f64())
+            .find(|g| g.contains(pos))
+        else {
+            return;
+        };
+        let mut drag = EdgeDrag {
+            slot,
+            begin: pos,
+            last: pos,
+            monitor,
+            recognizing: false,
+            cancel_timer: None,
+        };
+        if !drag.near_edge(pos) {
+            return;
+        }
+        // Still at the edge after `CANCEL_TIMEOUT_MS` is a touch resting there, not a drag.
+        drag.cancel_timer = Some(self.synoik.timer_after(EDGE_CANCEL_TIMEOUT, |state| {
+            if let Some(drag) = state.synoik.osk.edge_drag.as_mut() {
+                drag.cancel_timer = None;
+                if !drag.recognizing && drag.near_edge(drag.last) {
+                    state.osk_edge_drag_cancel();
+                }
+            }
+            None
+        }));
+        self.synoik.osk.edge_drag = Some(drag);
+    }
+
+    /// The touch moved. Returns whether the drag has it — then nothing under it sees it.
+    pub fn osk_edge_drag_motion(&mut self, slot: i32, pos: Point<f64, Logical>) -> bool {
+        let Some(drag) = self
+            .synoik
+            .osk
+            .edge_drag
+            .as_mut()
+            .filter(|d| d.slot == slot)
+        else {
+            return false;
+        };
+        drag.last = pos;
+        if (pos.x - drag.begin.x).abs() > EDGE_CANCEL_THRESHOLD {
+            self.osk_edge_drag_cancel();
+            return false;
+        }
+        if !drag.recognizing && !drag.near_edge(pos) {
+            drag.recognizing = true;
+            if let Some(token) = drag.cancel_timer.take() {
+                self.synoik.cancel_timer(token);
+            }
+            // The gesture claims the touch: the client under it loses it.
+            if let Some(touch) = self.synoik.seat.get_touch() {
+                touch.cancel(self);
+            }
+        }
+        let Some(drag) = self.synoik.osk.edge_drag.as_ref() else {
+            return false;
+        };
+        if !drag.recognizing {
+            return false;
+        }
+        let distance = (pos.y - drag.begin.y).abs();
+        let completed = pos.y < drag.monitor.loc.y + drag.monitor.size.h - EDGE_DRAG_DISTANCE;
+        self.osk_gesture_progress(distance);
+        if completed {
+            self.synoik.osk.edge_drag = None;
+            self.osk_gesture_activate();
+        }
+        true
+    }
+
+    /// The touch lifted. Returns whether the drag had it.
+    pub fn osk_edge_drag_up(&mut self, slot: i32) -> bool {
+        let recognizing = match self.synoik.osk.edge_drag.as_ref() {
+            Some(drag) if drag.slot == slot => drag.recognizing,
+            _ => return false,
+        };
+        // An end before the distance is a cancel (`point_ended`).
+        self.osk_edge_drag_cancel();
+        recognizing
+    }
+
+    fn osk_edge_drag_cancel(&mut self) {
+        let Some(drag) = self.synoik.osk.edge_drag.take() else {
+            return;
+        };
+        if let Some(token) = drag.cancel_timer {
+            self.synoik.cancel_timer(token);
+        }
+        if drag.recognizing {
+            self.osk_gesture_cancel();
+        }
+    }
+
+    /// `gestureProgress`: the keyboard follows the finger up, and the focus window with it.
+    fn osk_gesture_progress(&mut self, delta: f64) {
+        let Some(height) = self.synoik.osk_full_height() else {
+            return;
+        };
+        let progress = delta.min(height) / height.max(1.);
+        self.synoik.osk.gesture = Some(progress);
+        self.synoik.osk.bump();
+        if let Some(focus) = self.synoik.osk.focus_window.clone() {
+            let dy = -height * progress - focus.shift;
+            // The actor follows the finger, unanimated.
+            let config = synoik_config::Animation {
+                off: true,
+                kind: synoik_config::animations::Kind::Easing(
+                    synoik_config::animations::EasingParams {
+                        duration_ms: 0,
+                        curve: synoik_config::animations::Curve::EaseOutQuad,
+                    },
+                ),
+            };
+            let moved = self
+                .synoik
+                .layout
+                .slide_floating_window_y(&focus.window, dy, config)
+                .unwrap_or(0.);
+            if let Some(focus) = self.synoik.osk.focus_window.as_mut() {
+                focus.shift += moved;
+            }
+            self.synoik.osk.watched = self.osk_focused_window_position();
+        }
+        self.synoik.queue_redraw_all();
+    }
+
+    /// `gestureActivate` → `open(true)`: up the rest of the way from where the finger left it.
+    fn osk_gesture_activate(&mut self) {
+        self.osk_open(true);
+        self.synoik.osk.gesture = None;
+        self.synoik.queue_redraw_all();
+    }
+
+    /// `gestureCancel` → `_animateHide`: back down from where the finger left it.
+    fn osk_gesture_cancel(&mut self) {
+        if self.synoik.osk.gesture.is_none() {
+            return;
+        }
+        let clock = self.synoik.clock.clone();
+        let osk = &mut self.synoik.osk;
+        osk.animate_to(&clock, 0., Curve::EaseInQuad);
+        osk.gesture = None;
+        osk.bump();
+        self.osk_animate_window(false);
         self.synoik.queue_redraw_all();
     }
 

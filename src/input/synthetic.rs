@@ -19,7 +19,7 @@ use smithay::backend::input::{
     GestureHoldEndEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
     InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent,
     PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
-    TouchSlot, TouchUpEvent, UnusedEvent,
+    TouchMotionEvent, TouchSlot, TouchUpEvent, UnusedEvent,
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
@@ -598,6 +598,49 @@ impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {
 
 impl TouchDownEvent<SyntheticInputBackend> for SyntheticTouchDownEvent {}
 
+/// The single test slot's touch point moving.
+pub struct SyntheticTouchMotionEvent {
+    pub time: u64,
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Event<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> SyntheticInputDevice {
+        SyntheticInputDevice
+    }
+}
+
+impl TouchEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn slot(&self) -> TouchSlot {
+        TouchSlot::from(Some(0))
+    }
+}
+
+impl AbsolutePositionEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {
+    fn x(&self) -> f64 {
+        self.x
+    }
+
+    fn y(&self) -> f64 {
+        self.y
+    }
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        self.x
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        self.y
+    }
+}
+
+impl TouchMotionEvent<SyntheticInputBackend> for SyntheticTouchMotionEvent {}
+
 pub struct SyntheticTouchUpEvent {
     pub time: u64,
 }
@@ -766,7 +809,7 @@ impl InputBackend for SyntheticInputBackend {
     type TouchDownEvent = SyntheticTouchDownEvent;
     type TouchUpEvent = SyntheticTouchUpEvent;
 
-    type TouchMotionEvent = UnusedEvent;
+    type TouchMotionEvent = SyntheticTouchMotionEvent;
     type TouchCancelEvent = UnusedEvent;
     type TouchFrameEvent = UnusedEvent;
     type TabletToolAxisEvent = UnusedEvent;

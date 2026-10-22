@@ -45953,3 +45953,93 @@ fn osk_capitalises_sentences() {
     osk_feed(&mut f, id, &seen);
     assert_eq!(page(&mut f), "shift");
 }
+
+/// With the setting off, the keyboard exists while the seat is in touch mode and a touchscreen is
+/// what was used last (`KeyboardManager._syncEnabled`'s `autoEnabled`); a mouse takes it away.
+#[test]
+fn osk_comes_with_touch_mode() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik()
+        .gnome_settings
+        .a11y
+        .set(crate::gnome::A11yToggle::ScreenKeyboard, false);
+    f.synoik_state().sync_osk();
+    assert!(!f.synoik().osk.is_enabled());
+
+    // A touchscreen alone, with a mouse plugged in: no touch mode.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        has_pointer: true,
+        ..Default::default()
+    });
+    f.touch_down(300., 300.);
+    f.touch_up();
+    assert!(!f.synoik().osk.is_enabled());
+
+    // Unplug the mouse.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        ..Default::default()
+    });
+    assert!(f.synoik().osk.is_enabled(), "the touchscreen was the last");
+    pointer_motion_to(&mut f, 400., 400.);
+    assert!(!f.synoik().osk.is_enabled(), "a pointer was the last");
+    f.touch_down(300., 300.);
+    f.touch_up();
+    assert!(f.synoik().osk.is_enabled());
+
+    // A tablet-mode switch decides when there is one.
+    f.synoik_state().osk_set_touch_mode(crate::osk::TouchMode {
+        has_touchscreen: true,
+        has_tablet_switch: true,
+        ..Default::default()
+    });
+    assert!(!f.synoik().osk.is_enabled());
+    f.synoik_state().osk_set_tablet_mode(true);
+    assert!(f.synoik().osk.is_enabled());
+}
+
+/// A touch dragged up from the bottom edge pulls the keyboard up after it, and past
+/// `DRAG_DISTANCE` it opens the rest of the way; let go short of that and it drops back
+/// (`ShellEdgeDragGesture`, `gestureProgress`/`gestureActivate`/`gestureCancel`). A touch resting
+/// on the edge is not a drag.
+#[test]
+fn osk_bottom_edge_drag() {
+    let (mut f, _id, _seen, _requests) = osk_fixture();
+    f.synoik().seat.add_touch();
+    let output = f.synoik_output(1);
+    assert!(f.synoik().osk.is_enabled());
+    assert!(!f.synoik().osk.is_visible());
+
+    f.touch_down(960., 1075.);
+    f.touch_motion(960., 1050.);
+    assert!(!f.synoik().osk.is_visible());
+    let rect = f.synoik().osk_rect(&output).expect("following the finger");
+    assert_eq!(rect.loc.y, 1080. - 25.);
+    f.touch_motion(960., 1010.);
+    assert_eq!(f.synoik().osk_rect(&output).unwrap().loc.y, 1080. - 65.);
+    // Let go short of the distance: back down.
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(f.synoik().osk_rect(&output).is_none());
+    assert!(!f.synoik().osk.is_visible());
+
+    // All the way: it opens, at once.
+    f.touch_down(960., 1075.);
+    f.touch_motion(960., 1040.);
+    f.touch_motion(960., 990.);
+    assert!(f.synoik().osk.is_visible());
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert_eq!(f.synoik().osk_rect(&output).unwrap().loc.y, 720.);
+
+    // Down again; a touch that rests at the edge first is no drag.
+    f.synoik_state().osk_close(true);
+    run_for(&mut f, Duration::from_millis(300));
+    f.touch_down(960., 1075.);
+    run_for(&mut f, Duration::from_millis(250));
+    f.touch_motion(960., 990.);
+    f.touch_up();
+    run_for(&mut f, Duration::from_millis(300));
+    assert!(!f.synoik().osk.is_visible());
+}

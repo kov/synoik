@@ -21,7 +21,7 @@ use crate::input::synthetic::{
     SyntheticGestureSwipeBeginEvent, SyntheticGestureSwipeEndEvent,
     SyntheticGestureSwipeUpdateEvent, SyntheticInputBackend, SyntheticKeyboardKeyEvent,
     SyntheticPointerAxisEvent, SyntheticPointerButtonEvent, SyntheticPointerMotionEvent,
-    SyntheticTouchDownEvent, SyntheticTouchUpEvent,
+    SyntheticTouchDownEvent, SyntheticTouchMotionEvent, SyntheticTouchUpEvent,
 };
 use crate::synoik::{NewClient, Synoik};
 
@@ -664,6 +664,18 @@ impl Fixture {
     pub fn touch_down(&mut self, x: f64, y: f64) {
         let event = InputEvent::<SyntheticInputBackend>::TouchDown {
             event: SyntheticTouchDownEvent {
+                time: self.next_input_micros(),
+                x,
+                y,
+            },
+        };
+        self.synoik_state().process_input_event(event);
+    }
+
+    /// Move the single test slot's touch point to `(x, y)`, through the real input pipeline.
+    pub fn touch_motion(&mut self, x: f64, y: f64) {
+        let event = InputEvent::<SyntheticInputBackend>::TouchMotion {
+            event: SyntheticTouchMotionEvent {
                 time: self.next_input_micros(),
                 x,
                 y,

@@ -695,6 +695,25 @@ impl State {
             self.synoik.overlay_key_armed = None;
         }
 
+        // `last-device-changed`, for anything but a keyboard.
+        match &event {
+            InputEvent::TouchDown { .. }
+            | InputEvent::TouchMotion { .. }
+            | InputEvent::TouchUp { .. } => self.osk_last_device(true),
+            InputEvent::PointerMotion { .. }
+            | InputEvent::PointerMotionAbsolute { .. }
+            | InputEvent::PointerButton { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TabletToolAxis { .. }
+            | InputEvent::TabletToolTip { .. }
+            | InputEvent::TabletToolProximity { .. }
+            | InputEvent::TabletToolButton { .. }
+            | InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GesturePinchBegin { .. }
+            | InputEvent::GestureHoldBegin { .. } => self.osk_last_device(false),
+            _ => {}
+        }
+
         let mut consumed_by_a11y = false;
         use InputEvent::*;
         match event {
@@ -800,11 +819,13 @@ impl State {
                 }
 
                 apply_libinput_settings(&self.synoik.config.borrow().input, device);
+                self.sync_touch_mode();
             }
             InputEvent::DeviceRemoved { device } => {
                 self.synoik.touch.remove(device);
                 self.synoik.tablets.remove(device);
                 self.synoik.devices.remove(device);
+                self.sync_touch_mode();
 
                 // Unplugging the last mouse hands workspace actions back to the focused display
                 // rather than leaving them aimed at wherever the cursor was abandoned
@@ -818,6 +839,26 @@ impl State {
             }
             _ => (),
         }
+    }
+
+    /// The seat's devices as mutter's touch mode reads them: a touchscreen, a pointer (a mouse or
+    /// a touchpad), a tablet-mode switch (`meta_seat_impl_add_device`).
+    fn sync_touch_mode(&mut self) {
+        let devices = &self.synoik.devices;
+        let touch_mode = crate::osk::TouchMode {
+            has_touchscreen: devices
+                .iter()
+                .any(|d| d.has_capability(input::DeviceCapability::Touch)),
+            has_pointer: devices
+                .iter()
+                .any(|d| d.has_capability(input::DeviceCapability::Pointer)),
+            has_tablet_switch: devices.iter().any(|d| {
+                d.has_capability(input::DeviceCapability::Switch)
+                    && d.switch_has_switch(input::event::switch::Switch::TabletMode) == Ok(true)
+            }),
+            ..self.synoik.osk.touch_mode()
+        };
+        self.osk_set_touch_mode(touch_mode);
     }
 
     fn on_device_added(&mut self, device: impl Device) {
@@ -11358,6 +11399,7 @@ impl State {
         if self.osk_touch_down(crate::osk::touch_id(slot), pos) {
             return;
         }
+        self.osk_edge_drag_down(crate::osk::touch_id(slot), pos);
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -11498,6 +11540,10 @@ impl State {
         if self.osk_touch_up(crate::osk::touch_id(slot)) {
             return;
         }
+        // A drag the keyboard claimed was already cancelled for the client.
+        if self.osk_edge_drag_up(crate::osk::touch_id(slot)) {
+            return;
+        }
 
         if let Some(up) = self.synoik.screenshot_ui.pointer_up(Some(slot)) {
             self.handle_screenshot_ui_pointer_up(up);
@@ -11523,6 +11569,9 @@ impl State {
         let slot = evt.slot();
 
         if self.osk_touch_motion(crate::osk::touch_id(slot), pos) {
+            return;
+        }
+        if self.osk_edge_drag_motion(crate::osk::touch_id(slot), pos) {
             return;
         }
 
@@ -11558,7 +11607,8 @@ impl State {
         };
         handle.frame(self);
     }
-    fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
+    fn on_touch_cancel<I: InputBackend>(&mut self, evt: I::TouchCancelEvent) {
+        self.osk_edge_drag_up(crate::osk::touch_id(evt.slot()));
         let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
@@ -11569,6 +11619,10 @@ impl State {
         let Some(switch) = evt.switch() else {
             return;
         };
+
+        if switch == Switch::TabletMode {
+            self.osk_set_tablet_mode(evt.state() == SwitchState::On);
+        }
 
         if switch == Switch::Lid {
             let is_closed = evt.state() == SwitchState::On;
