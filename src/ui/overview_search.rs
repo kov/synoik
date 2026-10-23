@@ -1193,12 +1193,33 @@ impl OverviewSearch {
                 push_icon(&section.icon, PROVIDER_ICON_PX, center);
                 for (meta, row) in section.rows.iter().zip(&sl.rows) {
                     if let Some(icon) = row_icon(meta) {
-                        let center = Point::from((
-                            row.loc.x + ITEM_PAD + ROW_ICON_PX / 2.,
-                            row.loc.y + row.size.h / 2.,
-                        ));
-                        push_icon(&icon, ROW_ICON_PX, center);
+                        push_icon(&icon, ROW_ICON_PX, row_icon_center(*row));
                     }
+                }
+            }
+            drop(uploads);
+            // A symbolic icon is recoloured to the text it sits with, as `St.Icon` does for any
+            // `-symbolic` name — Settings' panels and Calculator's copy glyph are all symbolic.
+            for (section, sl) in self.sections.iter().zip(&results.sections) {
+                for (meta, row) in section.rows.iter().zip(&sl.rows) {
+                    let Some(name) = symbolic_icon(meta) else {
+                        continue;
+                    };
+                    let Some(tb) =
+                        sym_icons.texture(renderer, name, ROW_ICON_PX, scale, style::TEXT)
+                    else {
+                        continue;
+                    };
+                    let logical = tb.logical_size();
+                    let loc = row_icon_center(*row) - Point::from((logical.w / 2., logical.h / 2.));
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb,
+                        loc,
+                        results_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
                 }
             }
         }
@@ -1562,8 +1583,31 @@ fn section_texts(
     }
 }
 
-/// The icon a row draws, if it is one this toolkit can draw.
+/// Where a row's icon is centered.
+fn row_icon_center(row: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+    Point::from((
+        row.loc.x + ITEM_PAD + ROW_ICON_PX / 2.,
+        row.loc.y + row.size.h / 2.,
+    ))
+}
+
+/// A row's icon name when it is symbolic, and so drawn in the text colour.
+fn symbolic_icon(meta: &ResultMeta) -> Option<&str> {
+    match meta.icon.as_ref()? {
+        ResultIcon::Themed(names) => names
+            .first()
+            .map(String::as_str)
+            .filter(|name| name.ends_with("-symbolic")),
+        _ => None,
+    }
+}
+
+/// The full-colour icon a row draws, if it is one this toolkit can draw. Symbolic ones are
+/// [`symbolic_icon`]'s.
 fn row_icon(meta: &ResultMeta) -> Option<AppIconRef> {
+    if symbolic_icon(meta).is_some() {
+        return None;
+    }
     match meta.icon.as_ref()? {
         ResultIcon::Themed(names) => Some(AppIconRef::Themed(names.clone())),
         ResultIcon::File(path) => Some(AppIconRef::File(path.clone())),

@@ -36,7 +36,9 @@ use crate::search_providers::{
 const IFACE_1: &str = "org.gnome.Shell.SearchProvider";
 const IFACE_2: &str = "org.gnome.Shell.SearchProvider2";
 
-/// GDBus's default call timeout, which is what gnome-shell's proxies wait.
+/// GDBus's default call timeout, which is what gnome-shell's proxies wait. Enforced around each
+/// call here: zbus applies a connection's `method_timeout` to `Connection::call_method` but not
+/// to `Proxy::call_with_flags`, which is the only call that carries the no-auto-start flag.
 const CALL_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Bounds on what a provider can make us hold. A real provider returns tens of results; these
@@ -54,13 +56,15 @@ pub fn start(
     to_niri: calloop::channel::Sender<SearchToSynoik>,
     from_niri: async_channel::Receiver<SynoikToSearch>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
-    let conn = zbus::blocking::connection::Builder::session()?
-        .method_timeout(CALL_TIMEOUT)
-        .build()?;
+    let conn = zbus::blocking::connection::Builder::session()?.build()?;
     let reply: Reply = Arc::new(move |msg| {
         let _ = to_niri.send(msg);
     });
-    let client = Client::new(conn.inner().clone(), reply);
+    let bus = Bus {
+        conn: conn.inner().clone(),
+        timeout: CALL_TIMEOUT,
+    };
+    let client = Client::new(bus, reply);
     conn.inner()
         .executor()
         .spawn(client.serve(from_niri), "serve search providers")
@@ -81,17 +85,24 @@ struct Shared {
     metas: HashMap<String, HashMap<String, ResultMeta>>,
 }
 
-struct Client {
+/// The connection, and how long a call on it may take.
+#[derive(Clone)]
+struct Bus {
     conn: zbus::Connection,
+    timeout: Duration,
+}
+
+struct Client {
+    bus: Bus,
     reply: Reply,
     providers: Vec<ProviderEndpoint>,
     shared: Arc<Mutex<Shared>>,
 }
 
 impl Client {
-    fn new(conn: zbus::Connection, reply: Reply) -> Self {
+    fn new(bus: Bus, reply: Reply) -> Self {
         Self {
-            conn,
+            bus,
             reply,
             providers: Vec::new(),
             shared: Arc::default(),
@@ -116,7 +127,7 @@ impl Client {
                 self.shared.lock().unwrap().generation = generation;
                 for endpoint in &self.providers {
                     let task = search_provider(
-                        self.conn.clone(),
+                        self.bus.clone(),
                         endpoint.clone(),
                         generation,
                         terms.clone(),
@@ -140,14 +151,14 @@ impl Client {
                 let Some(endpoint) = self.endpoint(&provider) else {
                     return;
                 };
-                let conn = self.conn.clone();
+                let bus = self.bus.clone();
                 self.spawn(
                     async move {
                         let result = if endpoint.version2 {
-                            call::<()>(&conn, &endpoint, "ActivateResult", &(id, terms, timestamp))
+                            call::<()>(&bus, &endpoint, "ActivateResult", &(id, terms, timestamp))
                                 .await
                         } else {
-                            call::<()>(&conn, &endpoint, "ActivateResult", &(id,)).await
+                            call::<()>(&bus, &endpoint, "ActivateResult", &(id,)).await
                         };
                         if let Err(err) = result {
                             warn!("search provider {}: ActivateResult: {err}", endpoint.id);
@@ -166,11 +177,11 @@ impl Client {
                 let Some(endpoint) = self.endpoint(&provider).filter(|e| e.version2) else {
                     return;
                 };
-                let conn = self.conn.clone();
+                let bus = self.bus.clone();
                 self.spawn(
                     async move {
                         if let Err(err) =
-                            call::<()>(&conn, &endpoint, "LaunchSearch", &(terms, timestamp)).await
+                            call::<()>(&bus, &endpoint, "LaunchSearch", &(terms, timestamp)).await
                         {
                             warn!("search provider {}: LaunchSearch: {err}", endpoint.id);
                         }
@@ -186,14 +197,14 @@ impl Client {
     }
 
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static, name: &str) {
-        self.conn.executor().spawn(task, name).detach();
+        self.bus.conn.executor().spawn(task, name).detach();
     }
 }
 
 /// Call `method` on the provider, honouring `AutoStart=false` the way a gnome-shell proxy built
 /// with `DO_NOT_AUTO_START` does: the bus will not start a provider for us.
 async fn call<R>(
-    conn: &zbus::Connection,
+    bus: &Bus,
     endpoint: &ProviderEndpoint,
     method: &str,
     body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
@@ -202,7 +213,7 @@ where
     R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
 {
     let iface = if endpoint.version2 { IFACE_2 } else { IFACE_1 };
-    let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(conn)
+    let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&bus.conn)
         .destination(endpoint.bus_name.as_str())?
         .path(endpoint.object_path.as_str())?
         .interface(iface)?
@@ -214,15 +225,21 @@ where
     } else {
         MethodFlags::NoAutoStart.into()
     };
-    proxy
-        .call_with_flags(method, flags, body)
-        .await?
-        .ok_or_else(|| zbus::Error::Failure("no reply".to_owned()))
+    let reply = std::pin::pin!(proxy.call_with_flags(method, flags, body));
+    let timeout = std::pin::pin!(async_io::Timer::after(bus.timeout));
+    match futures_util::future::select(reply, timeout).await {
+        futures_util::future::Either::Left((reply, _)) => {
+            reply?.ok_or_else(|| zbus::Error::Failure("no reply".to_owned()))
+        }
+        futures_util::future::Either::Right(_) => Err(zbus::Error::InputOutput(
+            std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
+        )),
+    }
 }
 
 /// One provider's part of a search (`_doProviderSearch`, then the section's `updateSearch`).
 async fn search_provider(
-    conn: zbus::Connection,
+    bus: Bus,
     endpoint: ProviderEndpoint,
     generation: u64,
     terms: Vec<String>,
@@ -241,14 +258,14 @@ async fn search_provider(
     let found = match previous {
         Some(previous) => {
             call::<Vec<String>>(
-                &conn,
+                &bus,
                 &endpoint,
                 "GetSubsearchResultSet",
                 &(previous, &terms),
             )
             .await
         }
-        None => call::<Vec<String>>(&conn, &endpoint, "GetInitialResultSet", &(&terms,)).await,
+        None => call::<Vec<String>>(&bus, &endpoint, "GetInitialResultSet", &(&terms,)).await,
     };
     let ids = match found {
         Ok(ids) => bound_ids(ids),
@@ -271,7 +288,7 @@ async fn search_provider(
     let results = if ids.is_empty() {
         None
     } else {
-        section(&conn, &endpoint, &ids, &shared).await
+        section(&bus, &endpoint, &ids, &shared).await
     };
     if !current(&shared.lock().unwrap()) {
         return;
@@ -287,7 +304,7 @@ async fn search_provider(
 /// (`_ensureResultActors`, `search.js:226-257`). `None` if the provider answered with metas
 /// gnome-shell would reject.
 async fn section(
-    conn: &zbus::Connection,
+    bus: &Bus,
     endpoint: &ProviderEndpoint,
     ids: &[String],
     shared: &Mutex<Shared>,
@@ -309,7 +326,7 @@ async fn section(
     };
     if !needed.is_empty() {
         let metas = match call::<Vec<HashMap<String, OwnedValue>>>(
-            conn,
+            bus,
             endpoint,
             "GetResultMetas",
             &(&needed,),
@@ -613,12 +630,13 @@ mod tests {
 
     /// One server connection hosting a provider per entry of `providers`, each at its own path.
     fn harness(providers: Vec<(Vec<(&str, &str)>, bool)>) -> Harness {
-        gated_harness(providers, None)
+        gated_harness(providers, None, Duration::from_secs(5))
     }
 
     fn gated_harness(
         providers: Vec<(Vec<(&str, &str)>, bool)>,
         gate: Option<async_channel::Receiver<()>>,
+        timeout: Duration,
     ) -> Harness {
         let calls: Vec<_> = providers.iter().map(|_| Arc::default()).collect();
         let fakes: Vec<_> = providers
@@ -653,7 +671,11 @@ mod tests {
         let (tx, replies) = mpsc::channel();
         let tx = Mutex::new(tx);
         let reply: Reply = Arc::new(move |msg| tx.lock().unwrap().send(msg).unwrap());
-        let mut client = Client::new(conn.inner().clone(), reply);
+        let bus = Bus {
+            conn: conn.inner().clone(),
+            timeout,
+        };
+        let mut client = Client::new(bus, reply);
         client.handle(SynoikToSearch::SetProviders(
             (0..n)
                 .map(|i| ProviderEndpoint {
@@ -780,7 +802,11 @@ mod tests {
     #[test]
     fn a_search_overtaken_before_it_answered_stays_quiet() {
         let (open, gate) = async_channel::unbounded();
-        let mut h = gated_harness(vec![(vec![("1", "apple")], false)], Some(gate));
+        let mut h = gated_harness(
+            vec![(vec![("1", "apple")], false)],
+            Some(gate),
+            Duration::from_secs(5),
+        );
         for generation in [1, 2] {
             h.client.handle(SynoikToSearch::Search {
                 generation,
@@ -796,6 +822,21 @@ mod tests {
         assert_eq!(got.len(), 1, "only the newer search reports: {got:?}");
         let SearchToSynoik::Results { generation, .. } = &got[0];
         assert_eq!(*generation, 2);
+    }
+
+    /// A provider that never answers stops counting as searching once the call times out, as
+    /// a GDBus proxy's would — or the status would read "Searching" for good.
+    #[test]
+    fn a_provider_that_never_answers_times_out_empty() {
+        let (_open, gate) = async_channel::unbounded();
+        let mut h = gated_harness(
+            vec![(vec![("1", "apple")], false)],
+            Some(gate),
+            Duration::from_millis(100),
+        );
+        let got = h.search(1, &["ap"]);
+        assert_eq!(got.len(), 1, "the timed-out provider still reports");
+        assert_eq!(rows(&got[0]), None);
     }
 
     #[test]
