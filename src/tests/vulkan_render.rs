@@ -9485,14 +9485,24 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
             crate::ui::text_edit::EditMods::default(),
             crate::ui::text_edit::KeyTheme::default(),
         );
-        let late = |id: &str, icon: &str, gave_up| crate::ui::overview_search::LateProvider {
+        use crate::ui::overview_search::{LateProvider, LateState};
+        // A saturated blue square: greyscale is measurable, and the red error badge stands out.
+        let red = std::env::temp_dir().join(format!("synoik-late-row-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([20, 20, 220, 255]))
+            .save(&red)
+            .unwrap();
+        let icon = crate::app_system::AppIconRef::File(red);
+        let late = |id: &str, state| LateProvider {
             id: id.to_owned(),
-            icon: crate::app_system::AppIconRef::Themed(vec![icon.to_owned()]),
-            gave_up,
+            icon: icon.clone(),
+            state,
         };
         s.set_late(vec![
-            late("files.desktop", "folder", false),
-            late("web.desktop", "folder", true),
+            late("a.desktop", LateState::Searching),
+            late("b.desktop", LateState::NoAnswer),
+            late("c.desktop", LateState::NotRunning),
+            late("d.desktop", LateState::Masked),
+            late("e.desktop", LateState::Failed),
         ]);
     }
     let controls = f
@@ -9556,29 +9566,74 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
         }
         n
     };
-    let peak = |r: Rectangle<f64, Logical>| {
-        let mut max = 0;
-        for y in r.loc.y as i32..(r.loc.y + r.size.h) as i32 {
-            for x in r.loc.x as i32..(r.loc.x + r.size.w) as i32 {
-                max = max.max(px(&pixels, w, x, y)[3]);
+    assert_eq!(
+        (icons.len(), texts.len()),
+        (5, 3),
+        "Still searching, No answer, Unavailable"
+    );
+    for r in &texts {
+        let ink = inked(*r);
+        eprintln!("vulkan_search_late_row: text {ink} inked at {r:?}");
+        assert!(ink > 100, "each group's text draws: {ink} at {r:?}");
+    }
+    // An icon's centre, and its badge's: on the corner, `BADGE_SHARE` of the icon across.
+    let center = |r: Rectangle<f64, Logical>| {
+        px(
+            &pixels,
+            w,
+            (r.loc.x + r.size.w / 2.) as i32,
+            (r.loc.y + r.size.h / 2.) as i32,
+        )
+    };
+    let badge = |r: Rectangle<f64, Logical>| {
+        let corner = (r.loc.x + r.size.w, r.loc.y + r.size.h / 2. + r.size.w / 2.);
+        let mut found = Vec::new();
+        // Inside the disc: 14px across, its centre 5.6px in from the corner.
+        for dy in -9..=-3 {
+            for dx in -9..=-3 {
+                found.push(px(&pixels, w, corner.0 as i32 + dx, corner.1 as i32 + dy));
             }
         }
-        max
+        found
     };
-    assert_eq!((icons.len(), texts.len()), (2, 2), "two groups of one");
-    for r in icons.iter().chain(&texts) {
-        let ink = inked(*r);
-        eprintln!(
-            "vulkan_search_late_row: {ink} inked, peak {} at {r:?}",
-            peak(*r)
-        );
-        assert!(ink > 100, "each icon and text draws: {ink} at {r:?}");
-    }
-    let (searching, gave_up) = (peak(icons[0]), peak(icons[1]));
-    assert_eq!(searching, 255, "a searching provider's icon is opaque");
+    let blue = |p: [u8; 4]| i32::from(p[2]) - i32::from(p[0]) > 100;
+    let red = |p: [u8; 4]| p[0] > 150 && p[2] < 100;
+
+    let searching = center(icons[0]);
+    eprintln!("vulkan_search_late_row: searching {searching:?}");
     assert!(
-        (110..=145).contains(&gave_up),
-        "a gave-up provider's icon is dimmed to half: {gave_up}"
+        blue(searching) && searching[3] == 255,
+        "drawn as it is: {searching:?}"
+    );
+    let no_answer = center(icons[1]);
+    eprintln!("vulkan_search_late_row: no answer {no_answer:?}");
+    assert!(
+        (110..=145).contains(&no_answer[3]),
+        "a timed-out provider's icon is dimmed to half: {no_answer:?}"
+    );
+    let grey = center(icons[2]);
+    eprintln!("vulkan_search_late_row: not running {grey:?}");
+    assert!(
+        grey[3] == 255 && grey[0].abs_diff(grey[2]) <= 2 && grey[1].abs_diff(grey[2]) <= 2,
+        "a provider that is not running is greyscale: {grey:?}"
+    );
+    assert!(!badge(icons[2]).into_iter().any(red), "and has no badge");
+    let masked = badge(icons[3]);
+    assert!(
+        masked.iter().all(|p| !blue(*p) && !red(*p)),
+        "a masked provider's corner is the dark badge: {masked:?}"
+    );
+    assert!(
+        blue(center(icons[3])),
+        "which leaves the icon's centre alone"
+    );
+    let failed = badge(icons[4]);
+    assert!(
+        failed.iter().any(|p| red(*p)),
+        "a failed provider has the red badge: {failed:?}"
+    );
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("synoik-late-row-{}.png", std::process::id())),
     );
 }
 

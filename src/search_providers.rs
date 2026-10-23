@@ -281,9 +281,29 @@ pub enum SearchToSynoik {
         generation: u64,
         provider: String,
         results: Option<SectionResults>,
-        /// It did not answer: a call failed or timed out, or what it answered was invalid.
-        failed: bool,
+        /// Why it did not answer, when it did not.
+        failure: Option<ProviderFailure>,
     },
+}
+
+/// Why a provider did not answer a search — classified on the worker's side of the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailure {
+    pub kind: FailureKind,
+    /// The error as the bus or the call reported it, bounded — for the details on a click.
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureKind {
+    /// Not running, and `AutoStart=false` says not to start it: it answers while its app is open.
+    NotRunning,
+    /// The bus would start it, but its systemd unit is masked.
+    Masked,
+    /// It could not be started, or its call failed, or what it answered was invalid.
+    Failed,
+    /// No reply within the call timeout.
+    TimedOut,
 }
 
 /// `filterResults` (`remoteSearch.js:224-232`): at most `max` regular results, and at most

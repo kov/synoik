@@ -33,13 +33,17 @@
 //! rather than as the last provider answers: the sections of providers still out go, the status
 //! stops reading "Searching", a row under everything names the late providers by their icons as
 //! "Still searching…", and a late answer's section joins below every other one, so it moves
-//! nothing on screen. A late provider that then fails or times out stays in that row, dimmed,
-//! as "No answer", until the next search. The system actions' availability is the power menu's (see
-//! `Synoik::system_action_available`). Enter inside the search delay activates what the typed terms
-//! find; gnome-shell's app provider answers asynchronously, so its Enter activates the previous
-//! default. The results scroll by wheel and touchpad, and the selection is eased into view;
-//! there is no touch-drag panning, no overlay scrollbar and no vfade — the view's edge is a hard
-//! clip. The keyboard walks the stops in one line — the app results, then each
+//! nothing on screen. A late provider that then times out stays in that row, dimmed, as "No
+//! answer". Providers that cannot answer at all are there too, as "Unavailable": greyscale when
+//! not running with `AutoStart=false`, with a "disabled" badge when their unit is masked, with an
+//! error badge when they failed. The row is redone when a search settles — at the deadline, or
+//! once every provider has answered — and the last one stays until then, so it does not blink
+//! as you type. GNOME has no badges; the look is ours. The system actions' availability is the
+//! power menu's (see `Synoik::system_action_available`). Enter inside the search delay activates
+//! what the typed terms find; gnome-shell's app provider answers asynchronously, so its Enter
+//! activates the previous default. The results scroll by wheel and touchpad, and the selection is
+//! eased into view; there is no touch-drag panning, no overlay scrollbar and no vfade — the view's
+//! edge is a hard clip. The keyboard walks the stops in one line — the app results, then each
 //! section's rows, and on Tab its header first — where St's arrow keys move by geometry (so
 //! Left from a row does not reach its header). Two provider files for one app make
 //! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
@@ -249,22 +253,65 @@ const PROVIDER_W: f64 = 2. * ITEM_PAD + PROVIDER_ICON_PX + PROVIDER_SPACING + PR
 const PROVIDER_MARGIN: f64 = 4.;
 /// One line of body text, for sizing a box around lines.
 const LINE_H: f64 = 18.;
-/// The late providers' row (a divergence, no GNOME counterpart): the icons of those still
-/// searching, at a row's icon size, then the text; then those that gave up, dimmed, and theirs.
-const LATE_TEXT: &str = "Still searching…";
-const GAVE_UP_TEXT: &str = "No answer";
+/// The row of providers that have not answered (a divergence, no GNOME counterpart): one group
+/// per [`LateGroup`], each its icons at a row's icon size and then its text.
 const LATE_ICON_SPACING: f64 = 6.;
 const LATE_GROUP_SPACING: f64 = 24.;
-/// A gave-up provider's icon, against a searching one's.
-const GAVE_UP_ICON_ALPHA: f32 = 0.5;
+/// A timed-out provider's icon, against a searching one's.
+const NO_ANSWER_ICON_ALPHA: f32 = 0.5;
+/// An unavailable provider's badge: a disc on the icon's bottom-right corner, as a share of the
+/// icon, and the glyph inside it, as a share of the disc.
+const BADGE_SHARE: f64 = 0.6;
+const BADGE_GLYPH_SHARE: f64 = 0.75;
 
-/// A provider that missed the search's deadline: still searching, or since given up (failed or
-/// timed out).
+/// A provider in that row, and why it is there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LateProvider {
     pub id: String,
     pub icon: AppIconRef,
-    pub gave_up: bool,
+    pub state: LateState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateState {
+    /// Past the deadline and still out.
+    Searching,
+    /// Past the deadline, then timed out: dimmed.
+    NoAnswer,
+    /// Not running, and not to be started for a search: greyscale.
+    NotRunning,
+    /// Its systemd unit is masked: a "disabled" badge.
+    Masked,
+    /// It failed to start or to answer: an error badge.
+    Failed,
+}
+
+/// The row's groups, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateGroup {
+    Searching,
+    NoAnswer,
+    Unavailable,
+}
+
+impl LateGroup {
+    const ALL: [LateGroup; 3] = [Self::Searching, Self::NoAnswer, Self::Unavailable];
+
+    fn of(state: LateState) -> Self {
+        match state {
+            LateState::Searching => Self::Searching,
+            LateState::NoAnswer => Self::NoAnswer,
+            LateState::NotRunning | LateState::Masked | LateState::Failed => Self::Unavailable,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Searching => "Still searching…",
+            Self::NoAnswer => "No answer",
+            Self::Unavailable => "Unavailable",
+        }
+    }
 }
 
 /// One app result — a plain-data snapshot (not a live catalog borrow), like
@@ -395,6 +442,9 @@ struct SearchCache {
     spinner: widget::Spinner,
     /// A system action's round plate.
     action_plate: widget::BakeCache,
+    /// The late row's badges: a masked provider's, a failed one's.
+    masked_badge: widget::Badge,
+    failed_badge: widget::Badge,
     /// Inline icon pixels a provider sent, sized for the row and uploaded, by provider, result
     /// id and scale — with the pixels they were made from, so a result whose icon changed is
     /// uploaded again.
@@ -1358,8 +1408,13 @@ impl OverviewSearch {
     fn late_pieces(&self, x: f64) -> LatePieces<'_> {
         let (mut icons, mut texts) = (Vec::new(), Vec::new());
         let mut pen = x;
-        for (gave_up, text) in [(false, LATE_TEXT), (true, GAVE_UP_TEXT)] {
-            let group: Vec<_> = self.late.iter().filter(|l| l.gave_up == gave_up).collect();
+        for group in LateGroup::ALL {
+            let text = group.text();
+            let group: Vec<_> = self
+                .late
+                .iter()
+                .filter(|l| LateGroup::of(l.state) == group)
+                .collect();
             if group.is_empty() {
                 continue;
             }
@@ -1370,7 +1425,7 @@ impl OverviewSearch {
                 if i > 0 {
                     pen += LATE_ICON_SPACING;
                 }
-                icons.push((&late.icon, pen, gave_up));
+                icons.push((&late.icon, pen, late.state));
                 pen += ROW_ICON_PX;
             }
             pen += TITLE_SPACING;
@@ -1636,11 +1691,19 @@ impl OverviewSearch {
                 }
             }
             drop(push_icon);
+            // The late row's badges go over their icons, which means before them: the first
+            // element is the topmost.
+            let late_from = elements.len();
+            let mut badges = Vec::new();
             if let Some(late) = results.late {
-                for (icon, x, gave_up) in self.late_pieces(late.loc.x).icons {
+                for (icon, x, state) in self.late_pieces(late.loc.x).icons {
                     let center = Point::from((x + ROW_ICON_PX / 2., late.loc.y + late.size.h / 2.));
-                    let dim = if gave_up { GAVE_UP_ICON_ALPHA } else { 1. };
-                    if let Some(el) = widget::app_icon_element(
+                    let (dim, style) = match state {
+                        LateState::NoAnswer => (NO_ANSWER_ICON_ALPHA, widget::IconStyle::Normal),
+                        LateState::NotRunning => (1., widget::IconStyle::Greyscale),
+                        _ => (1., widget::IconStyle::Normal),
+                    };
+                    if let Some(el) = widget::app_icon_element_styled(
                         renderer,
                         &mut uploads,
                         app_icons,
@@ -1650,12 +1713,46 @@ impl OverviewSearch {
                         Point::from((0., 0.)),
                         center,
                         results_alpha * dim,
+                        style,
                     ) {
+                        badges.push((state, center));
                         elements.push(el);
                     }
                 }
             }
             drop(uploads);
+            let mut badged = Vec::new();
+            for (state, center) in badges {
+                let (badge, glyph, disc) = match state {
+                    // A "disabled" sign on a dark disc.
+                    LateState::Masked => (
+                        &mut cache.masked_badge,
+                        "action-unavailable-symbolic",
+                        [0.15, 0.15, 0.15, 1.],
+                    ),
+                    // An error sign on the destructive red.
+                    LateState::Failed => (
+                        &mut cache.failed_badge,
+                        "dialog-error-symbolic",
+                        style::DESTRUCTIVE_BG,
+                    ),
+                    _ => continue,
+                };
+                badged.extend(badge.elements(
+                    renderer,
+                    sym_icons,
+                    scale,
+                    center,
+                    ROW_ICON_PX,
+                    BADGE_SHARE,
+                    glyph,
+                    BADGE_GLYPH_SHARE,
+                    disc,
+                    [1., 1., 1., 1.],
+                    results_alpha,
+                ));
+            }
+            elements.splice(late_from..late_from, badged);
             // A symbolic icon is recoloured to the text it sits with, as `St.Icon` does for any
             // `-symbolic` name — Settings' panels and Calculator's copy glyph are all symbolic.
             for (section, sl) in self.sections.iter().zip(&results.sections) {
@@ -2221,8 +2318,8 @@ fn status_text(status: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
 
 /// The late row laid out from a pen position ([`OverviewSearch::late_pieces`]).
 struct LatePieces<'a> {
-    /// Each icon, its left edge, and whether its provider gave up.
-    icons: Vec<(&'a AppIconRef, f64, bool)>,
+    /// Each icon, its left edge, and its provider's state.
+    icons: Vec<(&'a AppIconRef, f64, LateState)>,
     /// Each text and its left edge.
     texts: Vec<(&'static str, f64)>,
     width: f64,

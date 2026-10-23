@@ -23336,19 +23336,27 @@ fn answer(f: &mut Fixture, generation: u64, provider: &str, ids: &[&str]) {
         generation,
         provider: provider.to_owned(),
         results,
-        failed: false,
+        failure: None,
     });
 }
 
-/// `provider` failed or timed out on `generation`.
-fn answer_failed(f: &mut Fixture, generation: u64, provider: &str) {
-    f.synoik()
-        .on_search_provider_msg(crate::search_providers::SearchToSynoik::Results {
-            generation,
-            provider: provider.to_owned(),
-            results: None,
-            failed: true,
-        });
+/// `provider` did not answer `generation`, for the `kind` of reason.
+fn answer_failed(
+    f: &mut Fixture,
+    generation: u64,
+    provider: &str,
+    kind: crate::search_providers::FailureKind,
+) {
+    use crate::search_providers::{ProviderFailure, SearchToSynoik};
+    f.synoik().on_search_provider_msg(SearchToSynoik::Results {
+        generation,
+        provider: provider.to_owned(),
+        results: None,
+        failure: Some(ProviderFailure {
+            kind,
+            error: format!("{kind:?}"),
+        }),
+    });
 }
 
 /// Results past the bottom of the view scroll (`search.js` puts them in an `St.ScrollView`):
@@ -23816,7 +23824,7 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
             .overview_search
             .late()
             .iter()
-            .map(|l| format!("{}{}", l.id, if l.gave_up { " (gave up)" } else { "" }))
+            .map(|l| format!("{} {:?}", l.id, l.state))
             .collect()
     };
 
@@ -23849,16 +23857,21 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
         ["b.desktop"],
         "the sections answering older terms go"
     );
-    assert_eq!(late(&mut f), ["a.desktop", "c.desktop"]);
+    assert_eq!(late(&mut f), ["a.desktop Searching", "c.desktop Searching"]);
 
     // `a` comes first in order, but it is late: below `b`.
     answer(&mut f, generation, "a.desktop", &["r"]);
     assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
-    assert_eq!(late(&mut f), ["c.desktop"]);
+    assert_eq!(late(&mut f), ["c.desktop Searching"]);
     // `c` times out: its icon stays, saying it never answered.
-    answer_failed(&mut f, generation, "c.desktop");
+    answer_failed(
+        &mut f,
+        generation,
+        "c.desktop",
+        crate::search_providers::FailureKind::TimedOut,
+    );
     assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
-    assert_eq!(late(&mut f), ["c.desktop (gave up)"]);
+    assert_eq!(late(&mut f), ["c.desktop NoAnswer"]);
 
     // A late provider that answers with nothing leaves the row.
     tap(&mut f, KEY_B);
@@ -23868,7 +23881,7 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
     f.advance_until(Duration::from_millis(1600), |_| false);
     assert_eq!(
         late(&mut f),
-        ["a.desktop", "c.desktop"],
+        ["a.desktop Searching", "c.desktop Searching"],
         "a new search starts over"
     );
     answer(&mut f, generation, "a.desktop", &[]);
@@ -23882,6 +23895,63 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
     answer(&mut f, generation, "a.desktop", &["r"]);
     answer(&mut f, generation, "b.desktop", &["r"]);
     assert_eq!(shown(&mut f), ["a.desktop", "b.desktop"]);
+}
+
+/// Providers that cannot answer at all — not running with `AutoStart=false`, masked, failed to
+/// start — are in the row as "Unavailable" once the search settles, deadline or not; and the row
+/// stays put while the next search runs, until that one settles.
+#[test]
+fn remote_search_shows_unavailable_providers_once_settled() {
+    use crate::search_providers::FailureKind;
+    use crate::ui::overview_search::LateState;
+
+    let (mut f, rx) =
+        remote_search_overview_with(&["a.desktop", "b.desktop", "c.desktop", "d.desktop"]);
+    let late = |f: &mut Fixture| -> Vec<(String, LateState)> {
+        f.synoik()
+            .overview_search
+            .late()
+            .iter()
+            .map(|l| (l.id.clone(), l.state))
+            .collect()
+    };
+    let unavailable = || {
+        vec![
+            ("b.desktop".to_owned(), LateState::NotRunning),
+            ("c.desktop".to_owned(), LateState::Masked),
+            ("d.desktop".to_owned(), LateState::Failed),
+        ]
+    };
+
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer_failed(&mut f, generation, "d.desktop", FailureKind::Failed);
+    answer_failed(&mut f, generation, "b.desktop", FailureKind::NotRunning);
+    answer_failed(&mut f, generation, "c.desktop", FailureKind::Masked);
+    assert!(late(&mut f).is_empty(), "not settled: `a` is still out");
+    answer(&mut f, generation, "a.desktop", &["r"]);
+    assert_eq!(late(&mut f), unavailable(), "settled, in provider order");
+    assert!(!f.synoik().overview_search.is_searching());
+
+    // The next search keeps the row until it settles too.
+    tap(&mut f, KEY_B);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    assert_eq!(late(&mut f), unavailable(), "kept while the search runs");
+    answer(&mut f, generation, "a.desktop", &["r"]);
+    answer(&mut f, generation, "b.desktop", &["r"]);
+    answer_failed(&mut f, generation, "c.desktop", FailureKind::Masked);
+    assert_eq!(late(&mut f), unavailable(), "still kept: `d` is out");
+    answer_failed(&mut f, generation, "d.desktop", FailureKind::Failed);
+    assert_eq!(
+        late(&mut f),
+        [
+            ("c.desktop".to_owned(), LateState::Masked),
+            ("d.desktop".to_owned(), LateState::Failed),
+        ],
+        "`b` answered this time"
+    );
 }
 
 /// With nothing to show at the deadline, the status reads "No results", and the late row

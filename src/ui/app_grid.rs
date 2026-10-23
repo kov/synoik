@@ -2144,7 +2144,7 @@ impl AppGrid {
         //     batch for 2+ pending uploads — a lone miss uploads fine on its own. ---
         let subicon_px = metrics.folder_subicon_px();
         if let Ok(scale_key) = NotNan::new(scale) {
-            let mut keys: Vec<(NotNan<f64>, AppIconRef, u16)> = Vec::new();
+            let mut keys: Vec<(NotNan<f64>, AppIconRef, u16, widget::IconStyle)> = Vec::new();
             let mut buffers = Vec::new();
             // A folder tile draws its members instead of an icon of its own, at the
             // smaller sub-icon size — so it contributes up to four uploads, not one.
@@ -2160,7 +2160,12 @@ impl AppGrid {
                 })
                 .collect();
             for (icon, px) in pending {
-                let key = (scale_key, icon.clone(), (px.round() as u16).max(1));
+                let key = (
+                    scale_key,
+                    icon.clone(),
+                    (px.round() as u16).max(1),
+                    widget::IconStyle::Normal,
+                );
                 if self.icons.borrow().borrow().contains_key(&key) || keys.contains(&key) {
                     continue;
                 }

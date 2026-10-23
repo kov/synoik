@@ -367,8 +367,8 @@ struct SearchRun {
     deadline: Option<TimerToken>,
     /// Late sections of the current generation so far, once its deadline has passed.
     late: Option<usize>,
-    /// Providers that were late and then gave up on the current generation.
-    gave_up: std::collections::HashSet<String>,
+    /// Why the providers that did not answer the current generation did not.
+    failures: HashMap<String, crate::search_providers::ProviderFailure>,
     /// When the status spinner started spinning, while it is.
     spinning_since: Option<Duration>,
     /// The selection the results were last scrolled for.
@@ -18046,6 +18046,7 @@ impl Synoik {
             self.search_run.terms.clear();
             self.overview_search.set_results(Vec::new());
             self.overview_search.clear_sections();
+            self.overview_search.set_late(Vec::new());
             self.overview_search.set_searching(false);
             self.emit_search(crate::search_providers::SynoikToSearch::Reset {
                 generation: self.search_run.generation,
@@ -18140,6 +18141,8 @@ impl Synoik {
                 }
                 None
             }));
+        } else {
+            self.overview_search.set_late(Vec::new());
         }
         self.overview_search
             .set_searching(!self.search_run.pending.is_empty());
@@ -18150,25 +18153,37 @@ impl Synoik {
             self.cancel_timer(timer);
         }
         self.search_run.late = None;
-        self.search_run.gave_up.clear();
-        self.overview_search.set_late(Vec::new());
+        self.search_run.failures.clear();
     }
 
-    /// The providers still out past the deadline, and those that gave up since, for the row
-    /// saying so.
+    /// The row under the results: the providers still out past the deadline, and those that did
+    /// not answer and why. It is redone once the search settles — at the deadline, or when every
+    /// provider has answered — and the previous search's stays until then, so it does not blink
+    /// on every keystroke.
     fn sync_late_search_providers(&mut self) {
+        use crate::search_providers::FailureKind;
+        use crate::ui::overview_search::{LateProvider, LateState};
+
         let run = &self.search_run;
+        if run.late.is_none() && !run.pending.is_empty() {
+            return;
+        }
         let late = self
             .search_providers
             .iter()
             .filter_map(|p| {
-                let gave_up = run.gave_up.contains(p.id());
-                (gave_up || run.pending.contains(p.id())).then(|| {
-                    crate::ui::overview_search::LateProvider {
-                        id: p.id().to_owned(),
-                        icon: p.icon.clone(),
-                        gave_up,
-                    }
+                let state = match run.failures.get(p.id()).map(|f| f.kind) {
+                    Some(FailureKind::TimedOut) => LateState::NoAnswer,
+                    Some(FailureKind::NotRunning) => LateState::NotRunning,
+                    Some(FailureKind::Masked) => LateState::Masked,
+                    Some(FailureKind::Failed) => LateState::Failed,
+                    None if run.pending.contains(p.id()) => LateState::Searching,
+                    None => return None,
+                };
+                Some(LateProvider {
+                    id: p.id().to_owned(),
+                    icon: p.icon.clone(),
+                    state,
                 })
             })
             .collect();
@@ -18192,7 +18207,7 @@ impl Synoik {
             generation,
             provider,
             results,
-            failed,
+            failure,
         } = msg;
         if generation != self.search_run.generation || !self.search_run.pending.remove(&provider) {
             return;
@@ -18220,15 +18235,14 @@ impl Synoik {
                 },
             );
         self.overview_search.set_section(&provider, section);
-        if self.search_run.late.is_some() {
-            if failed {
-                self.search_run.gave_up.insert(provider.clone());
-            }
-            self.sync_late_search_providers();
-        } else {
+        if let Some(failure) = failure {
+            self.search_run.failures.insert(provider, failure);
+        }
+        if self.search_run.late.is_none() {
             self.overview_search
                 .set_searching(!self.search_run.pending.is_empty());
         }
+        self.sync_late_search_providers();
         self.queue_redraw_all();
     }
 
@@ -18266,6 +18280,7 @@ impl Synoik {
         self.search_run.pending.clear();
         self.cancel_search_deadline();
         self.overview_search.clear_sections();
+        self.overview_search.set_late(Vec::new());
         let searching = self.search_run.timer.is_some();
         self.overview_search.set_searching(searching);
         self.queue_redraw_all();

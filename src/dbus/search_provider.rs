@@ -29,8 +29,8 @@ use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::search_providers::{
-    filter_results, ProviderEndpoint, ResultIcon, ResultMeta, SearchToSynoik, SectionResults,
-    SynoikToSearch, MAX_LIST_ROWS,
+    filter_results, FailureKind, ProviderEndpoint, ProviderFailure, ResultIcon, ResultMeta,
+    SearchToSynoik, SectionResults, SynoikToSearch, MAX_LIST_ROWS,
 };
 
 const IFACE_1: &str = "org.gnome.Shell.SearchProvider";
@@ -270,11 +270,12 @@ async fn search_provider(
         }
         None => call::<Vec<String>>(&bus, &endpoint, "GetInitialResultSet", &(&terms,)).await,
     };
-    let mut failed = found.is_err();
+    let mut failure = None;
     let ids = match found {
         Ok(ids) => Some(bound_ids(ids)),
         Err(err) => {
             warn!("search provider {}: {err}", endpoint.id);
+            failure = Some(classify(&err, &endpoint));
             None
         }
     };
@@ -303,9 +304,13 @@ async fn search_provider(
     let results = if ids.is_empty() {
         None
     } else {
-        let results = section(&bus, &endpoint, &ids, &shared).await;
-        failed |= results.is_none();
-        results
+        match section(&bus, &endpoint, &ids, &shared).await {
+            Ok(results) => Some(results),
+            Err(err) => {
+                failure = Some(err);
+                None
+            }
+        }
     };
     if !current(&shared.lock().unwrap()) {
         return;
@@ -314,19 +319,55 @@ async fn search_provider(
         generation,
         provider: endpoint.id,
         results,
-        failed,
+        failure,
     });
 }
 
+/// What kind of failure `err` is, from what the bus said and what we know of the provider.
+fn classify(err: &zbus::Error, endpoint: &ProviderEndpoint) -> ProviderFailure {
+    let kind = match err {
+        zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            FailureKind::TimedOut
+        }
+        zbus::Error::MethodError(name, message, _) => {
+            let name = name.as_str();
+            let message = message.as_deref().unwrap_or_default();
+            let unreachable = matches!(
+                name,
+                "org.freedesktop.DBus.Error.NameHasNoOwner"
+                    | "org.freedesktop.DBus.Error.ServiceUnknown"
+            ) || name.starts_with("org.freedesktop.DBus.Error.Spawn.");
+            // dbus-broker says "activation request failed: unit is masked"; dbus-daemon names
+            // the unit "… is masked".
+            if unreachable && message.contains("masked") {
+                FailureKind::Masked
+            } else if unreachable && !endpoint.auto_start {
+                FailureKind::NotRunning
+            } else {
+                FailureKind::Failed
+            }
+        }
+        _ => FailureKind::Failed,
+    };
+    failed(kind, err.to_string())
+}
+
+fn failed(kind: FailureKind, error: String) -> ProviderFailure {
+    ProviderFailure {
+        kind,
+        error: error.chars().take(MAX_TEXT_CHARS).collect(),
+    }
+}
+
 /// The rows a provider's section shows, fetching the metas it does not have yet
-/// (`_ensureResultActors`, `search.js:226-257`). `None` if the provider answered with metas
-/// gnome-shell would reject.
+/// (`_ensureResultActors`, `search.js:226-257`). An error if the call failed or the provider
+/// answered with metas gnome-shell would reject.
 async fn section(
     bus: &Bus,
     endpoint: &ProviderEndpoint,
     ids: &[String],
     shared: &Mutex<Shared>,
-) -> Option<SectionResults> {
+) -> Result<SectionResults, ProviderFailure> {
     let shown = filter_results(ids, MAX_LIST_ROWS);
     let more = if endpoint.version2 {
         ids.len() - shown.len()
@@ -354,40 +395,40 @@ async fn section(
             Ok(metas) => metas,
             Err(err) => {
                 warn!("search provider {}: GetResultMetas: {err}", endpoint.id);
-                return None;
+                return Err(classify(&err, endpoint));
             }
         };
         if metas.len() != needed.len() {
-            warn!(
-                "search provider {} returned {} result metas for {} results",
-                endpoint.id,
+            let error = format!(
+                "returned {} result metas for {} results",
                 metas.len(),
                 needed.len()
             );
-            return None;
+            warn!("search provider {} {error}", endpoint.id);
+            return Err(failed(FailureKind::Failed, error));
         }
         let parsed: Option<Vec<ResultMeta>> = metas.iter().map(parse_meta).collect();
         let Some(parsed) = parsed else {
-            warn!(
-                "search provider {} returned an invalid result meta",
-                endpoint.id
-            );
-            return None;
+            let error = "returned an invalid result meta".to_owned();
+            warn!("search provider {} {error}", endpoint.id);
+            return Err(failed(FailureKind::Failed, error));
         };
         let mut shared = shared.lock().unwrap();
         let known = shared.metas.entry(endpoint.id.clone()).or_default();
         known.extend(needed.into_iter().zip(parsed));
     }
     let mut shared = shared.lock().unwrap();
-    let known = shared.metas.get_mut(&endpoint.id)?;
+    let missing = || failed(FailureKind::Failed, "a result meta went missing".to_owned());
+    let known = shared.metas.get_mut(&endpoint.id).ok_or_else(missing)?;
     // Keep only the rows on show: every keystroke can bring new ids, each with up to
     // `MAX_ICON_PX`² of pixels, and nothing else would ever let them go.
     known.retain(|id, _| shown.contains(id));
     let rows = shown
         .iter()
         .map(|id| known.get(id).cloned())
-        .collect::<Option<Vec<_>>>()?;
-    Some(SectionResults { rows, more })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(missing)?;
+    Ok(SectionResults { rows, more })
 }
 
 fn bound_ids(mut ids: Vec<String>) -> Vec<String> {
@@ -767,6 +808,66 @@ mod tests {
         }
     }
 
+    fn failure(msg: &SearchToSynoik) -> Option<FailureKind> {
+        let SearchToSynoik::Results { failure, .. } = msg;
+        failure.as_ref().map(|f| f.kind)
+    }
+
+    /// What the bus said becomes a kind of failure: a provider the bus may not start is not
+    /// running, a masked unit is masked, and the rest failed.
+    #[test]
+    fn bus_errors_classify_by_name_message_and_autostart() {
+        let error = |name: &str, message: &str| {
+            let msg = zbus::Message::method_call("/", "GetInitialResultSet")
+                .unwrap()
+                .build(&())
+                .unwrap();
+            zbus::Error::MethodError(
+                zbus::names::OwnedErrorName::try_from(name.to_owned()).unwrap(),
+                Some(message.to_owned()),
+                msg,
+            )
+        };
+        let endpoint = |auto_start| ProviderEndpoint {
+            id: "p.desktop".to_owned(),
+            bus_name: "org.example.P".to_owned(),
+            object_path: "/".to_owned(),
+            version2: true,
+            auto_start,
+        };
+        let no_owner = "org.freedesktop.DBus.Error.NameHasNoOwner";
+        let kind = |err: &zbus::Error, auto_start| classify(err, &endpoint(auto_start)).kind;
+
+        let absent = error(no_owner, "Destination does not exist");
+        assert_eq!(kind(&absent, false), FailureKind::NotRunning);
+        assert_eq!(
+            kind(&absent, true),
+            FailureKind::Failed,
+            "the bus should have started it"
+        );
+        let masked = error(
+            no_owner,
+            "Could not activate remote peer 'org.gnome.Software': activation request failed: unit is masked",
+        );
+        assert_eq!(kind(&masked, true), FailureKind::Masked);
+        let crashed = error(
+            no_owner,
+            "Could not activate remote peer 'org.gnome.Photos': unit failed",
+        );
+        assert_eq!(kind(&crashed, true), FailureKind::Failed);
+        let spawn = error(
+            "org.freedesktop.DBus.Error.Spawn.ChildExited",
+            "exited with 127",
+        );
+        assert_eq!(kind(&spawn, true), FailureKind::Failed);
+        let timeout =
+            zbus::Error::InputOutput(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+        assert_eq!(kind(&timeout, true), FailureKind::TimedOut);
+        assert!(classify(&crashed, &endpoint(true))
+            .error
+            .contains("unit failed"));
+    }
+
     fn rows(msg: &SearchToSynoik) -> Option<(Vec<&str>, usize)> {
         let SearchToSynoik::Results { results, .. } = msg;
         results
@@ -873,6 +974,7 @@ mod tests {
         let mut h = harness(vec![(vec![("1", "boomerang")], false)]);
         let got = h.search(1, &["boom"]);
         assert_eq!(rows(&got[0]), None);
+        assert_eq!(failure(&got[0]), Some(FailureKind::Failed));
         h.search(2, &["boomer"]);
         assert_eq!(h.calls(0), ["initial boom", "initial boomer", "metas 1"]);
     }
@@ -916,6 +1018,7 @@ mod tests {
         let got = h.search(1, &["ap"]);
         assert_eq!(got.len(), 1, "the timed-out provider still reports");
         assert_eq!(rows(&got[0]), None);
+        assert_eq!(failure(&got[0]), Some(FailureKind::TimedOut));
     }
 
     #[test]

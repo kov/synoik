@@ -35,6 +35,7 @@ use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle,
 use crate::app_system::AppIconRef;
 use crate::image_source::ImageSource;
 use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache, ImageFit};
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
@@ -44,9 +45,19 @@ use crate::ui::text_edit::TextEdit;
 use crate::utils::to_physical_precise_round;
 
 /// The upload cache for full-color app icons, keyed by
-/// `(scale, descriptor, logical size)`. Lives on a baking widget (the dash, later
+/// `(scale, descriptor, logical size, style)`. Lives on a baking widget (the dash, later
 /// the grid/search) so a hover re-bake doesn't re-upload the icon textures.
-pub type AppIconUploads = HashMap<(NotNan<f64>, AppIconRef, u16), TextureBuffer<VkTexture>>;
+pub type AppIconUploads =
+    HashMap<(NotNan<f64>, AppIconRef, u16, IconStyle), TextureBuffer<VkTexture>>;
+
+/// How a full-colour icon's pixels are treated before upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IconStyle {
+    #[default]
+    Normal,
+    /// Desaturated to its luminance — something that is there but not working.
+    Greyscale,
+}
 
 /// One [`AppIconUploads`] shared by every surface that draws app icons.
 ///
@@ -89,7 +100,7 @@ pub fn sync_icon_upload_context(
 /// fresh decode landed. Surfaces call this as each decode arrives, which is also why
 /// nothing needs to clear the whole map on a theme or catalog change.
 pub fn drop_app_icon_upload(uploads: &mut AppIconUploads, icon: &AppIconRef, logical_px: u16) {
-    uploads.retain(|(_, cached, px), _| cached != icon || *px != logical_px);
+    uploads.retain(|(_, cached, px, _), _| cached != icon || *px != logical_px);
 }
 
 /// Straight-alpha RGBA, the color type every draw verb takes (glyph coverage /
@@ -813,11 +824,47 @@ pub fn app_icon_element(
     center: Point<f64, Logical>,
     alpha: f32,
 ) -> Option<TextureRenderElement<VkTexture>> {
+    app_icon_element_styled(
+        renderer,
+        uploads,
+        icons,
+        icon,
+        logical_px,
+        scale,
+        origin,
+        center,
+        alpha,
+        IconStyle::Normal,
+    )
+}
+
+/// [`app_icon_element`] with its pixels treated as `style` says, once, at upload.
+#[allow(clippy::too_many_arguments)]
+pub fn app_icon_element_styled(
+    renderer: &mut VulkanRenderer,
+    uploads: &mut AppIconUploads,
+    icons: &AppIconCache,
+    icon: &AppIconRef,
+    logical_px: f64,
+    scale: f64,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+    style: IconStyle,
+) -> Option<TextureRenderElement<VkTexture>> {
     let scale_key = NotNan::new(scale).ok()?;
-    let key = (scale_key, icon.clone(), (logical_px.round() as u16).max(1));
+    let key = (
+        scale_key,
+        icon.clone(),
+        (logical_px.round() as u16).max(1),
+        style,
+    );
     #[allow(clippy::map_entry)]
     if !uploads.contains_key(&key) {
-        let buffer = icons.buffer(icon, logical_px, scale)?;
+        let mut buffer = icons.buffer(icon, logical_px, scale)?;
+        if style == IconStyle::Greyscale {
+            buffer = greyscale(&buffer);
+        }
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
                 uploads.insert(key.clone(), tb);
@@ -839,6 +886,106 @@ pub fn app_icon_element(
         None,
         Kind::Unspecified,
     ))
+}
+
+/// `buffer` desaturated to its Rec. 709 luminance. A weighted sum of the channels keeps
+/// premultiplied pixels premultiplied. A format whose channel order is not known here is left
+/// as it is.
+fn greyscale(buffer: &MemoryBuffer) -> MemoryBuffer {
+    use smithay::backend::allocator::Fourcc;
+    // Byte offsets of red, green and blue in a little-endian 32-bit pixel.
+    let (r, g, b) = match buffer.format() {
+        Fourcc::Argb8888 | Fourcc::Xrgb8888 => (2, 1, 0),
+        Fourcc::Abgr8888 | Fourcc::Xbgr8888 => (0, 1, 2),
+        _ => return buffer.clone(),
+    };
+    let mut data = buffer.data().to_vec();
+    for px in data.as_chunks_mut::<4>().0 {
+        let y = 0.2126 * f32::from(px[r]) + 0.7152 * f32::from(px[g]) + 0.0722 * f32::from(px[b]);
+        let y = y.round().min(255.) as u8;
+        (px[r], px[g], px[b]) = (y, y, y);
+    }
+    MemoryBuffer::new(
+        data,
+        buffer.format(),
+        buffer.size(),
+        buffer.scale(),
+        buffer.transform(),
+    )
+}
+
+/// A status badge on an icon's bottom-right corner: a disc, and a symbolic glyph in it. The
+/// disc is baked once per instance, so keep one per look.
+#[derive(Default)]
+pub struct Badge {
+    disc: BakeCache,
+}
+
+impl Badge {
+    /// The badge for an icon `icon_px` across centred at `icon_center`: a `share` of the icon
+    /// across, overhanging its corner by a tenth of itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn elements(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        sym_icons: &IconCache,
+        scale: f64,
+        icon_center: Point<f64, Logical>,
+        icon_px: f64,
+        share: f64,
+        glyph: &str,
+        glyph_share: f64,
+        disc_color: Rgba,
+        glyph_color: Rgba,
+        alpha: f32,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let d = (icon_px * share).round();
+        let corner = icon_center + Point::from((icon_px / 2., icon_px / 2.));
+        let center = corner - Point::from((d / 2. - d / 10., d / 2. - d / 10.));
+        let mut out = Vec::new();
+        if let Some(tb) = sym_icons.texture(
+            renderer,
+            glyph,
+            (d * glyph_share).round(),
+            scale,
+            glyph_color,
+        ) {
+            let logical = tb.logical_size();
+            out.push(TextureRenderElement::from_texture_buffer(
+                tb,
+                center - Point::from((logical.w / 2., logical.h / 2.)),
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
+        }
+        let disc = bake(
+            renderer,
+            &mut self.disc,
+            scale,
+            Size::from((d, d)),
+            0,
+            |_| Ok(()),
+            |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(d / 2., disc_color)
+            },
+        );
+        match disc {
+            Ok(tb) => out.push(TextureRenderElement::from_texture_buffer(
+                tb,
+                center - Point::from((d / 2., d / 2.)),
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            )),
+            Err(err) => tracing::error!("error baking a badge: {err:#}"),
+        }
+        out
+    }
 }
 
 /// Uploaded textures for runtime-chosen images (album art, the account picture), keyed by output
