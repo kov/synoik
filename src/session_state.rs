@@ -561,14 +561,18 @@ impl StoreWriter {
 /// The `sync_all` is what makes that true of a power loss rather than only of a process crash:
 /// without it the rename can be durable before the bytes are, and the store comes back empty.
 /// glib's `g_file_set_contents`, which mutter writes through, fsyncs for the same reason.
-pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let tmp = path.with_extension("json.tmp");
+    // Beside it, named for the whole file name: `with_extension` would replace a `.json` and
+    // invent one for a file that has none.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;

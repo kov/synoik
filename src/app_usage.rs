@@ -67,8 +67,10 @@ impl AppUsage {
         Self::default()
     }
 
-    /// `restore_from_file`: the scores in `xml`, then `idle_clean_usage` at `now`. What does not
-    /// parse is left out, as GMarkup stops at its first error.
+    /// `restore_from_file`: the scores in `xml`, then `idle_clean_usage` at `now`. The file is
+    /// anyone's to write, so it is read leniently: a document that does not parse is no scores
+    /// at all (GMarkup keeps what came before the error), an entry without an id is skipped and
+    /// a `last-seen` out of range is 0 (the C fails the parse, and wraps).
     pub fn from_xml(xml: &str, now: i64) -> Self {
         let mut usage = Self::new();
         if let Ok(doc) = roxmltree::Document::parse(xml) {
@@ -134,14 +136,18 @@ impl AppUsage {
             .retain(|_, u| !(u.score < SCORE_MIN && u.last_seen < week_ago));
     }
 
-    /// `shell_app_usage_compare`: the more used first, apps never seen last. Like the C, the
-    /// score difference is truncated to an integer, so scores less than a point apart tie.
+    /// `shell_app_usage_compare`: the more used first, apps never seen last.
+    ///
+    /// **Divergence:** the C returns the score difference truncated to an `int`, so scores less
+    /// than a point apart tie — which is not transitive (3.5 ties 4, 4 ties 4.5, 3.5 does not
+    /// tie 4.5), and a sort may panic on a comparator that is not a total order. The scores are
+    /// compared whole instead.
     pub fn compare(&self, a: &str, b: &str) -> Ordering {
         match (self.usages.get(a), self.usages.get(b)) {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Greater,
             (Some(_), None) => Ordering::Less,
-            (Some(a), Some(b)) => ((b.score - a.score) as i64).cmp(&0),
+            (Some(a), Some(b)) => b.score.total_cmp(&a.score),
         }
     }
 
@@ -251,6 +257,28 @@ mod tests {
         assert_eq!(usage.compare("b.desktop", "a.desktop"), Ordering::Less);
         assert_eq!(usage.compare("b.desktop", "c.desktop"), Ordering::Less);
         assert_eq!(usage.compare("c.desktop", "d.desktop"), Ordering::Equal);
+    }
+
+    #[test]
+    fn comparing_is_a_total_order_on_fractional_scores() {
+        let usage = AppUsage::from_xml(
+            "<application-state><context id=\"\">\
+             <application id=\"a\" score=\"3.5\" last-seen=\"0\"/>\
+             <application id=\"b\" score=\"4\" last-seen=\"0\"/>\
+             <application id=\"c\" score=\"4.5\" last-seen=\"0\"/>\
+             </context></application-state>",
+            0,
+        );
+        assert_eq!(usage.compare("c", "b"), Ordering::Less);
+        assert_eq!(usage.compare("b", "a"), Ordering::Less);
+        assert_eq!(usage.compare("c", "a"), Ordering::Less);
+        // Enough ids for the sort to go past its insertion-sort threshold.
+        let mut ids: Vec<String> = (0..64)
+            .map(|i| ["a", "b", "c", "z"][i % 4].to_owned())
+            .collect();
+        ids.sort_by(|x, y| usage.compare(x, y));
+        assert_eq!(ids.first().map(String::as_str), Some("c"));
+        assert_eq!(ids.last().map(String::as_str), Some("z"));
     }
 
     #[test]

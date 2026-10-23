@@ -23511,6 +23511,76 @@ fn remote_search_providers_follow_the_search_settings() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `Shell.AppUsage` counts a point per 7s an app's window holds the keyboard
+/// (`shell-app-usage.c:166-230`): a stretch ends when focus goes to the overview, which takes
+/// the key focus as gnome-shell's stage does, and the scores are written 5 minutes after.
+#[test]
+fn app_usage_counts_focus_and_saves_after_a_delay() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake_with_wm_class("a.desktop", "A", "a"),
+            AppEntry::fake("b.desktop", "B"),
+        ])),
+        Box::new(RecordingLauncher::default()),
+    );
+    let path = std::env::temp_dir().join(format!("synoik-app-usage-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    f.synoik().app_usage_path = Some(path.clone());
+    f.synoik().usage_now = Some(1000);
+    f.synoik().sync_app_usage_monitoring();
+
+    let window = f.client(client).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("a");
+    window.commit();
+    f.roundtrip(client);
+    let window = f.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(client);
+
+    // 70 seconds in the window, then the overview takes the keys.
+    f.synoik().usage_now = Some(1070);
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
+    let usage = |f: &mut Fixture| f.synoik().app_usage.to_xml(|_| true);
+    assert!(
+        usage(&mut f).contains("id=\"a.desktop\" score=\"10\""),
+        "ten points for seventy seconds: {}",
+        usage(&mut f)
+    );
+    // Time in the overview is nobody's.
+    f.synoik().usage_now = Some(2000);
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.settle();
+    assert!(usage(&mut f).contains("score=\"10\""));
+    assert_eq!(
+        f.synoik().app_usage.compare("a.desktop", "b.desktop"),
+        std::cmp::Ordering::Less
+    );
+
+    assert!(!path.exists(), "not written yet");
+    f.advance_until(Duration::from_secs(5 * 60 + 1), |_| false);
+    let written = (0..200).find_map(|_| {
+        std::fs::read_to_string(&path).ok().or_else(|| {
+            std::thread::sleep(Duration::from_millis(10));
+            None
+        })
+    });
+    let written = written.expect("written five minutes after the change");
+    assert!(
+        written.contains("<application id=\"a.desktop\" score=\"10\""),
+        "{written}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Within a relevance tier the app results go by use, most used first, apps never used last
 /// (`group.sort((a, b) => usage.compare(a, b))`, `appDisplay.js:1817-1823`); tiers keep their
 /// order whatever the use.

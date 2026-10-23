@@ -1444,9 +1444,14 @@ impl OverviewSearch {
             // `.system-action-icon` (`_app-grid.scss:139-147`): the symbolic glyph at half the
             // icon size, in `$system_fg_color`, on a circle of it at 10%.
             for (name, center) in actions {
-                if let Some(tb) =
-                    sym_icons.texture(renderer, &name, RESULT_ICON_PX / 2., scale, style::TEXT)
-                {
+                // `$system_fg_color` is white whatever the color scheme.
+                if let Some(tb) = sym_icons.texture(
+                    renderer,
+                    &name,
+                    RESULT_ICON_PX / 2.,
+                    scale,
+                    [1., 1., 1., 1.],
+                ) {
                     let logical = tb.logical_size();
                     elements.push(TextureRenderElement::from_texture_buffer(
                         tb,

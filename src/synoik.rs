@@ -1287,9 +1287,14 @@ pub struct Synoik {
     pub app_usage: crate::app_usage::AppUsage,
     /// The queued write of [`Self::app_usage`].
     app_usage_save: Option<TimerToken>,
+    /// Writes [`Self::app_usage`] off the compositor thread, made on the first save.
+    app_usage_writer: Option<crate::session_state::StoreWriter>,
     /// Where [`Self::app_usage`] is kept: gnome-shell's `application_state`, and nowhere under
-    /// test, so the corpus neither reads nor writes the host's.
-    app_usage_path: Option<std::path::PathBuf>,
+    /// test, so the corpus neither reads nor writes the host's — unless a test puts it somewhere.
+    pub(crate) app_usage_path: Option<std::path::PathBuf>,
+    /// The wall clock [`Self::app_usage`] reads, set by a test to step it.
+    #[cfg(test)]
+    pub(crate) usage_now: Option<i64>,
     /// A search result asked for the screenshot UI: it opens once the overview is hidden.
     pub screenshot_after_overview: bool,
     /// Where provider `.ini` files are discovered: the system data dirs, and none under test,
@@ -7690,7 +7695,8 @@ impl State {
             PresenceStatus::Unknown(n) => n >= 3,
             PresenceStatus::Available | PresenceStatus::Busy | PresenceStatus::Invisible => false,
         };
-        if self.synoik.app_usage.set_idle(idle, wall_clock_secs()) {
+        let now_wall = self.synoik.usage_now();
+        if self.synoik.app_usage.set_idle(idle, now_wall) {
             self.synoik.queue_app_usage_save();
         }
 
@@ -9302,7 +9308,10 @@ impl Synoik {
                 crate::app_usage::AppUsage::load(&crate::app_usage::data_path(), wall_clock_secs())
             },
             app_usage_save: None,
+            app_usage_writer: None,
             app_usage_path: (!cfg!(test)).then(crate::app_usage::data_path),
+            #[cfg(test)]
+            usage_now: None,
             screenshot_after_overview: false,
             search_provider_dirs: if cfg!(test) {
                 Vec::new()
@@ -17338,10 +17347,12 @@ impl Synoik {
     /// the unlocked overview, so what is left of the session-mode gates is the lockdown keys.
     ///
     /// **Divergences**, shared with the power menu: Power Off, Restart and Suspend do not ask
-    /// gnome-session's `CanShutdown`/`CanReboot`/`CanSuspend`, and Log Out is always offered —
-    /// gnome-shell offers it only with more than one user or session, a non-local or system
-    /// account, or `always-show-log-out`. Lock Orientation needs a panel whose orientation is
-    /// managed, which nothing here reports, so it never is.
+    /// gnome-session's `CanShutdown`/`CanReboot`/`CanSuspend`, and Log Out is offered unless
+    /// `disable-log-out` — gnome-shell offers it only with more than one user or session, a
+    /// non-local or system account, or `always-show-log-out`. Lock Screen does not ask
+    /// `LoginManager.canLock()`, which is whether GDM runs: our shield locks without it. Lock
+    /// Orientation needs a panel whose orientation is managed, which nothing here reports, so it
+    /// never is.
     pub fn system_action_available(&self, action: crate::system_actions::SystemAction) -> bool {
         use crate::system_actions::SystemAction;
         let shield = self.screen_shield.settings();
@@ -17349,14 +17360,23 @@ impl Synoik {
             SystemAction::PowerOff
             | SystemAction::Restart
             | SystemAction::Suspend
-            | SystemAction::Logout
             | SystemAction::Screenshot => true,
+            SystemAction::Logout => !self.gnome_settings.disable_log_out,
             SystemAction::LockScreen => !shield.disable_lock_screen,
             SystemAction::SwitchUser => {
                 self.can_switch_user && self.multiple_users && !shield.disable_user_switching
             }
             SystemAction::LockOrientation => false,
         }
+    }
+
+    /// Wall-clock seconds for [`Self::app_usage`] — a test's when it set one.
+    pub(crate) fn usage_now(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now) = self.usage_now {
+            return now;
+        }
+        wall_clock_secs()
     }
 
     /// The app the focused window belongs to — `ShellWindowTracker:focus-app`.
@@ -17374,14 +17394,20 @@ impl Synoik {
     }
 
     /// Feed the focus app to [`crate::app_usage`] (`notify::focus-app`, `shell-app-usage.c:218`).
+    /// Only a window holding the keyboard is: under the overview, the shield or any other modal
+    /// the stage has the key focus, and gnome-shell's focus app is none.
     fn track_app_usage(&mut self) {
         if !self.app_usage.is_monitoring() {
             return;
         }
-        let focused = self.focused_app_id();
+        let focused = self
+            .keyboard_focus
+            .is_layout()
+            .then(|| self.focused_app_id())
+            .flatten();
         if self
             .app_usage
-            .focus_changed(focused.as_deref(), wall_clock_secs())
+            .focus_changed(focused.as_deref(), self.usage_now())
         {
             self.queue_app_usage_save();
         }
@@ -17393,7 +17419,7 @@ impl Synoik {
         let enable = self.gnome_settings.remember_app_usage;
         let focused = self.focused_app_id();
         self.app_usage
-            .set_monitoring(enable, focused.as_deref(), wall_clock_secs());
+            .set_monitoring(enable, focused.as_deref(), self.usage_now());
         if !enable {
             if let Some(token) = self.app_usage_save.take() {
                 self.cancel_timer(token);
@@ -17419,20 +17445,20 @@ impl Synoik {
         ));
     }
 
-    /// `idle_save_application_usage`: every app the catalog still knows.
-    fn save_app_usage(&self) {
+    /// `idle_save_application_usage`: every app the catalog still knows, written off this
+    /// thread.
+    fn save_app_usage(&mut self) {
         let Some(path) = &self.app_usage_path else {
             return;
         };
         let xml = self
             .app_usage
             .to_xml(|id| self.app_system.lookup(id).is_some());
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Err(err) = crate::session_state::write_atomically(path, xml.as_bytes()) {
-            debug!("could not save applications usage data: {err}");
-        }
+        self.app_usage_writer
+            .get_or_insert_with(|| {
+                crate::session_state::StoreWriter::spawn(path.clone(), "app usage store")
+            })
+            .queue(xml.into_bytes());
     }
 
     pub fn sync_running_apps(&mut self) -> bool {
@@ -17491,6 +17517,14 @@ impl Synoik {
             // The `&&` below this call can swallow a `true`, and the cursor is drawn
             // per frame, so it queues its own redraw.
             self.queue_redraw_all();
+        }
+
+        // `on_app_state_changed`: an app found running is seen now (`shell-app-usage.c:197`).
+        if state_changed && self.app_usage.is_monitoring() {
+            let now = self.usage_now();
+            for app in self.app_system.running() {
+                self.app_usage.app_running(&app.id, now);
+            }
         }
 
         windows_changed || state_changed

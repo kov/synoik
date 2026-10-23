@@ -122,6 +122,9 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
     /// dialog refuses to open (gnome-shell's `RunDialog.open`).
     pub disable_command_line: bool,
+    /// `org.gnome.desktop.lockdown disable-log-out` — no Log Out system action
+    /// (`systemActions.js:442`).
+    pub disable_log_out: bool,
     /// The screen shield's two keys — `disable-lock-screen` (lockdown) and
     /// `lock-enabled` (screensaver). Kept as one struct because the shield
     /// consults them together and they live in different schemas.
@@ -536,6 +539,7 @@ impl Default for GnomeSettings {
             favorite_apps: Vec::new(),
             switchers: SwitcherSettings::default(),
             disable_command_line: false,
+            disable_log_out: false,
             shield: Default::default(),
             login_screen: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
@@ -803,6 +807,9 @@ impl GnomeSettings {
     fn load_lockdown(&mut self, lockdown: &gio::Settings) {
         if settings_has_key(lockdown, "disable-command-line") {
             self.disable_command_line = lockdown.boolean("disable-command-line");
+        }
+        if settings_has_key(lockdown, "disable-log-out") {
+            self.disable_log_out = lockdown.boolean("disable-log-out");
         }
         if settings_has_key(lockdown, "disable-lock-screen") {
             self.shield.disable_lock_screen = lockdown.boolean("disable-lock-screen");

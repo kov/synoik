@@ -96,7 +96,8 @@ impl SystemAction {
         }
     }
 
-    /// `tokenizeKeywords`: every keyword tokenized and folded, flattened.
+    /// `tokenizeKeywords`: every keyword tokenized and folded, with its ASCII alternates — the
+    /// keywords keep both lists (`.flat(2)`), only the terms drop the second.
     fn keywords(self) -> &'static [String] {
         static KEYWORDS: OnceLock<Vec<Vec<String>>> = OnceLock::new();
         let all = KEYWORDS.get_or_init(|| {
@@ -105,7 +106,10 @@ impl SystemAction {
                 .map(|a| {
                     a.keyword_source()
                         .split(';')
-                        .flat_map(tokenize_and_fold)
+                        .flat_map(|k| {
+                            let (tokens, alternates) = tokenize_and_fold(k);
+                            tokens.into_iter().chain(alternates)
+                        })
                         .collect()
                 })
                 .collect()
@@ -118,7 +122,7 @@ impl SystemAction {
 /// is, in order. Terms tokenize and fold the way the keywords did, so "Shut" finds "shutdown"
 /// and "log out" is two terms that each have to match.
 pub fn matching(terms: &[String], available: impl Fn(SystemAction) -> bool) -> Vec<SystemAction> {
-    let terms: Vec<String> = terms.iter().flat_map(|t| tokenize_and_fold(t)).collect();
+    let terms: Vec<String> = terms.iter().flat_map(|t| tokenize_and_fold(t).0).collect();
     if terms.is_empty() {
         return Vec::new();
     }
@@ -134,9 +138,9 @@ pub fn matching(terms: &[String], available: impl Fn(SystemAction) -> bool) -> V
         .collect()
 }
 
-/// `GLib.str_tokenize_and_fold(text, null)[0]`: the words of `text`, normalized and case-folded.
-/// The transliterated ASCII alternates GLib also returns are dropped, as gnome-shell drops them.
-fn tokenize_and_fold(text: &str) -> Vec<String> {
+/// `GLib.str_tokenize_and_fold(text, null)`: the words of `text`, normalized and case-folded,
+/// and their ASCII transliterations where they differ.
+fn tokenize_and_fold(text: &str) -> (Vec<String>, Vec<String>) {
     use gio::glib;
     use gio::glib::translate::{FromGlibPtrContainer, ToGlibPtr};
 
@@ -144,19 +148,23 @@ fn tokenize_and_fold(text: &str) -> Vec<String> {
     let text = text.split('\0').next().unwrap_or_default();
     // SAFETY: `text` is a valid NUL-terminated string for the duration of the call (the stash
     // lives to the end of the statement); a null locale is GLib's documented default; both
-    // returned vectors are newly allocated and owned by us — the tokens are taken over by
-    // `from_glib_full`, the alternates freed here.
-    let tokens: Vec<glib::GString> = unsafe {
+    // returned vectors are newly allocated and owned by us, and `from_glib_full` takes them over.
+    let (tokens, alternates): (Vec<glib::GString>, Vec<glib::GString>) = unsafe {
         let mut alternates: *mut *mut std::ffi::c_char = std::ptr::null_mut();
         let tokens = glib::ffi::g_str_tokenize_and_fold(
             text.to_glib_none().0,
             std::ptr::null(),
             &mut alternates,
         );
-        glib::ffi::g_strfreev(alternates);
-        FromGlibPtrContainer::from_glib_full(tokens)
+        (
+            FromGlibPtrContainer::from_glib_full(tokens),
+            FromGlibPtrContainer::from_glib_full(alternates),
+        )
     };
-    tokens.into_iter().map(String::from).collect()
+    (
+        tokens.into_iter().map(String::from).collect(),
+        alternates.into_iter().map(String::from).collect(),
+    )
 }
 
 #[cfg(test)]
