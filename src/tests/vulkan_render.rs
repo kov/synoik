@@ -9516,6 +9516,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                     clipboard_text: None,
                 }],
                 more: 0,
+                terms: vec!["a".into()],
             }),
         );
     }

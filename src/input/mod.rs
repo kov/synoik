@@ -3794,7 +3794,10 @@ impl State {
                     self.set_clipboard_text(text);
                 }
             }
-            Activation::LaunchSearch { provider } => {
+            Activation::LaunchSearch {
+                provider,
+                terms: section_terms,
+            } => {
                 let can_launch_search = self
                     .synoik
                     .search_providers
@@ -3804,7 +3807,7 @@ impl State {
                 if can_launch_search {
                     self.synoik.emit_search(SynoikToSearch::LaunchSearch {
                         provider,
-                        terms,
+                        terms: section_terms,
                         timestamp,
                     });
                 } else {

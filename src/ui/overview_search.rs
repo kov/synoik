@@ -27,10 +27,13 @@
 //! (`searchController.js:153-160`).
 //!
 //! **Divergences:** no `Shell.AppUsage` ordering within a relevance tier, and no
-//! `SystemActions` results. The results do not scroll: a section that would run past the
-//! bottom of the results view is left out. Rows draw themed and file icons only, not icon
-//! pixels a provider sends inline, and the description is not highlighted with the terms.
-//! A section header is not a keyboard stop. GNOME's stage-capture `reset-search` gesture (a
+//! `SystemActions` results. Enter inside the search delay activates what the typed terms find;
+//! gnome-shell's app provider answers asynchronously, so its Enter activates the previous
+//! default. The results do not scroll: a section that would run past the bottom of the results
+//! view is left out. Rows draw themed and file icons only, not icon pixels a provider sends
+//! inline, and the description is not highlighted with the terms. The status has no spinner.
+//! A section header is not a keyboard stop. Two provider files for one app make one provider,
+//! the first. GNOME's stage-capture `reset-search` gesture (a
 //! click outside the entry/results clears the search) is not ported: such a click falls
 //! through to the picker and the query survives until the next overview enter. Like the
 //! panel and dash, the search draws on **every** output with one shared selection/hover
@@ -252,6 +255,8 @@ pub struct ListSection {
     pub rows: Vec<ResultMeta>,
     /// The header's "N more".
     pub more: usize,
+    /// The terms these rows answer — what the header opens in the app (`_terms`).
+    pub terms: Vec<String>,
 }
 
 /// What activating a result does — the caller performs it.
@@ -265,8 +270,12 @@ pub enum Activation {
         id: String,
         clipboard_text: Option<String>,
     },
-    /// A section header: open the search in the provider's app (`launchSearch`).
-    LaunchSearch { provider: String },
+    /// A section header: open the search the section answers in the provider's app
+    /// (`launchSearch(this._terms)`).
+    LaunchSearch {
+        provider: String,
+        terms: Vec<String>,
+    },
 }
 
 /// What a point over the search UI hit. Nothing is hittable while the search is
@@ -449,9 +458,13 @@ impl OverviewSearch {
         match hit {
             SearchHit::Result(i) => self.activation(Item::App(i)),
             SearchHit::Row { section, row } => self.activation(Item::Row { section, row }),
-            SearchHit::Provider(section) => Some(Activation::LaunchSearch {
-                provider: self.sections.get(section)?.provider.clone(),
-            }),
+            SearchHit::Provider(section) => {
+                let section = self.sections.get(section)?;
+                Some(Activation::LaunchSearch {
+                    provider: section.provider.clone(),
+                    terms: section.terms.clone(),
+                })
+            }
             SearchHit::Clear | SearchHit::Field | SearchHit::Background => None,
         }
     }
@@ -847,10 +860,10 @@ impl OverviewSearch {
     /// The results under an active search, top to bottom in `#searchResultsContent`: the app
     /// grid, then one card per provider section; or the status line when there are none.
     fn results_layout(&self, area: SearchArea) -> ResultsLayout {
-        let avail = area.results.size.w - 2. * RESULTS_MARGIN;
-        let column_w = avail.min(RESULTS_MAX_W);
-        let column_x = area.results.loc.x + (area.results.size.w - column_w) / 2.;
-        let top = (area.results.loc.y + SECTION_SPACING).round();
+        let (column_x, column_w) = results_column(area);
+        // The first section starts at the top of the scroll view: `.search-section`'s spacing
+        // is between a section's results and its separator, not above it.
+        let top = area.results.loc.y.round();
         let bottom = area.results.loc.y + area.results.size.h;
 
         if self.has_no_results() {
@@ -1583,6 +1596,32 @@ fn section_texts(
     }
 }
 
+/// `#searchResultsContent`: the results view less its margins, capped at
+/// [`RESULTS_MAX_W`] and centered (`MaxWidthBox`). Its x and width.
+fn results_column(area: SearchArea) -> (f64, f64) {
+    let avail = area.results.size.w - 2. * RESULTS_MARGIN;
+    let column_w = avail.min(RESULTS_MAX_W);
+    (
+        area.results.loc.x + (area.results.size.w - column_w) / 2.,
+        column_w,
+    )
+}
+
+/// How many app results fit across the results column —
+/// `GridSearchResultsLayout.columnsForWidth` (`search.js:442-460`).
+pub fn grid_columns(area: SearchArea) -> usize {
+    let (_, mut width) = results_column(area);
+    let mut columns = 0;
+    while width > tile_w() {
+        width -= tile_w();
+        if columns > 0 {
+            width -= GRID_SPACING;
+        }
+        columns += 1;
+    }
+    columns
+}
+
 /// Where a row's icon is centered.
 fn row_icon_center(row: Rectangle<f64, Logical>) -> Point<f64, Logical> {
     Point::from((
@@ -2296,6 +2335,21 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(LABEL_PT, crate::ui::BASE_FONT_PT);
     }
 
+    /// The app grid holds as many results as fit across the results column
+    /// (`_getMaxDisplayedResults`), never more than the provider's six.
+    #[test]
+    fn the_app_grid_takes_the_columns_that_fit() {
+        let wide = area_1080();
+        assert!(grid_columns(wide) >= MAX_RESULTS);
+        // `columnsForWidth` counts a column while more than a tile is left, and charges the
+        // spacing only after counting it.
+        let mut narrow = wide;
+        narrow.results.size.w = 2. * RESULTS_MARGIN + 2. * tile_w() + 1.;
+        assert_eq!(grid_columns(narrow), 2);
+        narrow.results.size.w -= 1.;
+        assert_eq!(grid_columns(narrow), 1);
+    }
+
     /// With nothing to show, the status line (`_statusContainer`) sits centered in the results
     /// view, and reads "Searching" while a provider has yet to answer.
     #[test]
@@ -2331,6 +2385,7 @@ run it with --features reference-env, as the fedora CI job does"
             icon: AppIconRef::Fallback,
             rows: ids.iter().map(|id| meta(id)).collect(),
             more: 0,
+            terms: vec!["a".to_owned()],
         }
     }
 
@@ -2435,7 +2490,8 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(
             s.hit_activation(SearchHit::Provider(0)),
             Some(Activation::LaunchSearch {
-                provider: "p".into()
+                provider: "p".into(),
+                terms: vec!["a".into()],
             })
         );
     }

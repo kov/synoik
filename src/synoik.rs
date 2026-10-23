@@ -17749,7 +17749,9 @@ impl Synoik {
             self.overview_search.set_results(Vec::new());
             self.overview_search.clear_sections();
             self.overview_search.set_searching(false);
-            self.emit_search(crate::search_providers::SynoikToSearch::Reset);
+            self.emit_search(crate::search_providers::SynoikToSearch::Reset {
+                generation: self.search_run.generation,
+            });
             return;
         }
         self.search_run.terms = terms;
@@ -17778,8 +17780,18 @@ impl Synoik {
         }
         // The built-in `AppSearchProvider` (`appDisplay.js:1801-1831`):
         // `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` →
-        // concat → cap at [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS). (No
-        // `Shell.AppUsage` within-tier sort yet.)
+        // concat → cap at [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS), or at the
+        // columns that fit (`_getMaxDisplayedResults`, `search.js:530-541`) — on the narrowest
+        // output, as one result set is drawn on all of them. (No `Shell.AppUsage` within-tier
+        // sort yet.)
+        let cap = self
+            .global_space
+            .outputs()
+            .filter_map(|output| self.layout.controls_layout_for_output(output))
+            .map(|controls| crate::ui::overview_search::grid_columns(controls.into()))
+            .min()
+            .unwrap_or(crate::ui::overview_search::MAX_RESULTS)
+            .min(crate::ui::overview_search::MAX_RESULTS);
         let query = self.search_run.terms.join(" ");
         let mut results = Vec::new();
         'outer: for group in self.app_system.search(&query) {
@@ -17791,7 +17803,7 @@ impl Synoik {
                             name: entry.name,
                             icon: entry.icon,
                         });
-                        if results.len() >= crate::ui::overview_search::MAX_RESULTS {
+                        if results.len() >= cap {
                             break 'outer;
                         }
                     }
@@ -17842,6 +17854,7 @@ impl Synoik {
                     icon: p.icon.clone(),
                     rows: results.rows,
                     more: results.more,
+                    terms: self.search_run.terms.clone(),
                 },
             );
         self.overview_search.set_section(&provider, section);

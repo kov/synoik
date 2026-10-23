@@ -163,9 +163,14 @@ pub fn select(
     if settings.disable_external {
         return Vec::new();
     }
-    let mut providers: Vec<Provider> = specs
-        .iter()
-        .filter_map(|spec| {
+    let mut providers: Vec<Provider> = Vec::new();
+    for spec in specs {
+        // A provider is known by its app, on both sides of the seam; a second file for the same
+        // app would have its answers taken for the first's.
+        if providers.iter().any(|p| p.id() == spec.desktop_id) {
+            continue;
+        }
+        let provider = (|| {
             let app = lookup(&spec.desktop_id).filter(|app| app.should_show)?;
             let id = &spec.desktop_id;
             let wanted = if spec.default_enabled {
@@ -184,8 +189,9 @@ pub fn select(
                 name: app.name,
                 icon: app.icon,
             })
-        })
-        .collect();
+        })();
+        providers.extend(provider);
+    }
     let rank = |p: &Provider| settings.sort_order.iter().position(|id| id == p.id());
     providers.sort_by(|a, b| match (rank(a), rank(b)) {
         (Some(a), Some(b)) => a.cmp(&b),
@@ -243,8 +249,9 @@ pub enum SynoikToSearch {
     /// one's replies stale. Whether it is a sub-search of the last completed one is the
     /// client's call — it holds the results that would be refined.
     Search { generation: u64, terms: Vec<String> },
-    /// The search was cleared: drop the remembered results and metas (`_reset`, `clear`).
-    Reset,
+    /// The search was cleared: drop the remembered results and metas (`_reset`, `clear`), and
+    /// retire whatever is in flight — `generation` is the compositor's, past every search sent.
+    Reset { generation: u64 },
     ActivateResult {
         provider: String,
         id: String,

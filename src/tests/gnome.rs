@@ -23478,7 +23478,10 @@ fn emptying_the_query_resets_the_provider_search() {
     search_settle(&mut f);
     sent(&rx);
     tap(&mut f, KEY_BACKSPACE);
-    assert_eq!(sent(&rx), [SynoikToSearch::Reset]);
+    assert!(
+        matches!(sent(&rx)[..], [SynoikToSearch::Reset { .. }]),
+        "one reset"
+    );
     assert!(!f.synoik().overview_search.is_searching());
 }
 

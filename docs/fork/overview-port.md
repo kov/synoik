@@ -685,7 +685,8 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   results view stacks the app grid (no plate — only list sections build `.search-section-content`)
   and one card per provider with its `ProviderInfo` header and up to five rows; Enter, row clicks
   and header clicks activate (`ActivateResult` + clipboard text, `LaunchSearch`). Still open:
-  **R2** scrolling, inline icon pixels, term highlighting, the header as a keyboard stop; **R3**
+  **R2** scrolling, inline icon pixels, term highlighting, the status spinner, the header as a
+  keyboard stop; **R3**
   the settings' live reaction is in, the Settings-panel round trip is unverified; **R4**
   `SystemActions` results and `Shell.AppUsage` ordering.
 - **S9+ — Polish.** Favorites DnD reorder / add-remove, folders, usage stats.

@@ -46,7 +46,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_RESULT_IDS: usize = 1000;
 const MAX_ID_BYTES: usize = 4096;
 const MAX_TEXT_CHARS: usize = 1024;
-const MAX_ICON_PX: i32 = 512;
+const MAX_ICON_PX: i32 = 256;
 
 /// Where replies go: the compositor's channel in a session, a test's in a test.
 type Reply = Arc<dyn Fn(SearchToSynoik) + Send + Sync>;
@@ -137,8 +137,11 @@ impl Client {
                     self.spawn(task, "search a provider");
                 }
             }
-            SynoikToSearch::Reset => {
+            SynoikToSearch::Reset { generation } => {
                 let mut shared = self.shared.lock().unwrap();
+                // Retire a search still in flight, or it would store its results after the
+                // reset and the next search would refine them.
+                shared.generation = generation;
                 shared.previous.clear();
                 shared.metas.clear();
             }
@@ -268,22 +271,33 @@ async fn search_provider(
         None => call::<Vec<String>>(&bus, &endpoint, "GetInitialResultSet", &(&terms,)).await,
     };
     let ids = match found {
-        Ok(ids) => bound_ids(ids),
+        Ok(ids) => Some(bound_ids(ids)),
         Err(err) => {
             warn!("search provider {}: {err}", endpoint.id);
-            Vec::new()
+            None
         }
     };
 
-    {
+    let ids = {
         let mut shared = shared.lock().unwrap();
         if !current(&shared) {
             return;
         }
-        shared
-            .previous
-            .insert(endpoint.id.clone(), (joined, ids.clone()));
-    }
+        // A failed call produced nothing to refine: the next search starts afresh rather than
+        // narrowing an empty list (gnome-shell's `finally` stores the `[]` and does narrow it).
+        match ids {
+            Some(ids) => {
+                shared
+                    .previous
+                    .insert(endpoint.id.clone(), (joined, ids.clone()));
+                ids
+            }
+            None => {
+                shared.previous.remove(&endpoint.id);
+                Vec::new()
+            }
+        }
+    };
 
     let results = if ids.is_empty() {
         None
@@ -360,8 +374,11 @@ async fn section(
         let known = shared.metas.entry(endpoint.id.clone()).or_default();
         known.extend(needed.into_iter().zip(parsed));
     }
-    let shared = shared.lock().unwrap();
-    let known = shared.metas.get(&endpoint.id)?;
+    let mut shared = shared.lock().unwrap();
+    let known = shared.metas.get_mut(&endpoint.id)?;
+    // Keep only the rows on show: every keystroke can bring new ids, each with up to
+    // `MAX_ICON_PX`² of pixels, and nothing else would ever let them go.
+    known.retain(|id, _| shown.contains(id));
     let rows = shown
         .iter()
         .map(|id| known.get(id).cloned())
@@ -565,12 +582,18 @@ mod tests {
 
     #[zbus::interface(name = "org.gnome.Shell.SearchProvider2")]
     impl FakeProvider {
-        async fn get_initial_result_set(&self, terms: Vec<String>) -> Vec<String> {
+        async fn get_initial_result_set(
+            &self,
+            terms: Vec<String>,
+        ) -> zbus::fdo::Result<Vec<String>> {
             self.log(format!("initial {}", terms.join(" ")));
             if let Some(gate) = &self.gate {
                 gate.recv().await.unwrap();
             }
-            self.matching(&terms, None)
+            if terms.iter().any(|t| t == "boom") {
+                return Err(zbus::fdo::Error::Failed("boom".to_owned()));
+            }
+            Ok(self.matching(&terms, None))
         }
 
         fn get_subsearch_result_set(
@@ -822,6 +845,42 @@ mod tests {
         assert_eq!(got.len(), 1, "only the newer search reports: {got:?}");
         let SearchToSynoik::Results { generation, .. } = &got[0];
         assert_eq!(*generation, 2);
+    }
+
+    /// A failed search leaves nothing to refine: the next, longer string is searched afresh.
+    #[test]
+    fn a_failed_search_is_not_refined() {
+        let mut h = harness(vec![(vec![("1", "boomerang")], false)]);
+        let got = h.search(1, &["boom"]);
+        assert_eq!(rows(&got[0]), None);
+        h.search(2, &["boomer"]);
+        assert_eq!(h.calls(0), ["initial boom", "initial boomer", "metas 1"]);
+    }
+
+    /// A reset retires a search still in flight: it neither reports nor leaves results for the
+    /// next search to refine.
+    #[test]
+    fn a_reset_retires_the_search_in_flight() {
+        let (open, gate) = async_channel::unbounded();
+        let mut h = gated_harness(
+            vec![(vec![("1", "apple")], false)],
+            Some(gate),
+            Duration::from_secs(5),
+        );
+        h.client.handle(SynoikToSearch::Search {
+            generation: 1,
+            terms: vec!["ap".into()],
+        });
+        h.client.handle(SynoikToSearch::Reset { generation: 2 });
+        open.send_blocking(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            h.replies.try_recv().is_err(),
+            "the retired search reports nothing"
+        );
+        open.send_blocking(()).unwrap();
+        h.search(3, &["app"]);
+        assert_eq!(h.calls(0), ["initial ap", "initial app", "metas 1"]);
     }
 
     /// A provider that never answers stops counting as searching once the call times out, as
