@@ -196,8 +196,8 @@ mod tests {
             find(&["SCREEN"]),
             [SystemAction::LockScreen, SystemAction::Screenshot]
         );
-        // Only the folded tokens are compared, not GLib's ASCII alternates — an accent that
-        // is not in the keyword does not match, in gnome-shell either.
+        // A term's ASCII alternates are dropped — an accent that is not in the keyword does
+        // not match, in gnome-shell either.
         assert_eq!(find(&["scréen"]), []);
     }
 
