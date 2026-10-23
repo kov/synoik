@@ -2704,6 +2704,12 @@ impl State {
 
         self.refresh();
 
+        // Content scrolled under a pointer that did not move: what it is over changed.
+        if self.synoik.is_overview_search_scrolling() {
+            let pos = self.synoik.seat.get_pointer().unwrap().current_location();
+            self.update_panel_hover(pos);
+        }
+
         // A search result's screenshot waits for the overview to be gone (`overview 'hidden'`).
         if self.synoik.screenshot_after_overview && self.synoik.layout.is_overview_hidden() {
             self.synoik.screenshot_after_overview = false;
@@ -17782,6 +17788,9 @@ impl Synoik {
             if done {
                 self.search_run.scroll = None;
             }
+        } else if let Some(area) = area.filter(|_| self.overview_search.is_active()) {
+            // The content changed under the scroll: keep it in bounds as St does.
+            self.overview_search.clamp_scroll(area);
         }
     }
 

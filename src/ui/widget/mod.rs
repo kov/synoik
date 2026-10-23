@@ -954,7 +954,8 @@ pub fn image_element(
 /// Drawn without a per-frame bake, which would cost a GPU round trip on every frame it spins
 /// (see `frame_log`'s bake attribution). The circle and one round dot are baked once; the arc is
 /// dots set along it, each frame only their positions change. Overlapping dots of an opaque
-/// colour read as a round-capped stroke.
+/// colour read as a round-capped stroke; faded, each dot takes the alpha that `DOT_OVERLAP`
+/// layers of it compose to, so the arc fades with the circle rather than saturating.
 #[derive(Default)]
 pub struct Spinner {
     ring: BakeCache,
@@ -975,6 +976,8 @@ impl Spinner {
     const OVERLAP: f64 = std::f64::consts::PI * 0.7;
     const EXTEND: f64 = std::f64::consts::PI * 1.1;
     const CONTRACT: f64 = std::f64::consts::PI * 1.35;
+    /// Dots per stroke width along the arc — how many cover a point of its centre line.
+    const DOT_OVERLAP: f64 = 4.;
 
     pub fn new() -> Self {
         Self::default()
@@ -1057,15 +1060,19 @@ impl Spinner {
         match dot {
             Ok(dot) => {
                 let (from, to) = Self::arc(elapsed);
-                // A dot every quarter of a stroke width keeps the edge smooth.
-                let steps = ((to - from) * radius / (width / 4.)).ceil().max(1.) as usize;
+                // `DOT_OVERLAP` layers of `dot_alpha` compose to `alpha`: 1 - (1 - a')^n = a.
+                let dot_alpha = 1. - (1. - alpha.clamp(0., 1.)).powf(1. / Self::DOT_OVERLAP as f32);
+                // A dot every `1 / DOT_OVERLAP` of a stroke width keeps the edge smooth.
+                let steps = ((to - from) * radius / (width / Self::DOT_OVERLAP))
+                    .ceil()
+                    .max(1.) as usize;
                 for i in 0..=steps {
                     let a = from + (to - from) * i as f64 / steps as f64;
                     let at = center + Point::from((a.cos() * radius, a.sin() * radius));
                     out.push(TextureRenderElement::from_texture_buffer(
                         dot.clone(),
                         at - Point::from((width / 2., width / 2.)),
-                        alpha,
+                        dot_alpha,
                         None,
                         None,
                         Kind::Unspecified,

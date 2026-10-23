@@ -23400,6 +23400,22 @@ fn remote_search_results_scroll_and_follow_the_selection() {
         "the row rests 68px above the view's bottom: {center:?}"
     );
 
+    // A wheel notch moves the rows under a pointer that stays put: its hover follows them.
+    let hovered_row = f.synoik().overview_search.hovered();
+    assert!(
+        matches!(hovered_row, Some(SearchHit::Row { .. })),
+        "the pointer is over a row: {hovered_row:?}"
+    );
+    f.scroll_wheel();
+    let now_hovered = f.synoik().overview_search.hovered();
+    assert_ne!(now_hovered, hovered_row, "the hover is re-picked");
+    let pos = f.synoik().seat.get_pointer().unwrap().current_location();
+    assert_eq!(
+        now_hovered,
+        f.synoik().overview_search.hit_test(pos, area),
+        "…to what is under the pointer now"
+    );
+
     // At the very end the content runs out first: the scroll stops there.
     for _ in 0..20 {
         tap(&mut f, KEY_DOWN);

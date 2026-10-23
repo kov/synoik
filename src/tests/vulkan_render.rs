@@ -9500,12 +9500,14 @@ fn vulkan_search_spinner_draws_its_arc_over_the_circle() {
     let (from, to) = crate::ui::widget::Spinner::arc(spin);
 
     let state = f.synoik_state();
-    let composited =
-        state
-            .backend
-            .headless()
-            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let synoik = &mut state.synoik;
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<Vec<u8>>, i32)> {
+            let synoik = &mut state.synoik;
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let mut frames = Vec::new();
+            // Shown, then halfway through the search cross-fade.
+            for search in [1.0, 0.5] {
                 let elements = synoik.overview_search.render(
                     vk,
                     &synoik.app_icon_cache,
@@ -9514,41 +9516,43 @@ fn vulkan_search_spinner_draws_its_arc_over_the_circle() {
                     area,
                     crate::ui::overview_search::SearchFade {
                         overview: 1.0,
-                        search: 1.0,
+                        search,
                     },
                     synoik.gnome_settings.accent_color,
                     synoik.appearance(),
                     spin,
                 );
-                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
-                let scale = Scale::from(output.current_scale().fractional_scale());
-                let pixels = render_to_vec(
+                frames.push(render_to_vec(
                     vk,
                     phys,
                     scale,
                     Transform::Normal,
                     Fourcc::Abgr8888,
                     elements.iter().rev(),
-                )?;
-                Ok((pixels, phys.w))
-            });
+                )?);
+            }
+            Ok((frames, phys.w))
+        },
+    );
     let Some(result) = composited else {
         eprintln!("skipping vulkan_search_spinner: no Vulkan device");
         return;
     };
-    let (pixels, w) = result.expect("compositing the spinner through Vulkan must not error");
-    let at = |angle: f64, r: f64| {
+    let (frames, w) = result.expect("compositing the spinner through Vulkan must not error");
+    let at = |pixels: &[u8], angle: f64, r: f64| {
         px(
-            &pixels,
+            pixels,
             w,
             (center.x + angle.cos() * r).round() as i32,
             (center.y + angle.sin() * r).round() as i32,
         )
     };
+    let mid = (from + to) / 2.;
+    let gap_angle = to + (2. * std::f64::consts::PI - (to - from)) / 2.;
 
-    let arc = at((from + to) / 2., radius);
-    let gap = at(to + (2. * std::f64::consts::PI - (to - from)) / 2., radius);
-    let hole = at(0., 0.);
+    let arc = at(&frames[0], mid, radius);
+    let gap = at(&frames[0], gap_angle, radius);
+    let hole = at(&frames[0], 0., 0.);
     eprintln!("vulkan_search_spinner: arc={arc:?} gap={gap:?} hole={hole:?}");
     assert_eq!(arc[3], 255, "the arc is the full foreground: {arc:?}");
     assert!(
@@ -9556,6 +9560,19 @@ fn vulkan_search_spinner_draws_its_arc_over_the_circle() {
         "the rest of the circle is it at CIRCLE_OPACITY (~38): {gap:?}"
     );
     assert_eq!(hole[3], 0, "the circle is a ring, not a disc: {hole:?}");
+
+    // Half faded, the arc is half its alpha — its overlapping dots do not pile up past it.
+    let arc = at(&frames[1], mid, radius);
+    let gap = at(&frames[1], gap_angle, radius);
+    eprintln!("vulkan_search_spinner: faded arc={arc:?} gap={gap:?}");
+    assert!(
+        (115..=140).contains(&arc[3]),
+        "the faded arc composes to about half (~128): {arc:?}"
+    );
+    assert!(
+        (14..=25).contains(&gap[3]),
+        "the faded circle (~19): {gap:?}"
+    );
 }
 
 #[test]

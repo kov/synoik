@@ -40,8 +40,10 @@
 //! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
 //! click outside the entry/results clears the search) is not ported: such a click falls
 //! through to the picker and the query survives until the next overview enter. Like the
-//! panel and dash, the search draws on **every** output with one shared selection/hover
-//! (GNOME shows it on the primary monitor only); hit-testing is still per-output.
+//! panel and dash, the search draws on **every** output with one shared selection, hover and
+//! scroll (GNOME shows it on the primary monitor only): each output clamps the scroll to its own
+//! overflow, the selection is eased into view on the active output, and hit-testing is
+//! per-output.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -694,6 +696,15 @@ impl OverviewSearch {
             .clamp(0., self.results_layout_at_rest(area).max_scroll())
     }
 
+    /// Store the scroll clamped to what `area` can scroll now — what an `St.Adjustment` does to its
+    /// value whenever its bounds change, so a shrink is not undone when the content grows back.
+    pub fn clamp_scroll(&mut self, area: SearchArea) {
+        let clamped = self.scroll(area);
+        if clamped != self.scroll {
+            self.scroll = clamped;
+        }
+    }
+
     /// Scroll to `value`, clamped to what `area` can scroll.
     pub fn set_scroll(&mut self, value: f64, area: SearchArea) {
         self.scroll = value.clamp(0., self.results_layout_at_rest(area).max_scroll());
@@ -853,8 +864,13 @@ impl OverviewSearch {
     fn on_query_changed(&mut self) {
         // GNOME re-selects the first result whenever results update; reset here so
         // Enter after a Backspace activates the new first result.
+        let key = self.selected_key();
         self.selected = self.default_index();
-        self.selection_serial += 1;
+        // Brought into view only if that is a different result: GNOME keeps the actor of a
+        // result that is still there, and the default with it (`search.js:828-830`).
+        if self.selected_key() != key {
+            self.selection_serial += 1;
+        }
         self.navigated = false;
         self.content_rev = self.content_rev.wrapping_add(1);
     }
@@ -903,6 +919,7 @@ impl OverviewSearch {
             && !self.searching
             && self.hovered.is_none()
             && !self.expanded
+            && self.scroll == 0.
         {
             return;
         }
@@ -919,6 +936,11 @@ impl OverviewSearch {
         self.navigated = false;
         self.hovered = None;
         self.content_rev = self.content_rev.wrapping_add(1);
+    }
+
+    /// The mouse-hovered element.
+    pub fn hovered(&self) -> Option<SearchHit> {
+        self.hovered
     }
 
     /// Set the mouse-hovered element; returns whether it changed (→ redraw). Does not
@@ -1714,6 +1736,7 @@ impl OverviewSearch {
                     .to_owned(),
                     true,
                 )],
+                pen: false,
                 pt: STATUS_PT,
                 x: rel(status).loc.x + status.size.w / 2.,
                 align: widget::HAlign::Center,
@@ -1774,7 +1797,7 @@ impl OverviewSearch {
                     )?;
                 }
                 for (shaped, t) in texts {
-                    if let [single] = &shaped[..] {
+                    if let ([single], false) = (&shaped[..], t.pen) {
                         p.text_band(single, t.x, t.align, t.top, t.h, t.color, all)?;
                         continue;
                     }
@@ -1885,9 +1908,11 @@ impl OverviewSearch {
 
 /// A run of text to place in the results' text layer.
 struct TextItem {
-    /// The line's runs, each regular or bold. A single run is placed by its ink per `align`;
-    /// several are set one after another from `x` by their advances.
+    /// The line's runs, each regular or bold.
     runs: Vec<(String, bool)>,
+    /// Set from `x` by pen position, run after run — a description, highlighted or not, so the
+    /// two start at the same place. Otherwise the line's ink is placed per `align`.
+    pen: bool,
     pt: f64,
     x: f64,
     align: widget::HAlign,
@@ -1909,9 +1934,10 @@ fn section_texts(
     let line_w = |s: &str| {
         synoik_vk::text::measure_line_width_weighted(s, crate::ui::pt_to_px(pt) as f32, false)
     };
-    let mut push = |runs: Vec<(String, bool)>, x: f64, top: f64, h: f64, color| {
+    let mut push = |runs: Vec<(String, bool)>, pen: bool, x: f64, top: f64, h: f64, color| {
         if runs.iter().any(|(text, _)| !text.is_empty()) {
             texts.push(TextItem {
+                pen,
                 runs,
                 pt,
                 x: x - origin.x,
@@ -1931,6 +1957,7 @@ fn section_texts(
     if section.more > 0 {
         push(
             vec![(name, false)],
+            false,
             details_x,
             content_top,
             content_h - LINE_H,
@@ -1938,6 +1965,7 @@ fn section_texts(
         );
         push(
             vec![(format!("{} more", section.more), false)],
+            false,
             details_x,
             content_top + content_h - LINE_H,
             LINE_H,
@@ -1946,6 +1974,7 @@ fn section_texts(
     } else {
         push(
             vec![(name, false)],
+            false,
             details_x,
             content_top,
             content_h,
@@ -1961,6 +1990,7 @@ fn section_texts(
         let title_w = line_w(&title).min(avail);
         push(
             vec![(title, false)],
+            false,
             title_x,
             row.loc.y,
             row.size.h,
@@ -1972,6 +2002,7 @@ fn section_texts(
             if avail > 0. {
                 push(
                     highlighted_line(description, terms, pt, avail),
+                    true,
                     x,
                     row.loc.y,
                     row.size.h,
@@ -2087,6 +2118,11 @@ fn highlighted_line(text: &str, terms: &[&str], pt: f64, avail: f64) -> Vec<(Str
             break;
         }
         budget -= width - avail;
+    }
+    // Still too wide after the passes: the plain cut, which always fits.
+    let width: f64 = runs.iter().map(|(t, b)| run_width(t, pt, *b)).sum();
+    if width > avail {
+        runs = vec![(widget::ellipsized_line(text, pt, avail), false)];
     }
     runs
 }
@@ -3138,6 +3174,55 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(s.scroll(area), max, "…and is clamped");
         s.set_scroll(-5., area);
         assert_eq!(s.scroll(area), 0.);
+    }
+
+    /// The scroll is kept in bounds as the content changes, the way an `St.Adjustment` clamps its
+    /// value: content that shrank and grows back does not return to the old offset. Clearing
+    /// resets it.
+    #[test]
+    fn the_scroll_stays_in_bounds_as_the_content_changes() {
+        let mut s = typed('a');
+        let fill = |s: &mut OverviewSearch, n: usize| {
+            for i in 0..n {
+                let id = format!("p{i}");
+                s.set_section(&id, Some(section(i, &id, &["a", "b", "c", "d", "e"])));
+            }
+        };
+        fill(&mut s, 20);
+        let area = area_1080();
+        s.set_scroll(f64::MAX, area);
+        assert!(s.scroll(area) > 0.);
+        for i in 2..20 {
+            s.set_section(&format!("p{i}"), None);
+        }
+        s.clamp_scroll(area);
+        assert_eq!(s.scroll(area), 0., "two sections fit");
+        fill(&mut s, 20);
+        assert_eq!(
+            s.scroll(area),
+            0.,
+            "growing back does not restore the old offset"
+        );
+
+        s.set_scroll(f64::MAX, area);
+        s.clear();
+        assert_eq!(s.scroll, 0.);
+    }
+
+    /// A new query whose default result is the one already selected does not move the view:
+    /// GNOME keeps that result's actor, and scrolls only for a new default.
+    #[test]
+    fn a_query_change_keeps_the_view_if_the_default_stays() {
+        let mut s = typed('a');
+        s.set_results(vec![entry("app.desktop", "App")]);
+        let serial = s.selection_serial();
+        s.handle_key(None, Some('b'), EditMods::default(), KeyTheme::default());
+        assert_eq!(s.selection_serial(), serial);
+        s.set_results(vec![entry("other.desktop", "Other")]);
+        assert!(
+            s.selection_serial() > serial,
+            "a new default is brought into view"
+        );
     }
 
     /// The selection is brought into view the way `ensureActorVisibleInScrollView` does,

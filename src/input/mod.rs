@@ -6364,7 +6364,7 @@ impl State {
     /// Light up the panel button under the pointer (gnome-shell `panel_button:hover`).
     /// `pos` is the global-space pointer location. Off any button — or outside GNOME
     /// mode — clears the hover. Redraws only when the hovered button actually changed.
-    fn update_panel_hover(&mut self, pos: Point<f64, Logical>) {
+    pub(crate) fn update_panel_hover(&mut self, pos: Point<f64, Logical>) {
         // Whether a pointer grab currently owns the cursor. A grab — an interactive resize, a move,
         // a DnD — sets the cursor deliberately and holds it until it ends, so the "force the arrow"
         // rules below must not fire. They exist because a *client* can no longer paint its own
@@ -10028,6 +10028,8 @@ impl State {
                             event.amount(Axis::Vertical).unwrap_or(0.) / 10.
                         };
                         if self.synoik.scroll_overview_search(delta, area) {
+                            // The pointer is over something else now.
+                            self.update_panel_hover(pointer.current_location());
                             self.synoik.queue_redraw_all();
                         }
                         return;
