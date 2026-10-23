@@ -14,6 +14,9 @@
 //! client owns its bus connection and does all of the parsing and bounding; across the seam
 //! travel only the plain, validated types here ([`SynoikToSearch`] in, [`SearchToSynoik`] out), so
 //! the client can move into its own process without the compositor changing.
+//!
+//! **Divergence:** providers are not filtered by parental controls (`_registerProvider`'s
+//! `shouldShowApp`, `search.js:660-668`): malcontent is not modelled anywhere yet.
 
 use std::path::{Path, PathBuf};
 

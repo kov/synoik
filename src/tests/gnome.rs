@@ -23412,6 +23412,89 @@ fn remote_search_results_scroll_and_follow_the_selection() {
     assert_eq!(f.synoik().overview_search.scroll(area), end, "clamped");
 }
 
+/// The providers follow `org.gnome.desktop.search-providers` live, the way the Settings
+/// Search panel drives them (`search.js:630-634`, `remoteSearch.js:141-219`): disabling one
+/// drops its section and leaves it out of the next search, `sort-order` reorders the sections,
+/// and `disable-external` turns them all off.
+#[test]
+fn remote_search_providers_follow_the_search_settings() {
+    use crate::search_providers::{SearchProviderSettings, SynoikToSearch};
+
+    let dir = std::env::temp_dir().join(format!("synoik-search-settings-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, id) in [("a.ini", "files.desktop"), ("b.ini", "calc.desktop")] {
+        std::fs::write(
+            dir.join(file),
+            format!(
+                "[Shell Search Provider]\nDesktopId={id}\nBusName=org.example.{id}\n\
+                 ObjectPath=/{}\nVersion=2\n",
+                &file[..1]
+            ),
+        )
+        .unwrap();
+    }
+    let (mut f, _rec) = search_overview(&[&["files.desktop", "calc.desktop"]]);
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().search_provider_emit = Some(tx);
+    f.synoik().search_provider_dirs = vec![dir.clone()];
+    f.synoik().reload_search_providers();
+    let ids = |f: &mut Fixture| -> Vec<String> {
+        f.synoik()
+            .search_providers
+            .iter()
+            .map(|p| p.id().to_owned())
+            .collect()
+    };
+    // Unsorted, by name: "calc.desktop" before "files.desktop".
+    assert_eq!(ids(&mut f), ["calc.desktop", "files.desktop"]);
+
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "calc.desktop", &["2"]);
+    answer(&mut f, generation, "files.desktop", &["one"]);
+    assert_eq!(f.synoik().overview_search.sections().len(), 2);
+
+    // The Settings panel switches Files off.
+    f.synoik()
+        .set_search_provider_settings(SearchProviderSettings {
+            disabled: vec!["files.desktop".into()],
+            ..Default::default()
+        });
+    assert_eq!(ids(&mut f), ["calc.desktop"]);
+    let msgs = sent(&rx);
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, SynoikToSearch::SetProviders(p) if p.len() == 1)),
+        "the client is told the new set: {msgs:?}"
+    );
+    assert!(
+        f.synoik().overview_search.sections().is_empty(),
+        "the old sections go with the providers that drew them"
+    );
+    tap(&mut f, KEY_S);
+    search_settle(&mut f);
+    assert_eq!(f.synoik().search_run_pending(), ["calc.desktop"]);
+
+    // It reorders them.
+    f.synoik()
+        .set_search_provider_settings(SearchProviderSettings {
+            sort_order: vec!["files.desktop".into(), "calc.desktop".into()],
+            ..Default::default()
+        });
+    assert_eq!(ids(&mut f), ["files.desktop", "calc.desktop"]);
+
+    // And turns every one off.
+    f.synoik()
+        .set_search_provider_settings(SearchProviderSettings {
+            disable_external: true,
+            ..Default::default()
+        });
+    assert!(ids(&mut f).is_empty());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The search runs 150 ms after the **first** keystroke of a burst, not the last:
 /// `setTerms` arms its timeout only when none is running (`search.js:769-770`). It then asks
 /// every provider at once, with everything typed by then.

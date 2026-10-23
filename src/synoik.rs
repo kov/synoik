@@ -1275,6 +1275,9 @@ pub struct Synoik {
     pub overview_search: OverviewSearch,
     /// The remote search providers, in section order.
     pub search_providers: Vec<crate::search_providers::Provider>,
+    /// Where provider `.ini` files are discovered: the system data dirs, and none under test,
+    /// so the corpus never reads the host's providers — a test installs its own.
+    pub search_provider_dirs: Vec<std::path::PathBuf>,
     /// Requests to the search-provider client, which owns the bus connection; `None` when it
     /// is not running.
     pub search_provider_emit:
@@ -2556,12 +2559,12 @@ impl State {
                             new_is.present && old_is.mru_sources != new_is.mru_sources;
                         let icon_theme_changed =
                             state.synoik.gnome_settings.icon_theme != settings.icon_theme;
-                        let search_providers_changed = state.synoik.gnome_settings.search_providers
-                            != settings.search_providers;
+                        let search_providers = std::mem::replace(
+                            &mut settings.search_providers,
+                            state.synoik.gnome_settings.search_providers.clone(),
+                        );
                         state.synoik.gnome_settings = settings;
-                        if search_providers_changed {
-                            state.synoik.reload_search_providers();
-                        }
+                        state.synoik.set_search_provider_settings(search_providers);
                         state.synoik.sync_cursor_settings();
                         state.sync_keyboard_a11y();
                         state.sync_pointer_a11y();
@@ -9251,6 +9254,11 @@ impl Synoik {
             dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
             search_providers: Vec::new(),
+            search_provider_dirs: if cfg!(test) {
+                Vec::new()
+            } else {
+                crate::search_providers::provider_dirs()
+            },
             search_provider_emit: None,
             search_run: SearchRun::default(),
             app_grid: AppGrid::new(animation_clock.clone()),
@@ -17573,6 +17581,14 @@ impl Synoik {
         Some(self.layout.controls_layout_for_output(output)?.into())
     }
 
+    /// The providers the current search still waits on, sorted.
+    #[cfg(test)]
+    pub fn search_run_pending(&self) -> Vec<String> {
+        let mut pending: Vec<String> = self.search_run.pending.iter().cloned().collect();
+        pending.sort();
+        pending
+    }
+
     /// The results are easing a selection into view.
     pub fn is_overview_search_scrolling(&self) -> bool {
         self.search_run.scroll.is_some()
@@ -17949,11 +17965,23 @@ impl Synoik {
         self.queue_redraw_all();
     }
 
+    /// `org.gnome.desktop.search-providers` as read now (`search.js:630-634`): a change to any
+    /// of its keys reloads the providers.
+    pub fn set_search_provider_settings(
+        &mut self,
+        settings: crate::search_providers::SearchProviderSettings,
+    ) {
+        if self.gnome_settings.search_providers != settings {
+            self.gnome_settings.search_providers = settings;
+            self.reload_search_providers();
+        }
+    }
+
     /// Re-read the provider files and settings (`_reloadRemoteProviders`, `search.js:650-658`):
     /// on startup, when the app catalog changes and when `org.gnome.desktop.search-providers`
     /// does. A changed set forgets the old providers' sections.
     pub fn reload_search_providers(&mut self) {
-        let specs = crate::search_providers::discover(&crate::search_providers::provider_dirs());
+        let specs = crate::search_providers::discover(&self.search_provider_dirs);
         let providers =
             crate::search_providers::select(&specs, &self.gnome_settings.search_providers, |id| {
                 self.app_system.lookup(id)
