@@ -694,8 +694,10 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   providers (malcontent is not modelled). R4: the app provider sorts each relevance tier by
   `Shell.AppUsage` (`src/app_usage.rs`: focus-time scores in gnome-shell's own
   `application_state` file, honouring `remember-app-usage`) and appends the matching
-  `SystemActions` (`src/system_actions.rs`), whose availability is the power menu's — no
-  `CanShutdown`/`CanReboot`/`CanSuspend` query, Log Out always offered.
+  `SystemActions` (`src/system_actions.rs`): the lockdown keys are honoured, gnome-session's
+  `CanShutdown`/`CanReboot`/`CanSuspend` are not asked, and Log Out does not wait for a second
+  user or session. Open: the power menu still offers Log Out under `disable-log-out` — its row
+  shape is decided by the session mode alone.
 - **S9+ — Polish.** Favorites DnD reorder / add-remove, folders, usage stats.
 - **S10 — Shifted-keysym blind spot. ✅ FIXED.** Reported live: in the search results **Tab stepped
   forward but so did Shift+Tab**. Not a logic bug in the search — `ISO_Left_Tab` is the *modified*
