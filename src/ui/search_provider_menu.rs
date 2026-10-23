@@ -112,7 +112,12 @@ impl SearchProviderMenu {
                             muted: true,
                         });
                     }
-                    if !diagnosis.log.is_empty() {
+                    if diagnosis.log.is_empty() {
+                        entries.push(MenuEntry::Text {
+                            text: "Nothing in its log lately.".to_owned(),
+                            muted: true,
+                        });
+                    } else {
                         entries.push(MenuEntry::SectionHeader("Recent log".to_owned()));
                         entries.extend(diagnosis.log.iter().map(|line| MenuEntry::Text {
                             text: line.clone(),

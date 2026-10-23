@@ -23292,6 +23292,7 @@ fn remote_search_overview_with(
             },
             name: id.to_owned(),
             icon: crate::app_system::AppIconRef::Fallback,
+            default_enabled: true,
         })
         .collect();
     (f, rx)
@@ -24102,6 +24103,19 @@ fn clicking_a_late_provider_shows_its_details() {
         "the worker is asked what it can find out"
     );
 
+    // Another provider's findings are not these details'.
+    f.synoik()
+        .on_search_provider_msg(SearchToSynoik::Diagnosis {
+            provider: "files.desktop".to_owned(),
+            diagnosis: ProviderDiagnosis {
+                unit: None,
+                log: vec!["files: not this one".to_owned()],
+            },
+        });
+    assert_eq!(
+        menu(&mut f).0.last().map(String::as_str),
+        Some("Reading its log…")
+    );
     f.synoik()
         .on_search_provider_msg(SearchToSynoik::Diagnosis {
             provider: "calc.desktop".to_owned(),
@@ -24120,6 +24134,37 @@ fn clicking_a_late_provider_shows_its_details() {
         ]
     );
     assert_eq!(labels, ["calc.desktop", "Recent log", "Hide from Search"]);
+
+    // A long log does not run the box off the screen: it takes the roomier side of its icon,
+    // and scrolls within it.
+    f.synoik()
+        .on_search_provider_msg(SearchToSynoik::Diagnosis {
+            provider: "calc.desktop".to_owned(),
+            diagnosis: ProviderDiagnosis {
+                unit: Some("calc.service".to_owned()),
+                log: vec!["a long line of log that goes on and on ".repeat(8); 6],
+            },
+        });
+    f.settle();
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let size = f.synoik().panel_popover.content_size().expect("open");
+    assert!(
+        origin.y >= crate::ui::panel::panel_height() && origin.y + size.h <= 1080.,
+        "on screen: {origin:?} {size:?}"
+    );
+    assert!(
+        origin.y > at.y || origin.y + size.h < at.y,
+        "and off its icon: {origin:?} {size:?} {at:?}"
+    );
+    f.synoik()
+        .on_search_provider_msg(SearchToSynoik::Diagnosis {
+            provider: "calc.desktop".to_owned(),
+            diagnosis: ProviderDiagnosis {
+                unit: None,
+                log: vec!["calc: symbol lookup error".to_owned()],
+            },
+        });
 
     let output = f.synoik_output(1);
     let origin = f.synoik().panel_popover.content_location(&output);

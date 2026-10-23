@@ -3524,6 +3524,35 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(s.scroll, 0.);
     }
 
+    /// The late row draws its providers by group — still searching, no answer, unavailable —
+    /// whatever order they came in, and a click on an icon is its provider, in that drawn order.
+    #[test]
+    fn late_row_hits_follow_the_drawn_order() {
+        let mut s = typed('a');
+        let late = |id: &str, state| LateProvider {
+            id: id.to_owned(),
+            icon: AppIconRef::Fallback,
+            state,
+            error: None,
+        };
+        s.set_late(vec![
+            late("x", LateState::Failed),
+            late("y", LateState::Searching),
+            late("z", LateState::NoAnswer),
+            late("w", LateState::NotRunning),
+        ]);
+        let area = area_1080();
+        let drawn: Vec<String> = (0..4)
+            .map(|k| {
+                let at = s.hit_center(SearchHit::Late(k), area).expect("drawn");
+                assert_eq!(s.hit_test(at, area), Some(SearchHit::Late(k)));
+                s.late_hit(k, area).expect("a provider").0.id
+            })
+            .collect();
+        assert_eq!(drawn, ["y", "z", "x", "w"]);
+        assert!(s.late_hit(4, area).is_none());
+    }
+
     /// A new query whose default result is the one already selected does not move the view:
     /// GNOME keeps that result's actor, and scrolls only for a new default.
     #[test]

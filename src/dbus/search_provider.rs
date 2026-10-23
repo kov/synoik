@@ -50,6 +50,9 @@ const MAX_ICON_PX: i32 = 256;
 /// How much of a provider's log its details show, and how far back it looks.
 const DIAGNOSIS_LOG_LINES: usize = 6;
 const DIAGNOSIS_LOG_SINCE: &str = "-10min";
+/// How long `journalctl` gets before its answer is given up on: a wedged journald must not
+/// keep a thread and a process per click.
+const DIAGNOSIS_LOG_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Where replies go: the compositor's channel in a session, a test's in a test.
 type Reply = Arc<dyn Fn(SearchToSynoik) + Send + Sync>;
@@ -100,6 +103,8 @@ struct Client {
     reply: Reply,
     providers: Vec<ProviderEndpoint>,
     shared: Arc<Mutex<Shared>>,
+    /// Providers being diagnosed: one at a time each, however often their details are opened.
+    diagnosing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Client {
@@ -109,6 +114,7 @@ impl Client {
             reply,
             providers: Vec::new(),
             shared: Arc::default(),
+            diagnosing: Arc::default(),
         }
     }
 
@@ -199,11 +205,30 @@ impl Client {
         }
     }
 
+    /// Every `Diagnose` gets a `Diagnosis` back — an empty one when there is nothing to look at
+    /// — or the details would read "Reading its log…" for good. One that asks while the same
+    /// provider is being looked at shares that answer.
     fn diagnose(&self, provider: String) {
         let Some(endpoint) = self.endpoint(&provider) else {
+            (self.reply)(SearchToSynoik::Diagnosis {
+                provider,
+                diagnosis: ProviderDiagnosis::default(),
+            });
             return;
         };
-        let reply = self.reply.clone();
+        if !self.diagnosing.lock().unwrap().insert(provider.clone()) {
+            return;
+        }
+        let (reply, diagnosing) = (self.reply.clone(), self.diagnosing.clone());
+        let done = move |provider: String, diagnosis: ProviderDiagnosis| {
+            diagnosing.lock().unwrap().remove(&provider);
+            reply(SearchToSynoik::Diagnosis {
+                provider,
+                diagnosis,
+            });
+        };
+        let done_too = done.clone();
+        let for_thread = provider.clone();
         // A file walk and a `journalctl` run: blocking, so on a thread of their own, never the
         // executor the searches share.
         let spawned = std::thread::Builder::new()
@@ -216,13 +241,11 @@ impl Client {
                     .clone()
                     .unwrap_or_else(|| format!("dbus-*-{}@*", endpoint.bus_name));
                 let log = recent_log(&pattern);
-                reply(SearchToSynoik::Diagnosis {
-                    provider,
-                    diagnosis: ProviderDiagnosis { unit, log },
-                });
+                done(for_thread, ProviderDiagnosis { unit, log });
             });
         if let Err(err) = spawned {
             warn!("could not start a search provider diagnosis: {err}");
+            done_too(provider, ProviderDiagnosis::default());
         }
     }
 
@@ -358,6 +381,18 @@ async fn search_provider(
 fn classify(err: &zbus::Error, endpoint: &ProviderEndpoint) -> ProviderFailure {
     let kind = match err {
         zbus::Error::InputOutput(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            FailureKind::TimedOut
+        }
+        // The bus gave up on it for us: an activation that took too long, or a provider that
+        // went away mid-call.
+        zbus::Error::MethodError(name, _, _)
+            if matches!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.TimedOut"
+                    | "org.freedesktop.DBus.Error.Timeout"
+                    | "org.freedesktop.DBus.Error.NoReply"
+            ) =>
+        {
             FailureKind::TimedOut
         }
         zbus::Error::MethodError(name, message, _) => {
@@ -505,24 +540,48 @@ fn service_unit(dirs: &[std::path::PathBuf], bus_name: &str) -> Option<String> {
     None
 }
 
-/// The last lines the user units matching `pattern` logged lately, as plain messages.
+/// The last lines the user units matching `pattern` logged lately, as plain messages — or
+/// nothing, if `journalctl` cannot be run or takes longer than [`DIAGNOSIS_LOG_TIMEOUT`].
 fn recent_log(pattern: &str) -> Vec<String> {
-    let output = std::process::Command::new("journalctl")
+    use std::io::Read as _;
+
+    let child = std::process::Command::new("journalctl")
         .args(["--user", "--no-pager", "--output=cat", "--since"])
         .arg(DIAGNOSIS_LOG_SINCE)
         .arg(format!("--lines={DIAGNOSIS_LOG_LINES}"))
         .arg(format!("--user-unit={pattern}"))
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(output) => output,
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
         Err(err) => {
             warn!("could not read a search provider's log: {err}");
             return Vec::new();
         }
     };
-    let text = String::from_utf8_lossy(&output.stdout);
+    // A few short lines: they fit the pipe, so waiting for the exit before reading is safe.
+    let deadline = std::time::Instant::now() + DIAGNOSIS_LOG_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                warn!("reading a search provider's log took too long");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    let text = String::from_utf8_lossy(&stdout);
     let lines: Vec<String> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -1017,6 +1076,11 @@ mod tests {
         let timeout =
             zbus::Error::InputOutput(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
         assert_eq!(kind(&timeout, true), FailureKind::TimedOut);
+        let gone = error(
+            "org.freedesktop.DBus.Error.NoReply",
+            "Remote peer disconnected",
+        );
+        assert_eq!(kind(&gone, true), FailureKind::TimedOut);
         assert!(classify(&crashed, &endpoint(true))
             .error
             .contains("unit failed"));

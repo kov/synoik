@@ -915,7 +915,7 @@ fn greyscale(buffer: &MemoryBuffer) -> MemoryBuffer {
 }
 
 /// A status badge on an icon's bottom-right corner: a disc, and a symbolic glyph in it. The
-/// disc is baked once per instance, so keep one per look.
+/// disc is baked once and kept while its colour stays, so one per look avoids rebaking.
 #[derive(Default)]
 pub struct Badge {
     disc: BakeCache,
@@ -965,7 +965,9 @@ impl Badge {
             &mut self.disc,
             scale,
             Size::from((d, d)),
-            0,
+            disc_color
+                .iter()
+                .fold(0u64, |key, c| key.rotate_left(16) ^ u64::from(c.to_bits())),
             |_| Ok(()),
             |frame, phys, ()| {
                 let mut p = Painter::new(frame, scale, phys);

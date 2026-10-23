@@ -76,6 +76,9 @@ pub struct Provider {
     /// The app's name, the section header's label (`ProviderInfo`).
     pub name: String,
     pub icon: AppIconRef,
+    /// Not `DefaultDisabled`: it runs unless listed in `disabled`, where a default-disabled one
+    /// runs only when listed in `enabled`.
+    pub default_enabled: bool,
 }
 
 impl Provider {
@@ -194,6 +197,7 @@ pub fn select(
                 },
                 name: app.name,
                 icon: app.icon,
+                default_enabled: spec.default_enabled,
             })
         })();
         providers.extend(provider);

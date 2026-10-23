@@ -189,7 +189,8 @@ pub enum MenuEntry {
     },
 }
 
-/// The most lines a [`MenuEntry::Text`] wraps to; the last is ellipsized.
+/// The most lines a [`MenuEntry::Text`] wraps to, its hard line breaks included; a paragraph
+/// that runs out of them ends in an ellipsis.
 pub const TEXT_MAX_LINES: usize = 8;
 
 /// A [`MenuEntry::Text`] line's row: the line box and a little leading.
@@ -202,22 +203,25 @@ fn text_wrap_w() -> f64 {
     max_w() - 2. * (CONTENT_PAD + ITEM_PAD_H)
 }
 
-/// A [`MenuEntry::Text`]'s lines — a hard line break starts a new one.
+/// A [`MenuEntry::Text`]'s lines — a hard line break starts a new one. Each paragraph wraps
+/// within what the ones before it left of [`TEXT_MAX_LINES`], so the one that runs out is the
+/// one ellipsized.
 fn text_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text
-        .lines()
-        .flat_map(|line| {
-            synoik_vk::text::wrap_lines_weighted(
-                line,
-                text_px() as f32,
-                false,
-                text_wrap_w(),
-                TEXT_MAX_LINES,
-                true,
-            )
-        })
-        .collect();
-    lines.truncate(TEXT_MAX_LINES);
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.lines() {
+        let budget = TEXT_MAX_LINES - lines.len();
+        if budget == 0 {
+            break;
+        }
+        lines.extend(synoik_vk::text::wrap_lines_weighted(
+            paragraph,
+            text_px() as f32,
+            false,
+            text_wrap_w(),
+            budget,
+            true,
+        ));
+    }
     lines
 }
 

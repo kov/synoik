@@ -2658,8 +2658,16 @@ impl State {
                 self.synoik.layout.close_overview();
             }
             PopoverAction::SearchProviderHide(provider) => {
-                if let Some(writer) = &self.synoik.gnome_settings_writer {
-                    writer.hide_search_provider(provider);
+                let default_enabled = self
+                    .synoik
+                    .search_providers
+                    .iter()
+                    .find(|p| p.id() == provider)
+                    .map(|p| p.default_enabled);
+                if let (Some(writer), Some(default_enabled)) =
+                    (&self.synoik.gnome_settings_writer, default_enabled)
+                {
+                    writer.hide_search_provider(provider, default_enabled);
                 }
             }
             PopoverAction::IndicatorMenuExpand { item_id, node_id } => {
@@ -3246,10 +3254,22 @@ impl State {
             .panel_popover
             .open_search_provider_menu(output.clone(), anchor, details);
         if SearchProviderMenu::wants_diagnosis(late.state) {
-            self.synoik
-                .emit_search(crate::search_providers::SynoikToSearch::Diagnose {
-                    provider: late.id,
+            let sent = self
+                .synoik
+                .search_provider_emit
+                .as_ref()
+                .is_some_and(|emit| {
+                    emit.try_send(crate::search_providers::SynoikToSearch::Diagnose {
+                        provider: late.id.clone(),
+                    })
+                    .is_ok()
                 });
+            // Nobody to ask: say there is nothing, rather than read for good.
+            if !sent {
+                self.synoik
+                    .panel_popover
+                    .set_search_provider_diagnosis(&late.id, Default::default());
+            }
         }
         self.synoik.queue_redraw_all();
     }

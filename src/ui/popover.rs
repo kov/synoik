@@ -573,6 +573,10 @@ pub enum PopoverSide {
     /// (`PopupMenu(sourceActor, 0, St.Side.TOP)`, `windowMenu.js:10-11`, over the rect
     /// `_shell_wm_show_window_menu` builds with `width = height = 0`, `shell-wm.c:336-350`).
     Point,
+    /// Arrow on top, centred → the box hangs *below* the anchor, centred on it: `Top` as
+    /// gnome-shell places it off the panel. Ours is `Top` pinned under the panel; this is the
+    /// rest of it, for an anchor anywhere else.
+    Below,
 }
 
 /// A single panel popover, owned on `Synoik` alongside the other overlays.
@@ -1269,12 +1273,22 @@ impl PanelPopover {
     ) {
         self.open = true;
         self.closing = false;
+        let screen_h = output_size(&output).h;
         self.output = Some(output);
         self.anchor = anchor;
-        // The row is at the bottom of the results: the box goes above it.
-        self.side = PopoverSide::Bottom;
+        // The row sits wherever the results end: the box goes to the side with more room, and
+        // scrolls if even that is not enough.
+        let top = crate::ui::panel::panel_height() + POPOVER_MARGIN;
+        let above = anchor.loc.y - top - POPOVER_MARGIN;
+        let below = screen_h - POPOVER_MARGIN - (anchor.loc.y + anchor.size.h) - POPOVER_MARGIN;
+        let (side, room) = if above >= below {
+            (PopoverSide::Bottom, above)
+        } else {
+            (PopoverSide::Below, below)
+        };
+        self.side = side;
         let mut menu = SearchProviderMenu::new(details);
-        menu.set_max_height(Some(self.available_menu_height()));
+        menu.set_max_height(Some(room.max(0.)));
         self.content = Some(PopoverContent::SearchProvider(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
     }
@@ -1291,7 +1305,9 @@ impl PanelPopover {
     /// is up. Returns whether it changed anything drawn.
     pub fn set_search_provider_diagnosis(&mut self, provider: &str, diagnosis: Diagnosis) -> bool {
         match &mut self.content {
-            Some(PopoverContent::SearchProvider(m)) if self.open && m.provider() == provider => {
+            Some(PopoverContent::SearchProvider(m))
+                if self.open && !self.closing && m.provider() == provider =>
+            {
                 m.set_diagnosis(diagnosis)
             }
             _ => false,
@@ -2024,6 +2040,11 @@ impl PanelPopover {
             PopoverSide::Bottom => Point::from((
                 centered_x,
                 (self.anchor.loc.y - POPOVER_MARGIN - size.h).clamp(POPOVER_MARGIN, max_y),
+            )),
+            PopoverSide::Below => Point::from((
+                centered_x,
+                (self.anchor.loc.y + self.anchor.size.h + POPOVER_MARGIN)
+                    .clamp(POPOVER_MARGIN, max_y),
             )),
             PopoverSide::Left => Point::from((
                 (self.anchor.loc.x + self.anchor.size.w + POPOVER_MARGIN)

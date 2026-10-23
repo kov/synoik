@@ -2108,34 +2108,30 @@ impl GnomeSettingsWriter {
         });
     }
 
-    /// Leave search provider `id` out of the search: on `org.gnome.desktop.search-providers
-    /// disabled`, and off `enabled` (which is what keeps a `DefaultDisabled` provider in), as
-    /// GNOME Settings' Search panel does when its switch goes off. The change comes back around
-    /// as a settings change, which reloads the providers.
-    pub fn hide_search_provider(&self, id: String) {
+    /// Leave search provider `id` out of the search, as GNOME Settings' Search panel does when
+    /// its switch goes off (`cc-search-panel.c` `switch_settings_mapping_set_generic`): onto
+    /// `org.gnome.desktop.search-providers disabled` for a provider that runs by default, off
+    /// `enabled` for a `DefaultDisabled` one. The change comes back around as a settings change,
+    /// which reloads the providers.
+    pub fn hide_search_provider(&self, id: String, default_enabled: bool) {
         self.ctx.invoke(move || {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if let Some(store) = &s.search_providers {
-                    let mut disabled: Vec<String> = store
-                        .strv("disabled")
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    if !disabled.contains(&id) {
-                        disabled.push(id.clone());
+                    let key = if default_enabled {
+                        "disabled"
+                    } else {
+                        "enabled"
+                    };
+                    let mut list: Vec<String> =
+                        store.strv(key).iter().map(|s| s.to_string()).collect();
+                    list.retain(|e| *e != id);
+                    if default_enabled {
+                        list.push(id);
                     }
-                    let enabled: Vec<String> = store
-                        .strv("enabled")
-                        .iter()
-                        .map(|s| s.to_string())
-                        .filter(|e| *e != id)
-                        .collect();
-                    for (key, value) in [("disabled", &disabled), ("enabled", &enabled)] {
-                        let value: Vec<&str> = value.iter().map(String::as_str).collect();
-                        if let Err(err) = store.set_strv(key, value) {
-                            warn!("error writing org.gnome.desktop.search-providers {key}: {err}");
-                        }
+                    let list: Vec<&str> = list.iter().map(String::as_str).collect();
+                    if let Err(err) = store.set_strv(key, list) {
+                        warn!("error writing org.gnome.desktop.search-providers {key}: {err}");
                     }
                 }
                 stores.set(Some(s));

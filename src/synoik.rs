@@ -18050,7 +18050,7 @@ impl Synoik {
             self.search_run.terms.clear();
             self.overview_search.set_results(Vec::new());
             self.overview_search.clear_sections();
-            self.overview_search.set_late(Vec::new());
+            self.set_late_search_providers(Vec::new());
             self.overview_search.set_searching(false);
             self.emit_search(crate::search_providers::SynoikToSearch::Reset {
                 generation: self.search_run.generation,
@@ -18146,7 +18146,7 @@ impl Synoik {
                 None
             }));
         } else {
-            self.overview_search.set_late(Vec::new());
+            self.set_late_search_providers(Vec::new());
         }
         self.overview_search
             .set_searching(!self.search_run.pending.is_empty());
@@ -18158,6 +18158,19 @@ impl Synoik {
         }
         self.search_run.late = None;
         self.search_run.failures.clear();
+    }
+
+    /// Put `late` in the row under the results. Details open on a provider that has left it go:
+    /// the icon they hang off is gone.
+    fn set_late_search_providers(&mut self, late: Vec<crate::ui::overview_search::LateProvider>) {
+        let orphaned = self
+            .panel_popover
+            .search_provider_menu()
+            .is_some_and(|m| !late.iter().any(|l| l.id == m.provider()));
+        self.overview_search.set_late(late);
+        if orphaned {
+            self.panel_popover.close();
+        }
     }
 
     /// The row under the results: the providers still out past the deadline, and those that did
@@ -18193,7 +18206,7 @@ impl Synoik {
                 })
             })
             .collect();
-        self.overview_search.set_late(late);
+        self.set_late_search_providers(late);
     }
 
     /// [`SEARCH_DEADLINE`] ran out with providers still out: the results settle without them.
@@ -18262,6 +18275,12 @@ impl Synoik {
         if self.search_run.late.is_none() {
             self.overview_search
                 .set_searching(!self.search_run.pending.is_empty());
+            // Settled before the deadline: it has nothing left to do.
+            if self.search_run.pending.is_empty() {
+                if let Some(timer) = self.search_run.deadline.take() {
+                    self.cancel_timer(timer);
+                }
+            }
         }
         self.sync_late_search_providers();
         self.queue_redraw_all();
@@ -18301,7 +18320,7 @@ impl Synoik {
         self.search_run.pending.clear();
         self.cancel_search_deadline();
         self.overview_search.clear_sections();
-        self.overview_search.set_late(Vec::new());
+        self.set_late_search_providers(Vec::new());
         let searching = self.search_run.timer.is_some();
         self.overview_search.set_searching(searching);
         self.queue_redraw_all();
