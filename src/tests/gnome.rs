@@ -19543,8 +19543,10 @@ fn overview_dragging_a_search_result_onto_the_dash_pins_it() {
     f.synoik().sync_dash_favorites();
 
     f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
     f.synoik_state().update_keyboard_focus();
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
     f.settle_animations();
     assert_eq!(
         f.synoik().overview_search.result_id(0),
@@ -22372,6 +22374,11 @@ fn overview_dash_hover_tracks_tile() {
 /// resolves each id in `groups` and returns `groups` from `search` (the fake ignores
 /// the query — seed exactly the relevance tiers you want), the overview open, and the
 /// keyboard focused on it (so typing engages the search). Returns the launch recorder.
+/// Let the search delay run out, as a pause in typing does (`setTerms`' 150 ms).
+fn search_settle(f: &mut Fixture) {
+    f.advance_until(Duration::from_millis(160), |_| false);
+}
+
 fn search_overview(groups: &[&[&str]]) -> (Fixture, crate::app_system::RecordingLauncher) {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
 
@@ -22392,6 +22399,9 @@ fn search_overview(groups: &[&[&str]]) -> (Fixture, crate::app_system::Recording
     f.synoik().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
 
     f.synoik_state().do_action(Action::OpenOverview, false);
+    // Let the open land: the search resets on the overview's first visible turn, which would
+    // otherwise eat whatever a test types before it.
+    f.settle();
     f.synoik_state().update_keyboard_focus();
     assert!(
         f.synoik().keyboard_focus.is_overview(),
@@ -22768,6 +22778,7 @@ fn overview_search_types_query_and_lists_results() {
 
     assert!(!f.synoik().overview_search.is_active());
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
     assert!(
         f.synoik().overview_search.is_active(),
         "a printable key must start a search"
@@ -22800,9 +22811,11 @@ fn overview_search_filters_hidden_and_caps_results() {
     f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
     f.synoik_state().do_action(Action::OpenOverview, false);
+    f.settle();
     f.synoik_state().update_keyboard_focus();
 
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
     // hidden.desktop filtered → first result is app0; capped at 6.
     assert_eq!(
         f.synoik().overview_search.result_id(0),
@@ -22850,6 +22863,7 @@ fn overview_search_arrow_then_enter_launches_second() {
     let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
 
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
     tap(&mut f, KEY_RIGHT);
     tap(&mut f, KEY_ENTER);
 
@@ -22873,6 +22887,7 @@ fn overview_search_shift_tab_steps_back() {
     let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop", "c.desktop"]]);
 
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
     tap(&mut f, KEY_TAB);
     tap(&mut f, KEY_TAB);
     f.key_press(KEY_LEFTSHIFT);
@@ -22893,6 +22908,7 @@ fn overview_search_shift_tab_steps_back() {
 fn overview_search_click_result_launches() {
     let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
     tap(&mut f, KEY_A);
+    search_settle(&mut f);
 
     let area = overview_controls(&mut f).into();
     let center = f
@@ -23239,6 +23255,231 @@ fn overview_search_resets_on_reopen() {
         !f.synoik().overview_search.is_active(),
         "a re-opened overview starts with an empty search"
     );
+}
+
+/// An overview with two remote providers whose requests land in the returned channel instead
+/// of on a bus — the compositor's half of the provider client, driven through its real messages.
+fn remote_search_overview() -> (
+    Fixture,
+    async_channel::Receiver<crate::search_providers::SynoikToSearch>,
+) {
+    use crate::search_providers::{Provider, ProviderEndpoint};
+
+    let (mut f, _rec) = search_overview(&[]);
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().search_provider_emit = Some(tx);
+    f.synoik().search_providers = ["files.desktop", "calc.desktop"]
+        .into_iter()
+        .map(|id| Provider {
+            endpoint: ProviderEndpoint {
+                id: id.to_owned(),
+                bus_name: format!("org.example.{id}"),
+                object_path: "/".to_owned(),
+                version2: true,
+                auto_start: true,
+            },
+            name: id.to_owned(),
+            icon: crate::app_system::AppIconRef::Fallback,
+        })
+        .collect();
+    (f, rx)
+}
+
+fn sent(
+    rx: &async_channel::Receiver<crate::search_providers::SynoikToSearch>,
+) -> Vec<crate::search_providers::SynoikToSearch> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+/// The generation and terms of the one `Search` among `msgs`.
+fn searched(msgs: &[crate::search_providers::SynoikToSearch]) -> (u64, Vec<String>) {
+    use crate::search_providers::SynoikToSearch;
+    let searches: Vec<_> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            SynoikToSearch::Search { generation, terms } => Some((*generation, terms.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(searches.len(), 1, "exactly one search: {msgs:?}");
+    searches[0].clone()
+}
+
+fn answer(f: &mut Fixture, generation: u64, provider: &str, ids: &[&str]) {
+    use crate::search_providers::{ResultMeta, SearchToSynoik, SectionResults};
+    let results = (!ids.is_empty()).then(|| SectionResults {
+        rows: ids
+            .iter()
+            .map(|id| ResultMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: None,
+                icon: None,
+                clipboard_text: Some(format!("{id} copied")),
+            })
+            .collect(),
+        more: 0,
+    });
+    f.synoik().on_search_provider_msg(SearchToSynoik::Results {
+        generation,
+        provider: provider.to_owned(),
+        results,
+    });
+}
+
+/// The search runs 150 ms after the **first** keystroke of a burst, not the last:
+/// `setTerms` arms its timeout only when none is running (`search.js:769-770`). It then asks
+/// every provider at once, with everything typed by then.
+#[test]
+fn remote_search_runs_one_delay_after_the_first_keystroke() {
+    let (mut f, rx) = remote_search_overview();
+    f.freeze_clock();
+    tap(&mut f, KEY_A);
+    f.advance_until(Duration::from_millis(100), |_| false);
+    tap(&mut f, KEY_S);
+    assert!(sent(&rx).is_empty(), "nothing is searched inside the delay");
+    assert!(f.synoik().overview_search.is_searching());
+
+    f.advance_until(Duration::from_millis(60), |_| false);
+    let (_, terms) = searched(&sent(&rx));
+    assert_eq!(
+        terms,
+        ["as"],
+        "the delay was not restarted by the second key"
+    );
+}
+
+/// A provider's answer lands as a section; an answer to terms that have since changed is
+/// dropped, as gnome-shell cancels it in `setTerms`.
+#[test]
+fn remote_search_drops_answers_to_older_terms() {
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (old, _) = searched(&sent(&rx));
+
+    tap(&mut f, KEY_S);
+    answer(&mut f, old, "files.desktop", &["stale"]);
+    assert!(
+        f.synoik().overview_search.sections().is_empty(),
+        "an answer to \"a\" must not show under \"as\""
+    );
+
+    search_settle(&mut f);
+    let (new, terms) = searched(&sent(&rx));
+    assert_eq!(terms, ["as"]);
+    answer(&mut f, new, "calc.desktop", &["2"]);
+    answer(&mut f, new, "files.desktop", &["one", "two"]);
+    let sections: Vec<(String, usize)> = f
+        .synoik()
+        .overview_search
+        .sections()
+        .iter()
+        .map(|s| (s.provider.clone(), s.rows.len()))
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            ("files.desktop".to_owned(), 2),
+            ("calc.desktop".to_owned(), 1)
+        ],
+        "sections take the providers' order, not the order they answered in"
+    );
+}
+
+/// With nothing to show, the status reads "Searching" until every provider has answered, and
+/// only then "No results" (`_updateSearchProgress`, `search.js:843-861`).
+#[test]
+fn remote_search_is_searching_until_every_provider_answered() {
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_Z);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    assert!(f.synoik().overview_search.is_searching());
+    answer(&mut f, generation, "files.desktop", &[]);
+    assert!(
+        f.synoik().overview_search.is_searching(),
+        "one provider is still out"
+    );
+    answer(&mut f, generation, "calc.desktop", &[]);
+    assert!(!f.synoik().overview_search.is_searching());
+    assert!(f.synoik().overview_search.has_no_results());
+}
+
+/// Enter on a provider's row asks the provider to activate it with the terms, copies the
+/// row's clipboard text (Calculator's answer), and leaves the overview.
+#[test]
+fn enter_on_a_provider_result_activates_it_and_copies_its_text() {
+    use crate::search_providers::SynoikToSearch;
+
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "calc.desktop", &["42"]);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+
+    let msgs = sent(&rx);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            SynoikToSearch::ActivateResult { provider, id, terms, .. }
+                if provider == "calc.desktop" && id == "42" && terms == &["a"]
+        )),
+        "{msgs:?}"
+    );
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("42 copied"));
+    assert!(!f.synoik().layout.is_overview_open());
+}
+
+/// A click on a section's header opens the search in the provider's app (`LaunchSearch`).
+#[test]
+fn clicking_a_section_header_launches_the_providers_search() {
+    use crate::search_providers::SynoikToSearch;
+    use crate::ui::overview_search::SearchHit;
+
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "files.desktop", &["one"]);
+
+    let area = overview_controls(&mut f).into();
+    let at = f
+        .synoik()
+        .overview_search
+        .hit_center(SearchHit::Provider(0), area)
+        .expect("the section is shown");
+    f.pointer_motion(at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    let msgs = sent(&rx);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            SynoikToSearch::LaunchSearch { provider, terms, .. }
+                if provider == "files.desktop" && terms == &["a"]
+        )),
+        "{msgs:?}"
+    );
+    assert!(!f.synoik().layout.is_overview_open());
+}
+
+/// Emptying the query resets the providers' side too, so the next search starts afresh.
+#[test]
+fn emptying_the_query_resets_the_provider_search() {
+    use crate::search_providers::SynoikToSearch;
+
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    sent(&rx);
+    tap(&mut f, KEY_BACKSPACE);
+    assert_eq!(sent(&rx), [SynoikToSearch::Reset]);
+    assert!(!f.synoik().overview_search.is_searching());
 }
 
 /// **Lifecycle.** A launch puts the app in `STARTING` and its first window moves

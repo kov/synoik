@@ -365,6 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     dbus::DBusServers::start(&mut state, cli.session);
+    state.synoik.reload_search_providers();
 
     // Default-sink volume/mute for the panel indicator + QS slider, from PipeWire.
     // The connection's loop is driven on the compositor's calloop; skip in headless

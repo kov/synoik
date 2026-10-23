@@ -251,6 +251,9 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.app-folders`: the user's app-grid folders, in
     /// `folder-children` order. See [`AppFolder`].
     pub app_folders: Vec<AppFolder>,
+    /// `org.gnome.desktop.search-providers`: which remote search providers run, and in what
+    /// order (`remoteSearch.js:140-186`).
+    pub search_providers: crate::search_providers::SearchProviderSettings,
     /// The accessibility state behind the `a11y` panel indicator and its menu.
     pub a11y: A11ySettings,
     /// `org.gnome.desktop.peripherals.*`: the pointer and keyboard device settings, which
@@ -565,6 +568,7 @@ impl Default for GnomeSettings {
             input_sources: InputSources::default(),
             world_clocks: WorldClocks::default(),
             app_folders: Vec::new(),
+            search_providers: Default::default(),
             a11y: A11ySettings::default(),
             peripherals: Peripherals::default(),
         }
@@ -3044,6 +3048,7 @@ struct Stores {
     window_switcher: Option<gio::Settings>,
     world_clocks: Option<gio::Settings>,
     app_folders: Option<gio::Settings>,
+    search_providers: Option<gio::Settings>,
     /// `org.gnome.desktop.a11y` — only `always-show-universal-access-status`, the
     /// indicator's pin (`accessibility.js:10-11`).
     a11y: Option<gio::Settings>,
@@ -3115,6 +3120,7 @@ impl Stores {
             window_switcher: gsettings("org.gnome.shell.window-switcher", b),
             world_clocks: gsettings("org.gnome.shell.world-clocks", b),
             app_folders: gsettings("org.gnome.desktop.app-folders", b),
+            search_providers: gsettings("org.gnome.desktop.search-providers", b),
             a11y: gsettings("org.gnome.desktop.a11y", b),
             a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
@@ -3183,6 +3189,7 @@ impl Stores {
             &self.window_switcher,
             &self.world_clocks,
             &self.app_folders,
+            &self.search_providers,
             &self.a11y,
             &self.a11y_interface,
             &self.a11y_applications,
@@ -3274,6 +3281,14 @@ impl Stores {
             settings.load_magnifier(magnifier);
         }
         settings.app_folders = self.read_app_folders();
+        if let Some(store) = &self.search_providers {
+            settings.search_providers = crate::search_providers::SearchProviderSettings {
+                disabled: strv(store, "disabled"),
+                enabled: strv(store, "enabled"),
+                disable_external: store.boolean("disable-external"),
+                sort_order: strv(store, "sort-order"),
+            };
+        }
         settings
     }
 

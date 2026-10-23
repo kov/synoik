@@ -331,6 +331,23 @@ const ALL_RENDER_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
+/// How long a search waits after the first keystroke that changed it (`setTerms`'
+/// `timeout_add_once(…, 150, …)`, `search.js:769`).
+const SEARCH_DELAY: Duration = Duration::from_millis(150);
+
+/// What `SearchResultsView` keeps about the current search (`search.js`).
+#[derive(Default)]
+struct SearchRun {
+    /// Bumped by every change of terms; a provider's answer for another generation is stale.
+    generation: u64,
+    /// The terms set last — what the next search runs.
+    terms: Vec<String>,
+    /// The delay before searching; while it runs, the search is still "starting".
+    timer: Option<TimerToken>,
+    /// Providers yet to answer the current generation.
+    pending: std::collections::HashSet<String>,
+}
+
 /// How long the app catalog waits for `installed-changed` pings to stop before
 /// reloading — gnome-shell's `DEFAULT_TIMEOUT_SECONDS` (`src/shell-app-cache.c:28`),
 /// which it uses both as the coalescing timeout and as its directory monitors'
@@ -1250,6 +1267,14 @@ pub struct Synoik {
     pub dash: Dash,
     /// The overview search (entry + app results).
     pub overview_search: OverviewSearch,
+    /// The remote search providers, in section order.
+    pub search_providers: Vec<crate::search_providers::Provider>,
+    /// Requests to the search-provider client, which owns the bus connection; `None` when it
+    /// is not running.
+    pub search_provider_emit:
+        Option<async_channel::Sender<crate::search_providers::SynoikToSearch>>,
+    /// The search in flight — see [`Synoik::sync_overview_search`].
+    search_run: SearchRun,
     /// The overview app grid (installed apps minus favorites).
     pub app_grid: AppGrid,
     /// The app-folder dialog a click on a folder tile opens.
@@ -2525,7 +2550,12 @@ impl State {
                             new_is.present && old_is.mru_sources != new_is.mru_sources;
                         let icon_theme_changed =
                             state.synoik.gnome_settings.icon_theme != settings.icon_theme;
+                        let search_providers_changed = state.synoik.gnome_settings.search_providers
+                            != settings.search_providers;
                         state.synoik.gnome_settings = settings;
+                        if search_providers_changed {
+                            state.synoik.reload_search_providers();
+                        }
                         state.synoik.sync_cursor_settings();
                         state.sync_keyboard_a11y();
                         state.sync_pointer_a11y();
@@ -9214,6 +9244,9 @@ impl Synoik {
             overview_was_open: false,
             dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
+            search_providers: Vec::new(),
+            search_provider_emit: None,
+            search_run: SearchRun::default(),
             app_grid: AppGrid::new(animation_clock.clone()),
             folder_dialog: crate::ui::folder_dialog::FolderDialog::new(animation_clock.clone()),
             workspace_rename: None,
@@ -17000,9 +17033,12 @@ impl Synoik {
         // cache keeps serving the old pixels until each replacement decode lands, and
         // the uploads are dropped per icon at that point — so nothing blanks here.
         self.app_icon_cache.clear();
-        // A refreshed catalog may change what the current query resolves to, and
-        // which apps populate the grid.
-        self.sync_overview_search();
+        // A refreshed catalog may change which providers there are, what the current query
+        // resolves to, and which apps populate the grid.
+        self.reload_search_providers();
+        if self.overview_search.is_active() {
+            self.run_overview_search();
+        }
         self.sync_dash_favorites();
         self.sync_app_grid();
         // The catalog (and its icons) just changed and the caches were cleared above
@@ -17637,7 +17673,7 @@ impl Synoik {
     pub fn refresh_overview_search_state(&mut self) {
         let open = self.layout.is_gnome_mode() && self.layout.is_overview_open();
         if open && !self.overview_search_was_visible {
-            self.overview_search.clear();
+            self.clear_overview_search();
             // A fresh overview open starts the app grid on page 0
             // (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
             self.app_grid.reset_page();
@@ -17650,7 +17686,7 @@ impl Synoik {
         // no overview left to explain it: every window vanished behind the shade and the
         // only way back was to open the overview again.
         if !open && self.overview_search_was_visible {
-            self.overview_search.clear();
+            self.clear_overview_search();
         }
         // Leaving the app grid takes any open folder with it — hiding the whole overview
         // and returning to the window picker alike. It *animates* out rather than being
@@ -17684,19 +17720,67 @@ impl Synoik {
         self.overview_search_was_visible = open;
     }
 
-    /// Run the app search for the current query and feed the results into the overview
-    /// search model — GNOME's `SearchResultsView.setTerms` → `_doSearch` → the built-in
-    /// `AppSearchProvider` (`appDisplay.js:1801-1831`): `AppSystem.search(terms.join(' '))`
-    /// → relevance-tier groups → filter `should_show` → concat → cap at
-    /// [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS). (No `Shell.AppUsage`
-    /// within-tier sort yet — S9+.)
+    /// Clear the search — its query, its results, and the search behind them.
+    pub fn clear_overview_search(&mut self) {
+        self.overview_search.clear();
+        self.sync_overview_search();
+    }
+
+    /// Follow the query (`SearchResultsView.setTerms`, `search.js:741-772`). A change starts a
+    /// new generation, so answers to the old terms are dropped, and arms the search delay —
+    /// only if it is not already running: the search fires [`SEARCH_DELAY`] after the first
+    /// keystroke of a burst, not the last. The results on screen stay until the new ones
+    /// replace them. Emptied terms reset everything at once.
     pub fn sync_overview_search(&mut self) {
-        let terms = crate::ui::overview_search::tokenize(self.overview_search.query());
-        if terms.is_empty() {
-            self.overview_search.set_results(Vec::new());
+        let terms: Vec<String> = crate::ui::overview_search::tokenize(self.overview_search.query())
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if terms == self.search_run.terms {
             return;
         }
-        let query = terms.join(" ");
+        self.search_run.generation += 1;
+        self.search_run.pending.clear();
+        if terms.is_empty() {
+            if let Some(timer) = self.search_run.timer.take() {
+                self.cancel_timer(timer);
+            }
+            self.search_run.terms.clear();
+            self.overview_search.set_results(Vec::new());
+            self.overview_search.clear_sections();
+            self.overview_search.set_searching(false);
+            self.emit_search(crate::search_providers::SynoikToSearch::Reset);
+            return;
+        }
+        self.search_run.terms = terms;
+        // `_startingSearch`: until the delay runs out the search is in progress, so an empty
+        // result set reads "Searching", not "No results".
+        self.overview_search.set_searching(true);
+        if self.search_run.timer.is_none() {
+            self.search_run.timer = Some(self.timer_after(SEARCH_DELAY, |state| {
+                state.synoik.search_run.timer = None;
+                state.synoik.run_overview_search();
+                state.synoik.queue_redraw_all();
+                None
+            }));
+        }
+    }
+
+    /// Search now (`_doSearch`): the app provider answers on the spot, the remote ones through
+    /// [`Self::on_search_provider_msg`]. Also what Enter does with a search still waiting out
+    /// its delay (`activateDefault`).
+    pub fn run_overview_search(&mut self) {
+        if let Some(timer) = self.search_run.timer.take() {
+            self.cancel_timer(timer);
+        }
+        if self.search_run.terms.is_empty() {
+            return;
+        }
+        // The built-in `AppSearchProvider` (`appDisplay.js:1801-1831`):
+        // `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` →
+        // concat → cap at [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS). (No
+        // `Shell.AppUsage` within-tier sort yet.)
+        let query = self.search_run.terms.join(" ");
         let mut results = Vec::new();
         'outer: for group in self.app_system.search(&query) {
             for id in group {
@@ -17715,6 +17799,99 @@ impl Synoik {
             }
         }
         self.overview_search.set_results(results);
+
+        self.search_run.pending = if self.search_provider_emit.is_some() {
+            self.search_providers
+                .iter()
+                .map(|p| p.id().to_owned())
+                .collect()
+        } else {
+            Default::default()
+        };
+        if !self.search_run.pending.is_empty() {
+            self.emit_search(crate::search_providers::SynoikToSearch::Search {
+                generation: self.search_run.generation,
+                terms: self.search_run.terms.clone(),
+            });
+        }
+        self.overview_search
+            .set_searching(!self.search_run.pending.is_empty());
+    }
+
+    /// A provider answered.
+    pub fn on_search_provider_msg(&mut self, msg: crate::search_providers::SearchToSynoik) {
+        let crate::search_providers::SearchToSynoik::Results {
+            generation,
+            provider,
+            results,
+        } = msg;
+        if generation != self.search_run.generation || !self.search_run.pending.remove(&provider) {
+            return;
+        }
+        let section = self
+            .search_providers
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.id() == provider)
+            .zip(results)
+            .map(
+                |((order, p), results)| crate::ui::overview_search::ListSection {
+                    order,
+                    provider: provider.clone(),
+                    name: p.name.clone(),
+                    icon: p.icon.clone(),
+                    rows: results.rows,
+                    more: results.more,
+                },
+            );
+        self.overview_search.set_section(&provider, section);
+        self.overview_search
+            .set_searching(!self.search_run.pending.is_empty());
+        self.queue_redraw_all();
+    }
+
+    /// Re-read the provider files and settings (`_reloadRemoteProviders`, `search.js:650-658`):
+    /// on startup, when the app catalog changes and when `org.gnome.desktop.search-providers`
+    /// does. A changed set forgets the old providers' sections.
+    pub fn reload_search_providers(&mut self) {
+        let specs = crate::search_providers::discover(&crate::search_providers::provider_dirs());
+        let providers =
+            crate::search_providers::select(&specs, &self.gnome_settings.search_providers, |id| {
+                self.app_system.lookup(id)
+            });
+        if providers == self.search_providers {
+            return;
+        }
+        self.search_providers = providers;
+        self.emit_search(crate::search_providers::SynoikToSearch::SetProviders(
+            self.search_providers
+                .iter()
+                .map(|p| p.endpoint.clone())
+                .collect(),
+        ));
+        self.search_run.pending.clear();
+        self.overview_search.clear_sections();
+        let searching = self.search_run.timer.is_some();
+        self.overview_search.set_searching(searching);
+        self.queue_redraw_all();
+    }
+
+    /// Run a search still waiting out its delay, now (`activateDefault`'s first step).
+    pub fn flush_overview_search(&mut self) {
+        if self.search_run.timer.is_some() {
+            self.run_overview_search();
+        }
+    }
+
+    /// The terms the current search runs — what activating a provider's result passes on.
+    pub fn search_terms(&self) -> Vec<String> {
+        self.search_run.terms.clone()
+    }
+
+    pub fn emit_search(&self, msg: crate::search_providers::SynoikToSearch) {
+        if let Some(emit) = &self.search_provider_emit {
+            let _ = emit.try_send(msg);
+        }
     }
 
     /// Push a fresh store snapshot into an open calendar popover's message

@@ -677,9 +677,18 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     and `workspace_render_idx`'s synchronized-animation pairing. Chrome opacity fades still key off the
     raw progress rather than the state, so on a close from the grid they are not in the reference's
     phase order.
-- **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
-  `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
-  usage stats.
+- **S9 — Remote search providers. R1 ✅ DONE.** `src/search_providers.rs` reads the
+  `gnome-shell/search-providers/*.ini` files and `org.gnome.desktop.search-providers`;
+  `src/dbus/search_provider.rs` is the `SearchProvider(2)` client behind the §4 process seam (one
+  task per provider, staleness by generation, all parsing on its side). `Synoik::sync_overview_search`
+  is `setTerms`: GNOME's 150 ms delay from the first keystroke, for the app provider too. The
+  results view stacks the app grid (no plate — only list sections build `.search-section-content`)
+  and one card per provider with its `ProviderInfo` header and up to five rows; Enter, row clicks
+  and header clicks activate (`ActivateResult` + clipboard text, `LaunchSearch`). Still open:
+  **R2** scrolling, inline icon pixels, term highlighting, the header as a keyboard stop; **R3**
+  the settings' live reaction is in, the Settings-panel round trip is unverified; **R4**
+  `SystemActions` results and `Shell.AppUsage` ordering.
+- **S9+ — Polish.** Favorites DnD reorder / add-remove, folders, usage stats.
 - **S10 — Shifted-keysym blind spot. ✅ FIXED.** Reported live: in the search results **Tab stepped
   forward but so did Shift+Tab**. Not a logic bug in the search — `ISO_Left_Tab` is the *modified*
   keysym and the key path hands surfaces the **raw** one, so Shift+Tab arrives as a plain `Tab` and

@@ -2,46 +2,39 @@
 //
 // Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
 
-//! The overview search — a `search-entry` at the top of the Activities overview
-//! feeding the built-in **app** search provider, showing a grid of app results that
-//! Enter/click launches (`js/ui/searchController.js`, `search.js`, `appDisplay.js`
-//! `AppSearchProvider`).
+//! The overview search — a `search-entry` at the top of the Activities overview, and the
+//! results under it: the built-in **app** provider's grid, then one list section per remote
+//! search provider (`js/ui/searchController.js`, `search.js`, `appDisplay.js`
+//! `AppSearchProvider`, `remoteSearch.js`).
 //!
-//! **Model split.** Like the dash ([`crate::ui::dash`]), this owns only plain state:
-//! the query string, a snapshot of result entries, the keyboard selection, and mouse
-//! hover. It does NOT own the app catalog — [`OverviewSearch::handle_key`] mutates the
-//! query and returns a [`SearchOutcome`]; `Synoik::sync_overview_search` runs
-//! `AppSystem::search` and feeds results back via [`OverviewSearch::set_results`]
-//! (GNOME's `SearchResultsView.setTerms` → `_doSearch` → provider). Activation returns
-//! the selected app id for the caller to `launch` + `close_overview`.
+//! **Model split.** Like the dash ([`crate::ui::dash`]), this owns only plain state: the
+//! query, snapshots of the app results and the provider sections, the keyboard selection and
+//! mouse hover. Searching is `Synoik`'s: [`OverviewSearch::handle_key`] edits the query and
+//! returns a [`SearchOutcome`], `Synoik::sync_overview_search` runs the search after its
+//! delay, and the results come back through [`OverviewSearch::set_results`] (apps, on the
+//! spot) and [`OverviewSearch::set_section`] (each provider, as it answers — see
+//! [`crate::search_providers`]). Activation hands the caller an [`Activation`] to perform.
 //!
-//! **Faithful behavior (cited 50.1).** Tokenize = trim + split on whitespace
-//! (`searchController.js:19-24`). App provider: `AppSystem.search(terms.join(' '))` →
-//! relevance-tier groups → filter `should_show` → concat → cap `MAX_RESULTS`=6
-//! (`appDisplay.js:1760,1801-1831`). Default selection = first result
-//! (`search.js:799-823`); Enter activates it (`search.js:865-872`), closing the
-//! overview (`appDisplay.js:3077`). Escape while active clears (does not close)
+//! **Faithful behavior.** Tokenize = trim + split on whitespace (`searchController.js:19-24`).
+//! The search runs 150 ms after the first keystroke that changed the terms; Enter runs a
+//! pending one first (`search.js:741-772,879-886`). App provider:
+//! `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` → concat
+//! → cap [`MAX_RESULTS`] (`appDisplay.js:1801-1831`). Sections follow the providers' order and
+//! show up to five rows with an "N more" header (`search.js:293-340`). The default selection
+//! is the first result of the first section that has one (`_maybeSetInitialSelection`);
+//! Enter activates it. Until nothing is showing *and* every provider has answered the status
+//! reads "Searching", then "No results". Escape while active clears, it does not close
 //! (`searchController.js:153-160`).
 //!
-//! **Divergences (S4 MVP), revisited later:** no 150ms debounce — search runs
-//! synchronously per keystroke (search is in-process/cheap; keeps it clock-free and
-//! headless-testable; the Enter-forces-a-pending-search rule, `search.js:866-868`,
-//! becomes moot). No `Shell.AppUsage` ordering within a relevance tier (S9+) — tier
-//! order is `g_desktop_app_info_search`'s. No `SystemActions` results (S9+). Caret is
-//! at the end only (no mid-string edit/selection), so Left/Up map to selection-prev
-//! and Right/Down/Tab to selection-next (GNOME's Left-at-end-of-text nuance and RTL
-//! arrow-swap need a caret/locale port). No key autorepeat (run_dialog parity). No
-//! compose (`Multi_key`). Modified keys (Ctrl/Alt/Super) are refused outright rather
-//! than caret-handled, so GNOME's Ctrl+Enter open-new-window is unimplemented — a
-//! middle-click/Ctrl result activation launches plainly, the same divergence the dash
-//! records. The results grid renders over the still-visible window picker, and the
-//! entry sits at a hardcoded y over the thumbnail strip — S5 (`ControlsManager`) does
-//! the faithful layout + picker↔results cross-fade. GNOME's stage-capture
-//! `reset-search` gesture (a click outside the entry/results clears the search) is not
-//! ported: such a click falls through to the picker and the query survives until the
-//! next overview enter. Like the panel and dash, the search draws on **every** output
-//! with one shared selection/hover (GNOME shows it on the primary monitor only);
-//! hit-testing is still per-output.
+//! **Divergences:** no `Shell.AppUsage` ordering within a relevance tier, and no
+//! `SystemActions` results. The results do not scroll: a section that would run past the
+//! bottom of the results view is left out. Rows draw themed and file icons only, not icon
+//! pixels a provider sends inline, and the description is not highlighted with the terms.
+//! A section header is not a keyboard stop. GNOME's stage-capture `reset-search` gesture (a
+//! click outside the entry/results clears the search) is not ported: such a click falls
+//! through to the picker and the query survives until the next overview enter. Like the
+//! panel and dash, the search draws on **every** output with one shared selection/hover
+//! (GNOME shows it on the primary monitor only); hit-testing is still per-output.
 
 use std::cell::RefCell;
 
@@ -55,6 +48,7 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::search_providers::{ResultIcon, ResultMeta};
 use crate::ui::overview_layout::ControlsLayout;
 use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{
@@ -194,9 +188,46 @@ const CARD_RADIUS: f64 = 24.;
 const SECTION_SPACING: f64 = 18.;
 /// "No results" status text size (`.search-statustext` `%title_1` — 20pt/800).
 const STATUS_PT: f64 = 20.;
-/// Width of the empty-state ("No results") card — wide enough for the 20pt status
-/// string, which a tile-width card would clip. Matches the entry pill's width.
-const STATUS_CARD_W: f64 = ENTRY_WIDTH;
+/// The status line's box: wide enough for the 20pt string, tall enough for its line.
+const STATUS_W: f64 = ENTRY_WIDTH;
+const STATUS_H: f64 = 40.;
+/// `#searchResults` `margin: 0 $base_margin`.
+const RESULTS_MARGIN: f64 = 4.;
+/// `#searchResultsContent` `max-width` — the column the results are centered in.
+const RESULTS_MAX_W: f64 = 1044.;
+/// What separates two sections: `.search-section` `spacing` (18) down to its separator, whose
+/// `height: $base_margin*2` (8) is used as a spacer.
+const SECTION_GAP: f64 = SECTION_SPACING + 8.;
+/// `.search-section-content` `margin: 0 $base_margin*3`.
+const SECTION_MARGIN_X: f64 = 12.;
+/// `.search-section-content` `border: 2px solid transparent` — invisible, but it takes room.
+const CARD_BORDER: f64 = 2.;
+/// `%search_section_content_item` — `%tile` padding (`$base_padding`) and
+/// `border-radius: $base_border_radius*1.65`: a row and a section header.
+const ITEM_PAD: f64 = 6.;
+const ITEM_RADIUS: f64 = 8. * 1.65;
+/// `ListSearchResult.ICON_SIZE`.
+const ROW_ICON_PX: f64 = 24.;
+/// A row: its icon between the item padding — taller than its one line of text.
+const ROW_H: f64 = ROW_ICON_PX + 2. * ITEM_PAD;
+/// `.list-search-results` `spacing: $base_padding`.
+const ROW_SPACING: f64 = 6.;
+/// `.list-search-result-title` `spacing: $base_padding*2` — icon to title.
+const TITLE_SPACING: f64 = 12.;
+/// `.list-search-result-content` `spacing: $base_padding` — title to description.
+const DESCRIPTION_SPACING: f64 = 6.;
+/// `ProviderInfo.PROVIDER_ICON_SIZE`.
+const PROVIDER_ICON_PX: f64 = 32.;
+/// `.list-search-provider-content` `spacing: $base_padding*2`.
+const PROVIDER_SPACING: f64 = 12.;
+/// `.list-search-provider-details` `width: 120px`.
+const PROVIDER_DETAILS_W: f64 = 120.;
+/// The header button: padding, icon, spacing, details, padding.
+const PROVIDER_W: f64 = 2. * ITEM_PAD + PROVIDER_ICON_PX + PROVIDER_SPACING + PROVIDER_DETAILS_W;
+/// `.search-provider-icon` `margin-right: $base_margin` — header to rows.
+const PROVIDER_MARGIN: f64 = 4.;
+/// One line of body text, for sizing a box around lines.
+const LINE_H: f64 = 18.;
 
 /// One app result — a plain-data snapshot (not a live catalog borrow), like
 /// [`crate::ui::dash::DashEntry`].
@@ -207,6 +238,37 @@ pub struct SearchResultEntry {
     pub icon: AppIconRef,
 }
 
+/// One remote provider's section: a header naming the app, and up to
+/// [`MAX_LIST_ROWS`](crate::search_providers::MAX_LIST_ROWS) rows (`ListSearchResults`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListSection {
+    /// The provider's position among the providers — sections are drawn in this order
+    /// whatever order they answered in.
+    pub order: usize,
+    pub provider: String,
+    /// The app's name and icon, for the header (`ProviderInfo`).
+    pub name: String,
+    pub icon: AppIconRef,
+    pub rows: Vec<ResultMeta>,
+    /// The header's "N more".
+    pub more: usize,
+}
+
+/// What activating a result does — the caller performs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    /// Launch an app result.
+    App(String),
+    /// A provider's result: `ActivateResult` on its provider, then copy its clipboard text.
+    Result {
+        provider: String,
+        id: String,
+        clipboard_text: Option<String>,
+    },
+    /// A section header: open the search in the provider's app (`launchSearch`).
+    LaunchSearch { provider: String },
+}
+
 /// What a point over the search UI hit. Nothing is hittable while the search is
 /// inactive (the entry is then a passive hint over the thumbnail strip); once active
 /// the entry body consumes inertly as [`Background`](SearchHit::Background).
@@ -214,8 +276,12 @@ pub struct SearchResultEntry {
 pub enum SearchHit {
     /// The entry's trailing clear glyph.
     Clear,
-    /// Result tile at index `.0`.
+    /// App result tile at index `.0`.
     Result(usize),
+    /// Row `row` of list section `section`.
+    Row { section: usize, row: usize },
+    /// The header of list section `.0`.
+    Provider(usize),
     /// The entry's body — clicking it focuses (and so expands) the entry, the way
     /// gnome-shell's `searchEntryBin` click grabs key focus.
     Field,
@@ -236,12 +302,21 @@ pub enum SearchOutcome {
     QueryChanged,
     /// The search was cleared (Escape while active); re-sync to empty.
     Cleared,
-    /// Launch this app id, then close the overview (Enter on the selected result).
-    Activate(String),
+    /// Enter: activate the default result, if there is one (`activateDefault`). The caller
+    /// first runs a search that is still waiting out its delay, so Enter right after typing
+    /// acts on what was typed.
+    ActivateDefault,
     /// Close the overview (Escape while inactive — normally unreachable here, see the
     /// key-routing note in `src/input/mod.rs`; the real inactive-Escape close is the
     /// hardcoded overview bind).
     Close,
+}
+
+/// A selectable result, by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    App(usize),
+    Row { section: usize, row: usize },
 }
 
 #[derive(Default)]
@@ -270,8 +345,17 @@ pub struct OverviewSearch {
     /// instead of snapping to its destination.
     expand: f64,
     results: Vec<SearchResultEntry>,
-    /// Keyboard-selected (default) result index; meaningful only when `!results.empty()`.
+    /// The providers' sections, in provider order.
+    sections: Vec<ListSection>,
+    /// Some provider has yet to answer — the status reads "Searching", not "No results".
+    searching: bool,
+    /// Keyboard-selected result, as an index over the app results and then every section's
+    /// rows. Meaningful only when there is something to select.
     selected: usize,
+    /// The selection was moved by the keyboard since the query last changed. Until it is,
+    /// it follows the default result (the first one) as results arrive
+    /// (`_maybeSetInitialSelection`); after, it stays on the result it was moved to.
+    navigated: bool,
     /// Mouse hover (separate from `selected` — GNOME's Enter follows keynav, never the
     /// pointer).
     hovered: Option<SearchHit>,
@@ -299,7 +383,10 @@ impl OverviewSearch {
             expanded: false,
             expand: 0.,
             results: Vec::new(),
+            sections: Vec::new(),
+            searching: false,
             selected: 0,
+            navigated: false,
             hovered: None,
             content_rev: 0,
             cache: RefCell::new(SearchCache::default()),
@@ -343,7 +430,169 @@ impl OverviewSearch {
 
     /// The selected result's id, if any (what Enter activates).
     pub fn selected_id(&self) -> Option<&str> {
-        self.results.get(self.selected).map(|e| e.id.as_str())
+        match self.item(self.selected)? {
+            Item::App(i) => Some(self.results[i].id.as_str()),
+            Item::Row { section, row } => Some(self.sections[section].rows[row].id.as_str()),
+        }
+    }
+
+    /// What Enter activates (`activateDefault`): the selected result, if any.
+    pub fn selected_activation(&self) -> Option<Activation> {
+        if !self.is_active() {
+            return None;
+        }
+        self.activation(self.item(self.selected)?)
+    }
+
+    /// What clicking `hit` activates, if anything.
+    pub fn hit_activation(&self, hit: SearchHit) -> Option<Activation> {
+        match hit {
+            SearchHit::Result(i) => self.activation(Item::App(i)),
+            SearchHit::Row { section, row } => self.activation(Item::Row { section, row }),
+            SearchHit::Provider(section) => Some(Activation::LaunchSearch {
+                provider: self.sections.get(section)?.provider.clone(),
+            }),
+            SearchHit::Clear | SearchHit::Field | SearchHit::Background => None,
+        }
+    }
+
+    fn activation(&self, item: Item) -> Option<Activation> {
+        Some(match item {
+            Item::App(i) => Activation::App(self.results.get(i)?.id.clone()),
+            Item::Row { section, row } => {
+                let section = self.sections.get(section)?;
+                let meta = section.rows.get(row)?;
+                Activation::Result {
+                    provider: section.provider.clone(),
+                    id: meta.id.clone(),
+                    clipboard_text: meta.clipboard_text.clone(),
+                }
+            }
+        })
+    }
+
+    /// How many results can be selected: the app results, then every section's rows.
+    fn item_count(&self) -> usize {
+        self.results.len() + self.sections.iter().map(|s| s.rows.len()).sum::<usize>()
+    }
+
+    /// The result at flat index `i`.
+    fn item(&self, i: usize) -> Option<Item> {
+        if i < self.results.len() {
+            return Some(Item::App(i));
+        }
+        let mut i = i - self.results.len();
+        for (section, s) in self.sections.iter().enumerate() {
+            if i < s.rows.len() {
+                return Some(Item::Row { section, row: i });
+            }
+            i -= s.rows.len();
+        }
+        None
+    }
+
+    /// The flat index of `item`.
+    fn index_of(&self, item: Item) -> usize {
+        match item {
+            Item::App(i) => i,
+            Item::Row { section, row } => {
+                self.results.len()
+                    + self.sections[..section]
+                        .iter()
+                        .map(|s| s.rows.len())
+                        .sum::<usize>()
+                    + row
+            }
+        }
+    }
+
+    /// The selected result's identity — which provider, which id — so it can be found again
+    /// after the results around it change.
+    fn selected_key(&self) -> Option<(Option<String>, String)> {
+        Some(match self.item(self.selected)? {
+            Item::App(i) => (None, self.results[i].id.clone()),
+            Item::Row { section, row } => (
+                Some(self.sections[section].provider.clone()),
+                self.sections[section].rows[row].id.clone(),
+            ),
+        })
+    }
+
+    /// Put the selection back on `key` after a results change, or on the default result if it
+    /// was never moved or its result is gone.
+    fn reselect(&mut self, key: Option<(Option<String>, String)>) {
+        let found = key.filter(|_| self.navigated).and_then(|(provider, id)| {
+            let item = match provider {
+                None => Item::App(self.results.iter().position(|e| e.id == id)?),
+                Some(provider) => {
+                    let section = self.sections.iter().position(|s| s.provider == provider)?;
+                    let row = self.sections[section]
+                        .rows
+                        .iter()
+                        .position(|m| m.id == id)?;
+                    Item::Row { section, row }
+                }
+            };
+            Some(self.index_of(item))
+        });
+        self.selected = found.unwrap_or(0);
+    }
+
+    /// Whether no result of any kind is showing.
+    pub fn has_no_results(&self) -> bool {
+        self.results.is_empty() && self.sections.is_empty()
+    }
+
+    /// The providers' sections, in order.
+    pub fn sections(&self) -> &[ListSection] {
+        &self.sections
+    }
+
+    /// Replace (or with `None`, remove) one provider's section.
+    pub fn set_section(&mut self, provider: &str, section: Option<ListSection>) {
+        let key = self.selected_key();
+        let old = self.sections.iter().position(|s| s.provider == provider);
+        match (old, section) {
+            (Some(i), Some(section)) if self.sections[i] == section => return,
+            (None, None) => return,
+            (Some(i), Some(section)) => self.sections[i] = section,
+            (Some(i), None) => {
+                self.sections.remove(i);
+            }
+            (None, Some(section)) => {
+                let at = self
+                    .sections
+                    .iter()
+                    .position(|s| s.order > section.order)
+                    .unwrap_or(self.sections.len());
+                self.sections.insert(at, section);
+            }
+        }
+        self.reselect(key);
+        self.content_rev = self.content_rev.wrapping_add(1);
+    }
+
+    /// Drop every provider section (the provider set changed).
+    pub fn clear_sections(&mut self) {
+        if !self.sections.is_empty() {
+            let key = self.selected_key();
+            self.sections.clear();
+            self.reselect(key);
+            self.content_rev = self.content_rev.wrapping_add(1);
+        }
+    }
+
+    /// Whether the search is still in progress — what the empty state reads.
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    /// Whether a provider is still searching — what the empty state reads.
+    pub fn set_searching(&mut self, searching: bool) {
+        if self.searching != searching {
+            self.searching = searching;
+            self.content_rev = self.content_rev.wrapping_add(1);
+        }
     }
 
     /// The id of result `i`, if present (what a click activates).
@@ -411,11 +660,12 @@ impl OverviewSearch {
         let was = self.edit.text().to_owned();
         match self.edit.handle_key(raw, text, mods, theme) {
             EditOutcome::Activate => {
-                // activateDefault: launch the selected result, else consume (must NOT
-                // fall through, or the hardcoded Return bind would toggle the overview).
-                match self.selected_id() {
-                    Some(id) if self.is_active() => SearchOutcome::Activate(id.to_owned()),
-                    _ => SearchOutcome::Handled,
+                // activateDefault. Consumed even with nothing to activate: falling through,
+                // the hardcoded Return bind would toggle the overview.
+                if self.is_active() {
+                    SearchOutcome::ActivateDefault
+                } else {
+                    SearchOutcome::Handled
                 }
             }
             EditOutcome::Cancel => {
@@ -451,6 +701,7 @@ impl OverviewSearch {
         // GNOME re-selects the first result whenever results update; reset here so
         // Enter after a Backspace activates the new first result.
         self.selected = 0;
+        self.navigated = false;
         self.content_rev = self.content_rev.wrapping_add(1);
     }
 
@@ -459,16 +710,18 @@ impl OverviewSearch {
     }
 
     fn select_next(&mut self) {
-        if self.results.is_empty() {
+        let count = self.item_count();
+        if count == 0 {
             return;
         }
-        self.set_selected((self.selected + 1).min(self.results.len() - 1));
+        self.set_selected((self.selected + 1).min(count - 1));
     }
 
     fn set_selected(&mut self, i: usize) {
         // No `content_rev` bump: the selection wash is a separate element (the caller
         // always redraws on a handled key), so moving it never re-shapes the labels.
         self.selected = i;
+        self.navigated = true;
     }
 
     /// Replace the result snapshot (from `sync_overview_search`), clamping the
@@ -477,8 +730,9 @@ impl OverviewSearch {
         if results == self.results {
             return;
         }
+        let key = self.selected_key();
         self.results = results;
-        self.selected = self.selected.min(self.results.len().saturating_sub(1));
+        self.reselect(key);
         self.content_rev = self.content_rev.wrapping_add(1);
     }
 
@@ -486,6 +740,8 @@ impl OverviewSearch {
     pub fn clear(&mut self) {
         if self.edit.is_empty()
             && self.results.is_empty()
+            && self.sections.is_empty()
+            && !self.searching
             && self.hovered.is_none()
             && !self.expanded
         {
@@ -496,7 +752,10 @@ impl OverviewSearch {
         self.expanded = false;
         self.edit.clear();
         self.results.clear();
+        self.sections.clear();
+        self.searching = false;
         self.selected = 0;
+        self.navigated = false;
         self.hovered = None;
         self.content_rev = self.content_rev.wrapping_add(1);
     }
@@ -573,33 +832,7 @@ impl OverviewSearch {
             entry.pill.loc.x + (pill_w / 2.) + (Entry::ICON_INSET - pill_w / 2.) * e,
             entry.primary_icon.y,
         ));
-        let active = self.is_active();
-        let (card, tiles) = if !active {
-            (None, Vec::new())
-        } else {
-            let card_w = if self.results.is_empty() {
-                // The "No results" status card: sized for its own %title_1 text, not for
-                // a (nonexistent) tile — a tile-width card would clip the string.
-                STATUS_CARD_W
-            } else {
-                let n = self.results.len() as f64;
-                n * tile_w() + (n - 1.) * GRID_SPACING + 2. * CARD_PAD
-            };
-            let card_h = tile_h() + LABEL_OVERHANG + 2. * CARD_PAD;
-            let card_x = (area.results.loc.x + (area.results.size.w - card_w) / 2.).round();
-            let card_y = (area.results.loc.y + SECTION_SPACING).round();
-            let card = Rectangle::new(Point::from((card_x, card_y)), Size::from((card_w, card_h)));
-            let tiles = (0..self.results.len())
-                .map(|i| {
-                    let tx = card_x + CARD_PAD + i as f64 * (tile_w() + GRID_SPACING);
-                    Rectangle::new(
-                        Point::from((tx, card_y + CARD_PAD)),
-                        Size::from((tile_w(), tile_h())),
-                    )
-                })
-                .collect();
-            (Some(card), tiles)
-        };
+        let results = self.is_active().then(|| self.results_layout(area));
 
         SearchLayout {
             entry,
@@ -607,8 +840,103 @@ impl OverviewSearch {
             puck_icon_px: puck_icon_px(area.ramp),
             pill_w,
             pill_h,
-            card,
+            results,
+        }
+    }
+
+    /// The results under an active search, top to bottom in `#searchResultsContent`: the app
+    /// grid, then one card per provider section; or the status line when there are none.
+    fn results_layout(&self, area: SearchArea) -> ResultsLayout {
+        let avail = area.results.size.w - 2. * RESULTS_MARGIN;
+        let column_w = avail.min(RESULTS_MAX_W);
+        let column_x = area.results.loc.x + (area.results.size.w - column_w) / 2.;
+        let top = (area.results.loc.y + SECTION_SPACING).round();
+        let bottom = area.results.loc.y + area.results.size.h;
+
+        if self.has_no_results() {
+            // `_statusContainer`, centered in the whole results view.
+            let size = Size::from((STATUS_W, STATUS_H));
+            let status = Rectangle::new(
+                Point::from((
+                    (area.results.loc.x + (area.results.size.w - size.w) / 2.).round(),
+                    (area.results.loc.y + (area.results.size.h - size.h) / 2.).round(),
+                )),
+                size,
+            );
+            return ResultsLayout {
+                canvas: status,
+                tiles: Vec::new(),
+                sections: Vec::new(),
+                status: Some(status),
+            };
+        }
+
+        let mut y = top;
+        let mut tiles = Vec::new();
+        if !self.results.is_empty() {
+            // The grid sits centered in its section, with no plate behind it: only
+            // `ListSearchResults` builds a `.search-section-content` (`search.js:296-299`).
+            let n = self.results.len() as f64;
+            let grid_w = n * tile_w() + (n - 1.) * GRID_SPACING;
+            let x0 = (column_x + (column_w - grid_w) / 2.).round();
+            tiles = (0..self.results.len())
+                .map(|i| {
+                    Rectangle::new(
+                        Point::from((x0 + i as f64 * (tile_w() + GRID_SPACING), y)),
+                        Size::from((tile_w(), tile_h())),
+                    )
+                })
+                .collect();
+            y += tile_h() + LABEL_OVERHANG + SECTION_GAP;
+        }
+
+        let card_x = column_x + SECTION_MARGIN_X;
+        let card_w = column_w - 2. * SECTION_MARGIN_X;
+        let inset = CARD_BORDER + CARD_PAD;
+        let mut sections = Vec::new();
+        for section in &self.sections {
+            let header_h = 2. * ITEM_PAD
+                + PROVIDER_ICON_PX.max(if section.more > 0 { 2. } else { 1. } * LINE_H);
+            let rows_h = section.rows.len() as f64 * ROW_H
+                + section.rows.len().saturating_sub(1) as f64 * ROW_SPACING;
+            let card_h = 2. * inset + header_h.max(rows_h);
+            // Until the results scroll, a section that would run past the bottom is left
+            // out rather than drawn over the dash.
+            if y + card_h > bottom {
+                break;
+            }
+            let card = Rectangle::new(Point::from((card_x, y)), Size::from((card_w, card_h)));
+            let header = Rectangle::new(
+                Point::from((card_x + inset, y + inset)),
+                Size::from((PROVIDER_W, header_h)),
+            );
+            let rows_x = header.loc.x + PROVIDER_W + PROVIDER_MARGIN;
+            let rows_w = card_x + card_w - inset - rows_x;
+            let rows = (0..section.rows.len())
+                .map(|r| {
+                    Rectangle::new(
+                        Point::from((rows_x, y + inset + r as f64 * (ROW_H + ROW_SPACING))),
+                        Size::from((rows_w, ROW_H)),
+                    )
+                })
+                .collect();
+            sections.push(SectionLayout { card, header, rows });
+            y += card_h + SECTION_GAP;
+        }
+
+        let canvas_bottom = sections
+            .last()
+            .map(|s| s.card.loc.y + s.card.size.h)
+            .or_else(|| tiles.first().map(|t| t.loc.y + tile_h() + LABEL_OVERHANG))
+            .unwrap_or(top);
+        ResultsLayout {
+            canvas: Rectangle::new(
+                Point::from((column_x.round(), top)),
+                Size::from((column_w.round(), canvas_bottom - top)),
+            ),
             tiles,
+            sections,
+            status: None,
         }
     }
 
@@ -641,14 +969,21 @@ impl OverviewSearch {
             Some(EntryHit::Field) => return Some(SearchHit::Field),
             None => {}
         }
-        if let Some(card) = layout.card {
-            if card.contains(pos) {
-                for (i, tile) in layout.tiles.iter().enumerate() {
-                    if tile.contains(pos) {
-                        return Some(SearchHit::Result(i));
+        if let Some(results) = &layout.results {
+            for (i, tile) in results.tiles.iter().enumerate() {
+                if tile.contains(pos) {
+                    return Some(SearchHit::Result(i));
+                }
+            }
+            for (section, s) in results.sections.iter().enumerate() {
+                if s.header.contains(pos) {
+                    return Some(SearchHit::Provider(section));
+                }
+                for (row, rect) in s.rows.iter().enumerate() {
+                    if rect.contains(pos) {
+                        return Some(SearchHit::Row { section, row });
                     }
                 }
-                return Some(SearchHit::Background);
             }
         }
 
@@ -694,7 +1029,7 @@ impl OverviewSearch {
     /// the tile edges (not just its center) to sample the selection fill.
     #[cfg(test)]
     pub fn result_tile(&self, i: usize, area: SearchArea) -> Option<Rectangle<f64, Logical>> {
-        self.layout(area).tiles.get(i).copied()
+        self.result_rect(i, area)
     }
 
     /// The logical center of result tile `i`, or `None` if out of range. Used by a
@@ -708,7 +1043,28 @@ impl OverviewSearch {
 
     /// Result `i`'s tile rect — what a context menu anchors on.
     pub fn result_rect(&self, i: usize, area: SearchArea) -> Option<Rectangle<f64, Logical>> {
-        self.layout(area).tiles.get(i).copied()
+        self.layout(area).results?.tiles.get(i).copied()
+    }
+
+    /// Section `i`'s plate — a geometry probe for the render test.
+    #[cfg(test)]
+    pub fn section_card(&self, i: usize, area: SearchArea) -> Option<Rectangle<f64, Logical>> {
+        Some(self.layout(area).results?.sections.get(i)?.card)
+    }
+
+    /// Where `hit` is drawn — what the conformance corpus clicks.
+    pub fn hit_center(&self, hit: SearchHit, area: SearchArea) -> Option<Point<f64, Logical>> {
+        let results = self.layout(area).results?;
+        let rect = match hit {
+            SearchHit::Result(i) => *results.tiles.get(i)?,
+            SearchHit::Row { section, row } => *results.sections.get(section)?.rows.get(row)?,
+            SearchHit::Provider(section) => results.sections.get(section)?.header,
+            SearchHit::Clear | SearchHit::Field | SearchHit::Background => return None,
+        };
+        Some(Point::from((
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        )))
     }
 
     /// The search render elements for `output`, faded by overview `progress` (0..1).
@@ -804,25 +1160,46 @@ impl OverviewSearch {
             ));
         }
 
-        // --- Result app icons (topmost, over their tiles). ---
-        for (i, entry) in self.results.iter().enumerate() {
-            let tile = layout.tiles[i];
-            let center = Point::from((
-                tile.loc.x + tile.size.w / 2.,
-                tile.loc.y + TILE_PAD + RESULT_ICON_PX / 2.,
-            ));
-            if let Some(el) = widget::app_icon_element(
-                renderer,
-                &mut cache.icons.borrow_mut(),
-                app_icons,
-                &entry.icon,
-                RESULT_ICON_PX,
-                scale,
-                Point::from((0., 0.)),
-                center,
-                results_alpha,
-            ) {
-                elements.push(el);
+        // --- Result icons (topmost, over their tiles and rows). ---
+        if let Some(results) = &layout.results {
+            let mut uploads = cache.icons.borrow_mut();
+            let mut push_icon = |icon: &AppIconRef, px: f64, center: Point<f64, Logical>| {
+                if let Some(el) = widget::app_icon_element(
+                    renderer,
+                    &mut uploads,
+                    app_icons,
+                    icon,
+                    px,
+                    scale,
+                    Point::from((0., 0.)),
+                    center,
+                    results_alpha,
+                ) {
+                    elements.push(el);
+                }
+            };
+            for (entry, tile) in self.results.iter().zip(&results.tiles) {
+                let center = Point::from((
+                    tile.loc.x + tile.size.w / 2.,
+                    tile.loc.y + TILE_PAD + RESULT_ICON_PX / 2.,
+                ));
+                push_icon(&entry.icon, RESULT_ICON_PX, center);
+            }
+            for (section, sl) in self.sections.iter().zip(&results.sections) {
+                let center = Point::from((
+                    sl.header.loc.x + ITEM_PAD + PROVIDER_ICON_PX / 2.,
+                    sl.header.loc.y + ITEM_PAD + PROVIDER_ICON_PX / 2.,
+                ));
+                push_icon(&section.icon, PROVIDER_ICON_PX, center);
+                for (meta, row) in section.rows.iter().zip(&sl.rows) {
+                    if let Some(icon) = row_icon(meta) {
+                        let center = Point::from((
+                            row.loc.x + ITEM_PAD + ROW_ICON_PX / 2.,
+                            row.loc.y + row.size.h / 2.,
+                        ));
+                        push_icon(&icon, ROW_ICON_PX, center);
+                    }
+                }
             }
         }
 
@@ -869,190 +1246,328 @@ impl OverviewSearch {
             Err(err) => tracing::error!("error baking the search entry: {err:#}"),
         }
 
-        // --- The results card in two z-layers so a highlight change (every mouse move /
-        //     arrow key) never re-shapes the labels. The labels bake is keyed on
-        //     `content_rev` alone (results, never the highlight); the card bake — background
-        //     + selection/hover wash + "No results" status — re-bakes when the highlight
-        //     moves, but that is only rounded fills (no label shaping), so it is cheap. The
-        //     wash rides along in the card bake (rather than as its own element) simply because
-        //     it re-bakes on the same key as the background it sits on — one bake, not two.
-        //     The result icons were pushed above both. ---
-        if active {
-            if let Some(card) = layout.card {
-                let origin = card.loc;
-                let card_size = card.size;
-                let empty = self.results.is_empty();
-                let mut push_card_layer = |buffer| {
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        card.loc,
-                        results_alpha,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ));
-                };
-
-                // (1) Labels — highlight-independent, so hover/selection never re-shape them.
-                let rel_rects: Vec<Rectangle<f64, Logical>> = layout
-                    .tiles
-                    .iter()
-                    .map(|t| Rectangle::new(t.loc - origin, t.size))
-                    .collect();
-                // A search result's caption never expands — the provider builds its icons
-                // with `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is
-                // always the resting, end-ellipsized form, at the same line count the grid
-                // rests at (see [`LABEL_OVERHANG`], which is what makes room for it).
-                let label_w = widget::TileMetrics::overview().label_w();
-                let names: Vec<Vec<String>> = self
-                    .results
-                    .iter()
-                    .map(|e| {
-                        widget::tile_label_lines(
-                            &e.name,
-                            LABEL_PT,
-                            label_w,
-                            widget::TILE_LABEL_LINES,
-                            false,
-                        )
-                    })
-                    .collect();
-                let label_rects = rel_rects.clone();
-                match widget::bake(
-                    renderer,
-                    &mut cache.results_bake,
-                    scale,
-                    card_size,
-                    self.content_rev,
-                    move |r| {
-                        let mut shaper = widget::TextShaper::new(r, scale);
-                        names
-                            .iter()
-                            .map(|lines| {
-                                lines
-                                    .iter()
-                                    .map(|line| {
-                                        shaper.shape(line, widget::TextStyle::new(LABEL_PT))
-                                    })
-                                    .collect::<anyhow::Result<Vec<_>>>()
-                            })
-                            .collect::<anyhow::Result<Vec<_>>>()
-                    },
-                    move |frame, phys, labels| {
-                        let mut p = Painter::new(frame, scale, phys);
-                        p.clear(style::TRANSPARENT)?;
-                        for (rel, label) in label_rects.iter().zip(labels.iter()) {
-                            p.labelled_tile(
-                                *rel,
-                                label,
-                                &widget::TileMetrics::overview(),
-                                false,
-                                style::TEXT,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                ) {
-                    Ok(buffer) => push_card_layer(buffer),
-                    Err(err) => tracing::error!("error baking the search labels: {err:#}"),
-                }
-
-                // (2) Card background + selection/hover wash + "No results" status (bottom).
-                //     Re-bakes on a highlight change, but only rounded fills — no re-shape.
-                let selected = self.selected;
-                let hovered = self.hovered;
-                // The wash covers the caption, which may run past the tile box — GNOME's
-                // tile allocation follows its label, so the highlight grows with it (the
-                // app grid does the same for an expanded caption).
-                let wash_extra: Vec<f64> = self
-                    .results
-                    .iter()
-                    .map(|e| {
-                        let lines = widget::tile_label_lines(
-                            &e.name,
-                            LABEL_PT,
-                            label_w,
-                            widget::TILE_LABEL_LINES,
-                            false,
-                        )
-                        .len();
-                        18. * (lines as f64 - 1.)
-                    })
-                    .collect();
-                // Highlight packed into the bake revision so a move re-bakes the wash.
-                let hover_idx = match hovered {
-                    Some(SearchHit::Result(i)) => i as u64 + 1,
-                    _ => 0,
-                };
-                // The appearance rides the revision, or a Dark Style toggle would leave the
-                // card serving the old plate until its content next changed.
-                let card_rev = (self.content_rev << 41)
-                    | (appearance.rev() << 40)
-                    | ((selected as u64 & 0xF_FFFF) << 20)
-                    | (hover_idx & 0xF_FFFF);
-                match widget::bake(
-                    renderer,
-                    &mut cache.bg_bake,
-                    scale,
-                    card_size,
-                    card_rev,
-                    move |r| {
-                        if empty {
-                            let mut shaper = widget::TextShaper::new(r, scale);
-                            Ok(Some(shaper.shape(
-                                "No results",
-                                widget::TextStyle::new(STATUS_PT).bold(),
-                            )?))
-                        } else {
-                            Ok(None)
-                        }
-                    },
-                    move |frame, phys, status| {
-                        let mut p = Painter::new(frame, scale, phys);
-                        p.clear(style::TRANSPARENT)?;
-                        // `.search-section-content` — a plate on the overview backdrop, so it
-                        // takes the shared translucent fill rather than the opaque
-                        // `$system_overlay_bg_color` (`widget::style::Appearance::plate`).
-                        p.fill_rounded_full(CARD_RADIUS, appearance.plate())?;
-                        // Selection always washes; a hovered result adds/overlaps one.
-                        for (i, rel) in rel_rects.iter().enumerate() {
-                            if i == selected || hovered == Some(SearchHit::Result(i)) {
-                                let grown = Rectangle::new(
-                                    rel.loc,
-                                    Size::from((
-                                        rel.size.w,
-                                        rel.size.h + wash_extra.get(i).copied().unwrap_or(0.),
-                                    )),
-                                );
-                                p.fill_rounded(
-                                    grown,
-                                    widget::TileMetrics::overview().radius,
-                                    style::HOVER_WASH,
-                                )?;
-                            }
-                        }
-                        if let Some(status) = status {
-                            // Centered "No results" (`.search-statustext`).
-                            p.text_band(
-                                status,
-                                card_size.w / 2.,
-                                widget::HAlign::Center,
-                                0.,
-                                card_size.h,
-                                style::MUTED,
-                                Rectangle::from_size(card_size),
-                            )?;
-                        }
-                        Ok(())
-                    },
-                ) {
-                    Ok(buffer) => push_card_layer(buffer),
-                    Err(err) => tracing::error!("error baking the search card: {err:#}"),
-                }
-            }
+        // --- The results in two z-layers baked over the results column, so a highlight
+        //     change (every mouse move / arrow key) never re-shapes text. The text layer is
+        //     keyed on `content_rev` alone; the plate layer — section plates and the
+        //     selection/hover wash — re-bakes when the highlight moves, but that is only
+        //     rounded fills. The result icons were pushed above both. ---
+        if let Some(results) = &layout.results {
+            self.render_results(
+                renderer,
+                &mut cache,
+                scale,
+                results,
+                results_alpha,
+                appearance,
+                &mut elements,
+            );
         }
 
         elements
+    }
+}
+
+impl OverviewSearch {
+    #[allow(clippy::too_many_arguments)]
+    fn render_results(
+        &self,
+        renderer: &mut VulkanRenderer,
+        cache: &mut SearchCache,
+        scale: f64,
+        results: &ResultsLayout,
+        alpha: f32,
+        appearance: widget::style::Appearance,
+        elements: &mut Vec<TextureRenderElement<VkTexture>>,
+    ) {
+        let canvas = results.canvas;
+        let origin = canvas.loc;
+        let rel = |r: Rectangle<f64, Logical>| Rectangle::new(r.loc - origin, r.size);
+        let mut push = |buffer| {
+            elements.push(TextureRenderElement::from_texture_buffer(
+                buffer,
+                origin,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
+        };
+
+        // (1) Text — highlight-independent.
+        // A search result's caption never expands — the provider builds its icons with
+        // `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is always the
+        // resting, end-ellipsized form, at the same line count the grid rests at (see
+        // [`LABEL_OVERHANG`], which is what makes room for it).
+        let label_w = widget::TileMetrics::overview().label_w();
+        let captions: Vec<(Rectangle<f64, Logical>, Vec<String>)> = self
+            .results
+            .iter()
+            .zip(&results.tiles)
+            .map(|(e, tile)| {
+                let lines = widget::tile_label_lines(
+                    &e.name,
+                    LABEL_PT,
+                    label_w,
+                    widget::TILE_LABEL_LINES,
+                    false,
+                );
+                (rel(*tile), lines)
+            })
+            .collect();
+        let mut texts = Vec::new();
+        for (section, sl) in self.sections.iter().zip(&results.sections) {
+            section_texts(section, sl, origin, &mut texts);
+        }
+        if let Some(status) = results.status {
+            texts.push(TextItem {
+                text: if self.searching {
+                    "Searching"
+                } else {
+                    "No results"
+                }
+                .to_owned(),
+                pt: STATUS_PT,
+                bold: true,
+                x: rel(status).loc.x + status.size.w / 2.,
+                align: widget::HAlign::Center,
+                top: rel(status).loc.y,
+                h: status.size.h,
+                // `.search-statustext`: `transparentize($system_fg_color, .2)`.
+                color: [1., 1., 1., 0.8],
+            });
+        }
+        match widget::bake(
+            renderer,
+            &mut cache.results_bake,
+            scale,
+            canvas.size,
+            self.content_rev,
+            move |r| {
+                let mut shaper = widget::TextShaper::new(r, scale);
+                let captions = captions
+                    .into_iter()
+                    .map(|(rect, lines)| {
+                        let shaped = lines
+                            .iter()
+                            .map(|line| shaper.shape(line, widget::TextStyle::new(LABEL_PT)))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        Ok((rect, shaped))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let texts = texts
+                    .into_iter()
+                    .map(|t| {
+                        let mut style = widget::TextStyle::new(t.pt);
+                        if t.bold {
+                            style = style.bold();
+                        }
+                        Ok((shaper.shape(&t.text, style)?, t))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok((captions, texts))
+            },
+            move |frame, phys, (captions, texts)| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                let all = Rectangle::from_size(canvas.size);
+                for (rect, label) in captions {
+                    p.labelled_tile(
+                        *rect,
+                        label,
+                        &widget::TileMetrics::overview(),
+                        false,
+                        style::TEXT,
+                    )?;
+                }
+                for (shaped, t) in texts {
+                    p.text_band(shaped, t.x, t.align, t.top, t.h, t.color, all)?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(buffer) => push(buffer),
+            Err(err) => tracing::error!("error baking the search results: {err:#}"),
+        }
+
+        // (2) Plates and the selection/hover wash.
+        let plates: Vec<Rectangle<f64, Logical>> =
+            results.sections.iter().map(|s| rel(s.card)).collect();
+        // The wash covers a tile's caption, which may run past the tile box — GNOME's tile
+        // allocation follows its label, so the highlight grows with it (the app grid does
+        // the same for an expanded caption).
+        let tile_wash = |i: usize| {
+            let lines = widget::tile_label_lines(
+                &self.results[i].name,
+                LABEL_PT,
+                label_w,
+                widget::TILE_LABEL_LINES,
+                false,
+            )
+            .len();
+            let tile = rel(results.tiles[i]);
+            (
+                Rectangle::new(
+                    tile.loc,
+                    Size::from((tile.size.w, tile.size.h + LINE_H * (lines as f64 - 1.))),
+                ),
+                widget::TileMetrics::overview().radius,
+            )
+        };
+        let wash_of = |hit: SearchHit| -> Option<(Rectangle<f64, Logical>, f64)> {
+            match hit {
+                SearchHit::Result(i) if i < results.tiles.len() => Some(tile_wash(i)),
+                SearchHit::Row { section, row } => Some((
+                    rel(*results.sections.get(section)?.rows.get(row)?),
+                    ITEM_RADIUS,
+                )),
+                SearchHit::Provider(section) => {
+                    Some((rel(results.sections.get(section)?.header), ITEM_RADIUS))
+                }
+                _ => None,
+            }
+        };
+        let selected = self.item(self.selected).map(|item| match item {
+            Item::App(i) => SearchHit::Result(i),
+            Item::Row { section, row } => SearchHit::Row { section, row },
+        });
+        let washes: Vec<_> = [selected, self.hovered]
+            .into_iter()
+            .flatten()
+            .filter_map(wash_of)
+            .collect();
+        let hover_key = |hit: Option<SearchHit>| match hit {
+            Some(SearchHit::Result(i)) => 1 + i as u64,
+            Some(SearchHit::Row { section, row }) => 1_000 + 100 * section as u64 + row as u64,
+            Some(SearchHit::Provider(section)) => 100_000 + section as u64,
+            _ => 0,
+        };
+        // The appearance rides the revision, or a Dark Style toggle would leave the plates on
+        // the old fill until the content next changed.
+        let rev = (self.content_rev << 41)
+            | (appearance.rev() << 40)
+            | ((hover_key(selected) & 0xF_FFFF) << 20)
+            | (hover_key(self.hovered) & 0xF_FFFF);
+        match widget::bake(
+            renderer,
+            &mut cache.bg_bake,
+            scale,
+            canvas.size,
+            rev,
+            |_| Ok(()),
+            move |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                for plate in &plates {
+                    // `.search-section-content` — a plate on the overview backdrop, so it takes
+                    // the shared translucent fill rather than the opaque
+                    // `$system_overlay_bg_color` (`widget::style::Appearance::plate`).
+                    p.fill_rounded(*plate, CARD_RADIUS, appearance.plate())?;
+                }
+                for (rect, radius) in &washes {
+                    p.fill_rounded(*rect, *radius, style::HOVER_WASH)?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(buffer) => push(buffer),
+            Err(err) => tracing::error!("error baking the search plates: {err:#}"),
+        }
+    }
+}
+
+/// A run of text to place in the results' text layer.
+struct TextItem {
+    text: String,
+    pt: f64,
+    bold: bool,
+    x: f64,
+    align: widget::HAlign,
+    /// The band the line is centered in, relative to the canvas.
+    top: f64,
+    h: f64,
+    color: widget::Rgba,
+}
+
+/// A section's header and rows as text items, relative to `origin`.
+fn section_texts(
+    section: &ListSection,
+    sl: &SectionLayout,
+    origin: Point<f64, Logical>,
+    texts: &mut Vec<TextItem>,
+) {
+    let pt = crate::ui::BASE_FONT_PT;
+    let line_w = |s: &str| {
+        synoik_vk::text::measure_line_width_weighted(s, crate::ui::pt_to_px(pt) as f32, false)
+    };
+    let mut push = |text: String, x: f64, top: f64, h: f64, color| {
+        if !text.is_empty() {
+            texts.push(TextItem {
+                text,
+                pt,
+                bold: false,
+                x: x - origin.x,
+                align: widget::HAlign::Left,
+                top: top - origin.y,
+                h,
+                color,
+            });
+        }
+    };
+
+    // The header: the app's name, and under it "N more" when there is more to see.
+    let details_x = sl.header.loc.x + ITEM_PAD + PROVIDER_ICON_PX + PROVIDER_SPACING;
+    let content_top = sl.header.loc.y + ITEM_PAD;
+    let content_h = sl.header.size.h - 2. * ITEM_PAD;
+    let name = widget::ellipsized_line(&section.name, pt, PROVIDER_DETAILS_W);
+    if section.more > 0 {
+        push(
+            name,
+            details_x,
+            content_top,
+            content_h - LINE_H,
+            style::TEXT,
+        );
+        push(
+            format!("{} more", section.more),
+            details_x,
+            content_top + content_h - LINE_H,
+            LINE_H,
+            style::TEXT,
+        );
+    } else {
+        push(name, details_x, content_top, content_h, style::TEXT);
+    }
+
+    // The rows: the title after its icon, then the description's first line in what is left.
+    for (meta, row) in section.rows.iter().zip(&sl.rows) {
+        let title_x = row.loc.x + ITEM_PAD + ROW_ICON_PX + TITLE_SPACING;
+        let avail = row.loc.x + row.size.w - ITEM_PAD - title_x;
+        let title = widget::ellipsized_line(&meta.name, pt, avail);
+        let title_w = line_w(&title).min(avail);
+        push(title, title_x, row.loc.y, row.size.h, style::TEXT);
+        if let Some(description) = &meta.description {
+            let x = title_x + title_w + DESCRIPTION_SPACING;
+            let avail = row.loc.x + row.size.w - ITEM_PAD - x;
+            if avail > 0. {
+                push(
+                    widget::ellipsized_line(description, pt, avail),
+                    x,
+                    row.loc.y,
+                    row.size.h,
+                    // `.list-search-result-description`: `$system_insensitive_fg_color`.
+                    style::MUTED,
+                );
+            }
+        }
+    }
+}
+
+/// The icon a row draws, if it is one this toolkit can draw.
+fn row_icon(meta: &ResultMeta) -> Option<AppIconRef> {
+    match meta.icon.as_ref()? {
+        ResultIcon::Themed(names) => Some(AppIconRef::Themed(names.clone())),
+        ResultIcon::File(path) => Some(AppIconRef::File(path.clone())),
+        ResultIcon::Pixels { .. } => None,
     }
 }
 
@@ -1100,10 +1615,27 @@ struct SearchLayout {
     /// The pill's current size — what the chrome is baked at.
     pill_w: f64,
     pill_h: f64,
-    /// The results card (`None` when search inactive).
-    card: Option<Rectangle<f64, Logical>>,
-    /// Result-tile boxes (empty unless active with results).
+    /// Everything below the entry, while a search is active.
+    results: Option<ResultsLayout>,
+}
+
+struct ResultsLayout {
+    /// The box every result is drawn inside — the size the result layers are baked at.
+    canvas: Rectangle<f64, Logical>,
+    /// App result tiles.
     tiles: Vec<Rectangle<f64, Logical>>,
+    /// The provider sections that fit.
+    sections: Vec<SectionLayout>,
+    /// "No results" / "Searching", when nothing is showing.
+    status: Option<Rectangle<f64, Logical>>,
+}
+
+struct SectionLayout {
+    /// The `.search-section-content` plate.
+    card: Rectangle<f64, Logical>,
+    /// The `ProviderInfo` button.
+    header: Rectangle<f64, Logical>,
+    rows: Vec<Rectangle<f64, Logical>>,
 }
 
 #[cfg(test)]
@@ -1179,7 +1711,11 @@ mod tests {
                 EditMods::default(),
                 KeyTheme::default()
             ),
-            SearchOutcome::Activate("a.desktop".to_owned())
+            SearchOutcome::ActivateDefault
+        );
+        assert_eq!(
+            s.selected_activation(),
+            Some(Activation::App("a.desktop".to_owned()))
         );
     }
 
@@ -1370,7 +1906,7 @@ mod tests {
             KeyTheme::default(),
         );
         assert_eq!(s.selected_id(), None);
-        // Enter with no results is consumed, not an activate.
+        // Enter with no results has nothing to activate.
         assert_eq!(
             s.handle_key(
                 Some(Keysym::Return),
@@ -1378,7 +1914,7 @@ mod tests {
                 EditMods::default(),
                 KeyTheme::default()
             ),
-            SearchOutcome::Handled
+            SearchOutcome::ActivateDefault
         );
     }
 
@@ -1538,7 +2074,7 @@ mod tests {
             s.hit_test(layout.entry.secondary_icon, area),
             Some(SearchHit::Clear)
         );
-        let t0 = layout.tiles[0];
+        let t0 = layout.results.as_ref().unwrap().tiles[0];
         let tc = Point::from((t0.loc.x + t0.size.w / 2., t0.loc.y + t0.size.h / 2.));
         assert_eq!(s.hit_test(tc, area), Some(SearchHit::Result(0)));
     }
@@ -1686,22 +2222,21 @@ run it with --features reference-env, as the fedora CI job does"
              this pins (the dash keeps %tile, the app grid and search do not)"
         );
 
-        // The card grows with the bigger tiles, and still centers them — plus the room a
-        // resting caption needs below its tile box ([`LABEL_OVERHANG`]).
+        // The grid is centered in the results column, with no plate around it.
         let mut s = OverviewSearch::new();
         s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        let l = s.layout(area_1080());
-        let card = l.card.expect("an active search has a card");
-        assert_eq!(
-            card.size,
-            Size::from((
-                2. * tile_w() + GRID_SPACING + 2. * CARD_PAD,
-                tile_h() + LABEL_OVERHANG + 2. * CARD_PAD
-            ))
-        );
+        let area = area_1080();
+        let l = s.layout(area).results.unwrap();
         assert_eq!(l.tiles[0].size, Size::from((tile_w(), tile_h())));
-        assert_eq!(l.tiles[0].loc.x, card.loc.x + CARD_PAD);
+        assert_eq!(l.tiles[1].loc.x - l.tiles[0].loc.x, tile_w() + GRID_SPACING);
+        let middle = (l.tiles[0].loc.x + l.tiles[1].loc.x + tile_w()) / 2.;
+        let column_middle = area.results.loc.x + area.results.size.w / 2.;
+        assert!(
+            (middle - column_middle).abs() <= 1.,
+            "{middle} vs {column_middle}"
+        );
+        assert!(l.sections.is_empty());
     }
 
     /// The search results and the app grid are the same `.overview-tile` in GNOME
@@ -1717,22 +2252,164 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(LABEL_PT, crate::ui::BASE_FONT_PT);
     }
 
-    /// The empty-state ("No results") card is sized for its own status string, not for
-    /// a nonexistent tile — a tile-width card would clip the 20pt text.
+    /// With nothing to show, the status line (`_statusContainer`) sits centered in the results
+    /// view, and reads "Searching" while a provider has yet to answer.
     #[test]
-    fn empty_results_card_is_wide_enough_for_the_status_text() {
+    fn an_empty_search_shows_its_status_centered() {
         let mut s = OverviewSearch::new();
         s.handle_key(None, Some('z'), EditMods::default(), KeyTheme::default());
-        let card = s
-            .layout(area_1080())
-            .card
-            .expect("an active search has a card");
-        assert!(
-            card.size.w >= STATUS_CARD_W,
-            "the No-results card must fit its status text, got {}",
-            card.size.w
+        let area = area_1080();
+        let status = s.layout(area).results.unwrap().status.unwrap();
+        let center =
+            |r: Rectangle<f64, Logical>| (r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.);
+        let (sx, sy) = center(status);
+        let (ax, ay) = center(area.results);
+        assert!((sx - ax).abs() <= 1. && (sy - ay).abs() <= 1.);
+        s.set_section("p", Some(section(0, "p", &["one"])));
+        assert!(s.layout(area).results.unwrap().status.is_none());
+    }
+
+    fn meta(id: &str) -> ResultMeta {
+        ResultMeta {
+            id: id.to_owned(),
+            name: id.to_uppercase(),
+            description: None,
+            icon: None,
+            clipboard_text: Some(format!("copied {id}")),
+        }
+    }
+
+    fn section(order: usize, provider: &str, ids: &[&str]) -> ListSection {
+        ListSection {
+            order,
+            provider: provider.to_owned(),
+            name: provider.to_owned(),
+            icon: AppIconRef::Fallback,
+            rows: ids.iter().map(|id| meta(id)).collect(),
+            more: 0,
+        }
+    }
+
+    fn typed(query: char) -> OverviewSearch {
+        let mut s = OverviewSearch::new();
+        s.handle_key(None, Some(query), EditMods::default(), KeyTheme::default());
+        s
+    }
+
+    fn down(s: &mut OverviewSearch) {
+        s.handle_key(
+            Some(Keysym::Down),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
         );
-        assert!(card.size.w > tile_w() + 2. * CARD_PAD);
+    }
+
+    /// Sections take their providers' order whatever order they answer in, and the
+    /// selection runs through the app results and then every section's rows.
+    #[test]
+    fn sections_keep_provider_order_and_the_selection_runs_through_them() {
+        let mut s = typed('a');
+        s.set_results(vec![entry("app.desktop", "App")]);
+        s.set_section("second", Some(section(1, "second", &["c"])));
+        s.set_section("first", Some(section(0, "first", &["a", "b"])));
+        let order: Vec<&str> = s.sections().iter().map(|s| s.provider.as_str()).collect();
+        assert_eq!(order, ["first", "second"]);
+
+        let mut seen = vec![s.selected_id().unwrap().to_owned()];
+        for _ in 0..4 {
+            down(&mut s);
+            seen.push(s.selected_id().unwrap().to_owned());
+        }
+        assert_eq!(
+            seen,
+            ["app.desktop", "a", "b", "c", "c"],
+            "clamped at the last row"
+        );
+        assert_eq!(
+            s.selected_activation(),
+            Some(Activation::Result {
+                provider: "second".into(),
+                id: "c".into(),
+                clipboard_text: Some("copied c".into()),
+            })
+        );
+    }
+
+    /// Until the keyboard moves it, the selection is the default result — the first one — and
+    /// follows it as sections arrive. After, it stays on its result while others come and go.
+    #[test]
+    fn the_selection_follows_the_default_until_moved_then_stays_put() {
+        let mut s = typed('a');
+        s.set_section("second", Some(section(1, "second", &["c"])));
+        assert_eq!(s.selected_id(), Some("c"));
+        s.set_section("first", Some(section(0, "first", &["a"])));
+        assert_eq!(
+            s.selected_id(),
+            Some("a"),
+            "an earlier section's row is the new default"
+        );
+
+        down(&mut s);
+        assert_eq!(s.selected_id(), Some("c"));
+        s.set_section("first", Some(section(0, "first", &["a", "b"])));
+        assert_eq!(
+            s.selected_id(),
+            Some("c"),
+            "a moved selection stays on its result"
+        );
+        s.set_section("second", None);
+        assert_eq!(
+            s.selected_id(),
+            Some("a"),
+            "its result gone, back to the default"
+        );
+    }
+
+    /// Rows and headers hit-test, and activate as their provider's result and its search.
+    #[test]
+    fn rows_and_headers_hit_and_activate() {
+        let mut s = typed('a');
+        s.set_expand(1.);
+        s.set_section("p", Some(section(0, "p", &["a", "b"])));
+        let area = area_1080();
+        for hit in [
+            SearchHit::Row { section: 0, row: 1 },
+            SearchHit::Provider(0),
+        ] {
+            let at = s.hit_center(hit, area).unwrap();
+            assert_eq!(s.hit_test(at, area), Some(hit));
+        }
+        assert_eq!(
+            s.hit_activation(SearchHit::Row { section: 0, row: 1 }),
+            Some(Activation::Result {
+                provider: "p".into(),
+                id: "b".into(),
+                clipboard_text: Some("copied b".into()),
+            })
+        );
+        assert_eq!(
+            s.hit_activation(SearchHit::Provider(0)),
+            Some(Activation::LaunchSearch {
+                provider: "p".into()
+            })
+        );
+    }
+
+    /// A section that would run past the bottom of the results view is left out rather than
+    /// drawn over the dash.
+    #[test]
+    fn sections_that_do_not_fit_are_left_out() {
+        let mut s = typed('a');
+        for i in 0..20 {
+            let id = format!("p{i}");
+            s.set_section(&id, Some(section(i, &id, &["a", "b", "c", "d", "e"])));
+        }
+        let area = area_1080();
+        let l = s.layout(area).results.unwrap();
+        assert!(!l.sections.is_empty() && l.sections.len() < 20);
+        let last = l.sections.last().unwrap().card;
+        assert!(last.loc.y + last.size.h <= area.results.loc.y + area.results.size.h);
     }
 
     impl OverviewSearch {

@@ -121,6 +121,7 @@ pub struct DBusServers {
     /// org.kde.StatusNotifierWatcher (session bus) — app-indicator support. Owning this name is
     /// itself the feature: clients hide their tray affordance when nothing owns it.
     pub conn_status_notifier: Option<Connection>,
+    pub conn_search_provider: Option<Connection>,
     /// org.gnome.Shell.Brightness (session bus) — gsd-power's way in to idle dimming and the
     /// auto-brightness target. Its own well-known name, hence its own connection.
     pub conn_brightness: Option<Connection>,
@@ -398,6 +399,24 @@ impl DBusServers {
                 try_start(StatusNotifierWatcher::new(to_niri, sn_from_niri));
             if dbus.conn_status_notifier.is_some() {
                 synoik.status_notifier_emit = Some(to_status_notifier);
+            }
+
+            // Remote search providers: a client of apps' services, owning no name.
+            let (to_niri, from_search) = calloop::channel::channel();
+            synoik
+                .event_loop
+                .insert_source(from_search, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.synoik.on_search_provider_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let (to_search, search_from_niri) = async_channel::unbounded();
+            match search_provider::start(to_niri, search_from_niri) {
+                Ok(conn) => {
+                    dbus.conn_search_provider = Some(conn);
+                    synoik.search_provider_emit = Some(to_search);
+                }
+                Err(err) => warn!("error starting the search provider client: {err:?}"),
             }
         }
 

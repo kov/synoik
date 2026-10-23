@@ -447,18 +447,9 @@ impl State {
                     SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
                         self.synoik.sync_overview_search();
                     }
-                    SearchOutcome::Activate(id) => {
-                        self.launch_app(
-                            &id,
-                            crate::app_system::LaunchMode::Activate,
-                            None,
-                            "search",
-                        );
-                        self.synoik.overview_search.clear();
-                        self.synoik.layout.close_overview();
-                    }
+                    SearchOutcome::ActivateDefault => self.activate_search_default(),
                     SearchOutcome::Close => {
-                        self.synoik.overview_search.clear();
+                        self.synoik.clear_overview_search();
                         // Escape tiers (`searchController.js:153-159`): search → grid → hide.
                         if !self.synoik.layout.close_app_grid() {
                             self.synoik.layout.close_overview();
@@ -2009,18 +2000,11 @@ impl State {
                                     SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
                                         this.synoik.sync_overview_search();
                                     }
-                                    SearchOutcome::Activate(id) => {
-                                        this.launch_app(
-                                            &id,
-                                            crate::app_system::LaunchMode::Activate,
-                                            None,
-                                            "search",
-                                        );
-                                        this.synoik.overview_search.clear();
-                                        this.synoik.layout.close_overview();
+                                    SearchOutcome::ActivateDefault => {
+                                        this.activate_search_default()
                                     }
                                     SearchOutcome::Close => {
-                                        this.synoik.overview_search.clear();
+                                        this.synoik.clear_overview_search();
                                         // Escape tiers (`searchController.js:153-159`):
                                         // search → grid → hide. The entry only returns
                                         // Close with no query, so fall through to the
@@ -3765,6 +3749,80 @@ impl State {
     ///
     /// Returns whether the caller should close the overview: GNOME hides it on every branch
     /// (`appDisplay.js:3073`), including the one that does nothing.
+    /// Enter in the search (`activateDefault`, `search.js:879-886`): a search still waiting out
+    /// its delay runs first, so Enter acts on what was typed.
+    fn activate_search_default(&mut self) {
+        self.synoik.flush_overview_search();
+        if let Some(activation) = self.synoik.overview_search.selected_activation() {
+            self.activate_search_result(activation, None);
+        }
+    }
+
+    /// Activate a search result, then leave the overview (`SearchResult.activate`,
+    /// `search.js:62-70`; `ProviderInfo`'s `clicked`, `search.js:303-307`). `button` is the
+    /// click's, `None` from the keyboard.
+    fn activate_search_result(
+        &mut self,
+        activation: crate::ui::overview_search::Activation,
+        button: Option<MouseButton>,
+    ) {
+        use crate::search_providers::SynoikToSearch;
+        use crate::ui::overview_search::Activation;
+
+        // `global.get_current_time()`: input event times are this clock's milliseconds.
+        let timestamp = crate::utils::get_monotonic_time().as_millis() as u32;
+        let terms = self.synoik.search_terms();
+        match activation {
+            Activation::App(id) => match button {
+                Some(_) => self.activate_app_icon(&id, button, "search"),
+                None => {
+                    self.launch_app(&id, crate::app_system::LaunchMode::Activate, None, "search");
+                }
+            },
+            Activation::Result {
+                provider,
+                id,
+                clipboard_text,
+            } => {
+                self.synoik.emit_search(SynoikToSearch::ActivateResult {
+                    provider,
+                    id,
+                    terms,
+                    timestamp,
+                });
+                if let Some(text) = clipboard_text {
+                    self.set_clipboard_text(text);
+                }
+            }
+            Activation::LaunchSearch { provider } => {
+                let can_launch_search = self
+                    .synoik
+                    .search_providers
+                    .iter()
+                    .find(|p| p.id() == provider)
+                    .is_some_and(|p| p.can_launch_search());
+                if can_launch_search {
+                    self.synoik.emit_search(SynoikToSearch::LaunchSearch {
+                        provider,
+                        terms,
+                        timestamp,
+                    });
+                } else {
+                    // A version 1 provider has no `LaunchSearch`: gnome-shell launches its app
+                    // instead (`remoteSearch.js:302-307`).
+                    self.launch_app(
+                        &provider,
+                        crate::app_system::LaunchMode::Activate,
+                        None,
+                        "search",
+                    );
+                }
+            }
+        }
+        self.synoik.clear_overview_search();
+        self.synoik.layout.close_overview();
+    }
+
     fn activate_app_icon(&mut self, id: &str, button: Option<MouseButton>, origin: &str) {
         // An icon reads the intent off the input: Ctrl or a middle-click asks for a new
         // window (`AppIcon._onButtonPress` / `activate`). Keyboard callers state it.
@@ -8963,19 +9021,23 @@ impl State {
             // the same handler to `toggle-application-view`), so from the dock — overview
             // shut — it opens the overview at the grid rather than doing nothing.
             OverviewHit::Dash(DashHit::ShowApps) if primary => self.toggle_apps_page(),
-            OverviewHit::Search(SearchHit::Result(i)) if launches => {
-                if let Some(id) = self.synoik.overview_search.result_id(i).map(str::to_owned) {
-                    // An app search result *is* an `AppIcon`
-                    // (`AppSearchProvider.createResultObject`, `appDisplay.js:1835-1839`),
-                    // so it takes the same two modifiers as the grid.
-                    self.activate_app_icon(&id, button, "search");
-                    self.synoik.overview_search.clear();
-                    self.synoik.layout.close_overview();
+            // An app search result *is* an `AppIcon` (`AppSearchProvider.createResultObject`,
+            // `appDisplay.js:1835-1839`), so it takes the same two buttons as the grid; a
+            // provider's row and header are plain `St.Button`s, primary only.
+            OverviewHit::Search(hit @ SearchHit::Result(_)) if launches => {
+                if let Some(activation) = self.synoik.overview_search.hit_activation(hit) {
+                    self.activate_search_result(activation, button);
+                }
+            }
+            OverviewHit::Search(hit @ (SearchHit::Row { .. } | SearchHit::Provider(_)))
+                if primary =>
+            {
+                if let Some(activation) = self.synoik.overview_search.hit_activation(hit) {
+                    self.activate_search_result(activation, button);
                 }
             }
             OverviewHit::Search(SearchHit::Clear) if primary => {
-                self.synoik.overview_search.clear();
-                self.synoik.sync_overview_search();
+                self.synoik.clear_overview_search();
             }
             // Clicking the entry focuses it, which is what grows the resting puck into
             // GNOME's pill. Already-open is a no-op (but still consumes, so the click never

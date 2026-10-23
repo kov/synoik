@@ -9501,6 +9501,23 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                 icon: AppIconRef::Fallback,
             },
         ]);
+        s.set_section(
+            "files.desktop",
+            Some(crate::ui::overview_search::ListSection {
+                order: 0,
+                provider: "files.desktop".into(),
+                name: "Files".into(),
+                icon: AppIconRef::Fallback,
+                rows: vec![crate::search_providers::ResultMeta {
+                    id: "/home".into(),
+                    name: "home".into(),
+                    description: Some("/home".into()),
+                    icon: None,
+                    clipboard_text: None,
+                }],
+                more: 0,
+            }),
+        );
     }
 
     let controls = f
@@ -9520,6 +9537,11 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         .overview_search
         .result_tile(1, area)
         .expect("tile 1");
+    let card = f
+        .synoik()
+        .overview_search
+        .section_card(0, area)
+        .expect("the section fits");
 
     let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
@@ -9593,9 +9615,22 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     let plain = edge(t1);
     eprintln!("vulkan_overview_search: selected={selected:?} plain={plain:?}");
     assert_eq!(
-        plain[3],
+        plain[3], 0,
+        "app results have no plate — only a provider's list section builds a \
+         `.search-section-content` (`search.js:296-299`): {plain:?}"
+    );
+    // Inside the section card's left padding, clear of its header.
+    let section = px(
+        &pixels,
+        w,
+        (card.loc.x + 7.) as i32,
+        (card.loc.y + card.size.h / 2.) as i32,
+    );
+    eprintln!("vulkan_overview_search: section={section:?}");
+    assert_eq!(
+        section[3],
         (f.synoik().appearance().plate()[3] * 255.).round() as u8,
-        "the results card must composite at the plate's alpha: {plain:?}"
+        "a provider's section must composite at the plate's alpha: {section:?}"
     );
     for ch in 0..3 {
         assert!(
