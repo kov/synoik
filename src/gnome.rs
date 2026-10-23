@@ -254,6 +254,8 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.search-providers`: which remote search providers run, and in what
     /// order (`remoteSearch.js:140-186`).
     pub search_providers: crate::search_providers::SearchProviderSettings,
+    /// `org.gnome.desktop.privacy remember-app-usage`: whether `Shell.AppUsage` counts.
+    pub remember_app_usage: bool,
     /// The accessibility state behind the `a11y` panel indicator and its menu.
     pub a11y: A11ySettings,
     /// `org.gnome.desktop.peripherals.*`: the pointer and keyboard device settings, which
@@ -569,6 +571,7 @@ impl Default for GnomeSettings {
             world_clocks: WorldClocks::default(),
             app_folders: Vec::new(),
             search_providers: Default::default(),
+            remember_app_usage: true,
             a11y: A11ySettings::default(),
             peripherals: Peripherals::default(),
         }
@@ -3049,6 +3052,8 @@ struct Stores {
     world_clocks: Option<gio::Settings>,
     app_folders: Option<gio::Settings>,
     search_providers: Option<gio::Settings>,
+    /// `org.gnome.desktop.privacy` — `remember-app-usage`.
+    privacy: Option<gio::Settings>,
     /// `org.gnome.desktop.a11y` — only `always-show-universal-access-status`, the
     /// indicator's pin (`accessibility.js:10-11`).
     a11y: Option<gio::Settings>,
@@ -3121,6 +3126,7 @@ impl Stores {
             world_clocks: gsettings("org.gnome.shell.world-clocks", b),
             app_folders: gsettings("org.gnome.desktop.app-folders", b),
             search_providers: gsettings("org.gnome.desktop.search-providers", b),
+            privacy: gsettings("org.gnome.desktop.privacy", b),
             a11y: gsettings("org.gnome.desktop.a11y", b),
             a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
@@ -3190,6 +3196,7 @@ impl Stores {
             &self.world_clocks,
             &self.app_folders,
             &self.search_providers,
+            &self.privacy,
             &self.a11y,
             &self.a11y_interface,
             &self.a11y_applications,
@@ -3288,6 +3295,11 @@ impl Stores {
                 disable_external: store.boolean("disable-external"),
                 sort_order: strv(store, "sort-order"),
             };
+        }
+        if let Some(store) = &self.privacy {
+            if settings_has_key(store, "remember-app-usage") {
+                settings.remember_app_usage = store.boolean("remember-app-usage");
+            }
         }
         settings
     }

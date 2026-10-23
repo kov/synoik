@@ -9601,6 +9601,11 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                 name: "B".into(),
                 icon: AppIconRef::Fallback,
             },
+            SearchResultEntry {
+                id: "power-off".into(),
+                name: "Power Off".into(),
+                icon: AppIconRef::Themed(vec!["system-shutdown-symbolic".into()]),
+            },
         ]);
         s.set_section(
             "files.desktop",
@@ -9654,6 +9659,11 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         .overview_search
         .row_icon(0, 0, area)
         .expect("the row fits");
+    let t2 = f
+        .synoik()
+        .overview_search
+        .result_tile(2, area)
+        .expect("tile 2");
 
     let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
@@ -9740,6 +9750,29 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         (card.loc.y + card.size.h / 2.) as i32,
     );
     eprintln!("vulkan_overview_search: section={section:?}");
+    // A system action's tile: `.system-action-icon`'s circle, `$system_fg_color` at 10%, inside
+    // its 96px icon box but clear of the 48px glyph — and nothing outside the circle.
+    let plate_px = |dx: f64| {
+        let probe = |y: f64| {
+            px(
+                &pixels,
+                w,
+                (t2.loc.x + t2.size.w / 2. + dx) as i32,
+                y as i32,
+            )
+        };
+        // The icon sits at the tile's top padding; scan its column for the plate's alpha.
+        (0..t2.size.h as i32)
+            .map(|y| probe(t2.loc.y + f64::from(y))[3])
+            .max()
+            .unwrap()
+    };
+    let inside = plate_px(40.);
+    eprintln!("vulkan_overview_search: action plate alpha={inside}");
+    assert!(
+        (20..=32).contains(&inside),
+        "the action's plate is fg at 10% (~26): {inside}"
+    );
     // The provider's own pixels, drawn as the row's icon, scaled up to fill its square.
     for (dx, dy) in [(0., 0.), (-10., -10.), (10., 10.)] {
         let icon = px(

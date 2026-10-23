@@ -335,6 +335,14 @@ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995
 /// `timeout_add_once(…, 150, …)`, `search.js:769`).
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
 
+/// Wall-clock seconds since the epoch — `g_get_real_time () / G_TIME_SPAN_SECOND`, the clock
+/// `Shell.AppUsage` stamps its file with. Not a deadline, so not the compositor's clock.
+fn wall_clock_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// What `SearchResultsView` keeps about the current search (`search.js`).
 #[derive(Default)]
 struct SearchRun {
@@ -1275,6 +1283,15 @@ pub struct Synoik {
     pub overview_search: OverviewSearch,
     /// The remote search providers, in section order.
     pub search_providers: Vec<crate::search_providers::Provider>,
+    /// How much each app is used — what orders the app search's results within a tier.
+    pub app_usage: crate::app_usage::AppUsage,
+    /// The queued write of [`Self::app_usage`].
+    app_usage_save: Option<TimerToken>,
+    /// Where [`Self::app_usage`] is kept: gnome-shell's `application_state`, and nowhere under
+    /// test, so the corpus neither reads nor writes the host's.
+    app_usage_path: Option<std::path::PathBuf>,
+    /// A search result asked for the screenshot UI: it opens once the overview is hidden.
+    pub screenshot_after_overview: bool,
     /// Where provider `.ini` files are discovered: the system data dirs, and none under test,
     /// so the corpus never reads the host's providers — a test installs its own.
     pub search_provider_dirs: Vec<std::path::PathBuf>,
@@ -2505,6 +2522,7 @@ impl State {
                 .synoik
                 .panel
                 .set_a11y(state.synoik.gnome_settings.a11y);
+            state.synoik.sync_app_usage_monitoring();
             state
                 .synoik
                 .event_loop
@@ -2565,6 +2583,7 @@ impl State {
                         );
                         state.synoik.gnome_settings = settings;
                         state.synoik.set_search_provider_settings(search_providers);
+                        state.synoik.sync_app_usage_monitoring();
                         state.synoik.sync_cursor_settings();
                         state.sync_keyboard_a11y();
                         state.sync_pointer_a11y();
@@ -2684,6 +2703,12 @@ impl State {
         }
 
         self.refresh();
+
+        // A search result's screenshot waits for the overview to be gone (`overview 'hidden'`).
+        if self.synoik.screenshot_after_overview && self.synoik.layout.is_overview_hidden() {
+            self.synoik.screenshot_after_overview = false;
+            self.open_screenshot_ui(None);
+        }
 
         // Advance animations to the current time (not target render time) before rendering outputs
         // in order to clear completed animations and render elements. Even if we're not rendering,
@@ -7652,6 +7677,17 @@ impl State {
         let PresenceToSynoik::StatusChanged(status) = msg;
         let now = self.synoik.shield_now();
 
+        // `Shell.AppUsage` reads idleness off the same signal (`shell-app-usage.c:233-263`), as
+        // `status >= IDLE`.
+        let idle = match status {
+            PresenceStatus::Idle => true,
+            PresenceStatus::Unknown(n) => n >= 3,
+            PresenceStatus::Available | PresenceStatus::Busy | PresenceStatus::Invisible => false,
+        };
+        if self.synoik.app_usage.set_idle(idle, wall_clock_secs()) {
+            self.synoik.queue_app_usage_save();
+        }
+
         let effects = match status {
             PresenceStatus::Idle => self.synoik.screen_shield.on_session_idle(now),
             // Only `Available` counts as the user coming back. GNOME hangs this on the core idle
@@ -9254,6 +9290,14 @@ impl Synoik {
             dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
             search_providers: Vec::new(),
+            app_usage: if cfg!(test) {
+                crate::app_usage::AppUsage::new()
+            } else {
+                crate::app_usage::AppUsage::load(&crate::app_usage::data_path(), wall_clock_secs())
+            },
+            app_usage_save: None,
+            app_usage_path: (!cfg!(test)).then(crate::app_usage::data_path),
+            screenshot_after_overview: false,
             search_provider_dirs: if cfg!(test) {
                 Vec::new()
             } else {
@@ -17262,16 +17306,7 @@ impl Synoik {
     fn clear_urgency_of_focused_app(&mut self) {
         use crate::utils::with_toplevel_role;
 
-        let focused_app = self.layout.focus().and_then(|focused| {
-            let app_id = with_toplevel_role(focused.toplevel(), |role| role.app_id.clone())?;
-            let sandbox = self
-                .app_system
-                .sandbox_id_cached(focused.credentials().map(|c| c.pid));
-            self.app_system
-                .app_for_window(&app_id, sandbox)
-                .map(|entry| entry.id)
-        });
-        let Some(focused_app) = focused_app else {
+        let Some(focused_app) = self.focused_app_id() else {
             return;
         };
 
@@ -17293,12 +17328,114 @@ impl Synoik {
         });
     }
 
+    /// Whether the search may offer `action` (`systemActions.js:352-450`). The search only runs in
+    /// the unlocked overview, so what is left of the session-mode gates is the lockdown keys.
+    ///
+    /// **Divergences**, shared with the power menu: Power Off, Restart and Suspend do not ask
+    /// gnome-session's `CanShutdown`/`CanReboot`/`CanSuspend`, and Log Out is always offered —
+    /// gnome-shell offers it only with more than one user or session, a non-local or system
+    /// account, or `always-show-log-out`. Lock Orientation needs a panel whose orientation is
+    /// managed, which nothing here reports, so it never is.
+    pub fn system_action_available(&self, action: crate::system_actions::SystemAction) -> bool {
+        use crate::system_actions::SystemAction;
+        let shield = self.screen_shield.settings();
+        match action {
+            SystemAction::PowerOff
+            | SystemAction::Restart
+            | SystemAction::Suspend
+            | SystemAction::Logout
+            | SystemAction::Screenshot => true,
+            SystemAction::LockScreen => !shield.disable_lock_screen,
+            SystemAction::SwitchUser => {
+                self.can_switch_user && self.multiple_users && !shield.disable_user_switching
+            }
+            SystemAction::LockOrientation => false,
+        }
+    }
+
+    /// The app the focused window belongs to — `ShellWindowTracker:focus-app`.
+    fn focused_app_id(&self) -> Option<String> {
+        use crate::utils::with_toplevel_role;
+
+        let focused = self.layout.focus()?;
+        let app_id = with_toplevel_role(focused.toplevel(), |role| role.app_id.clone())?;
+        let sandbox = self
+            .app_system
+            .sandbox_id_cached(focused.credentials().map(|c| c.pid));
+        self.app_system
+            .app_for_window(&app_id, sandbox)
+            .map(|entry| entry.id)
+    }
+
+    /// Feed the focus app to [`crate::app_usage`] (`notify::focus-app`, `shell-app-usage.c:218`).
+    fn track_app_usage(&mut self) {
+        if !self.app_usage.is_monitoring() {
+            return;
+        }
+        let focused = self.focused_app_id();
+        if self
+            .app_usage
+            .focus_changed(focused.as_deref(), wall_clock_secs())
+        {
+            self.queue_app_usage_save();
+        }
+    }
+
+    /// `remember-app-usage` as read now (`update_enable_monitoring`): on, the focus app is
+    /// watched from here; off, nothing is counted and a queued save is dropped.
+    pub fn sync_app_usage_monitoring(&mut self) {
+        let enable = self.gnome_settings.remember_app_usage;
+        let focused = self.focused_app_id();
+        self.app_usage
+            .set_monitoring(enable, focused.as_deref(), wall_clock_secs());
+        if !enable {
+            if let Some(token) = self.app_usage_save.take() {
+                self.cancel_timer(token);
+            }
+        }
+    }
+
+    /// `ensure_queued_save`: write the scores [`SAVE_APPS_TIMEOUT_SECONDS`] after the first
+    /// change since the last write.
+    ///
+    /// [`SAVE_APPS_TIMEOUT_SECONDS`]: crate::app_usage::SAVE_APPS_TIMEOUT_SECONDS
+    pub fn queue_app_usage_save(&mut self) {
+        if self.app_usage_save.is_some() || self.app_usage_path.is_none() {
+            return;
+        }
+        self.app_usage_save = Some(self.timer_after(
+            Duration::from_secs(crate::app_usage::SAVE_APPS_TIMEOUT_SECONDS),
+            |state| {
+                state.synoik.app_usage_save = None;
+                state.synoik.save_app_usage();
+                None
+            },
+        ));
+    }
+
+    /// `idle_save_application_usage`: every app the catalog still knows.
+    fn save_app_usage(&self) {
+        let Some(path) = &self.app_usage_path else {
+            return;
+        };
+        let xml = self
+            .app_usage
+            .to_xml(|id| self.app_system.lookup(id).is_some());
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(err) = crate::session_state::write_atomically(path, xml.as_bytes()) {
+            debug!("could not save applications usage data: {err}");
+        }
+    }
+
     pub fn sync_running_apps(&mut self) -> bool {
         use crate::app_system::RunningWindow;
         use crate::utils::with_toplevel_role;
 
         // Before the snapshot, so a window cleared here never reaches the dash as urgent.
         self.clear_urgency_of_focused_app();
+        self.track_app_usage();
 
         // Sweep timed-out startup sequences here too — mutter runs a timeout source
         // for the same purpose (`startup_sequence_timeout`,
@@ -17882,10 +18019,10 @@ impl Synoik {
         }
         // The built-in `AppSearchProvider` (`appDisplay.js:1801-1831`):
         // `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` →
-        // concat → cap at [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS), or at the
-        // columns that fit (`_getMaxDisplayedResults`, `search.js:530-541`) — on the narrowest
-        // output, as one result set is drawn on all of them. (No `Shell.AppUsage` within-tier
-        // sort yet.)
+        // each tier sorted by `Shell.AppUsage` → concat → the matching system actions → cap at
+        // [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS), or at the columns that fit
+        // (`_getMaxDisplayedResults`, `search.js:530-541`) — on the narrowest output, as one
+        // result set is drawn on all of them.
         let cap = self
             .global_space
             .outputs()
@@ -17896,22 +18033,29 @@ impl Synoik {
             .min(crate::ui::overview_search::MAX_RESULTS);
         let query = self.search_run.terms.join(" ");
         let mut results = Vec::new();
-        'outer: for group in self.app_system.search(&query) {
-            for id in group {
-                if let Some(entry) = self.app_system.lookup(&id) {
-                    if entry.should_show {
-                        results.push(SearchResultEntry {
-                            id: entry.id,
-                            name: entry.name,
-                            icon: entry.icon,
-                        });
-                        if results.len() >= cap {
-                            break 'outer;
-                        }
-                    }
-                }
-            }
+        for group in self.app_system.search(&query) {
+            let mut group: Vec<_> = group
+                .iter()
+                .filter_map(|id| self.app_system.lookup(id))
+                .filter(|entry| entry.should_show)
+                .collect();
+            // Stable, as `Array.prototype.sort` is: equal use keeps the relevance order.
+            group.sort_by(|a, b| self.app_usage.compare(&a.id, &b.id));
+            results.extend(group.into_iter().map(|entry| SearchResultEntry {
+                id: entry.id,
+                name: entry.name,
+                icon: entry.icon,
+            }));
         }
+        let actions = crate::system_actions::matching(&self.search_run.terms, |action| {
+            self.system_action_available(action)
+        });
+        results.extend(actions.into_iter().map(|action| SearchResultEntry {
+            id: action.id().to_owned(),
+            name: action.name().to_owned(),
+            icon: crate::app_system::AppIconRef::Themed(vec![action.icon_name().to_owned()]),
+        }));
+        results.truncate(cap);
         self.overview_search.set_results(results);
 
         self.search_run.pending = if self.search_provider_emit.is_some() {

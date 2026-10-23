@@ -7434,6 +7434,11 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
+    /// Closed and done closing — the overview's `hidden`.
+    pub fn is_overview_hidden(&self) -> bool {
+        !self.overview_open && self.overview_progress.is_none()
+    }
+
     /// The workspace a drop at `pos` on `output` would land on, if it is an
     /// existing one: the workspace under the pointer in the picker, or the
     /// thumbnail under it in the strip (gnome-shell's `Workspace.acceptDrop` /

@@ -18,8 +18,10 @@
 //! **Faithful behavior.** Tokenize = trim + split on whitespace (`searchController.js:19-24`).
 //! The search runs 150 ms after the first keystroke that changed the terms; Enter runs a
 //! pending one first (`search.js:741-772,879-886`). App provider:
-//! `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` → concat
-//! → cap [`MAX_RESULTS`] (`appDisplay.js:1801-1831`). Sections follow the providers' order and
+//! `AppSystem.search(terms.join(' '))` → relevance-tier groups → filter `should_show` → each
+//! tier by `Shell.AppUsage` ([`crate::app_usage`]) → concat → the matching system actions
+//! ([`crate::system_actions`], drawn as `.system-action-icon`) → cap [`MAX_RESULTS`]
+//! (`appDisplay.js:1801-1831`). Sections follow the providers' order and
 //! show up to five rows with an "N more" header (`search.js:293-340`). The default selection
 //! is the first result of the first section that has one (`_maybeSetInitialSelection`);
 //! Enter activates it. Until nothing is showing *and* every provider has answered the status
@@ -27,9 +29,9 @@
 //! bold (`Util.Highlighter`). Escape while active clears, it does not close
 //! (`searchController.js:153-160`).
 //!
-//! **Divergences:** no `Shell.AppUsage` ordering within a relevance tier, and no
-//! `SystemActions` results. Enter inside the search delay activates what the typed terms find;
-//! gnome-shell's app provider answers asynchronously, so its Enter activates the previous
+//! **Divergences:** the system actions' availability is the power menu's (see
+//! `Synoik::system_action_available`). Enter inside the search delay activates what the typed terms
+//! find; gnome-shell's app provider answers asynchronously, so its Enter activates the previous
 //! default. The results scroll by wheel and touchpad, and the selection is eased into view;
 //! there is no touch-drag panning, no overlay scrollbar and no vfade — the view's edge is a hard
 //! clip. The keyboard walks the stops in one line — the app results, then each
@@ -273,6 +275,8 @@ pub struct ListSection {
 pub enum Activation {
     /// Launch an app result.
     App(String),
+    /// A system action the app search found (`SystemActionIcon.activate`).
+    SystemAction(crate::system_actions::SystemAction),
     /// A provider's result: `ActivateResult` on its provider, then copy its clipboard text.
     Result {
         provider: String,
@@ -364,6 +368,8 @@ struct SearchCache {
     icons: SharedAppIconUploads,
     /// The "Searching" spinner.
     spinner: widget::Spinner,
+    /// A system action's round plate.
+    action_plate: widget::BakeCache,
     /// Inline icon pixels a provider sent, sized for the row and uploaded, by provider, result
     /// id and scale — with the pixels they were made from, so a result whose icon changed is
     /// uploaded again.
@@ -502,7 +508,14 @@ impl OverviewSearch {
 
     fn activation(&self, item: Item) -> Option<Activation> {
         Some(match item {
-            Item::App(i) => Activation::App(self.results.get(i)?.id.clone()),
+            Item::App(i) => {
+                let id = &self.results.get(i)?.id;
+                // `createResultObject` tells the two apart by the `.desktop` suffix.
+                match crate::system_actions::SystemAction::from_id(id) {
+                    Some(action) if !id.ends_with(".desktop") => Activation::SystemAction(action),
+                    _ => Activation::App(id.clone()),
+                }
+            }
             Item::Header(section) => {
                 let section = self.sections.get(section)?;
                 Activation::LaunchSearch {
@@ -731,6 +744,12 @@ impl OverviewSearch {
     /// The id of result `i`, if present (what a click activates).
     pub fn result_id(&self, i: usize) -> Option<&str> {
         self.results.get(i).map(|e| e.id.as_str())
+    }
+
+    /// Result `i`'s desktop id when it is an app — what has a menu and can be dragged. A system
+    /// action is a plain `GridSearchResult`, neither.
+    pub fn result_app_id(&self, i: usize) -> Option<&str> {
+        self.result_id(i).filter(|id| id.ends_with(".desktop"))
     }
 
     /// The icon of result `i`, if present (what a drag of that tile carries).
@@ -1386,13 +1405,77 @@ impl OverviewSearch {
                     elements.push(el);
                 }
             };
+            let mut actions = Vec::new();
             for (entry, tile) in self.results.iter().zip(&results.tiles) {
                 let center = Point::from((
                     tile.loc.x + tile.size.w / 2.,
                     tile.loc.y + TILE_PAD + RESULT_ICON_PX / 2.,
                 ));
-                push_icon(&entry.icon, RESULT_ICON_PX, center);
+                if entry.id.ends_with(".desktop") {
+                    push_icon(&entry.icon, RESULT_ICON_PX, center);
+                } else if let AppIconRef::Themed(names) = &entry.icon {
+                    actions.extend(names.first().map(|name| (name.clone(), center)));
+                }
             }
+            drop(push_icon);
+            drop(uploads);
+            // `.system-action-icon` (`_app-grid.scss:139-147`): the symbolic glyph at half the
+            // icon size, in `$system_fg_color`, on a circle of it at 10%.
+            for (name, center) in actions {
+                if let Some(tb) =
+                    sym_icons.texture(renderer, &name, RESULT_ICON_PX / 2., scale, style::TEXT)
+                {
+                    let logical = tb.logical_size();
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb,
+                        center - Point::from((logical.w / 2., logical.h / 2.)),
+                        results_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                let plate = widget::bake(
+                    renderer,
+                    &mut cache.action_plate,
+                    scale,
+                    Size::from((RESULT_ICON_PX, RESULT_ICON_PX)),
+                    0,
+                    |_| Ok(()),
+                    |frame, phys, ()| {
+                        let mut p = widget::Painter::new(frame, scale, phys);
+                        p.clear(style::TRANSPARENT)?;
+                        p.fill_rounded_full(RESULT_ICON_PX / 2., [1., 1., 1., 0.1])
+                    },
+                );
+                match plate {
+                    Ok(tb) => elements.push(TextureRenderElement::from_texture_buffer(
+                        tb,
+                        center - Point::from((RESULT_ICON_PX / 2., RESULT_ICON_PX / 2.)),
+                        results_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    )),
+                    Err(err) => tracing::error!("error baking a system action plate: {err:#}"),
+                }
+            }
+            let mut uploads = cache.icons.borrow_mut();
+            let mut push_icon = |icon: &AppIconRef, px: f64, center: Point<f64, Logical>| {
+                if let Some(el) = widget::app_icon_element(
+                    renderer,
+                    &mut uploads,
+                    app_icons,
+                    icon,
+                    px,
+                    scale,
+                    Point::from((0., 0.)),
+                    center,
+                    results_alpha,
+                ) {
+                    elements.push(el);
+                }
+            };
             for (section, sl) in self.sections.iter().zip(&results.sections) {
                 let center = Point::from((
                     sl.header.loc.x + ITEM_PAD + PROVIDER_ICON_PX / 2.,
@@ -2881,6 +2964,7 @@ run it with --features reference-env, as the fedora CI job does"
         match s.selected_activation().unwrap() {
             Activation::App(id) | Activation::Result { id, .. } => id,
             Activation::LaunchSearch { provider, .. } => format!("header:{provider}"),
+            Activation::SystemAction(action) => action.id().to_owned(),
         }
     }
 

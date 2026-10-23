@@ -3228,7 +3228,10 @@ impl State {
                 PopoverSide::Left,
             ),
             OverviewHit::Search(SearchHit::Result(i)) => (
-                self.synoik.overview_search.result_id(i).map(str::to_owned),
+                self.synoik
+                    .overview_search
+                    .result_app_id(i)
+                    .map(str::to_owned),
                 self.synoik.overview_search.result_rect(i, controls.into()),
                 PopoverSide::Left,
             ),
@@ -3779,6 +3782,7 @@ impl State {
                     self.launch_app(&id, crate::app_system::LaunchMode::Activate, None, "search");
                 }
             },
+            Activation::SystemAction(action) => self.activate_system_action(action),
             Activation::Result {
                 provider,
                 id,
@@ -3824,6 +3828,32 @@ impl State {
         }
         self.synoik.clear_overview_search();
         self.synoik.layout.close_overview();
+    }
+
+    /// `SystemActions.activateAction` (`systemActions.js:323-350`); the overview is left by the
+    /// caller, as `SystemActionIcon.activate` hides it.
+    fn activate_system_action(&mut self, action: crate::system_actions::SystemAction) {
+        use crate::end_session::SessionRequest;
+        use crate::system_actions::SystemAction;
+
+        // Offered only when available, but the result can outlive a change of that.
+        if !self.synoik.system_action_available(action) {
+            return;
+        }
+        match action {
+            SystemAction::PowerOff => self.request_session_action(SessionRequest::PowerOff),
+            SystemAction::Restart => self.request_session_action(SessionRequest::Reboot),
+            SystemAction::Logout => self.request_session_action(SessionRequest::Logout),
+            SystemAction::Suspend => self.request_session_action(SessionRequest::Suspend),
+            // `Main.screenShield.lock(true)`.
+            SystemAction::LockScreen => self.on_screen_saver_msg(
+                crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(None),
+            ),
+            SystemAction::SwitchUser => self.activate_switch_user(),
+            // Once the overview is `hidden`, so the shot is not of it (`activateScreenshotUI`).
+            SystemAction::Screenshot => self.synoik.screenshot_after_overview = true,
+            SystemAction::LockOrientation => {}
+        }
     }
 
     fn activate_app_icon(&mut self, id: &str, button: Option<MouseButton>, origin: &str) {
@@ -7251,7 +7281,10 @@ impl State {
             // grid uses, so it is draggable for the same reasons (`appDisplay.js`
             // `AppSearchProvider` results are `AppIcon`s).
             OverviewHit::Search(SearchHit::Result(i)) => (
-                self.synoik.overview_search.result_id(*i).map(str::to_owned),
+                self.synoik
+                    .overview_search
+                    .result_app_id(*i)
+                    .map(str::to_owned),
                 self.synoik.overview_search.result_icon(*i).cloned(),
                 controls.and_then(|c| self.synoik.overview_search.result_center(*i, c.into())),
             ),

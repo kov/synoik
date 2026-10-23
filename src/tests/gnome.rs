@@ -23495,6 +23495,129 @@ fn remote_search_providers_follow_the_search_settings() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Within a relevance tier the app results go by use, most used first, apps never used last
+/// (`group.sort((a, b) => usage.compare(a, b))`, `appDisplay.js:1817-1823`); tiers keep their
+/// order whatever the use.
+#[test]
+fn app_search_orders_each_tier_by_usage() {
+    let (mut f, _rec) = search_overview(&[
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["d.desktop", "e.desktop"],
+    ]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    f.synoik().app_usage = crate::app_usage::AppUsage::from_xml(
+        &format!(
+            "<application-state><context id=\"\">\
+             <application id=\"b.desktop\" score=\"50\" last-seen=\"{now}\"/>\
+             <application id=\"c.desktop\" score=\"0.5\" last-seen=\"{now}\"/>\
+             <application id=\"e.desktop\" score=\"900\" last-seen=\"{now}\"/>\
+             </context></application-state>"
+        ),
+        now as i64,
+    );
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let ids: Vec<String> = (0..5)
+        .filter_map(|i| f.synoik().overview_search.result_id(i).map(str::to_owned))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "b.desktop",
+            "c.desktop",
+            "a.desktop",
+            "e.desktop",
+            "d.desktop"
+        ],
+        "each tier by use; the most used app of all stays in its tier"
+    );
+}
+
+/// The app search also finds the system actions by keyword, after the apps
+/// (`getMatchingActions`, `systemActions.js:296-313`), drawn as `SystemActionIcon`s: Enter on
+/// one runs it and leaves the overview. One the lockdown keys take away is not offered.
+#[test]
+fn app_search_finds_system_actions_and_runs_them() {
+    const KEY_L: u32 = 38;
+
+    let (mut f, _rec) = search_overview(&[&["lockapp.desktop"]]);
+    for key in [KEY_L, KEY_O, KEY_C, KEY_K] {
+        tap(&mut f, key);
+    }
+    search_settle(&mut f);
+    let ids: Vec<String> = (0..3)
+        .filter_map(|i| f.synoik().overview_search.result_id(i).map(str::to_owned))
+        .collect();
+    assert_eq!(
+        ids,
+        ["lockapp.desktop", "lock-screen"],
+        "after the apps; Lock Orientation is never available here"
+    );
+    assert_eq!(
+        f.synoik().overview_search.result_app_id(1),
+        None,
+        "an action has no app menu and is not dragged"
+    );
+
+    tap(&mut f, KEY_TAB);
+    tap(&mut f, KEY_ENTER);
+    f.settle();
+    assert!(
+        f.synoik().screen_shield.is_active(),
+        "Lock Screen locks (`Main.screenShield.lock(true)`)"
+    );
+    assert!(!f.synoik().layout.is_overview_open());
+
+    // Locked down, it is not offered.
+    let (mut f, _rec) = search_overview(&[]);
+    f.synoik()
+        .screen_shield
+        .set_settings(crate::screen_shield::ShieldSettings {
+            disable_lock_screen: true,
+            ..Default::default()
+        });
+    for key in [KEY_L, KEY_O, KEY_C, KEY_K] {
+        tap(&mut f, key);
+    }
+    search_settle(&mut f);
+    assert_eq!(f.synoik().overview_search.result_id(0), None);
+}
+
+/// Take a Screenshot waits for the overview to be hidden before it opens, so the shot is not
+/// of the overview (`activateScreenshotUI`, `systemActions.js:513-524`).
+#[test]
+fn the_screenshot_action_waits_for_the_overview_to_hide() {
+    const KEY_N: u32 = 49;
+    const KEY_I: u32 = 23;
+    const KEY_P: u32 = 25;
+
+    // "snip": "scree" would find Lock Screen first, by its "screen".
+    let (mut f, _rec) = search_overview(&[]);
+    for key in [KEY_S, KEY_N, KEY_I, KEY_P] {
+        tap(&mut f, key);
+    }
+    search_settle(&mut f);
+    assert_eq!(
+        f.synoik().overview_search.result_id(0),
+        Some("open-screenshot-ui")
+    );
+    tap(&mut f, KEY_ENTER);
+    assert!(
+        f.synoik().screenshot_after_overview,
+        "held while the overview animates out"
+    );
+    assert!(!f.synoik().layout.is_overview_hidden());
+    f.settle();
+    assert!(f.synoik().layout.is_overview_hidden());
+    assert!(
+        !f.synoik().screenshot_after_overview,
+        "taken once the overview is hidden"
+    );
+}
+
 /// The search runs 150 ms after the **first** keystroke of a burst, not the last:
 /// `setTerms` arms its timeout only when none is running (`search.js:769-770`). It then asks
 /// every provider at once, with everything typed by then.
