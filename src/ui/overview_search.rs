@@ -23,33 +23,35 @@
 //! show up to five rows with an "N more" header (`search.js:293-340`). The default selection
 //! is the first result of the first section that has one (`_maybeSetInitialSelection`);
 //! Enter activates it. Until nothing is showing *and* every provider has answered the status
-//! reads "Searching", then "No results". Escape while active clears, it does not close
+//! reads "Searching" under a spinner, then "No results". A row's description has the terms in
+//! bold (`Util.Highlighter`). Escape while active clears, it does not close
 //! (`searchController.js:153-160`).
 //!
 //! **Divergences:** no `Shell.AppUsage` ordering within a relevance tier, and no
 //! `SystemActions` results. Enter inside the search delay activates what the typed terms find;
 //! gnome-shell's app provider answers asynchronously, so its Enter activates the previous
 //! default. The results do not scroll: a section that would run past the bottom of the results
-//! view is left out. Rows draw themed and file icons only, not icon pixels a provider sends
-//! inline, and the description is not highlighted with the terms. The status has no spinner.
-//! A section header is not a keyboard stop. Two provider files for one app make one provider,
-//! the first. GNOME's stage-capture `reset-search` gesture (a
+//! view is left out. A section header is not a keyboard stop. Two provider files for one app make
+//! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
 //! click outside the entry/results clears the search) is not ported: such a click falls
 //! through to the picker and the query survives until the next overview enter. Like the
 //! panel and dash, the search draws on **every** output with one shared selection/hover
 //! (GNOME shows it on the primary monitor only); hit-testing is still per-output.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::Duration;
 
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::texture::TextureRenderElement;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::search_providers::{ResultIcon, ResultMeta};
 use crate::ui::overview_layout::ControlsLayout;
@@ -194,6 +196,10 @@ const STATUS_PT: f64 = 20.;
 /// The status line's box: wide enough for the 20pt string, tall enough for its line.
 const STATUS_W: f64 = ENTRY_WIDTH;
 const STATUS_H: f64 = 40.;
+/// `SEARCH_SPINNER_SIZE` (`search.js:24`), above the status text.
+const SPINNER_PX: f64 = 64.;
+/// `.search-statusbox` `spacing: $base_padding * 4`, between the spinner and the text.
+const STATUS_SPACING: f64 = 24.;
 /// `#searchResults` `margin: 0 $base_margin`.
 const RESULTS_MARGIN: f64 = 4.;
 /// `#searchResultsContent` `max-width` — the column the results are centered in.
@@ -340,6 +346,13 @@ struct SearchCache {
     results_bake: widget::BakeCache,
     /// Full-color result-icon uploads (shared key space with the dash's).
     icons: SharedAppIconUploads,
+    /// The "Searching" spinner.
+    spinner: widget::Spinner,
+    /// Inline icon pixels a provider sent, uploaded, by provider and result id — with the
+    /// pixels they were made from, so a result whose icon changed is uploaded again.
+    pixel_icons: HashMap<(String, String), (Vec<u8>, TextureBuffer<VkTexture>)>,
+    /// The renderer `pixel_icons` were uploaded to.
+    pixel_context: Option<ContextId<VkTexture>>,
 }
 
 /// The overview search model. Owned on `Synoik`; fed results by `sync_overview_search`.
@@ -601,6 +614,11 @@ impl OverviewSearch {
     }
 
     /// Whether a provider is still searching — what the empty state reads.
+    /// The status spinner is on show: something is still searching, and nothing is showing.
+    pub fn is_spinning(&self) -> bool {
+        self.is_active() && self.searching && self.has_no_results()
+    }
+
     pub fn set_searching(&mut self, searching: bool) {
         if self.searching != searching {
             self.searching = searching;
@@ -867,8 +885,9 @@ impl OverviewSearch {
         let bottom = area.results.loc.y + area.results.size.h;
 
         if self.has_no_results() {
-            // `_statusContainer`, centered in the whole results view.
-            let size = Size::from((STATUS_W, STATUS_H));
+            // `_statusContainer`, centered in the whole results view: the spinner's square,
+            // which keeps its place while stopped (it only goes transparent), then the text.
+            let size = Size::from((STATUS_W, SPINNER_PX + STATUS_SPACING + STATUS_H));
             let status = Rectangle::new(
                 Point::from((
                     (area.results.loc.x + (area.results.size.w - size.w) / 2.).round(),
@@ -1065,6 +1084,31 @@ impl OverviewSearch {
         Some(self.layout(area).results?.sections.get(i)?.card)
     }
 
+    /// The centre of a row's icon — a geometry probe for the render test.
+    #[cfg(test)]
+    pub fn row_icon(
+        &self,
+        section: usize,
+        row: usize,
+        area: SearchArea,
+    ) -> Option<Point<f64, Logical>> {
+        let results = self.layout(area).results?;
+        Some(row_icon_center(
+            *results.sections.get(section)?.rows.get(row)?,
+        ))
+    }
+
+    /// The spinner's centre and the circle's radius — a geometry probe for the render test.
+    #[cfg(test)]
+    pub fn spinner_ring(&self, area: SearchArea) -> Option<(Point<f64, Logical>, f64)> {
+        let status = self.layout(area).results?.status?;
+        let center = Point::from((
+            status.loc.x + status.size.w / 2.,
+            status.loc.y + SPINNER_PX / 2.,
+        ));
+        Some((center, widget::Spinner::geometry(SPINNER_PX).0))
+    }
+
     /// Where `hit` is drawn — what the conformance corpus clicks.
     pub fn hit_center(&self, hit: SearchHit, area: SearchArea) -> Option<Point<f64, Logical>> {
         let results = self.layout(area).results?;
@@ -1099,6 +1143,8 @@ impl OverviewSearch {
         // `org.gnome.desktop.interface color-scheme`, for the two surfaces here that take the
         // shared plate: the entry pill and the results card.
         appearance: widget::style::Appearance,
+        // How long the spinner has been spinning, while [`Self::is_spinning`].
+        spin: Duration,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let SearchFade { overview, search } = fade;
         let scale = output.current_scale().fractional_scale();
@@ -1173,6 +1219,29 @@ impl OverviewSearch {
             ));
         }
 
+        // `_statusSpinner.play()` while a provider is still searching and nothing shows.
+        if let Some(status) = layout
+            .results
+            .as_ref()
+            .and_then(|r| r.status)
+            .filter(|_| self.searching)
+        {
+            let center = Point::from((
+                status.loc.x + status.size.w / 2.,
+                status.loc.y + SPINNER_PX / 2.,
+            ));
+            elements.extend(cache.spinner.elements(
+                renderer,
+                scale,
+                center,
+                SPINNER_PX,
+                spin,
+                // The statusbox's colour: `$system_fg_color`.
+                [1., 1., 1., 1.],
+                results_alpha,
+            ));
+        }
+
         // --- Result icons (topmost, over their tiles and rows). ---
         if let Some(results) = &layout.results {
             let mut uploads = cache.icons.borrow_mut();
@@ -1235,6 +1304,7 @@ impl OverviewSearch {
                     ));
                 }
             }
+            self.push_pixel_icons(renderer, &mut cache, results, results_alpha, &mut elements);
         }
 
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
@@ -1302,6 +1372,80 @@ impl OverviewSearch {
 }
 
 impl OverviewSearch {
+    /// The rows whose icon is pixels the provider sent: uploaded once per result, drawn
+    /// aspect-fitted into the row's icon square (`St.Icon`'s `icon_size` on a `GdkPixbuf`).
+    fn push_pixel_icons(
+        &self,
+        renderer: &mut VulkanRenderer,
+        cache: &mut SearchCache,
+        results: &ResultsLayout,
+        alpha: f32,
+        elements: &mut Vec<TextureRenderElement<VkTexture>>,
+    ) {
+        let context = renderer.context_id();
+        if cache.pixel_context.as_ref() != Some(&context) {
+            cache.pixel_icons.clear();
+            cache.pixel_context = Some(context);
+        }
+        // Only what is on show stays uploaded.
+        cache.pixel_icons.retain(|(provider, id), _| {
+            self.sections
+                .iter()
+                .any(|s| s.provider == *provider && s.rows.iter().any(|m| m.id == *id))
+        });
+        for (section, sl) in self.sections.iter().zip(&results.sections) {
+            for (meta, row) in section.rows.iter().zip(&sl.rows) {
+                let Some(ResultIcon::Pixels {
+                    width,
+                    height,
+                    rgba,
+                }) = &meta.icon
+                else {
+                    continue;
+                };
+                let key = (section.provider.clone(), meta.id.clone());
+                let stale = cache
+                    .pixel_icons
+                    .get(&key)
+                    .is_none_or(|(src, _)| src != rgba);
+                if stale {
+                    match TextureBuffer::from_memory(
+                        renderer,
+                        rgba,
+                        Fourcc::Abgr8888,
+                        (*width as i32, *height as i32),
+                        false,
+                        1.,
+                        Transform::Normal,
+                        Vec::new(),
+                    ) {
+                        Ok(tb) => {
+                            cache.pixel_icons.insert(key.clone(), (rgba.clone(), tb));
+                        }
+                        Err(err) => {
+                            tracing::error!("error uploading a search result icon: {err:#}");
+                            continue;
+                        }
+                    }
+                }
+                let Some((_, tb)) = cache.pixel_icons.get(&key) else {
+                    continue;
+                };
+                let fit = ROW_ICON_PX / f64::from((*width).max(*height).max(1));
+                let size = Size::from((f64::from(*width) * fit, f64::from(*height) * fit));
+                let loc = row_icon_center(*row) - Point::from((size.w / 2., size.h / 2.));
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    tb.clone(),
+                    loc,
+                    alpha,
+                    None,
+                    Some(size),
+                    Kind::Unspecified,
+                ));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_results(
         &self,
@@ -1348,20 +1492,23 @@ impl OverviewSearch {
                 (rel(*tile), lines)
             })
             .collect();
+        let terms = tokenize(self.query());
         let mut texts = Vec::new();
         for (section, sl) in self.sections.iter().zip(&results.sections) {
-            section_texts(section, sl, origin, &mut texts);
+            section_texts(section, sl, origin, &terms, &mut texts);
         }
-        if let Some(status) = results.status {
+        if let Some(status) = results.status.map(status_text) {
             texts.push(TextItem {
-                text: if self.searching {
-                    "Searching"
-                } else {
-                    "No results"
-                }
-                .to_owned(),
+                runs: vec![(
+                    if self.searching {
+                        "Searching"
+                    } else {
+                        "No results"
+                    }
+                    .to_owned(),
+                    true,
+                )],
                 pt: STATUS_PT,
-                bold: true,
                 x: rel(status).loc.x + status.size.w / 2.,
                 align: widget::HAlign::Center,
                 top: rel(status).loc.y,
@@ -1391,11 +1538,18 @@ impl OverviewSearch {
                 let texts = texts
                     .into_iter()
                     .map(|t| {
-                        let mut style = widget::TextStyle::new(t.pt);
-                        if t.bold {
-                            style = style.bold();
-                        }
-                        Ok((shaper.shape(&t.text, style)?, t))
+                        let shaped = t
+                            .runs
+                            .iter()
+                            .map(|(text, bold)| {
+                                let mut style = widget::TextStyle::new(t.pt);
+                                if *bold {
+                                    style = style.bold();
+                                }
+                                shaper.shape(text, style)
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        Ok((shaped, t))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 Ok((captions, texts))
@@ -1414,7 +1568,18 @@ impl OverviewSearch {
                     )?;
                 }
                 for (shaped, t) in texts {
-                    p.text_band(shaped, t.x, t.align, t.top, t.h, t.color, all)?;
+                    if let [single] = &shaped[..] {
+                        p.text_band(single, t.x, t.align, t.top, t.h, t.color, all)?;
+                        continue;
+                    }
+                    // Pen positions, so a run that starts with a space keeps it.
+                    let px = |v: f64| (v * scale).round() as i32;
+                    let mut pen = t.x;
+                    for (run, (text, bold)) in shaped.iter().zip(&t.runs) {
+                        let y = px(t.top) + run.line_box_centered_y(px(t.h));
+                        p.text_px(run, Point::from((px(pen), y)), t.color)?;
+                        pen += run_width(text, t.pt, *bold);
+                    }
                 }
                 Ok(())
             },
@@ -1511,9 +1676,10 @@ impl OverviewSearch {
 
 /// A run of text to place in the results' text layer.
 struct TextItem {
-    text: String,
+    /// The line's runs, each regular or bold. A single run is placed by its ink per `align`;
+    /// several are set one after another from `x` by their advances.
+    runs: Vec<(String, bool)>,
     pt: f64,
-    bold: bool,
     x: f64,
     align: widget::HAlign,
     /// The band the line is centered in, relative to the canvas.
@@ -1527,18 +1693,18 @@ fn section_texts(
     section: &ListSection,
     sl: &SectionLayout,
     origin: Point<f64, Logical>,
+    terms: &[&str],
     texts: &mut Vec<TextItem>,
 ) {
     let pt = crate::ui::BASE_FONT_PT;
     let line_w = |s: &str| {
         synoik_vk::text::measure_line_width_weighted(s, crate::ui::pt_to_px(pt) as f32, false)
     };
-    let mut push = |text: String, x: f64, top: f64, h: f64, color| {
-        if !text.is_empty() {
+    let mut push = |runs: Vec<(String, bool)>, x: f64, top: f64, h: f64, color| {
+        if runs.iter().any(|(text, _)| !text.is_empty()) {
             texts.push(TextItem {
-                text,
+                runs,
                 pt,
-                bold: false,
                 x: x - origin.x,
                 align: widget::HAlign::Left,
                 top: top - origin.y,
@@ -1555,21 +1721,27 @@ fn section_texts(
     let name = widget::ellipsized_line(&section.name, pt, PROVIDER_DETAILS_W);
     if section.more > 0 {
         push(
-            name,
+            vec![(name, false)],
             details_x,
             content_top,
             content_h - LINE_H,
             style::TEXT,
         );
         push(
-            format!("{} more", section.more),
+            vec![(format!("{} more", section.more), false)],
             details_x,
             content_top + content_h - LINE_H,
             LINE_H,
             style::TEXT,
         );
     } else {
-        push(name, details_x, content_top, content_h, style::TEXT);
+        push(
+            vec![(name, false)],
+            details_x,
+            content_top,
+            content_h,
+            style::TEXT,
+        );
     }
 
     // The rows: the title after its icon, then the description's first line in what is left.
@@ -1578,13 +1750,19 @@ fn section_texts(
         let avail = row.loc.x + row.size.w - ITEM_PAD - title_x;
         let title = widget::ellipsized_line(&meta.name, pt, avail);
         let title_w = line_w(&title).min(avail);
-        push(title, title_x, row.loc.y, row.size.h, style::TEXT);
+        push(
+            vec![(title, false)],
+            title_x,
+            row.loc.y,
+            row.size.h,
+            style::TEXT,
+        );
         if let Some(description) = &meta.description {
             let x = title_x + title_w + DESCRIPTION_SPACING;
             let avail = row.loc.x + row.size.w - ITEM_PAD - x;
             if avail > 0. {
                 push(
-                    widget::ellipsized_line(description, pt, avail),
+                    highlighted_line(description, terms, pt, avail),
                     x,
                     row.loc.y,
                     row.size.h,
@@ -1594,6 +1772,77 @@ fn section_texts(
             }
         }
     }
+}
+
+/// The status box's text line, under the spinner.
+fn status_text(status: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((status.loc.x, status.loc.y + status.size.h - STATUS_H)),
+        Size::from((status.size.w, STATUS_H)),
+    )
+}
+
+/// A run's advance, logical px.
+fn run_width(text: &str, pt: f64, bold: bool) -> f64 {
+    synoik_vk::text::measure_line_width_weighted(text, crate::ui::pt_to_px(pt) as f32, bold)
+}
+
+/// `Highlighter.highlight` (`misc/util.js:421-470`): the terms, case-insensitively, wherever they
+/// occur, in bold — as `(text, bold)` runs. At each position the first term that matches wins, as
+/// it does in the `(a|b)` regex.
+fn highlight(text: &str, terms: &[&str]) -> Vec<(String, bool)> {
+    let matches_at = |at: usize, term: &str| -> Option<usize> {
+        let mut rest = text[at..].char_indices();
+        for want in term.chars() {
+            let (_, got) = rest.next()?;
+            if !got.to_lowercase().eq(want.to_lowercase()) {
+                return None;
+            }
+        }
+        Some(rest.next().map_or(text.len(), |(i, _)| at + i))
+    };
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    let mut push = |s: &str, bold: bool| match runs.last_mut() {
+        _ if s.is_empty() => {}
+        Some((last, b)) if *b == bold => last.push_str(s),
+        _ => runs.push((s.to_owned(), bold)),
+    };
+    let mut plain_from = 0;
+    let mut at = 0;
+    while at < text.len() {
+        let hit = terms
+            .iter()
+            .filter(|t| !t.is_empty())
+            .find_map(|t| matches_at(at, t));
+        match hit {
+            Some(end) => {
+                push(&text[plain_from..at], false);
+                push(&text[at..end], true);
+                at = end;
+                plain_from = end;
+            }
+            None => at += text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    push(&text[plain_from..], false);
+    runs
+}
+
+/// A description's line, highlighted, cut with an ellipsis to fit `avail` — measured with its
+/// bold runs, which are wider than the plain cut assumed.
+fn highlighted_line(text: &str, terms: &[&str], pt: f64, avail: f64) -> Vec<(String, bool)> {
+    let mut budget = avail;
+    let mut runs = Vec::new();
+    for _ in 0..4 {
+        let line = widget::ellipsized_line(text, pt, budget);
+        runs = highlight(&line, terms);
+        let width: f64 = runs.iter().map(|(t, b)| run_width(t, pt, *b)).sum();
+        if width <= avail {
+            break;
+        }
+        budget -= width - avail;
+    }
+    runs
 }
 
 /// `#searchResultsContent`: the results view less its margins, capped at
@@ -2335,6 +2584,27 @@ run it with --features reference-env, as the fedora CI job does"
         assert_eq!(LABEL_PT, crate::ui::BASE_FONT_PT);
     }
 
+    #[test]
+    fn highlighting_bolds_every_term_case_insensitively() {
+        let runs = highlight("Use Night Light and display night", &["night", "li"]);
+        assert_eq!(
+            runs,
+            [
+                ("Use ".to_owned(), false),
+                ("Night".to_owned(), true),
+                (" ".to_owned(), false),
+                ("Li".to_owned(), true),
+                ("ght and display ".to_owned(), false),
+                ("night".to_owned(), true),
+            ]
+        );
+        assert_eq!(highlight("plain", &[]), [("plain".to_owned(), false)]);
+        assert_eq!(
+            highlight("ÉCOLE école", &["éc"])[0],
+            ("ÉC".to_owned(), true)
+        );
+    }
+
     /// The app grid holds as many results as fit across the results column
     /// (`_getMaxDisplayedResults`), never more than the provider's six.
     #[test]
@@ -2363,6 +2633,13 @@ run it with --features reference-env, as the fedora CI job does"
         let (sx, sy) = center(status);
         let (ax, ay) = center(area.results);
         assert!((sx - ax).abs() <= 1. && (sy - ay).abs() <= 1.);
+        // The spinner's square, the spacing, then the text.
+        assert_eq!(
+            status_text(status).loc.y,
+            status.loc.y + SPINNER_PX + STATUS_SPACING
+        );
+        s.set_searching(true);
+        assert!(s.is_spinning());
         s.set_section("p", Some(section(0, "p", &["one"])));
         assert!(s.layout(area).results.unwrap().status.is_none());
     }

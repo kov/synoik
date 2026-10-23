@@ -9408,6 +9408,7 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
                     },
                     synoik.gnome_settings.accent_color,
                     synoik.appearance(),
+                    Duration::ZERO,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9455,6 +9456,106 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
         "a name that fits draws nothing on the second line ({control}) — so the ink \
          above is the wrap, not the card"
     );
+}
+
+/// `St.SpinnerContent` while a provider is still searching: the faint circle all the way round,
+/// and the bright arc over it where the timeline has it.
+#[test]
+fn vulkan_search_spinner_draws_its_arc_over_the_circle() {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_search_spinner: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    {
+        let s = &mut f.synoik().overview_search;
+        s.handle_key(
+            None,
+            Some('a'),
+            crate::ui::text_edit::EditMods::default(),
+            crate::ui::text_edit::KeyTheme::default(),
+        );
+        s.set_searching(true);
+    }
+    let controls = f
+        .synoik()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let area: crate::ui::overview_search::SearchArea = controls.into();
+    let (center, radius) = f
+        .synoik()
+        .overview_search
+        .spinner_ring(area)
+        .expect("the status shows");
+    let spin = Duration::from_millis(700);
+    let (from, to) = crate::ui::widget::Spinner::arc(spin);
+
+    let state = f.synoik_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let synoik = &mut state.synoik;
+                let elements = synoik.overview_search.render(
+                    vk,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
+                    &output,
+                    area,
+                    crate::ui::overview_search::SearchFade {
+                        overview: 1.0,
+                        search: 1.0,
+                    },
+                    synoik.gnome_settings.accent_color,
+                    synoik.appearance(),
+                    spin,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_search_spinner: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the spinner through Vulkan must not error");
+    let at = |angle: f64, r: f64| {
+        px(
+            &pixels,
+            w,
+            (center.x + angle.cos() * r).round() as i32,
+            (center.y + angle.sin() * r).round() as i32,
+        )
+    };
+
+    let arc = at((from + to) / 2., radius);
+    let gap = at(to + (2. * std::f64::consts::PI - (to - from)) / 2., radius);
+    let hole = at(0., 0.);
+    eprintln!("vulkan_search_spinner: arc={arc:?} gap={gap:?} hole={hole:?}");
+    assert_eq!(arc[3], 255, "the arc is the full foreground: {arc:?}");
+    assert!(
+        (25..=50).contains(&gap[3]),
+        "the rest of the circle is it at CIRCLE_OPACITY (~38): {gap:?}"
+    );
+    assert_eq!(hole[3], 0, "the circle is a ring, not a disc: {hole:?}");
 }
 
 #[test]
@@ -9512,7 +9613,12 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                     id: "/home".into(),
                     name: "home".into(),
                     description: Some("/home".into()),
-                    icon: None,
+                    // Inline pixels (`icon-data`), premultiplied: opaque red.
+                    icon: Some(crate::search_providers::ResultIcon::Pixels {
+                        width: 4,
+                        height: 4,
+                        rgba: [255, 0, 0, 255].repeat(16),
+                    }),
                     clipboard_text: None,
                 }],
                 more: 0,
@@ -9543,6 +9649,11 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         .overview_search
         .section_card(0, area)
         .expect("the section fits");
+    let row_icon = f
+        .synoik()
+        .overview_search
+        .row_icon(0, 0, area)
+        .expect("the row fits");
 
     let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
@@ -9560,6 +9671,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                 },
                 synoik.gnome_settings.accent_color,
                 synoik.appearance(),
+                Duration::ZERO,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9628,6 +9740,19 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         (card.loc.y + card.size.h / 2.) as i32,
     );
     eprintln!("vulkan_overview_search: section={section:?}");
+    // The provider's own pixels, drawn as the row's icon, scaled up to fill its square.
+    for (dx, dy) in [(0., 0.), (-10., -10.), (10., 10.)] {
+        let icon = px(
+            &pixels,
+            w,
+            (row_icon.x + dx) as i32,
+            (row_icon.y + dy) as i32,
+        );
+        assert!(
+            icon[0] > 240 && icon[1] < 15 && icon[3] == 255,
+            "the row's inline icon draws, filling its 24px square: {icon:?} at {dx},{dy}"
+        );
+    }
     assert_eq!(
         section[3],
         (f.synoik().appearance().plate()[3] * 255.).round() as u8,

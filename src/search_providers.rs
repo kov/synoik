@@ -24,6 +24,9 @@ use crate::app_system::{AppEntry, AppIconRef};
 /// `KEY_FILE_GROUP` (`remoteSearch.js:10`).
 const KEY_FILE_GROUP: &str = "Shell Search Provider";
 
+/// The largest inline icon kept: a row's 24px icon at scale 4.
+pub const MAX_PIXEL_ICON_PX: u32 = 96;
+
 /// `MAX_LIST_SEARCH_RESULTS_ROWS` (`search.js:23`): how many rows a provider's section shows.
 pub const MAX_LIST_ROWS: usize = 5;
 
@@ -209,7 +212,8 @@ pub enum ResultIcon {
     Themed(Vec<String>),
     /// An image file on disk.
     File(PathBuf),
-    /// Pixels the provider sent, as straight-alpha RGBA rows.
+    /// Pixels the provider sent, as **premultiplied** RGBA rows, no bigger than
+    /// [`MAX_PIXEL_ICON_PX`] on a side.
     Pixels {
         width: u32,
         height: u32,

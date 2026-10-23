@@ -948,6 +948,200 @@ pub fn image_element(
     ))
 }
 
+/// `St.SpinnerContent` (`src/st/st-spinner-content.c`), the spinner behind `Animation.Spinner`: a
+/// faint full circle with an arc running round it that grows and shrinks as it goes.
+///
+/// Drawn without a per-frame bake, which would cost a GPU round trip on every frame it spins
+/// (see `frame_log`'s bake attribution). The circle and one round dot are baked once; the arc is
+/// dots set along it, each frame only their positions change. Overlapping dots of an opaque
+/// colour read as a round-capped stroke.
+#[derive(Default)]
+pub struct Spinner {
+    ring: BakeCache,
+    dot: BakeCache,
+}
+
+impl Spinner {
+    const MIN_RADIUS: f64 = 8.;
+    const NAT_RADIUS: f64 = 48.;
+    const SMALL_WIDTH: f64 = 2.5;
+    const LARGE_WIDTH: f64 = 12.;
+    const SPIN_MS: f64 = 1200.;
+    const START_ANGLE: f64 = std::f64::consts::PI * 0.35;
+    const CIRCLE_OPACITY: f32 = 0.15;
+    const MIN_ARC: f64 = std::f64::consts::PI * 0.015;
+    const MAX_ARC: f64 = std::f64::consts::PI * 0.9;
+    const IDLE: f64 = std::f64::consts::PI * 0.9;
+    const OVERLAP: f64 = std::f64::consts::PI * 0.7;
+    const EXTEND: f64 = std::f64::consts::PI * 1.1;
+    const CONTRACT: f64 = std::f64::consts::PI * 1.35;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The circle's radius (to the middle of its stroke) and the stroke width, for a spinner
+    /// `size` logical px across.
+    pub fn geometry(size: f64) -> (f64, f64) {
+        let radius = (size / 2.).floor().min(Self::NAT_RADIUS);
+        let t = (radius - Self::MIN_RADIUS) / (Self::NAT_RADIUS - Self::MIN_RADIUS);
+        let width = Self::SMALL_WIDTH + (Self::LARGE_WIDTH - Self::SMALL_WIDTH) * t;
+        (radius - (width / 2.).round(), width)
+    }
+
+    /// The arc after `elapsed`, as the angles it runs between, clockwise from `from` to `to`
+    /// (`to >= from`).
+    pub fn arc(elapsed: Duration) -> (f64, f64) {
+        use std::f64::consts::PI;
+        let ease = |t: f64| -0.5 * ((PI * t).cos() - 1.);
+        let l = Self::IDLE + Self::EXTEND + Self::CONTRACT - Self::OVERLAP;
+        let progress = elapsed.as_secs_f64() * 1000. / Self::SPIN_MS * 2. * PI;
+        let angle = progress % l;
+        let t = if angle > Self::EXTEND {
+            1.
+        } else {
+            ease(angle / Self::EXTEND)
+        };
+        let start = Self::MIN_ARC + (Self::MAX_ARC - Self::MIN_ARC) * t - angle * Self::MAX_ARC / l;
+        let t = if angle < Self::EXTEND - Self::OVERLAP {
+            0.
+        } else if angle > l - Self::IDLE {
+            1.
+        } else {
+            ease((angle - Self::EXTEND + Self::OVERLAP) / Self::CONTRACT)
+        };
+        let end = (Self::MAX_ARC - Self::MIN_ARC) * t - angle * Self::MAX_ARC / l;
+        let norm = |a: f64| a.rem_euclid(2. * PI);
+        let from = norm(progress + end + Self::START_ANGLE);
+        let mut to = norm(progress + start + Self::START_ANGLE);
+        // `cairo_arc` from `end` to `start` goes the increasing way round.
+        if to < from {
+            to += 2. * PI;
+        }
+        (from, to)
+    }
+
+    /// The spinner, `size` logical px across, centered at `center`, `elapsed` into its spin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn elements(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        center: Point<f64, Logical>,
+        size: f64,
+        elapsed: Duration,
+        color: Rgba,
+        alpha: f32,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let (radius, width) = Self::geometry(size);
+        if radius <= 0. {
+            return Vec::new();
+        }
+        let rev = Revision::new().of(color.map(f32::to_bits)).px(width).done();
+        let mut out = Vec::new();
+
+        // Dots first: the arc sits over the circle.
+        let dot = bake(
+            renderer,
+            &mut self.dot,
+            scale,
+            Size::from((width, width)),
+            rev,
+            |_| Ok(()),
+            move |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(width / 2., color)
+            },
+        );
+        match dot {
+            Ok(dot) => {
+                let (from, to) = Self::arc(elapsed);
+                // A dot every quarter of a stroke width keeps the edge smooth.
+                let steps = ((to - from) * radius / (width / 4.)).ceil().max(1.) as usize;
+                for i in 0..=steps {
+                    let a = from + (to - from) * i as f64 / steps as f64;
+                    let at = center + Point::from((a.cos() * radius, a.sin() * radius));
+                    out.push(TextureRenderElement::from_texture_buffer(
+                        dot.clone(),
+                        at - Point::from((width / 2., width / 2.)),
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
+            Err(err) => tracing::error!("error baking the spinner: {err:#}"),
+        }
+
+        let outer = radius + width / 2.;
+        let ring = bake(
+            renderer,
+            &mut self.ring,
+            scale,
+            Size::from((2. * outer, 2. * outer)),
+            rev,
+            |_| Ok(()),
+            move |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                let mut faint = color;
+                faint[3] *= Self::CIRCLE_OPACITY;
+                p.stroke_rounded_full(outer, width, faint)
+            },
+        );
+        match ring {
+            Ok(ring) => out.push(TextureRenderElement::from_texture_buffer(
+                ring,
+                center - Point::from((outer, outer)),
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            )),
+            Err(err) => tracing::error!("error baking the spinner: {err:#}"),
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod spinner_tests {
+    use super::*;
+
+    #[test]
+    fn the_spinner_is_sized_like_st_spinner_content() {
+        // 64 px: radius 32, a stroke of 2.5 + 9.5 × 0.6, the radius pulled in by half of it.
+        let (radius, width) = Spinner::geometry(64.);
+        assert!((width - 8.2).abs() < 1e-9);
+        assert_eq!(radius, 28.);
+    }
+
+    #[test]
+    fn the_arc_starts_short_and_grows() {
+        use std::f64::consts::PI;
+        let (from, to) = Spinner::arc(Duration::ZERO);
+        assert!(
+            (to - from - Spinner::MIN_ARC).abs() < 1e-9,
+            "a sliver at first"
+        );
+        assert!((from - Spinner::START_ANGLE).abs() < 1e-9);
+        let lengths: Vec<f64> = (0..100)
+            .map(|ms| {
+                let (from, to) = Spinner::arc(Duration::from_millis(ms * 20));
+                to - from
+            })
+            .collect();
+        let longest = lengths.iter().cloned().fold(0., f64::max);
+        // Extend and contract overlap, so the arc never quite reaches `MAX_ARC`.
+        assert!(
+            longest > PI * 0.5 && longest < Spinner::MAX_ARC,
+            "{longest}"
+        );
+    }
+}
+
 /// GNOME's `.user-icon` (`_misc.scss:8-27`) — the circular user picture.
 ///
 /// It is a widget rather than a lock-screen detail because `.user-icon` is one style class with

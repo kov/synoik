@@ -527,17 +527,33 @@ fn icon_data(value: &Value<'_>) -> Option<ResultIcon> {
     if bytes.len() < stride * (h - 1) + w * channels {
         return None;
     }
+    // Premultiplied, which is what the renderer blends and what a resize must work in: a
+    // straight-alpha resize bleeds the colour of transparent pixels into the edges.
     let mut rgba = Vec::with_capacity(w * h * 4);
     for row in 0..h {
         for px in bytes[row * stride..][..w * channels].chunks_exact(channels) {
-            rgba.extend_from_slice(&px[..3]);
-            rgba.push(if channels == 4 { px[3] } else { 0xff });
+            let a = if channels == 4 { px[3] } else { 0xff };
+            let pre = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+            rgba.extend_from_slice(&[pre(px[0]), pre(px[1]), pre(px[2]), a]);
         }
     }
+    let (w, h) = (w as u32, h as u32);
+    let image = image::RgbaImage::from_raw(w, h, rgba)?;
+    let max = crate::search_providers::MAX_PIXEL_ICON_PX;
+    let image = if w.max(h) > max {
+        let (nw, nh) = if w >= h {
+            (max, (h * max / w).max(1))
+        } else {
+            ((w * max / h).max(1), max)
+        };
+        image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
     Some(ResultIcon::Pixels {
-        width: w as u32,
-        height: h as u32,
-        rgba,
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
     })
 }
 
@@ -994,6 +1010,30 @@ mod tests {
             None,
             "too few bytes for the size"
         );
+
+        // Straight alpha arrives premultiplied, and a big icon is cut down to size.
+        let side = 200i32;
+        let half_red: Vec<u8> = (0..side * side).flat_map(|_| [255u8, 0, 0, 128]).collect();
+        let big = StructureBuilder::new()
+            .add_field(side)
+            .add_field(side / 2)
+            .add_field(side * 4)
+            .add_field(true)
+            .add_field(8i32)
+            .add_field(4i32)
+            .append_field(Value::from(Array::from(half_red)))
+            .build()
+            .unwrap();
+        let Some(ResultIcon::Pixels {
+            width,
+            height,
+            rgba,
+        }) = icon_data(&Value::from(big))
+        else {
+            panic!("a valid image");
+        };
+        assert_eq!((width, height), (96, 48));
+        assert_eq!(&rgba[..4], &[128, 0, 0, 128]);
     }
 
     #[test]

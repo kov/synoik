@@ -346,6 +346,8 @@ struct SearchRun {
     timer: Option<TimerToken>,
     /// Providers yet to answer the current generation.
     pending: std::collections::HashSet<String>,
+    /// When the status spinner started spinning, while it is.
+    spinning_since: Option<Duration>,
 }
 
 /// How long the app catalog waits for `installed-changed` pings to stop before
@@ -12163,7 +12165,9 @@ impl Synoik {
         // the results appear stuck at a partial alpha until the mouse moves.
         causes.set(
             AnimCauses::OVERVIEW_SEARCH,
-            self.overview_search_fade.is_some() || self.overview_search_expand.is_some(),
+            self.overview_search_fade.is_some()
+                || self.overview_search_expand.is_some()
+                || self.search_run.spinning_since.is_some(),
         );
         if self.startup_animation.is_some() {
             causes |= AnimCauses::OVERVIEW;
@@ -12221,6 +12225,11 @@ impl Synoik {
         self.layout.advance_animations();
         self.update_overview_search_fade();
         self.update_overview_search_expand();
+        // The spinner's timeline starts with `play()`, each time it starts showing.
+        let spinning = self.overview_search.is_spinning();
+        if spinning != self.search_run.spinning_since.is_some() {
+            self.search_run.spinning_since = spinning.then(|| self.clock.now_unadjusted());
+        }
 
         // Banners are blocked while a panel popover is open; syncing here (once per
         // frame) covers every open/close path with a single site. The drain check
@@ -13618,6 +13627,11 @@ impl Synoik {
                     },
                     self.gnome_settings.accent_color,
                     self.appearance(),
+                    self.search_run
+                        .spinning_since
+                        .map_or(Duration::ZERO, |since| {
+                            self.clock.now_unadjusted().saturating_sub(since)
+                        }),
                 ) {
                     push(element.into());
                 }
