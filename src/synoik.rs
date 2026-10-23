@@ -335,6 +335,15 @@ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995
 /// `timeout_add_once(…, 150, …)`, `search.js:769`).
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
 
+/// How long a search waits for its providers before the results settle — **a divergence**:
+/// gnome-shell waits out GDBus's 25s call timeout and slots each section in as it answers.
+/// Chromium's omnibox stops its providers 1.5s after the last keystroke "to avoid the
+/// disruptive effect of belated" suggestions; here a search starts at most [`SEARCH_DELAY`]
+/// after a keystroke. At the deadline the sections of providers still out are taken away (they
+/// answer older terms), the status stops reading "Searching", and an answer that comes later is
+/// added below every section, so it never moves one.
+const SEARCH_DEADLINE: Duration = Duration::from_millis(1500);
+
 /// Wall-clock seconds since the epoch — `g_get_real_time () / G_TIME_SPAN_SECOND`, the clock
 /// `Shell.AppUsage` stamps its file with. Not a deadline, so not the compositor's clock.
 fn wall_clock_secs() -> i64 {
@@ -354,6 +363,10 @@ struct SearchRun {
     timer: Option<TimerToken>,
     /// Providers yet to answer the current generation.
     pending: std::collections::HashSet<String>,
+    /// [`SEARCH_DEADLINE`] for the current generation, while it runs.
+    deadline: Option<TimerToken>,
+    /// Late sections of the current generation so far, once its deadline has passed.
+    late: Option<usize>,
     /// When the status spinner started spinning, while it is.
     spinning_since: Option<Duration>,
     /// The selection the results were last scrolled for.
@@ -18023,6 +18036,7 @@ impl Synoik {
         }
         self.search_run.generation += 1;
         self.search_run.pending.clear();
+        self.cancel_search_deadline();
         if terms.is_empty() {
             if let Some(timer) = self.search_run.timer.take() {
                 self.cancel_timer(timer);
@@ -18109,14 +18123,54 @@ impl Synoik {
         } else {
             Default::default()
         };
+        self.cancel_search_deadline();
         if !self.search_run.pending.is_empty() {
             self.emit_search(crate::search_providers::SynoikToSearch::Search {
                 generation: self.search_run.generation,
                 terms: self.search_run.terms.clone(),
             });
+            let generation = self.search_run.generation;
+            self.search_run.deadline = Some(self.timer_after(SEARCH_DEADLINE, move |state| {
+                let synoik = &mut state.synoik;
+                synoik.search_run.deadline = None;
+                if synoik.search_run.generation == generation {
+                    synoik.search_deadline_passed();
+                }
+                None
+            }));
         }
         self.overview_search
             .set_searching(!self.search_run.pending.is_empty());
+    }
+
+    fn cancel_search_deadline(&mut self) {
+        if let Some(timer) = self.search_run.deadline.take() {
+            self.cancel_timer(timer);
+        }
+        self.search_run.late = None;
+        self.overview_search.set_late(Vec::new());
+    }
+
+    /// The providers still out past the deadline, for the row saying so.
+    fn sync_late_search_providers(&mut self) {
+        let late = self
+            .search_providers
+            .iter()
+            .filter(|p| self.search_run.pending.contains(p.id()))
+            .map(|p| (p.id().to_owned(), p.icon.clone()))
+            .collect();
+        self.overview_search.set_late(late);
+    }
+
+    /// [`SEARCH_DEADLINE`] ran out with providers still out: the results settle without them.
+    fn search_deadline_passed(&mut self) {
+        self.search_run.late = Some(0);
+        for provider in &self.search_run.pending {
+            self.overview_search.set_section(provider, None);
+        }
+        self.overview_search.set_searching(false);
+        self.sync_late_search_providers();
+        self.queue_redraw_all();
     }
 
     /// A provider answered.
@@ -18129,6 +18183,11 @@ impl Synoik {
         if generation != self.search_run.generation || !self.search_run.pending.remove(&provider) {
             return;
         }
+        // Past the deadline, below everything already settled, in the order they come.
+        let late = self.search_run.late.as_mut().map(|late| {
+            *late += 1;
+            self.search_providers.len() + *late
+        });
         let section = self
             .search_providers
             .iter()
@@ -18137,7 +18196,7 @@ impl Synoik {
             .zip(results)
             .map(
                 |((order, p), results)| crate::ui::overview_search::ListSection {
-                    order,
+                    order: late.unwrap_or(order),
                     provider: provider.clone(),
                     name: p.name.clone(),
                     icon: p.icon.clone(),
@@ -18147,8 +18206,12 @@ impl Synoik {
                 },
             );
         self.overview_search.set_section(&provider, section);
-        self.overview_search
-            .set_searching(!self.search_run.pending.is_empty());
+        if self.search_run.late.is_some() {
+            self.sync_late_search_providers();
+        } else {
+            self.overview_search
+                .set_searching(!self.search_run.pending.is_empty());
+        }
         self.queue_redraw_all();
     }
 
@@ -18184,6 +18247,7 @@ impl Synoik {
                 .collect(),
         ));
         self.search_run.pending.clear();
+        self.cancel_search_deadline();
         self.overview_search.clear_sections();
         let searching = self.search_run.timer.is_some();
         self.overview_search.set_searching(searching);

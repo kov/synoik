@@ -22458,6 +22458,7 @@ fn overview_search_ctrl_backspace_deletes_a_word() {
 // ---- Clipboard (`st-entry.c:656-740`) ----
 
 const KEY_C: u32 = 46;
+const KEY_B: u32 = 48;
 const KEY_X: u32 = 45;
 const KEY_INSERT: u32 = 110;
 
@@ -23781,6 +23782,105 @@ fn remote_search_is_searching_until_every_provider_answered() {
     answer(&mut f, generation, "calc.desktop", &[]);
     assert!(!f.synoik().overview_search.is_searching());
     assert!(f.synoik().overview_search.has_no_results());
+}
+
+/// **Divergence:** the results settle 1.5s into a search (Chromium's omnibox deadline, where
+/// gnome-shell waits out GDBus's 25s): the sections of providers still out are taken away, a row
+/// at the bottom names them as still searching, and an answer that comes later is added below
+/// every section rather than in its place, so nothing on screen moves for it.
+#[test]
+fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
+    let (mut f, rx) = remote_search_overview_with(&["a.desktop", "b.desktop", "c.desktop"]);
+    let shown = |f: &mut Fixture| -> Vec<String> {
+        f.synoik()
+            .overview_search
+            .sections()
+            .iter()
+            .map(|s| s.provider.clone())
+            .collect()
+    };
+    let late = |f: &mut Fixture| -> Vec<String> {
+        f.synoik()
+            .overview_search
+            .late()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    for id in ["a.desktop", "b.desktop", "c.desktop"] {
+        answer(&mut f, generation, id, &["r"]);
+    }
+    assert_eq!(shown(&mut f), ["a.desktop", "b.desktop", "c.desktop"]);
+
+    // A refining search that only `b` answers in time.
+    tap(&mut f, KEY_B);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "b.desktop", &["r"]);
+    f.advance_until(Duration::from_millis(1300), |_| false);
+    assert!(f.synoik().overview_search.is_searching(), "not yet");
+    assert_eq!(
+        shown(&mut f),
+        ["a.desktop", "b.desktop", "c.desktop"],
+        "the old answers stay while the search runs"
+    );
+    assert!(late(&mut f).is_empty());
+
+    f.advance_until(Duration::from_millis(250), |_| false);
+    assert!(!f.synoik().overview_search.is_searching());
+    assert_eq!(
+        shown(&mut f),
+        ["b.desktop"],
+        "the sections answering older terms go"
+    );
+    assert_eq!(late(&mut f), ["a.desktop", "c.desktop"]);
+
+    // `a` comes first in order, but it is late: below `b`.
+    answer(&mut f, generation, "a.desktop", &["r"]);
+    assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
+    assert_eq!(late(&mut f), ["c.desktop"]);
+    answer(&mut f, generation, "c.desktop", &[]);
+    assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
+    assert!(late(&mut f).is_empty(), "everyone answered");
+
+    // The next search puts an answer in time back in its place.
+    tap(&mut f, KEY_C);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "a.desktop", &["r"]);
+    answer(&mut f, generation, "b.desktop", &["r"]);
+    assert_eq!(shown(&mut f), ["a.desktop", "b.desktop"]);
+}
+
+/// With nothing to show at the deadline, the status reads "No results", and the late row
+/// under it says who may still answer.
+#[test]
+fn remote_search_with_nothing_at_the_deadline_says_who_is_late() {
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_Z);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "files.desktop", &[]);
+    f.advance_until(Duration::from_millis(1600), |_| false);
+    assert!(!f.synoik().overview_search.is_searching());
+    assert!(f.synoik().overview_search.has_no_results());
+    assert_eq!(
+        f.synoik()
+            .overview_search
+            .late()
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["calc.desktop"]
+    );
+    // Clearing the search takes the row with it.
+    tap(&mut f, KEY_ESC);
+    f.settle();
+    assert!(f.synoik().overview_search.late().is_empty());
 }
 
 /// Enter on a provider's row asks the provider to activate it with the terms, copies the

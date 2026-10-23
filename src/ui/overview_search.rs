@@ -29,7 +29,11 @@
 //! bold (`Util.Highlighter`). Escape while active clears, it does not close
 //! (`searchController.js:153-160`).
 //!
-//! **Divergences:** the system actions' availability is the power menu's (see
+//! **Divergences:** the results settle 1.5s into a search (`SEARCH_DEADLINE` in `synoik.rs`)
+//! rather than as the last provider answers: the sections of providers still out go, the status
+//! stops reading "Searching", a row under everything names the late providers by their icons as
+//! "Still searching…", and a late answer's section joins below every other one, so it moves
+//! nothing on screen. The system actions' availability is the power menu's (see
 //! `Synoik::system_action_available`). Enter inside the search delay activates what the typed terms
 //! find; gnome-shell's app provider answers asynchronously, so its Enter activates the previous
 //! default. The results scroll by wheel and touchpad, and the selection is eased into view;
@@ -244,6 +248,10 @@ const PROVIDER_W: f64 = 2. * ITEM_PAD + PROVIDER_ICON_PX + PROVIDER_SPACING + PR
 const PROVIDER_MARGIN: f64 = 4.;
 /// One line of body text, for sizing a box around lines.
 const LINE_H: f64 = 18.;
+/// The late providers' row (a divergence, no GNOME counterpart): their icons, at a row's icon
+/// size, then the text.
+const LATE_TEXT: &str = "Still searching…";
+const LATE_ICON_SPACING: f64 = 6.;
 
 /// One app result — a plain-data snapshot (not a live catalog borrow), like
 /// [`crate::ui::dash::DashEntry`].
@@ -259,7 +267,8 @@ pub struct SearchResultEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListSection {
     /// The provider's position among the providers — sections are drawn in this order
-    /// whatever order they answered in.
+    /// whatever order they answered in. A section that answered past the search's deadline
+    /// comes after all of them.
     pub order: usize,
     pub provider: String,
     /// The app's name and icon, for the header (`ProviderInfo`).
@@ -396,6 +405,9 @@ pub struct OverviewSearch {
     sections: Vec<ListSection>,
     /// Some provider has yet to answer — the status reads "Searching", not "No results".
     searching: bool,
+    /// Providers that missed the search's deadline and have yet to answer, with their icons —
+    /// the row under the results saying so.
+    late: Vec<(String, AppIconRef)>,
     /// Keyboard-selected result, as an index over the app results and then every section's
     /// rows. Meaningful only when there is something to select.
     selected: usize,
@@ -436,6 +448,7 @@ impl OverviewSearch {
             results: Vec::new(),
             sections: Vec::new(),
             searching: false,
+            late: Vec::new(),
             selected: 0,
             navigated: false,
             scroll: 0.,
@@ -652,11 +665,16 @@ impl OverviewSearch {
         match (old, section) {
             (Some(i), Some(section)) if self.sections[i] == section => return,
             (None, None) => return,
-            (Some(i), Some(section)) => self.sections[i] = section,
+            (Some(i), Some(section)) if self.sections[i].order == section.order => {
+                self.sections[i] = section;
+            }
             (Some(i), None) => {
                 self.sections.remove(i);
             }
-            (None, Some(section)) => {
+            (old, Some(section)) => {
+                if let Some(i) = old {
+                    self.sections.remove(i);
+                }
                 let at = self
                     .sections
                     .iter()
@@ -684,7 +702,6 @@ impl OverviewSearch {
         self.searching
     }
 
-    /// Whether a provider is still searching — what the empty state reads.
     /// Bumped whenever a different stop becomes selected — the caller brings it into view.
     pub fn selection_serial(&self) -> u64 {
         self.selection_serial
@@ -743,6 +760,18 @@ impl OverviewSearch {
     /// The status spinner is on show: something is still searching, and nothing is showing.
     pub fn is_spinning(&self) -> bool {
         self.is_active() && self.searching && self.has_no_results()
+    }
+
+    /// The providers past the search's deadline that are still to answer, in section order.
+    pub fn set_late(&mut self, late: Vec<(String, AppIconRef)>) {
+        if self.late != late {
+            self.late = late;
+            self.content_rev = self.content_rev.wrapping_add(1);
+        }
+    }
+
+    pub fn late(&self) -> &[(String, AppIconRef)] {
+        &self.late
     }
 
     pub fn set_searching(&mut self, searching: bool) {
@@ -917,6 +946,7 @@ impl OverviewSearch {
             && self.results.is_empty()
             && self.sections.is_empty()
             && !self.searching
+            && self.late.is_empty()
             && self.hovered.is_none()
             && !self.expanded
             && self.scroll == 0.
@@ -930,6 +960,7 @@ impl OverviewSearch {
         self.results.clear();
         self.sections.clear();
         self.searching = false;
+        self.late.clear();
         self.selected = 0;
         self.selection_serial += 1;
         self.scroll = 0.;
@@ -1053,12 +1084,18 @@ impl OverviewSearch {
                 )),
                 size,
             );
+            let late = self.late_row(
+                column_x,
+                column_w,
+                status.loc.y + status.size.h + STATUS_SPACING,
+            );
             return ResultsLayout {
                 view: area.results,
-                canvas: status,
+                canvas: late.map_or(status, |late| status.merge(late)),
                 tiles: Vec::new(),
                 sections: Vec::new(),
                 status: Some(status),
+                late,
             };
         }
 
@@ -1110,11 +1147,15 @@ impl OverviewSearch {
             y += card_h + SECTION_GAP;
         }
 
-        let canvas_bottom = sections
+        let mut canvas_bottom = sections
             .last()
             .map(|s| s.card.loc.y + s.card.size.h)
             .or_else(|| tiles.first().map(|t| t.loc.y + tile_h() + LABEL_OVERHANG))
             .unwrap_or(top);
+        let late = self.late_row(column_x, column_w, canvas_bottom + SECTION_GAP);
+        if let Some(late) = late {
+            canvas_bottom = late.loc.y + late.size.h;
+        }
         ResultsLayout {
             view: area.results,
             canvas: Rectangle::new(
@@ -1124,7 +1165,25 @@ impl OverviewSearch {
             tiles,
             sections,
             status: None,
+            late,
         }
+    }
+
+    /// The late providers' row, centered in the column at `top`: their icons, then
+    /// [`LATE_TEXT`].
+    fn late_row(&self, column_x: f64, column_w: f64, top: f64) -> Option<Rectangle<f64, Logical>> {
+        if self.late.is_empty() {
+            return None;
+        }
+        let n = self.late.len() as f64;
+        let w = n * ROW_ICON_PX
+            + (n - 1.) * LATE_ICON_SPACING
+            + TITLE_SPACING
+            + run_width(LATE_TEXT, crate::ui::BASE_FONT_PT, false).ceil();
+        Some(Rectangle::new(
+            Point::from(((column_x + (column_w - w) / 2.).round(), top)),
+            Size::from((w, ROW_H)),
+        ))
     }
 
     /// Which interactive element is under `pos` (logical, output coords).
@@ -1262,6 +1321,25 @@ impl OverviewSearch {
             status.loc.y + SPINNER_PX / 2.,
         ));
         Some((center, widget::Spinner::geometry(SPINNER_PX).0))
+    }
+
+    /// The late row's first icon square and its text's box — a geometry probe for the render
+    /// test.
+    #[cfg(test)]
+    pub fn late_row_probe(
+        &self,
+        area: SearchArea,
+    ) -> Option<(Rectangle<f64, Logical>, Rectangle<f64, Logical>)> {
+        let late = self.layout(area).results?.late?;
+        let n = self.late.len() as f64;
+        let text_x = late.loc.x + n * ROW_ICON_PX + (n - 1.) * LATE_ICON_SPACING + TITLE_SPACING;
+        Some((
+            Rectangle::new(late.loc, Size::from((ROW_ICON_PX, ROW_H))),
+            Rectangle::new(
+                Point::from((text_x, late.loc.y)),
+                Size::from((late.loc.x + late.size.w - text_x, late.size.h)),
+            ),
+        ))
     }
 
     /// Where `hit` is drawn — what the conformance corpus clicks.
@@ -1515,6 +1593,13 @@ impl OverviewSearch {
                     }
                 }
             }
+            if let Some(late) = results.late {
+                for (i, (_, icon)) in self.late.iter().enumerate() {
+                    let x = late.loc.x + i as f64 * (ROW_ICON_PX + LATE_ICON_SPACING);
+                    let center = Point::from((x + ROW_ICON_PX / 2., late.loc.y + late.size.h / 2.));
+                    push_icon(icon, ROW_ICON_PX, center);
+                }
+            }
             drop(uploads);
             // A symbolic icon is recoloured to the text it sits with, as `St.Icon` does for any
             // `-symbolic` name — Settings' panels and Calculator's copy glyph are all symbolic.
@@ -1749,6 +1834,20 @@ impl OverviewSearch {
                 h: status.size.h,
                 // `.search-statustext`: `transparentize($system_fg_color, .2)`.
                 color: [1., 1., 1., 0.8],
+            });
+        }
+        if let Some(late) = results.late {
+            let n = self.late.len() as f64;
+            texts.push(TextItem {
+                runs: vec![(LATE_TEXT.to_owned(), false)],
+                pen: false,
+                pt: crate::ui::BASE_FONT_PT,
+                x: rel(late).loc.x + n * ROW_ICON_PX + (n - 1.) * LATE_ICON_SPACING + TITLE_SPACING,
+                align: widget::HAlign::Left,
+                top: rel(late).loc.y,
+                h: late.size.h,
+                // As a result's description: `$system_insensitive_fg_color`.
+                color: style::MUTED,
             });
         }
         match widget::bake(
@@ -2250,6 +2349,8 @@ struct ResultsLayout {
     sections: Vec<SectionLayout>,
     /// "No results" / "Searching", when nothing is showing.
     status: Option<Rectangle<f64, Logical>>,
+    /// The late providers' row, under everything else.
+    late: Option<Rectangle<f64, Logical>>,
 }
 
 impl ResultsLayout {
@@ -2263,6 +2364,8 @@ impl ResultsLayout {
         let up = |r: &mut Rectangle<f64, Logical>| r.loc.y -= dy;
         up(&mut self.canvas);
         self.tiles.iter_mut().for_each(up);
+        self.status.iter_mut().for_each(up);
+        self.late.iter_mut().for_each(up);
         for s in &mut self.sections {
             up(&mut s.card);
             up(&mut s.header);

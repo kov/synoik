@@ -688,7 +688,10 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   scroll (wheel/touchpad at `page_size^(2/3)` a unit, the selection eased into view 68px clear);
   rows draw a provider's inline `icon-data`, descriptions bold the terms (`Util.Highlighter`), the
   "Searching" status spins (`widget::Spinner`, `St.SpinnerContent`), and Tab stops on a section's
-  header. Not ported: touch-drag panning, the overlay scrollbar and the vfade (a hard clip
+  header. **Divergence:** the results settle 1.5 s into a search (Chromium's omnibox deadline;
+  gnome-shell waits out GDBus's 25 s): sections still answering older terms go, a "Still
+  searching…" row at the bottom shows the late providers' icons, and a late answer's section is
+  added below all the others instead of in its place. Not ported: touch-drag panning, the overlay scrollbar and the vfade (a hard clip
   instead). R3: `org.gnome.desktop.search-providers` is followed live — a change reloads the
   providers and drops the old sections (`_reloadRemoteProviders`); parental controls do not filter
   providers (malcontent is not modelled). R4: the app provider sorts each relevance tier by

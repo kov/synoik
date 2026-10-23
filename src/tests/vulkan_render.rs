@@ -9460,6 +9460,103 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
 
 /// `St.SpinnerContent` while a provider is still searching: the faint circle all the way round,
 /// and the bright arc over it where the timeline has it.
+/// The row naming the providers still out past the search's deadline draws their icons and
+/// its text, under the "No results" status.
+#[test]
+fn vulkan_search_late_row_draws_its_icons_and_text() {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_search_late_row: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    {
+        let s = &mut f.synoik().overview_search;
+        s.handle_key(
+            None,
+            Some('a'),
+            crate::ui::text_edit::EditMods::default(),
+            crate::ui::text_edit::KeyTheme::default(),
+        );
+        s.set_late(vec![(
+            "files.desktop".to_owned(),
+            crate::app_system::AppIconRef::Themed(vec!["folder".to_owned()]),
+        )]);
+    }
+    let controls = f
+        .synoik()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let area: crate::ui::overview_search::SearchArea = controls.into();
+    let (icon, text) = f
+        .synoik()
+        .overview_search
+        .late_row_probe(area)
+        .expect("the late row shows");
+
+    let state = f.synoik_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let synoik = &mut state.synoik;
+                let elements = synoik.overview_search.render(
+                    vk,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
+                    &output,
+                    area,
+                    crate::ui::overview_search::SearchFade {
+                        overview: 1.0,
+                        search: 1.0,
+                    },
+                    synoik.gnome_settings.accent_color,
+                    synoik.appearance(),
+                    Duration::ZERO,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_search_late_row: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the late row through Vulkan must not error");
+    let inked = |r: Rectangle<f64, Logical>| {
+        let mut n = 0;
+        for y in r.loc.y as i32..(r.loc.y + r.size.h) as i32 {
+            for x in r.loc.x as i32..(r.loc.x + r.size.w) as i32 {
+                if px(&pixels, w, x, y)[3] > 0 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let (icon_ink, text_ink) = (inked(icon), inked(text));
+    eprintln!("vulkan_search_late_row: icon={icon_ink} text={text_ink} at {icon:?} {text:?}");
+    assert!(icon_ink > 100, "the provider's icon draws: {icon_ink}");
+    assert!(text_ink > 100, "\"Still searching…\" draws: {text_ink}");
+}
+
 #[test]
 fn vulkan_search_spinner_draws_its_arc_over_the_circle() {
     if let Err(e) = VulkanRenderer::new() {
