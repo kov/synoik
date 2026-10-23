@@ -31,7 +31,9 @@
 //! `SystemActions` results. Enter inside the search delay activates what the typed terms find;
 //! gnome-shell's app provider answers asynchronously, so its Enter activates the previous
 //! default. The results do not scroll: a section that would run past the bottom of the results
-//! view is left out. A section header is not a keyboard stop. Two provider files for one app make
+//! view is left out. The keyboard walks the stops in one line — the app results, then each
+//! section's rows, and on Tab its header first — where St's arrow keys move by geometry (so
+//! Left from a row does not reach its header). Two provider files for one app make
 //! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
 //! click outside the entry/results clears the search) is not ported: such a click falls
 //! through to the picker and the query survives until the next overview enter. Like the
@@ -327,12 +329,25 @@ pub enum SearchOutcome {
     Close,
 }
 
-/// A selectable result, by position.
+/// A keyboard stop, by position: an app result, a section's header (`ProviderInfo` is a
+/// focusable button, first in its section), or a section's row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Item {
     App(usize),
+    Header(usize),
     Row { section: usize, row: usize },
 }
+
+/// A keyboard stop's identity, which survives the results around it changing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemKey {
+    App(String),
+    Header(String),
+    Row { provider: String, id: String },
+}
+
+/// An inline icon's upload: provider, result id, and the scale's bits.
+type PixelIconKey = (String, String, u64);
 
 #[derive(Default)]
 struct SearchCache {
@@ -348,9 +363,10 @@ struct SearchCache {
     icons: SharedAppIconUploads,
     /// The "Searching" spinner.
     spinner: widget::Spinner,
-    /// Inline icon pixels a provider sent, uploaded, by provider and result id — with the
-    /// pixels they were made from, so a result whose icon changed is uploaded again.
-    pixel_icons: HashMap<(String, String), (Vec<u8>, TextureBuffer<VkTexture>)>,
+    /// Inline icon pixels a provider sent, sized for the row and uploaded, by provider, result
+    /// id and scale — with the pixels they were made from, so a result whose icon changed is
+    /// uploaded again.
+    pixel_icons: HashMap<PixelIconKey, (Vec<u8>, TextureBuffer<VkTexture>)>,
     /// The renderer `pixel_icons` were uploaded to.
     pixel_context: Option<ContextId<VkTexture>>,
 }
@@ -454,6 +470,7 @@ impl OverviewSearch {
     pub fn selected_id(&self) -> Option<&str> {
         match self.item(self.selected)? {
             Item::App(i) => Some(self.results[i].id.as_str()),
+            Item::Header(_) => None,
             Item::Row { section, row } => Some(self.sections[section].rows[row].id.as_str()),
         }
     }
@@ -471,13 +488,7 @@ impl OverviewSearch {
         match hit {
             SearchHit::Result(i) => self.activation(Item::App(i)),
             SearchHit::Row { section, row } => self.activation(Item::Row { section, row }),
-            SearchHit::Provider(section) => {
-                let section = self.sections.get(section)?;
-                Some(Activation::LaunchSearch {
-                    provider: section.provider.clone(),
-                    terms: section.terms.clone(),
-                })
-            }
+            SearchHit::Provider(section) => self.activation(Item::Header(section)),
             SearchHit::Clear | SearchHit::Field | SearchHit::Background => None,
         }
     }
@@ -485,6 +496,13 @@ impl OverviewSearch {
     fn activation(&self, item: Item) -> Option<Activation> {
         Some(match item {
             Item::App(i) => Activation::App(self.results.get(i)?.id.clone()),
+            Item::Header(section) => {
+                let section = self.sections.get(section)?;
+                Activation::LaunchSearch {
+                    provider: section.provider.clone(),
+                    terms: section.terms.clone(),
+                }
+            }
             Item::Row { section, row } => {
                 let section = self.sections.get(section)?;
                 let meta = section.rows.get(row)?;
@@ -497,61 +515,88 @@ impl OverviewSearch {
         })
     }
 
-    /// How many results can be selected: the app results, then every section's rows.
+    /// How many keyboard stops there are: the app results, then each section's header and rows.
     fn item_count(&self) -> usize {
-        self.results.len() + self.sections.iter().map(|s| s.rows.len()).sum::<usize>()
+        self.results.len()
+            + self
+                .sections
+                .iter()
+                .map(|s| 1 + s.rows.len())
+                .sum::<usize>()
     }
 
-    /// The result at flat index `i`.
+    /// The keyboard stop at flat index `i`.
     fn item(&self, i: usize) -> Option<Item> {
         if i < self.results.len() {
             return Some(Item::App(i));
         }
         let mut i = i - self.results.len();
         for (section, s) in self.sections.iter().enumerate() {
-            if i < s.rows.len() {
-                return Some(Item::Row { section, row: i });
+            if i == 0 {
+                return Some(Item::Header(section));
             }
-            i -= s.rows.len();
+            if i <= s.rows.len() {
+                return Some(Item::Row {
+                    section,
+                    row: i - 1,
+                });
+            }
+            i -= 1 + s.rows.len();
         }
         None
     }
 
     /// The flat index of `item`.
     fn index_of(&self, item: Item) -> usize {
+        let section_start = |section: usize| {
+            self.results.len()
+                + self.sections[..section]
+                    .iter()
+                    .map(|s| 1 + s.rows.len())
+                    .sum::<usize>()
+        };
         match item {
             Item::App(i) => i,
-            Item::Row { section, row } => {
-                self.results.len()
-                    + self.sections[..section]
-                        .iter()
-                        .map(|s| s.rows.len())
-                        .sum::<usize>()
-                    + row
-            }
+            Item::Header(section) => section_start(section),
+            Item::Row { section, row } => section_start(section) + 1 + row,
         }
     }
 
-    /// The selected result's identity — which provider, which id — so it can be found again
-    /// after the results around it change.
-    fn selected_key(&self) -> Option<(Option<String>, String)> {
+    /// The default result (`_maybeSetInitialSelection`): the first result of the first
+    /// provider that has one — never a header.
+    fn default_index(&self) -> usize {
+        if !self.results.is_empty() {
+            return 0;
+        }
+        self.sections
+            .iter()
+            .position(|s| !s.rows.is_empty())
+            .map_or(0, |section| self.index_of(Item::Row { section, row: 0 }))
+    }
+
+    /// The selected stop's identity, so it can be found again after the results around it
+    /// change.
+    fn selected_key(&self) -> Option<ItemKey> {
         Some(match self.item(self.selected)? {
-            Item::App(i) => (None, self.results[i].id.clone()),
-            Item::Row { section, row } => (
-                Some(self.sections[section].provider.clone()),
-                self.sections[section].rows[row].id.clone(),
-            ),
+            Item::App(i) => ItemKey::App(self.results[i].id.clone()),
+            Item::Header(section) => ItemKey::Header(self.sections[section].provider.clone()),
+            Item::Row { section, row } => ItemKey::Row {
+                provider: self.sections[section].provider.clone(),
+                id: self.sections[section].rows[row].id.clone(),
+            },
         })
     }
 
     /// Put the selection back on `key` after a results change, or on the default result if it
     /// was never moved or its result is gone.
-    fn reselect(&mut self, key: Option<(Option<String>, String)>) {
-        let found = key.filter(|_| self.navigated).and_then(|(provider, id)| {
-            let item = match provider {
-                None => Item::App(self.results.iter().position(|e| e.id == id)?),
-                Some(provider) => {
-                    let section = self.sections.iter().position(|s| s.provider == provider)?;
+    fn reselect(&mut self, key: Option<ItemKey>) {
+        let section_of = |provider: &str| self.sections.iter().position(|s| s.provider == provider);
+        let found = key.filter(|_| self.navigated).and_then(|key| {
+            let item = match key {
+                ItemKey::App(id) => Item::App(self.results.iter().position(|e| e.id == id)?),
+                ItemKey::Header(provider) => Item::Header(section_of(&provider)?),
+                ItemKey::Row { provider, id } => {
+                    let section = section_of(&provider)?;
                     let row = self.sections[section]
                         .rows
                         .iter()
@@ -561,7 +606,7 @@ impl OverviewSearch {
             };
             Some(self.index_of(item))
         });
-        self.selected = found.unwrap_or(0);
+        self.selected = found.unwrap_or_else(|| self.default_index());
     }
 
     /// Whether no result of any kind is showing.
@@ -665,23 +710,24 @@ impl OverviewSearch {
         // Left is *not* a navigation key in gnome-shell at all, and is now a caret move
         // here too — a divergence from our own MVP, which mapped it to select-prev
         // because there was no caret to move.
+        //
+        // Only Tab stops on a section's header: St's arrow keys move by geometry, and a
+        // header sits beside its section's first row, so Down from a row goes to the next
+        // row (`navigate_focus` with `St.DirectionType.DOWN`), while Tab follows the
+        // children's order, header first.
         if mods.is_plain() {
             let at_end =
                 self.edit.cursor() == self.edit.text().len() && self.edit.selection().is_none();
             let nav = match raw {
-                Some(Keysym::Tab) => Some(!mods.shift),
-                Some(Keysym::ISO_Left_Tab) => Some(false),
-                Some(Keysym::Up | Keysym::KP_Up) => Some(false),
-                Some(Keysym::Down | Keysym::KP_Down) => Some(true),
-                Some(Keysym::Right | Keysym::KP_Right) if at_end => Some(true),
+                Some(Keysym::Tab) => Some((!mods.shift, true)),
+                Some(Keysym::ISO_Left_Tab) => Some((false, true)),
+                Some(Keysym::Up | Keysym::KP_Up) => Some((false, false)),
+                Some(Keysym::Down | Keysym::KP_Down) => Some((true, false)),
+                Some(Keysym::Right | Keysym::KP_Right) if at_end => Some((true, false)),
                 _ => None,
             };
-            if let Some(forward) = nav {
-                if forward {
-                    self.select_next();
-                } else {
-                    self.select_prev();
-                }
+            if let Some((forward, headers)) = nav {
+                self.select_step(forward, headers);
                 return SearchOutcome::Handled;
             }
         }
@@ -731,21 +777,23 @@ impl OverviewSearch {
     fn on_query_changed(&mut self) {
         // GNOME re-selects the first result whenever results update; reset here so
         // Enter after a Backspace activates the new first result.
-        self.selected = 0;
+        self.selected = self.default_index();
         self.navigated = false;
         self.content_rev = self.content_rev.wrapping_add(1);
     }
 
-    fn select_prev(&mut self) {
-        self.set_selected(self.selected.saturating_sub(1));
-    }
-
-    fn select_next(&mut self) {
-        let count = self.item_count();
-        if count == 0 {
-            return;
+    /// Move the selection to the next stop forward or back — passing over headers unless
+    /// `headers` — or leave it where it is if there is none.
+    fn select_step(&mut self, forward: bool, headers: bool) {
+        let stops = |i: &usize| headers || !matches!(self.item(*i), Some(Item::Header(_)));
+        let next = if forward {
+            (self.selected + 1..self.item_count()).find(stops)
+        } else {
+            (0..self.selected).rev().find(stops)
+        };
+        if let Some(i) = next {
+            self.set_selected(i);
         }
-        self.set_selected((self.selected + 1).min(count - 1));
     }
 
     fn set_selected(&mut self, i: usize) {
@@ -1304,7 +1352,14 @@ impl OverviewSearch {
                     ));
                 }
             }
-            self.push_pixel_icons(renderer, &mut cache, results, results_alpha, &mut elements);
+            self.push_pixel_icons(
+                renderer,
+                &mut cache,
+                scale,
+                results,
+                results_alpha,
+                &mut elements,
+            );
         }
 
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
@@ -1378,6 +1433,7 @@ impl OverviewSearch {
         &self,
         renderer: &mut VulkanRenderer,
         cache: &mut SearchCache,
+        scale: f64,
         results: &ResultsLayout,
         alpha: f32,
         elements: &mut Vec<TextureRenderElement<VkTexture>>,
@@ -1388,7 +1444,7 @@ impl OverviewSearch {
             cache.pixel_context = Some(context);
         }
         // Only what is on show stays uploaded.
-        cache.pixel_icons.retain(|(provider, id), _| {
+        cache.pixel_icons.retain(|(provider, id, _), _| {
             self.sections
                 .iter()
                 .any(|s| s.provider == *provider && s.rows.iter().any(|m| m.id == *id))
@@ -1403,43 +1459,28 @@ impl OverviewSearch {
                 else {
                     continue;
                 };
-                let key = (section.provider.clone(), meta.id.clone());
+                let key = (section.provider.clone(), meta.id.clone(), scale.to_bits());
                 let stale = cache
                     .pixel_icons
                     .get(&key)
                     .is_none_or(|(src, _)| src != rgba);
                 if stale {
-                    match TextureBuffer::from_memory(
-                        renderer,
-                        rgba,
-                        Fourcc::Abgr8888,
-                        (*width as i32, *height as i32),
-                        false,
-                        1.,
-                        Transform::Normal,
-                        Vec::new(),
-                    ) {
-                        Ok(tb) => {
-                            cache.pixel_icons.insert(key.clone(), (rgba.clone(), tb));
-                        }
-                        Err(err) => {
-                            tracing::error!("error uploading a search result icon: {err:#}");
-                            continue;
-                        }
-                    }
+                    let Some(tb) = upload_pixel_icon(renderer, *width, *height, rgba, scale) else {
+                        continue;
+                    };
+                    cache.pixel_icons.insert(key.clone(), (rgba.clone(), tb));
                 }
                 let Some((_, tb)) = cache.pixel_icons.get(&key) else {
                     continue;
                 };
-                let fit = ROW_ICON_PX / f64::from((*width).max(*height).max(1));
-                let size = Size::from((f64::from(*width) * fit, f64::from(*height) * fit));
+                let size = tb.logical_size();
                 let loc = row_icon_center(*row) - Point::from((size.w / 2., size.h / 2.));
                 elements.push(TextureRenderElement::from_texture_buffer(
                     tb.clone(),
                     loc,
                     alpha,
                     None,
-                    Some(size),
+                    None,
                     Kind::Unspecified,
                 ));
             }
@@ -1625,8 +1666,11 @@ impl OverviewSearch {
                 _ => None,
             }
         };
+        // A focused header takes the same wash as a selected row: both are
+        // `%search_section_content_item`.
         let selected = self.item(self.selected).map(|item| match item {
             Item::App(i) => SearchHit::Result(i),
+            Item::Header(section) => SearchHit::Provider(section),
             Item::Row { section, row } => SearchHit::Row { section, row },
         });
         let washes: Vec<_> = [selected, self.hovered]
@@ -1772,6 +1816,43 @@ fn section_texts(
             }
         }
     }
+}
+
+/// A provider's inline icon, fitted into the row's icon square and uploaded at `scale`.
+///
+/// Sized on the CPU to the pixels it covers: a GPU minification of up to 4x is bilinear and
+/// aliases, and glyph icons (Characters') show it. The pixels are premultiplied, so the resize is
+/// edge-correct.
+fn upload_pixel_icon(
+    renderer: &mut VulkanRenderer,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    scale: f64,
+) -> Option<TextureBuffer<VkTexture>> {
+    let fit = ROW_ICON_PX * scale / f64::from(width.max(height).max(1));
+    let w = ((f64::from(width) * fit).round() as u32).max(1);
+    let h = ((f64::from(height) * fit).round() as u32).max(1);
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let image = if (w, h) == (width, height) {
+        image
+    } else if w < width {
+        image::imageops::resize(&image, w, h, image::imageops::FilterType::Triangle)
+    } else {
+        image::imageops::resize(&image, w, h, image::imageops::FilterType::CatmullRom)
+    };
+    TextureBuffer::from_memory(
+        renderer,
+        image.as_raw(),
+        Fourcc::Abgr8888,
+        (w as i32, h as i32),
+        false,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .inspect_err(|err| tracing::error!("error uploading a search result icon: {err:#}"))
+    .ok()
 }
 
 /// The status box's text line, under the spinner.
@@ -2681,8 +2762,17 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
+    /// The selected stop, as a string: a result's id, or a header's provider.
+    fn stop(s: &OverviewSearch) -> String {
+        match s.selected_activation().unwrap() {
+            Activation::App(id) | Activation::Result { id, .. } => id,
+            Activation::LaunchSearch { provider, .. } => format!("header:{provider}"),
+        }
+    }
+
     /// Sections take their providers' order whatever order they answer in, and the
-    /// selection runs through the app results and then every section's rows.
+    /// selection runs through the app results and then every section — its header, a
+    /// focusable `ProviderInfo` button, then its rows.
     #[test]
     fn sections_keep_provider_order_and_the_selection_runs_through_them() {
         let mut s = typed('a');
@@ -2692,16 +2782,53 @@ run it with --features reference-env, as the fedora CI job does"
         let order: Vec<&str> = s.sections().iter().map(|s| s.provider.as_str()).collect();
         assert_eq!(order, ["first", "second"]);
 
-        let mut seen = vec![s.selected_id().unwrap().to_owned()];
+        let tab = |s: &mut OverviewSearch| {
+            s.handle_key(
+                Some(Keysym::Tab),
+                None,
+                EditMods::default(),
+                KeyTheme::default(),
+            );
+        };
+        let mut seen = vec![stop(&s)];
+        for _ in 0..6 {
+            tab(&mut s);
+            seen.push(stop(&s));
+        }
+        assert_eq!(
+            seen,
+            [
+                "app.desktop",
+                "header:first",
+                "a",
+                "b",
+                "header:second",
+                "c",
+                "c"
+            ],
+            "Tab walks every stop, clamped at the last row"
+        );
+        let mut s2 = typed('a');
+        s2.set_results(vec![entry("app.desktop", "App")]);
+        s2.set_section("first", Some(section(0, "first", &["a", "b"])));
+        s2.set_section("second", Some(section(1, "second", &["c"])));
+        let mut seen = vec![stop(&s2)];
         for _ in 0..4 {
-            down(&mut s);
-            seen.push(s.selected_id().unwrap().to_owned());
+            down(&mut s2);
+            seen.push(stop(&s2));
         }
         assert_eq!(
             seen,
             ["app.desktop", "a", "b", "c", "c"],
-            "clamped at the last row"
+            "Down goes row to row, past the headers beside them"
         );
+        s2.handle_key(
+            Some(Keysym::Up),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(stop(&s2), "b");
         assert_eq!(
             s.selected_activation(),
             Some(Activation::Result {
