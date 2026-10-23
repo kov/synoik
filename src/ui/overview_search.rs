@@ -30,8 +30,9 @@
 //! **Divergences:** no `Shell.AppUsage` ordering within a relevance tier, and no
 //! `SystemActions` results. Enter inside the search delay activates what the typed terms find;
 //! gnome-shell's app provider answers asynchronously, so its Enter activates the previous
-//! default. The results do not scroll: a section that would run past the bottom of the results
-//! view is left out. The keyboard walks the stops in one line — the app results, then each
+//! default. The results scroll by wheel and touchpad, and the selection is eased into view;
+//! there is no touch-drag panning, no overlay scrollbar and no vfade — the view's edge is a hard
+//! clip. The keyboard walks the stops in one line — the app results, then each
 //! section's rows, and on Tab its header first — where St's arrow keys move by geometry (so
 //! Left from a row does not reach its header). Two provider files for one app make
 //! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
@@ -394,6 +395,10 @@ pub struct OverviewSearch {
     /// it follows the default result (the first one) as results arrive
     /// (`_maybeSetInitialSelection`); after, it stays on the result it was moved to.
     navigated: bool,
+    /// How far the results are scrolled, before clamping to an output's overflow.
+    scroll: f64,
+    /// Bumped whenever a different stop becomes selected: what brings it into view.
+    selection_serial: u64,
     /// Mouse hover (separate from `selected` — GNOME's Enter follows keynav, never the
     /// pointer).
     hovered: Option<SearchHit>,
@@ -425,6 +430,8 @@ impl OverviewSearch {
             searching: false,
             selected: 0,
             navigated: false,
+            scroll: 0.,
+            selection_serial: 0,
             hovered: None,
             content_rev: 0,
             cache: RefCell::new(SearchCache::default()),
@@ -591,7 +598,7 @@ impl OverviewSearch {
     /// was never moved or its result is gone.
     fn reselect(&mut self, key: Option<ItemKey>) {
         let section_of = |provider: &str| self.sections.iter().position(|s| s.provider == provider);
-        let found = key.filter(|_| self.navigated).and_then(|key| {
+        let found = key.clone().filter(|_| self.navigated).and_then(|key| {
             let item = match key {
                 ItemKey::App(id) => Item::App(self.results.iter().position(|e| e.id == id)?),
                 ItemKey::Header(provider) => Item::Header(section_of(&provider)?),
@@ -607,6 +614,10 @@ impl OverviewSearch {
             Some(self.index_of(item))
         });
         self.selected = found.unwrap_or_else(|| self.default_index());
+        // `_maybeSetInitialSelection` scrolls only when the default result changed.
+        if self.selected_key() != key {
+            self.selection_serial += 1;
+        }
     }
 
     /// Whether no result of any kind is showing.
@@ -659,6 +670,52 @@ impl OverviewSearch {
     }
 
     /// Whether a provider is still searching — what the empty state reads.
+    /// Bumped whenever a different stop becomes selected — the caller brings it into view.
+    pub fn selection_serial(&self) -> u64 {
+        self.selection_serial
+    }
+
+    /// How far the results are scrolled on `area`.
+    pub fn scroll(&self, area: SearchArea) -> f64 {
+        self.scroll
+            .clamp(0., self.results_layout_at_rest(area).max_scroll())
+    }
+
+    /// Scroll to `value`, clamped to what `area` can scroll.
+    pub fn set_scroll(&mut self, value: f64, area: SearchArea) {
+        self.scroll = value.clamp(0., self.results_layout_at_rest(area).max_scroll());
+    }
+
+    /// Where a scroll `delta` takes the results on `area` — `delta` in wheel notches, or a
+    /// smooth scroll's in Clutter's units (a tenth of a touchpad pixel's). One unit is
+    /// `page_size^(2/3)`, `st_adjustment_adjust_for_scroll_event`'s.
+    pub fn scroll_by(&self, delta: f64, area: SearchArea) -> f64 {
+        let page = area.results.size.h.max(0.);
+        self.scroll(area) + delta * page.powf(2. / 3.)
+    }
+
+    /// Where to scroll on `area` so the selected stop shows, or `None` if it already does —
+    /// `ensureActorVisibleInScrollView`, which keeps it the vfade's 68px clear of either edge.
+    pub fn scroll_to_show_selected(&self, area: SearchArea) -> Option<f64> {
+        const FADE_OFFSET: f64 = 68.;
+        let rest = self.results_layout_at_rest(area);
+        let rect = rest.item_rect(self.item(self.selected)?)?;
+        let value = self.scroll(area);
+        let page = rest.view.size.h;
+        // Content coordinates: from the top of the scroll view.
+        let y1 = rect.loc.y - rest.view.loc.y;
+        let y2 = y1 + rect.size.h;
+        let target = if y1 < value + FADE_OFFSET {
+            (y1 - FADE_OFFSET).max(0.)
+        } else if y2 > value + page - FADE_OFFSET {
+            y2 + FADE_OFFSET - page
+        } else {
+            return None;
+        };
+        let target = target.clamp(0., rest.max_scroll());
+        (target != value).then_some(target)
+    }
+
     /// The status spinner is on show: something is still searching, and nothing is showing.
     pub fn is_spinning(&self) -> bool {
         self.is_active() && self.searching && self.has_no_results()
@@ -778,6 +835,7 @@ impl OverviewSearch {
         // GNOME re-selects the first result whenever results update; reset here so
         // Enter after a Backspace activates the new first result.
         self.selected = self.default_index();
+        self.selection_serial += 1;
         self.navigated = false;
         self.content_rev = self.content_rev.wrapping_add(1);
     }
@@ -799,6 +857,9 @@ impl OverviewSearch {
     fn set_selected(&mut self, i: usize) {
         // No `content_rev` bump: the selection wash is a separate element (the caller
         // always redraws on a handled key), so moving it never re-shapes the labels.
+        if self.selected != i {
+            self.selection_serial += 1;
+        }
         self.selected = i;
         self.navigated = true;
     }
@@ -834,6 +895,8 @@ impl OverviewSearch {
         self.sections.clear();
         self.searching = false;
         self.selected = 0;
+        self.selection_serial += 1;
+        self.scroll = 0.;
         self.navigated = false;
         self.hovered = None;
         self.content_rev = self.content_rev.wrapping_add(1);
@@ -926,11 +989,17 @@ impl OverviewSearch {
     /// The results under an active search, top to bottom in `#searchResultsContent`: the app
     /// grid, then one card per provider section; or the status line when there are none.
     fn results_layout(&self, area: SearchArea) -> ResultsLayout {
+        let layout = self.results_layout_at_rest(area);
+        let dy = self.scroll.clamp(0., layout.max_scroll());
+        layout.scrolled(dy)
+    }
+
+    /// The results at scroll 0.
+    fn results_layout_at_rest(&self, area: SearchArea) -> ResultsLayout {
         let (column_x, column_w) = results_column(area);
         // The first section starts at the top of the scroll view: `.search-section`'s spacing
         // is between a section's results and its separator, not above it.
         let top = area.results.loc.y.round();
-        let bottom = area.results.loc.y + area.results.size.h;
 
         if self.has_no_results() {
             // `_statusContainer`, centered in the whole results view: the spinner's square,
@@ -944,6 +1013,7 @@ impl OverviewSearch {
                 size,
             );
             return ResultsLayout {
+                view: area.results,
                 canvas: status,
                 tiles: Vec::new(),
                 sections: Vec::new(),
@@ -980,11 +1050,6 @@ impl OverviewSearch {
             let rows_h = section.rows.len() as f64 * ROW_H
                 + section.rows.len().saturating_sub(1) as f64 * ROW_SPACING;
             let card_h = 2. * inset + header_h.max(rows_h);
-            // Until the results scroll, a section that would run past the bottom is left
-            // out rather than drawn over the dash.
-            if y + card_h > bottom {
-                break;
-            }
             let card = Rectangle::new(Point::from((card_x, y)), Size::from((card_w, card_h)));
             let header = Rectangle::new(
                 Point::from((card_x + inset, y + inset)),
@@ -1010,6 +1075,7 @@ impl OverviewSearch {
             .or_else(|| tiles.first().map(|t| t.loc.y + tile_h() + LABEL_OVERHANG))
             .unwrap_or(top);
         ResultsLayout {
+            view: area.results,
             canvas: Rectangle::new(
                 Point::from((column_x.round(), top)),
                 Size::from((column_w.round(), canvas_bottom - top)),
@@ -1049,7 +1115,7 @@ impl OverviewSearch {
             Some(EntryHit::Field) => return Some(SearchHit::Field),
             None => {}
         }
-        if let Some(results) = &layout.results {
+        if let Some(results) = layout.results.as_ref().filter(|r| r.view.contains(pos)) {
             for (i, tile) in results.tiles.iter().enumerate() {
                 if tile.contains(pos) {
                     return Some(SearchHit::Result(i));
@@ -1166,10 +1232,9 @@ impl OverviewSearch {
             SearchHit::Provider(section) => results.sections.get(section)?.header,
             SearchHit::Clear | SearchHit::Field | SearchHit::Background => return None,
         };
-        Some(Point::from((
-            rect.loc.x + rect.size.w / 2.,
-            rect.loc.y + rect.size.h / 2.,
-        )))
+        let center = Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
+        // Scrolled out of the view, it cannot be clicked.
+        results.view.contains(center).then_some(center)
     }
 
     /// The search render elements for `output`, faded by overview `progress` (0..1).
@@ -1267,6 +1332,19 @@ impl OverviewSearch {
             ));
         }
 
+        // Everything of the results is clipped to the scroll view.
+        let view = layout.results.as_ref().map(|r| r.view);
+        let clip_from = |elements: &mut Vec<TextureRenderElement<VkTexture>>, from: usize| {
+            if let Some(view) = view {
+                let tail: Vec<_> = elements
+                    .drain(from..)
+                    .filter_map(|el| el.clipped(view))
+                    .collect();
+                elements.extend(tail);
+            }
+        };
+        let results_from = elements.len();
+
         // `_statusSpinner.play()` while a provider is still searching and nothing shows.
         if let Some(status) = layout
             .results
@@ -1362,6 +1440,8 @@ impl OverviewSearch {
             );
         }
 
+        clip_from(&mut elements, results_from);
+
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
         // The pill's own size — the bake is the chrome, so it has to be what the layout
         // placed, ramp and expansion included, or the two disagree.
@@ -1410,6 +1490,7 @@ impl OverviewSearch {
         //     keyed on `content_rev` alone; the plate layer — section plates and the
         //     selection/hover wash — re-bakes when the highlight moves, but that is only
         //     rounded fills. The result icons were pushed above both. ---
+        let results_from = elements.len();
         if let Some(results) = &layout.results {
             self.render_results(
                 renderer,
@@ -1421,6 +1502,7 @@ impl OverviewSearch {
                 &mut elements,
             );
         }
+        clip_from(&mut elements, results_from);
 
         elements
     }
@@ -2033,14 +2115,46 @@ struct SearchLayout {
 }
 
 struct ResultsLayout {
-    /// The box every result is drawn inside — the size the result layers are baked at.
+    /// The scroll view: what of the results shows, and where they can be hit.
+    view: Rectangle<f64, Logical>,
+    /// The box every result is drawn inside — the size the result layers are baked at. It is
+    /// the whole content, scrolled with it and clipped to `view`.
     canvas: Rectangle<f64, Logical>,
     /// App result tiles.
     tiles: Vec<Rectangle<f64, Logical>>,
-    /// The provider sections that fit.
+    /// The provider sections.
     sections: Vec<SectionLayout>,
     /// "No results" / "Searching", when nothing is showing.
     status: Option<Rectangle<f64, Logical>>,
+}
+
+impl ResultsLayout {
+    /// How far the content can scroll: its overflow past the bottom of the view.
+    fn max_scroll(&self) -> f64 {
+        (self.canvas.loc.y + self.canvas.size.h - (self.view.loc.y + self.view.size.h)).max(0.)
+    }
+
+    /// Everything moved up by `dy`.
+    fn scrolled(mut self, dy: f64) -> Self {
+        let up = |r: &mut Rectangle<f64, Logical>| r.loc.y -= dy;
+        up(&mut self.canvas);
+        self.tiles.iter_mut().for_each(up);
+        for s in &mut self.sections {
+            up(&mut s.card);
+            up(&mut s.header);
+            s.rows.iter_mut().for_each(up);
+        }
+        self
+    }
+
+    /// The rect of keyboard stop `item`.
+    fn item_rect(&self, item: Item) -> Option<Rectangle<f64, Logical>> {
+        match item {
+            Item::App(i) => self.tiles.get(i).copied(),
+            Item::Header(section) => Some(self.sections.get(section)?.header),
+            Item::Row { section, row } => self.sections.get(section)?.rows.get(row).copied(),
+        }
+    }
 }
 
 struct SectionLayout {
@@ -2900,10 +3014,10 @@ run it with --features reference-env, as the fedora CI job does"
         );
     }
 
-    /// A section that would run past the bottom of the results view is left out rather than
-    /// drawn over the dash.
+    /// Results past the bottom of the view are scrolled to, not dropped: out of the view they
+    /// cannot be hit, scrolled in they can, and the scroll stops where the content ends.
     #[test]
-    fn sections_that_do_not_fit_are_left_out() {
+    fn results_past_the_view_scroll_into_it() {
         let mut s = typed('a');
         for i in 0..20 {
             let id = format!("p{i}");
@@ -2911,9 +3025,71 @@ run it with --features reference-env, as the fedora CI job does"
         }
         let area = area_1080();
         let l = s.layout(area).results.unwrap();
-        assert!(!l.sections.is_empty() && l.sections.len() < 20);
-        let last = l.sections.last().unwrap().card;
-        assert!(last.loc.y + last.size.h <= area.results.loc.y + area.results.size.h);
+        assert_eq!(l.sections.len(), 20);
+        let last = SearchHit::Row {
+            section: 19,
+            row: 4,
+        };
+        assert_eq!(s.hit_center(last, area), None, "below the view");
+
+        s.set_scroll(f64::MAX, area);
+        let max = s.scroll(area);
+        let l = s.layout(area).results.unwrap();
+        let card = l.sections[19].card;
+        assert_eq!(
+            card.loc.y + card.size.h,
+            area.results.loc.y + area.results.size.h,
+            "scrolled all the way, the content ends at the view's bottom"
+        );
+        let center = s.hit_center(last, area).expect("scrolled into the view");
+        assert_eq!(s.hit_test(center, area), Some(last));
+        assert_eq!(
+            s.hit_center(SearchHit::Row { section: 0, row: 0 }, area),
+            None,
+            "the top scrolled out"
+        );
+
+        assert!(s.scroll_by(1., area) > max, "a notch asks for more…");
+        s.set_scroll(s.scroll_by(1., area), area);
+        assert_eq!(s.scroll(area), max, "…and is clamped");
+        s.set_scroll(-5., area);
+        assert_eq!(s.scroll(area), 0.);
+    }
+
+    /// The selection is brought into view the way `ensureActorVisibleInScrollView` does,
+    /// 68px clear of the edge, and only when it is out of that band.
+    #[test]
+    fn the_selection_is_scrolled_into_view() {
+        let mut s = typed('a');
+        for i in 0..20 {
+            let id = format!("p{i}");
+            s.set_section(&id, Some(section(i, &id, &["a", "b", "c", "d", "e"])));
+        }
+        let area = area_1080();
+        assert_eq!(
+            s.scroll_to_show_selected(area),
+            None,
+            "the default is in view"
+        );
+        let serial = s.selection_serial();
+        for _ in 0..40 {
+            down(&mut s);
+        }
+        assert!(s.selection_serial() > serial);
+        let target = s.scroll_to_show_selected(area).expect("below the view");
+        s.set_scroll(target, area);
+        let row = s
+            .layout(area)
+            .results
+            .unwrap()
+            .item_rect(s.item(s.selected).unwrap())
+            .unwrap();
+        let bottom = area.results.loc.y + area.results.size.h;
+        assert!(
+            (row.loc.y + row.size.h + 68. - bottom).abs() < 1e-6,
+            "68px clear of the bottom"
+        );
+        assert_eq!(s.scroll_to_show_selected(area), None);
     }
 
     impl OverviewSearch {

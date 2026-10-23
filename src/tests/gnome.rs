@@ -23263,13 +23263,24 @@ fn remote_search_overview() -> (
     Fixture,
     async_channel::Receiver<crate::search_providers::SynoikToSearch>,
 ) {
+    remote_search_overview_with(&["files.desktop", "calc.desktop"])
+}
+
+/// [`remote_search_overview`] with the providers `ids`, in that order.
+fn remote_search_overview_with(
+    ids: &[&str],
+) -> (
+    Fixture,
+    async_channel::Receiver<crate::search_providers::SynoikToSearch>,
+) {
     use crate::search_providers::{Provider, ProviderEndpoint};
 
     let (mut f, _rec) = search_overview(&[]);
     let (tx, rx) = async_channel::unbounded();
     f.synoik().search_provider_emit = Some(tx);
-    f.synoik().search_providers = ["files.desktop", "calc.desktop"]
-        .into_iter()
+    f.synoik().search_providers = ids
+        .iter()
+        .copied()
         .map(|id| Provider {
             endpoint: ProviderEndpoint {
                 id: id.to_owned(),
@@ -23325,6 +23336,80 @@ fn answer(f: &mut Fixture, generation: u64, provider: &str, ids: &[&str]) {
         provider: provider.to_owned(),
         results,
     });
+}
+
+/// Results past the bottom of the view scroll (`search.js` puts them in an `St.ScrollView`):
+/// a wheel notch over them moves them `page_size^(2/3)`, and a selection the keyboard takes
+/// out of view is eased back into it (`ensureActorVisibleInScrollView`).
+#[test]
+fn remote_search_results_scroll_and_follow_the_selection() {
+    use crate::ui::overview_search::SearchHit;
+
+    let ids: Vec<String> = (0..8).map(|i| format!("p{i}.desktop")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, rx) = remote_search_overview_with(&refs);
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    for id in &refs {
+        answer(&mut f, generation, id, &["r1", "r2", "r3", "r4", "r5"]);
+    }
+    let output = f.synoik_output(1);
+    let area: crate::ui::overview_search::SearchArea = f
+        .synoik()
+        .layout
+        .controls_layout_for_output(&output)
+        .unwrap()
+        .into();
+    let last = SearchHit::Row { section: 7, row: 4 };
+    assert_eq!(
+        f.synoik().overview_search.hit_center(last, area),
+        None,
+        "eight full sections overflow 1080px"
+    );
+
+    // A wheel notch over the results.
+    pointer_motion_to(
+        &mut f,
+        area.results.loc.x + area.results.size.w / 2.,
+        area.results.loc.y + area.results.size.h / 2.,
+    );
+    f.scroll_wheel();
+    let notch = area.results.size.h.powf(2. / 3.);
+    let scrolled = f.synoik().overview_search.scroll(area);
+    assert!(
+        (scrolled - notch).abs() < 1e-6,
+        "one notch is page_size^(2/3) = {notch}, got {scrolled}"
+    );
+
+    // The keyboard walks down to the sixth section's last row; it is eased into view, 68px
+    // clear of the bottom.
+    for _ in 0..29 {
+        tap(&mut f, KEY_DOWN);
+    }
+    f.advance_until(Duration::from_millis(150), |_| false);
+    let row = SearchHit::Row { section: 5, row: 4 };
+    let center = f
+        .synoik()
+        .overview_search
+        .hit_center(row, area)
+        .expect("the selection was scrolled into view");
+    let bottom = area.results.loc.y + area.results.size.h;
+    assert!(
+        (center.y + 18. + 68. - bottom).abs() < 1.,
+        "the row rests 68px above the view's bottom: {center:?}"
+    );
+
+    // At the very end the content runs out first: the scroll stops there.
+    for _ in 0..20 {
+        tap(&mut f, KEY_DOWN);
+    }
+    f.advance_until(Duration::from_millis(150), |_| false);
+    assert!(f.synoik().overview_search.hit_center(last, area).is_some());
+    f.scroll_wheel();
+    let end = f.synoik().overview_search.scroll(area);
+    f.scroll_wheel();
+    assert_eq!(f.synoik().overview_search.scroll(area), end, "clamped");
 }
 
 /// The search runs 150 ms after the **first** keystroke of a burst, not the last:

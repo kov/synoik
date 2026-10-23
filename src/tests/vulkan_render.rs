@@ -10855,6 +10855,7 @@ fn bake_sites_per_frame(
 
         if f.synoik().layout.are_animations_ongoing(Some(output))
             || f.synoik().panel_popover.are_animations_ongoing()
+            || f.synoik().is_overview_search_scrolling()
         {
             animated += 1;
         }
@@ -11625,6 +11626,83 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
         repeats.is_empty(),
         "these widgets re-baked across {} frames of the app-grid open: {repeats:?}\n\
          Every tile label is a shaped run; re-shaping them per frame is the `c5336421` stutter.",
+        per_frame.len(),
+    );
+}
+
+/// Scrolling the search results is a move of the baked canvas, never a re-bake: the scroll
+/// offset is a position, not part of any bake's key.
+#[test]
+fn the_search_scroll_rebakes_nothing_per_frame() {
+    use crate::search_providers::ResultMeta;
+    use crate::ui::overview_search::ListSection;
+
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("search scroll bake probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    f.synoik().layout.toggle_overview();
+    f.settle_animations();
+    {
+        let s = &mut f.synoik().overview_search;
+        s.handle_key(
+            None,
+            Some('a'),
+            crate::ui::text_edit::EditMods::default(),
+            crate::ui::text_edit::KeyTheme::default(),
+        );
+        for i in 0..8 {
+            let provider = format!("p{i}.desktop");
+            s.set_section(
+                &provider,
+                Some(ListSection {
+                    order: i,
+                    provider: provider.clone(),
+                    name: provider.clone(),
+                    icon: crate::app_system::AppIconRef::Fallback,
+                    rows: (0..5)
+                        .map(|r| ResultMeta {
+                            id: format!("r{r}"),
+                            name: format!("Result {r}"),
+                            description: Some(format!("about result {r}")),
+                            icon: None,
+                            clipboard_text: None,
+                        })
+                        .collect(),
+                    more: 0,
+                    terms: vec!["a".into()],
+                }),
+            );
+        }
+    }
+    // Typing opened the entry pill: let that animation finish first, it is not the subject. Its
+    // first advance only starts it, so it takes two.
+    f.settle_animations();
+    f.settle_animations();
+    let _ = crate::frame_log::take_bake_sites();
+    let _ = render_output_vulkan(&mut f, &output);
+    let warm = crate::frame_log::take_bake_sites();
+    assert!(
+        warm.iter().any(|s| s.file.contains("overview_search.rs")),
+        "no overview_search.rs bake with results showing, so this test cannot observe the thing \
+         it asserts about. Sites seen: {warm:?}"
+    );
+
+    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(20), |f| {
+        // Down the rows past the view: the selection is eased into it.
+        for _ in 0..29 {
+            f.synoik().overview_search.handle_key(
+                Some(smithay::input::keyboard::Keysym::Down),
+                None,
+                crate::ui::text_edit::EditMods::default(),
+                crate::ui::text_edit::KeyTheme::default(),
+            );
+        }
+    });
+    let repeats = sites_baking_repeatedly(&per_frame);
+    assert!(
+        repeats.is_empty(),
+        "these widgets re-baked across {} frames of the search scroll: {repeats:?}",
         per_frame.len(),
     );
 }

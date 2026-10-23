@@ -9975,6 +9975,34 @@ impl State {
             }
         }
 
+        // A scroll over the search results scrolls them (`search.js` puts them in an
+        // `St.ScrollView`); consumed, so it never reaches workspace switching underneath.
+        if is_overview_open && should_handle_in_overview && self.synoik.overview_search.is_active()
+        {
+            let target = self
+                .synoik
+                .output_under(pointer.current_location())
+                .map(|(output, pos)| (output.clone(), pos));
+            if let Some((output, pos)) = target {
+                if let Some(controls) = self.synoik.layout.controls_layout_for_output(&output) {
+                    let area: crate::ui::overview_search::SearchArea = controls.into();
+                    if area.results.contains(pos) {
+                        // A notch is one unit; a smooth delta is Clutter's, a tenth of
+                        // libinput's pixels.
+                        let delta = if source == AxisSource::Wheel {
+                            vertical_amount_v120.map_or(0., |v| v / 120.)
+                        } else {
+                            event.amount(Axis::Vertical).unwrap_or(0.) / 10.
+                        };
+                        if self.synoik.scroll_overview_search(delta, area) {
+                            self.synoik.queue_redraw_all();
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         // A scroll over the open app grid pages it (gnome-shell's grid
         // `scroll-event`, `appDisplay.js:658`). Consume every scroll over the grid so
         // it can't leak to workspace switching; only discrete wheel notches flip a

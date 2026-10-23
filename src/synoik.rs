@@ -348,6 +348,10 @@ struct SearchRun {
     pending: std::collections::HashSet<String>,
     /// When the status spinner started spinning, while it is.
     spinning_since: Option<Duration>,
+    /// The selection the results were last scrolled for.
+    scroll_serial: u64,
+    /// The ease bringing the selection into view (`ensureActorVisibleInScrollView`).
+    scroll: Option<Animation>,
 }
 
 /// How long the app catalog waits for `installed-changed` pings to stop before
@@ -12167,7 +12171,8 @@ impl Synoik {
             AnimCauses::OVERVIEW_SEARCH,
             self.overview_search_fade.is_some()
                 || self.overview_search_expand.is_some()
-                || self.search_run.spinning_since.is_some(),
+                || self.search_run.spinning_since.is_some()
+                || self.search_run.scroll.is_some(),
         );
         if self.startup_animation.is_some() {
             causes |= AnimCauses::OVERVIEW;
@@ -12230,6 +12235,7 @@ impl Synoik {
         if spinning != self.search_run.spinning_since.is_some() {
             self.search_run.spinning_since = spinning.then(|| self.clock.now_unadjusted());
         }
+        self.update_overview_search_scroll();
 
         // Banners are blocked while a panel popover is open; syncing here (once per
         // frame) covers every open/close path with a single site. The drain check
@@ -17560,6 +17566,72 @@ impl Synoik {
 
     /// Arms (or retires) the grow/shrink, and pushes the current progress into the search
     /// model so hit-testing follows the animating pill rather than snapping to its target.
+    /// The search's box on the active output — where the keyboard's selection is brought into
+    /// view, since the search draws on every output but scrolls once.
+    pub fn overview_search_area(&self) -> Option<crate::ui::overview_search::SearchArea> {
+        let output = self.layout.active_output()?;
+        Some(self.layout.controls_layout_for_output(output)?.into())
+    }
+
+    /// The results are easing a selection into view.
+    pub fn is_overview_search_scrolling(&self) -> bool {
+        self.search_run.scroll.is_some()
+    }
+
+    /// Scroll the results by a wheel or touchpad `delta` (see `OverviewSearch::scroll_by`),
+    /// ending any ease in flight: St sets the adjustment's value outright.
+    pub fn scroll_overview_search(
+        &mut self,
+        delta: f64,
+        area: crate::ui::overview_search::SearchArea,
+    ) -> bool {
+        self.search_run.scroll = None;
+        let before = self.overview_search.scroll(area);
+        let target = self.overview_search.scroll_by(delta, area);
+        self.overview_search.set_scroll(target, area);
+        self.overview_search.scroll(area) != before
+    }
+
+    /// A newly selected stop is eased into view over `SCROLL_TIME` (`animationUtils.js:7`).
+    fn update_overview_search_scroll(&mut self) {
+        let serial = self.overview_search.selection_serial();
+        let area = self.overview_search_area();
+        if serial != self.search_run.scroll_serial {
+            self.search_run.scroll_serial = serial;
+            let target = area.and_then(|area| {
+                let target = self.overview_search.scroll_to_show_selected(area)?;
+                Some((area, target))
+            });
+            if let Some((area, target)) = target {
+                let config = synoik_config::Animation {
+                    off: self.config.borrow().animations.off,
+                    kind: synoik_config::animations::Kind::Easing(
+                        synoik_config::animations::EasingParams {
+                            duration_ms: 100,
+                            curve: synoik_config::animations::Curve::EaseOutQuad,
+                        },
+                    ),
+                };
+                self.search_run.scroll = Some(Animation::new(
+                    self.clock.clone(),
+                    self.overview_search.scroll(area),
+                    target,
+                    0.,
+                    config,
+                ));
+            }
+        }
+        if let Some(anim) = &self.search_run.scroll {
+            let (value, done) = (anim.value(), anim.is_done());
+            if let Some(area) = area {
+                self.overview_search.set_scroll(value, area);
+            }
+            if done {
+                self.search_run.scroll = None;
+            }
+        }
+    }
+
     fn update_overview_search_expand(&mut self) {
         let target = self.overview_search.is_expanded();
         if target != self.overview_search_expand_target {
