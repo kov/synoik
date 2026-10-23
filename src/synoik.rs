@@ -12334,6 +12334,10 @@ impl Synoik {
         {
             self.panel_popover.close();
         }
+        // A search provider's details hang off the search, which the overview takes with it.
+        if self.panel_popover.search_provider_menu().is_some() && !self.layout.is_overview_open() {
+            self.panel_popover.close();
+        }
         if !self.panel_popover.is_app_menu() {
             self.app_menu_from_dock = false;
         }
@@ -18172,7 +18176,8 @@ impl Synoik {
             .search_providers
             .iter()
             .filter_map(|p| {
-                let state = match run.failures.get(p.id()).map(|f| f.kind) {
+                let failure = run.failures.get(p.id());
+                let state = match failure.map(|f| f.kind) {
                     Some(FailureKind::TimedOut) => LateState::NoAnswer,
                     Some(FailureKind::NotRunning) => LateState::NotRunning,
                     Some(FailureKind::Masked) => LateState::Masked,
@@ -18184,6 +18189,7 @@ impl Synoik {
                     id: p.id().to_owned(),
                     icon: p.icon.clone(),
                     state,
+                    error: failure.map(|f| f.error.clone()),
                 })
             })
             .collect();
@@ -18201,14 +18207,29 @@ impl Synoik {
         self.queue_redraw_all();
     }
 
-    /// A provider answered.
+    /// A provider answered, or the worker found out what is wrong with one.
     pub fn on_search_provider_msg(&mut self, msg: crate::search_providers::SearchToSynoik) {
-        let crate::search_providers::SearchToSynoik::Results {
-            generation,
-            provider,
-            results,
-            failure,
-        } = msg;
+        use crate::search_providers::SearchToSynoik;
+        let (generation, provider, results, failure) = match msg {
+            SearchToSynoik::Results {
+                generation,
+                provider,
+                results,
+                failure,
+            } => (generation, provider, results, failure),
+            SearchToSynoik::Diagnosis {
+                provider,
+                diagnosis,
+            } => {
+                if self
+                    .panel_popover
+                    .set_search_provider_diagnosis(&provider, diagnosis)
+                {
+                    self.queue_redraw_all();
+                }
+                return;
+            }
+        };
         if generation != self.search_run.generation || !self.search_run.pending.remove(&provider) {
             return;
         }

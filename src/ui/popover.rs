@@ -89,6 +89,7 @@ use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::panel_height;
 use crate::ui::quick_settings::QuickSettings;
+use crate::ui::search_provider_menu::{Diagnosis, SearchProviderDetails, SearchProviderMenu};
 use crate::ui::widget;
 use crate::ui::window_menu::{WindowMenu, WindowMenuContext};
 use crate::ui::workspace_menu::{WorkspaceMenu, WorkspaceMenuContext};
@@ -216,6 +217,11 @@ pub enum PopoverAction {
         item_id: String,
         node_id: i32,
     },
+    /// Open the app behind a search provider that is not running; the popover closes.
+    SearchProviderOpenApp(String),
+    /// Leave a search provider out of the search (`org.gnome.desktop.search-providers
+    /// disabled`); the popover closes.
+    SearchProviderHide(String),
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -397,6 +403,8 @@ impl PopoverAction {
                 // Activating a remote row closes the menu too — but *expanding* one does not,
                 // which is why the two are separate actions.
                 | PopoverAction::IndicatorMenuActivate { .. }
+                | PopoverAction::SearchProviderOpenApp(_)
+                | PopoverAction::SearchProviderHide(_)
                 // Every window-menu row is a plain `PopupMenuItem`, so activating any of them
                 // runs `menu.itemActivated()` and the menu goes.
                 | PopoverAction::WindowTakeScreenshot(_)
@@ -431,6 +439,8 @@ pub enum PopoverContent {
     App(Box<AppMenu>),
     /// An app indicator's remote menu, which opens empty and fills in when the client answers.
     Indicator(Box<IndicatorMenu>),
+    /// A search provider's details, from its icon in the overview search's late row.
+    SearchProvider(Box<SearchProviderMenu>),
     /// A window's own menu, summoned on its titlebar.
     Window(Box<WindowMenu>),
     /// A workspace thumbnail's menu, summoned in the overview strip.
@@ -465,6 +475,7 @@ impl PopoverContent {
             PopoverContent::LoginA11y(m) => m.logical_size(),
             PopoverContent::App(m) => m.logical_size(),
             PopoverContent::Indicator(m) => m.logical_size(),
+            PopoverContent::SearchProvider(m) => m.logical_size(),
             PopoverContent::Window(m) => m.logical_size(),
             PopoverContent::Workspace(m) => m.logical_size(),
             PopoverContent::Background(m) => m.logical_size(),
@@ -485,6 +496,7 @@ impl PopoverContent {
                 Some(action) => (true, Some(action)),
                 None => (false, None),
             },
+            PopoverContent::SearchProvider(m) => (m.nav(dir), None),
             PopoverContent::Window(m) => (m.nav(dir), None),
             PopoverContent::Workspace(m) => (m.nav(dir), None),
             PopoverContent::Background(m) => (m.nav(dir), None),
@@ -505,6 +517,7 @@ impl PopoverContent {
         match self {
             PopoverContent::App(m) => Activation::new(m.activate_focused()),
             PopoverContent::Indicator(m) => Activation::new(m.activate_focused()),
+            PopoverContent::SearchProvider(m) => Activation::new(m.activate_focused()),
             PopoverContent::Window(m) => Activation::new(m.activate_focused()),
             PopoverContent::Workspace(m) => Activation::new(m.activate_focused()),
             PopoverContent::Background(m) => Activation::new(m.activate_focused()),
@@ -530,6 +543,7 @@ impl PopoverContent {
             PopoverContent::LoginA11y(m) => m.corner_radius(),
             PopoverContent::App(m) => m.corner_radius(),
             PopoverContent::Indicator(m) => m.corner_radius(),
+            PopoverContent::SearchProvider(m) => m.corner_radius(),
             PopoverContent::Window(m) => m.corner_radius(),
             PopoverContent::Workspace(m) => m.corner_radius(),
             PopoverContent::Background(m) => m.corner_radius(),
@@ -679,6 +693,7 @@ impl PanelPopover {
             // would have to name *which* icon; it does not, and lighting the whole cluster would
             // be worse than lighting none of it.
             PopoverContent::Indicator(_) => None,
+            PopoverContent::SearchProvider(_) => None,
             // It hangs off the login dialog's own button, which reads `is_login_a11y_open`.
             PopoverContent::LoginA11y(_) => None,
         }
@@ -1244,6 +1259,45 @@ impl PanelPopover {
         }
     }
 
+    /// Pop up a search provider's details, anchored on its icon at `anchor` in the overview
+    /// search. Unconditionally opens, like the app context menu.
+    pub fn open_search_provider_menu(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        details: SearchProviderDetails,
+    ) {
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        // The row is at the bottom of the results: the box goes above it.
+        self.side = PopoverSide::Bottom;
+        let mut menu = SearchProviderMenu::new(details);
+        menu.set_max_height(Some(self.available_menu_height()));
+        self.content = Some(PopoverContent::SearchProvider(Box::new(menu)));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// The open search provider details, if that is what is up.
+    pub fn search_provider_menu(&self) -> Option<&SearchProviderMenu> {
+        match &self.content {
+            Some(PopoverContent::SearchProvider(m)) if self.open && !self.closing => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The search worker's findings on `provider` landed. Ignored unless its details are what
+    /// is up. Returns whether it changed anything drawn.
+    pub fn set_search_provider_diagnosis(&mut self, provider: &str, diagnosis: Diagnosis) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::SearchProvider(m)) if self.open && m.provider() == provider => {
+                m.set_diagnosis(diagnosis)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether an app context menu is the content that is up — the overview closes it
     /// on the way out (`Main.overview.connectObject('hiding', …)`, `appDisplay.js:3040`).
     pub fn is_app_menu(&self) -> bool {
@@ -1453,6 +1507,7 @@ impl PanelPopover {
             PopoverContent::InputSources(m) => m.focused_label().map(str::to_owned),
             PopoverContent::App(m) => m.focused_label(),
             PopoverContent::Indicator(m) => m.focused_label(),
+            PopoverContent::SearchProvider(m) => m.focused_label(),
             PopoverContent::Window(m) => m.focused_label(),
             PopoverContent::Workspace(m) => m.focused_label(),
             PopoverContent::Background(m) => m.focused_label(),
@@ -1625,6 +1680,7 @@ impl PanelPopover {
             Some(PopoverContent::LoginA11y(m)) => m.pointer_hover(local),
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
             Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
+            Some(PopoverContent::SearchProvider(m)) => m.pointer_hover(local),
             Some(PopoverContent::Window(m)) => m.pointer_hover(local),
             Some(PopoverContent::Workspace(m)) => m.pointer_hover(local),
             Some(PopoverContent::Background(m)) => m.pointer_hover(local),
@@ -1784,6 +1840,9 @@ impl PanelPopover {
             Some(PopoverContent::Indicator(m)) => {
                 m.nav(widget::Dir::Down);
             }
+            Some(PopoverContent::SearchProvider(m)) => {
+                m.nav(widget::Dir::Down);
+            }
             Some(PopoverContent::Window(m)) => {
                 m.nav(widget::Dir::Down);
             }
@@ -1857,6 +1916,7 @@ impl PanelPopover {
                 Some(PopoverContent::LoginA11y(m)) => m.pointer_click(local),
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
                 Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
+                Some(PopoverContent::SearchProvider(m)) => m.pointer_click(local),
                 Some(PopoverContent::Window(m)) => m.pointer_click(local),
                 Some(PopoverContent::Workspace(m)) => m.pointer_click(local),
                 Some(PopoverContent::Background(m)) => m.pointer_click(local),
@@ -1913,6 +1973,7 @@ impl PanelPopover {
             // event for whatever is behind it.
             Some(PopoverContent::App(m)) => m.scroll(delta),
             Some(PopoverContent::Indicator(m)) => m.scroll(delta),
+            Some(PopoverContent::SearchProvider(m)) => m.scroll(delta),
             Some(PopoverContent::Window(m)) => m.scroll(delta),
             _ => false,
         }
@@ -2016,6 +2077,7 @@ impl PanelPopover {
             Some(PopoverContent::LoginA11y(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::App(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::Indicator(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::SearchProvider(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::Window(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::Workspace(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::Background(m)) => m.render(renderer, icons, scale, origin),

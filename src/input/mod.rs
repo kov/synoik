@@ -2651,6 +2651,17 @@ impl State {
             PopoverAction::StepPanelMenu(delta) => {
                 self.step_panel_menu(delta);
             }
+            // A provider whose app is not running answers once it is: launch it as a search
+            // result would be, which leaves the overview.
+            PopoverAction::SearchProviderOpenApp(provider) => {
+                self.activate_app(&provider, false, "search provider details");
+                self.synoik.layout.close_overview();
+            }
+            PopoverAction::SearchProviderHide(provider) => {
+                if let Some(writer) = &self.synoik.gnome_settings_writer {
+                    writer.hide_search_provider(provider);
+                }
+            }
             PopoverAction::IndicatorMenuExpand { item_id, node_id } => {
                 self.send_indicator_menu_request(
                     &item_id,
@@ -3207,6 +3218,42 @@ impl State {
     /// *upward* (`popupMenuSide: St.Side.BOTTOM`, `dash.js:27`) because the dash sits at
     /// the bottom of the screen, while a grid or search icon takes `AppIcon`'s default
     /// `St.Side.LEFT` and opens to the icon's right (`appDisplay.js:2928`).
+    /// Pop up the details of the provider behind late-row icon `i` of the overview search, and
+    /// ask the search worker for what it can find out about it.
+    fn open_search_provider_details(&mut self, output: &Output, i: usize) {
+        use crate::ui::search_provider_menu::{SearchProviderDetails, SearchProviderMenu};
+
+        let Some(controls) = self.synoik.layout.controls_layout_for_output(output) else {
+            return;
+        };
+        let Some((late, anchor)) = self.synoik.overview_search.late_hit(i, controls.into()) else {
+            return;
+        };
+        let name = self
+            .synoik
+            .search_providers
+            .iter()
+            .find(|p| p.id() == late.id)
+            .map_or_else(|| late.id.clone(), |p| p.name.clone());
+        let details = SearchProviderDetails {
+            provider: late.id.clone(),
+            name,
+            state: late.state,
+            error: late.error.clone(),
+            can_open: self.synoik.app_system.lookup(&late.id).is_some(),
+        };
+        self.synoik
+            .panel_popover
+            .open_search_provider_menu(output.clone(), anchor, details);
+        if SearchProviderMenu::wants_diagnosis(late.state) {
+            self.synoik
+                .emit_search(crate::search_providers::SynoikToSearch::Diagnose {
+                    provider: late.id,
+                });
+        }
+        self.synoik.queue_redraw_all();
+    }
+
     fn open_app_menu_for(&mut self, output: &Output, hit: OverviewHit) -> bool {
         let Some(controls) = self.synoik.layout.controls_layout_for_output(output) else {
             return false;
@@ -9074,6 +9121,9 @@ impl State {
             }
             OverviewHit::Search(SearchHit::Clear) if primary => {
                 self.synoik.clear_overview_search();
+            }
+            OverviewHit::Search(SearchHit::Late(i)) if primary => {
+                self.open_search_provider_details(output, i);
             }
             // Clicking the entry focuses it, which is what grows the resting puck into
             // GNOME's pill. Already-open is a no-op (but still consumes, so the click never

@@ -46,6 +46,7 @@ pub mod ripples;
 pub mod run_dialog;
 pub mod screen_transition;
 pub mod screenshot_ui;
+pub mod search_provider_menu;
 pub mod switcher;
 pub mod text_edit;
 pub mod theme_node;

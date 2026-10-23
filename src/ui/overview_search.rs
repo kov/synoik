@@ -38,15 +38,16 @@
 //! not running with `AutoStart=false`, with a "disabled" badge when their unit is masked, with an
 //! error badge when they failed. The row is redone when a search settles — at the deadline, or
 //! once every provider has answered — and the last one stays until then, so it does not blink
-//! as you type. GNOME has no badges; the look is ours. The system actions' availability is the
-//! power menu's (see `Synoik::system_action_available`). Enter inside the search delay activates
-//! what the typed terms find; gnome-shell's app provider answers asynchronously, so its Enter
-//! activates the previous default. The results scroll by wheel and touchpad, and the selection is
-//! eased into view; there is no touch-drag panning, no overlay scrollbar and no vfade — the view's
-//! edge is a hard clip. The keyboard walks the stops in one line — the app results, then each
-//! section's rows, and on Tab its header first — where St's arrow keys move by geometry (so
-//! Left from a row does not reach its header). Two provider files for one app make
-//! one provider, the first. GNOME's stage-capture `reset-search` gesture (a
+//! as you type. A click on an icon there opens the provider's details
+//! (`crate::ui::search_provider_menu`). GNOME has no badges and no details; both are ours. The
+//! system actions' availability is the power menu's (see `Synoik::system_action_available`). Enter
+//! inside the search delay activates what the typed terms find; gnome-shell's app provider answers
+//! asynchronously, so its Enter activates the previous default. The results scroll by wheel and
+//! touchpad, and the selection is eased into view; there is no touch-drag panning, no overlay
+//! scrollbar and no vfade — the view's edge is a hard clip. The keyboard walks the stops in one
+//! line — the app results, then each section's rows, and on Tab its header first — where St's arrow
+//! keys move by geometry (so Left from a row does not reach its header). Two provider files for one
+//! app make one provider, the first. GNOME's stage-capture `reset-search` gesture (a
 //! click outside the entry/results clears the search) is not ported: such a click falls
 //! through to the picker and the query survives until the next overview enter. Like the
 //! panel and dash, the search draws on **every** output with one shared selection, hover and
@@ -270,6 +271,8 @@ pub struct LateProvider {
     pub id: String,
     pub icon: AppIconRef,
     pub state: LateState,
+    /// What the bus or the call said, when it failed — for its details.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +379,8 @@ pub enum SearchHit {
     Row { section: usize, row: usize },
     /// The header of list section `.0`.
     Provider(usize),
+    /// Icon `.0` of the row of providers that have not answered, in the order it draws them.
+    Late(usize),
     /// The entry's body — clicking it focuses (and so expands) the entry, the way
     /// gnome-shell's `searchEntryBin` click grabs key focus.
     Field,
@@ -581,7 +586,10 @@ impl OverviewSearch {
             SearchHit::Result(i) => self.activation(Item::App(i)),
             SearchHit::Row { section, row } => self.activation(Item::Row { section, row }),
             SearchHit::Provider(section) => self.activation(Item::Header(section)),
-            SearchHit::Clear | SearchHit::Field | SearchHit::Background => None,
+            // A late provider's icon opens its details, which is the caller's to do.
+            SearchHit::Late(_) | SearchHit::Clear | SearchHit::Field | SearchHit::Background => {
+                None
+            }
         }
     }
 
@@ -1280,6 +1288,13 @@ impl OverviewSearch {
                     return Some(SearchHit::Result(i));
                 }
             }
+            if let Some(late) = results.late {
+                for (i, (_, x)) in self.late_pieces(late.loc.x).icons.iter().enumerate() {
+                    if late_icon_rect(late, *x).contains(pos) {
+                        return Some(SearchHit::Late(i));
+                    }
+                }
+            }
             for (section, s) in results.sections.iter().enumerate() {
                 if s.header.contains(pos) {
                     return Some(SearchHit::Provider(section));
@@ -1382,6 +1397,18 @@ impl OverviewSearch {
         Some((center, widget::Spinner::geometry(SPINNER_PX).0))
     }
 
+    /// The provider behind late-row icon `i`, and where its icon is — what its details hang off.
+    pub fn late_hit(
+        &self,
+        i: usize,
+        area: SearchArea,
+    ) -> Option<(LateProvider, Rectangle<f64, Logical>)> {
+        let late = self.layout(area).results?.late?;
+        let pieces = self.late_pieces(late.loc.x);
+        let (provider, x) = pieces.icons.get(i)?;
+        Some(((*provider).clone(), late_icon_rect(late, *x)))
+    }
+
     /// The late row's icon squares and text boxes, in order — a geometry probe for the render
     /// test.
     #[cfg(test)]
@@ -1393,7 +1420,7 @@ impl OverviewSearch {
             pieces
                 .icons
                 .iter()
-                .map(|(_, x, _)| rect(*x, ROW_ICON_PX))
+                .map(|(_, x)| rect(*x, ROW_ICON_PX))
                 .collect(),
             pieces
                 .texts
@@ -1425,7 +1452,7 @@ impl OverviewSearch {
                 if i > 0 {
                     pen += LATE_ICON_SPACING;
                 }
-                icons.push((&late.icon, pen, late.state));
+                icons.push((*late, pen));
                 pen += ROW_ICON_PX;
             }
             pen += TITLE_SPACING;
@@ -1446,6 +1473,10 @@ impl OverviewSearch {
             SearchHit::Result(i) => *results.tiles.get(i)?,
             SearchHit::Row { section, row } => *results.sections.get(section)?.rows.get(row)?,
             SearchHit::Provider(section) => results.sections.get(section)?.header,
+            SearchHit::Late(i) => {
+                let late = results.late?;
+                late_icon_rect(late, self.late_pieces(late.loc.x).icons.get(i)?.1)
+            }
             SearchHit::Clear | SearchHit::Field | SearchHit::Background => return None,
         };
         let center = Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
@@ -1696,7 +1727,8 @@ impl OverviewSearch {
             let late_from = elements.len();
             let mut badges = Vec::new();
             if let Some(late) = results.late {
-                for (icon, x, state) in self.late_pieces(late.loc.x).icons {
+                for (provider, x) in self.late_pieces(late.loc.x).icons {
+                    let (icon, state) = (&provider.icon, provider.state);
                     let center = Point::from((x + ROW_ICON_PX / 2., late.loc.y + late.size.h / 2.));
                     let (dim, style) = match state {
                         LateState::NoAnswer => (NO_ANSWER_ICON_ALPHA, widget::IconStyle::Normal),
@@ -2318,11 +2350,19 @@ fn status_text(status: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
 
 /// The late row laid out from a pen position ([`OverviewSearch::late_pieces`]).
 struct LatePieces<'a> {
-    /// Each icon, its left edge, and its provider's state.
-    icons: Vec<(&'a AppIconRef, f64, LateState)>,
+    /// Each provider and its icon's left edge.
+    icons: Vec<(&'a LateProvider, f64)>,
     /// Each text and its left edge.
     texts: Vec<(&'static str, f64)>,
     width: f64,
+}
+
+/// The square of the late row's icon at `x`: a row's icon, centred in the row.
+fn late_icon_rect(late: Rectangle<f64, Logical>, x: f64) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((x, late.loc.y + (late.size.h - ROW_ICON_PX) / 2.)),
+        Size::from((ROW_ICON_PX, ROW_ICON_PX)),
+    )
 }
 
 /// A late row text's width, logical px.

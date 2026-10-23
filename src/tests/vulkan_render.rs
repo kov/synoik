@@ -9496,6 +9496,7 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
             id: id.to_owned(),
             icon: icon.clone(),
             state,
+            error: None,
         };
         s.set_late(vec![
             late("a.desktop", LateState::Searching),

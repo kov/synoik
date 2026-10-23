@@ -24043,6 +24043,114 @@ fn clicking_a_section_header_launches_the_providers_search() {
     assert!(!f.synoik().layout.is_overview_open());
 }
 
+/// A click on a provider's icon in the late row opens its details: what is wrong, what the bus
+/// said, and — once the worker has read it — its recent log; with Hide from Search to act on
+/// it. They close with the overview.
+#[test]
+fn clicking_a_late_provider_shows_its_details() {
+    use crate::search_providers::{FailureKind, ProviderDiagnosis, SearchToSynoik, SynoikToSearch};
+    use crate::ui::overview_search::SearchHit;
+
+    let (mut f, rx) = remote_search_overview();
+    tap(&mut f, KEY_A);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "files.desktop", &["one"]);
+    answer_failed(&mut f, generation, "calc.desktop", FailureKind::Failed);
+
+    let area = overview_controls(&mut f).into();
+    let at = f
+        .synoik()
+        .overview_search
+        .hit_center(SearchHit::Late(0), area)
+        .expect("the failed provider is in the row");
+    pointer_motion_to(&mut f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    let menu = |f: &mut Fixture| -> (Vec<String>, Vec<String>) {
+        let menu = f
+            .synoik()
+            .panel_popover
+            .search_provider_menu()
+            .expect("its details are up");
+        (
+            menu.texts().into_iter().map(str::to_owned).collect(),
+            menu.labels().into_iter().map(str::to_owned).collect(),
+        )
+    };
+    let (texts, labels) = menu(&mut f);
+    assert_eq!(
+        texts,
+        [
+            "It failed to start, or to answer.",
+            "Failed",
+            "Reading its log…"
+        ]
+    );
+    assert_eq!(
+        labels,
+        ["calc.desktop", "Hide from Search"],
+        "no Open App: the catalog has no such app"
+    );
+    assert!(
+        sent(&rx).iter().any(|m| matches!(
+            m,
+            SynoikToSearch::Diagnose { provider } if provider == "calc.desktop"
+        )),
+        "the worker is asked what it can find out"
+    );
+
+    f.synoik()
+        .on_search_provider_msg(SearchToSynoik::Diagnosis {
+            provider: "calc.desktop".to_owned(),
+            diagnosis: ProviderDiagnosis {
+                unit: None,
+                log: vec!["calc: symbol lookup error".to_owned()],
+            },
+        });
+    let (texts, labels) = menu(&mut f);
+    assert_eq!(
+        texts,
+        [
+            "It failed to start, or to answer.",
+            "Failed",
+            "calc: symbol lookup error"
+        ]
+    );
+    assert_eq!(labels, ["calc.desktop", "Recent log", "Hide from Search"]);
+
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let row = f
+        .synoik()
+        .panel_popover
+        .search_provider_menu()
+        .unwrap()
+        .row_center("Hide from Search")
+        .expect("the row");
+    let hide = origin + row;
+    pointer_motion_to(&mut f, hide.x, hide.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "Hide from Search closes it"
+    );
+
+    // Opened again, it goes with the overview.
+    pointer_motion_to(&mut f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    assert!(f.synoik().panel_popover.search_provider_menu().is_some());
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.settle();
+    assert!(f.synoik().panel_popover.search_provider_menu().is_none());
+}
+
 /// Emptying the query resets the providers' side too, so the next search starts afresh.
 #[test]
 fn emptying_the_query_resets_the_provider_search() {

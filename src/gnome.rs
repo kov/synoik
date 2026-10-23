@@ -2108,6 +2108,41 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Leave search provider `id` out of the search: on `org.gnome.desktop.search-providers
+    /// disabled`, and off `enabled` (which is what keeps a `DefaultDisabled` provider in), as
+    /// GNOME Settings' Search panel does when its switch goes off. The change comes back around
+    /// as a settings change, which reloads the providers.
+    pub fn hide_search_provider(&self, id: String) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(store) = &s.search_providers {
+                    let mut disabled: Vec<String> = store
+                        .strv("disabled")
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    if !disabled.contains(&id) {
+                        disabled.push(id.clone());
+                    }
+                    let enabled: Vec<String> = store
+                        .strv("enabled")
+                        .iter()
+                        .map(|s| s.to_string())
+                        .filter(|e| *e != id)
+                        .collect();
+                    for (key, value) in [("disabled", &disabled), ("enabled", &enabled)] {
+                        let value: Vec<&str> = value.iter().map(String::as_str).collect();
+                        if let Err(err) = store.set_strv(key, value) {
+                            warn!("error writing org.gnome.desktop.search-providers {key}: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Persist the emoji picker's history to `org.synoik.emoji recently-used-emoji`. Missing
     /// store or key is a no-op, like [`set_command_history`](Self::set_command_history).
     pub fn set_emoji_recents(&self, recents: Vec<String>) {

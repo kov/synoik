@@ -270,6 +270,9 @@ pub enum SynoikToSearch {
         terms: Vec<String>,
         timestamp: u32,
     },
+    /// Find out what is wrong with `provider`, for its details: its systemd unit, its recent
+    /// log. Answered with [`SearchToSynoik::Diagnosis`].
+    Diagnose { provider: String },
 }
 
 /// The provider client's replies.
@@ -284,6 +287,21 @@ pub enum SearchToSynoik {
         /// Why it did not answer, when it did not.
         failure: Option<ProviderFailure>,
     },
+    /// What [`SynoikToSearch::Diagnose`] found.
+    Diagnosis {
+        provider: String,
+        diagnosis: ProviderDiagnosis,
+    },
+}
+
+/// What is known of a provider that did not answer, beyond the bus error. The log is the
+/// provider's own output: text to show, bounded, never anything to act on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderDiagnosis {
+    /// The systemd unit its D-Bus service names (`SystemdService=`), if it names one.
+    pub unit: Option<String>,
+    /// Its recent log lines, oldest first.
+    pub log: Vec<String>,
 }
 
 /// Why a provider did not answer a search — classified on the worker's side of the seam.

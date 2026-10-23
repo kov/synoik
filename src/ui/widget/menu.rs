@@ -180,6 +180,45 @@ pub enum MenuEntry {
     /// `PopupSeparatorMenuItem(text)` (`popupMenu.js:300-324`): a label followed by a rule that
     /// fills the rest of the row.
     SectionHeader(String),
+    /// Text to read, not a row to activate: wrapped to the menu's widest, never focused, at most
+    /// [`TEXT_MAX_LINES`] lines. `muted` draws it in `$system_insensitive_fg_color`, for detail
+    /// under a statement. No GNOME menu has one; it is what a popover of details needs.
+    Text {
+        text: String,
+        muted: bool,
+    },
+}
+
+/// The most lines a [`MenuEntry::Text`] wraps to; the last is ellipsized.
+pub const TEXT_MAX_LINES: usize = 8;
+
+/// A [`MenuEntry::Text`] line's row: the line box and a little leading.
+fn text_line_h() -> f64 {
+    crate::ui::line_height_px(TEXT_PT) + 2.
+}
+
+/// The width a [`MenuEntry::Text`] wraps at: the widest a menu gets, less its padding.
+fn text_wrap_w() -> f64 {
+    max_w() - 2. * (CONTENT_PAD + ITEM_PAD_H)
+}
+
+/// A [`MenuEntry::Text`]'s lines — a hard line break starts a new one.
+fn text_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .flat_map(|line| {
+            synoik_vk::text::wrap_lines_weighted(
+                line,
+                text_px() as f32,
+                false,
+                text_wrap_w(),
+                TEXT_MAX_LINES,
+                true,
+            )
+        })
+        .collect();
+    lines.truncate(TEXT_MAX_LINES);
+    lines
 }
 
 /// One row as laid out: an entry, the depth it sits at, and the path to reach it.
@@ -189,6 +228,8 @@ struct VisibleRow {
     path: Vec<usize>,
     depth: usize,
     height: f64,
+    /// A [`MenuEntry::Text`]'s row is one of its lines, and this is which.
+    line: Option<String>,
 }
 
 /// What a click on the menu did.
@@ -368,6 +409,18 @@ impl Menu {
         ) {
             for (i, entry) in entries.iter().enumerate() {
                 prefix.push(i);
+                if let MenuEntry::Text { text, .. } = entry {
+                    for line in text_lines(text) {
+                        out.push(VisibleRow {
+                            path: prefix.clone(),
+                            depth,
+                            height: text_line_h(),
+                            line: Some(line),
+                        });
+                    }
+                    prefix.pop();
+                    continue;
+                }
                 out.push(VisibleRow {
                     path: prefix.clone(),
                     depth,
@@ -375,6 +428,7 @@ impl Menu {
                         MenuEntry::Separator => SEP_H,
                         _ => ROW_H,
                     },
+                    line: None,
                 });
                 if let MenuEntry::Item(item) = entry {
                     if item.is_submenu() && expanded.contains(&item.id) {
@@ -483,6 +537,7 @@ impl Menu {
                     MenuEntry::SectionHeader(label) => {
                         Some(indent + measure(label) + HEADER_RULE_GAP + HEADER_RULE_MIN)
                     }
+                    MenuEntry::Text { .. } => Some(indent + measure(row.line.as_deref()?)),
                     MenuEntry::Separator => None,
                 }
             })
@@ -524,9 +579,26 @@ impl Menu {
             .filter_map(|row| match self.entry_at(&row.path)? {
                 MenuEntry::Item(item) => Some(item.label.as_str()),
                 MenuEntry::SectionHeader(label) => Some(label.as_str()),
-                MenuEntry::Separator => None,
+                MenuEntry::Separator | MenuEntry::Text { .. } => None,
             })
             .collect()
+    }
+
+    /// Every [`MenuEntry::Text`] as written, top to bottom — what a person reads in the menu
+    /// besides its rows, for the corpus.
+    pub fn texts(&self) -> Vec<&str> {
+        fn walk<'a>(entries: &'a [MenuEntry], out: &mut Vec<&'a str>) {
+            for entry in entries {
+                match entry {
+                    MenuEntry::Text { text, .. } => out.push(text),
+                    MenuEntry::Item(item) => walk(&item.children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.entries, &mut out);
+        out
     }
 
     /// The labels of the rows that are drawn insensitive, in the same order [`labels`] gives.
@@ -911,6 +983,10 @@ impl Menu {
             .map(|row| match self.entry_at(&row.path) {
                 Some(MenuEntry::Item(item)) => shaper.shape(&item.label, style).map(Some),
                 Some(MenuEntry::SectionHeader(label)) => shaper.shape(label, style).map(Some),
+                Some(MenuEntry::Text { .. }) => match &row.line {
+                    Some(line) => shaper.shape(line, style).map(Some),
+                    None => Ok(None),
+                },
                 _ => Ok(None),
             })
             .collect()
@@ -967,6 +1043,14 @@ impl Menu {
                         p.fill_rounded(rule, 0., SEPARATOR)?;
                     }
                 }
+                (Some(MenuEntry::Text { muted, .. }), Some(run)) => {
+                    p.text(
+                        run,
+                        Point::from((rect.loc.x + ITEM_PAD_H, rect.loc.y + rect.size.h / 2.)),
+                        Align::LEFT_MIDDLE,
+                        if *muted { style::MUTED } else { style::TEXT },
+                    )?;
+                }
                 (Some(MenuEntry::Item(item)), Some(run)) => {
                     // Hover and keyboard focus draw the same wash: GNOME's menus give the focused
                     // item the hover look rather than a second style.
@@ -1022,6 +1106,41 @@ fn measure(label: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text wraps to the menu's widest and takes a row per line; it is read, not focused.
+    #[test]
+    fn text_wraps_and_is_never_focused() {
+        let long = "word ".repeat(60);
+        let mut menu = Menu::new(vec![
+            MenuEntry::Text {
+                text: long.trim().to_owned(),
+                muted: false,
+            },
+            item(1, "Only"),
+        ]);
+        let rows = menu.visible_rows();
+        assert!(
+            rows.len() > 2,
+            "the text took several lines: {}",
+            rows.len()
+        );
+        assert!(menu.logical_size().w <= max_w() + 0.5);
+        assert_eq!(menu.labels(), ["Only"]);
+        assert_eq!(menu.texts(), [long.trim()]);
+        assert!(menu.focus_step(1));
+        assert_eq!(menu.focused_label().as_deref(), Some("Only"));
+        menu.focus_step(-1);
+        assert_eq!(
+            menu.focused_label().as_deref(),
+            Some("Only"),
+            "the text above is no stop"
+        );
+        let capped = Menu::new(vec![MenuEntry::Text {
+            text: "word ".repeat(400),
+            muted: true,
+        }]);
+        assert_eq!(capped.visible_rows().len(), TEXT_MAX_LINES);
+    }
 
     fn item(id: u64, label: &str) -> MenuEntry {
         MenuEntry::Item(MenuItem::new(id, label))

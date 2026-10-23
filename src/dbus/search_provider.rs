@@ -29,8 +29,8 @@ use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::search_providers::{
-    filter_results, FailureKind, ProviderEndpoint, ProviderFailure, ResultIcon, ResultMeta,
-    SearchToSynoik, SectionResults, SynoikToSearch, MAX_LIST_ROWS,
+    filter_results, FailureKind, ProviderDiagnosis, ProviderEndpoint, ProviderFailure, ResultIcon,
+    ResultMeta, SearchToSynoik, SectionResults, SynoikToSearch, MAX_LIST_ROWS,
 };
 
 const IFACE_1: &str = "org.gnome.Shell.SearchProvider";
@@ -47,6 +47,9 @@ const MAX_RESULT_IDS: usize = 1000;
 const MAX_ID_BYTES: usize = 4096;
 const MAX_TEXT_CHARS: usize = 1024;
 const MAX_ICON_PX: i32 = 256;
+/// How much of a provider's log its details show, and how far back it looks.
+const DIAGNOSIS_LOG_LINES: usize = 6;
+const DIAGNOSIS_LOG_SINCE: &str = "-10min";
 
 /// Where replies go: the compositor's channel in a session, a test's in a test.
 type Reply = Arc<dyn Fn(SearchToSynoik) + Send + Sync>;
@@ -170,6 +173,7 @@ impl Client {
                     "activate a search result",
                 );
             }
+            SynoikToSearch::Diagnose { provider } => self.diagnose(provider),
             SynoikToSearch::LaunchSearch {
                 provider,
                 terms,
@@ -192,6 +196,33 @@ impl Client {
                     "launch a provider's search",
                 );
             }
+        }
+    }
+
+    fn diagnose(&self, provider: String) {
+        let Some(endpoint) = self.endpoint(&provider) else {
+            return;
+        };
+        let reply = self.reply.clone();
+        // A file walk and a `journalctl` run: blocking, so on a thread of their own, never the
+        // executor the searches share.
+        let spawned = std::thread::Builder::new()
+            .name("search provider diagnosis".to_owned())
+            .spawn(move || {
+                let unit = service_unit(&dbus_service_dirs(), &endpoint.bus_name);
+                // A bus-activated service without a unit of its own runs as
+                // `dbus-:1.N-<name>@M.service`, whose name we cannot know but can match.
+                let pattern = unit
+                    .clone()
+                    .unwrap_or_else(|| format!("dbus-*-{}@*", endpoint.bus_name));
+                let log = recent_log(&pattern);
+                reply(SearchToSynoik::Diagnosis {
+                    provider,
+                    diagnosis: ProviderDiagnosis { unit, log },
+                });
+            });
+        if let Err(err) = spawned {
+            warn!("could not start a search provider diagnosis: {err}");
         }
     }
 
@@ -429,6 +460,76 @@ async fn section(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(missing)?;
     Ok(SectionResults { rows, more })
+}
+
+/// Where the session bus looks for its service files: `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, each
+/// with `dbus-1/services`.
+fn dbus_service_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![glib::user_data_dir()];
+    dirs.extend(glib::system_data_dirs());
+    dirs.into_iter()
+        .map(|d| d.join("dbus-1").join("services"))
+        .collect()
+}
+
+/// The systemd unit the D-Bus service owning `bus_name` names, if it names one — the first file
+/// in `dirs` that provides the name wins, as for the bus.
+fn service_unit(dirs: &[std::path::PathBuf], bus_name: &str) -> Option<String> {
+    for dir in dirs {
+        let Ok(files) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|e| e != "service") {
+                continue;
+            }
+            let keys = glib::KeyFile::new();
+            if keys
+                .load_from_file(&path, glib::KeyFileFlags::NONE)
+                .is_err()
+            {
+                continue;
+            }
+            const GROUP: &str = "D-BUS Service";
+            if keys.string(GROUP, "Name").ok().as_deref() != Some(bus_name) {
+                continue;
+            }
+            return keys
+                .string(GROUP, "SystemdService")
+                .ok()
+                .map(String::from)
+                .filter(|unit| !unit.is_empty());
+        }
+    }
+    None
+}
+
+/// The last lines the user units matching `pattern` logged lately, as plain messages.
+fn recent_log(pattern: &str) -> Vec<String> {
+    let output = std::process::Command::new("journalctl")
+        .args(["--user", "--no-pager", "--output=cat", "--since"])
+        .arg(DIAGNOSIS_LOG_SINCE)
+        .arg(format!("--lines={DIAGNOSIS_LOG_LINES}"))
+        .arg(format!("--user-unit={pattern}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            warn!("could not read a search provider's log: {err}");
+            return Vec::new();
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take(MAX_TEXT_CHARS).collect())
+        .collect();
+    let skip = lines.len().saturating_sub(DIAGNOSIS_LOG_LINES);
+    lines.into_iter().skip(skip).collect()
 }
 
 fn bound_ids(mut ids: Vec<String>) -> Vec<String> {
@@ -799,7 +900,10 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            got.sort_by_key(|SearchToSynoik::Results { provider, .. }| provider.clone());
+            got.sort_by_key(|msg| match msg {
+                SearchToSynoik::Results { provider, .. }
+                | SearchToSynoik::Diagnosis { provider, .. } => provider.clone(),
+            });
             got
         }
 
@@ -809,8 +913,58 @@ mod tests {
     }
 
     fn failure(msg: &SearchToSynoik) -> Option<FailureKind> {
-        let SearchToSynoik::Results { failure, .. } = msg;
+        let SearchToSynoik::Results { failure, .. } = msg else {
+            panic!("not a result: {msg:?}");
+        };
         failure.as_ref().map(|f| f.kind)
+    }
+
+    /// A provider's systemd unit is what the D-Bus service file owning its name says, the first
+    /// directory that has one winning.
+    #[test]
+    fn a_providers_unit_comes_from_its_service_file() {
+        let root =
+            std::env::temp_dir().join(format!("synoik-dbus-services-{}", std::process::id()));
+        let (user, system) = (root.join("user"), root.join("system"));
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let write = |dir: &std::path::Path, file: &str, body: &str| {
+            std::fs::write(dir.join(file), body).unwrap();
+        };
+        write(
+            &system,
+            "org.gnome.Software.service",
+            "[D-BUS Service]\nName=org.gnome.Software\nExec=/usr/bin/gnome-software\nSystemdService=gnome-software.service\n",
+        );
+        write(
+            &system,
+            "org.gnome.Photos.service",
+            "[D-BUS Service]\nName=org.gnome.Photos\nExec=/usr/bin/gnome-photos\n",
+        );
+        write(
+            &user,
+            "mine.service",
+            "[D-BUS Service]\nName=org.gnome.Software\nExec=/bin/true\nSystemdService=mine.service\n",
+        );
+        write(
+            &system,
+            "notes.txt",
+            "[D-BUS Service]\nName=org.gnome.Photos\nSystemdService=x\n",
+        );
+        let dirs = [user, system];
+
+        assert_eq!(
+            service_unit(&dirs, "org.gnome.Software").as_deref(),
+            Some("mine.service"),
+            "the user's own file first"
+        );
+        assert_eq!(
+            service_unit(&dirs, "org.gnome.Photos"),
+            None,
+            "no unit named"
+        );
+        assert_eq!(service_unit(&dirs, "org.example.Nothing"), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// What the bus said becomes a kind of failure: a provider the bus may not start is not
@@ -869,7 +1023,9 @@ mod tests {
     }
 
     fn rows(msg: &SearchToSynoik) -> Option<(Vec<&str>, usize)> {
-        let SearchToSynoik::Results { results, .. } = msg;
+        let SearchToSynoik::Results { results, .. } = msg else {
+            panic!("not a result: {msg:?}");
+        };
         results
             .as_ref()
             .map(|r| (r.rows.iter().map(|m| m.name.as_str()).collect(), r.more))
@@ -919,7 +1075,9 @@ mod tests {
             "metas 0,1,2,3,4",
             "metas only for the rows shown"
         );
-        let SearchToSynoik::Results { results, .. } = &got[0];
+        let SearchToSynoik::Results { results, .. } = &got[0] else {
+            panic!("not a result");
+        };
         assert_eq!(
             results.as_ref().unwrap().rows[0].description.as_deref(),
             Some("item 0"),
@@ -964,7 +1122,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         got.extend(h.replies.try_iter());
         assert_eq!(got.len(), 1, "only the newer search reports: {got:?}");
-        let SearchToSynoik::Results { generation, .. } = &got[0];
+        let SearchToSynoik::Results { generation, .. } = &got[0] else {
+            panic!("not a result");
+        };
         assert_eq!(*generation, 2);
     }
 
