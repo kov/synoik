@@ -270,6 +270,7 @@ async fn search_provider(
         }
         None => call::<Vec<String>>(&bus, &endpoint, "GetInitialResultSet", &(&terms,)).await,
     };
+    let mut failed = found.is_err();
     let ids = match found {
         Ok(ids) => Some(bound_ids(ids)),
         Err(err) => {
@@ -302,7 +303,9 @@ async fn search_provider(
     let results = if ids.is_empty() {
         None
     } else {
-        section(&bus, &endpoint, &ids, &shared).await
+        let results = section(&bus, &endpoint, &ids, &shared).await;
+        failed |= results.is_none();
+        results
     };
     if !current(&shared.lock().unwrap()) {
         return;
@@ -311,6 +314,7 @@ async fn search_provider(
         generation,
         provider: endpoint.id,
         results,
+        failed,
     });
 }
 

@@ -33,7 +33,8 @@
 //! rather than as the last provider answers: the sections of providers still out go, the status
 //! stops reading "Searching", a row under everything names the late providers by their icons as
 //! "Still searching…", and a late answer's section joins below every other one, so it moves
-//! nothing on screen. The system actions' availability is the power menu's (see
+//! nothing on screen. A late provider that then fails or times out stays in that row, dimmed,
+//! as "No answer", until the next search. The system actions' availability is the power menu's (see
 //! `Synoik::system_action_available`). Enter inside the search delay activates what the typed terms
 //! find; gnome-shell's app provider answers asynchronously, so its Enter activates the previous
 //! default. The results scroll by wheel and touchpad, and the selection is eased into view;
@@ -248,10 +249,23 @@ const PROVIDER_W: f64 = 2. * ITEM_PAD + PROVIDER_ICON_PX + PROVIDER_SPACING + PR
 const PROVIDER_MARGIN: f64 = 4.;
 /// One line of body text, for sizing a box around lines.
 const LINE_H: f64 = 18.;
-/// The late providers' row (a divergence, no GNOME counterpart): their icons, at a row's icon
-/// size, then the text.
+/// The late providers' row (a divergence, no GNOME counterpart): the icons of those still
+/// searching, at a row's icon size, then the text; then those that gave up, dimmed, and theirs.
 const LATE_TEXT: &str = "Still searching…";
+const GAVE_UP_TEXT: &str = "No answer";
 const LATE_ICON_SPACING: f64 = 6.;
+const LATE_GROUP_SPACING: f64 = 24.;
+/// A gave-up provider's icon, against a searching one's.
+const GAVE_UP_ICON_ALPHA: f32 = 0.5;
+
+/// A provider that missed the search's deadline: still searching, or since given up (failed or
+/// timed out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LateProvider {
+    pub id: String,
+    pub icon: AppIconRef,
+    pub gave_up: bool,
+}
 
 /// One app result — a plain-data snapshot (not a live catalog borrow), like
 /// [`crate::ui::dash::DashEntry`].
@@ -407,7 +421,7 @@ pub struct OverviewSearch {
     searching: bool,
     /// Providers that missed the search's deadline and have yet to answer, with their icons —
     /// the row under the results saying so.
-    late: Vec<(String, AppIconRef)>,
+    late: Vec<LateProvider>,
     /// Keyboard-selected result, as an index over the app results and then every section's
     /// rows. Meaningful only when there is something to select.
     selected: usize,
@@ -763,14 +777,14 @@ impl OverviewSearch {
     }
 
     /// The providers past the search's deadline that are still to answer, in section order.
-    pub fn set_late(&mut self, late: Vec<(String, AppIconRef)>) {
+    pub fn set_late(&mut self, late: Vec<LateProvider>) {
         if self.late != late {
             self.late = late;
             self.content_rev = self.content_rev.wrapping_add(1);
         }
     }
 
-    pub fn late(&self) -> &[(String, AppIconRef)] {
+    pub fn late(&self) -> &[LateProvider] {
         &self.late
     }
 
@@ -1169,17 +1183,12 @@ impl OverviewSearch {
         }
     }
 
-    /// The late providers' row, centered in the column at `top`: their icons, then
-    /// [`LATE_TEXT`].
+    /// The late providers' row, centered in the column at `top`.
     fn late_row(&self, column_x: f64, column_w: f64, top: f64) -> Option<Rectangle<f64, Logical>> {
         if self.late.is_empty() {
             return None;
         }
-        let n = self.late.len() as f64;
-        let w = n * ROW_ICON_PX
-            + (n - 1.) * LATE_ICON_SPACING
-            + TITLE_SPACING
-            + run_width(LATE_TEXT, crate::ui::BASE_FONT_PT, false).ceil();
+        let w = self.late_pieces(0.).width;
         Some(Rectangle::new(
             Point::from(((column_x + (column_w - w) / 2.).round(), top)),
             Size::from((w, ROW_H)),
@@ -1323,23 +1332,56 @@ impl OverviewSearch {
         Some((center, widget::Spinner::geometry(SPINNER_PX).0))
     }
 
-    /// The late row's first icon square and its text's box — a geometry probe for the render
+    /// The late row's icon squares and text boxes, in order — a geometry probe for the render
     /// test.
     #[cfg(test)]
-    pub fn late_row_probe(
-        &self,
-        area: SearchArea,
-    ) -> Option<(Rectangle<f64, Logical>, Rectangle<f64, Logical>)> {
+    pub fn late_row_probe(&self, area: SearchArea) -> Option<[Vec<Rectangle<f64, Logical>>; 2]> {
         let late = self.layout(area).results?.late?;
-        let n = self.late.len() as f64;
-        let text_x = late.loc.x + n * ROW_ICON_PX + (n - 1.) * LATE_ICON_SPACING + TITLE_SPACING;
-        Some((
-            Rectangle::new(late.loc, Size::from((ROW_ICON_PX, ROW_H))),
-            Rectangle::new(
-                Point::from((text_x, late.loc.y)),
-                Size::from((late.loc.x + late.size.w - text_x, late.size.h)),
-            ),
-        ))
+        let pieces = self.late_pieces(late.loc.x);
+        let rect = |x, w| Rectangle::new(Point::from((x, late.loc.y)), Size::from((w, ROW_H)));
+        Some([
+            pieces
+                .icons
+                .iter()
+                .map(|(_, x, _)| rect(*x, ROW_ICON_PX))
+                .collect(),
+            pieces
+                .texts
+                .iter()
+                .map(|(t, x)| rect(*x, late_text_w(t)))
+                .collect(),
+        ])
+    }
+
+    /// The late row from `x`: each icon's left edge and whether it gave up, each text's, and
+    /// the row's width. Those still searching come first.
+    fn late_pieces(&self, x: f64) -> LatePieces<'_> {
+        let (mut icons, mut texts) = (Vec::new(), Vec::new());
+        let mut pen = x;
+        for (gave_up, text) in [(false, LATE_TEXT), (true, GAVE_UP_TEXT)] {
+            let group: Vec<_> = self.late.iter().filter(|l| l.gave_up == gave_up).collect();
+            if group.is_empty() {
+                continue;
+            }
+            if !texts.is_empty() {
+                pen += LATE_GROUP_SPACING;
+            }
+            for (i, late) in group.iter().enumerate() {
+                if i > 0 {
+                    pen += LATE_ICON_SPACING;
+                }
+                icons.push((&late.icon, pen, gave_up));
+                pen += ROW_ICON_PX;
+            }
+            pen += TITLE_SPACING;
+            texts.push((text, pen));
+            pen += late_text_w(text);
+        }
+        LatePieces {
+            icons,
+            texts,
+            width: pen - x,
+        }
     }
 
     /// Where `hit` is drawn — what the conformance corpus clicks.
@@ -1593,11 +1635,24 @@ impl OverviewSearch {
                     }
                 }
             }
+            drop(push_icon);
             if let Some(late) = results.late {
-                for (i, (_, icon)) in self.late.iter().enumerate() {
-                    let x = late.loc.x + i as f64 * (ROW_ICON_PX + LATE_ICON_SPACING);
+                for (icon, x, gave_up) in self.late_pieces(late.loc.x).icons {
                     let center = Point::from((x + ROW_ICON_PX / 2., late.loc.y + late.size.h / 2.));
-                    push_icon(icon, ROW_ICON_PX, center);
+                    let dim = if gave_up { GAVE_UP_ICON_ALPHA } else { 1. };
+                    if let Some(el) = widget::app_icon_element(
+                        renderer,
+                        &mut uploads,
+                        app_icons,
+                        icon,
+                        ROW_ICON_PX,
+                        scale,
+                        Point::from((0., 0.)),
+                        center,
+                        results_alpha * dim,
+                    ) {
+                        elements.push(el);
+                    }
                 }
             }
             drop(uploads);
@@ -1837,18 +1892,19 @@ impl OverviewSearch {
             });
         }
         if let Some(late) = results.late {
-            let n = self.late.len() as f64;
-            texts.push(TextItem {
-                runs: vec![(LATE_TEXT.to_owned(), false)],
-                pen: false,
-                pt: crate::ui::BASE_FONT_PT,
-                x: rel(late).loc.x + n * ROW_ICON_PX + (n - 1.) * LATE_ICON_SPACING + TITLE_SPACING,
-                align: widget::HAlign::Left,
-                top: rel(late).loc.y,
-                h: late.size.h,
-                // As a result's description: `$system_insensitive_fg_color`.
-                color: style::MUTED,
-            });
+            for (text, x) in self.late_pieces(late.loc.x).texts {
+                texts.push(TextItem {
+                    runs: vec![(text.to_owned(), false)],
+                    pen: false,
+                    pt: crate::ui::BASE_FONT_PT,
+                    x: x - origin.x,
+                    align: widget::HAlign::Left,
+                    top: rel(late).loc.y,
+                    h: late.size.h,
+                    // As a result's description: `$system_insensitive_fg_color`.
+                    color: style::MUTED,
+                });
+            }
         }
         match widget::bake(
             renderer,
@@ -2161,6 +2217,20 @@ fn status_text(status: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
         Point::from((status.loc.x, status.loc.y + status.size.h - STATUS_H)),
         Size::from((status.size.w, STATUS_H)),
     )
+}
+
+/// The late row laid out from a pen position ([`OverviewSearch::late_pieces`]).
+struct LatePieces<'a> {
+    /// Each icon, its left edge, and whether its provider gave up.
+    icons: Vec<(&'a AppIconRef, f64, bool)>,
+    /// Each text and its left edge.
+    texts: Vec<(&'static str, f64)>,
+    width: f64,
+}
+
+/// A late row text's width, logical px.
+fn late_text_w(text: &str) -> f64 {
+    run_width(text, crate::ui::BASE_FONT_PT, false).ceil()
 }
 
 /// A run's advance, logical px.

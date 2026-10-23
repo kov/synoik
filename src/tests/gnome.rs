@@ -23336,7 +23336,19 @@ fn answer(f: &mut Fixture, generation: u64, provider: &str, ids: &[&str]) {
         generation,
         provider: provider.to_owned(),
         results,
+        failed: false,
     });
+}
+
+/// `provider` failed or timed out on `generation`.
+fn answer_failed(f: &mut Fixture, generation: u64, provider: &str) {
+    f.synoik()
+        .on_search_provider_msg(crate::search_providers::SearchToSynoik::Results {
+            generation,
+            provider: provider.to_owned(),
+            results: None,
+            failed: true,
+        });
 }
 
 /// Results past the bottom of the view scroll (`search.js` puts them in an `St.ScrollView`):
@@ -23804,7 +23816,7 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
             .overview_search
             .late()
             .iter()
-            .map(|(id, _)| id.clone())
+            .map(|l| format!("{}{}", l.id, if l.gave_up { " (gave up)" } else { "" }))
             .collect()
     };
 
@@ -23843,8 +23855,24 @@ fn remote_search_settles_at_the_deadline_and_late_answers_go_below() {
     answer(&mut f, generation, "a.desktop", &["r"]);
     assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
     assert_eq!(late(&mut f), ["c.desktop"]);
-    answer(&mut f, generation, "c.desktop", &[]);
+    // `c` times out: its icon stays, saying it never answered.
+    answer_failed(&mut f, generation, "c.desktop");
     assert_eq!(shown(&mut f), ["b.desktop", "a.desktop"]);
+    assert_eq!(late(&mut f), ["c.desktop (gave up)"]);
+
+    // A late provider that answers with nothing leaves the row.
+    tap(&mut f, KEY_B);
+    search_settle(&mut f);
+    let (generation, _) = searched(&sent(&rx));
+    answer(&mut f, generation, "b.desktop", &["r"]);
+    f.advance_until(Duration::from_millis(1600), |_| false);
+    assert_eq!(
+        late(&mut f),
+        ["a.desktop", "c.desktop"],
+        "a new search starts over"
+    );
+    answer(&mut f, generation, "a.desktop", &[]);
+    answer(&mut f, generation, "c.desktop", &[]);
     assert!(late(&mut f).is_empty(), "everyone answered");
 
     // The next search puts an answer in time back in its place.
@@ -23873,7 +23901,7 @@ fn remote_search_with_nothing_at_the_deadline_says_who_is_late() {
             .overview_search
             .late()
             .iter()
-            .map(|(id, _)| id.as_str())
+            .map(|l| l.id.as_str())
             .collect::<Vec<_>>(),
         ["calc.desktop"]
     );

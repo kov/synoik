@@ -367,6 +367,8 @@ struct SearchRun {
     deadline: Option<TimerToken>,
     /// Late sections of the current generation so far, once its deadline has passed.
     late: Option<usize>,
+    /// Providers that were late and then gave up on the current generation.
+    gave_up: std::collections::HashSet<String>,
     /// When the status spinner started spinning, while it is.
     spinning_since: Option<Duration>,
     /// The selection the results were last scrolled for.
@@ -18148,16 +18150,27 @@ impl Synoik {
             self.cancel_timer(timer);
         }
         self.search_run.late = None;
+        self.search_run.gave_up.clear();
         self.overview_search.set_late(Vec::new());
     }
 
-    /// The providers still out past the deadline, for the row saying so.
+    /// The providers still out past the deadline, and those that gave up since, for the row
+    /// saying so.
     fn sync_late_search_providers(&mut self) {
+        let run = &self.search_run;
         let late = self
             .search_providers
             .iter()
-            .filter(|p| self.search_run.pending.contains(p.id()))
-            .map(|p| (p.id().to_owned(), p.icon.clone()))
+            .filter_map(|p| {
+                let gave_up = run.gave_up.contains(p.id());
+                (gave_up || run.pending.contains(p.id())).then(|| {
+                    crate::ui::overview_search::LateProvider {
+                        id: p.id().to_owned(),
+                        icon: p.icon.clone(),
+                        gave_up,
+                    }
+                })
+            })
             .collect();
         self.overview_search.set_late(late);
     }
@@ -18179,6 +18192,7 @@ impl Synoik {
             generation,
             provider,
             results,
+            failed,
         } = msg;
         if generation != self.search_run.generation || !self.search_run.pending.remove(&provider) {
             return;
@@ -18207,6 +18221,9 @@ impl Synoik {
             );
         self.overview_search.set_section(&provider, section);
         if self.search_run.late.is_some() {
+            if failed {
+                self.search_run.gave_up.insert(provider.clone());
+            }
             self.sync_late_search_providers();
         } else {
             self.overview_search

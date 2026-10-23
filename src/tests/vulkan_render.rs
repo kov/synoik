@@ -9485,10 +9485,15 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
             crate::ui::text_edit::EditMods::default(),
             crate::ui::text_edit::KeyTheme::default(),
         );
-        s.set_late(vec![(
-            "files.desktop".to_owned(),
-            crate::app_system::AppIconRef::Themed(vec!["folder".to_owned()]),
-        )]);
+        let late = |id: &str, icon: &str, gave_up| crate::ui::overview_search::LateProvider {
+            id: id.to_owned(),
+            icon: crate::app_system::AppIconRef::Themed(vec![icon.to_owned()]),
+            gave_up,
+        };
+        s.set_late(vec![
+            late("files.desktop", "folder", false),
+            late("web.desktop", "folder", true),
+        ]);
     }
     let controls = f
         .synoik()
@@ -9496,7 +9501,7 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
     let area: crate::ui::overview_search::SearchArea = controls.into();
-    let (icon, text) = f
+    let [icons, texts] = f
         .synoik()
         .overview_search
         .late_row_probe(area)
@@ -9551,10 +9556,30 @@ fn vulkan_search_late_row_draws_its_icons_and_text() {
         }
         n
     };
-    let (icon_ink, text_ink) = (inked(icon), inked(text));
-    eprintln!("vulkan_search_late_row: icon={icon_ink} text={text_ink} at {icon:?} {text:?}");
-    assert!(icon_ink > 100, "the provider's icon draws: {icon_ink}");
-    assert!(text_ink > 100, "\"Still searching…\" draws: {text_ink}");
+    let peak = |r: Rectangle<f64, Logical>| {
+        let mut max = 0;
+        for y in r.loc.y as i32..(r.loc.y + r.size.h) as i32 {
+            for x in r.loc.x as i32..(r.loc.x + r.size.w) as i32 {
+                max = max.max(px(&pixels, w, x, y)[3]);
+            }
+        }
+        max
+    };
+    assert_eq!((icons.len(), texts.len()), (2, 2), "two groups of one");
+    for r in icons.iter().chain(&texts) {
+        let ink = inked(*r);
+        eprintln!(
+            "vulkan_search_late_row: {ink} inked, peak {} at {r:?}",
+            peak(*r)
+        );
+        assert!(ink > 100, "each icon and text draws: {ink} at {r:?}");
+    }
+    let (searching, gave_up) = (peak(icons[0]), peak(icons[1]));
+    assert_eq!(searching, 255, "a searching provider's icon is opaque");
+    assert!(
+        (110..=145).contains(&gave_up),
+        "a gave-up provider's icon is dimmed to half: {gave_up}"
+    );
 }
 
 #[test]

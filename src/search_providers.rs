@@ -281,6 +281,8 @@ pub enum SearchToSynoik {
         generation: u64,
         provider: String,
         results: Option<SectionResults>,
+        /// It did not answer: a call failed or timed out, or what it answered was invalid.
+        failed: bool,
     },
 }
 
