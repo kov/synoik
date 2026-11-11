@@ -180,8 +180,7 @@ impl ThumbnailChrome {
             }
         }
 
-        // The same caption pill the window picker puts under a preview, so the two labels in
-        // the overview read as one kind of overlay.
+        // GNOME's `%tooltip` caption pill — what `.window-caption` extends.
         for label in names {
             if label.name.is_empty() {
                 continue;

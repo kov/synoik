@@ -3185,13 +3185,22 @@ impl<W: LayoutElement> Workspace<W> {
     ///
     /// Note a padding constant here would have been a no-op: the cap already binds, so an
     /// inset has to exceed the slack under it (~26px at 1920×1080) before it moves anything.
+    ///
+    /// **Every edge keeps the preview chrome clear** — the icon's overhang, the close button's
+    /// and the hover growth ([`expose::chrome_oversize`]). gnome-shell does this for the bottom
+    /// edge only, and only for the caption (`_adjustSpacingAndPadding`, `workspace.js:500-509`);
+    /// ours sits inside the preview, so what can fall off the screen is the chrome, and on any
+    /// edge a crowded picker packs a preview against. **Divergence (approved 2026-11-11).**
     pub(super) fn expose_area(&self) -> Rectangle<f64, Logical> {
         let work = self.floating.working_area();
         let view = Rectangle::from_size(self.view_size);
+        // Whole pixels: the packed slots floor their origin (`clone_x.floor()`), which can
+        // hand a fractional margin back on the leading edges.
+        let chrome = expose::chrome_oversize().ceil();
 
         let inset = |lo: f64, hi: f64| -> (f64, f64) {
-            let strut = f64::max(lo, hi);
-            (strut, strut * 2.)
+            let edge = f64::max(f64::max(lo, hi), chrome);
+            (edge, edge * 2.)
         };
         let (x, dw) = inset(
             work.loc.x - view.loc.x,

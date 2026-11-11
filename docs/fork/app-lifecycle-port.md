@@ -94,6 +94,10 @@ the app name. Activating a row is `Main.activateWindow(window)`. Windows are fil
   `%tooltip` (`_common.scss:225-238`): `background-color: rgba(0,0,0,.9)`, `1px solid rgba($light_1,.1)`,
   `color: $light_1`, `border-radius: $forced_circular_radius` (a pill), `padding: $base_padding
   $base_padding*2` = 6px/12px, centred text.
+  **Ours diverges** (`src/ui/window_preview.rs`, `CAPTION_PT`): the caption sits *inside* the
+  preview, above the icon, on an opaque OSD plate with a drop shadow and 13pt text, so a bottom-row
+  caption cannot fall off the screen; the picker's area keeps the chrome's overhang clear on every
+  edge instead (`Workspace::expose_area`).
 - Caption text is `metaWindow.title`, falling back to the **app name** (`_getCaption`, `:259-266`).
 - **Visibility differs between the two.** The icon is always visible in the window picker, and its
   *scale* ramps with the overview adjustment: `1 - |WINDOW_PICKER - currentState|`, and 0 unless the

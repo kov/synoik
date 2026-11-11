@@ -42,7 +42,7 @@ const ACTIVE_SIZE_INC: f64 = 5.;
 /// * left — nothing but the active-size increase
 ///
 /// plus `ACTIVE_SIZE_INC` on every side. The bottom (icon) side wins for our chrome.
-fn chrome_oversize() -> f64 {
+pub(crate) fn chrome_oversize() -> f64 {
     use crate::ui::window_preview::{CLOSE_SIZE, ICON_OVERLAP, ICON_SIZE};
 
     let top = CLOSE_SIZE / 2.;

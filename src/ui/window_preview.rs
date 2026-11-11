@@ -43,7 +43,7 @@ use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::widget::{
-    self, style, BakeCache, Painter, Rgba, SharedAppIconUploads, TextShaper, TextStyle,
+    self, style, Align, BakeCache, Painter, Rgba, SharedAppIconUploads, TextShaper, TextStyle,
 };
 
 /// The button's box, logical px — `$large_icon_size` (`_window-picker.scss:35-36`).
@@ -122,18 +122,54 @@ pub fn icon_center(preview: Rectangle<f64, Logical>) -> Point<f64, Logical> {
     ))
 }
 
-/// The caption pill's top-left for a preview of `preview` and a pill of `size`.
-/// X-centred; Y is the preview's bottom edge plus the icon's overhang and the
-/// spacing (`windowPreview.js:170-186`).
-pub fn caption_origin(
+/// The caption's text size. **Divergence (approved 2026-11-11):** gnome-shell's
+/// `.window-caption` is a `%tooltip` pill at the stage's 11pt hung *below* the icon
+/// (`windowPreview.js:159-186`, `_window-picker.scss:24-26`), which puts a bottom-row caption
+/// off the screen once the picker is crowded. Ours sits *inside* the preview, just above the
+/// icon, on an opaque OSD plate with a drop shadow and larger text, so it reads as chrome laid
+/// over the window rather than as part of its content.
+pub const CAPTION_PT: f64 = 13.;
+/// The plate's padding around the label.
+const CAPTION_PAD_V: f64 = 8.;
+const CAPTION_PAD_H: f64 = 16.;
+/// The least the plate keeps clear of the preview's sides; a longer title is ellipsized.
+const CAPTION_MARGIN: f64 = 12.;
+/// Heavier than the switcher's `0 8px 8px 0 $shadow_color`: the plate floats over arbitrary
+/// window content, not over the wallpaper.
+const CAPTION_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
+    blur: 12.,
+    offset: (0., 4.),
+    spread: 0.,
+    color: [0., 0., 0., 0.5],
+};
+
+/// The caption as drawn on a preview of `preview`: `caption`, ellipsized to fit inside it.
+pub fn caption_text(caption: &str, preview: Rectangle<f64, Logical>) -> String {
+    let max_w = preview.size.w - 2. * (CAPTION_MARGIN + CAPTION_PAD_H);
+    widget::ellipsized_line(caption, CAPTION_PT, max_w.max(0.))
+}
+
+/// The caption plate's box for an already-fitted `text` (see [`caption_text`]).
+pub fn caption_size(text: &str) -> Size<f64, Logical> {
+    let px = crate::ui::pt_to_px(CAPTION_PT);
+    let w = synoik_vk::text::measure_line_width_weighted(text, px as f32, false);
+    Size::from((w + 2. * CAPTION_PAD_H, px.ceil() + 2. * CAPTION_PAD_V))
+}
+
+/// The caption plate's box on a preview of `preview`: X-centred, its bottom
+/// `ICON_TITLE_SPACING` above the top of the app icon.
+pub fn caption_rect(
     preview: Rectangle<f64, Logical>,
     size: Size<f64, Logical>,
-) -> Point<f64, Logical> {
-    let bottom = preview.loc.y + preview.size.h;
-    Point::from((
-        preview.loc.x + (preview.size.w - size.w) / 2.,
-        bottom + ICON_SIZE * (1. - ICON_OVERLAP) + ICON_TITLE_SPACING,
-    ))
+) -> Rectangle<f64, Logical> {
+    let icon_top = preview.loc.y + preview.size.h - ICON_SIZE * ICON_OVERLAP;
+    Rectangle::new(
+        Point::from((
+            preview.loc.x + (preview.size.w - size.w) / 2.,
+            icon_top - ICON_TITLE_SPACING - size.h,
+        )),
+        size,
+    )
 }
 
 /// One preview's chrome, as the renderer needs it: where the preview draws, how
@@ -193,7 +229,7 @@ impl PreviewChrome {
     }
 
     /// Render each preview's chrome, topmost first (the caller pushes these above
-    /// the previews): close button, caption pill, app icon. `output` names the
+    /// the previews): close button, caption plate, app icon. `output` names the
     /// screen being drawn, whose bakes these are.
     pub fn render(
         &self,
@@ -329,14 +365,32 @@ impl PreviewChrome {
         elements
     }
 
-    /// One caption pill, baked and placed. `None` when the bake failed.
+    /// One caption plate, baked and placed. `None` when the bake failed.
     fn caption_element(
         chrome: &OutputChrome,
         renderer: &mut VulkanRenderer,
         scale: f64,
         overlay: &PreviewOverlay,
     ) -> Option<TextureRenderElement<VkTexture>> {
-        let size = widget::Tooltip::size(&overlay.caption);
+        let text = caption_text(&overlay.caption, overlay.preview);
+        let plate = caption_rect(overlay.preview, caption_size(&text));
+        let radius = plate.size.h / 2.;
+
+        // The bake carries the shadow too, so it is the plate padded by the blur's reach
+        // (~3σ) plus the downward offset on every side.
+        let pad = CAPTION_SHADOW.blur * 1.5 + 1. + CAPTION_SHADOW.offset.1;
+        let inner = Rectangle::new(Point::from((pad, pad)), plate.size);
+        let size = plate.size + Size::from((pad * 2., pad * 2.));
+
+        // The cache is per caption string, but the fitted text also depends on the preview's
+        // width; a different cut is a different bake.
+        let revision = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            h.finish()
+        };
+
         let mut caches = chrome.captions.borrow_mut();
         let cache = caches.entry(overlay.caption.clone()).or_default();
         let texture = widget::bake(
@@ -344,20 +398,42 @@ impl PreviewChrome {
             cache,
             scale,
             size,
-            0,
+            revision,
             |r| {
                 let mut shaper = TextShaper::new(r, scale);
-                shaper.shape(&overlay.caption, TextStyle::new(widget::Tooltip::TEXT_PT))
+                shaper.shape(&text, TextStyle::new(CAPTION_PT))
             },
             |frame, phys, label| {
                 let mut p = Painter::new(frame, scale, phys);
-                p.tooltip(size, label)
+                p.clear(style::TRANSPARENT)?;
+                if style::shadows() {
+                    p.drop_shadow(
+                        inner,
+                        radius,
+                        CAPTION_SHADOW.blur,
+                        CAPTION_SHADOW.offset,
+                        CAPTION_SHADOW.color,
+                    )?;
+                }
+                p.fill_rounded(inner, radius, style::osd_bg())?;
+                p.stroke_rounded(
+                    inner,
+                    radius,
+                    style::osd_border_width(),
+                    style::osd_border(),
+                )?;
+                p.text(
+                    label,
+                    inner.loc + inner.size.downscale(2.).to_point(),
+                    Align::CENTER,
+                    style::OSD_FG,
+                )
             },
         );
         match texture {
             Ok(buffer) => Some(TextureRenderElement::from_texture_buffer(
                 buffer,
-                caption_origin(overlay.preview, size),
+                plate.loc - Point::from((pad, pad)),
                 overlay.alpha,
                 None,
                 None,
@@ -385,10 +461,10 @@ mod tests {
 
     /// The preview's slot, and the reference numbers the constraints work out to
     /// (`windowPreview.js:142-186`): the icon hangs `ICON_SIZE * (1 - ICON_OVERLAP)`
-    /// = 19.2px below the preview, and the caption's top is that plus
-    /// `ICON_TITLE_SPACING`.
+    /// = 19.2px below the preview. The caption plate (our divergence) sits inside
+    /// the preview, `ICON_TITLE_SPACING` above the icon.
     #[test]
-    fn the_icon_straddles_the_preview_bottom_and_the_caption_clears_it() {
+    fn the_icon_straddles_the_preview_bottom_and_the_caption_sits_above_it() {
         let preview =
             Rectangle::<f64, Logical>::new(Point::from((100., 200.)), Size::from((400., 300.)));
         let bottom = 500.;
@@ -407,17 +483,34 @@ mod tests {
             "70% of it sits inside"
         );
 
-        let size = Size::<f64, Logical>::from((200., 30.));
-        let origin = caption_origin(preview, size);
-        assert_eq!(origin.x, 200., "the caption is centred too");
+        let plate = caption_rect(preview, Size::from((200., 30.)));
+        assert_eq!(plate.loc.x, 200., "the caption is centred too");
         assert!(
-            (origin.y - (bottom + 19.2 + ICON_TITLE_SPACING)).abs() < 1e-9,
-            "the caption clears the icon's overhang by ICON_TITLE_SPACING"
+            (plate.loc.y + plate.size.h - (icon_top - ICON_TITLE_SPACING)).abs() < 1e-9,
+            "the caption ends ICON_TITLE_SPACING above the icon"
         );
         assert!(
-            origin.y > icon_bottom,
-            "and so it never overlaps the icon itself"
+            preview.contains_rect(plate),
+            "and it is inside the preview, so it can never fall off the screen"
         );
+    }
+
+    /// A title wider than the preview is ellipsized to keep the plate inside it.
+    #[test]
+    fn a_long_caption_is_ellipsized_to_the_preview() {
+        let preview =
+            Rectangle::<f64, Logical>::new(Point::from((0., 0.)), Size::from((240., 200.)));
+        let long = "a considerably longer window title than any preview this narrow can hold";
+        let text = caption_text(long, preview);
+        assert_ne!(text, long, "the title is cut");
+        let plate = caption_rect(preview, caption_size(&text));
+        assert!(
+            plate.size.w <= preview.size.w - 2. * CAPTION_MARGIN + 1e-9,
+            "the plate keeps CAPTION_MARGIN from both sides: {plate:?} in {preview:?}"
+        );
+
+        let short = caption_text("Files", preview);
+        assert_eq!(short, "Files", "a title that fits is left alone");
     }
 
     /// `%tooltip` is a pill: its radius is half its height whatever the label

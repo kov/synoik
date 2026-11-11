@@ -805,3 +805,68 @@ fn touch_picks_a_preview_or_leaves() {
         "a touch on a preview goes to its window"
     );
 }
+
+/// A crowded grid keeps the preview chrome on screen on every edge: the app icon hanging off
+/// a bottom-row preview, the close button straddling a top-row one, and the hover growth.
+/// gnome-shell reserves room under the bottom row only, for the caption it hangs there
+/// (`workspace.js:500-509`); ours sits inside the preview, so what needs the room is the
+/// chrome, on all four sides.
+#[test]
+fn a_crowded_grid_keeps_the_preview_chrome_on_screen() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+    let client = f.add_client();
+    // Big windows, so the grid is limited by the area and not by `MAXIMUM_SCALE`.
+    for _ in 0..12 {
+        let window = f.client(client).create_window();
+        let surface = window.surface.clone();
+        window.set_app_id(ONE);
+        window.commit();
+        f.roundtrip(client);
+        let window = f.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(1600, 900);
+        window.ack_last_and_commit();
+        f.double_roundtrip(client);
+    }
+    f.settle();
+    let out = output(&mut f, "headless-1");
+    open(&mut f);
+
+    let view = f
+        .synoik()
+        .layout
+        .monitor_for_output(&out)
+        .unwrap()
+        .view_size();
+    let chrome = crate::layout::expose::chrome_oversize();
+    let slots = f.synoik().layout.app_expose_slots(&out);
+    assert_eq!(slots.len(), 12, "precondition: every window is in the grid");
+
+    let gap = |slot: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        [
+            slot.loc.x,
+            slot.loc.y,
+            view.w - (slot.loc.x + slot.size.w),
+            view.h - (slot.loc.y + slot.size.h),
+        ]
+    };
+    for (_, slot) in &slots {
+        for g in gap(*slot) {
+            assert!(
+                g >= chrome - 1e-6,
+                "a preview at {slot:?} is {g}px from an edge of {view:?}; its chrome needs {chrome}"
+            );
+        }
+    }
+    let tightest = slots
+        .iter()
+        .flat_map(|(_, s)| gap(*s))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        tightest < chrome + 1.,
+        "precondition: the grid must be packed against the margin, or this proves nothing \
+         (tightest gap {tightest}px)"
+    );
+}
